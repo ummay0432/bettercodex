@@ -1,6 +1,7 @@
 mod editor;
 mod markdown;
 mod terminal;
+mod tool_catalogue;
 mod view;
 
 use crate::agent::Agent;

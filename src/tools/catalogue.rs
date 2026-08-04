@@ -69,12 +69,50 @@ static EXEC_DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+static DISPLAY_TOOLS: LazyLock<Vec<CatalogueTool>> = LazyLock::new(|| {
+    let mut tools = specifications()
+        .into_iter()
+        .map(|specification| {
+            let name = specification
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("request tool specifications always have a name");
+            CatalogueTool {
+                name: name.to_string(),
+                route: CatalogueRoute::Request,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    tools.extend(core_tools().iter().map(|tool| CatalogueTool {
+        name: tool.name.clone(),
+        route: CatalogueRoute::InsideExec,
+    }));
+    tools
+});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogueRoute {
+    Request,
+    InsideExec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogueTool {
+    pub(crate) name: String,
+    pub(crate) route: CatalogueRoute,
+}
+
 pub(super) fn core_tools() -> &'static [ToolDefinition] {
     &CORE_TOOLS
 }
 
 pub(crate) fn text() -> &'static str {
     &EXEC_DESCRIPTION
+}
+
+pub(crate) fn display_tools() -> &'static [CatalogueTool] {
+    &DISPLAY_TOOLS
 }
 
 pub(crate) fn specifications() -> Vec<Value> {
@@ -385,6 +423,32 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
         assert_eq!(names, ["exec", "wait"]);
+    }
+
+    #[test]
+    fn display_catalogue_matches_the_request_and_nested_definitions() {
+        let request = specifications();
+        let expected_request = request
+            .iter()
+            .map(|tool| (tool["name"].as_str().unwrap(), CatalogueRoute::Request))
+            .collect::<Vec<_>>();
+        let displayed_request = display_tools()
+            .iter()
+            .filter(|tool| tool.route == CatalogueRoute::Request)
+            .map(|tool| (tool.name.as_str(), tool.route))
+            .collect::<Vec<_>>();
+        assert_eq!(displayed_request, expected_request);
+
+        let expected_nested = core_tools()
+            .iter()
+            .map(|tool| (tool.name.as_str(), CatalogueRoute::InsideExec))
+            .collect::<Vec<_>>();
+        let displayed_nested = display_tools()
+            .iter()
+            .filter(|tool| tool.route == CatalogueRoute::InsideExec)
+            .map(|tool| (tool.name.as_str(), tool.route))
+            .collect::<Vec<_>>();
+        assert_eq!(displayed_nested, expected_nested);
     }
 
     #[test]

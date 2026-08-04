@@ -4,6 +4,8 @@ mod code_runtime;
 mod executor;
 mod patch;
 
+pub(crate) use catalogue::CatalogueRoute;
+pub(crate) use catalogue::CatalogueTool;
 pub(crate) use executor::command_argv_for_display;
 
 use self::code_runtime::CodeModeNestedToolCall;
@@ -271,6 +273,10 @@ pub(crate) fn specifications() -> Vec<Value> {
 
 pub(crate) fn catalogue_text() -> &'static str {
     catalogue::text()
+}
+
+pub(crate) fn display_tools() -> &'static [CatalogueTool] {
+    catalogue::display_tools()
 }
 
 pub(crate) fn code_mode_tool_names() -> Value {

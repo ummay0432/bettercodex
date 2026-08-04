@@ -1,6 +1,9 @@
 use super::editor;
 use super::editor::Editor;
 use super::markdown;
+use super::tool_catalogue::CatalogueAction;
+use super::tool_catalogue::ToolCatalogueView;
+use super::tool_catalogue::VIEWPORT_HEIGHT as TOOL_CATALOGUE_VIEWPORT_HEIGHT;
 use crate::MODEL;
 use crate::agent::SubmitOutcome;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
@@ -56,6 +59,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show keyboard shortcuts",
     },
     SlashCommand {
+        name: "tools",
+        description: "inspect the active tool catalogue",
+    },
+    SlashCommand {
         name: "exit",
         description: "leave BetterCodex",
     },
@@ -89,7 +96,7 @@ pub(super) struct View {
     queued: usize,
     assistant_received_this_turn: bool,
     composer_text_width: u16,
-    show_shortcuts: bool,
+    overlay: Option<Overlay>,
     slash_selection: usize,
     dismissed_slash: Option<String>,
     user_message_style: Style,
@@ -193,6 +200,11 @@ struct SlashCommand {
     description: &'static str,
 }
 
+enum Overlay {
+    Shortcuts,
+    Tools(ToolCatalogueView),
+}
+
 #[derive(Clone, Copy)]
 struct TerminalColors {
     foreground: (u8, u8, u8),
@@ -222,7 +234,7 @@ impl View {
             queued: 0,
             assistant_received_this_turn: false,
             composer_text_width: 1,
-            show_shortcuts: false,
+            overlay: None,
             slash_selection: 0,
             dismissed_slash: None,
             user_message_style: user_message_style_for(Some((31, 31, 31))),
@@ -325,7 +337,7 @@ impl View {
         self.resize_reflow_requested = false;
         self.context_tokens = None;
         self.queued = 0;
-        self.show_shortcuts = false;
+        self.overlay = None;
         self.slash_selection = 0;
         self.dismissed_slash = None;
         self.process_commands.clear();
@@ -415,6 +427,7 @@ impl View {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
             }
+            Event::Paste(_) if self.overlay.is_some() => Action::None,
             Event::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 self.editor.insert(&text);
@@ -438,11 +451,17 @@ impl View {
         if control && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
-        if key.code == KeyCode::Esc {
-            if self.show_shortcuts {
-                self.show_shortcuts = false;
-                return Action::None;
+        if let Some(overlay) = self.overlay.as_ref() {
+            let action = match overlay {
+                Overlay::Shortcuts => CatalogueAction::Close,
+                Overlay::Tools(catalogue) => catalogue.handle_key(key.code),
+            };
+            if action == CatalogueAction::Close {
+                self.overlay = None;
             }
+            return Action::None;
+        }
+        if key.code == KeyCode::Esc {
             if !self.slash_matches().is_empty() {
                 self.dismissed_slash = Some(self.editor.text().to_string());
                 return Action::None;
@@ -453,12 +472,8 @@ impl View {
                 Action::None
             };
         }
-        if self.show_shortcuts {
-            self.show_shortcuts = false;
-            return Action::None;
-        }
         if key.code == KeyCode::Char('?') && self.editor.is_empty() {
-            self.show_shortcuts = true;
+            self.overlay = Some(Overlay::Shortcuts);
             return Action::None;
         }
 
@@ -558,6 +573,10 @@ impl View {
                     "Enter submit/steer · Tab queue · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
                         .to_string(),
                 ));
+                Action::None
+            }
+            "/tools" => {
+                self.overlay = Some(Overlay::Tools(ToolCatalogueView::new()));
                 Action::None
             }
             _ if queued => Action::Queue(prompt),
@@ -712,14 +731,18 @@ impl View {
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
         // extends downward from the composer instead of becoming an overlay above it.
         let trailing_height = if popup_height > 0 { popup_height } else { 2 };
-        let shortcuts_height = if self.show_shortcuts { 15 } else { 0 };
+        let overlay_height = match self.overlay.as_ref() {
+            Some(Overlay::Shortcuts) => 15,
+            Some(Overlay::Tools(_)) => TOOL_CATALOGUE_VIEWPORT_HEIGHT,
+            None => 0,
+        };
         active_height
             .saturating_add(bottom_spacing)
             .saturating_add(status_height)
             .saturating_add(status_composer_spacing)
             .saturating_add(composer_height)
             .saturating_add(trailing_height)
-            .max(shortcuts_height)
+            .max(overlay_height)
             .clamp(1, screen_height.max(1))
     }
 
@@ -734,7 +757,7 @@ impl View {
             .layout(self.composer_text_width, MAX_EDITOR_ROWS);
         let editor_rows = (editor_layout.lines.len() as u16).max(1);
         let composer_height = editor_rows.saturating_add(2).min(area.height);
-        let popup_height = if self.show_shortcuts {
+        let popup_height = if self.overlay.is_some() {
             0
         } else {
             self.slash_popup_height(area.width)
@@ -791,10 +814,13 @@ impl View {
             );
         }
         self.render_composer(frame, composer_area, footer_area, editor_layout);
-        if !self.show_shortcuts {
+        if self.overlay.is_none() {
             self.render_slash_popup(frame, popup_area);
-        } else {
-            self.render_shortcuts(frame, area);
+        }
+        match self.overlay.as_ref() {
+            Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
+            Some(Overlay::Tools(catalogue)) => catalogue.render(frame, area),
+            None => {}
         }
     }
 
@@ -865,7 +891,7 @@ impl View {
             );
         }
 
-        if !self.show_shortcuts {
+        if self.overlay.is_none() {
             let cursor_x = text_x
                 .saturating_add(layout.cursor_column)
                 .min(area.right().saturating_sub(1));
@@ -2544,6 +2570,52 @@ mod tests {
         assert!(!rendered.contains("Commands"), "{rendered}");
         assert!(!rendered.contains('┌'), "{rendered}");
         assert!(!rendered.contains("gpt-5.6-sol"), "{rendered}");
+    }
+
+    #[test]
+    fn tools_command_opens_and_closes_the_rendered_catalogue() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        for character in "/tools".chars() {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Tools(_))));
+        assert_eq!(view.desired_height(88, 30), TOOL_CATALOGUE_VIEWPORT_HEIGHT);
+
+        let backend = TestBackend::new(88, TOOL_CATALOGUE_VIEWPORT_HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("Request tools"), "{rendered}");
+        assert!(rendered.contains("Inside exec"), "{rendered}");
+        assert!(rendered.contains("apply_patch"), "{rendered}");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "┌");
+        assert!(!rendered.contains("available"), "{rendered}");
+        assert!(!rendered.contains("Code Mode"), "{rendered}");
+        assert!(!rendered.contains("function"), "{rendered}");
+        assert!(!rendered.contains(MODEL), "{rendered}");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert!(view.overlay.is_none());
+        assert_eq!(view.desired_height(88, 30), 6);
     }
 
     #[test]
