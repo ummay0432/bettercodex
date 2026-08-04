@@ -51,6 +51,6 @@ Name the actual sources and required action; do not hide them behind abstraction
 
 ## Source repositories
 
-- bettercodex: https://github.com/ummay0432/pi-custom
+- bettercodex: https://github.com/ummay0432/bettercodex
 - Pi: https://github.com/earendil-works/pi
 - Codex CLI: https://github.com/openai/codex
