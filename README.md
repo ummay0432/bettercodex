@@ -60,7 +60,9 @@ composer. The core shortcuts are:
 - `Shift+Enter` or `Ctrl+J` inserts a newline.
 - `Esc` interrupts an active turn; `Ctrl+C` exits.
 - `Up` and `Down` move through older and newer prompt history.
-- `Option+Left` and `Option+Right` jump by word on macOS (`Alt` elsewhere).
+- `Option+Left` and `Option+Right` jump by word, and `Option+Backspace`
+  deletes the previous word on macOS (`Alt` elsewhere). `Ctrl+W` also deletes
+  the previous word.
 - The mouse wheel and the terminal's normal scrollback controls browse the
   finalized transcript.
 - `?` on an empty composer opens the shortcut reference.

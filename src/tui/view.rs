@@ -666,6 +666,10 @@ impl View {
             KeyCode::Char('u') if control => self.editor.kill_to_line_start(),
             KeyCode::Char('k') if control => self.editor.kill_to_line_end(),
             KeyCode::Char('w') if control => self.editor.delete_previous_word(),
+            // Terminals whose Backspace byte is Ctrl+H encode Option+Backspace as Esc, Ctrl+H.
+            KeyCode::Char('h') if control && alt && !shift => {
+                self.editor.delete_previous_word();
+            }
             KeyCode::Char('l') if control => {}
             KeyCode::Char('b') if alt && !control => self.editor.move_word_left(),
             KeyCode::Char('f') if alt && !control => self.editor.move_word_right(),
@@ -673,6 +677,7 @@ impl View {
                 let mut bytes = [0; 4];
                 self.editor.insert(character.encode_utf8(&mut bytes));
             }
+            KeyCode::Backspace if alt && !control => self.editor.delete_previous_word(),
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete(),
             KeyCode::Left if control || alt => self.editor.move_word_left(),
@@ -753,7 +758,7 @@ impl View {
             "/context" => Action::ShowContext,
             "/help" => {
                 self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · Up/Down history · Option+Left/Right jump by word · @ files · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
+                    "Enter submit/steer · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
                         .to_string(),
                 ));
                 Action::None
@@ -1155,7 +1160,7 @@ impl View {
             shortcut_line("@", "find and insert a file path"),
             shortcut_line("Esc", "interrupt active turn"),
             shortcut_line("Up / Down", "restore prompt history"),
-            shortcut_line("Ctrl+W", "delete previous word"),
+            shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
             shortcut_line("Ctrl+C", "exit"),
             Line::from(""),
             Line::from("Press any key to close").dim(),
@@ -3242,6 +3247,35 @@ mod tests {
         view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
         assert_eq!(view.editor.cursor(), 10);
         assert_eq!(view.editor.text(), "alpha.beta gamma");
+    }
+
+    #[test]
+    fn option_backspace_deletes_the_previous_word_for_terminal_encodings_and_repeats() {
+        let events = [
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+            KeyEvent::new_with_kind(KeyCode::Backspace, KeyModifiers::ALT, KeyEventKind::Repeat),
+            KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        ];
+
+        for event in events {
+            let mut view = View::new(Path::new("/tmp/bettercodex"));
+            view.editor.set_text("hello world");
+
+            assert_eq!(view.handle_terminal_event(Event::Key(event)), Action::None);
+            assert_eq!(view.editor.text(), "hello ");
+            assert_eq!(view.editor.cursor(), "hello ".len());
+        }
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("hello world");
+        view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(view.editor.text(), "hello worl");
     }
 
     #[test]
