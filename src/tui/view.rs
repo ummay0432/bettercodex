@@ -76,7 +76,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "inspect the active tool catalogue",
     },
     SlashCommand {
-        name: "exit",
+        name: "quit",
         description: "leave BetterCodex",
     },
 ];
@@ -742,7 +742,7 @@ impl View {
         let prompt = self.editor.take();
         self.editor.remember(&prompt);
         match prompt.trim() {
-            "/exit" | "/quit" => Action::Quit,
+            "/q" | "/quit" | "/exit" => Action::Quit,
             "/clear" if self.busy => {
                 self.entries.push(TranscriptEntry::Notice(
                     "Interrupt the active turn before starting a fresh session".to_string(),
@@ -3054,10 +3054,10 @@ mod tests {
     }
 
     #[test]
-    fn slash_commands_render_below_the_composer_like_codex() {
+    fn quit_completion_renders_and_q_dispatches_it() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        for character in "/ex".chars() {
+        for character in "/q".chars() {
             assert_eq!(
                 view.handle_terminal_event(Event::Key(KeyEvent::new(
                     KeyCode::Char(character),
@@ -3076,10 +3076,10 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let rendered = render_buffer(buffer);
         let rows = rendered.lines().collect::<Vec<_>>();
-        let composer_y = rows.iter().position(|row| row.contains("/ex")).unwrap();
+        let composer_y = rows.iter().position(|row| row.contains("/q")).unwrap();
         let command_y = rows
             .iter()
-            .position(|row| row.contains("/exit  leave BetterCodex"))
+            .position(|row| row.contains("/quit  leave BetterCodex"))
             .unwrap();
         assert!(command_y > composer_y, "{rendered}");
         assert_eq!(buffer[(2, composer_y as u16)].symbol(), "/");
@@ -3093,6 +3093,34 @@ mod tests {
         assert!(!rendered.contains("Commands"), "{rendered}");
         assert!(!rendered.contains('┌'), "{rendered}");
         assert!(!rendered.contains("gpt-5.6-sol"), "{rendered}");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Quit
+        );
+        assert!(view.editor.is_empty());
+    }
+
+    #[test]
+    fn q_remains_a_quit_alias_after_completion_is_dismissed() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/q");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Quit
+        );
     }
 
     #[test]
