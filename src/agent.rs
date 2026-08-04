@@ -1,6 +1,7 @@
 use crate::api::ApiClient;
 use crate::api::ApiError;
 use crate::api::ModelResponse;
+use crate::api::retry_delay;
 use crate::auth::Auth;
 use crate::compaction::CompactionPhase;
 use crate::compaction::InitialContextInjection;
@@ -22,7 +23,6 @@ use std::collections::VecDeque;
 use std::future::pending;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
@@ -388,7 +388,11 @@ impl Agent {
                         return Err(error.into());
                     }
                     retries += 1;
-                    let delay = sleep(error.retry_after().unwrap_or_else(|| retry_delay(retries)));
+                    let delay = sleep(
+                        error
+                            .retry_after()
+                            .unwrap_or_else(|| retry_delay(retries.saturating_sub(1))),
+                    );
                     tokio::pin!(delay);
                     loop {
                         tokio::select! {
@@ -454,9 +458,11 @@ impl Agent {
             _ = cancellation.cancelled() => return Ok(false),
             compacted = self.api.compact(self.conversation.items(), phase) => compacted?,
         };
-        let _compaction_usage = compacted.usage;
-        self.conversation
-            .replace_compacted(compacted.items, initial_context_injection)?;
+        self.conversation.replace_compacted(
+            compacted.items,
+            initial_context_injection,
+            compacted.usage,
+        )?;
         self.emit_context(events);
         emit(events, AgentEvent::CompactionCompleted);
         Ok(true)
@@ -549,10 +555,6 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
         return Err(anyhow!("{} is not a directory", path.display()));
     }
     Ok(path)
-}
-
-fn retry_delay(retry: usize) -> Duration {
-    Duration::from_secs(1_u64 << retry.saturating_sub(1).min(4))
 }
 
 fn emit(events: &Option<UnboundedSender<AgentEvent>>, event: AgentEvent) {

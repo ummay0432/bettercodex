@@ -5,6 +5,9 @@ mod executor;
 mod image_preparation;
 mod patch;
 
+const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
+    code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
+
 pub(crate) use catalogue::CatalogueRoute;
 pub(crate) use catalogue::CatalogueTool;
 pub(crate) use exec_runtime::ToolRuntime;
@@ -20,6 +23,8 @@ use anyhow::Result;
 use anyhow::anyhow;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_utils_image::data_url_from_bytes;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::formatted_truncate_text;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
@@ -125,6 +130,10 @@ pub(crate) struct ToolResult {
 
 impl ToolResult {
     pub(crate) fn text(text: String) -> Self {
+        let text = formatted_truncate_text(
+            &text,
+            TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
+        );
         Self {
             body: Value::String(text.clone()),
             preview: text,

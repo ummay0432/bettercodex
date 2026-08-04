@@ -70,6 +70,14 @@ fn custom_outputs_preserve_structured_content_items() {
     );
 }
 
+#[test]
+fn direct_tool_errors_are_bounded_before_history_insertion() {
+    let result = ToolResult::text("x".repeat(50_000));
+
+    assert!(result.preview.starts_with("Warning: truncated output"));
+    assert!(result.preview.len() < 50_000);
+}
+
 #[tokio::test]
 async fn web_search_runs_through_exec_and_posts_the_codex_alpha_contract() {
     let (base_url, requests, server) = spawn_search_server();

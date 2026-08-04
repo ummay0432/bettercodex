@@ -1,4 +1,5 @@
 use crate::context::estimated_tokens;
+use crate::context::is_contextual_user_message;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
@@ -11,7 +12,6 @@ const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 const MAX_RETAINED_AGENT_MESSAGE_TOKENS: u64 = 10_000;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
-const REPOSITORY_ONBOARDING_PREFIX: &str = "# Repository onboarding from AGENTS.md for ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactionPhase {
@@ -140,10 +140,6 @@ fn should_keep_compacted_history_item(item: &Value) -> bool {
     }
 }
 
-fn is_contextual_user_message(item: &Value) -> bool {
-    message_text(item).is_some_and(|text| text.starts_with(REPOSITORY_ONBOARDING_PREFIX))
-}
-
 fn is_agent_completion(item: &Value) -> bool {
     item.pointer("/content/0/text")
         .and_then(Value::as_str)
@@ -215,13 +211,6 @@ fn truncate_message_text(mut item: Value, max_tokens: usize) -> Option<Value> {
     }
     *content = retained;
     Some(item)
-}
-
-fn message_text(item: &Value) -> Option<&str> {
-    item.get("content")
-        .and_then(Value::as_array)?
-        .iter()
-        .find_map(content_text)
 }
 
 fn content_text(item: &Value) -> Option<&str> {

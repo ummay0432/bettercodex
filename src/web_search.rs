@@ -24,6 +24,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
+use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::truncate_text;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
@@ -43,7 +44,7 @@ pub(crate) const TOOL_NAME: &str = "run";
 pub(crate) const DESCRIPTION: &str = include_str!("tools/web_run_description.md");
 
 const ASSISTANT_CONTEXT_TOKEN_LIMIT: usize = 1_000;
-const MAX_OUTPUT_TOKENS: u64 = 10_000;
+const MAX_OUTPUT_TOKENS: usize = 10_000;
 const SEARCH_PATH: &str = "alpha/search";
 const REQUEST_MAX_RETRIES: u64 = 4;
 const REQUEST_RETRY_DELAY: Duration = Duration::from_millis(200);
@@ -313,7 +314,7 @@ impl WebSearchClient {
                 "allowed_callers": ["direct"],
                 "external_web_access": true,
             })),
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            max_output_tokens: Some(u64::try_from(MAX_OUTPUT_TOKENS).unwrap_or(u64::MAX)),
         };
         let body = serde_json::to_value(request)
             .context("failed to encode standalone web search request")?;
@@ -337,8 +338,12 @@ impl WebSearchClient {
         .map_err(|error| anyhow!("standalone web search request failed: {error}"))?;
         let response: SearchResponse = serde_json::from_slice(&response.body)
             .context("failed to decode standalone web search response")?;
-        Ok(Value::String(response.output))
+        Ok(Value::String(bounded_search_output(&response.output)))
     }
+}
+
+fn bounded_search_output(output: &str) -> String {
+    formatted_truncate_text(output, TruncationPolicy::Tokens(MAX_OUTPUT_TOKENS))
 }
 
 impl ToolTurnContext {
@@ -553,11 +558,7 @@ fn is_operator_message(content: &[ContentItem]) -> bool {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let text = text.trim_start();
-    !text.starts_with("# Repository onboarding from AGENTS.md for ")
-        && !text.starts_with("<environment_context>")
-        && !text.starts_with("<turn_aborted>")
-        && !text.starts_with("<response_interrupted>")
+    !crate::context::is_contextual_user_text(&text)
 }
 
 fn retain_recent_user_turns(items: &mut Vec<ResponseItem>, user_message_count: usize) {

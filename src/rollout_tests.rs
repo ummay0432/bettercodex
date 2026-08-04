@@ -12,6 +12,24 @@ fn temporary_directory(name: &str) -> PathBuf {
 }
 
 #[test]
+fn legacy_history_replacements_default_missing_response_usage() {
+    let record: RolloutRecord = serde_json::from_value(json!({
+        "type": "history_replace",
+        "reason": "compaction",
+        "items": [],
+    }))
+    .unwrap();
+
+    assert!(matches!(
+        record,
+        RolloutRecord::HistoryReplace {
+            response_usage: None,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn rollout_replays_replacements_usage_and_turn_state() {
     let root = temporary_directory("rollout-replay");
     let cwd = root.join("repo");

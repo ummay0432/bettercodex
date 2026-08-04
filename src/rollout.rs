@@ -105,6 +105,8 @@ enum RolloutRecord {
     HistoryReplace {
         reason: HistoryReplacement,
         items: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_usage: Option<TokenUsage>,
     },
     Usage {
         usage: TokenUsage,
@@ -127,6 +129,7 @@ pub(crate) enum HistoryReplacement {
     Initial,
     Compaction,
     Normalization,
+    ContextRefresh,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -213,6 +216,19 @@ impl Rollout {
         self.write_record(&RolloutRecord::HistoryReplace {
             reason,
             items: items.to_vec(),
+            response_usage: None,
+        })
+    }
+
+    pub(crate) fn replace_compacted_history(
+        &mut self,
+        items: &[Value],
+        response_usage: Option<&TokenUsage>,
+    ) -> Result<()> {
+        self.write_record(&RolloutRecord::HistoryReplace {
+            reason: HistoryReplacement::Compaction,
+            items: items.to_vec(),
+            response_usage: response_usage.cloned(),
         })
     }
 
@@ -316,14 +332,23 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 }
             }
             RolloutRecord::HistoryAppend { items } => history.extend(items),
-            RolloutRecord::HistoryReplace { reason, items } => {
+            RolloutRecord::HistoryReplace {
+                reason,
+                items,
+                response_usage: _,
+            } => {
                 if reason == HistoryReplacement::Compaction {
                     compaction_count = compaction_count.saturating_add(1);
                 }
                 history = items;
-                usage = None;
-                usage_history_estimate = None;
-                server_reasoning_included = false;
+                if !matches!(
+                    reason,
+                    HistoryReplacement::Normalization | HistoryReplacement::ContextRefresh
+                ) {
+                    usage = None;
+                    usage_history_estimate = None;
+                    server_reasoning_included = false;
+                }
             }
             RolloutRecord::Usage {
                 usage: new_usage,

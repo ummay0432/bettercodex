@@ -895,9 +895,9 @@ fn truncate_output(
     original_token_count: usize,
     omitted_bytes: usize,
 ) -> String {
-    let Some(max_tokens) = max_tokens else {
-        return output.to_string();
-    };
+    let max_tokens = max_tokens
+        .unwrap_or(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS)
+        .min(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS);
     let policy = TruncationPolicy::Tokens(max_tokens);
     if omitted_bytes == 0 {
         return formatted_truncate_text(output, policy);
@@ -1121,9 +1121,16 @@ mod tests {
     }
 
     #[test]
-    fn explicit_output_budget_matches_codex_but_default_keeps_collected_output() {
-        let text = "x".repeat(80);
-        assert_eq!(truncate_output(&text, None, 20, 0), text);
+    fn default_and_explicit_output_budgets_use_stable_head_tail_truncation() {
+        let text = "x".repeat(50_000);
+        let default_truncated = truncate_output(&text, None, 12_500, 0);
+        assert!(default_truncated.starts_with("Warning: truncated output"));
+        assert!(default_truncated.len() < text.len());
+        assert_eq!(
+            truncate_output(&text, Some(50_000), 12_500, 0),
+            default_truncated,
+            "an explicit request cannot exceed the model-visible item ceiling"
+        );
         let truncated = truncate_output(&text, Some(5), 20, 0);
         assert!(truncated.starts_with("Warning: truncated output"));
     }

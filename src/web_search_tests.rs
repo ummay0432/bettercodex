@@ -136,3 +136,12 @@ fn display_actions_match_codex_web_search_activity() {
         }
     );
 }
+
+#[test]
+fn search_output_is_bounded_even_if_the_endpoint_exceeds_its_budget() {
+    let output = "x".repeat(50_000);
+    let bounded = bounded_search_output(&output);
+
+    assert!(bounded.starts_with("Warning: truncated output"));
+    assert!(bounded.len() < output.len());
+}

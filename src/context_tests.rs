@@ -29,11 +29,13 @@ fn normalization_inserts_stable_outputs_and_removes_orphans() {
             "output": "lost"
         }),
     ];
+    assert!(!history_is_normalized(&history));
     normalize_history(&mut history);
     assert_eq!(history.len(), 2);
     assert_eq!(history[1]["call_id"], "call_one");
     assert_eq!(history[1]["output"], "aborted");
     let first_id = history[1]["id"].clone();
+    assert!(history_is_normalized(&history));
     normalize_history(&mut history);
     assert_eq!(history[1]["id"], first_id);
 }
@@ -74,12 +76,119 @@ fn normalization_preserves_exec_notifications_and_final_output() {
         }),
     ];
     let expected = history.clone();
+    assert!(history_is_normalized(&history));
     normalize_history(&mut history);
     assert_eq!(history, expected);
 }
 
 #[test]
-fn original_image_estimate_uses_patch_dimensions_not_base64_size() {
+fn normalization_removes_function_outputs_mismatched_with_custom_exec() {
+    let mut history = vec![
+        json!({
+            "type": "custom_tool_call",
+            "name": "exec",
+            "call_id": "call_exec",
+            "input": "text('done')",
+        }),
+        json!({
+            "type": "function_call_output",
+            "call_id": "call_exec",
+            "output": "first",
+        }),
+        json!({
+            "type": "function_call_output",
+            "call_id": "call_exec",
+            "output": "duplicate",
+        }),
+    ];
+
+    assert!(!history_is_normalized(&history));
+    normalize_history(&mut history);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1]["type"], "custom_tool_call_output");
+    assert_eq!(history[1]["output"], "aborted");
+    assert!(history_is_normalized(&history));
+}
+
+#[test]
+fn normalization_removes_custom_outputs_mismatched_with_function_calls() {
+    let mut history = vec![
+        json!({
+            "type": "function_call",
+            "name": "shell_command",
+            "call_id": "call_function",
+            "arguments": "{}",
+        }),
+        json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call_function",
+            "output": "wrong kind",
+        }),
+    ];
+
+    assert!(!history_is_normalized(&history));
+    normalize_history(&mut history);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1]["type"], "function_call_output");
+    assert_eq!(history[1]["output"], "aborted");
+    assert!(history_is_normalized(&history));
+}
+
+#[test]
+fn normalization_preserves_the_backend_usage_baseline_for_local_repairs() {
+    let (root, cwd) = temporary_repository("normalization-usage");
+    let rollout_root = root.join("state");
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    conversation
+        .extend([
+            UserInput::text("run the tool").into_message(),
+            json!({
+                "id": "fc_missing_output",
+                "type": "function_call",
+                "call_id": "call_missing_output",
+                "name": "example",
+                "arguments": "{}",
+            }),
+        ])
+        .unwrap();
+    let usage = TokenUsage {
+        input_tokens: 900,
+        output_tokens: 100,
+        total_tokens: 1_000,
+        ..TokenUsage::default()
+    };
+    conversation
+        .record_usage(Some(usage.clone()), true)
+        .unwrap();
+
+    assert!(conversation.normalize().unwrap());
+    let repaired_output = conversation
+        .items()
+        .iter()
+        .find(|item| {
+            item["call_id"] == "call_missing_output"
+                && item["type"]
+                    .as_str()
+                    .is_some_and(|item_type| item_type.ends_with("_output"))
+        })
+        .unwrap();
+    assert_eq!(
+        conversation.context_tokens(),
+        Some(1_000 + estimate_value_tokens(repaired_output))
+    );
+    drop(conversation);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.usage, Some(usage));
+    assert!(loaded.server_reasoning_included);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn original_and_auto_image_estimates_use_patch_dimensions_not_base64_size() {
     let mut png = vec![0_u8; 24];
     png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
     png[16..20].copy_from_slice(&1024_u32.to_be_bytes());
@@ -90,6 +199,24 @@ fn original_image_estimate_uses_patch_dimensions_not_base64_size() {
         base64::engine::general_purpose::STANDARD.encode(png)
     );
     assert_eq!(estimate_image_tokens(&url), 32 * 24);
+    for detail in ["original", "auto"] {
+        let item = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": url,
+                "detail": detail,
+            }],
+        });
+        let serialized_tokens = serde_json::to_vec(&item).unwrap().len().div_ceil(4) as u64;
+        let payload_tokens = url.split_once(',').unwrap().1.len().div_ceil(4) as u64;
+        assert_eq!(
+            estimate_value_tokens(&item),
+            serialized_tokens - payload_tokens + 32 * 24,
+            "{detail} must retain the source patch dimensions"
+        );
+    }
 }
 
 #[test]
@@ -137,11 +264,90 @@ fn backend_usage_adds_past_reasoning_only_when_the_server_omits_it() {
         .record_usage(Some(usage.clone()), true)
         .unwrap();
     assert_eq!(conversation.context_tokens(), Some(1_000));
+    conversation
+        .start_turn("turn-after-included-usage")
+        .unwrap();
+    assert_eq!(
+        conversation.context_tokens(),
+        Some(1_000),
+        "the reasoning-included flag qualifies the retained usage baseline across turns"
+    );
     conversation.record_usage(Some(usage), false).unwrap();
     assert_eq!(
         conversation.context_tokens(),
         Some(1_000 + estimate_value_tokens(&reasoning))
     );
+    conversation
+        .finish_turn("turn-after-included-usage", TurnOutcome::Completed)
+        .unwrap();
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn contextual_user_messages_do_not_turn_current_reasoning_into_past_reasoning() {
+    let (root, cwd) = temporary_repository("contextual-reasoning-boundary");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    conversation
+        .extend([
+            UserInput::text("real user turn").into_message(),
+            json!({
+                "type": "reasoning",
+                "id": "rs_current",
+                "encrypted_content": "x".repeat(4_650),
+            }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "current response"}],
+            }),
+        ])
+        .unwrap();
+    conversation
+        .record_usage(
+            Some(TokenUsage {
+                input_tokens: 990,
+                output_tokens: 10,
+                total_tokens: 1_000,
+                ..TokenUsage::default()
+            }),
+            false,
+        )
+        .unwrap();
+
+    let contextual = message(
+        "user",
+        "# Repository onboarding from AGENTS.md for /repo\n\nupdated instructions".to_string(),
+    );
+    let contextual_tokens = estimate_value_tokens(&contextual);
+    conversation.extend([contextual]).unwrap();
+
+    assert_eq!(
+        conversation.context_tokens(),
+        Some(1_000 + contextual_tokens)
+    );
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stream_interruption_notices_are_bounded_before_history_insertion() {
+    let (root, cwd) = temporary_repository("bounded-stream-notice");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+
+    conversation
+        .mark_stream_interrupted(&"x".repeat(50_000))
+        .unwrap();
+
+    let notice = conversation.items().last().unwrap();
+    let text = message_text(notice).unwrap();
+    assert!(text.starts_with("<response_interrupted>\nWarning: truncated output"));
+    assert!(text.ends_with("\n</response_interrupted>"));
+    assert!(estimate_value_tokens(notice) <= 10_000);
 
     drop(conversation);
     std::fs::remove_dir_all(root).unwrap();
@@ -374,6 +580,7 @@ fn cached_context_metrics_follow_every_history_mutation() {
                 "encrypted_content": "opaque metrics",
             })],
             InitialContextInjection::AfterCompaction,
+            None,
         )
         .unwrap();
     assert_current(&conversation);
@@ -484,9 +691,21 @@ fn compaction_replaces_history_canonically_then_reinjects_world_state() {
         "id": "cmp_1",
         "encrypted_content": "opaque",
     })];
+    let compaction_usage = TokenUsage {
+        input_tokens: 320_000,
+        cached_input_tokens: 20_000,
+        cache_write_input_tokens: 1_000,
+        output_tokens: 2_000,
+        reasoning_output_tokens: 1_500,
+        total_tokens: 322_000,
+    };
 
     conversation
-        .replace_compacted(canonical.clone(), InitialContextInjection::AfterCompaction)
+        .replace_compacted(
+            canonical.clone(),
+            InitialContextInjection::AfterCompaction,
+            Some(compaction_usage.clone()),
+        )
         .unwrap();
     assert_eq!(&conversation.items()[..canonical.len()], canonical);
     assert!(conversation.items().len() > canonical.len());
@@ -499,6 +718,22 @@ fn compaction_replaces_history_canonically_then_reinjects_world_state() {
         1
     );
     drop(conversation);
+
+    let journal = std::fs::read_to_string(
+        rollout_root
+            .join("sessions")
+            .join(format!("{session_id}.jsonl")),
+    )
+    .unwrap();
+    let replacement = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|record| record["type"] == "history_replace" && record["reason"] == "compaction")
+        .unwrap();
+    assert_eq!(
+        replacement["response_usage"],
+        serde_json::to_value(compaction_usage).unwrap()
+    );
 
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert_eq!(loaded.compaction_count, 1);
@@ -524,6 +759,7 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
         .replace_compacted(
             vec![current_user.clone(), summary.clone()],
             InitialContextInjection::BeforeLastUserMessage,
+            None,
         )
         .unwrap();
     assert_eq!(conversation.items().last(), Some(&summary));
@@ -568,6 +804,7 @@ fn mid_turn_context_is_inserted_before_the_last_retained_agent_message() {
         .replace_compacted(
             vec![current_user, agent_message.clone(), summary.clone()],
             InitialContextInjection::BeforeLastUserMessage,
+            None,
         )
         .unwrap();
 
@@ -612,6 +849,7 @@ fn retained_world_state_keeps_remote_v2_history_order_unchanged() {
         .replace_compacted(
             canonical.clone(),
             InitialContextInjection::BeforeLastUserMessage,
+            None,
         )
         .unwrap();
     assert_eq!(conversation.items(), canonical);
@@ -693,6 +931,59 @@ fn resume_recovers_an_unfinished_turn_and_closes_its_journal_state() {
 
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert!(loaded.unfinished_turn.is_none());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resume_replaces_stale_world_state_without_losing_the_usage_baseline() {
+    let (root, cwd) = temporary_repository("refresh-world-state");
+    let rollout_root = root.join("state");
+    std::fs::write(
+        cwd.join("AGENTS.md"),
+        "old saved instruction ".repeat(1_000),
+    )
+    .unwrap();
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    conversation
+        .extend([UserInput::text("saved user turn").into_message()])
+        .unwrap();
+    let usage = TokenUsage {
+        input_tokens: 19_000,
+        output_tokens: 1_000,
+        total_tokens: 20_000,
+        ..TokenUsage::default()
+    };
+    conversation
+        .record_usage(Some(usage.clone()), true)
+        .unwrap();
+    let context_before_refresh = conversation.context_tokens().unwrap();
+    drop(conversation);
+
+    std::fs::write(cwd.join("AGENTS.md"), "current instruction").unwrap();
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    let resumed = Conversation::resume(&cwd, loaded).unwrap();
+    let repository_context = resumed
+        .items()
+        .iter()
+        .filter(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && message_text(item)
+                    .is_some_and(|text| text.trim_start().starts_with(REPOSITORY_ONBOARDING_PREFIX))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(repository_context.len(), 1);
+    let current_context = message_text(repository_context[0]).unwrap();
+    assert!(current_context.contains("current instruction"));
+    assert!(!current_context.contains("old saved instruction"));
+    assert!(resumed.context_tokens().unwrap() < context_before_refresh);
+    drop(resumed);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.usage, Some(usage));
+    assert!(loaded.server_reasoning_included);
 
     std::fs::remove_dir_all(root).unwrap();
 }

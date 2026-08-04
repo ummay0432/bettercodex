@@ -14,7 +14,11 @@ use crate::usage::TokenUsage;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Context;
+use bytes::Bytes;
+use codex_client::backoff;
 use reqwest::StatusCode;
+use reqwest::header::CONTENT_ENCODING;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use serde_json::Map;
@@ -37,12 +41,17 @@ use websocket::WebSocketConnection;
 
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
-const MAX_HTTP_ATTEMPTS: usize = 3;
+const MAX_HTTP_RETRIES: usize = 4;
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: usize = 2;
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_STREAM_EVENT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 16_000;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
+const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
+const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
+    "ws_request_header_x_openai_internal_codex_responses_lite";
 static CONTEXT_PREFIX_ITEMS: LazyLock<[Value; 2]> = LazyLock::new(|| {
     [
         json!({
@@ -140,10 +149,12 @@ pub(crate) struct ApiClient {
     session_id: String,
     thread_id: String,
     turn_id: String,
+    turn_started_at_unix_ms: u64,
     turn_state: Option<String>,
     window: u64,
     explicit_cache: bool,
     prefer_websocket: bool,
+    websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
     websocket_reasoning_included: bool,
     websocket_baseline: Option<WebSocketBaseline>,
@@ -156,9 +167,11 @@ struct WebSocketBaseline {
     output: Vec<Value>,
 }
 
-enum WebSocketRequestRestoration {
-    Full,
-    Delta { input_prefix: Vec<Value> },
+struct WebSocketRequestRestoration {
+    input_prefix: Option<Vec<Value>>,
+    stream: Option<Value>,
+    client_turn_state: Option<Value>,
+    client_responses_lite: Option<Value>,
 }
 
 impl WebSocketRequestRestoration {
@@ -167,24 +180,46 @@ impl WebSocketRequestRestoration {
             .as_object_mut()
             .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
         object.remove("type");
-        match self {
-            Self::Full => {}
-            Self::Delta { mut input_prefix } => {
-                object.remove("previous_response_id");
-                let incremental_input = object
-                    .remove("input")
-                    .ok_or_else(|| ApiError::fatal("WebSocket delta request omitted input"))?;
-                let Value::Array(incremental_input) = incremental_input else {
-                    return Err(ApiError::fatal(
-                        "WebSocket delta request input was not an array",
-                    ));
-                };
-                input_prefix.extend(incremental_input);
-                object.insert("input".to_string(), Value::Array(input_prefix));
-            }
+        object.remove("generate");
+        object.remove("previous_response_id");
+        if let Some(stream) = self.stream {
+            object.insert("stream".to_string(), stream);
+        }
+        let client_metadata = object
+            .get_mut("client_metadata")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| ApiError::fatal("Responses request omitted client metadata"))?;
+        client_metadata.remove(X_CODEX_TURN_STATE);
+        if let Some(turn_state) = self.client_turn_state {
+            client_metadata.insert(X_CODEX_TURN_STATE.to_string(), turn_state);
+        }
+        client_metadata.remove(WS_RESPONSES_LITE_CLIENT_METADATA);
+        if let Some(responses_lite) = self.client_responses_lite {
+            client_metadata.insert(
+                WS_RESPONSES_LITE_CLIENT_METADATA.to_string(),
+                responses_lite,
+            );
+        }
+        if let Some(mut input_prefix) = self.input_prefix {
+            let incremental_input = object
+                .remove("input")
+                .ok_or_else(|| ApiError::fatal("WebSocket delta request omitted input"))?;
+            let Value::Array(incremental_input) = incremental_input else {
+                return Err(ApiError::fatal(
+                    "WebSocket delta request input was not an array",
+                ));
+            };
+            input_prefix.extend(incremental_input);
+            object.insert("input".to_string(), Value::Array(input_prefix));
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum WebSocketRequestMode {
+    Inference,
+    Warmup,
 }
 
 pub(crate) struct ModelResponse {
@@ -234,10 +269,12 @@ impl ApiClient {
             session_id: identity.session_id.clone(),
             thread_id: identity.thread_id.clone(),
             turn_id: Uuid::new_v4().to_string(),
+            turn_started_at_unix_ms: unix_timestamp_millis(),
             turn_state: None,
             window: compaction_count,
             explicit_cache: true,
             prefer_websocket: true,
+            websocket_prewarm_attempted: false,
             websocket: None,
             websocket_reasoning_included: false,
             websocket_baseline: None,
@@ -246,6 +283,7 @@ impl ApiClient {
 
     pub(crate) fn begin_turn(&mut self) -> &str {
         self.turn_id = Uuid::new_v4().to_string();
+        self.turn_started_at_unix_ms = unix_timestamp_millis();
         self.turn_state = None;
         &self.turn_id
     }
@@ -309,10 +347,44 @@ impl ApiClient {
         // Build once from the owned sampling snapshot. Retries mutate only transport fields, and
         // a successful WebSocket response moves this request into the next delta baseline.
         let mut request = self.build_request(history, request_kind);
+        if self.prefer_websocket && !self.websocket_prewarm_attempted {
+            self.websocket_prewarm_attempted = true;
+            match self.prewarm_websocket().await {
+                Ok(()) => {}
+                Err(error) if error.kind == ApiErrorKind::Unauthorized => {
+                    self.auth
+                        .force_refresh(&self.client)
+                        .await
+                        .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
+                    refreshed_websocket_auth = true;
+                    self.abandon_response();
+                }
+                Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
+                    if self.explicit_cache {
+                        self.disable_explicit_cache();
+                        disable_explicit_cache_for_request(&mut request)?;
+                    }
+                }
+                Err(error) if error.kind == ApiErrorKind::WebSocketUnavailable => {
+                    self.fall_back_to_http();
+                }
+                Err(_) => {
+                    // Warmup is an optimization. A normal full request remains the
+                    // authoritative path when the connection or warmup response fails.
+                    self.abandon_response();
+                }
+            }
+        }
         loop {
             if self.prefer_websocket {
                 match self
-                    .respond_websocket(&mut request, completed_items, events, request_kind)
+                    .respond_websocket(
+                        &mut request,
+                        completed_items,
+                        events,
+                        request_kind,
+                        WebSocketRequestMode::Inference,
+                    )
                     .await
                 {
                     Ok(response) => {
@@ -388,11 +460,32 @@ impl ApiClient {
         let response = self
             .post("responses", request, "text/event-stream", request_kind)
             .await?;
+        validate_server_model_header(response.headers())?;
         let server_reasoning_included = response.headers().contains_key("x-reasoning-included");
         self.capture_turn_state(response.headers());
         let mut response = collect_http_stream(response, completed_items, events).await?;
         response.server_reasoning_included = server_reasoning_included;
         Ok(response)
+    }
+
+    async fn prewarm_websocket(&mut self) -> ApiResult<()> {
+        let mut request = self.build_request(Vec::new(), RequestKind::Prewarm);
+        let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
+        let response = self
+            .respond_websocket(
+                &mut request,
+                &completed_items,
+                None,
+                RequestKind::Prewarm,
+                WebSocketRequestMode::Warmup,
+            )
+            .await?;
+        self.websocket_baseline = Some(WebSocketBaseline {
+            request,
+            response_id: response.response_id,
+            output: response.items,
+        });
+        Ok(())
     }
 
     async fn respond_websocket(
@@ -401,11 +494,12 @@ impl ApiClient {
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
         request_kind: RequestKind,
+        mode: WebSocketRequestMode,
     ) -> ApiResult<ModelResponse> {
         self.ensure_websocket(request_kind).await?;
         // Serialize a delta in place, then restore the logical request for retries and baseline
         // retention. Input values move between vectors instead of being deep-cloned.
-        let restoration = self.prepare_websocket_request(logical_request)?;
+        let restoration = self.prepare_websocket_request(logical_request, mode)?;
         let send_result = self
             .websocket
             .as_mut()
@@ -457,6 +551,7 @@ impl ApiClient {
         insert_header(&mut headers, "openai-beta", RESPONSES_WEBSOCKET_BETA)?;
         let url = websocket_url(&self.base_url, "responses")?;
         let (websocket, response_headers) = WebSocketConnection::connect(&url, &headers).await?;
+        validate_server_model_header(&response_headers)?;
         self.websocket_reasoning_included = response_headers.contains_key("x-reasoning-included");
         self.capture_turn_state(&response_headers);
         self.websocket = Some(websocket);
@@ -466,44 +561,77 @@ impl ApiClient {
     fn prepare_websocket_request(
         &self,
         request: &mut Value,
+        mode: WebSocketRequestMode,
     ) -> ApiResult<WebSocketRequestRestoration> {
-        let incremental = if let Some(baseline) = &self.websocket_baseline {
-            if !request_properties_match(&baseline.request, request) {
-                None
-            } else {
-                let previous_input = baseline
-                    .request
-                    .get("input")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| ApiError::fatal("previous Responses request omitted input"))?;
-                let current_input = request
-                    .get("input")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
-                let baseline_length = previous_input.len().saturating_add(baseline.output.len());
-                if current_input.len() <= baseline_length {
-                    None
+        let incremental = match mode {
+            WebSocketRequestMode::Warmup => None,
+            WebSocketRequestMode::Inference => {
+                if let Some(baseline) = &self.websocket_baseline {
+                    if !request_properties_match(&baseline.request, request) {
+                        None
+                    } else {
+                        let previous_input = baseline
+                            .request
+                            .get("input")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                ApiError::fatal("previous Responses request omitted input")
+                            })?;
+                        let current_input = request
+                            .get("input")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
+                        let baseline_length =
+                            previous_input.len().saturating_add(baseline.output.len());
+                        if current_input.len() < baseline_length {
+                            None
+                        } else {
+                            let expected = previous_input.iter().chain(&baseline.output);
+                            expected
+                                .zip(current_input.iter().take(baseline_length))
+                                .all(|(previous, current)| previous == current)
+                                .then(|| (baseline.response_id.clone(), baseline_length))
+                        }
+                    }
                 } else {
-                    let expected = previous_input.iter().chain(&baseline.output);
-                    expected
-                        .zip(current_input.iter().take(baseline_length))
-                        .all(|(previous, current)| previous == current)
-                        .then(|| (baseline.response_id.clone(), baseline_length))
+                    None
                 }
             }
-        } else {
-            None
         };
 
         let object = request
             .as_object_mut()
             .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
+        let stream = object.remove("stream");
+        let client_metadata = object
+            .get_mut("client_metadata")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| ApiError::fatal("Responses request omitted client metadata"))?;
+        let client_turn_state = client_metadata.remove(X_CODEX_TURN_STATE);
+        if let Some(turn_state) = &self.turn_state {
+            client_metadata.insert(
+                X_CODEX_TURN_STATE.to_string(),
+                Value::String(turn_state.clone()),
+            );
+        }
+        let client_responses_lite = client_metadata.insert(
+            WS_RESPONSES_LITE_CLIENT_METADATA.to_string(),
+            Value::String("true".to_string()),
+        );
         object.insert(
             "type".to_string(),
             Value::String("response.create".to_string()),
         );
+        if matches!(mode, WebSocketRequestMode::Warmup) {
+            object.insert("generate".to_string(), Value::Bool(false));
+        }
         let Some((previous_response_id, baseline_length)) = incremental else {
-            return Ok(WebSocketRequestRestoration::Full);
+            return Ok(WebSocketRequestRestoration {
+                input_prefix: None,
+                stream,
+                client_turn_state,
+                client_responses_lite,
+            });
         };
         let full_input = object
             .remove("input")
@@ -517,7 +645,12 @@ impl ApiClient {
             "previous_response_id".to_string(),
             Value::String(previous_response_id),
         );
-        Ok(WebSocketRequestRestoration::Delta { input_prefix })
+        Ok(WebSocketRequestRestoration {
+            input_prefix: Some(input_prefix),
+            stream,
+            client_turn_state,
+            client_responses_lite,
+        })
     }
 
     pub(crate) async fn compact(
@@ -650,7 +783,7 @@ impl ApiClient {
             // Responses Lite requires Codex's protocol key even though
             // BetterCodex has one fixed tool runtime and no mode selector.
             "code_mode_tool_names": tools::nested_tool_name_map(),
-            "turn_started_at_unix_ms": unix_timestamp_millis(),
+            "turn_started_at_unix_ms": self.turn_started_at_unix_ms,
         });
         if let RequestKind::Compaction(phase) = request_kind {
             metadata["compaction"] = json!({
@@ -660,6 +793,17 @@ impl ApiClient {
                 "phase": phase.as_str(),
                 "strategy": "memento",
             });
+        }
+        metadata
+    }
+
+    fn compatibility_turn_metadata(&self, request_kind: RequestKind) -> Value {
+        let mut metadata = self.turn_metadata(request_kind);
+        if let Some(metadata) = metadata.as_object_mut() {
+            // The complete mapping belongs in request client_metadata. Keeping it
+            // out of the compatibility header matches Codex and bounds headers
+            // independently of the nested catalogue.
+            metadata.remove("code_mode_tool_names");
         }
         metadata
     }
@@ -692,7 +836,7 @@ impl ApiClient {
         insert_header(
             &mut headers,
             "x-codex-turn-metadata",
-            &self.turn_metadata(request_kind).to_string(),
+            &self.compatibility_turn_metadata(request_kind).to_string(),
         )?;
         insert_header(
             &mut headers,
@@ -705,7 +849,7 @@ impl ApiClient {
             REMOTE_COMPACTION_V2_FEATURE,
         )?;
         if let Some(turn_state) = &self.turn_state {
-            insert_header(&mut headers, "x-codex-turn-state", turn_state)?;
+            insert_header(&mut headers, X_CODEX_TURN_STATE, turn_state)?;
         }
         Ok(headers)
     }
@@ -717,6 +861,14 @@ impl ApiClient {
         accept: &str,
         request_kind: RequestKind,
     ) -> ApiResult<reqwest::Response> {
+        let encoded_body = serde_json::to_vec(body).map_err(|error| {
+            ApiError::fatal(format!("failed to encode Responses request: {error}"))
+        })?;
+        let compressed_body = Bytes::from(
+            zstd::stream::encode_all(std::io::Cursor::new(encoded_body), 3).map_err(|error| {
+                ApiError::fatal(format!("failed to compress Responses request: {error}"))
+            })?,
+        );
         let mut auth = self
             .auth
             .refreshed_snapshot(&self.client)
@@ -728,20 +880,23 @@ impl ApiClient {
             path.trim_start_matches('/')
         );
         let mut refreshed_after_unauthorized = false;
-        let mut last_error = None;
-        for attempt in 0..MAX_HTTP_ATTEMPTS {
+        let mut attempt = 0_usize;
+        loop {
+            let mut headers = self.request_headers(accept, request_kind, &auth)?;
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
             let response = self
                 .client
                 .post(&url)
-                .headers(self.request_headers(accept, request_kind, &auth)?)
-                .json(body)
+                .headers(headers)
+                .body(compressed_body.clone())
                 .send()
                 .await;
             let response = match response {
                 Ok(response) => response,
-                Err(error) if attempt + 1 < MAX_HTTP_ATTEMPTS => {
-                    last_error = Some(error.to_string());
+                Err(_) if attempt < MAX_HTTP_RETRIES => {
                     sleep(retry_delay(attempt)).await;
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 Err(error) => {
@@ -765,17 +920,21 @@ impl ApiClient {
                     .await
                     .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
                 refreshed_after_unauthorized = true;
+                // Codex's unauthorized recovery wraps the transport retry loop,
+                // so a refreshed request receives a fresh transport budget.
+                attempt = 0;
                 continue;
             }
             let retry_after = parse_retry_after(response.headers());
-            let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-            if retryable && attempt + 1 < MAX_HTTP_ATTEMPTS {
+            let transport_retryable = status.is_server_error();
+            if transport_retryable && attempt < MAX_HTTP_RETRIES {
                 sleep(
                     retry_after
                         .unwrap_or_else(|| retry_delay(attempt))
                         .min(Duration::from_secs(30)),
                 )
                 .await;
+                attempt = attempt.saturating_add(1);
                 continue;
             }
             let body = bounded_error_body(response).await;
@@ -783,19 +942,19 @@ impl ApiClient {
             if explicit_cache_unsupported(&body) {
                 return Err(ApiError::new(ApiErrorKind::CacheUnsupported, message));
             }
-            if retryable {
+            if status == StatusCode::TOO_MANY_REQUESTS || transport_retryable {
                 return Err(ApiError::retryable_after(message, retry_after));
             }
             return Err(ApiError::fatal(message));
         }
-        Err(ApiError::retryable(last_error.unwrap_or_else(|| {
-            "Responses request exhausted its retries".to_string()
-        })))
     }
 
     fn capture_turn_state(&mut self, headers: &HeaderMap) {
+        if self.turn_state.is_some() {
+            return;
+        }
         if let Some(value) = headers
-            .get("x-codex-turn-state")
+            .get(X_CODEX_TURN_STATE)
             .and_then(|value| value.to_str().ok())
         {
             self.turn_state = Some(value.to_string());
@@ -803,11 +962,16 @@ impl ApiClient {
     }
 
     fn capture_event_turn_state(&mut self, event: &Value) {
-        let headers = event.get("headers").and_then(Value::as_object);
-        if let Some(value) = headers
-            .and_then(|headers| headers.get("x-codex-turn-state"))
-            .and_then(Value::as_str)
+        if self.turn_state.is_some()
+            || event.get("type").and_then(Value::as_str) != Some("response.metadata")
         {
+            return;
+        }
+        let value = event
+            .get("headers")
+            .and_then(Value::as_object)
+            .and_then(|headers| json_header_value(headers, &[X_CODEX_TURN_STATE]));
+        if let Some(value) = value {
             self.turn_state = Some(value.to_string());
         }
     }
@@ -816,6 +980,7 @@ impl ApiClient {
 #[derive(Clone, Copy)]
 enum RequestKind {
     Turn,
+    Prewarm,
     Compaction(CompactionPhase),
 }
 
@@ -823,6 +988,7 @@ impl RequestKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Turn => "turn",
+            Self::Prewarm => "prewarm",
             Self::Compaction(_) => "compaction",
         }
     }
@@ -1049,6 +1215,7 @@ fn process_event_value(
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
 ) -> ApiResult<()> {
+    validate_event_server_model(&event)?;
     match event.get("type").and_then(Value::as_str) {
         Some("response.output_text.delta") => {
             if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -1169,20 +1336,32 @@ fn error_event(event: &Value) -> ApiError {
 fn classify_stream_error(code: &str, message: &str) -> ApiError {
     if explicit_cache_unsupported(message) {
         ApiError::new(ApiErrorKind::CacheUnsupported, message)
-    } else if code.contains("rate_limit") || code.contains("server") || code.contains("overload") {
-        ApiError::retryable(message)
     } else {
-        ApiError::fatal(message)
+        match code {
+            "previous_response_not_found" => {
+                ApiError::new(ApiErrorKind::PreviousResponseNotFound, message)
+            }
+            "context_length_exceeded"
+            | "insufficient_quota"
+            | "usage_not_included"
+            | "cyber_policy"
+            | "invalid_prompt"
+            | "bio_policy" => ApiError::fatal(message),
+            // Codex treats other response.failed errors as retryable, including
+            // server_is_overloaded, slow_down, and future transient codes.
+            _ => ApiError::retryable_after(
+                message,
+                (code == "rate_limit_exceeded")
+                    .then(|| parse_rate_limit_delay(message))
+                    .flatten(),
+            ),
+        }
     }
 }
 
 fn validate_completed_response(response: &Value) -> ApiResult<()> {
-    if let Some(model) = response.get("model").and_then(Value::as_str)
-        && model != MODEL
-    {
-        return Err(ApiError::fatal(format!(
-            "backend returned model `{model}` for fixed BetterCodex model `{MODEL}`"
-        )));
+    if let Some(model) = response.get("model").and_then(Value::as_str) {
+        validate_server_model(model)?;
     }
     if let Some(context) = response
         .pointer("/reasoning/context")
@@ -1194,6 +1373,62 @@ fn validate_completed_response(response: &Value) -> ApiResult<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_server_model_header(headers: &HeaderMap) -> ApiResult<()> {
+    if let Some(model) = headers
+        .get("openai-model")
+        .and_then(|value| value.to_str().ok())
+    {
+        validate_server_model(model)?;
+    }
+    Ok(())
+}
+
+fn validate_event_server_model(event: &Value) -> ApiResult<()> {
+    if let Some(model) = event.pointer("/response/model").and_then(Value::as_str) {
+        validate_server_model(model)?;
+    }
+    let response_headers = event
+        .pointer("/response/headers")
+        .and_then(Value::as_object);
+    let event_headers = event.get("headers").and_then(Value::as_object);
+    if let Some(model) = response_headers
+        .and_then(|headers| json_header_value(headers, &["openai-model", "x-openai-model"]))
+        .or_else(|| {
+            event_headers
+                .and_then(|headers| json_header_value(headers, &["openai-model", "x-openai-model"]))
+        })
+    {
+        validate_server_model(model)?;
+    }
+    Ok(())
+}
+
+fn json_header_value<'a>(
+    headers: &'a Map<String, Value>,
+    accepted_names: &[&str],
+) -> Option<&'a str> {
+    headers.iter().find_map(|(name, value)| {
+        accepted_names
+            .iter()
+            .any(|accepted| name.eq_ignore_ascii_case(accepted))
+            .then(|| match value {
+                Value::String(value) => Some(value.as_str()),
+                Value::Array(values) => values.first().and_then(Value::as_str),
+                _ => None,
+            })
+            .flatten()
+    })
+}
+
+fn validate_server_model(model: &str) -> ApiResult<()> {
+    if model == MODEL {
+        return Ok(());
+    }
+    Err(ApiError::fatal(format!(
+        "backend returned model `{model}` for fixed BetterCodex model `{MODEL}`"
+    )))
 }
 
 fn parse_usage(usage: &Value) -> Option<TokenUsage> {
@@ -1257,17 +1492,24 @@ struct SseDecoder {
 impl SseDecoder {
     fn push(&mut self, chunk: &[u8]) -> ApiResult<Vec<String>> {
         self.buffer.extend_from_slice(chunk);
+        let buffer = std::mem::take(&mut self.buffer);
+        let mut events = Vec::new();
+        let mut line_start = 0_usize;
+        for (newline, _) in buffer
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+        {
+            let mut line = &buffer[line_start..newline];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            self.process_line(line, &mut events)?;
+            line_start = newline.saturating_add(1);
+        }
+        self.buffer.extend_from_slice(&buffer[line_start..]);
         if self.buffer.len() > MAX_STREAM_EVENT_BYTES {
             return Err(ApiError::fatal("model sent an oversized SSE event"));
-        }
-        let mut events = Vec::new();
-        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.buffer.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.process_line(&line, &mut events)?;
         }
         Ok(events)
     }
@@ -1285,6 +1527,9 @@ impl SseDecoder {
     }
 
     fn process_line(&mut self, line: &[u8], events: &mut Vec<String>) -> ApiResult<()> {
+        if line.len() > MAX_STREAM_EVENT_BYTES {
+            return Err(ApiError::fatal("model sent an oversized SSE event"));
+        }
         let line =
             std::str::from_utf8(line).map_err(|_| ApiError::fatal("SSE stream was not UTF-8"))?;
         if line.is_empty() {
@@ -1334,8 +1579,11 @@ fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> Ap
     Ok(())
 }
 
-fn retry_delay(attempt: usize) -> Duration {
-    Duration::from_secs(1_u64 << attempt.min(4))
+pub(crate) fn retry_delay(attempt: usize) -> Duration {
+    backoff(
+        RETRY_BASE_DELAY,
+        u64::try_from(attempt.saturating_add(1)).unwrap_or(u64::MAX),
+    )
 }
 
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -1346,6 +1594,31 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+fn parse_rate_limit_delay(message: &str) -> Option<Duration> {
+    const MARKER: &str = "try again in";
+    let lowercase = message.to_ascii_lowercase();
+    let tail = lowercase
+        .get(lowercase.find(MARKER)?.saturating_add(MARKER.len())..)?
+        .trim_start();
+    let number_end = tail
+        .char_indices()
+        .take_while(|(_, character)| character.is_ascii_digit() || *character == '.')
+        .map(|(index, character)| index + character.len_utf8())
+        .last()?;
+    let value = tail.get(..number_end)?.parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let unit = tail.get(number_end..)?.trim_start();
+    if unit.starts_with("ms") {
+        Duration::try_from_secs_f64(value / 1_000.0).ok()
+    } else if unit.starts_with('s') || unit.starts_with("second") {
+        Duration::try_from_secs_f64(value).ok()
+    } else {
+        None
+    }
+}
+
 fn explicit_cache_unsupported(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     (message.contains("prompt_cache_options") || message.contains("prompt_cache_breakpoint"))
@@ -1354,21 +1627,28 @@ fn explicit_cache_unsupported(message: &str) -> bool {
             || message.contains("invalid"))
 }
 
-fn unix_timestamp_millis() -> u128 {
+fn unix_timestamp_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
-async fn bounded_error_body(response: reqwest::Response) -> String {
-    response
-        .text()
-        .await
-        .unwrap_or_else(|_| "unreadable response".to_string())
-        .chars()
-        .take(4_000)
-        .collect()
+async fn bounded_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) if body.is_empty() => return "unreadable response".to_string(),
+            Err(_) => break,
+        };
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&body).chars().take(4_000).collect()
 }
 
 #[cfg(test)]

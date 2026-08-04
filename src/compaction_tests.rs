@@ -25,6 +25,11 @@ fn remote_v2_retains_only_recent_user_and_non_completion_agent_messages() {
             "user",
             "# Repository onboarding from AGENTS.md for /repo\n\nstale instructions",
         ),
+        message("user", "<turn_aborted>\ninterrupted\n</turn_aborted>"),
+        message(
+            "user",
+            "<response_interrupted>\nretry\n</response_interrupted>",
+        ),
         user.clone(),
         message("assistant", "assistant output is summarized"),
         delegated.clone(),

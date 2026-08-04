@@ -28,6 +28,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_utils_audio::estimate_audio_token_count;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use serde::Deserialize;
@@ -71,7 +72,7 @@ impl ToolRuntime {
         cancellation: CancellationToken,
     ) -> Result<ToolResult> {
         let parsed = code_runtime::parse_exec_source(source).map_err(|error| anyhow!(error))?;
-        let max_output_tokens = parsed.max_output_tokens;
+        let max_output_tokens = output_token_budget(parsed.max_output_tokens);
         let started_at = Instant::now();
         self.state.ui_events.prepare(events);
         let started = self
@@ -81,7 +82,7 @@ impl ToolRuntime {
                 enabled_tools: catalogue::core_tools().to_vec(),
                 source: parsed.code,
                 yield_time_ms: parsed.yield_time_ms,
-                max_output_tokens: parsed.max_output_tokens,
+                max_output_tokens: Some(max_output_tokens),
             })
             .await
             .map_err(|error| {
@@ -100,7 +101,7 @@ impl ToolRuntime {
                     .into()
             }
         };
-        self.format_response(response, max_output_tokens, started_at.elapsed())
+        self.format_response(response, Some(max_output_tokens), started_at.elapsed())
     }
 
     pub(super) async fn wait(
@@ -111,6 +112,7 @@ impl ToolRuntime {
     ) -> Result<ToolResult> {
         let arguments: WaitArgs = serde_json::from_str(input)
             .map_err(|error| anyhow!("failed to parse function arguments: {error}"))?;
+        let max_tokens = output_token_budget(arguments.max_tokens);
         let cell_id = CellId::new(arguments.cell_id);
         self.state.ui_events.attach(&cell_id, events);
         let started_at = Instant::now();
@@ -135,7 +137,7 @@ impl ToolRuntime {
                 }
             }
         };
-        self.format_response(response.into(), arguments.max_tokens, started_at.elapsed())
+        self.format_response(response.into(), Some(max_tokens), started_at.elapsed())
     }
 
     fn format_response(
@@ -264,12 +266,13 @@ impl SessionDelegate for RuntimeState {
             let result = self
                 .tools
                 .execute_nested(invocation, cancellation_token)
-                .await;
+                .await
+                .map_err(|error| bounded_runtime_text(&format!("{error:#}")));
             if let Some(sender) = sender {
                 let output = match &result {
                     Ok(_) if tool_name == "view_image" => Ok(json!({})),
                     Ok(value) => Ok(value.clone()),
-                    Err(error) => Err(format!("{error:#}")),
+                    Err(error) => Err(error.clone()),
                 };
                 let _ = sender.send(AgentEvent::ToolCompleted {
                     call_id,
@@ -277,7 +280,7 @@ impl SessionDelegate for RuntimeState {
                     duration: started_at.elapsed(),
                 });
             }
-            result.map_err(|error| format!("{error:#}"))
+            result
         })
     }
 
@@ -381,6 +384,7 @@ impl Notifications {
         call_id: String,
         text: String,
     ) -> std::result::Result<(), String> {
+        let text = bounded_runtime_text(&text);
         self.by_cell
             .lock()
             .map_err(|_| "notification lock was poisoned".to_string())?
@@ -404,9 +408,7 @@ fn truncate_items(
     items: Vec<FunctionCallOutputContentItem>,
     max_tokens: Option<usize>,
 ) -> Vec<FunctionCallOutputContentItem> {
-    let policy = TruncationPolicy::Tokens(
-        max_tokens.unwrap_or(code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
-    );
+    let policy = TruncationPolicy::Tokens(output_token_budget(max_tokens));
     if items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
@@ -415,6 +417,19 @@ fn truncate_items(
     }
 
     truncate_function_output_items_with_policy(&items, policy, estimate_audio_token_count)
+}
+
+fn output_token_budget(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS)
+        .min(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS)
+}
+
+fn bounded_runtime_text(text: &str) -> String {
+    formatted_truncate_text(
+        text,
+        TruncationPolicy::Tokens(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
+    )
 }
 
 fn output_body(items: Vec<FunctionCallOutputContentItem>) -> Result<Value> {
@@ -501,6 +516,48 @@ text(`${left.output}:${right.output}`);
             .await
             .unwrap();
         assert!(result.preview.contains("left:right"), "{}", result.preview);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_command_default_is_bounded_before_javascript_receives_it() {
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
+            .execute(
+                "call-bounded-command",
+                r#"
+const result = await tools.exec_command({
+  cmd: "dd if=/dev/zero bs=50000 count=1 2>/dev/null | tr '\\000' x",
+});
+text(`${result.output.startsWith("Warning: truncated output")}:${result.original_token_count}`);
+"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.preview.contains("true:12500"), "{}", result.preview);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_outer_budget_cannot_exceed_the_history_item_ceiling() {
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
+            .execute(
+                "call-bounded-outer",
+                "// @exec: {\"max_output_tokens\": 50000}\ntext(\"x\".repeat(50000));",
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.preview.contains("Warning: truncated output"),
+            "{}",
+            result.preview
+        );
+        assert!(result.preview.len() < 50_000);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -799,6 +856,24 @@ text("after");
             })]
         );
         assert!(result.preview.contains("done"), "{}", result.preview);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notify_output_is_bounded_before_history_insertion() {
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
+            .execute(
+                "call-large-notify",
+                r#"notify("x".repeat(50000)); text("done");"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let output = result.preceding_items[0]["output"].as_str().unwrap();
+        assert!(output.starts_with("Warning: truncated output"));
+        assert!(output.len() < 50_000);
     }
 
     #[test]

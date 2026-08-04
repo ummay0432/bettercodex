@@ -9,10 +9,14 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::connect_async_with_config;
+use tungstenite::Message;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::extensions::ExtensionsConfig;
+use tungstenite::extensions::compression::deflate::DeflateConfig;
+use tungstenite::protocol::WebSocketConfig;
+
+const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) struct WebSocketConnection {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -24,10 +28,13 @@ impl WebSocketConnection {
             ApiError::fatal(format!("failed to build WebSocket request: {error}"))
         })?;
         request.headers_mut().extend(headers.clone());
-        let (stream, response) = timeout(Duration::from_secs(20), connect_async(request))
-            .await
-            .map_err(|_| ApiError::retryable("timed out connecting Responses WebSocket"))?
-            .map_err(map_connect_error)?;
+        let (stream, response) = timeout(
+            WEBSOCKET_CONNECT_TIMEOUT,
+            connect_async_with_config(request, Some(websocket_config()), false),
+        )
+        .await
+        .map_err(|_| ApiError::retryable("timed out connecting Responses WebSocket"))?
+        .map_err(map_connect_error)?;
         Ok((Self { stream }, response.headers().clone()))
     }
 
@@ -89,6 +96,16 @@ impl WebSocketConnection {
             }
         }
     }
+}
+
+pub(super) fn websocket_config() -> WebSocketConfig {
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    config.max_message_size = Some(super::MAX_STREAM_EVENT_BYTES);
+    config
 }
 
 fn map_connect_error(error: tungstenite::Error) -> ApiError {
