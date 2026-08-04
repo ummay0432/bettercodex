@@ -52,7 +52,8 @@ const MAX_EDITOR_ROWS: u16 = 8;
 const LIVE_PREFIX_COLS: u16 = 2;
 const TOOL_OUTPUT_MAX_ROWS: usize = 5;
 const COMMAND_CONTINUATION_MAX_ROWS: usize = 2;
-const STATUS_COMPOSER_SPACING: u16 = 1;
+const COMPOSER_STATUS_GAP: u16 = 1;
+const STATUS_LINE_HEIGHT: u16 = 1;
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "clear",
@@ -757,13 +758,17 @@ impl View {
             .layout(self.composer_text_width, MAX_EDITOR_ROWS);
         let composer_height = (editor.lines.len() as u16).max(1).saturating_add(2);
         let status_height = u16::from(self.busy);
-        let status_composer_spacing = STATUS_COMPOSER_SPACING.saturating_mul(status_height);
+        let status_composer_spacing = COMPOSER_STATUS_GAP.saturating_mul(status_height);
         let bottom_spacing = 1;
         let active_height = rendered_line_count(&self.active_lines(width), width);
         let popup_height = self.slash_popup_height(width);
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
         // extends downward from the composer instead of becoming an overlay above it.
-        let trailing_height = if popup_height > 0 { popup_height } else { 2 };
+        let trailing_height = if popup_height > 0 {
+            popup_height
+        } else {
+            COMPOSER_STATUS_GAP.saturating_add(STATUS_LINE_HEIGHT)
+        };
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => 15,
             Some(Overlay::Context(context)) => context.preferred_height(width),
@@ -796,8 +801,12 @@ impl View {
         } else {
             self.slash_popup_height(area.width)
         };
-        let trailing_height = if popup_height > 0 { popup_height } else { 2 }
-            .min(area.height.saturating_sub(composer_height));
+        let trailing_height = if popup_height > 0 {
+            popup_height
+        } else {
+            COMPOSER_STATUS_GAP.saturating_add(STATUS_LINE_HEIGHT)
+        }
+        .min(area.height.saturating_sub(composer_height));
         let composer_y = area
             .bottom()
             .saturating_sub(composer_height.saturating_add(trailing_height));
@@ -815,7 +824,7 @@ impl View {
         };
         let status_height = u16::from(self.busy && composer_y > area.y);
         let status_composer_spacing = if status_height > 0 {
-            STATUS_COMPOSER_SPACING.min(
+            COMPOSER_STATUS_GAP.min(
                 composer_y
                     .saturating_sub(area.y)
                     .saturating_sub(status_height),
@@ -914,14 +923,14 @@ impl View {
             Rect::new(area.x, text_y, 1, 1),
         );
 
-        if footer_area.height > 1 {
+        if footer_area.height > COMPOSER_STATUS_GAP {
             frame.render_widget(
                 Paragraph::new(self.status_line(footer_area.width)),
                 Rect::new(
                     footer_area.x,
-                    footer_area.bottom().saturating_sub(1),
+                    footer_area.y.saturating_add(COMPOSER_STATUS_GAP),
                     footer_area.width,
-                    1,
+                    STATUS_LINE_HEIGHT,
                 ),
             );
         }
@@ -1070,7 +1079,7 @@ impl View {
 
     fn status_line(&self, width: u16) -> Line<'static> {
         let mut spans = vec![
-            Span::from(format!(" {MODEL}")),
+            Span::from(MODEL),
             Span::styled(" max", Style::default().fg(MUTED)),
             Span::styled(" │ ", Style::default().fg(MUTED)),
             Span::styled(
@@ -2550,7 +2559,7 @@ mod tests {
         view.context_tokens = Some(70_680);
         assert_eq!(
             plain(&view.status_line(80)),
-            " gpt-5.6-sol max │ pi / main │ 20% of 353K"
+            "gpt-5.6-sol max │ pi / main │ 20% of 353K"
         );
     }
 
@@ -2577,7 +2586,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_status_matches_codex_activity_and_composer_spacing() {
+    fn busy_status_and_footer_are_equally_spaced_and_left_aligned() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.start_turn("test");
@@ -2609,8 +2618,34 @@ mod tests {
         let composer_y = (0..height)
             .find(|&y| buffer[(0, y)].bg == composer_background)
             .unwrap();
-        assert_eq!(composer_y, status_y + 2, "{rendered}");
-        assert_eq!(buffer[(0, status_y + 1)].bg, Color::Reset);
+        let composer_bottom = (0..height)
+            .rfind(|&y| buffer[(0, y)].bg == composer_background)
+            .unwrap()
+            .saturating_add(1);
+        let prompt_y = (composer_y..composer_bottom)
+            .find(|&y| buffer[(0, y)].symbol() == "›")
+            .unwrap();
+        let footer_y = rows.iter().position(|row| row.contains(MODEL)).unwrap() as u16;
+
+        assert_eq!(
+            composer_y.saturating_sub(status_y.saturating_add(1)),
+            COMPOSER_STATUS_GAP,
+            "{rendered}"
+        );
+        assert_eq!(
+            footer_y.saturating_sub(composer_bottom),
+            COMPOSER_STATUS_GAP,
+            "{rendered}"
+        );
+        assert_eq!(
+            (
+                buffer[(0, status_y)].symbol(),
+                buffer[(0, prompt_y)].symbol(),
+                buffer[(0, footer_y)].symbol(),
+            ),
+            ("•", "›", "g"),
+            "{rendered}"
+        );
     }
 
     #[test]

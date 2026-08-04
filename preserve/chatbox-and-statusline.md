@@ -16,6 +16,9 @@ usage:
 
 ![Accepted status line close crop](assets/statusline.png)
 
+These historical screenshots retain the former one-cell footer inset. The
+left-edge alignment in the status-line contract below supersedes that detail.
+
 The design should be implemented directly in the Codex TUI rather than carried
 over as a Pi compatibility layer.
 
@@ -50,10 +53,11 @@ The active Rust TUI follows Codex's bottom-pane layout for slash commands:
 
 ## Status-line contract
 
-Render one compact line with a leading space:
+Render one compact line from the left edge, aligned with the activity marker and
+composer prompt:
 
 ```text
- gpt-5.6-sol max │ pi / main │ 20% of 353K
+gpt-5.6-sol max │ pi / main │ 20% of 353K
 ```
 
 The fields are:
