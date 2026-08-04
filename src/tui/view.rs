@@ -60,22 +60,27 @@ const STATUS_LINE_HEIGHT: u16 = 1;
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "clear",
+        aliases: &[],
         description: "start a fresh session",
     },
     SlashCommand {
         name: "context",
+        aliases: &[],
         description: "visualize current context usage",
     },
     SlashCommand {
         name: "help",
+        aliases: &[],
         description: "show keyboard shortcuts",
     },
     SlashCommand {
         name: "tools",
+        aliases: &[],
         description: "inspect the active tool catalogue",
     },
     SlashCommand {
         name: "quit",
+        aliases: &["exit"],
         description: "leave BetterCodex",
     },
 ];
@@ -241,7 +246,29 @@ struct Repository {
 
 struct SlashCommand {
     name: &'static str,
+    aliases: &'static [&'static str],
     description: &'static str,
+}
+
+impl SlashCommand {
+    fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.name).chain(self.aliases.iter().copied())
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.names().any(|name| name.starts_with(query))
+    }
+
+    fn completion_name(&self, query: &str) -> &'static str {
+        self.names()
+            .find(|name| name.starts_with(query))
+            .unwrap_or(self.name)
+    }
+
+    fn display_width(&self) -> usize {
+        self.names().map(|name| name.len() + 1).sum::<usize>()
+            + self.aliases.len().saturating_mul(2)
+    }
 }
 
 enum Overlay {
@@ -624,18 +651,12 @@ impl View {
             match key.code {
                 KeyCode::Enter if !shift && !alt && !control => {
                     let selection = self.slash_selection.min(slash_matches.len() - 1);
-                    self.editor
-                        .set_text(format!("/{}", slash_matches[selection].name));
-                    self.dismissed_slash = None;
-                    self.slash_selection = selection;
+                    self.complete_slash_command(slash_matches[selection], selection);
                     return self.submit_action();
                 }
                 KeyCode::Tab => {
                     let selection = self.slash_selection.min(slash_matches.len() - 1);
-                    self.editor
-                        .set_text(format!("/{}", slash_matches[selection].name));
-                    self.dismissed_slash = None;
-                    self.slash_selection = selection;
+                    self.complete_slash_command(slash_matches[selection], selection);
                     return Action::None;
                 }
                 KeyCode::Up => {
@@ -700,6 +721,14 @@ impl View {
             self.slash_selection = 0;
         }
         Action::None
+    }
+
+    fn complete_slash_command(&mut self, command: &SlashCommand, selection: usize) {
+        let query = self.editor.text().strip_prefix('/').unwrap_or_default();
+        let name = command.completion_name(query);
+        self.editor.set_text(format!("/{name}"));
+        self.dismissed_slash = None;
+        self.slash_selection = selection;
     }
 
     fn insert_selected_file(&mut self) -> bool {
@@ -1227,27 +1256,36 @@ impl View {
         let query = self.editor.text().strip_prefix('/').unwrap_or_default();
         let name_width = matches
             .iter()
-            .map(|command| command.name.len().saturating_add(1))
+            .map(|command| command.display_width())
             .max()
             .unwrap_or(1);
         let lines = matches
             .iter()
             .enumerate()
             .map(|(index, command)| {
-                let matched = query.len().min(command.name.len());
-                let mut line = Line::from(vec![
-                    Span::from("/"),
-                    Span::from(command.name[..matched].to_string()).bold(),
-                    Span::from(command.name[matched..].to_string()),
-                    Span::from(
-                        " ".repeat(
-                            name_width
-                                .saturating_sub(command.name.len().saturating_add(1))
-                                .saturating_add(2),
-                        ),
+                let mut spans = Vec::with_capacity(command.aliases.len().saturating_mul(4) + 5);
+                for (name_index, name) in command.names().enumerate() {
+                    if name_index > 0 {
+                        spans.push(Span::from(", "));
+                    }
+                    let matched = if name.starts_with(query) {
+                        query.len()
+                    } else {
+                        0
+                    };
+                    spans.push(Span::from("/"));
+                    spans.push(Span::from(name[..matched].to_string()).bold());
+                    spans.push(Span::from(name[matched..].to_string()));
+                }
+                spans.push(Span::from(
+                    " ".repeat(
+                        name_width
+                            .saturating_sub(command.display_width())
+                            .saturating_add(2),
                     ),
-                    Span::from(command.description).dim(),
-                ]);
+                ));
+                spans.push(Span::from(command.description).dim());
+                let mut line = Line::from(spans);
                 if index == selected {
                     let selected_style = Style::default()
                         .fg(Color::Cyan)
@@ -1290,7 +1328,7 @@ impl View {
         }
         SLASH_COMMANDS
             .iter()
-            .filter(|command| command.name.starts_with(query))
+            .filter(|command| command.matches(query))
             .collect()
     }
 
@@ -3106,7 +3144,7 @@ mod tests {
     }
 
     #[test]
-    fn quit_completion_renders_and_q_dispatches_it() {
+    fn quit_aliases_share_one_completion_row_and_q_dispatches_it() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         for character in "/q".chars() {
@@ -3131,7 +3169,7 @@ mod tests {
         let composer_y = rows.iter().position(|row| row.contains("/q")).unwrap();
         let command_y = rows
             .iter()
-            .position(|row| row.contains("/quit  leave BetterCodex"))
+            .position(|row| row.contains("/quit, /exit  leave BetterCodex"))
             .unwrap();
         assert!(command_y > composer_y, "{rendered}");
         assert_eq!(buffer[(2, composer_y as u16)].symbol(), "/");
@@ -3154,6 +3192,27 @@ mod tests {
             Action::Quit
         );
         assert!(view.editor.is_empty());
+    }
+
+    #[test]
+    fn exit_alias_filters_and_completes_the_shared_quit_command() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/ex");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "/exit");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Quit
+        );
     }
 
     #[test]
