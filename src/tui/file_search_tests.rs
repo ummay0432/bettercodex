@@ -35,6 +35,25 @@ fn active_token_follows_the_cursor_without_crossing_whitespace() {
         None
     );
     assert_eq!(active_token("@src\nnext", "@src\n".len()), None);
+
+    let text = "inspect @src next";
+    assert_eq!(
+        active_token(text, "inspect @src".len()),
+        Some(ActiveToken {
+            range: "inspect ".len().."inspect @src".len(),
+            query: "src".to_string(),
+        })
+    );
+    assert_eq!(active_token(text, "inspect @src ".len()), None);
+
+    let adjacent = "@old  @new";
+    assert_eq!(
+        active_token(adjacent, "@old ".len()),
+        Some(ActiveToken {
+            range: "@old  ".len()..adjacent.len(),
+            query: "new".to_string(),
+        })
+    );
 }
 
 #[test]
@@ -71,6 +90,21 @@ fn popup_rejects_stale_results_and_wraps_selection() {
         popup.selected_path().map(|(_, path)| path),
         Some("src/tui/view.rs".to_string())
     );
+}
+
+#[test]
+fn dismissal_is_scoped_to_one_token_occurrence() {
+    let text = "@same @same";
+    let mut popup = FileSearchPopup::default();
+    popup.sync(text, 3);
+    assert!(popup.is_active());
+    popup.dismiss();
+    popup.sync(text, 3);
+    assert!(!popup.is_active());
+
+    popup.sync(text, text.len());
+    assert!(popup.is_active());
+    assert_eq!(popup.query(), "same");
 }
 
 #[test]

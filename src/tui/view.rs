@@ -4,6 +4,7 @@ use super::editor;
 use super::editor::Editor;
 use super::file_search::FileSearchPopup;
 use super::file_search::FileSearchUpdate;
+use super::file_search::is_horizontal_whitespace;
 use super::markdown;
 use super::reasoning_status::ReasoningStatus;
 use super::tool_catalogue::CatalogueAction;
@@ -567,7 +568,7 @@ impl View {
         }
         if key.code == KeyCode::Esc {
             if self.file_search.is_active() {
-                self.file_search.dismiss(self.editor.text());
+                self.file_search.dismiss();
                 return Action::None;
             }
             if !self.slash_matches().is_empty() {
@@ -601,7 +602,7 @@ impl View {
             match key.code {
                 KeyCode::Tab => {
                     if !self.insert_selected_file() {
-                        self.file_search.dismiss(self.editor.text());
+                        self.file_search.dismiss();
                     }
                     return Action::None;
                 }
@@ -707,7 +708,7 @@ impl View {
         };
         self.editor.replace_range(token_range, &inserted);
         self.advance_past_completion_separator();
-        self.file_search.dismiss(self.editor.text());
+        self.file_search.dismiss();
         true
     }
 
@@ -716,18 +717,7 @@ impl View {
         let separator = self.editor.text()[cursor..]
             .chars()
             .next()
-            .filter(|character| {
-                character.is_whitespace()
-                    && !matches!(
-                        *character,
-                        '\n' | '\r'
-                            | '\u{000B}'
-                            | '\u{000C}'
-                            | '\u{0085}'
-                            | '\u{2028}'
-                            | '\u{2029}'
-                    )
-            });
+            .filter(|character| is_horizontal_whitespace(*character));
         let Some(separator) = separator else {
             self.editor.insert(" ");
             return;

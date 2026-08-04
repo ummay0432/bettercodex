@@ -1,3 +1,8 @@
+//! Codex-style `@` file completion backed by the pinned `codex-file-search` crate.
+//!
+//! One session walks the working tree while the token is active; query edits reuse that index and
+//! stream ranked matches with the character positions needed for fuzzy highlighting.
+
 use codex_file_search::FileMatch;
 use codex_file_search::FileSearchOptions;
 use codex_file_search::FileSearchSession;
@@ -163,7 +168,7 @@ struct ActiveToken {
 #[derive(Debug, Default)]
 pub(super) struct FileSearchPopup {
     token: Option<ActiveToken>,
-    dismissed_text: Option<String>,
+    dismissed_token: Option<ActiveToken>,
     display_query: String,
     waiting: bool,
     matches: Vec<FileMatch>,
@@ -173,14 +178,12 @@ pub(super) struct FileSearchPopup {
 
 impl FileSearchPopup {
     pub(super) fn sync(&mut self, text: &str, cursor: usize) {
-        if self.dismissed_text.as_deref() != Some(text) {
-            self.dismissed_text = None;
-        }
-        let token = if self.dismissed_text.is_some() {
-            None
+        let mut token = active_token(text, cursor);
+        if self.dismissed_token.as_ref() == token.as_ref() {
+            token = None;
         } else {
-            active_token(text, cursor)
-        };
+            self.dismissed_token = None;
+        }
         if token == self.token {
             return;
         }
@@ -230,8 +233,8 @@ impl FileSearchPopup {
         self.token.is_some()
     }
 
-    pub(super) fn dismiss(&mut self, editor_text: &str) {
-        self.dismissed_text = Some(editor_text.to_string());
+    pub(super) fn dismiss(&mut self) {
+        self.dismissed_token = self.token.clone();
         self.hide();
     }
 
@@ -358,32 +361,88 @@ impl FileSearchPopup {
 
 fn active_token(text: &str, cursor: usize) -> Option<ActiveToken> {
     let cursor = previous_char_boundary(text, cursor.min(text.len()));
-    let at_cursor = text[cursor..].chars().next();
-    if at_cursor.is_some_and(char::is_whitespace) {
-        return None;
-    }
+    let before_cursor = &text[..cursor];
+    let after_cursor = &text[cursor..];
+    let at_whitespace = after_cursor.chars().next().is_some_and(char::is_whitespace);
+    let after_horizontal_whitespace = before_cursor
+        .chars()
+        .next_back()
+        .is_some_and(is_horizontal_whitespace);
+    let cursor_starts_token = after_horizontal_whitespace && !at_whitespace;
+    let next_non_separator = after_cursor
+        .chars()
+        .find(|character| !is_horizontal_whitespace(*character));
+    let separator_precedes_token =
+        next_non_separator.is_some_and(|character| !character.is_whitespace());
+    let separator_precedes_completion = next_non_separator == Some('@');
+    let at_separator = (at_whitespace || after_horizontal_whitespace) && separator_precedes_token;
 
-    let previous = text[..cursor].chars().next_back();
-    let start = if at_cursor == Some('@') && previous.is_none_or(char::is_whitespace) {
-        cursor
-    } else if previous.is_some_and(|character| !character.is_whitespace()) {
-        text[..cursor]
-            .char_indices()
-            .rfind(|(_, character)| character.is_whitespace())
-            .map_or(0, |(index, character)| index + character.len_utf8())
+    let left_end = if at_separator {
+        before_cursor
+            .trim_end_matches(is_horizontal_whitespace)
+            .len()
     } else {
-        return None;
+        cursor
+            + after_cursor
+                .char_indices()
+                .find(|(_, character)| character.is_whitespace())
+                .map_or(after_cursor.len(), |(index, _)| index)
     };
-    let end = text[cursor..]
+    let left_start = text[..left_end]
         .char_indices()
-        .find(|(_, character)| character.is_whitespace())
-        .map_or(text.len(), |(index, _)| cursor + index);
-    let candidate = text.get(start..end)?;
-    let query = candidate.strip_prefix('@')?;
+        .rfind(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let right_start = cursor
+        + after_cursor
+            .chars()
+            .take_while(|character| is_horizontal_whitespace(*character))
+            .map(char::len_utf8)
+            .sum::<usize>();
+    let right_end = right_start
+        + text[right_start..]
+            .char_indices()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(text.len() - right_start, |(index, _)| index);
+
+    let left = token_in_range(text, left_start..left_end);
+    let right = token_in_range(text, right_start..right_end);
+    if cursor_starts_token {
+        return right;
+    }
+    if at_separator {
+        if after_horizontal_whitespace && !separator_precedes_completion {
+            return right;
+        }
+        return right.or(left);
+    }
+    if after_cursor.starts_with('@') {
+        let prefix_starts_token = before_cursor
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+        return if prefix_starts_token {
+            right.or(left)
+        } else {
+            left
+        };
+    }
+    left.or(right)
+}
+
+fn token_in_range(text: &str, range: Range<usize>) -> Option<ActiveToken> {
+    let query = text.get(range.clone())?.strip_prefix('@')?;
     Some(ActiveToken {
-        range: start..end,
+        range,
         query: query.to_string(),
     })
+}
+
+pub(super) fn is_horizontal_whitespace(character: char) -> bool {
+    character.is_whitespace()
+        && !matches!(
+            character,
+            '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+        )
 }
 
 fn previous_char_boundary(text: &str, mut index: usize) -> usize {
