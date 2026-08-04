@@ -279,6 +279,49 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
 }
 
 #[test]
+fn request_bakes_in_the_fixed_exec_runtime() {
+    let client = test_client("http://127.0.0.1:1".to_string());
+    let request = client.build_request(vec![user_message("run tools")], RequestKind::Turn);
+    let request_tools = request["input"][0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            (
+                tool["type"].as_str().unwrap(),
+                tool["name"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        request_tools,
+        vec![("custom", "exec"), ("function", "wait")]
+    );
+    assert_eq!(request["tool_choice"], "auto");
+    assert_eq!(request["parallel_tool_calls"], false);
+    assert!(request.get("tool_mode").is_none());
+
+    let turn_metadata: Value = serde_json::from_str(
+        request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        turn_metadata["code_mode_tool_names"],
+        json!({
+            "apply_patch": {"name": "apply_patch", "namespace": null},
+            "exec_command": {"name": "exec_command", "namespace": null},
+            "update_plan": {"name": "update_plan", "namespace": null},
+            "view_image": {"name": "view_image", "namespace": null},
+            "web__run": {"name": "run", "namespace": "web"},
+            "write_stdin": {"name": "write_stdin", "namespace": null},
+        })
+    );
+}
+
+#[test]
 fn websocket_delta_requires_an_exact_prefix_and_new_input() {
     let mut client = test_client("http://127.0.0.1:1".to_string());
     let first_request = client.build_request(vec![user_message("one")], RequestKind::Turn);

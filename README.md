@@ -77,12 +77,19 @@ inferred.
 
 ## Tools
 
-BetterCodex always uses Codex Code Mode for Sol. The Responses request exposes
-the freeform `exec` tool and its `wait` continuation tool. `exec` runs
-JavaScript in an embedded V8 isolate and gives that program the fixed nested
-catalogue: `apply_patch`, `exec_command`, `update_plan`, `view_image`, and
-`write_stdin`. Command sessions persist across calls and run with the invoking
-user's permissions.
+BetterCodex always exposes one JavaScript tool runtime for Sol; there is no tool
+mode or selector. The Responses request exposes the freeform `exec` tool and its
+`wait` continuation tool. `exec` runs JavaScript in an embedded V8 isolate and
+gives that program the fixed nested catalogue: `apply_patch`, `exec_command`,
+`update_plan`, `view_image`, and `write_stdin`. This unconditionally ports the
+efficient orchestration path that upstream Codex calls `code_mode_only`, while
+command sessions persist across calls and run with the invoking user's
+permissions.
+
+Sol therefore gets programmatic composition, parallel calls, and intermediate
+result reduction by default. On the ChatGPT Responses Lite route this is a
+client-owned `exec` contract, not the public API's hosted `program` and
+`program_output` item protocol.
 
 Read the exact model-visible catalogue in
 [`prompts/tool-catalogue.md`](prompts/tool-catalogue.md), or print the generated text

@@ -1,18 +1,26 @@
+//! The fixed `exec`/`wait` runtime used by every BetterCodex turn.
+//!
+//! Upstream Codex calls this mechanism Code Mode because its tool planner can
+//! choose other modes. BetterCodex has no planner or selector: this module is
+//! the only top-level tool execution path.
+
 use super::NestedTools;
 use super::ToolResult;
 use super::catalogue;
 use super::code_runtime;
 use super::code_runtime::CellId;
-use super::code_runtime::CodeModeNestedToolCall;
-use super::code_runtime::CodeModeSessionDelegate;
+use super::code_runtime::CodeModeNestedToolCall as NestedToolCall;
+use super::code_runtime::CodeModeSessionDelegate as SessionDelegate;
 use super::code_runtime::ExecuteRequest;
-use super::code_runtime::InProcessCodeModeSession;
+use super::code_runtime::InProcessCodeModeSession as JavaScriptSession;
 use super::code_runtime::NotificationFuture;
 use super::code_runtime::RuntimeResponse;
 use super::code_runtime::ToolInvocationFuture;
 use super::code_runtime::WaitRequest;
 use super::image_preparation::prepare_tool_output_images;
 use crate::events::AgentEvent;
+use crate::web_search::ToolTurnContext;
+use crate::web_search::WebSearchClient;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
@@ -26,6 +34,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -33,32 +42,25 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-pub(super) struct CodeMode {
-    session: Arc<InProcessCodeModeSession>,
-    tools: Arc<NestedTools>,
-    notifications: Arc<Notifications>,
-    ui_events: Arc<UiEvents>,
+pub(crate) struct ToolRuntime {
+    session: JavaScriptSession,
+    state: Arc<RuntimeState>,
 }
 
-impl CodeMode {
-    pub(super) fn new(tools: Arc<NestedTools>) -> Self {
-        let notifications = Arc::new(Notifications::default());
-        let ui_events = Arc::new(UiEvents::default());
-        let delegate = Arc::new(Delegate {
-            tools: Arc::clone(&tools),
-            notifications: Arc::clone(&notifications),
-            ui_events: Arc::clone(&ui_events),
+impl ToolRuntime {
+    pub(crate) fn new(cwd: PathBuf, web_search: WebSearchClient) -> Self {
+        let state = Arc::new(RuntimeState {
+            tools: NestedTools::with_web_search(cwd, web_search),
+            notifications: Notifications::default(),
+            ui_events: UiEvents::default(),
         });
-        Self {
-            session: Arc::new(InProcessCodeModeSession::with_delegate(delegate)),
-            tools,
-            notifications,
-            ui_events,
-        }
+        let delegate: Arc<dyn SessionDelegate> = state.clone();
+        let session = JavaScriptSession::with_delegate(delegate);
+        Self { session, state }
     }
 
-    pub(super) fn prepare_turn(&self, context: crate::web_search::ToolTurnContext) {
-        self.tools.prepare_turn(context);
+    pub(super) fn prepare_turn(&self, context: ToolTurnContext) {
+        self.state.tools.prepare_turn(context);
     }
 
     pub(super) async fn execute(
@@ -71,7 +73,7 @@ impl CodeMode {
         let parsed = code_runtime::parse_exec_source(source).map_err(|error| anyhow!(error))?;
         let max_output_tokens = parsed.max_output_tokens;
         let started_at = Instant::now();
-        self.ui_events.prepare(events);
+        self.state.ui_events.prepare(events);
         let started = self
             .session
             .execute(ExecuteRequest {
@@ -83,11 +85,11 @@ impl CodeMode {
             })
             .await
             .map_err(|error| {
-                self.ui_events.clear_pending();
+                self.state.ui_events.clear_pending();
                 anyhow!(error)
             })?;
         let cell_id = started.cell_id.clone();
-        self.ui_events.bind(&cell_id);
+        self.state.ui_events.bind(&cell_id);
         let response = tokio::select! {
             response = started.initial_response() => response.map_err(|error| anyhow!(error))?,
             _ = cancellation.cancelled() => {
@@ -110,7 +112,7 @@ impl CodeMode {
         let arguments: WaitArgs = serde_json::from_str(input)
             .map_err(|error| anyhow!("failed to parse function arguments: {error}"))?;
         let cell_id = CellId::new(arguments.cell_id);
-        self.ui_events.attach(&cell_id, events);
+        self.state.ui_events.attach(&cell_id, events);
         let started_at = Instant::now();
         let response = if arguments.terminate.unwrap_or(false) {
             self.session
@@ -180,7 +182,7 @@ impl CodeMode {
             ),
         };
 
-        let notifications = self.notifications.take(&cell_id)?;
+        let notifications = self.state.notifications.take(&cell_id)?;
         let mut output_items = Vec::new();
         let mut items = into_protocol_items(items);
         if let Some(error) = error {
@@ -217,7 +219,7 @@ impl CodeMode {
             .join("\n");
         let body = output_body(items)?;
         if !yielded {
-            self.ui_events.close(&cell_id);
+            self.state.ui_events.close(&cell_id);
         }
         Ok(ToolResult {
             body,
@@ -235,16 +237,16 @@ struct WaitArgs {
     terminate: Option<bool>,
 }
 
-struct Delegate {
-    tools: Arc<NestedTools>,
-    notifications: Arc<Notifications>,
-    ui_events: Arc<UiEvents>,
+struct RuntimeState {
+    tools: NestedTools,
+    notifications: Notifications,
+    ui_events: UiEvents,
 }
 
-impl CodeModeSessionDelegate for Delegate {
+impl SessionDelegate for RuntimeState {
     fn invoke_tool<'a>(
         &'a self,
-        invocation: CodeModeNestedToolCall,
+        invocation: NestedToolCall,
         cancellation_token: CancellationToken,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
@@ -463,13 +465,13 @@ mod tests {
 
     fn temporary_directory(label: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("bettercodex-code-mode-{label}-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("bettercodex-exec-{label}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
 
-    fn nested_tools(cwd: PathBuf) -> Arc<NestedTools> {
-        Arc::new(NestedTools::with_web_search(
+    fn runtime(cwd: PathBuf) -> ToolRuntime {
+        ToolRuntime::new(
             cwd,
             crate::web_search::WebSearchClient::new(
                 reqwest::Client::new(),
@@ -477,14 +479,13 @@ mod tests {
                 "http://127.0.0.1:1".to_string(),
                 "test-session".to_string(),
             ),
-        ))
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn composes_parallel_nested_calls_in_v8() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
-        let result = mode
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
             .execute(
                 "call-1",
                 r#"
@@ -504,10 +505,9 @@ text(`${left.output}:${right.output}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nested_calls_emit_codex_tui_events_instead_of_outer_exec_events() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
+        let runtime = runtime(PathBuf::from("."));
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-        mode.execute(
+        runtime.execute(
             "call-events",
             r#"const result = await tools.exec_command({cmd: "printf ready"}); text(result.output);"#,
             Some(events_tx),
@@ -534,9 +534,8 @@ text(`${left.output}:${right.output}`);
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn patch_and_plan_tools_dispatch_through_v8() {
         let cwd = temporary_directory("patch-plan");
-        let nested = nested_tools(cwd.clone());
-        let mode = CodeMode::new(Arc::clone(&nested));
-        let result = mode
+        let runtime = runtime(cwd.clone());
+        let result = runtime
             .execute(
                 "call-patch-plan",
                 r#"
@@ -571,9 +570,8 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
             include_bytes!("../../preserve/assets/statusline.png"),
         )
         .unwrap();
-        let nested = nested_tools(cwd.clone());
-        let mode = CodeMode::new(nested);
-        let result = mode
+        let runtime = runtime(cwd.clone());
+        let result = runtime
             .execute(
                 "call-image",
                 r#"const result = await tools.view_image({path: "sample.png", detail: "original"}); image(result);"#,
@@ -597,9 +595,8 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
     async fn invalid_view_image_is_replaced_at_the_model_facing_boundary() {
         let cwd = temporary_directory("invalid-view-image");
         std::fs::write(cwd.join("broken.png"), b"\x89PNG\r\n\x1a\nnot-an-image").unwrap();
-        let nested = nested_tools(cwd.clone());
-        let mode = CodeMode::new(nested);
-        let result = mode
+        let runtime = runtime(cwd.clone());
+        let result = runtime
             .execute(
                 "call-invalid-image",
                 r#"const result = await tools.view_image({path: "broken.png"}); image(result);"#,
@@ -622,9 +619,8 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn text_only_single_item_result_uses_codex_plain_string_shape() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
-        let result = mode
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
             .execute(
                 "call-no-output",
                 r#"store("answer", 42);"#,
@@ -646,9 +642,8 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn javascript_has_no_node_or_console_globals() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
-        let result = mode
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
             .execute(
                 "call-1",
                 "text(`${typeof process}:${typeof require}:${typeof console}`);",
@@ -666,9 +661,8 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_exposes_the_fixed_catalogue() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
-        let result = mode
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
             .execute(
                 "call-tools",
                 "text(ALL_TOOLS.map(tool => tool.name).join(','));",
@@ -688,9 +682,8 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn yielded_cells_resume_with_wait() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
-        let yielded = mode
+        let runtime = runtime(PathBuf::from("."));
+        let yielded = runtime
             .execute(
                 "call-yield",
                 r#"
@@ -710,7 +703,7 @@ text("after");
             .unwrap();
         assert!(yielded.preview.contains("before"), "{}", yielded.preview);
 
-        let completed = mode
+        let completed = runtime
             .wait(
                 &json!({"cell_id": cell_id, "yield_time_ms": 1000}).to_string(),
                 None,
@@ -728,9 +721,8 @@ text("after");
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_can_terminate_a_yielded_cell() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
-        let yielded = mode
+        let runtime = runtime(PathBuf::from("."));
+        let yielded = runtime
             .execute(
                 "call-terminate",
                 "yield_control(); await new Promise(resolve => setTimeout(resolve, 5000));",
@@ -746,7 +738,7 @@ text("after");
             .unwrap()
             .strip_prefix("Script running with cell ID ")
             .unwrap();
-        let terminated = mode
+        let terminated = runtime
             .wait(
                 &json!({"cell_id": cell_id, "terminate": true}).to_string(),
                 None,
@@ -763,17 +755,17 @@ text("after");
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stored_values_survive_between_cells() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
-        mode.execute(
-            "call-store",
-            r#"store("answer", {value: 42});"#,
-            None,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        let loaded = mode
+        let runtime = runtime(PathBuf::from("."));
+        runtime
+            .execute(
+                "call-store",
+                r#"store("answer", {value: 42});"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let loaded = runtime
             .execute(
                 "call-load",
                 r#"text(load("answer").value);"#,
@@ -787,9 +779,8 @@ text("after");
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn notify_injects_a_preceding_output_item() {
-        let nested = nested_tools(PathBuf::from("."));
-        let mode = CodeMode::new(nested);
-        let result = mode
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
             .execute(
                 "call-notify",
                 r#"notify({stage: "ready"}); text("done");"#,

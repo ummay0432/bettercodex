@@ -7,6 +7,8 @@
 //! upstream's implementation. BetterCodex links the standard `rusty_v8`
 //! archive so one Cargo package builds on Linux and macOS. Codex release builds
 //! instead inject target-specific pointer-compression and V8-sandbox artifacts.
+//! Upstream protocol identifiers are retained in this port for source-level
+//! auditability; BetterCodex exposes the runtime unconditionally.
 
 mod cell_actor;
 mod runtime;

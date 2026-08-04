@@ -71,7 +71,7 @@ fn custom_outputs_preserve_structured_content_items() {
 }
 
 #[tokio::test]
-async fn web_search_runs_through_code_mode_and_posts_the_codex_alpha_contract() {
+async fn web_search_runs_through_exec_and_posts_the_codex_alpha_contract() {
     let (base_url, requests, server) = spawn_search_server();
     let client = reqwest::Client::builder()
         .default_headers(reqwest::header::HeaderMap::from_iter([(

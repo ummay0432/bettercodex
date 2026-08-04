@@ -3,8 +3,8 @@
 //! `codex-rs/core/src/image_preparation.rs`.
 //!
 //! Codex deliberately leaves `view_image` results as opaque data URLs inside
-//! Code Mode, then validates and prepares any image the JavaScript program
-//! chooses to return before inserting the outer tool result into history.
+//! the exec runtime, then validates and prepares any image the JavaScript
+//! program chooses to return before inserting the outer tool result into history.
 
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;

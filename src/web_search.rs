@@ -2,9 +2,9 @@
 //!
 //! The wire client and request types come from OpenAI Codex commit
 //! `1669c2403f793d0230065397dfc25f52b844244e`. The focused adapter here mirrors
-//! `codex-rs/ext/web-search`: it exposes `web.run` inside Code Mode and sends
-//! search, fetch/navigation, image, finance, weather, sports, and time commands
-//! to the same `alpha/search` endpoint used by Codex.
+//! `codex-rs/ext/web-search`: it exposes `web.run` inside the exec runtime and
+//! sends search, fetch/navigation, image, finance, weather, sports, and time
+//! commands to the same `alpha/search` endpoint used by Codex.
 
 use crate::MODEL;
 use crate::auth::SharedAuth;
@@ -37,7 +37,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const CODE_MODE_NAME: &str = "web__run";
+pub(crate) const JAVASCRIPT_NAME: &str = "web__run";
 pub(crate) const NAMESPACE: &str = "web";
 pub(crate) const TOOL_NAME: &str = "run";
 pub(crate) const DESCRIPTION: &str = include_str!("tools/web_run_description.md");

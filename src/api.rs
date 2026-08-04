@@ -647,7 +647,9 @@ impl ApiClient {
             "window_id": self.window_id(),
             "request_kind": request_kind.as_str(),
             "sandbox": "danger-full-access",
-            "code_mode_tool_names": tools::code_mode_tool_names(),
+            // Responses Lite requires Codex's protocol key even though
+            // BetterCodex has one fixed tool runtime and no mode selector.
+            "code_mode_tool_names": tools::nested_tool_name_map(),
             "turn_started_at_unix_ms": unix_timestamp_millis(),
         });
         if let RequestKind::Compaction(phase) = request_kind {

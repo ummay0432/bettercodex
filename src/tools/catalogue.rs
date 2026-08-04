@@ -1,5 +1,6 @@
-//! Fixed Code Mode tool plan ported from Codex at
-//! `1669c2403f793d0230065397dfc25f52b844244e`.
+//! Fixed JavaScript tool catalogue ported from Codex's `code_mode_only` plan at
+//! `1669c2403f793d0230065397dfc25f52b844244e`. BetterCodex exposes this one
+//! execution path unconditionally; it has no tool-mode selector.
 //!
 //! The schemas mirror `core/src/tools/handlers/{apply_patch_spec,plan_spec,
 //! shell_spec,view_image_spec}.rs`; the `exec` and `wait` wrappers mirror
@@ -8,7 +9,7 @@
 //! cannot drift into a BetterCodex-specific format.
 
 use super::code_runtime;
-use super::code_runtime::CodeModeToolKind;
+use super::code_runtime::CodeModeToolKind as ToolKind;
 use super::code_runtime::ToolDefinition;
 use super::code_runtime::ToolNamespaceDescription;
 use codex_protocol::ToolName;
@@ -17,7 +18,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
+const EXEC_SOURCE_GRAMMAR: &str = r#"
 start: pragma_source | plain_source
 pragma_source: PRAGMA_LINE NEWLINE SOURCE
 plain_source: SOURCE
@@ -26,6 +27,7 @@ PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
 NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 "#;
+const INCLUDE_FIXED_CATALOGUE: bool = true;
 
 static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
     vec![
@@ -58,7 +60,7 @@ static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
             Some(unified_exec_output_schema()),
         ),
         namespaced_function_tool(
-            crate::web_search::CODE_MODE_NAME,
+            crate::web_search::JAVASCRIPT_NAME,
             crate::web_search::NAMESPACE,
             crate::web_search::TOOL_NAME,
             crate::web_search::DESCRIPTION,
@@ -84,7 +86,7 @@ static EXEC_DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
         &[],
         &NAMESPACE_DESCRIPTIONS,
         code_runtime::DEFAULT_EXEC_YIELD_TIME_MS,
-        true,
+        INCLUDE_FIXED_CATALOGUE,
     )
 });
 
@@ -143,7 +145,7 @@ pub(crate) fn specifications() -> Vec<Value> {
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
-                "definition": CODE_MODE_FREEFORM_GRAMMAR,
+                "definition": EXEC_SOURCE_GRAMMAR,
             }
         }),
         json!({
@@ -181,7 +183,7 @@ pub(crate) fn specifications() -> Vec<Value> {
     ]
 }
 
-pub(crate) fn code_mode_tool_names() -> Value {
+pub(crate) fn nested_tool_name_map() -> Value {
     Value::Object(
         core_tools()
             .iter()
@@ -208,24 +210,24 @@ fn function_tool(
         name: name.to_string(),
         tool_name: ToolName::plain(name),
         description: description.to_string(),
-        kind: CodeModeToolKind::Function,
+        kind: ToolKind::Function,
         input_schema: Some(input_schema),
         output_schema,
     }
 }
 
 fn namespaced_function_tool(
-    code_mode_name: &str,
+    javascript_name: &str,
     namespace: &str,
     name: &str,
     description: &str,
     input_schema: Value,
 ) -> ToolDefinition {
     ToolDefinition {
-        name: code_mode_name.to_string(),
+        name: javascript_name.to_string(),
         tool_name: ToolName::namespaced(namespace, name),
         description: description.to_string(),
-        kind: CodeModeToolKind::Function,
+        kind: ToolKind::Function,
         input_schema: Some(input_schema),
         output_schema: None,
     }
@@ -236,7 +238,7 @@ fn freeform_tool(name: &str, description: &str) -> ToolDefinition {
         name: name.to_string(),
         tool_name: ToolName::plain(name),
         description: description.to_string(),
-        kind: CodeModeToolKind::Freeform,
+        kind: ToolKind::Freeform,
         input_schema: None,
         output_schema: None,
     }

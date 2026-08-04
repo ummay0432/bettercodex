@@ -63,8 +63,8 @@ the invoking user's permissions; BetterCodex does not sandbox them.
   conversation state, compaction, saved JSONL sessions, and resume.
 - `src/api.rs` and `src/api_websocket.rs`: Responses request assembly, HTTP/SSE,
   WebSockets, streaming, retries, and remote compaction.
-- `src/tools/`: Codex Code Mode, the nested tool catalogue, bounded command
-  execution, and patch application.
+- `src/tools/`: the fixed JavaScript exec runtime, nested tool catalogue,
+  bounded command execution, and patch application.
 - `src/tui/`: the Ratatui chat interface and terminal lifecycle.
 - `prompts/system.md`: the active system prompt. Edit it only when the user
   explicitly asks to edit the system prompt.
