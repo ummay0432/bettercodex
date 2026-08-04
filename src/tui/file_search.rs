@@ -1,0 +1,526 @@
+use codex_file_search::FileMatch;
+use codex_file_search::FileSearchOptions;
+use codex_file_search::FileSearchSession;
+use codex_file_search::FileSearchSnapshot;
+use codex_file_search::MatchType;
+use codex_file_search::SessionReporter;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::text::Span;
+use std::num::NonZeroUsize;
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
+use tokio::sync::mpsc::UnboundedSender;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+pub(super) const MAX_POPUP_ROWS: usize = 8;
+
+#[derive(Debug)]
+pub(super) enum FileSearchUpdate {
+    Matches {
+        query: String,
+        matches: Vec<FileMatch>,
+    },
+    Failed {
+        query: String,
+        message: String,
+    },
+}
+
+pub(super) struct FileSearchManager {
+    state: Arc<Mutex<SearchState>>,
+    search_root: PathBuf,
+    updates: UnboundedSender<FileSearchUpdate>,
+}
+
+struct SearchState {
+    latest_query: String,
+    session: Option<FileSearchSession>,
+    session_token: usize,
+}
+
+impl FileSearchManager {
+    pub(super) fn new(search_root: PathBuf, updates: UnboundedSender<FileSearchUpdate>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SearchState {
+                latest_query: String::new(),
+                session: None,
+                session_token: 0,
+            })),
+            search_root,
+            updates,
+        }
+    }
+
+    /// Updates the active fuzzy query. An empty query releases the filesystem index.
+    pub(super) fn on_query_changed(&self, query: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if query == state.latest_query {
+            return;
+        }
+        state.latest_query.clear();
+        state.latest_query.push_str(query);
+
+        if query.is_empty() {
+            state.session.take();
+            return;
+        }
+
+        if state.session.is_none()
+            && let Err(error) = self.start_session(&mut state)
+        {
+            let message = bounded_error(&error.to_string());
+            let _ = self.updates.send(FileSearchUpdate::Failed {
+                query: query.to_string(),
+                message,
+            });
+            return;
+        }
+        if let Some(session) = state.session.as_ref() {
+            session.update_query(query);
+        }
+    }
+
+    fn start_session(&self, state: &mut SearchState) -> anyhow::Result<()> {
+        state.session_token = state.session_token.wrapping_add(1);
+        let reporter = Arc::new(SearchReporter {
+            state: Arc::downgrade(&self.state),
+            updates: self.updates.clone(),
+            session_token: state.session_token,
+        });
+        let session = codex_file_search::create_session(
+            vec![self.search_root.clone()],
+            FileSearchOptions {
+                limit: NonZeroUsize::new(MAX_POPUP_ROWS)
+                    .expect("the file-search result limit is nonzero"),
+                compute_indices: true,
+                ..FileSearchOptions::default()
+            },
+            reporter,
+            None,
+        )?;
+        state.session = Some(session);
+        Ok(())
+    }
+}
+
+struct SearchReporter {
+    state: Weak<Mutex<SearchState>>,
+    updates: UnboundedSender<FileSearchUpdate>,
+    session_token: usize,
+}
+
+impl SessionReporter for SearchReporter {
+    fn on_update(&self, snapshot: &FileSearchSnapshot) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.session_token != self.session_token
+            || state.latest_query.is_empty()
+            || state.latest_query != snapshot.query
+        {
+            return;
+        }
+        drop(state);
+        let _ = self.updates.send(FileSearchUpdate::Matches {
+            query: snapshot.query.clone(),
+            matches: snapshot.matches.clone(),
+        });
+    }
+
+    fn on_complete(&self) {}
+}
+
+fn bounded_error(error: &str) -> String {
+    let mut characters = error.chars();
+    let shortened = characters.by_ref().take(160).collect::<String>();
+    if characters.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveToken {
+    range: Range<usize>,
+    query: String,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct FileSearchPopup {
+    token: Option<ActiveToken>,
+    dismissed_text: Option<String>,
+    display_query: String,
+    waiting: bool,
+    matches: Vec<FileMatch>,
+    selected: Option<usize>,
+    error: Option<String>,
+}
+
+impl FileSearchPopup {
+    pub(super) fn sync(&mut self, text: &str, cursor: usize) {
+        if self.dismissed_text.as_deref() != Some(text) {
+            self.dismissed_text = None;
+        }
+        let token = if self.dismissed_text.is_some() {
+            None
+        } else {
+            active_token(text, cursor)
+        };
+        if token == self.token {
+            return;
+        }
+
+        match token.as_ref() {
+            Some(token) if token.query.is_empty() => {
+                self.display_query.clear();
+                self.waiting = false;
+                self.matches.clear();
+                self.selected = None;
+                self.error = None;
+            }
+            Some(token) => {
+                self.waiting = true;
+                self.error = None;
+                if self
+                    .token
+                    .as_ref()
+                    .is_none_or(|previous| previous.range.start != token.range.start)
+                    && self.display_query != token.query
+                {
+                    self.matches.clear();
+                    self.selected = None;
+                    self.display_query.clear();
+                }
+            }
+            None => {
+                self.display_query.clear();
+                self.waiting = false;
+                self.matches.clear();
+                self.selected = None;
+                self.error = None;
+            }
+        }
+        self.token = token;
+    }
+
+    pub(super) fn query(&self) -> &str {
+        self.token
+            .as_ref()
+            .map(|token| token.query.as_str())
+            .filter(|query| !query.is_empty())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.token.is_some()
+    }
+
+    pub(super) fn dismiss(&mut self, editor_text: &str) {
+        self.dismissed_text = Some(editor_text.to_string());
+        self.token = None;
+        self.display_query.clear();
+        self.waiting = false;
+        self.matches.clear();
+        self.selected = None;
+        self.error = None;
+    }
+
+    pub(super) fn apply_update(&mut self, update: FileSearchUpdate) {
+        match update {
+            FileSearchUpdate::Matches { query, matches }
+                if self
+                    .token
+                    .as_ref()
+                    .is_some_and(|token| token.query == query) =>
+            {
+                self.display_query = query;
+                self.matches = matches.into_iter().take(MAX_POPUP_ROWS).collect();
+                self.waiting = false;
+                self.error = None;
+                self.selected = (!self.matches.is_empty())
+                    .then(|| self.selected.unwrap_or(0).min(self.matches.len() - 1));
+            }
+            FileSearchUpdate::Failed { query, message }
+                if self
+                    .token
+                    .as_ref()
+                    .is_some_and(|token| token.query == query) =>
+            {
+                self.display_query = query;
+                self.waiting = false;
+                self.matches.clear();
+                self.selected = None;
+                self.error = Some(format!("file search unavailable: {message}"));
+            }
+            FileSearchUpdate::Matches { .. } | FileSearchUpdate::Failed { .. } => {}
+        }
+    }
+
+    pub(super) fn move_up(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.selected = Some(match self.selected {
+            Some(0) | None => self.matches.len() - 1,
+            Some(selected) => selected - 1,
+        });
+    }
+
+    pub(super) fn move_down(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.selected = Some(match self.selected {
+            Some(selected) if selected + 1 < self.matches.len() => selected + 1,
+            Some(_) | None => 0,
+        });
+    }
+
+    pub(super) fn selected_path(&self) -> Option<(Range<usize>, String)> {
+        let token = self.token.as_ref()?;
+        let selected = self.selected?;
+        let path = self
+            .matches
+            .get(selected)?
+            .path
+            .to_string_lossy()
+            .into_owned();
+        Some((token.range.clone(), path))
+    }
+
+    pub(super) fn height(&self) -> u16 {
+        if !self.is_active() {
+            return 0;
+        }
+        let rows = self.matches.len().clamp(1, MAX_POPUP_ROWS) as u16;
+        rows.saturating_add(2)
+    }
+
+    pub(super) fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        if !self.is_active() {
+            return Vec::new();
+        }
+        let mut lines = if self.matches.is_empty() {
+            vec![
+                Line::from(format!("  {}", self.empty_message()))
+                    .dim()
+                    .italic(),
+            ]
+        } else {
+            self.matches
+                .iter()
+                .enumerate()
+                .map(|(index, file_match)| {
+                    file_match_line(file_match, Some(index) == self.selected, usize::from(width))
+                })
+                .collect()
+        };
+        lines.push(Line::default());
+        lines.push(Line::from("  enter insert · esc close · ↑/↓ select").dim());
+        lines
+    }
+
+    fn empty_message(&self) -> &str {
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|token| token.query.is_empty())
+        {
+            "type to search files"
+        } else if let Some(error) = self.error.as_deref() {
+            error
+        } else if self.waiting {
+            "searching files…"
+        } else {
+            "no matches"
+        }
+    }
+}
+
+fn active_token(text: &str, cursor: usize) -> Option<ActiveToken> {
+    let cursor = previous_char_boundary(text, cursor.min(text.len()));
+    let at_cursor = text[cursor..].chars().next();
+    if at_cursor.is_some_and(char::is_whitespace) {
+        return None;
+    }
+
+    let previous = text[..cursor].chars().next_back();
+    let start = if at_cursor == Some('@') && previous.is_none_or(char::is_whitespace) {
+        cursor
+    } else if previous.is_some_and(|character| !character.is_whitespace()) {
+        text[..cursor]
+            .char_indices()
+            .rfind(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8())
+    } else {
+        return None;
+    };
+    let end = text[cursor..]
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(text.len(), |(index, _)| cursor + index);
+    let candidate = text.get(start..end)?;
+    let query = candidate.strip_prefix('@')?;
+    Some(ActiveToken {
+        range: start..end,
+        query: query.to_string(),
+    })
+}
+
+fn previous_char_boundary(text: &str, mut index: usize) -> usize {
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn file_match_line(file_match: &FileMatch, selected: bool, width: usize) -> Line<'static> {
+    let path = file_match.path.to_string_lossy();
+    let (parent, name, name_char_start) = split_path(&path);
+    let indices = file_match.indices.as_deref().unwrap_or_default();
+    let mut content = matched_spans(
+        name,
+        name_char_start,
+        indices,
+        Style::default().fg(Color::Cyan),
+    );
+    content.push(Span::from("  "));
+    if name_char_start == 0 {
+        content.push(Span::styled(
+            parent.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    } else {
+        content.extend(matched_spans(
+            parent,
+            0,
+            indices,
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+
+    let tag = match file_match.match_type {
+        MatchType::File => "File",
+        MatchType::Directory => "Dir",
+    };
+    let gutter_width = 2;
+    let tag_width = UnicodeWidthStr::width(tag);
+    let tagged = width >= gutter_width + tag_width + 2;
+    let content_limit = if tagged {
+        width - gutter_width - tag_width - 2
+    } else {
+        width.saturating_sub(gutter_width)
+    };
+    let mut spans = vec![Span::from(if selected { "> " } else { "  " })];
+    let content = truncate_spans(content, content_limit);
+    let content_width = spans_width(&content);
+    spans.extend(content);
+    if tagged {
+        spans.push(Span::from(
+            " ".repeat(width - gutter_width - content_width - tag_width),
+        ));
+        spans.push(Span::from(tag).dim());
+    }
+    if selected {
+        let selected_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        for span in &mut spans {
+            span.style = selected_style;
+        }
+    }
+    Line::from(spans)
+}
+
+fn split_path(path: &str) -> (&str, &str, usize) {
+    let Some(separator) = path.rfind('/') else {
+        return ("./", path, 0);
+    };
+    let name_start = separator + 1;
+    let name_char_start = path[..name_start].chars().count();
+    (&path[..name_start], &path[name_start..], name_char_start)
+}
+
+fn matched_spans(
+    text: &str,
+    char_offset: usize,
+    indices: &[u32],
+    base: Style,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (index, character) in text.chars().enumerate() {
+        let matched = indices
+            .binary_search(&((char_offset + index) as u32))
+            .is_ok();
+        let style = if matched {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+        if let Some(previous) = spans.last_mut()
+            && previous.style == style
+        {
+            previous.content.to_mut().push(character);
+        } else {
+            spans.push(Span::styled(character.to_string(), style));
+        }
+    }
+    spans
+}
+
+fn truncate_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    if spans_width(&spans) <= width {
+        return spans;
+    }
+    if width == 0 {
+        return Vec::new();
+    }
+    let target = width.saturating_sub(1);
+    let mut used = 0;
+    let mut shortened = Vec::new();
+    'spans: for span in spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if used + grapheme_width > target {
+                if !content.is_empty() {
+                    shortened.push(Span::styled(content, span.style));
+                }
+                break 'spans;
+            }
+            content.push_str(grapheme);
+            used += grapheme_width;
+        }
+        if !content.is_empty() {
+            shortened.push(Span::styled(content, span.style));
+        }
+    }
+    shortened.push(Span::from("…").dim());
+    shortened
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+#[cfg(test)]
+#[path = "file_search_tests.rs"]
+mod tests;

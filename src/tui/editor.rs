@@ -25,6 +25,10 @@ impl Editor {
         &self.text
     }
 
+    pub(super) fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
@@ -100,6 +104,14 @@ impl Editor {
         self.leave_history();
         self.text.insert_str(self.cursor, value);
         self.cursor += value.len();
+        self.preferred_column = None;
+    }
+
+    pub(super) fn replace_range(&mut self, range: Range<usize>, value: &str) {
+        self.leave_history();
+        let start = range.start;
+        self.text.replace_range(range, value);
+        self.cursor = start + value.len();
         self.preferred_column = None;
     }
 
@@ -445,5 +457,14 @@ mod tests {
         assert_eq!(editor.text(), "first");
         editor.history_next();
         assert_eq!(editor.text(), "draft");
+    }
+
+    #[test]
+    fn replacing_a_completion_moves_the_cursor_after_it() {
+        let mut editor = Editor::default();
+        editor.insert("inspect @vie next");
+        editor.replace_range("inspect ".len().."inspect @vie".len(), "src/tui/view.rs");
+        assert_eq!(editor.text(), "inspect src/tui/view.rs next");
+        assert_eq!(editor.cursor(), "inspect src/tui/view.rs".len());
     }
 }

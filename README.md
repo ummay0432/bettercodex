@@ -64,6 +64,9 @@ The core shortcuts are:
 - Typing `/` opens completion for `/clear`, `/context`, `/help`, `/tools`, and
   `/exit`. `/context` opens a colored breakdown of the raw window, current
   request categories, free space before auto-compaction, and reserved headroom.
+- Typing `@` opens Git-ignore-aware fuzzy file search. `Up` and `Down` select a
+  result, `Enter` or `Tab` inserts its repository-relative path, and `Esc`
+  closes the search.
 
 When stdin or stdout is redirected, no-argument invocation falls back to the
 plain line interface. Passing a prompt remains a one-shot invocation.

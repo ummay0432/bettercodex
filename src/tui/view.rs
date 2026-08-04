@@ -2,6 +2,8 @@ use super::context_window::ContextAction;
 use super::context_window::ContextWindowView;
 use super::editor;
 use super::editor::Editor;
+use super::file_search::FileSearchPopup;
+use super::file_search::FileSearchUpdate;
 use super::markdown;
 use super::reasoning_status::ReasoningStatus;
 use super::tool_catalogue::CatalogueAction;
@@ -98,10 +100,12 @@ pub(super) struct View {
     clear_requested: bool,
     resize_reflow_requested: bool,
     editor: Editor,
+    file_search: FileSearchPopup,
     context_tokens: Option<u64>,
     busy: bool,
     interrupting: bool,
     working_since: Option<Instant>,
+    turn_had_work: bool,
     reasoning_status: ReasoningStatus,
     status_detail: Option<String>,
     queued: usize,
@@ -114,14 +118,43 @@ pub(super) struct View {
     process_commands: HashMap<i64, String>,
 }
 
+pub(super) struct PreparedView {
+    width: u16,
+    height: u16,
+    active_height: u16,
+    active_lines: Vec<Line<'static>>,
+}
+
+impl PreparedView {
+    pub(super) fn height(&self) -> u16 {
+        self.height
+    }
+}
+
 #[derive(Debug)]
 enum TranscriptEntry {
     User(String),
-    Assistant { text: String, streaming: bool },
+    Assistant {
+        text: String,
+        streaming: bool,
+        rendered: Option<RenderedAssistant>,
+    },
     Tool(ToolEntry),
-    Exploration { tools: Vec<ToolEntry>, sealed: bool },
+    Exploration {
+        tools: Vec<ToolEntry>,
+        sealed: bool,
+    },
     Notice(String),
     Error(String),
+    FinalMessageSeparator {
+        elapsed_seconds: Option<u64>,
+    },
+}
+
+#[derive(Debug)]
+struct RenderedAssistant {
+    width: u16,
+    lines: Vec<Line<'static>>,
 }
 
 #[derive(Debug)]
@@ -238,10 +271,12 @@ impl View {
             clear_requested: false,
             resize_reflow_requested: false,
             editor: Editor::default(),
+            file_search: FileSearchPopup::default(),
             context_tokens: None,
             busy: false,
             interrupting: false,
             working_since: None,
+            turn_had_work: false,
             reasoning_status: ReasoningStatus::default(),
             status_detail: None,
             queued: 0,
@@ -287,6 +322,7 @@ impl View {
         self.busy = true;
         self.interrupting = false;
         self.working_since = Some(Instant::now());
+        self.turn_had_work = false;
         self.reasoning_status.reset();
         self.status_detail = None;
         self.assistant_received_this_turn = false;
@@ -304,9 +340,13 @@ impl View {
         self.close_streaming_entries();
         self.seal_exploration();
         self.finish_incomplete_tools();
+        let elapsed_seconds = self
+            .working_since
+            .take()
+            .map(|started| started.elapsed().as_secs());
+        let turn_had_work = std::mem::take(&mut self.turn_had_work);
         self.busy = false;
         self.interrupting = false;
-        self.working_since = None;
         self.reasoning_status.reset();
         self.status_detail = None;
         match result {
@@ -315,7 +355,12 @@ impl View {
                     self.entries.push(TranscriptEntry::Assistant {
                         text: answer,
                         streaming: false,
+                        rendered: None,
                     });
+                }
+                if turn_had_work {
+                    self.entries
+                        .push(TranscriptEntry::FinalMessageSeparator { elapsed_seconds });
                 }
             }
             Ok(SubmitOutcome::Cancelled) => self
@@ -348,6 +393,14 @@ impl View {
         self.overlay = Some(Overlay::Context(ContextWindowView::new(snapshot)));
     }
 
+    pub(super) fn file_search_query(&self) -> &str {
+        self.file_search.query()
+    }
+
+    pub(super) fn handle_file_search_update(&mut self, update: FileSearchUpdate) {
+        self.file_search.apply_update(update);
+    }
+
     pub(super) fn clear(&mut self) {
         self.entries.clear();
         self.committed_entries = 0;
@@ -359,6 +412,7 @@ impl View {
         self.reasoning_status.reset();
         self.queued = 0;
         self.overlay = None;
+        self.file_search = FileSearchPopup::default();
         self.slash_selection = 0;
         self.dismissed_slash = None;
         self.process_commands.clear();
@@ -370,12 +424,18 @@ impl View {
                 self.seal_exploration();
                 self.assistant_received_this_turn = true;
                 match self.entries.last_mut() {
-                    Some(TranscriptEntry::Assistant { text, streaming }) if *streaming => {
+                    Some(TranscriptEntry::Assistant {
+                        text,
+                        streaming,
+                        rendered,
+                    }) if *streaming => {
                         text.push_str(&delta);
+                        *rendered = None;
                     }
                     _ => self.entries.push(TranscriptEntry::Assistant {
                         text: delta,
                         streaming: true,
+                        rendered: None,
                     }),
                 }
                 self.status_detail = None;
@@ -423,9 +483,19 @@ impl View {
                 output,
                 duration: _,
             } => {
-                if let Some(tool) = self.find_tool_mut(&call_id) {
+                let completed_work = self.find_tool_mut(&call_id).is_some_and(|tool| {
+                    let completed_work = matches!(
+                        &tool.display,
+                        ToolDisplay::Command { .. }
+                            | ToolDisplay::Interaction { .. }
+                            | ToolDisplay::Patch(_)
+                            | ToolDisplay::WebSearch(_)
+                            | ToolDisplay::Other
+                    );
                     tool.outcome = Some(ToolOutcome { output });
-                }
+                    completed_work
+                });
+                self.turn_had_work |= completed_work;
                 self.remember_process_command(&call_id);
                 self.repository = Repository::discover(&self.cwd);
                 self.status_detail = self.latest_tool_activity();
@@ -446,7 +516,7 @@ impl View {
     }
 
     pub(super) fn handle_terminal_event(&mut self, event: Event) -> Action {
-        match event {
+        let action = match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
             }
@@ -463,7 +533,10 @@ impl View {
                 Action::None
             }
             _ => Action::None,
-        }
+        };
+        self.file_search
+            .sync(self.editor.text(), self.editor.cursor());
+        action
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -488,6 +561,10 @@ impl View {
             return Action::None;
         }
         if key.code == KeyCode::Esc {
+            if self.file_search.is_active() {
+                self.file_search.dismiss(self.editor.text());
+                return Action::None;
+            }
             if !self.slash_matches().is_empty() {
                 self.dismissed_slash = Some(self.editor.text().to_string());
                 return Action::None;
@@ -501,6 +578,33 @@ impl View {
         if key.code == KeyCode::Char('?') && self.editor.is_empty() {
             self.overlay = Some(Overlay::Shortcuts);
             return Action::None;
+        }
+
+        if self.file_search.is_active() {
+            if key.code == KeyCode::Up
+                || (key.code == KeyCode::Char('p') && control && !alt && !shift)
+            {
+                self.file_search.move_up();
+                return Action::None;
+            }
+            if key.code == KeyCode::Down
+                || (key.code == KeyCode::Char('n') && control && !alt && !shift)
+            {
+                self.file_search.move_down();
+                return Action::None;
+            }
+            match key.code {
+                KeyCode::Tab => {
+                    if !self.insert_selected_file() {
+                        self.file_search.dismiss(self.editor.text());
+                    }
+                    return Action::None;
+                }
+                KeyCode::Enter if !shift && !alt && !control && self.insert_selected_file() => {
+                    return Action::None;
+                }
+                _ => {}
+            }
         }
 
         let slash_matches = self.slash_matches();
@@ -587,6 +691,54 @@ impl View {
         Action::None
     }
 
+    fn insert_selected_file(&mut self) -> bool {
+        let Some((token_range, path)) = self.file_search.selected_path() else {
+            return false;
+        };
+        let inserted = if path.chars().any(char::is_whitespace) && !path.contains('"') {
+            format!("\"{path}\"")
+        } else {
+            path
+        };
+        self.editor.replace_range(token_range, &inserted);
+        self.advance_past_completion_separator();
+        self.file_search.dismiss(self.editor.text());
+        true
+    }
+
+    fn advance_past_completion_separator(&mut self) {
+        let cursor = self.editor.cursor();
+        let separator = self.editor.text()[cursor..]
+            .chars()
+            .next()
+            .filter(|character| {
+                character.is_whitespace()
+                    && !matches!(
+                        *character,
+                        '\n' | '\r'
+                            | '\u{000B}'
+                            | '\u{000C}'
+                            | '\u{0085}'
+                            | '\u{2028}'
+                            | '\u{2029}'
+                    )
+            });
+        let Some(separator) = separator else {
+            self.editor.insert(" ");
+            return;
+        };
+        let after_separator = cursor + separator.len_utf8();
+        if self.editor.text()[after_separator..]
+            .chars()
+            .next()
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            self.editor.insert(" ");
+        } else {
+            self.editor.move_right();
+        }
+    }
+
     fn submit_action(&mut self, queued: bool) -> Action {
         if self.editor.text().trim().is_empty() {
             return Action::None;
@@ -605,7 +757,7 @@ impl View {
             "/context" => Action::ShowContext,
             "/help" => {
                 self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · Tab queue · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
+                    "Enter submit/steer · Tab queue · @ files · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
                         .to_string(),
                 ));
                 Action::None
@@ -627,7 +779,8 @@ impl View {
                 TranscriptEntry::Tool(_)
                 | TranscriptEntry::Exploration { .. }
                 | TranscriptEntry::Notice(_)
-                | TranscriptEntry::Error(_) => {}
+                | TranscriptEntry::Error(_)
+                | TranscriptEntry::FinalMessageSeparator { .. } => {}
             }
         }
     }
@@ -709,7 +862,7 @@ impl View {
             .get(self.committed_entries)
             .is_some_and(TranscriptEntry::is_finalized)
         {
-            let entry = &self.entries[self.committed_entries];
+            let entry = &mut self.entries[self.committed_entries];
             append_history_cell(
                 entry.display_lines(width, self.user_message_style),
                 &mut lines,
@@ -738,7 +891,7 @@ impl View {
         let mut lines = Vec::new();
         let mut emitted = false;
         append_history_cell(welcome_lines(&self.cwd, width), &mut lines, &mut emitted);
-        for entry in &self.entries[..self.committed_entries] {
+        for entry in &mut self.entries[..self.committed_entries] {
             append_history_cell(
                 entry.display_lines(width, self.user_message_style),
                 &mut lines,
@@ -750,8 +903,33 @@ impl View {
         lines
     }
 
+    #[cfg(test)]
     pub(super) fn desired_height(&mut self, width: u16, screen_height: u16) -> u16 {
         let width = width.max(1);
+        let active_lines = self.active_lines(width);
+        let active_height = rendered_line_count(&active_lines, width);
+        self.desired_height_with_active_history(width, screen_height, active_height)
+    }
+
+    pub(super) fn prepare(&mut self, width: u16, screen_height: u16) -> PreparedView {
+        let width = width.max(1);
+        let active_lines = self.active_lines(width);
+        let active_height = rendered_line_count(&active_lines, width);
+        let height = self.desired_height_with_active_history(width, screen_height, active_height);
+        PreparedView {
+            width,
+            height,
+            active_height,
+            active_lines,
+        }
+    }
+
+    fn desired_height_with_active_history(
+        &mut self,
+        width: u16,
+        screen_height: u16,
+        active_height: u16,
+    ) -> u16 {
         self.composer_text_width = width.saturating_sub(3).max(1);
         let editor = self
             .editor
@@ -760,8 +938,7 @@ impl View {
         let status_height = u16::from(self.busy);
         let status_composer_spacing = COMPOSER_STATUS_GAP.saturating_mul(status_height);
         let bottom_spacing = 1;
-        let active_height = rendered_line_count(&self.active_lines(width), width);
-        let popup_height = self.slash_popup_height(width);
+        let popup_height = self.completion_popup_height(width);
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
         // extends downward from the composer instead of becoming an overlay above it.
         let trailing_height = if popup_height > 0 {
@@ -785,7 +962,17 @@ impl View {
             .clamp(1, screen_height.max(1))
     }
 
+    #[cfg(test)]
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
+        self.render_frame(frame, None);
+    }
+
+    pub(super) fn render_prepared(&mut self, frame: &mut Frame<'_>, prepared: PreparedView) {
+        let prepared = (frame.area().width.max(1) == prepared.width).then_some(prepared);
+        self.render_frame(frame, prepared);
+    }
+
+    fn render_frame(&mut self, frame: &mut Frame<'_>, prepared: Option<PreparedView>) {
         let area = frame.area();
         if area.is_empty() {
             return;
@@ -799,7 +986,7 @@ impl View {
         let popup_height = if self.overlay.is_some() {
             0
         } else {
-            self.slash_popup_height(area.width)
+            self.completion_popup_height(area.width)
         };
         let trailing_height = if popup_height > 0 {
             popup_height
@@ -846,7 +1033,7 @@ impl View {
             history_bottom.saturating_sub(area.y),
         );
 
-        self.render_active_history(frame, history_area);
+        self.render_active_history(frame, history_area, prepared);
         if status_height > 0 {
             frame.render_widget(
                 Paragraph::new(truncate_line(
@@ -858,7 +1045,7 @@ impl View {
         }
         self.render_composer(frame, composer_area, footer_area, editor_layout);
         if self.overlay.is_none() {
-            self.render_slash_popup(frame, popup_area);
+            self.render_completion_popup(frame, popup_area);
         }
         match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
@@ -868,18 +1055,28 @@ impl View {
         }
     }
 
-    fn render_active_history(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_active_history(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        prepared: Option<PreparedView>,
+    ) {
         if area.is_empty() {
             return;
         }
-        let lines = self.active_lines(area.width);
+        let (lines, active_height) = prepared.map_or_else(
+            || {
+                let lines = self.active_lines(area.width);
+                let active_height = rendered_line_count(&lines, area.width);
+                (lines, active_height)
+            },
+            |prepared| (prepared.active_lines, prepared.active_height),
+        );
         if lines.is_empty() {
             return;
         }
         let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-        let overflow = paragraph
-            .line_count(area.width)
-            .saturating_sub(usize::from(area.height));
+        let overflow = usize::from(active_height).saturating_sub(usize::from(area.height));
         frame.render_widget(
             paragraph.scroll((u16::try_from(overflow).unwrap_or(u16::MAX), 0)),
             area,
@@ -960,6 +1157,7 @@ impl View {
             shortcut_line("Enter while working", "send steering input"),
             shortcut_line("Tab while working", "queue next prompt"),
             shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
+            shortcut_line("@", "find and insert a file path"),
             shortcut_line("Esc", "interrupt active turn"),
             shortcut_line("Up / Down", "restore prompt history"),
             shortcut_line("Ctrl+W", "delete previous word"),
@@ -968,6 +1166,23 @@ impl View {
             Line::from("Press any key to close").dim(),
         ];
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_completion_popup(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.file_search.is_active() {
+            if area.is_empty() {
+                return;
+            }
+            let lines = self
+                .file_search
+                .lines(area.width)
+                .into_iter()
+                .map(|line| truncate_line(line, usize::from(area.width)))
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines), area);
+        } else {
+            self.render_slash_popup(frame, area);
+        }
     }
 
     fn render_slash_popup(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1022,6 +1237,14 @@ impl View {
 
     fn slash_popup_height(&self, _width: u16) -> u16 {
         u16::try_from(self.slash_matches().len()).unwrap_or(u16::MAX)
+    }
+
+    fn completion_popup_height(&self, width: u16) -> u16 {
+        if self.file_search.is_active() {
+            self.file_search.height()
+        } else {
+            self.slash_popup_height(width)
+        }
     }
 
     fn slash_matches(&self) -> Vec<&'static SlashCommand> {
@@ -1101,10 +1324,10 @@ impl View {
         truncate_line(Line::from(spans), usize::from(width))
     }
 
-    fn active_lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn active_lines(&mut self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let mut emitted = self.history_emitted;
-        for entry in &self.entries[self.committed_entries..] {
+        for entry in &mut self.entries[self.committed_entries..] {
             append_history_cell(
                 entry.display_lines(width, self.user_message_style),
                 &mut lines,
@@ -1118,7 +1341,10 @@ impl View {
 impl TranscriptEntry {
     fn is_finalized(&self) -> bool {
         match self {
-            Self::User(_) | Self::Notice(_) | Self::Error(_) => true,
+            Self::User(_)
+            | Self::Notice(_)
+            | Self::Error(_)
+            | Self::FinalMessageSeparator { .. } => true,
             Self::Assistant { streaming, .. } => !streaming,
             Self::Tool(tool) => tool.outcome.is_some(),
             Self::Exploration { tools, sealed } => {
@@ -1127,10 +1353,33 @@ impl TranscriptEntry {
         }
     }
 
-    fn display_lines(&self, width: u16, user_style: Style) -> Vec<Line<'static>> {
+    fn display_lines(&mut self, width: u16, user_style: Style) -> Vec<Line<'static>> {
         match self {
             Self::User(message) => user_message_lines(message, width, user_style),
-            Self::Assistant { text, .. } => assistant_lines(text, width),
+            Self::Assistant {
+                text,
+                streaming,
+                rendered,
+            } => {
+                if rendered.as_ref().is_none_or(|cached| cached.width != width) {
+                    *rendered = Some(RenderedAssistant {
+                        width,
+                        lines: assistant_lines(text, width),
+                    });
+                }
+                if *streaming {
+                    rendered
+                        .as_ref()
+                        .expect("streaming assistant rendering was cached")
+                        .lines
+                        .clone()
+                } else {
+                    rendered
+                        .take()
+                        .expect("finalized assistant rendering was cached")
+                        .lines
+                }
+            }
             Self::Tool(tool) => tool.display_lines(width, user_style),
             Self::Exploration { tools, .. } => exploration_lines(tools, width),
             Self::Notice(message) => vec![Line::from(vec![
@@ -1141,6 +1390,9 @@ impl TranscriptEntry {
                 Span::styled("■ ", Style::default().fg(Color::Red)),
                 Span::styled(message.clone(), Style::default().fg(Color::Red)),
             ])],
+            Self::FinalMessageSeparator { elapsed_seconds } => {
+                final_message_separator_lines(*elapsed_seconds, width)
+            }
         }
     }
 }
@@ -1849,6 +2101,28 @@ fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
     prefix_styled_lines(wrapped, "• ", "  ")
 }
 
+fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Vec<Line<'static>> {
+    let Some(elapsed) = elapsed_seconds
+        .filter(|seconds| *seconds > 60)
+        .map(format_elapsed)
+    else {
+        return vec![Line::from("─".repeat(usize::from(width))).dim()];
+    };
+
+    let label = format!("─ Worked for {elapsed} ─")
+        .chars()
+        .take(usize::from(width))
+        .collect::<String>();
+    let label_width = UnicodeWidthStr::width(label.as_str());
+    vec![
+        Line::from_iter([
+            label,
+            "─".repeat(usize::from(width).saturating_sub(label_width)),
+        ])
+        .dim(),
+    ]
+}
+
 fn command_lines(tool: &ToolEntry, command: &str, width: u16) -> Vec<Line<'static>> {
     let (bullet, title) = match tool.succeeded() {
         None => (activity_marker(Some(tool.started_at)), "Running"),
@@ -2536,6 +2810,8 @@ mod tests {
     use super::*;
     use crate::context::ContextKind;
     use crate::context::ContextSection;
+    use codex_file_search::FileMatch;
+    use codex_file_search::MatchType;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
@@ -2645,6 +2921,79 @@ mod tests {
             ),
             ("•", "›", "g"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn completed_work_turn_renders_the_codex_worked_for_separator() {
+        const WIDTH: u16 = 80;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "call-1".to_string(),
+            name: "exec_command".to_string(),
+            input: Some(json!({"cmd": "true"})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "call-1".to_string(),
+            output: Ok(json!({"exit_code": 0, "output": ""})),
+            duration: Duration::from_millis(10),
+        });
+        view.handle_agent_event(AgentEvent::ModelTextDelta("Done.".to_string()));
+        view.handle_agent_event(AgentEvent::ModelItemCompleted);
+        view.working_since = Some(Instant::now() - Duration::from_secs(125));
+        view.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
+
+        let height = view.desired_height(WIDTH, 30);
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let separator_y = rows
+            .iter()
+            .position(|row| row.contains("Worked for"))
+            .expect("rendered worked-for separator") as u16;
+        let label = "─ Worked for 2m 05s ─";
+        assert_eq!(
+            rows[usize::from(separator_y)],
+            format!(
+                "{label}{}",
+                "─".repeat(usize::from(WIDTH) - UnicodeWidthStr::width(label))
+            )
+        );
+        assert!((0..WIDTH).all(|x| buffer[(x, separator_y)].modifier.contains(Modifier::DIM)));
+    }
+
+    #[test]
+    fn worked_for_separator_matches_codex_visibility_and_clipping() {
+        assert_eq!(
+            plain(&final_message_separator_lines(Some(60), 24)[0]),
+            "─".repeat(24)
+        );
+        assert_eq!(
+            plain(&final_message_separator_lines(Some(61), 24)[0]),
+            "─ Worked for 1m 01s ────"
+        );
+        assert_eq!(
+            plain(&final_message_separator_lines(Some(61), 8)[0]),
+            "─ Worked"
+        );
+
+        let mut conversational = View::new(Path::new("/tmp/bettercodex"));
+        conversational.welcome_pending = false;
+        conversational.start_turn("test");
+        conversational.working_since = Some(Instant::now() - Duration::from_secs(125));
+        conversational.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
+        assert!(
+            conversational
+                .take_pending_history_lines(80)
+                .iter()
+                .all(|line| !plain(line).contains("Worked for"))
         );
     }
 
@@ -2791,6 +3140,120 @@ mod tests {
             Action::None
         );
         assert_eq!(view.editor.text(), "/tools");
+    }
+
+    #[test]
+    fn file_search_renders_fuzzy_results_and_inserts_the_selected_path() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        for character in "@vie".chars() {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+        assert_eq!(view.file_search_query(), "vie");
+        view.handle_file_search_update(FileSearchUpdate::Matches {
+            query: "vie".to_string(),
+            matches: vec![
+                FileMatch {
+                    score: 100,
+                    path: PathBuf::from("src/tui/view.rs"),
+                    match_type: MatchType::File,
+                    root: PathBuf::from("/tmp/bettercodex"),
+                    indices: Some(vec![8, 9, 10]),
+                },
+                FileMatch {
+                    score: 90,
+                    path: PathBuf::from("src/view_model.rs"),
+                    match_type: MatchType::File,
+                    root: PathBuf::from("/tmp/bettercodex"),
+                    indices: Some(vec![4, 5, 6]),
+                },
+            ],
+        });
+
+        let height = view.desired_height(60, 24);
+        assert_eq!(height, 8);
+        let backend = TestBackend::new(60, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let selected_y = rendered
+            .lines()
+            .position(|line| line.contains("> view.rs  src/tui/"))
+            .expect("selected file row") as u16;
+        assert!(rendered.contains("view_model.rs  src/"), "{rendered}");
+        assert!(
+            rendered.contains("enter insert · esc close · ↑/↓ select"),
+            "{rendered}"
+        );
+        assert_eq!(buffer[(0, selected_y)].symbol(), ">");
+        assert_eq!(buffer[(2, selected_y)].fg, Color::Cyan);
+        assert!(buffer[(2, selected_y)].modifier.contains(Modifier::BOLD));
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "src/view_model.rs ");
+        assert_eq!(view.file_search_query(), "");
+    }
+
+    #[test]
+    fn file_search_quotes_paths_with_spaces_and_escape_only_closes_the_popup() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        for character in "@design".chars() {
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        }
+        view.handle_file_search_update(FileSearchUpdate::Matches {
+            query: "design".to_string(),
+            matches: vec![FileMatch {
+                score: 100,
+                path: PathBuf::from("docs/design note.md"),
+                match_type: MatchType::File,
+                root: PathBuf::from("/tmp/bettercodex"),
+                indices: Some(vec![5, 6, 7, 8, 9, 10]),
+            }],
+        });
+        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(view.editor.text(), "\"docs/design note.md\" ");
+
+        view.editor.set_text("@");
+        view.file_search
+            .sync(view.editor.text(), view.editor.cursor());
+        let height = view.desired_height(52, 20);
+        let backend = TestBackend::new(52, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("type to search files"), "{rendered}");
+
+        view.busy = true;
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert!(view.busy);
+        assert!(!view.file_search.is_active());
     }
 
     #[test]

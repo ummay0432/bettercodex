@@ -1,0 +1,189 @@
+use super::MAX_READY_AGENT_EVENTS;
+use super::ReceiverState;
+use super::drain_ready_agent_events;
+use super::view::View;
+use crate::events::AgentEvent;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use std::path::Path;
+use std::time::Instant;
+use tokio::sync::mpsc::unbounded_channel;
+
+#[test]
+fn ready_stream_events_are_drained_before_the_terminal_frame() {
+    const DELTAS: usize = 128;
+    const WIDTH: u16 = 80;
+    const SCREEN_HEIGHT: u16 = 24;
+
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn("render a response");
+    let _ = view.take_pending_history_lines(WIDTH);
+    let (events, mut ready) = unbounded_channel();
+    for index in 0..DELTAS {
+        events
+            .send(AgentEvent::ModelTextDelta(format!(
+                "streamed line {index}\n"
+            )))
+            .unwrap();
+    }
+    drop(events);
+
+    let mut applied = 0;
+    let state = drain_ready_agent_events(&mut ready, |event| {
+        applied += 1;
+        view.handle_agent_event(event);
+    });
+
+    assert_eq!((state, applied), (ReceiverState::Closed, DELTAS));
+    let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+    let height = prepared.height();
+    let backend = TestBackend::new(WIDTH, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| view.render_prepared(frame, prepared))
+        .unwrap();
+    let rendered = render_buffer(terminal.backend().buffer());
+    let visible_text = rendered
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(visible_text.contains("streamedline127"), "{rendered}");
+}
+
+#[test]
+fn ready_event_drain_yields_to_the_event_loop_at_its_bound() {
+    let (events, mut ready) = unbounded_channel();
+    for _ in 0..=MAX_READY_AGENT_EVENTS {
+        events
+            .send(AgentEvent::ModelItemCompleted)
+            .expect("receiver remains open");
+    }
+    drop(events);
+
+    let mut applied = 0;
+    let first = drain_ready_agent_events(&mut ready, |_| applied += 1);
+    assert_eq!(
+        (first, applied),
+        (ReceiverState::Open, MAX_READY_AGENT_EVENTS)
+    );
+
+    let second = drain_ready_agent_events(&mut ready, |_| applied += 1);
+    assert_eq!(
+        (second, applied),
+        (ReceiverState::Closed, MAX_READY_AGENT_EVENTS + 1)
+    );
+}
+
+#[test]
+fn prepared_streaming_layout_tracks_new_deltas_and_finalizes_to_history() {
+    const WIDTH: u16 = 80;
+    const SCREEN_HEIGHT: u16 = 24;
+
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn("render a cached response");
+    let _ = view.take_pending_history_lines(WIDTH);
+    view.handle_agent_event(AgentEvent::ModelTextDelta("**alpha**".to_string()));
+    assert!(render_view(&mut view, WIDTH, SCREEN_HEIGHT).contains("alpha"));
+
+    view.handle_agent_event(AgentEvent::ModelTextDelta(" omega".to_string()));
+    let updated = render_view(&mut view, WIDTH, SCREEN_HEIGHT);
+    assert!(updated.contains("alpha omega"), "{updated}");
+
+    view.handle_agent_event(AgentEvent::ModelItemCompleted);
+    let finalized = view
+        .take_pending_history_lines(WIDTH)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(finalized.contains("alpha omega"), "{finalized}");
+}
+
+#[test]
+fn prepared_layout_reflows_if_the_terminal_resizes_before_draw() {
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn("render across a resize");
+    let _ = view.take_pending_history_lines(80);
+    view.handle_agent_event(AgentEvent::ModelTextDelta(
+        "a response wide enough to reflow at the narrower width resize-marker".to_string(),
+    ));
+    let prepared = view.prepare(80, 24);
+    let backend = TestBackend::new(32, prepared.height());
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| view.render_prepared(frame, prepared))
+        .unwrap();
+
+    let rendered = render_buffer(terminal.backend().buffer());
+    let visible_text = rendered
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(visible_text.contains("resize-marker"), "{rendered}");
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_streaming_markdown_event_burst() {
+    const DELTAS: usize = 2_000;
+    const WIDTH: u16 = 100;
+    const SCREEN_HEIGHT: u16 = 40;
+
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn("measure streaming rendering");
+    let _ = view.take_pending_history_lines(WIDTH);
+    let (events, mut ready) = unbounded_channel();
+    for index in 0..DELTAS {
+        events
+            .send(AgentEvent::ModelTextDelta(format!(
+                "token {index} with **markdown** and `code`\n"
+            )))
+            .unwrap();
+    }
+    drop(events);
+
+    let started = Instant::now();
+    let state = drain_ready_agent_events(&mut ready, |event| view.handle_agent_event(event));
+    let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+    let height = prepared.height();
+    let backend = TestBackend::new(WIDTH, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| view.render_prepared(frame, prepared))
+        .unwrap();
+    std::hint::black_box(terminal.backend().buffer());
+    assert_eq!(state, ReceiverState::Closed);
+    eprintln!(
+        "{DELTAS} streaming deltas drained into one frame: {:?}",
+        started.elapsed()
+    );
+}
+
+fn render_buffer(buffer: &ratatui::buffer::Buffer) -> String {
+    let area = buffer.area;
+    (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_view(view: &mut View, width: u16, screen_height: u16) -> String {
+    let prepared = view.prepare(width, screen_height);
+    let height = prepared.height();
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| view.render_prepared(frame, prepared))
+        .unwrap();
+    render_buffer(terminal.backend().buffer())
+}
