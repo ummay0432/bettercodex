@@ -18,12 +18,14 @@ use ratatui::widgets::Paragraph;
 const MUTED: Color = Color::Indexed(245);
 const RULE: Color = Color::Indexed(8);
 const PREFERRED_WIDTH: u16 = 86;
-const PREFERRED_HEIGHT: u16 = 21;
+const BORDER_SIZE: u16 = 2;
+const HEADER_HEIGHT: u16 = 3;
+const FOOTER_HEIGHT: u16 = 1;
+const MIN_GRID_WIDTH: u16 = 58;
 const GRID_COLUMNS: usize = 10;
 const GRID_ROWS: usize = 10;
 const GRID_CELLS: usize = GRID_COLUMNS * GRID_ROWS;
-
-pub(super) const VIEWPORT_HEIGHT: u16 = PREFERRED_HEIGHT;
+const PANEL_CHROME_HEIGHT: u16 = BORDER_SIZE + HEADER_HEIGHT + FOOTER_HEIGHT;
 
 pub(super) struct ContextWindowView {
     snapshot: ContextSnapshot,
@@ -51,6 +53,10 @@ impl ContextWindowView {
         self.snapshot = snapshot;
     }
 
+    pub(super) fn preferred_height(&self, width: u16) -> u16 {
+        panel_height(width, self.segments().len())
+    }
+
     pub(super) fn handle_key(&self, code: KeyCode) -> ContextAction {
         match code {
             KeyCode::Esc | KeyCode::Char('q') => ContextAction::Close,
@@ -63,11 +69,12 @@ impl ContextWindowView {
             return;
         }
         frame.render_widget(Clear, area);
+        let segments = self.segments();
         let panel = Rect::new(
             area.x,
             area.y,
             PREFERRED_WIDTH.min(area.width),
-            PREFERRED_HEIGHT.min(area.height),
+            panel_height(area.width, segments.len()).min(area.height),
         );
         let block = Block::default()
             .title(" Context ")
@@ -79,12 +86,8 @@ impl ContextWindowView {
             return;
         }
 
-        let footer_height = u16::from(inner.height >= 2);
-        let header_height = if inner.height >= 6 {
-            3
-        } else {
-            inner.height.saturating_sub(footer_height)
-        };
+        let footer_height = FOOTER_HEIGHT.min(inner.height.saturating_sub(1));
+        let header_height = HEADER_HEIGHT.min(inner.height.saturating_sub(footer_height));
         let body_height = inner
             .height
             .saturating_sub(header_height)
@@ -94,7 +97,6 @@ impl ContextWindowView {
         let footer_area = Rect::new(inner.x, body_area.bottom(), inner.width, footer_height);
 
         self.render_header(frame, header_area);
-        let segments = self.segments();
         self.render_body(frame, body_area, &segments);
         if !footer_area.is_empty() {
             frame.render_widget(
@@ -134,7 +136,7 @@ impl ContextWindowView {
         if area.is_empty() {
             return;
         }
-        if area.width >= 58 && area.height >= GRID_ROWS as u16 {
+        if area.width >= MIN_GRID_WIDTH && area.height >= GRID_ROWS as u16 {
             let grid_width = 21.min(area.width);
             let grid_area = Rect::new(area.x, area.y, grid_width, area.height);
             let legend_x = grid_area.right().saturating_add(1).min(area.right());
@@ -218,6 +220,17 @@ impl ContextWindowView {
         }
         segments
     }
+}
+
+fn panel_height(width: u16, legend_rows: usize) -> u16 {
+    let legend_rows = u16::try_from(legend_rows).unwrap_or(u16::MAX);
+    let inner_width = PREFERRED_WIDTH.min(width).saturating_sub(BORDER_SIZE);
+    let body_height = if inner_width >= MIN_GRID_WIDTH {
+        legend_rows.max(GRID_ROWS as u16)
+    } else {
+        legend_rows
+    };
+    PANEL_CHROME_HEIGHT.saturating_add(body_height)
 }
 
 fn render_legend(frame: &mut Frame<'_>, area: Rect, segments: &[Segment], total: u64) {

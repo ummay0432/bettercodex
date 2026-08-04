@@ -1,6 +1,5 @@
 use super::context_window::ContextAction;
 use super::context_window::ContextWindowView;
-use super::context_window::VIEWPORT_HEIGHT as CONTEXT_VIEWPORT_HEIGHT;
 use super::editor;
 use super::editor::Editor;
 use super::markdown;
@@ -766,7 +765,7 @@ impl View {
         let trailing_height = if popup_height > 0 { popup_height } else { 2 };
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => 15,
-            Some(Overlay::Context(_)) => CONTEXT_VIEWPORT_HEIGHT,
+            Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Tools(_)) => TOOL_CATALOGUE_VIEWPORT_HEIGHT,
             None => 0,
         };
@@ -2709,9 +2708,9 @@ mod tests {
             }],
         });
         assert!(matches!(view.overlay.as_ref(), Some(Overlay::Context(_))));
-        assert_eq!(view.desired_height(92, 30), CONTEXT_VIEWPORT_HEIGHT);
+        assert_eq!(view.desired_height(92, 30), 16);
 
-        let backend = TestBackend::new(92, CONTEXT_VIEWPORT_HEIGHT);
+        let backend = TestBackend::new(92, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());

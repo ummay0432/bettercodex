@@ -92,7 +92,9 @@ fn renders_capacity_grid_categories_and_compaction_headroom() {
         ],
         [1, 2, 1, 3, 4, 3, 6, 75, 5]
     );
-    let backend = TestBackend::new(92, VIEWPORT_HEIGHT);
+    assert_eq!(context.preferred_height(92), 16);
+    assert_eq!(context.preferred_height(40), 15);
+    let backend = TestBackend::new(92, context.preferred_height(92));
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| context.render(frame, frame.area()))
@@ -126,7 +128,7 @@ fn renders_capacity_grid_categories_and_compaction_headroom() {
 fn omits_accounting_notes() {
     for measured in [false, true] {
         let context = ContextWindowView::new(snapshot(measured));
-        let backend = TestBackend::new(92, VIEWPORT_HEIGHT);
+        let backend = TestBackend::new(92, context.preferred_height(92));
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| context.render(frame, frame.area()))
@@ -140,6 +142,41 @@ fn omits_accounting_notes() {
         );
         assert!(!rendered.contains("Each square is 1%"), "{rendered}");
     }
+}
+
+#[test]
+fn height_expands_to_fit_a_legend_larger_than_the_grid() {
+    let mut snapshot = snapshot(true);
+    snapshot.sections.extend([
+        ContextSection {
+            kind: ContextKind::Environment,
+            tokens: 1,
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::Compaction,
+            tokens: 1,
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::Other,
+            tokens: 1,
+            items: 1,
+        },
+    ]);
+    let context = ContextWindowView::new(snapshot);
+    assert_eq!(context.segments().len(), 12);
+    assert_eq!(context.preferred_height(92), 18);
+
+    let backend = TestBackend::new(92, context.preferred_height(92));
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| context.render(frame, frame.area()))
+        .unwrap();
+    let rendered = render_buffer(terminal.backend().buffer());
+    assert!(rendered.contains("Compacted history"), "{rendered}");
+    assert!(rendered.contains("Other"), "{rendered}");
+    assert!(rendered.contains("Auto-compact reserve"), "{rendered}");
 }
 
 #[test]
