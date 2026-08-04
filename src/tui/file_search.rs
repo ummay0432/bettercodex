@@ -232,6 +232,10 @@ impl FileSearchPopup {
 
     pub(super) fn dismiss(&mut self, editor_text: &str) {
         self.dismissed_text = Some(editor_text.to_string());
+        self.hide();
+    }
+
+    pub(super) fn hide(&mut self) {
         self.token = None;
         self.display_query.clear();
         self.waiting = false;

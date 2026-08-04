@@ -54,7 +54,8 @@ const MAX_EDITOR_ROWS: u16 = 8;
 const LIVE_PREFIX_COLS: u16 = 2;
 const TOOL_OUTPUT_MAX_ROWS: usize = 5;
 const COMMAND_CONTINUATION_MAX_ROWS: usize = 2;
-const COMPOSER_STATUS_GAP: u16 = 1;
+const ACTIVITY_COMPOSER_GAP: u16 = 1;
+const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
@@ -534,8 +535,12 @@ impl View {
             }
             _ => Action::None,
         };
-        self.file_search
-            .sync(self.editor.text(), self.editor.cursor());
+        if self.editor.is_browsing_history() {
+            self.file_search.hide();
+        } else {
+            self.file_search
+                .sync(self.editor.text(), self.editor.cursor());
+        }
         action
     }
 
@@ -936,7 +941,7 @@ impl View {
             .layout(self.composer_text_width, MAX_EDITOR_ROWS);
         let composer_height = (editor.lines.len() as u16).max(1).saturating_add(2);
         let status_height = u16::from(self.busy);
-        let status_composer_spacing = COMPOSER_STATUS_GAP.saturating_mul(status_height);
+        let status_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(status_height);
         let bottom_spacing = 1;
         let popup_height = self.completion_popup_height(width);
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
@@ -944,7 +949,7 @@ impl View {
         let trailing_height = if popup_height > 0 {
             popup_height
         } else {
-            COMPOSER_STATUS_GAP.saturating_add(STATUS_LINE_HEIGHT)
+            COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
         };
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => 15,
@@ -991,7 +996,7 @@ impl View {
         let trailing_height = if popup_height > 0 {
             popup_height
         } else {
-            COMPOSER_STATUS_GAP.saturating_add(STATUS_LINE_HEIGHT)
+            COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
         }
         .min(area.height.saturating_sub(composer_height));
         let composer_y = area
@@ -1011,7 +1016,7 @@ impl View {
         };
         let status_height = u16::from(self.busy && composer_y > area.y);
         let status_composer_spacing = if status_height > 0 {
-            COMPOSER_STATUS_GAP.min(
+            ACTIVITY_COMPOSER_GAP.min(
                 composer_y
                     .saturating_sub(area.y)
                     .saturating_sub(status_height),
@@ -1120,12 +1125,12 @@ impl View {
             Rect::new(area.x, text_y, 1, 1),
         );
 
-        if footer_area.height > COMPOSER_STATUS_GAP {
+        if footer_area.height > COMPOSER_FOOTER_GAP {
             frame.render_widget(
                 Paragraph::new(self.status_line(footer_area.width)),
                 Rect::new(
                     footer_area.x,
-                    footer_area.y.saturating_add(COMPOSER_STATUS_GAP),
+                    footer_area.y.saturating_add(COMPOSER_FOOTER_GAP),
                     footer_area.width,
                     STATUS_LINE_HEIGHT,
                 ),
@@ -1248,6 +1253,9 @@ impl View {
     }
 
     fn slash_matches(&self) -> Vec<&'static SlashCommand> {
+        if self.editor.is_browsing_history() {
+            return Vec::new();
+        }
         let text = self.editor.text();
         if self.dismissed_slash.as_deref() == Some(text) {
             return Vec::new();
@@ -2842,16 +2850,16 @@ mod tests {
     #[test]
     fn initial_viewport_contains_only_the_codex_composer() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
-        assert_eq!(view.desired_height(88, 24), 6);
+        assert_eq!(view.desired_height(88, 24), 5);
         let history = view.take_pending_history_lines(88);
         assert!(
             history
                 .iter()
                 .any(|line| plain(line).contains("BetterCodex"))
         );
-        assert_eq!(view.desired_height(88, 24), 6);
+        assert_eq!(view.desired_height(88, 24), 5);
 
-        let backend = TestBackend::new(88, 6);
+        let backend = TestBackend::new(88, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
@@ -2862,14 +2870,14 @@ mod tests {
     }
 
     #[test]
-    fn busy_status_and_footer_are_equally_spaced_and_left_aligned() {
+    fn busy_status_keeps_the_upper_gap_and_joins_the_footer_to_the_composer() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.start_turn("test");
         let _ = view.take_pending_history_lines(60);
 
         let height = view.desired_height(60, 24);
-        assert_eq!(height, 8);
+        assert_eq!(height, 7);
         let backend = TestBackend::new(60, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
@@ -2905,12 +2913,12 @@ mod tests {
 
         assert_eq!(
             composer_y.saturating_sub(status_y.saturating_add(1)),
-            COMPOSER_STATUS_GAP,
+            ACTIVITY_COMPOSER_GAP,
             "{rendered}"
         );
         assert_eq!(
             footer_y.saturating_sub(composer_bottom),
-            COMPOSER_STATUS_GAP,
+            COMPOSER_FOOTER_GAP,
             "{rendered}"
         );
         assert_eq!(
@@ -3257,6 +3265,29 @@ mod tests {
     }
 
     #[test]
+    fn recalled_at_prompts_keep_up_and_down_bound_to_history() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let _ = view.desired_height(80, 24);
+        view.editor.remember("inspect @one.rs");
+        view.editor.remember("inspect @two.rs");
+
+        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(view.editor.text(), "inspect @two.rs");
+        assert!(!view.file_search.is_active());
+
+        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(view.editor.text(), "inspect @one.rs");
+        assert!(!view.file_search.is_active());
+
+        view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('!'),
+            KeyModifiers::NONE,
+        )));
+        assert!(view.file_search.is_active());
+        assert_eq!(view.file_search_query(), "one.rs!");
+    }
+
+    #[test]
     fn context_command_opens_and_closes_the_rendered_window() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
@@ -3369,7 +3400,7 @@ mod tests {
             Action::None
         );
         assert!(view.overlay.is_none());
-        assert_eq!(view.desired_height(88, 30), 6);
+        assert_eq!(view.desired_height(88, 30), 5);
     }
 
     #[test]
@@ -3429,7 +3460,7 @@ mod tests {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.user_message_style = style;
-        let backend = TestBackend::new(40, 6);
+        let backend = TestBackend::new(40, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
         assert_eq!(terminal.backend().buffer()[(0, 1)].bg, style.bg.unwrap());
