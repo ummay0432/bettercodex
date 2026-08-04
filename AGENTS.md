@@ -70,6 +70,7 @@ the invoking user's permissions; BetterCodex does not sandbox them.
   explicitly asks to edit the system prompt.
 - `prompts/tool-catalogue.md` and `prompts/tool-context.md`: the exact generated
   tool text and the complete tool-related request prefix.
+- `docs/MANIFEST.md`: read before Rust work for authoritative engineering and performance sources.
 - `docs/gpt-5.6-sol-harness.md`: the exact inventory of public Sol behavior,
   Codex code, and behavior proved here. Open it before changing requests,
   history, reasoning, compaction, caching, tools, the executor, transport, or

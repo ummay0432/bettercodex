@@ -145,6 +145,7 @@ pub(crate) struct ApiClient {
     explicit_cache: bool,
     prefer_websocket: bool,
     websocket: Option<WebSocketConnection>,
+    websocket_reasoning_included: bool,
     websocket_baseline: Option<WebSocketBaseline>,
 }
 
@@ -191,6 +192,7 @@ pub(crate) struct ModelResponse {
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) text: String,
     pub(crate) usage: Option<TokenUsage>,
+    pub(crate) server_reasoning_included: bool,
     response_id: String,
 }
 
@@ -218,7 +220,7 @@ impl ApiClient {
         codex_utils_rustls_provider::ensure_rustls_crypto_provider();
         let mut default_headers = HeaderMap::new();
         default_headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
-        let client = reqwest::Client::builder()
+        let client = codex_client::with_chatgpt_cloudflare_cookie_store(reqwest::Client::builder())
             .default_headers(default_headers)
             .user_agent(concat!("bettercodex/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(20))
@@ -237,6 +239,7 @@ impl ApiClient {
             explicit_cache: true,
             prefer_websocket: true,
             websocket: None,
+            websocket_reasoning_included: false,
             websocket_baseline: None,
         })
     }
@@ -257,14 +260,12 @@ impl ApiClient {
     }
 
     pub(crate) fn tool_turn_context(&self, history: &[Value]) -> ToolTurnContext {
-        ToolTurnContext {
-            history: history.to_vec(),
-            turn_metadata: self.turn_metadata(RequestKind::Turn).to_string(),
-        }
+        ToolTurnContext::from_history(history, self.turn_metadata(RequestKind::Turn).to_string())
     }
 
     pub(crate) fn abandon_response(&mut self) {
         self.websocket = None;
+        self.websocket_reasoning_included = false;
         self.websocket_baseline = None;
     }
 
@@ -387,8 +388,11 @@ impl ApiClient {
         let response = self
             .post("responses", request, "text/event-stream", request_kind)
             .await?;
+        let server_reasoning_included = response.headers().contains_key("x-reasoning-included");
         self.capture_turn_state(response.headers());
-        collect_http_stream(response, completed_items, events).await
+        let mut response = collect_http_stream(response, completed_items, events).await?;
+        response.server_reasoning_included = server_reasoning_included;
+        Ok(response)
     }
 
     async fn respond_websocket(
@@ -434,7 +438,9 @@ impl ApiClient {
                 break;
             }
         }
-        collected.finish(events)
+        let mut response = collected.finish(events)?;
+        response.server_reasoning_included = self.websocket_reasoning_included;
+        Ok(response)
     }
 
     async fn ensure_websocket(&mut self, request_kind: RequestKind) -> ApiResult<()> {
@@ -451,6 +457,7 @@ impl ApiClient {
         insert_header(&mut headers, "openai-beta", RESPONSES_WEBSOCKET_BETA)?;
         let url = websocket_url(&self.base_url, "responses")?;
         let (websocket, response_headers) = WebSocketConnection::connect(&url, &headers).await?;
+        self.websocket_reasoning_included = response_headers.contains_key("x-reasoning-included");
         self.capture_turn_state(&response_headers);
         self.websocket = Some(websocket);
         Ok(())
@@ -1012,6 +1019,7 @@ impl CollectedResponse {
             tool_calls,
             text,
             usage: self.usage,
+            server_reasoning_included: false,
             response_id: self
                 .response_id
                 .ok_or_else(|| ApiError::fatal("response.completed omitted the response ID"))?,

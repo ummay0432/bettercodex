@@ -378,10 +378,10 @@ fn stream_errors_classify_websocket_recovery_cases() {
 #[tokio::test]
 async fn http_transport_sends_the_contract_and_collects_the_response() {
     let item = assistant_item("http");
-    let (base_url, requests, server) = spawn_http_server(vec![HttpReply::ok(
-        "text/event-stream",
-        completed_sse("resp_http", &item),
-    )]);
+    let (base_url, requests, server) = spawn_http_server(vec![
+        HttpReply::ok("text/event-stream", completed_sse("resp_http", &item))
+            .with_header("x-reasoning-included", "true"),
+    ]);
     let mut client = test_client(base_url);
     client.prefer_websocket = false;
     let (completed_items, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -391,6 +391,7 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
         .await
         .unwrap();
     assert_eq!(response.text, "http");
+    assert!(response.server_reasoning_included);
     assert_eq!(response.usage.unwrap().cached_input_tokens, 30);
     assert_eq!(completed_rx.try_recv().unwrap(), item);
     assert!(completed_rx.try_recv().is_err());
@@ -678,6 +679,7 @@ struct HttpReply {
     status: u16,
     content_type: &'static str,
     body: String,
+    headers: Vec<(&'static str, &'static str)>,
 }
 
 impl HttpReply {
@@ -690,7 +692,13 @@ impl HttpReply {
             status,
             content_type,
             body: body.into(),
+            headers: Vec::new(),
         }
+    }
+
+    fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+        self.headers.push((name, value));
+        self
     }
 }
 
@@ -722,13 +730,19 @@ fn spawn_http_server(
                 429 => "Too Many Requests",
                 _ => "Error",
             };
+            let extra_headers = reply
+                .headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect::<String>();
             write!(
                 stream,
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
                 reply.status,
                 reason,
                 reply.content_type,
                 reply.body.len(),
+                extra_headers,
                 reply.body,
             )
             .unwrap();

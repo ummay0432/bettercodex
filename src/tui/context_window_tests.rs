@@ -107,34 +107,39 @@ fn renders_capacity_grid_categories_and_compaction_headroom() {
     assert!(rendered.contains("74.4K / 372K tokens"), "{rendered}");
     assert!(rendered.contains("20.0% used"), "{rendered}");
     assert!(rendered.contains("Auto-compact at 353.4K"), "{rendered}");
-    assert!(rendered.contains("279K free before compact"), "{rendered}");
+    assert!(
+        !rendered.contains("Auto-compact at 353.4K  ·"),
+        "{rendered}"
+    );
     assert!(rendered.contains("System prompt"), "{rendered}");
     assert!(rendered.contains("Tool catalogue"), "{rendered}");
     assert!(rendered.contains("AGENTS.md instructions"), "{rendered}");
     assert!(rendered.contains("Tool calls & results"), "{rendered}");
     assert!(rendered.contains("Free before compact"), "{rendered}");
     assert!(rendered.contains("Auto-compact reserve"), "{rendered}");
-    assert!(
-        rendered.contains("Total from latest API usage"),
-        "{rendered}"
-    );
     assert!(rendered.matches('■').count() >= GRID_CELLS, "{rendered}");
     assert_eq!(context.handle_key(KeyCode::Esc), ContextAction::Close);
     assert_eq!(context.handle_key(KeyCode::Down), ContextAction::StayOpen);
 }
 
 #[test]
-fn explains_when_all_accounting_is_estimated() {
-    let context = ContextWindowView::new(snapshot(false));
-    let backend = TestBackend::new(92, VIEWPORT_HEIGHT);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| context.render(frame, frame.area()))
-        .unwrap();
-    let rendered = render_buffer(terminal.backend().buffer());
+fn omits_accounting_notes() {
+    for measured in [false, true] {
+        let context = ContextWindowView::new(snapshot(measured));
+        let backend = TestBackend::new(92, VIEWPORT_HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| context.render(frame, frame.area()))
+            .unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
 
-    assert!(rendered.contains("No API usage yet"), "{rendered}");
-    assert!(rendered.contains("all values estimated"), "{rendered}");
+        assert!(!rendered.contains("No API usage yet"), "{rendered}");
+        assert!(
+            !rendered.contains("Total from latest API usage"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Each square is 1%"), "{rendered}");
+    }
 }
 
 #[test]

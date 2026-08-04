@@ -87,6 +87,7 @@ pub(crate) struct Conversation {
     context_metrics: ContextMetrics,
     usage: Option<TokenUsage>,
     usage_history_estimate: Option<u64>,
+    server_reasoning_included: bool,
     rollout: Rollout,
     world_state: WorldState,
 }
@@ -97,11 +98,14 @@ struct WorldState {
     repository_instructions: Option<Value>,
 }
 
+/// Aggregate request accounting kept in lockstep with `Conversation::history`.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ContextMetrics {
     estimated_tokens: u64,
     tokens: [u64; CONTEXT_KINDS.len()],
     items: [usize; CONTEXT_KINDS.len()],
+    encrypted_reasoning_tokens: u64,
+    encrypted_reasoning_before_last_instruction: u64,
     has_tools: bool,
     has_system_prompt: bool,
 }
@@ -117,6 +121,7 @@ impl Conversation {
             context_metrics,
             usage: None,
             usage_history_estimate: None,
+            server_reasoning_included: false,
             rollout,
             world_state,
         })
@@ -128,6 +133,7 @@ impl Conversation {
             history,
             usage,
             usage_history_estimate,
+            server_reasoning_included,
             unfinished_turn,
             ..
         } = loaded;
@@ -138,6 +144,7 @@ impl Conversation {
             context_metrics,
             usage,
             usage_history_estimate,
+            server_reasoning_included,
             rollout,
             world_state,
         };
@@ -157,6 +164,7 @@ impl Conversation {
     }
 
     pub(crate) fn start_turn(&mut self, turn_id: &str) -> Result<()> {
+        self.server_reasoning_included = false;
         self.rollout.start_turn(turn_id)
     }
 
@@ -195,6 +203,7 @@ impl Conversation {
         self.history = history;
         self.usage = None;
         self.usage_history_estimate = None;
+        self.server_reasoning_included = false;
         Ok(())
     }
 
@@ -202,14 +211,20 @@ impl Conversation {
         &self.history
     }
 
-    pub(crate) fn record_usage(&mut self, usage: Option<TokenUsage>) -> Result<()> {
+    pub(crate) fn record_usage(
+        &mut self,
+        usage: Option<TokenUsage>,
+        server_reasoning_included: bool,
+    ) -> Result<()> {
         let Some(usage) = usage else {
             return Ok(());
         };
         let history_estimate = self.context_metrics.estimated_tokens;
-        self.rollout.record_usage(&usage, history_estimate)?;
+        self.rollout
+            .record_usage(&usage, history_estimate, server_reasoning_included)?;
         self.usage = Some(usage);
         self.usage_history_estimate = Some(history_estimate);
+        self.server_reasoning_included = server_reasoning_included;
         Ok(())
     }
 
@@ -221,7 +236,18 @@ impl Conversation {
         let usage = self.usage.as_ref()?;
         let baseline = self.usage_history_estimate?;
         let growth = history_estimate.saturating_sub(baseline);
-        Some(usage.active_context_tokens().saturating_add(growth))
+        let omitted_reasoning = if self.server_reasoning_included {
+            0
+        } else {
+            self.context_metrics
+                .encrypted_reasoning_before_last_instruction
+        };
+        Some(
+            usage
+                .active_context_tokens()
+                .saturating_add(omitted_reasoning)
+                .saturating_add(growth),
+        )
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
@@ -326,6 +352,7 @@ impl Conversation {
         self.history = normalized;
         self.usage = None;
         self.usage_history_estimate = None;
+        self.server_reasoning_included = false;
         Ok(true)
     }
 
@@ -400,6 +427,9 @@ impl ContextMetrics {
     fn extend(&mut self, history: &[Value], world_state: &WorldState) {
         let [tools_item, system_prompt_item] = crate::api::context_prefix_items();
         for item in history {
+            if is_initial_context_boundary(item) {
+                self.encrypted_reasoning_before_last_instruction = self.encrypted_reasoning_tokens;
+            }
             let kind = if same_additional_tools_item(item, tools_item) {
                 self.has_tools = true;
                 ContextKind::ToolCatalogue
@@ -417,12 +447,17 @@ impl ContextMetrics {
             } else {
                 context_kind(item)
             };
-            self.estimated_tokens = self.estimated_tokens.saturating_add(record_context_item(
-                &mut self.tokens,
-                &mut self.items,
-                kind,
-                item,
-            ));
+            let estimated = record_context_item(&mut self.tokens, &mut self.items, kind, item);
+            if item.get("type").and_then(Value::as_str) == Some("reasoning")
+                && item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some()
+            {
+                self.encrypted_reasoning_tokens =
+                    self.encrypted_reasoning_tokens.saturating_add(estimated);
+            }
+            self.estimated_tokens = self.estimated_tokens.saturating_add(estimated);
         }
     }
 }

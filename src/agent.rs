@@ -250,7 +250,8 @@ impl Agent {
             if !response.text.trim().is_empty() {
                 transcript.push(response.text.trim().to_string());
             }
-            self.conversation.record_usage(response.usage)?;
+            self.conversation
+                .record_usage(response.usage, response.server_reasoning_included)?;
             self.emit_context(events);
             emit(events, AgentEvent::ModelResponseCompleted);
 

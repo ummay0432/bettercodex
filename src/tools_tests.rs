@@ -101,14 +101,14 @@ text(result);
     let output = call
         .execute(
             &runtime,
-            ToolTurnContext {
-                history: vec![json!({
+            ToolTurnContext::from_history(
+                &[json!({
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": "search now"}],
                 })],
-                turn_metadata: r#"{"turn_id":"turn-test"}"#.to_string(),
-            },
+                r#"{"turn_id":"turn-test"}"#.to_string(),
+            ),
             None,
             CancellationToken::new(),
         )

@@ -18,7 +18,7 @@ use ratatui::widgets::Paragraph;
 const MUTED: Color = Color::Indexed(245);
 const RULE: Color = Color::Indexed(8);
 const PREFERRED_WIDTH: u16 = 86;
-const PREFERRED_HEIGHT: u16 = 24;
+const PREFERRED_HEIGHT: u16 = 21;
 const GRID_COLUMNS: usize = 10;
 const GRID_ROWS: usize = 10;
 const GRID_CELLS: usize = GRID_COLUMNS * GRID_ROWS;
@@ -80,29 +80,22 @@ impl ContextWindowView {
         }
 
         let footer_height = u16::from(inner.height >= 2);
-        let note_height = if inner.height >= 8 { 3 } else { 0 };
         let header_height = if inner.height >= 6 {
             3
         } else {
-            inner
-                .height
-                .saturating_sub(footer_height)
-                .saturating_sub(note_height)
+            inner.height.saturating_sub(footer_height)
         };
         let body_height = inner
             .height
             .saturating_sub(header_height)
-            .saturating_sub(note_height)
             .saturating_sub(footer_height);
         let header_area = Rect::new(inner.x, inner.y, inner.width, header_height);
         let body_area = Rect::new(inner.x, header_area.bottom(), inner.width, body_height);
-        let note_area = Rect::new(inner.x, body_area.bottom(), inner.width, note_height);
-        let footer_area = Rect::new(inner.x, note_area.bottom(), inner.width, footer_height);
+        let footer_area = Rect::new(inner.x, body_area.bottom(), inner.width, footer_height);
 
         self.render_header(frame, header_area);
         let segments = self.segments();
         self.render_body(frame, body_area, &segments);
-        self.render_note(frame, note_area);
         if !footer_area.is_empty() {
             frame.render_widget(
                 Paragraph::new("Esc/q close")
@@ -118,25 +111,6 @@ impl ContextWindowView {
             return;
         }
         let used_percent = format_percent(self.snapshot.used_tokens, self.snapshot.context_window);
-        let threshold_status = if self.snapshot.used_tokens < self.snapshot.compact_at_tokens {
-            format!(
-                "{} free before compact",
-                format_tokens(
-                    self.snapshot
-                        .compact_at_tokens
-                        .saturating_sub(self.snapshot.used_tokens)
-                )
-            )
-        } else {
-            format!(
-                "{} past threshold",
-                format_tokens(
-                    self.snapshot
-                        .used_tokens
-                        .saturating_sub(self.snapshot.compact_at_tokens)
-                )
-            )
-        };
         let lines = vec![
             Line::from(vec![
                 Span::from(MODEL).cyan().bold(),
@@ -147,7 +121,7 @@ impl ContextWindowView {
                 )),
             ]),
             Line::from(format!(
-                "Auto-compact at {}  ·  {threshold_status}",
+                "Auto-compact at {}",
                 format_tokens(self.snapshot.compact_at_tokens)
             ))
             .dim(),
@@ -202,36 +176,6 @@ impl ContextWindowView {
             })
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(lines), area);
-    }
-
-    fn render_note(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.is_empty() {
-            return;
-        }
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(RULE));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if inner.is_empty() {
-            return;
-        }
-        let accounting = if self.snapshot.measured {
-            "Total from latest API usage · category split estimated from current request items"
-        } else {
-            "No API usage yet · all values estimated from current request items"
-        };
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(accounting),
-                Line::from(format!(
-                    "Each square is 1% of the {} context window",
-                    format_tokens(self.snapshot.context_window)
-                ))
-                .dim(),
-            ]),
-            inner,
-        );
     }
 
     fn segments(&self) -> Vec<Segment> {

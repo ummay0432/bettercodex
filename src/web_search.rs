@@ -59,8 +59,8 @@ pub(crate) struct WebSearchClient {
 
 #[derive(Clone, Default)]
 pub(crate) struct ToolTurnContext {
-    pub(crate) history: Vec<Value>,
-    pub(crate) turn_metadata: String,
+    input: Option<SearchInput>,
+    turn_metadata: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,7 +77,7 @@ struct SearchRequest {
     max_output_tokens: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 enum SearchInput {
     Items(Vec<ResponseItem>),
@@ -306,7 +306,7 @@ impl WebSearchClient {
         let request = SearchRequest {
             id: self.session_id.clone(),
             model: MODEL.to_string(),
-            input: recent_input(&context.history),
+            input: context.input.clone(),
             commands: Some(commands),
             settings: Some(serde_json::json!({
                 "allowed_callers": ["direct"],
@@ -337,6 +337,15 @@ impl WebSearchClient {
         let response: SearchResponse = serde_json::from_slice(&response.body)
             .context("failed to decode standalone web search response")?;
         Ok(Value::String(response.output))
+    }
+}
+
+impl ToolTurnContext {
+    pub(crate) fn from_history(history: &[Value], turn_metadata: String) -> Self {
+        Self {
+            input: recent_input(history),
+            turn_metadata,
+        }
     }
 }
 
@@ -419,16 +428,37 @@ fn search_retry_policy() -> RetryPolicy {
 }
 
 fn recent_input(history: &[Value]) -> Option<SearchInput> {
-    let mut messages = history
-        .iter()
-        .filter_map(visible_message)
-        .collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    let mut user_messages = 0;
+    for value in history.iter().rev() {
+        let Some(message) = visible_message(value) else {
+            continue;
+        };
+        if message.is_user_message() {
+            user_messages += 1;
+            messages.push(message);
+            if user_messages == 2 {
+                break;
+            }
+        } else if user_messages > 0 {
+            messages.push(message);
+        }
+    }
+    messages.reverse();
     retain_recent_user_turns(&mut messages, 2);
     truncate_assistant_text(&mut messages, ASSISTANT_CONTEXT_TOKEN_LIMIT);
     (!messages.is_empty()).then_some(SearchInput::Items(messages))
 }
 
 fn visible_message(value: &Value) -> Option<ResponseItem> {
+    if value.get("type").and_then(Value::as_str) != Some("message")
+        || !matches!(
+            value.get("role").and_then(Value::as_str),
+            Some("assistant" | "user")
+        )
+    {
+        return None;
+    }
     let item = serde_json::from_value::<ResponseItem>(value.clone()).ok()?;
     match item {
         ResponseItem::Message { ref role, .. } if role == "assistant" => {

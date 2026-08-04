@@ -34,7 +34,7 @@ fn rollout_replays_replacements_usage_and_turn_state() {
         total_tokens: 14,
         ..TokenUsage::default()
     };
-    rollout.record_usage(&usage, 9).unwrap();
+    rollout.record_usage(&usage, 9, true).unwrap();
     drop(rollout);
 
     let loaded = Rollout::resume_in(
@@ -46,6 +46,7 @@ fn rollout_replays_replacements_usage_and_turn_state() {
     assert_eq!(loaded.history.len(), 2);
     assert_eq!(loaded.usage, Some(usage));
     assert_eq!(loaded.usage_history_estimate, Some(9));
+    assert!(loaded.server_reasoning_included);
     assert_eq!(loaded.unfinished_turn.as_deref(), Some("turn-1"));
     assert_eq!(loaded.compaction_count, 0);
 

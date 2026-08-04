@@ -105,6 +105,49 @@ fn encrypted_reasoning_uses_codex_model_visible_size_adjustment() {
 }
 
 #[test]
+fn backend_usage_adds_past_reasoning_only_when_the_server_omits_it() {
+    let (root, cwd) = temporary_repository("reasoning-usage");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let reasoning = json!({
+        "type": "reasoning",
+        "id": "rs_previous",
+        "encrypted_content": "x".repeat(4_650),
+    });
+    conversation
+        .extend([
+            UserInput::text("first turn").into_message(),
+            reasoning.clone(),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "first response"}],
+            }),
+            UserInput::text("second turn").into_message(),
+        ])
+        .unwrap();
+    let usage = TokenUsage {
+        input_tokens: 990,
+        output_tokens: 10,
+        total_tokens: 1_000,
+        ..TokenUsage::default()
+    };
+
+    conversation
+        .record_usage(Some(usage.clone()), true)
+        .unwrap();
+    assert_eq!(conversation.context_tokens(), Some(1_000));
+    conversation.record_usage(Some(usage), false).unwrap();
+    assert_eq!(
+        conversation.context_tokens(),
+        Some(1_000 + estimate_value_tokens(&reasoning))
+    );
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn webp_extended_dimensions_are_included_in_image_budgeting() {
     let mut webp = vec![0_u8; 30];
     webp[..4].copy_from_slice(b"RIFF");
@@ -246,12 +289,15 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
 
     let measured_total = estimated_total.saturating_add(10_000);
     conversation
-        .record_usage(Some(TokenUsage {
-            input_tokens: measured_total.saturating_sub(100),
-            output_tokens: 100,
-            total_tokens: measured_total,
-            ..TokenUsage::default()
-        }))
+        .record_usage(
+            Some(TokenUsage {
+                input_tokens: measured_total.saturating_sub(100),
+                output_tokens: 100,
+                total_tokens: measured_total,
+                ..TokenUsage::default()
+            }),
+            true,
+        )
         .unwrap();
     let measured = conversation.context_snapshot();
     assert_eq!(measured.used_tokens, measured_total);

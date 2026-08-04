@@ -58,6 +58,7 @@ pub(crate) struct LoadedRollout {
     pub(crate) history: Vec<Value>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) usage_history_estimate: Option<u64>,
+    pub(crate) server_reasoning_included: bool,
     pub(crate) compaction_count: u64,
     pub(crate) unfinished_turn: Option<String>,
 }
@@ -108,6 +109,8 @@ enum RolloutRecord {
     Usage {
         usage: TokenUsage,
         history_estimate: u64,
+        #[serde(default)]
+        server_reasoning_included: bool,
     },
     TurnStarted {
         turn_id: String,
@@ -213,10 +216,16 @@ impl Rollout {
         })
     }
 
-    pub(crate) fn record_usage(&mut self, usage: &TokenUsage, history_estimate: u64) -> Result<()> {
+    pub(crate) fn record_usage(
+        &mut self,
+        usage: &TokenUsage,
+        history_estimate: u64,
+        server_reasoning_included: bool,
+    ) -> Result<()> {
         self.write_record(&RolloutRecord::Usage {
             usage: usage.clone(),
             history_estimate,
+            server_reasoning_included,
         })
     }
 
@@ -256,6 +265,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut history = Vec::new();
     let mut usage = None;
     let mut usage_history_estimate = None;
+    let mut server_reasoning_included = false;
     let mut compaction_count = 0_u64;
     let mut unfinished_turn = None;
     let mut line_number = 0_usize;
@@ -313,13 +323,16 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 history = items;
                 usage = None;
                 usage_history_estimate = None;
+                server_reasoning_included = false;
             }
             RolloutRecord::Usage {
                 usage: new_usage,
                 history_estimate,
+                server_reasoning_included: reasoning_included,
             } => {
                 usage = Some(new_usage);
                 usage_history_estimate = Some(history_estimate);
+                server_reasoning_included = reasoning_included;
             }
             RolloutRecord::TurnStarted { turn_id } => unfinished_turn = Some(turn_id),
             RolloutRecord::TurnFinished { turn_id, .. } => {
@@ -366,6 +379,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         history,
         usage,
         usage_history_estimate,
+        server_reasoning_included,
         compaction_count,
         unfinished_turn,
     })
