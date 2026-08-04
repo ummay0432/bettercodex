@@ -79,6 +79,10 @@ the invoking user's permissions; BetterCodex does not sandbox them.
 
 ## Success criteria
 
+For implementation work, use Git proactively from start to finish. Existing changes are
+shared work: you may commit and publish them regardless of who created them. Do not discard
+unfinished work or leave cleanup for the user.
+
 Your work is complete only when all three success criteria are satisfied:
 
 - System quality: Judge the affected system, not diff size. Do not preserve an inferior
