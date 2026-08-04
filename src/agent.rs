@@ -7,6 +7,8 @@ use crate::compaction::CompactionPhase;
 use crate::compaction::InitialContextInjection;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
+use crate::context::EFFECTIVE_CONTEXT_WINDOW;
+use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserInput;
@@ -456,12 +458,28 @@ impl Agent {
         phase: CompactionPhase,
         initial_context_injection: InitialContextInjection,
     ) -> Result<bool> {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
         emit(events, AgentEvent::CompactionStarted);
         self.conversation.normalize()?;
-        let compacted = tokio::select! {
-            _ = cancellation.cancelled() => return Ok(false),
-            compacted = self.api.compact(self.conversation.items(), phase) => compacted?,
+        let compacted = {
+            let request = self.api.compact(self.conversation.items(), phase);
+            tokio::pin!(request);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => None,
+                compacted = &mut request => Some(compacted),
+            }
         };
+        let Some(compacted) = compacted else {
+            // Dropping the request future stops polling, but the server still owns the
+            // in-flight response. A Responses WebSocket cannot carry the next request
+            // until that response finishes, so discard the connection and its baseline.
+            self.api.abandon_response();
+            return Ok(false);
+        };
+        let compacted = compacted?;
         self.conversation.replace_compacted(
             compacted.items,
             initial_context_injection,
@@ -487,6 +505,12 @@ impl Agent {
             return Err(anyhow!("prompt and image list are both empty"));
         }
         let projected = input.into_message();
+        let incoming_tokens = estimated_tokens(std::slice::from_ref(&projected));
+        if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
+            return Err(anyhow!(
+                "input alone is estimated at {incoming_tokens} tokens, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
+            ));
+        }
         if self
             .conversation
             .needs_compaction_with(std::slice::from_ref(&projected))
@@ -500,6 +524,14 @@ impl Agent {
                 .await?
         {
             return Ok(false);
+        }
+        let projected_tokens = self
+            .conversation
+            .projected_tokens(std::slice::from_ref(&projected));
+        if projected_tokens > EFFECTIVE_CONTEXT_WINDOW {
+            return Err(anyhow!(
+                "input would require an estimated {projected_tokens} tokens after compaction, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
+            ));
         }
         self.conversation.extend([projected])?;
         if let Some(id) = steering_id {

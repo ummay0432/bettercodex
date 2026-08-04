@@ -1,6 +1,12 @@
 use super::*;
 use crate::auth::Auth;
+use crate::context::AUTO_COMPACT_TOKEN_LIMIT;
+use crate::context::EFFECTIVE_CONTEXT_WINDOW;
+use crate::context::estimated_tokens;
+use crate::input::ImageDetail;
 use crate::rollout::SessionIdentity;
+use futures::SinkExt;
+use futures::StreamExt;
 use serde_json::json;
 use std::io::Read;
 use std::io::Write;
@@ -9,7 +15,17 @@ use std::net::TcpStream;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
+use tokio::net::TcpListener as TokioTcpListener;
+use tokio::net::TcpStream as TokioTcpStream;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::accept_async_with_config;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
+use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -81,7 +97,191 @@ async fn steering_waits_for_the_response_boundary_and_enters_the_next_request() 
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn cancelling_compaction_reconnects_before_the_next_turn() {
+    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (compaction_started_tx, compaction_started_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut first = accept_websocket(&listener).await;
+        let warmup = read_websocket_request(&mut first).await.unwrap();
+        assert_eq!(warmup["generate"], false);
+        send_websocket_completion(&mut first, "resp_warm", &[]).await;
+
+        let compaction = read_websocket_request(&mut first).await.unwrap();
+        assert_eq!(
+            compaction["input"].as_array().unwrap().last().unwrap()["type"],
+            "compaction_trigger"
+        );
+        compaction_started_tx.send(()).unwrap();
+
+        let (fresh_connection, next_request, mut websocket) =
+            match read_websocket_request(&mut first).await {
+                Some(request) => (false, request, first),
+                None => {
+                    let mut fresh = timeout(Duration::from_secs(5), accept_websocket(&listener))
+                        .await
+                        .expect("agent did not reconnect after cancellation");
+                    let request = read_websocket_request(&mut fresh).await.unwrap();
+                    (true, request, fresh)
+                }
+            };
+        send_websocket_text_response(&mut websocket, "resp_next", "next answer").await;
+        (fresh_connection, next_request)
+    });
+
+    let (root, mut agent) = test_websocket_agent(&format!("http://{address}"));
+    let large_text =
+        "x".repeat(usize::try_from(AUTO_COMPACT_TOKEN_LIMIT.saturating_mul(4)).unwrap());
+    let large_message = UserInput::text(large_text.clone()).into_message();
+    let incoming_tokens = estimated_tokens(std::slice::from_ref(&large_message));
+    assert!(incoming_tokens >= AUTO_COMPACT_TOKEN_LIMIT);
+    assert!(incoming_tokens <= EFFECTIVE_CONTEXT_WINDOW);
+
+    let (events, _event_rx) = unbounded_channel();
+    let (handle, control) = TurnControl::channel();
+    let cancelled = {
+        let submission = agent.submit_with_control(UserInput::text(large_text), events, control);
+        tokio::pin!(submission);
+        tokio::select! {
+            result = &mut submission => panic!("turn finished before compaction cancellation: {result:?}"),
+            signal = compaction_started_rx => signal.unwrap(),
+        }
+        handle.cancel();
+        submission.await.unwrap()
+    };
+    assert_eq!(cancelled, SubmitOutcome::Cancelled);
+
+    assert_eq!(
+        timeout(Duration::from_secs(5), agent.submit("next turn"))
+            .await
+            .expect("next turn timed out")
+            .unwrap(),
+        "next answer"
+    );
+    let (fresh_connection, next_request) = server.await.unwrap();
+    assert!(
+        fresh_connection,
+        "cancelled compaction reused its busy socket"
+    );
+    assert!(next_request.get("previous_response_id").is_none());
+    assert!(next_request.to_string().contains("next turn"));
+    assert_eq!(agent.prompt_history(), vec!["next turn".to_string()]);
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn input_is_rechecked_after_successful_compaction_before_sampling() {
+    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut websocket = accept_websocket(&listener).await;
+        let warmup = read_websocket_request(&mut websocket).await.unwrap();
+        assert_eq!(warmup["generate"], false);
+        send_websocket_completion(&mut websocket, "resp_warm", &[]).await;
+
+        let compaction_request = read_websocket_request(&mut websocket).await.unwrap();
+        assert_eq!(
+            compaction_request["input"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["type"],
+            "compaction_trigger"
+        );
+        let compaction = json!({
+            "type": "compaction_summary",
+            "id": "cmp_boundary",
+            "encrypted_content": "opaque",
+        });
+        send_websocket_completion(&mut websocket, "resp_compact", &[compaction]).await;
+        match timeout(
+            Duration::from_secs(2),
+            read_websocket_request(&mut websocket),
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                send_websocket_text_response(&mut websocket, "resp_sampled", "should not sample")
+                    .await;
+                true
+            }
+            Ok(None) | Err(_) => false,
+        }
+    });
+
+    let (root, mut agent) = test_websocket_agent(&format!("http://{address}"));
+    let text =
+        "x".repeat(usize::try_from((EFFECTIVE_CONTEXT_WINDOW - 1_000).saturating_mul(4)).unwrap());
+    let message = UserInput::text(text.clone()).into_message();
+    let incoming_tokens = estimated_tokens(std::slice::from_ref(&message));
+    assert!(incoming_tokens <= EFFECTIVE_CONTEXT_WINDOW);
+    assert!(incoming_tokens >= AUTO_COMPACT_TOKEN_LIMIT);
+    assert!(
+        agent
+            .conversation
+            .projected_tokens(std::slice::from_ref(&message))
+            > EFFECTIVE_CONTEXT_WINDOW
+    );
+
+    let error = timeout(Duration::from_secs(5), agent.submit(&text))
+        .await
+        .expect("input admission did not finish")
+        .unwrap_err();
+    assert!(error.to_string().contains("after compaction"), "{error:#}");
+    assert!(agent.prompt_history().is_empty());
+    assert!(!server.await.unwrap(), "oversized input reached sampling");
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn individually_oversized_text_and_image_batches_are_rejected_without_compaction() {
+    let (root, mut agent) = test_agent("http://127.0.0.1:1");
+    let text = "x".repeat(usize::try_from(EFFECTIVE_CONTEXT_WINDOW.saturating_mul(4)).unwrap());
+    let error = agent.submit(&text).await.unwrap_err();
+    assert!(error.to_string().contains("input alone"), "{error:#}");
+
+    let images_directory = root.join("images");
+    std::fs::create_dir_all(&images_directory).unwrap();
+    let mut png = vec![0_u8; 24];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[16..20].copy_from_slice(&3_200_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&3_200_u32.to_be_bytes());
+    let paths = (0..36)
+        .map(|index| {
+            let path = images_directory.join(format!("large-{index}.png"));
+            std::fs::write(&path, &png).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let images = UserInput::from_paths("", &paths, ImageDetail::Original).unwrap();
+    let error = agent.submit_user_input(images).await.unwrap_err();
+    assert!(error.to_string().contains("input alone"), "{error:#}");
+    assert!(agent.prompt_history().is_empty());
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn test_agent(base_url: &str) -> (PathBuf, Agent) {
+    test_agent_with_transport(base_url, TestTransport::Http)
+}
+
+fn test_websocket_agent(base_url: &str) -> (PathBuf, Agent) {
+    test_agent_with_transport(base_url, TestTransport::WebSocket)
+}
+
+#[derive(Clone, Copy)]
+enum TestTransport {
+    Http,
+    WebSocket,
+}
+
+fn test_agent_with_transport(base_url: &str, transport: TestTransport) -> (PathBuf, Agent) {
     let root = std::env::temp_dir().join(format!(
         "bettercodex-agent-steering-{}-{}",
         std::process::id(),
@@ -99,7 +299,10 @@ fn test_agent(base_url: &str) -> (PathBuf, Agent) {
         base_url.to_string(),
     )
     .unwrap();
-    assert!(api.fall_back_to_http());
+    match transport {
+        TestTransport::Http => assert!(api.fall_back_to_http()),
+        TestTransport::WebSocket => {}
+    }
     let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
     (
         root,
@@ -110,6 +313,88 @@ fn test_agent(base_url: &str) -> (PathBuf, Agent) {
             tools,
         },
     )
+}
+
+type TestWebSocket = WebSocketStream<TokioTcpStream>;
+
+async fn accept_websocket(listener: &TokioTcpListener) -> TestWebSocket {
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    accept_async_with_config(stream, Some(config))
+        .await
+        .unwrap()
+}
+
+async fn read_websocket_request(websocket: &mut TestWebSocket) -> Option<Value> {
+    loop {
+        match websocket.next().await? {
+            Ok(Message::Text(text)) => return Some(serde_json::from_str(&text).unwrap()),
+            Ok(Message::Ping(payload)) => {
+                websocket.send(Message::Pong(payload)).await.unwrap();
+            }
+            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(Message::Binary(_) | Message::Pong(_) | Message::Frame(_)) => {}
+        }
+    }
+}
+
+async fn send_websocket_text_response(
+    websocket: &mut TestWebSocket,
+    response_id: &str,
+    text: &str,
+) {
+    let item = json!({
+        "id": format!("msg_{}", text.replace(' ', "_")),
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    });
+    send_websocket_completion(websocket, response_id, &[item]).await;
+}
+
+async fn send_websocket_completion(
+    websocket: &mut TestWebSocket,
+    response_id: &str,
+    items: &[Value],
+) {
+    for (output_index, item) in items.iter().enumerate() {
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    websocket
+        .send(Message::Text(
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "model": crate::MODEL,
+                    "reasoning": {"context": "all_turns"},
+                    "output": items,
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12,
+                    },
+                },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
 }
 
 fn conversation_text(request: &[u8]) -> Vec<(String, String)> {

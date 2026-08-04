@@ -347,6 +347,16 @@ impl ApiClient {
         // Build once from the owned sampling snapshot. Retries mutate only transport fields, and
         // a successful WebSocket response moves this request into the next delta baseline.
         let mut request = self.build_request(history, request_kind);
+        let input = request
+            .get("input")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
+        let request_tokens = estimated_tokens(input);
+        if request_tokens > EFFECTIVE_CONTEXT_WINDOW {
+            return Err(ApiError::fatal(format!(
+                "Responses input is estimated at {request_tokens} tokens, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window"
+            )));
+        }
         if self.prefer_websocket && !self.websocket_prewarm_attempted {
             self.websocket_prewarm_attempted = true;
             match self.prewarm_websocket().await {

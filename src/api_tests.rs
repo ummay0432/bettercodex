@@ -304,6 +304,23 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
     );
 }
 
+#[tokio::test]
+async fn responses_transport_rejects_a_full_input_above_the_effective_window() {
+    let mut client = test_client("http://127.0.0.1:1".to_string());
+    assert!(client.fall_back_to_http());
+    let history = vec![user_message(&"x".repeat(
+        usize::try_from(EFFECTIVE_CONTEXT_WINDOW.saturating_mul(4)).unwrap(),
+    ))];
+    let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = match client.respond(history, &completed_items).await {
+        Ok(_) => panic!("oversized request reached the transport"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind, ApiErrorKind::Fatal);
+    assert!(error.to_string().contains("effective context window"));
+}
+
 #[test]
 fn request_bakes_in_the_fixed_exec_runtime() {
     let client = test_client("http://127.0.0.1:1".to_string());
