@@ -52,3 +52,6 @@ strip = true
 
 [lints.clippy]
 all = "deny"
+
+[dev-dependencies]
+vt100 = "0.16.2"

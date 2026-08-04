@@ -50,8 +50,8 @@ const CLEAR_VISIBLE_TERMINAL: &[u8] = b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[H";
 /// Codex keeps finalized transcript cells in normal terminal scrollback and owns only the mutable
 /// tail plus composer. Ratatui's fixed viewport gives this lean client the same dynamic-height
 /// ownership without pulling in Codex's alternate-screen overlays.
-pub(super) struct AppTerminal {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+pub(super) struct AppTerminal<B: Backend = CrosstermBackend<Stdout>> {
+    terminal: Terminal<B>,
     viewport_area: Rect,
     screen_size: Size,
     viewport_top: u16,
@@ -126,7 +126,10 @@ impl TerminalSession {
     }
 }
 
-impl AppTerminal {
+impl<B> AppTerminal<B>
+where
+    B: Backend<Error = io::Error> + Write,
+{
     pub(super) fn clear_screen(&mut self) -> Result<()> {
         self.refresh_screen_size()?;
         // This is the same reset/home/visible-clear/scrollback-purge sequence Codex uses before
@@ -195,7 +198,18 @@ impl AppTerminal {
             }
         }
         Backend::flush(self.terminal.backend_mut())?;
-        self.prepare_viewport(next_viewport_height)
+        self.prepare_viewport(next_viewport_height)?;
+        // Scrolling and drawing history bypass Ratatui's frame buffers, so its previous frame no
+        // longer describes the physical viewport. Clear only the mutable tail and reset that
+        // baseline so the immediately following draw repaints unchanged composer and footer cells
+        // as well as changed content.
+        execute!(
+            self.terminal.backend_mut(),
+            MoveTo(0, self.viewport_top),
+            Clear(ClearType::FromCursorDown),
+        )?;
+        self.terminal.swap_buffers();
+        Ok(())
     }
 
     pub(super) fn draw(
@@ -545,6 +559,208 @@ fn parse_osc_component(value: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MODEL;
+    use crate::events::AgentEvent;
+    use crate::tui::view::View;
+    use ratatui::backend::ClearType as BackendClearType;
+    use ratatui::backend::WindowSize;
+    use ratatui::buffer::Cell;
+    use ratatui::layout::Position;
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    #[derive(Clone)]
+    struct SharedParser {
+        parser: Rc<RefCell<vt100::Parser>>,
+    }
+
+    impl SharedParser {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                parser: Rc::new(RefCell::new(vt100::Parser::new(height, width, 0))),
+            }
+        }
+
+        fn screen(&self) -> String {
+            self.parser.borrow().screen().contents()
+        }
+    }
+
+    impl Write for SharedParser {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.parser.borrow_mut().write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.parser.borrow_mut().flush()
+        }
+    }
+
+    struct VtBackend {
+        backend: CrosstermBackend<SharedParser>,
+        output: SharedParser,
+        size: Size,
+    }
+
+    impl VtBackend {
+        fn new(width: u16, height: u16) -> (Self, SharedParser) {
+            let output = SharedParser::new(width, height);
+            (
+                Self {
+                    backend: CrosstermBackend::new(output.clone()),
+                    output: output.clone(),
+                    size: Size::new(width, height),
+                },
+                output,
+            )
+        }
+    }
+
+    impl Write for VtBackend {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.backend.write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Write::flush(&mut self.backend)
+        }
+    }
+
+    impl Backend for VtBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.backend.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.backend.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.backend.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(self
+                .output
+                .parser
+                .borrow()
+                .screen()
+                .cursor_position()
+                .into())
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.backend.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.backend.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: BackendClearType) -> io::Result<()> {
+            self.backend.clear_region(clear_type)
+        }
+
+        fn append_lines(&mut self, line_count: u16) -> io::Result<()> {
+            self.backend.append_lines(line_count)
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(640, 480),
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Write::flush(self)
+        }
+    }
+
+    fn test_terminal(
+        width: u16,
+        screen_height: u16,
+        viewport_height: u16,
+    ) -> (AppTerminal<VtBackend>, SharedParser) {
+        let viewport_top = screen_height - viewport_height;
+        let viewport_area = Rect::new(0, viewport_top, width, viewport_height);
+        let (backend, output) = VtBackend::new(width, screen_height);
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(viewport_area),
+            },
+        )
+        .unwrap();
+        (
+            AppTerminal {
+                terminal,
+                viewport_area,
+                screen_size: Size::new(width, screen_height),
+                viewport_top,
+            },
+            output,
+        )
+    }
+
+    #[test]
+    fn history_scroll_repaints_unchanged_composer_and_footer() {
+        const WIDTH: u16 = 60;
+        const SCREEN_HEIGHT: u16 = 12;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let _ = view.take_pending_history_lines(WIDTH);
+        view.start_turn("test the viewport");
+        let _ = view.take_pending_history_lines(WIDTH);
+
+        let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+        let viewport_height = prepared.height();
+        let (mut terminal, output) = test_terminal(WIDTH, SCREEN_HEIGHT, viewport_height);
+        terminal
+            .draw(viewport_height, |frame| {
+                view.render_prepared(frame, prepared);
+            })
+            .unwrap();
+        let initial = output.screen();
+        assert!(initial.contains('›'), "{initial}");
+        assert!(initial.contains(MODEL), "{initial}");
+
+        let history = (0..viewport_height)
+            .map(|row| Line::from(format!("history row {row}")))
+            .collect();
+        terminal
+            .insert_history_lines(history, viewport_height)
+            .unwrap();
+        view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
+        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
+            "**Inspecting viewport state**".to_string(),
+        ));
+        let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+        terminal
+            .draw(prepared.height(), |frame| {
+                view.render_prepared(frame, prepared);
+            })
+            .unwrap();
+
+        let repainted = output.screen();
+        assert!(repainted.contains("history row"), "{repainted}");
+        assert!(
+            repainted.contains("Inspecting viewport state"),
+            "{repainted}"
+        );
+        assert!(repainted.contains('›'), "{repainted}");
+        assert!(repainted.contains(MODEL), "{repainted}");
+    }
 
     #[test]
     fn startup_probe_parses_terminal_colors() {
