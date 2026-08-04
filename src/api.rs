@@ -525,7 +525,10 @@ impl ApiClient {
             });
         }
         let trigger = compaction::compaction_trigger();
-        let prefix_tokens = estimated_tokens(context_prefix_items())
+        let rendered_tokens =
+            estimated_tokens(&compose_input(history.to_vec(), self.explicit_cache));
+        let prefix_tokens = rendered_tokens
+            .saturating_sub(estimated_tokens(history))
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
         let mut prompt_history = history.to_vec();
         compaction::trim_tool_outputs_to_fit(

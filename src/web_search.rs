@@ -291,16 +291,6 @@ impl WebSearchClient {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self::new(
-            reqwest::Client::new(),
-            SharedAuth::new(crate::auth::Auth::for_test("test-token")),
-            "http://127.0.0.1:1".to_string(),
-            "test-session".to_string(),
-        )
-    }
-
     pub(crate) async fn run(
         &self,
         input: Option<Value>,

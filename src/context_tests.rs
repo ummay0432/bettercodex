@@ -281,6 +281,62 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
 }
 
 #[test]
+fn cached_context_metrics_follow_every_history_mutation() {
+    fn assert_current(conversation: &Conversation) {
+        assert_eq!(
+            conversation.context_metrics,
+            ContextMetrics::from_history(conversation.items(), &conversation.world_state)
+        );
+        assert_eq!(
+            conversation.context_metrics.estimated_tokens,
+            estimated_tokens(conversation.items())
+        );
+    }
+
+    let (root, cwd) = temporary_repository("cached-metrics");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    assert_current(&conversation);
+
+    conversation
+        .extend([
+            UserInput::text("measure this turn").into_message(),
+            json!({
+                "id": "fc_metrics",
+                "type": "function_call",
+                "call_id": "call_metrics",
+                "name": "example",
+                "arguments": "{}",
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "orphan_metrics",
+                "output": "orphan",
+            }),
+        ])
+        .unwrap();
+    assert_current(&conversation);
+
+    assert!(conversation.normalize().unwrap());
+    assert_current(&conversation);
+
+    conversation
+        .replace_compacted(
+            vec![json!({
+                "type": "compaction_summary",
+                "id": "cmp_metrics",
+                "encrypted_content": "opaque metrics",
+            })],
+            InitialContextInjection::AfterCompaction,
+        )
+        .unwrap();
+    assert_current(&conversation);
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[ignore = "manual performance measurement"]
 fn benchmark_repeated_context_snapshots() {
     let (root, cwd) = temporary_repository("snapshot-benchmark");
@@ -303,6 +359,15 @@ fn benchmark_repeated_context_snapshots() {
         std::hint::black_box(conversation.context_snapshot());
     }
     eprintln!("500 snapshots: {:?}", started.elapsed());
+
+    let started = std::time::Instant::now();
+    for _ in 0..500 {
+        std::hint::black_box(ContextMetrics::from_history(
+            conversation.items(),
+            &conversation.world_state,
+        ));
+    }
+    eprintln!("500 uncached metric scans: {:?}", started.elapsed());
 
     drop(conversation);
     std::fs::remove_dir_all(root).unwrap();

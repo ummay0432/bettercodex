@@ -173,11 +173,6 @@ impl NestedTools {
         }
     }
 
-    #[cfg(test)]
-    fn new(cwd: PathBuf) -> Self {
-        Self::with_web_search(cwd, WebSearchClient::for_test())
-    }
-
     fn prepare_turn(&self, context: ToolTurnContext) {
         if let Ok(mut turn) = self.turn.lock() {
             *turn = context;

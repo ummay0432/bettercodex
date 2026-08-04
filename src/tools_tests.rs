@@ -119,6 +119,14 @@ text(result);
         "{}",
         output.preview
     );
+    assert_eq!(
+        call.output_items(&output),
+        vec![json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call-web",
+            "output": output.body.clone(),
+        })]
+    );
     let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(request.path, "/alpha/search");
     assert!(request.headers.contains("authorization: Bearer token-test"));

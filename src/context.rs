@@ -17,6 +17,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use uuid::Uuid;
 
 const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 64 * 1024;
@@ -25,6 +26,13 @@ const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;
 pub(crate) const RAW_CONTEXT_WINDOW: u64 = 372_000;
 pub(crate) const EFFECTIVE_CONTEXT_WINDOW: u64 = RAW_CONTEXT_WINDOW * 95 / 100;
 const COMPACT_AT_TOKENS: u64 = EFFECTIVE_CONTEXT_WINDOW;
+static CONTEXT_PREFIX_TOKEN_ESTIMATES: LazyLock<[u64; 2]> = LazyLock::new(|| {
+    let [tools_item, system_prompt_item] = crate::api::context_prefix_items();
+    [
+        estimate_value_tokens(tools_item),
+        estimate_value_tokens(system_prompt_item),
+    ]
+});
 const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
 const CRASH_GUIDANCE: &str = "The previous BetterCodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
@@ -89,7 +97,7 @@ struct WorldState {
     repository_instructions: Option<Value>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ContextMetrics {
     estimated_tokens: u64,
     tokens: [u64; CONTEXT_KINDS.len()],
@@ -217,23 +225,23 @@ impl Conversation {
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
-        let [tools_item, system_prompt_item] = crate::api::context_prefix_items();
+        let [tools_tokens, system_prompt_tokens] = *CONTEXT_PREFIX_TOKEN_ESTIMATES;
         let mut tokens = self.context_metrics.tokens;
         let mut items = self.context_metrics.items;
         if !self.context_metrics.has_tools {
-            record_context_item(
+            record_context_estimate(
                 &mut tokens,
                 &mut items,
                 ContextKind::ToolCatalogue,
-                tools_item,
+                tools_tokens,
             );
         }
         if !self.context_metrics.has_system_prompt {
-            record_context_item(
+            record_context_estimate(
                 &mut tokens,
                 &mut items,
                 ContextKind::SystemPrompt,
-                system_prompt_item,
+                system_prompt_tokens,
             );
         }
 
@@ -272,13 +280,13 @@ impl Conversation {
     }
 
     fn estimated_context_tokens(&self) -> u64 {
-        let [tools_item, system_prompt_item] = crate::api::context_prefix_items();
+        let [tools_tokens, system_prompt_tokens] = *CONTEXT_PREFIX_TOKEN_ESTIMATES;
         let mut estimate = self.context_metrics.estimated_tokens;
         if !self.context_metrics.has_tools {
-            estimate = estimate.saturating_add(estimate_value_tokens(tools_item));
+            estimate = estimate.saturating_add(tools_tokens);
         }
         if !self.context_metrics.has_system_prompt {
-            estimate = estimate.saturating_add(estimate_value_tokens(system_prompt_item));
+            estimate = estimate.saturating_add(system_prompt_tokens);
         }
         estimate
     }
@@ -382,6 +390,43 @@ impl WorldState {
     }
 }
 
+impl ContextMetrics {
+    fn from_history(history: &[Value], world_state: &WorldState) -> Self {
+        let mut metrics = Self::default();
+        metrics.extend(history, world_state);
+        metrics
+    }
+
+    fn extend(&mut self, history: &[Value], world_state: &WorldState) {
+        let [tools_item, system_prompt_item] = crate::api::context_prefix_items();
+        for item in history {
+            let kind = if same_additional_tools_item(item, tools_item) {
+                self.has_tools = true;
+                ContextKind::ToolCatalogue
+            } else if same_system_prompt_item(item, system_prompt_item) {
+                self.has_system_prompt = true;
+                ContextKind::SystemPrompt
+            } else if same_model_visible_message(item, &world_state.environment) {
+                ContextKind::Environment
+            } else if world_state
+                .repository_instructions
+                .as_ref()
+                .is_some_and(|instructions| same_model_visible_message(item, instructions))
+            {
+                ContextKind::RepositoryInstructions
+            } else {
+                context_kind(item)
+            };
+            self.estimated_tokens = self.estimated_tokens.saturating_add(record_context_item(
+                &mut self.tokens,
+                &mut self.items,
+                kind,
+                item,
+            ));
+        }
+    }
+}
+
 fn same_model_visible_message(left: &Value, right: &Value) -> bool {
     ["type", "role", "content"]
         .into_iter()
@@ -422,11 +467,20 @@ fn record_context_item(
     kind: ContextKind,
     item: &Value,
 ) -> u64 {
-    let index = context_kind_index(kind);
     let estimated = estimate_value_tokens(item);
+    record_context_estimate(tokens, items, kind, estimated);
+    estimated
+}
+
+fn record_context_estimate(
+    tokens: &mut [u64; CONTEXT_KINDS.len()],
+    items: &mut [usize; CONTEXT_KINDS.len()],
+    kind: ContextKind,
+    estimated: u64,
+) {
+    let index = context_kind_index(kind);
     tokens[index] = tokens[index].saturating_add(estimated);
     items[index] = items[index].saturating_add(1);
-    estimated
 }
 
 fn context_kind_index(kind: ContextKind) -> usize {
@@ -632,6 +686,24 @@ pub(crate) fn estimated_tokens(items: &[Value]) -> u64 {
         .fold(0_u64, u64::saturating_add)
 }
 
+#[derive(Default)]
+struct SerializedSize {
+    bytes: u64,
+}
+
+impl Write for SerializedSize {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn estimate_value_tokens(value: &Value) -> u64 {
     let item_type = value.get("type").and_then(Value::as_str);
     if matches!(
@@ -642,8 +714,9 @@ fn estimate_value_tokens(value: &Value) -> u64 {
         return estimate_reasoning_bytes(encrypted.len()).div_ceil(4);
     }
 
-    let mut bytes = serde_json::to_vec(value)
-        .map(|serialized| serialized.len() as u64)
+    let mut serialized_size = SerializedSize::default();
+    let mut bytes = serde_json::to_writer(&mut serialized_size, value)
+        .map(|()| serialized_size.bytes)
         .unwrap_or_default();
     visit_model_content(
         value,

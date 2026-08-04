@@ -461,9 +461,21 @@ mod tests {
         path
     }
 
+    fn nested_tools(cwd: PathBuf) -> Arc<NestedTools> {
+        Arc::new(NestedTools::with_web_search(
+            cwd,
+            crate::web_search::WebSearchClient::new(
+                reqwest::Client::new(),
+                crate::auth::SharedAuth::new(crate::auth::Auth::for_test("test-token")),
+                "http://127.0.0.1:1".to_string(),
+                "test-session".to_string(),
+            ),
+        ))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn composes_parallel_nested_calls_in_v8() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         let result = mode
             .execute(
@@ -485,7 +497,7 @@ text(`${left.output}:${right.output}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nested_calls_emit_codex_tui_events_instead_of_outer_exec_events() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         mode.execute(
@@ -515,7 +527,7 @@ text(`${left.output}:${right.output}`);
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn patch_and_plan_tools_dispatch_through_v8() {
         let cwd = temporary_directory("patch-plan");
-        let nested = Arc::new(NestedTools::new(cwd.clone()));
+        let nested = nested_tools(cwd.clone());
         let mode = CodeMode::new(Arc::clone(&nested));
         let result = mode
             .execute(
@@ -552,7 +564,7 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
             include_bytes!("../../preserve/assets/statusline.png"),
         )
         .unwrap();
-        let nested = Arc::new(NestedTools::new(cwd.clone()));
+        let nested = nested_tools(cwd.clone());
         let mode = CodeMode::new(nested);
         let result = mode
             .execute(
@@ -578,7 +590,7 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
     async fn invalid_view_image_is_replaced_at_the_model_facing_boundary() {
         let cwd = temporary_directory("invalid-view-image");
         std::fs::write(cwd.join("broken.png"), b"\x89PNG\r\n\x1a\nnot-an-image").unwrap();
-        let nested = Arc::new(NestedTools::new(cwd.clone()));
+        let nested = nested_tools(cwd.clone());
         let mode = CodeMode::new(nested);
         let result = mode
             .execute(
@@ -603,7 +615,7 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn text_only_single_item_result_uses_codex_plain_string_shape() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         let result = mode
             .execute(
@@ -627,7 +639,7 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn javascript_has_no_node_or_console_globals() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         let result = mode
             .execute(
@@ -647,7 +659,7 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_exposes_the_fixed_catalogue() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         let result = mode
             .execute(
@@ -669,7 +681,7 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn yielded_cells_resume_with_wait() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         let yielded = mode
             .execute(
@@ -709,7 +721,7 @@ text("after");
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_can_terminate_a_yielded_cell() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         let yielded = mode
             .execute(
@@ -744,7 +756,7 @@ text("after");
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stored_values_survive_between_cells() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         mode.execute(
             "call-store",
@@ -768,7 +780,7 @@ text("after");
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn notify_injects_a_preceding_output_item() {
-        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let nested = nested_tools(PathBuf::from("."));
         let mode = CodeMode::new(nested);
         let result = mode
             .execute(

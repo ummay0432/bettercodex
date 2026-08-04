@@ -171,6 +171,9 @@ fn truncate_retained_messages(items: Vec<Value>, max_tokens: usize) -> Vec<Value
 }
 
 fn message_text_token_count(item: &Value) -> usize {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return usize::try_from(estimated_tokens(std::slice::from_ref(item))).unwrap_or(usize::MAX);
+    }
     let Some(content) = item.get("content").and_then(Value::as_array) else {
         return usize::try_from(estimated_tokens(std::slice::from_ref(item))).unwrap_or(usize::MAX);
     };
