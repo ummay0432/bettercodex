@@ -1,0 +1,23 @@
+use serde_json::Value;
+use std::time::Duration;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AgentEvent {
+    ModelTextDelta(String),
+    ReasoningDelta(String),
+    ModelItemCompleted,
+    ModelResponseCompleted,
+    ToolStarted {
+        call_id: String,
+        name: String,
+        input: Option<Value>,
+    },
+    ToolCompleted {
+        call_id: String,
+        output: Result<Value, String>,
+        duration: Duration,
+    },
+    UsageUpdated(u64),
+    CompactionStarted,
+    CompactionCompleted,
+}

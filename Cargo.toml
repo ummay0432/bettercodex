@@ -1,0 +1,48 @@
+[package]
+name = "bettercodex"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A deliberately small GPT-5.6 Sol coding-agent harness"
+default-run = "bcodex"
+
+[[bin]]
+name = "bcodex"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22.1"
+codex-ansi-escape = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-code-mode-protocol = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-protocol = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-shell-command = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-utils-audio = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-utils-image = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-utils-output-truncation = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-utils-rustls-provider = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+crossterm = { version = "0.29.0", features = ["bracketed-paste", "event-stream"] }
+deno_core_icudata = "0.77.0"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+libc = "0.2"
+portable-pty = "0.9.0"
+pulldown-cmark = { version = "0.10", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color", "unstable-rendered-line-info"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+supports-color = "3.0.2"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4", "v5"] }
+v8 = "=150.4.0"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.clippy]
+all = "deny"

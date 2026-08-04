@@ -1,0 +1,2899 @@
+use super::editor;
+use super::editor::Editor;
+use super::markdown;
+use crate::MODEL;
+use crate::agent::SubmitOutcome;
+use crate::context::EFFECTIVE_CONTEXT_WINDOW;
+use crate::events::AgentEvent;
+use codex_ansi_escape::ansi_escape_line;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_shell_command::parse_command::parse_command;
+use crossterm::event::Event;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
+use ratatui::Frame;
+use ratatui::layout::Position;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::text::Span;
+use ratatui::text::Text;
+use ratatui::widgets::Block;
+use ratatui::widgets::Borders;
+use ratatui::widgets::Clear;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+const MUTED: Color = Color::Indexed(245);
+const RULE: Color = Color::Indexed(8);
+const MAX_EDITOR_ROWS: u16 = 8;
+const LIVE_PREFIX_COLS: u16 = 2;
+const TOOL_OUTPUT_MAX_ROWS: usize = 5;
+const COMMAND_CONTINUATION_MAX_ROWS: usize = 2;
+const STATUS_COMPOSER_SPACING: u16 = 1;
+const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "clear",
+        description: "start a fresh session",
+    },
+    SlashCommand {
+        name: "help",
+        description: "show keyboard shortcuts",
+    },
+    SlashCommand {
+        name: "exit",
+        description: "leave BetterCodex",
+    },
+];
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Action {
+    None,
+    Submit(String),
+    Queue(String),
+    Cancel,
+    Clear,
+    Quit,
+}
+
+pub(super) struct View {
+    cwd: PathBuf,
+    repository: Repository,
+    entries: Vec<TranscriptEntry>,
+    committed_entries: usize,
+    welcome_pending: bool,
+    history_emitted: bool,
+    clear_requested: bool,
+    resize_reflow_requested: bool,
+    editor: Editor,
+    context_tokens: Option<u64>,
+    busy: bool,
+    interrupting: bool,
+    working_since: Option<Instant>,
+    status_detail: Option<String>,
+    queued: usize,
+    assistant_received_this_turn: bool,
+    composer_text_width: u16,
+    show_shortcuts: bool,
+    slash_selection: usize,
+    dismissed_slash: Option<String>,
+    user_message_style: Style,
+    process_commands: HashMap<i64, String>,
+}
+
+#[derive(Debug)]
+enum TranscriptEntry {
+    User(String),
+    Assistant { text: String, streaming: bool },
+    Reasoning { text: String, streaming: bool },
+    Tool(ToolEntry),
+    Exploration { tools: Vec<ToolEntry>, sealed: bool },
+    Notice(String),
+    Error(String),
+}
+
+#[derive(Debug)]
+struct ToolEntry {
+    call_id: String,
+    name: String,
+    display: ToolDisplay,
+    outcome: Option<ToolOutcome>,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+enum ToolDisplay {
+    Command {
+        command: String,
+        parsed: Vec<ParsedCommand>,
+    },
+    Interaction {
+        command: String,
+        input: String,
+    },
+    Patch(PatchDisplay),
+    Plan(PlanDisplay),
+    ViewImage(String),
+    Other,
+}
+
+#[derive(Debug)]
+struct ToolOutcome {
+    output: Result<Value, String>,
+}
+
+#[derive(Debug, Default)]
+struct PatchDisplay {
+    files: Vec<PatchFile>,
+}
+
+#[derive(Debug)]
+struct PatchFile {
+    path: String,
+    move_to: Option<String>,
+    kind: PatchKind,
+    rows: Vec<PatchRow>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PatchKind {
+    Add,
+    Delete,
+    Update,
+}
+
+#[derive(Debug)]
+struct PatchRow {
+    number: usize,
+    kind: PatchRowKind,
+    text: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PatchRowKind {
+    Context,
+    Add,
+    Delete,
+}
+
+#[derive(Debug, Default)]
+struct PlanDisplay {
+    explanation: Option<String>,
+    steps: Vec<PlanStep>,
+}
+
+#[derive(Debug)]
+struct PlanStep {
+    text: String,
+    status: String,
+}
+
+struct Repository {
+    name: String,
+    branch: Option<String>,
+}
+
+struct SlashCommand {
+    name: &'static str,
+    description: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalColors {
+    foreground: (u8, u8, u8),
+    background: (u8, u8, u8),
+}
+
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+static TERMINAL_COLORS: OnceLock<TerminalColors> = OnceLock::new();
+
+impl View {
+    pub(super) fn new(cwd: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            repository: Repository::discover(cwd),
+            entries: Vec::new(),
+            committed_entries: 0,
+            welcome_pending: true,
+            history_emitted: false,
+            clear_requested: false,
+            resize_reflow_requested: false,
+            editor: Editor::default(),
+            context_tokens: None,
+            busy: false,
+            interrupting: false,
+            working_since: None,
+            status_detail: None,
+            queued: 0,
+            assistant_received_this_turn: false,
+            composer_text_width: 1,
+            show_shortcuts: false,
+            slash_selection: 0,
+            dismissed_slash: None,
+            user_message_style: user_message_style_for(Some((31, 31, 31))),
+            process_commands: HashMap::new(),
+        }
+    }
+
+    pub(super) fn set_terminal_colors(
+        &mut self,
+        foreground: Option<(u8, u8, u8)>,
+        background: Option<(u8, u8, u8)>,
+    ) {
+        self.user_message_style = user_message_style_for(background);
+        if let (Some(foreground), Some(background)) = (foreground, background) {
+            let _ = TERMINAL_COLORS.set(TerminalColors {
+                foreground,
+                background,
+            });
+        }
+    }
+
+    pub(super) fn take_clear_request(&mut self) -> bool {
+        std::mem::take(&mut self.clear_requested)
+    }
+
+    pub(super) fn take_resize_reflow_request(&mut self) -> bool {
+        std::mem::take(&mut self.resize_reflow_requested)
+    }
+
+    pub(super) fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    pub(super) fn start_turn(&mut self, prompt: &str) {
+        self.seal_exploration();
+        self.entries.push(TranscriptEntry::User(prompt.to_string()));
+        self.busy = true;
+        self.interrupting = false;
+        self.working_since = Some(Instant::now());
+        self.status_detail = None;
+        self.assistant_received_this_turn = false;
+    }
+
+    pub(super) fn add_user_message(&mut self, prompt: &str) {
+        self.close_streaming_entries();
+        self.seal_exploration();
+        self.entries.push(TranscriptEntry::User(prompt.to_string()));
+        self.status_detail = None;
+    }
+
+    pub(super) fn finish_turn(&mut self, result: anyhow::Result<SubmitOutcome>) {
+        self.close_streaming_entries();
+        self.seal_exploration();
+        self.finish_incomplete_tools();
+        self.busy = false;
+        self.interrupting = false;
+        self.working_since = None;
+        self.status_detail = None;
+        match result {
+            Ok(SubmitOutcome::Completed(answer)) => {
+                if !self.assistant_received_this_turn && !answer.trim().is_empty() {
+                    self.entries.push(TranscriptEntry::Assistant {
+                        text: answer,
+                        streaming: false,
+                    });
+                }
+            }
+            Ok(SubmitOutcome::Cancelled) => self
+                .entries
+                .push(TranscriptEntry::Notice("Turn interrupted".to_string())),
+            Err(error) => self
+                .entries
+                .push(TranscriptEntry::Error(markdown::sanitize(&format!(
+                    "{error:#}"
+                )))),
+        }
+    }
+
+    pub(super) fn set_interrupting(&mut self) {
+        if self.busy {
+            self.interrupting = true;
+            self.status_detail = None;
+        }
+    }
+
+    pub(super) fn set_queued(&mut self, queued: usize) {
+        self.queued = queued;
+    }
+
+    pub(super) fn set_context_tokens(&mut self, tokens: Option<u64>) {
+        self.context_tokens = tokens;
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.committed_entries = 0;
+        self.welcome_pending = true;
+        self.history_emitted = false;
+        self.clear_requested = true;
+        self.resize_reflow_requested = false;
+        self.context_tokens = None;
+        self.queued = 0;
+        self.show_shortcuts = false;
+        self.slash_selection = 0;
+        self.dismissed_slash = None;
+        self.process_commands.clear();
+    }
+
+    pub(super) fn handle_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::ModelTextDelta(delta) => {
+                self.seal_exploration();
+                self.assistant_received_this_turn = true;
+                match self.entries.last_mut() {
+                    Some(TranscriptEntry::Assistant { text, streaming }) if *streaming => {
+                        text.push_str(&delta);
+                    }
+                    _ => self.entries.push(TranscriptEntry::Assistant {
+                        text: delta,
+                        streaming: true,
+                    }),
+                }
+                self.status_detail = None;
+            }
+            AgentEvent::ReasoningDelta(delta) => {
+                self.seal_exploration();
+                match self.entries.last_mut() {
+                    Some(TranscriptEntry::Reasoning { text, streaming }) if *streaming => {
+                        text.push_str(&delta);
+                    }
+                    _ => self.entries.push(TranscriptEntry::Reasoning {
+                        text: delta,
+                        streaming: true,
+                    }),
+                }
+            }
+            AgentEvent::ModelItemCompleted | AgentEvent::ModelResponseCompleted => {
+                self.close_streaming_entries();
+            }
+            AgentEvent::ToolStarted {
+                call_id,
+                name,
+                input,
+            } => {
+                self.close_streaming_entries();
+                let entry = ToolEntry::new(call_id, name, input, &self.cwd, &self.process_commands);
+                self.status_detail = Some(entry.activity_label());
+                if entry.is_exploration() {
+                    let last_is_uncommitted = self.entries.len() > self.committed_entries;
+                    match self.entries.last_mut() {
+                        Some(TranscriptEntry::Exploration {
+                            tools,
+                            sealed: false,
+                        }) if last_is_uncommitted => {
+                            tools.push(entry);
+                        }
+                        _ => self.entries.push(TranscriptEntry::Exploration {
+                            tools: vec![entry],
+                            sealed: false,
+                        }),
+                    }
+                } else {
+                    self.seal_exploration();
+                    self.entries.push(TranscriptEntry::Tool(entry));
+                }
+            }
+            AgentEvent::ToolCompleted {
+                call_id,
+                output,
+                duration: _,
+            } => {
+                if let Some(tool) = self.find_tool_mut(&call_id) {
+                    tool.outcome = Some(ToolOutcome { output });
+                }
+                self.remember_process_command(&call_id);
+                self.repository = Repository::discover(&self.cwd);
+                self.status_detail = self.latest_tool_activity();
+            }
+            AgentEvent::UsageUpdated(tokens) => self.context_tokens = Some(tokens),
+            AgentEvent::CompactionStarted => {
+                self.context_tokens = None;
+                self.status_detail = Some("Compacting conversation".to_string());
+            }
+            AgentEvent::CompactionCompleted => self.status_detail = self.latest_tool_activity(),
+        }
+    }
+
+    pub(super) fn handle_terminal_event(&mut self, event: Event) -> Action {
+        match event {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                self.handle_key(key)
+            }
+            Event::Paste(text) => {
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                self.editor.insert(&text);
+                self.dismissed_slash = None;
+                self.slash_selection = 0;
+                Action::None
+            }
+            Event::Resize(_, _) => {
+                self.resize_reflow_requested = true;
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Action {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        if control && key.code == KeyCode::Char('c') {
+            return Action::Quit;
+        }
+        if key.code == KeyCode::Esc {
+            if self.show_shortcuts {
+                self.show_shortcuts = false;
+                return Action::None;
+            }
+            if !self.slash_matches().is_empty() {
+                self.dismissed_slash = Some(self.editor.text().to_string());
+                return Action::None;
+            }
+            return if self.busy {
+                Action::Cancel
+            } else {
+                Action::None
+            };
+        }
+        if self.show_shortcuts {
+            self.show_shortcuts = false;
+            return Action::None;
+        }
+        if key.code == KeyCode::Char('?') && self.editor.is_empty() {
+            self.show_shortcuts = true;
+            return Action::None;
+        }
+
+        let slash_matches = self.slash_matches();
+        if !slash_matches.is_empty() {
+            match key.code {
+                KeyCode::Tab => {
+                    let selection = self.slash_selection.min(slash_matches.len() - 1);
+                    self.editor
+                        .set_text(format!("/{}", slash_matches[selection].name));
+                    self.dismissed_slash = None;
+                    self.slash_selection = selection;
+                    return Action::None;
+                }
+                KeyCode::Up => {
+                    self.slash_selection = self
+                        .slash_selection
+                        .min(slash_matches.len() - 1)
+                        .saturating_sub(1);
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    self.slash_selection = (self.slash_selection + 1).min(slash_matches.len() - 1);
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
+
+        let previous_text = self.editor.text().to_string();
+        match key.code {
+            KeyCode::Enter if shift || alt || control => self.editor.insert_newline(),
+            KeyCode::Enter => return self.submit_action(false),
+            KeyCode::Tab if !self.editor.is_empty() => return self.submit_action(self.busy),
+            KeyCode::Char('j') if control => self.editor.insert_newline(),
+            KeyCode::Char('d') if control && self.editor.is_empty() => return Action::Quit,
+            KeyCode::Char('d') if control => self.editor.delete(),
+            KeyCode::Char('a') if control => self.editor.move_home(),
+            KeyCode::Char('e') if control => self.editor.move_end(),
+            KeyCode::Char('u') if control => self.editor.kill_to_line_start(),
+            KeyCode::Char('k') if control => self.editor.kill_to_line_end(),
+            KeyCode::Char('w') if control => self.editor.delete_previous_word(),
+            KeyCode::Char('l') if control => {}
+            KeyCode::Char(character) if (!control && !alt) || (control && alt) => {
+                let mut bytes = [0; 4];
+                self.editor.insert(character.encode_utf8(&mut bytes));
+            }
+            KeyCode::Backspace => self.editor.backspace(),
+            KeyCode::Delete => self.editor.delete(),
+            KeyCode::Left if control || alt => self.editor.move_word_left(),
+            KeyCode::Right if control || alt => self.editor.move_word_right(),
+            KeyCode::Left => self.editor.move_left(),
+            KeyCode::Right => self.editor.move_right(),
+            KeyCode::Home => self.editor.move_home(),
+            KeyCode::End => self.editor.move_end(),
+            KeyCode::Up
+                if self
+                    .editor
+                    .is_on_first_visual_line(self.composer_text_width) =>
+            {
+                self.editor.history_previous();
+            }
+            KeyCode::Down
+                if self.editor.is_browsing_history()
+                    && self.editor.is_on_last_visual_line(self.composer_text_width) =>
+            {
+                self.editor.history_next();
+            }
+            KeyCode::Up => self.editor.move_vertical(-1, self.composer_text_width),
+            KeyCode::Down => self.editor.move_vertical(1, self.composer_text_width),
+            _ => {}
+        }
+        if self.editor.text() != previous_text {
+            self.dismissed_slash = None;
+            self.slash_selection = 0;
+        }
+        Action::None
+    }
+
+    fn submit_action(&mut self, queued: bool) -> Action {
+        if self.editor.text().trim().is_empty() {
+            return Action::None;
+        }
+        let prompt = self.editor.take();
+        self.editor.remember(&prompt);
+        match prompt.trim() {
+            "/exit" | "/quit" => Action::Quit,
+            "/clear" if self.busy => {
+                self.entries.push(TranscriptEntry::Notice(
+                    "Interrupt the active turn before starting a fresh session".to_string(),
+                ));
+                Action::None
+            }
+            "/clear" => Action::Clear,
+            "/help" => {
+                self.entries.push(TranscriptEntry::Notice(
+                    "Enter submit/steer · Tab queue · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
+                        .to_string(),
+                ));
+                Action::None
+            }
+            _ if queued => Action::Queue(prompt),
+            _ => Action::Submit(prompt),
+        }
+    }
+
+    fn close_streaming_entries(&mut self) {
+        for entry in self.entries.iter_mut().rev() {
+            match entry {
+                TranscriptEntry::Assistant { streaming, .. }
+                | TranscriptEntry::Reasoning { streaming, .. } => *streaming = false,
+                TranscriptEntry::User(_) => break,
+                TranscriptEntry::Tool(_)
+                | TranscriptEntry::Exploration { .. }
+                | TranscriptEntry::Notice(_)
+                | TranscriptEntry::Error(_) => {}
+            }
+        }
+    }
+
+    fn seal_exploration(&mut self) {
+        if let Some(TranscriptEntry::Exploration { sealed, .. }) = self.entries.last_mut() {
+            *sealed = true;
+        }
+    }
+
+    fn finish_incomplete_tools(&mut self) {
+        for entry in &mut self.entries[self.committed_entries..] {
+            match entry {
+                TranscriptEntry::Tool(tool) => tool.finish_if_incomplete(),
+                TranscriptEntry::Exploration { tools, .. } => {
+                    for tool in tools {
+                        tool.finish_if_incomplete();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn find_tool_mut(&mut self, call_id: &str) -> Option<&mut ToolEntry> {
+        self.entries.iter_mut().rev().find_map(|entry| match entry {
+            TranscriptEntry::Tool(tool) if tool.call_id == call_id => Some(tool),
+            TranscriptEntry::Exploration { tools, .. } => {
+                tools.iter_mut().rev().find(|tool| tool.call_id == call_id)
+            }
+            _ => None,
+        })
+    }
+
+    fn remember_process_command(&mut self, call_id: &str) {
+        let remembered = self.find_tool_mut(call_id).and_then(|tool| {
+            let ToolDisplay::Command { command, .. } = &tool.display else {
+                return None;
+            };
+            let output = tool.outcome.as_ref()?.output.as_ref().ok()?;
+            let session_id = output.get("session_id")?.as_i64()?;
+            Some((session_id, command.clone()))
+        });
+        if let Some((session_id, command)) = remembered {
+            self.process_commands.insert(session_id, command);
+        }
+    }
+
+    fn latest_tool_activity(&self) -> Option<String> {
+        self.entries[self.committed_entries..]
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Tool(tool) if tool.outcome.is_none() => {
+                    Some(tool.activity_label())
+                }
+                TranscriptEntry::Exploration { tools, .. } => tools
+                    .iter()
+                    .rev()
+                    .find(|tool| tool.outcome.is_none())
+                    .map(ToolEntry::activity_label),
+                _ => None,
+            })
+    }
+
+    pub(super) fn take_pending_history_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        let mut lines = Vec::new();
+        if self.welcome_pending {
+            append_history_cell(
+                welcome_lines(&self.cwd, width),
+                &mut lines,
+                &mut self.history_emitted,
+            );
+            self.welcome_pending = false;
+        }
+        while self
+            .entries
+            .get(self.committed_entries)
+            .is_some_and(TranscriptEntry::is_finalized)
+        {
+            let entry = &self.entries[self.committed_entries];
+            append_history_cell(
+                entry.display_lines(width, self.user_message_style),
+                &mut lines,
+                &mut self.history_emitted,
+            );
+            self.committed_entries += 1;
+        }
+        lines
+    }
+
+    /// Re-render the finalized transcript from its source after a terminal resize.
+    ///
+    /// A terminal can reflow the mutable composer into scrollback before crossterm delivers the
+    /// resize event. Codex repairs that state by clearing its terminal surface and replaying the
+    /// retained transcript at the new width instead of trusting terminal-wrapped rows.
+    pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        while self
+            .entries
+            .get(self.committed_entries)
+            .is_some_and(TranscriptEntry::is_finalized)
+        {
+            self.committed_entries += 1;
+        }
+
+        let mut lines = Vec::new();
+        let mut emitted = false;
+        append_history_cell(welcome_lines(&self.cwd, width), &mut lines, &mut emitted);
+        for entry in &self.entries[..self.committed_entries] {
+            append_history_cell(
+                entry.display_lines(width, self.user_message_style),
+                &mut lines,
+                &mut emitted,
+            );
+        }
+        self.welcome_pending = false;
+        self.history_emitted = emitted;
+        lines
+    }
+
+    pub(super) fn desired_height(&mut self, width: u16, screen_height: u16) -> u16 {
+        let width = width.max(1);
+        self.composer_text_width = width.saturating_sub(3).max(1);
+        let editor = self
+            .editor
+            .layout(self.composer_text_width, MAX_EDITOR_ROWS);
+        let composer_height = (editor.lines.len() as u16).max(1).saturating_add(2);
+        let status_height = u16::from(self.busy);
+        let status_composer_spacing = STATUS_COMPOSER_SPACING.saturating_mul(status_height);
+        let bottom_spacing = 1;
+        let active_height = rendered_line_count(&self.active_lines(width), width);
+        let popup_height = self.slash_popup_height(width);
+        // Match Codex's bottom-pane layout: an active completion list replaces the footer and
+        // extends downward from the composer instead of becoming an overlay above it.
+        let trailing_height = if popup_height > 0 { popup_height } else { 2 };
+        let shortcuts_height = if self.show_shortcuts { 15 } else { 0 };
+        active_height
+            .saturating_add(bottom_spacing)
+            .saturating_add(status_height)
+            .saturating_add(status_composer_spacing)
+            .saturating_add(composer_height)
+            .saturating_add(trailing_height)
+            .max(shortcuts_height)
+            .clamp(1, screen_height.max(1))
+    }
+
+    pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        if area.is_empty() {
+            return;
+        }
+        self.composer_text_width = area.width.saturating_sub(3).max(1);
+        let editor_layout = self
+            .editor
+            .layout(self.composer_text_width, MAX_EDITOR_ROWS);
+        let editor_rows = (editor_layout.lines.len() as u16).max(1);
+        let composer_height = editor_rows.saturating_add(2).min(area.height);
+        let popup_height = if self.show_shortcuts {
+            0
+        } else {
+            self.slash_popup_height(area.width)
+        };
+        let trailing_height = if popup_height > 0 { popup_height } else { 2 }
+            .min(area.height.saturating_sub(composer_height));
+        let composer_y = area
+            .bottom()
+            .saturating_sub(composer_height.saturating_add(trailing_height));
+        let composer_area = Rect::new(area.x, composer_y, area.width, composer_height);
+        let trailing_area = Rect::new(area.x, composer_area.bottom(), area.width, trailing_height);
+        let footer_area = if popup_height == 0 {
+            trailing_area
+        } else {
+            Rect::default()
+        };
+        let popup_area = if popup_height > 0 {
+            trailing_area
+        } else {
+            Rect::default()
+        };
+        let status_height = u16::from(self.busy && composer_y > area.y);
+        let status_composer_spacing = if status_height > 0 {
+            STATUS_COMPOSER_SPACING.min(
+                composer_y
+                    .saturating_sub(area.y)
+                    .saturating_sub(status_height),
+            )
+        } else {
+            0
+        };
+        let status_area = Rect::new(
+            area.x,
+            composer_y.saturating_sub(status_height + status_composer_spacing),
+            area.width,
+            status_height,
+        );
+        let history_bottom = status_area.y.saturating_sub(1).max(area.y);
+        let history_area = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            history_bottom.saturating_sub(area.y),
+        );
+
+        self.render_active_history(frame, history_area);
+        if status_height > 0 {
+            frame.render_widget(
+                Paragraph::new(truncate_line(
+                    self.working_line(),
+                    usize::from(status_area.width),
+                )),
+                status_area,
+            );
+        }
+        self.render_composer(frame, composer_area, footer_area, editor_layout);
+        if !self.show_shortcuts {
+            self.render_slash_popup(frame, popup_area);
+        } else {
+            self.render_shortcuts(frame, area);
+        }
+    }
+
+    fn render_active_history(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.is_empty() {
+            return;
+        }
+        let lines = self.active_lines(area.width);
+        if lines.is_empty() {
+            return;
+        }
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let overflow = paragraph
+            .line_count(area.width)
+            .saturating_sub(usize::from(area.height));
+        frame.render_widget(
+            paragraph.scroll((u16::try_from(overflow).unwrap_or(u16::MAX), 0)),
+            area,
+        );
+    }
+
+    fn render_composer(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        footer_area: Rect,
+        layout: super::editor::EditorLayout,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        frame.render_widget(Block::default().style(self.user_message_style), area);
+        let text_y = area.y.saturating_add(1);
+        let text_x = area.x.saturating_add(LIVE_PREFIX_COLS);
+        let text_width = area.right().saturating_sub(text_x).saturating_sub(1).max(1);
+        let lines = if layout.lines.is_empty() {
+            vec![String::new()]
+        } else {
+            layout.lines
+        };
+        for (index, text) in lines.iter().enumerate() {
+            let Ok(index) = u16::try_from(index) else {
+                break;
+            };
+            let y = text_y.saturating_add(index);
+            if y >= area.bottom().saturating_sub(1) {
+                break;
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(text.clone())),
+                Rect::new(text_x, y, text_width, 1),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::from("›").bold())),
+            Rect::new(area.x, text_y, 1, 1),
+        );
+
+        if footer_area.height > 1 {
+            frame.render_widget(
+                Paragraph::new(self.status_line(footer_area.width)),
+                Rect::new(
+                    footer_area.x,
+                    footer_area.bottom().saturating_sub(1),
+                    footer_area.width,
+                    1,
+                ),
+            );
+        }
+
+        if !self.show_shortcuts {
+            let cursor_x = text_x
+                .saturating_add(layout.cursor_column)
+                .min(area.right().saturating_sub(1));
+            let cursor_y = text_y
+                .saturating_add(layout.cursor_row)
+                .min(area.bottom().saturating_sub(2));
+            frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+        }
+    }
+
+    fn render_shortcuts(&self, frame: &mut Frame<'_>, area: Rect) {
+        let popup = centered(area, 58, 13);
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .title(" Keyboard shortcuts ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(RULE));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let lines = vec![
+            shortcut_line("Enter", "submit prompt"),
+            shortcut_line("Enter while working", "send steering input"),
+            shortcut_line("Tab while working", "queue next prompt"),
+            shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
+            shortcut_line("Esc", "interrupt active turn"),
+            shortcut_line("Up / Down", "restore prompt history"),
+            shortcut_line("Ctrl+W", "delete previous word"),
+            shortcut_line("Ctrl+C", "exit"),
+            Line::from(""),
+            Line::from("Press any key to close").dim(),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_slash_popup(&self, frame: &mut Frame<'_>, area: Rect) {
+        let matches = self.slash_matches();
+        if matches.is_empty() || area.is_empty() || area.width <= LIVE_PREFIX_COLS {
+            return;
+        }
+        let popup = Rect::new(
+            area.x.saturating_add(LIVE_PREFIX_COLS),
+            area.y,
+            area.width.saturating_sub(LIVE_PREFIX_COLS),
+            area.height,
+        );
+        let selected = self.slash_selection.min(matches.len() - 1);
+        let query = self.editor.text().strip_prefix('/').unwrap_or_default();
+        let name_width = matches
+            .iter()
+            .map(|command| command.name.len().saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        let lines = matches
+            .iter()
+            .enumerate()
+            .map(|(index, command)| {
+                let matched = query.len().min(command.name.len());
+                let mut line = Line::from(vec![
+                    Span::from("/"),
+                    Span::from(command.name[..matched].to_string()).bold(),
+                    Span::from(command.name[matched..].to_string()),
+                    Span::from(
+                        " ".repeat(
+                            name_width
+                                .saturating_sub(command.name.len().saturating_add(1))
+                                .saturating_add(2),
+                        ),
+                    ),
+                    Span::from(command.description).dim(),
+                ]);
+                if index == selected {
+                    let selected_style = Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD);
+                    for span in &mut line.spans {
+                        span.style = selected_style;
+                    }
+                }
+                truncate_line(line, usize::from(popup.width))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), popup);
+    }
+
+    fn slash_popup_height(&self, _width: u16) -> u16 {
+        u16::try_from(self.slash_matches().len()).unwrap_or(u16::MAX)
+    }
+
+    fn slash_matches(&self) -> Vec<&'static SlashCommand> {
+        let text = self.editor.text();
+        if self.dismissed_slash.as_deref() == Some(text) {
+            return Vec::new();
+        }
+        let Some(query) = text.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if query.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.name.starts_with(query))
+            .collect()
+    }
+
+    fn working_line(&self) -> Line<'static> {
+        let elapsed = self
+            .working_since
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let heading = if self.interrupting {
+            "Interrupting"
+        } else if self.status_detail.as_deref() == Some("Compacting conversation") {
+            "Compacting"
+        } else {
+            "Working"
+        };
+        let mut spans = vec![activity_marker(self.working_since), " ".into()];
+        spans.extend(shimmer_spans(heading));
+        spans.push(
+            format!(
+                " ({} • esc to interrupt)",
+                format_elapsed(elapsed.as_secs())
+            )
+            .dim(),
+        );
+        if let Some(detail) = self
+            .status_detail
+            .as_deref()
+            .filter(|detail| *detail != "Compacting conversation")
+        {
+            spans.push(Span::from(" · ").dim());
+            spans.push(Span::from(detail.to_string()).dim());
+        }
+        if self.queued > 0 {
+            spans.push(Span::from(" · ").dim());
+            spans.push(Span::from(format!("{} queued", self.queued)).dim());
+        }
+        Line::from(spans)
+    }
+
+    fn status_line(&self, width: u16) -> Line<'static> {
+        let mut spans = vec![
+            Span::from(format!(" {MODEL}")),
+            Span::styled(" max", Style::default().fg(MUTED)),
+            Span::styled(" │ ", Style::default().fg(MUTED)),
+            Span::styled(
+                self.repository.name.clone(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ];
+        if let Some(branch) = &self.repository.branch {
+            spans.push(Span::styled(
+                format!(" / {branch}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(
+            format_context_usage(self.context_tokens),
+            Style::default().fg(MUTED),
+        ));
+        truncate_line(Line::from(spans), usize::from(width))
+    }
+
+    fn active_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let mut emitted = self.history_emitted;
+        for entry in &self.entries[self.committed_entries..] {
+            append_history_cell(
+                entry.display_lines(width, self.user_message_style),
+                &mut lines,
+                &mut emitted,
+            );
+        }
+        lines
+    }
+}
+
+impl TranscriptEntry {
+    fn is_finalized(&self) -> bool {
+        match self {
+            Self::User(_) | Self::Notice(_) | Self::Error(_) => true,
+            Self::Assistant { streaming, .. } | Self::Reasoning { streaming, .. } => !streaming,
+            Self::Tool(tool) => tool.outcome.is_some(),
+            Self::Exploration { tools, sealed } => {
+                *sealed && tools.iter().all(|tool| tool.outcome.is_some())
+            }
+        }
+    }
+
+    fn display_lines(&self, width: u16, user_style: Style) -> Vec<Line<'static>> {
+        match self {
+            Self::User(message) => user_message_lines(message, width, user_style),
+            Self::Assistant { text, .. } => assistant_lines(text, width),
+            Self::Reasoning { text, .. } => reasoning_lines(text, width),
+            Self::Tool(tool) => tool.display_lines(width, user_style),
+            Self::Exploration { tools, .. } => exploration_lines(tools, width),
+            Self::Notice(message) => vec![Line::from(vec![
+                Span::from("• ").dim(),
+                Span::from(message.clone()).dim(),
+            ])],
+            Self::Error(message) => vec![Line::from(vec![
+                Span::styled("■ ", Style::default().fg(Color::Red)),
+                Span::styled(message.clone(), Style::default().fg(Color::Red)),
+            ])],
+        }
+    }
+}
+
+impl ToolEntry {
+    fn new(
+        call_id: String,
+        name: String,
+        input: Option<Value>,
+        cwd: &Path,
+        process_commands: &HashMap<i64, String>,
+    ) -> Self {
+        let display = match name.as_str() {
+            "exec_command" => {
+                let command = input
+                    .as_ref()
+                    .and_then(|input| input.get("cmd"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("exec_command")
+                    .to_string();
+                let command_argv = input
+                    .as_ref()
+                    .map(crate::tools::command_argv_for_display)
+                    .unwrap_or_default();
+                ToolDisplay::Command {
+                    command,
+                    parsed: parse_command(&command_argv),
+                }
+            }
+            "write_stdin" => {
+                let session_id = input
+                    .as_ref()
+                    .and_then(|input| input.get("session_id"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let interaction = input
+                    .as_ref()
+                    .and_then(|input| input.get("chars"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                ToolDisplay::Interaction {
+                    command: process_commands
+                        .get(&session_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("process {session_id}")),
+                    input: interaction,
+                }
+            }
+            "apply_patch" => ToolDisplay::Patch(PatchDisplay::parse(
+                input.as_ref().and_then(Value::as_str).unwrap_or_default(),
+                cwd,
+            )),
+            "update_plan" => ToolDisplay::Plan(PlanDisplay::parse(input.as_ref())),
+            "view_image" => ToolDisplay::ViewImage(
+                input
+                    .as_ref()
+                    .and_then(|input| input.get("path"))
+                    .and_then(Value::as_str)
+                    .map(|path| display_tool_path(Path::new(path), cwd))
+                    .unwrap_or_else(|| "image".to_string()),
+            ),
+            _ => ToolDisplay::Other,
+        };
+        Self {
+            call_id,
+            name,
+            display,
+            outcome: None,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn is_exploration(&self) -> bool {
+        matches!(
+            &self.display,
+            ToolDisplay::Command { parsed, .. }
+                if !parsed.is_empty()
+                    && parsed.iter().all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
+        )
+    }
+
+    fn activity_label(&self) -> String {
+        match &self.display {
+            ToolDisplay::Command { command, .. } => first_display_line(command),
+            ToolDisplay::Interaction { command, .. } => command.clone(),
+            ToolDisplay::Patch(_) => "Applying patch".to_string(),
+            ToolDisplay::Plan(_) => "Updating plan".to_string(),
+            ToolDisplay::ViewImage(path) => format!("Viewing {path}"),
+            ToolDisplay::Other => self.name.clone(),
+        }
+    }
+
+    fn finish_if_incomplete(&mut self) {
+        if self.outcome.is_none() {
+            self.outcome = Some(ToolOutcome {
+                output: Err("tool stopped before returning a result".to_string()),
+            });
+        }
+    }
+
+    fn display_lines(&self, width: u16, user_style: Style) -> Vec<Line<'static>> {
+        match &self.display {
+            ToolDisplay::Command { command, .. } => command_lines(self, command, width),
+            ToolDisplay::Interaction { command, input } => {
+                interaction_lines(self, command, input, width)
+            }
+            ToolDisplay::Patch(patch) => {
+                patch.display_lines(self.outcome.as_ref(), width, user_style)
+            }
+            ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
+            ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
+            ToolDisplay::Other => generic_tool_lines(self, width),
+        }
+    }
+
+    fn succeeded(&self) -> Option<bool> {
+        let outcome = self.outcome.as_ref()?;
+        Some(match &outcome.output {
+            Err(_) => false,
+            Ok(output) => output
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_none_or(|code| code == 0),
+        })
+    }
+}
+
+impl PatchDisplay {
+    fn parse(source: &str, cwd: &Path) -> Self {
+        let lines = source.replace("\r\n", "\n");
+        let lines = lines.lines().collect::<Vec<_>>();
+        let mut files = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            index += 1;
+            let (kind, path) = if let Some(path) = line.strip_prefix("*** Add File: ") {
+                (PatchKind::Add, path)
+            } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+                (PatchKind::Delete, path)
+            } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+                (PatchKind::Update, path)
+            } else {
+                continue;
+            };
+            let mut move_to = None;
+            if let Some(destination) = lines
+                .get(index)
+                .and_then(|line| line.strip_prefix("*** Move to: "))
+            {
+                move_to = Some(destination.to_string());
+                index += 1;
+            }
+            let mut rows = Vec::new();
+            let mut old_line = 1_usize;
+            let mut new_line = 1_usize;
+            let original = matches!(kind, PatchKind::Update)
+                .then(|| std::fs::read_to_string(cwd.join(path)).ok())
+                .flatten()
+                .unwrap_or_default();
+            let original_lines = original.lines().collect::<Vec<_>>();
+            let mut search_start = 0_usize;
+            let mut line_delta = 0_isize;
+            let mut hunk_located = false;
+            while index < lines.len() && !lines[index].starts_with("*** ") {
+                let line = lines[index];
+                index += 1;
+                if line == "*** End of File" {
+                    continue;
+                }
+                if line == "@@" || line.starts_with("@@ ") {
+                    let located = line
+                        .strip_prefix("@@ ")
+                        .and_then(|anchor| {
+                            find_patch_sequence(&original_lines, &[anchor], search_start)
+                                .map(|position| position.saturating_add(1))
+                        })
+                        .or_else(|| {
+                            patch_hunk_old_lines(&lines, index).and_then(|pattern| {
+                                find_patch_sequence(&original_lines, &pattern, search_start)
+                            })
+                        });
+                    if let Some(position) = located {
+                        search_start = position;
+                        old_line = position.saturating_add(1);
+                        new_line = shifted_line_number(old_line, line_delta);
+                    }
+                    hunk_located = true;
+                    continue;
+                }
+                if !hunk_located {
+                    if let Some(pattern) = patch_hunk_old_lines(&lines, index.saturating_sub(1))
+                        && let Some(position) =
+                            find_patch_sequence(&original_lines, &pattern, search_start)
+                    {
+                        old_line = position.saturating_add(1);
+                        new_line = shifted_line_number(old_line, line_delta);
+                    }
+                    hunk_located = true;
+                }
+                if let Some(text) = line.strip_prefix('+') {
+                    rows.push(PatchRow {
+                        number: new_line,
+                        kind: PatchRowKind::Add,
+                        text: text.to_string(),
+                    });
+                    new_line += 1;
+                    line_delta += 1;
+                } else if let Some(text) = line.strip_prefix('-') {
+                    rows.push(PatchRow {
+                        number: old_line,
+                        kind: PatchRowKind::Delete,
+                        text: text.to_string(),
+                    });
+                    old_line += 1;
+                    line_delta -= 1;
+                } else if let Some(text) = line.strip_prefix(' ') {
+                    rows.push(PatchRow {
+                        number: new_line,
+                        kind: PatchRowKind::Context,
+                        text: text.to_string(),
+                    });
+                    old_line += 1;
+                    new_line += 1;
+                } else if line.is_empty() {
+                    rows.push(PatchRow {
+                        number: new_line,
+                        kind: PatchRowKind::Context,
+                        text: String::new(),
+                    });
+                    old_line += 1;
+                    new_line += 1;
+                }
+                search_start = old_line.saturating_sub(1);
+            }
+            if matches!(kind, PatchKind::Delete)
+                && rows.is_empty()
+                && let Ok(content) = std::fs::read_to_string(cwd.join(path))
+            {
+                rows.extend(content.lines().enumerate().map(|(index, text)| PatchRow {
+                    number: index + 1,
+                    kind: PatchRowKind::Delete,
+                    text: text.to_string(),
+                }));
+            }
+            files.push(PatchFile {
+                path: path.to_string(),
+                move_to,
+                kind,
+                rows,
+            });
+        }
+        Self { files }
+    }
+
+    fn display_lines(
+        &self,
+        outcome: Option<&ToolOutcome>,
+        width: u16,
+        user_style: Style,
+    ) -> Vec<Line<'static>> {
+        let failure = outcome.and_then(|outcome| outcome.output.as_ref().err());
+        if self.files.is_empty() {
+            return match failure {
+                Some(error) => failed_tool_lines("Failed to apply patch", error, width),
+                None if outcome.is_none() => vec![Line::from(vec![
+                    activity_marker(None),
+                    " ".into(),
+                    "Applying patch".bold(),
+                ])],
+                None => vec![Line::from(vec!["• ".dim(), "Applied patch".bold()])],
+            };
+        }
+        let total_added = self.files.iter().map(PatchFile::added).sum::<usize>();
+        let total_removed = self.files.iter().map(PatchFile::removed).sum::<usize>();
+        let mut lines = Vec::new();
+        let mut header = vec!["• ".dim()];
+        if let [file] = self.files.as_slice() {
+            header.push(match file.kind {
+                PatchKind::Add => "Added".bold(),
+                PatchKind::Delete => "Deleted".bold(),
+                PatchKind::Update => "Edited".bold(),
+            });
+            header.push(" ".into());
+            header.push(file.display_path().into());
+            header.push(" ".into());
+            header.extend(line_count_spans(file.added(), file.removed()));
+        } else {
+            header.push("Edited".bold());
+            header.push(format!(" {} files ", self.files.len(),).into());
+            header.extend(line_count_spans(total_added, total_removed));
+        }
+        lines.push(truncate_line(Line::from(header), usize::from(width)));
+        for (file_index, file) in self.files.iter().enumerate() {
+            if file_index > 0 {
+                lines.push(Line::default());
+            }
+            if self.files.len() > 1 {
+                let mut file_header = vec!["  └ ".dim(), file.display_path().into(), " ".into()];
+                file_header.extend(line_count_spans(file.added(), file.removed()));
+                lines.push(truncate_line(Line::from(file_header), usize::from(width)));
+            }
+            let number_width = file
+                .rows
+                .iter()
+                .map(|row| row.number)
+                .max()
+                .unwrap_or(1)
+                .to_string()
+                .len();
+            for row in &file.rows {
+                lines.extend(patch_row_lines(row, width, number_width, user_style));
+            }
+        }
+        if let Some(error) = failure {
+            lines.push(Line::default());
+            lines.push(Line::from("✘ Failed to apply patch").magenta().bold());
+            append_bounded_output(error, width, &mut lines);
+        }
+        lines
+    }
+}
+
+fn patch_hunk_old_lines<'a>(lines: &'a [&'a str], start: usize) -> Option<Vec<&'a str>> {
+    let pattern = lines[start..]
+        .iter()
+        .take_while(|line| {
+            !line.starts_with("@@")
+                && !line.starts_with("*** Add File: ")
+                && !line.starts_with("*** Delete File: ")
+                && !line.starts_with("*** Update File: ")
+                && line.trim() != "*** End Patch"
+        })
+        .filter_map(|line| {
+            if line.is_empty() {
+                Some("")
+            } else {
+                line.strip_prefix(' ').or_else(|| line.strip_prefix('-'))
+            }
+        })
+        .collect::<Vec<_>>();
+    (!pattern.is_empty()).then_some(pattern)
+}
+
+fn find_patch_sequence(haystack: &[&str], needle: &[&str], start: usize) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let last = haystack.len().saturating_sub(needle.len());
+    let start = start.min(last);
+    [
+        |left: &str, right: &str| left == right,
+        |left: &str, right: &str| left.trim_end() == right.trim_end(),
+        |left: &str, right: &str| left.trim() == right.trim(),
+    ]
+    .into_iter()
+    .find_map(|matches| {
+        (start..=last).find(|&position| {
+            haystack[position..position + needle.len()]
+                .iter()
+                .zip(needle)
+                .all(|(actual, expected)| matches(actual, expected))
+        })
+    })
+}
+
+fn shifted_line_number(old_line: usize, delta: isize) -> usize {
+    old_line.saturating_add_signed(delta).max(1)
+}
+
+fn patch_row_lines(
+    row: &PatchRow,
+    width: u16,
+    number_width: usize,
+    user_style: Style,
+) -> Vec<Line<'static>> {
+    let light_background = matches!(user_style.bg, Some(Color::Rgb(red, green, blue))
+        if 0.299 * red as f32 + 0.587 * green as f32 + 0.114 * blue as f32 > 128.0);
+    let (marker, line_style, gutter_style, marker_style, content_style) = match row.kind {
+        PatchRowKind::Context => (
+            ' ',
+            Style::default(),
+            Style::default().dim(),
+            Style::default(),
+            Style::default(),
+        ),
+        PatchRowKind::Add if light_background => (
+            '+',
+            Style::default().bg(Color::Rgb(218, 251, 225)),
+            Style::default()
+                .fg(Color::Rgb(31, 35, 40))
+                .bg(Color::Rgb(172, 238, 187)),
+            Style::default().fg(Color::Green),
+            Style::default(),
+        ),
+        PatchRowKind::Delete if light_background => (
+            '-',
+            Style::default().bg(Color::Rgb(255, 235, 233)),
+            Style::default()
+                .fg(Color::Rgb(31, 35, 40))
+                .bg(Color::Rgb(255, 206, 203)),
+            Style::default().fg(Color::Red),
+            Style::default(),
+        ),
+        PatchRowKind::Add => {
+            let background = Color::Rgb(33, 58, 43);
+            (
+                '+',
+                Style::default().bg(background),
+                Style::default().dim(),
+                Style::default().fg(Color::Green).bg(background),
+                Style::default().fg(Color::Green).bg(background),
+            )
+        }
+        PatchRowKind::Delete => {
+            let background = Color::Rgb(74, 34, 29);
+            (
+                '-',
+                Style::default().bg(background),
+                Style::default().dim(),
+                Style::default().fg(Color::Red).bg(background),
+                Style::default().fg(Color::Red).bg(background),
+            )
+        }
+    };
+    let prefix_width = 4_usize.saturating_add(number_width).saturating_add(2);
+    let content_width = usize::from(width)
+        .saturating_sub(prefix_width)
+        .max(1)
+        .try_into()
+        .unwrap_or(u16::MAX);
+    let content = row.text.replace('\t', "    ");
+    let wrapped = wrap_styled_line(
+        &Line::from(Span::styled(content, content_style)),
+        content_width,
+    );
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut content)| {
+            let mut spans = if index == 0 {
+                vec![
+                    Span::styled(format!("    {:>number_width$} ", row.number), gutter_style),
+                    Span::styled(marker.to_string(), marker_style),
+                ]
+            } else {
+                vec![Span::styled(
+                    format!("    {:number_width$}  ", ""),
+                    gutter_style,
+                )]
+            };
+            spans.append(&mut content.spans);
+            Line::from(spans).style(line_style)
+        })
+        .collect()
+}
+
+impl PatchFile {
+    fn added(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row.kind, PatchRowKind::Add))
+            .count()
+    }
+
+    fn removed(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row.kind, PatchRowKind::Delete))
+            .count()
+    }
+
+    fn display_path(&self) -> String {
+        self.move_to.as_ref().map_or_else(
+            || self.path.clone(),
+            |move_to| format!("{} → {move_to}", self.path),
+        )
+    }
+}
+
+impl PlanDisplay {
+    fn parse(input: Option<&Value>) -> Self {
+        let explanation = input
+            .and_then(|input| input.get("explanation"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let steps = input
+            .and_then(|input| input.get("plan"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|step| PlanStep {
+                text: step
+                    .get("step")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                status: step
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending")
+                    .to_string(),
+            })
+            .collect();
+        Self { explanation, steps }
+    }
+
+    fn display_lines(&self, outcome: Option<&ToolOutcome>, width: u16) -> Vec<Line<'static>> {
+        match outcome.map(|outcome| &outcome.output) {
+            None => {
+                return vec![Line::from(vec![
+                    activity_marker(None),
+                    " ".into(),
+                    "Updating Plan".bold(),
+                ])];
+            }
+            Some(Err(error)) => return failed_tool_lines("Failed to update plan", error, width),
+            Some(Ok(_)) => {}
+        }
+        let mut lines = vec![Line::from(vec!["• ".dim(), "Updated Plan".bold()])];
+        let mut details = Vec::new();
+        if let Some(explanation) = self
+            .explanation
+            .as_deref()
+            .map(str::trim)
+            .filter(|explanation| !explanation.is_empty())
+        {
+            for line in editor::wrap_text(explanation, width.saturating_sub(4).max(1)) {
+                details.push(Line::from(line).dim().italic());
+            }
+        }
+        if self.steps.is_empty() {
+            details.push(Line::from("(no steps provided)").dim().italic());
+        } else {
+            for step in &self.steps {
+                let (marker, style) = match step.status.as_str() {
+                    "completed" => (
+                        "✔ ",
+                        Style::default().add_modifier(Modifier::CROSSED_OUT | Modifier::DIM),
+                    ),
+                    "in_progress" => ("□ ", Style::default().cyan().bold()),
+                    _ => ("□ ", Style::default().dim()),
+                };
+                let wrapped = editor::wrap_text(&step.text, width.saturating_sub(6).max(1));
+                for (index, line) in wrapped.into_iter().enumerate() {
+                    details.push(Line::from(vec![
+                        Span::from(if index == 0 { marker } else { "  " }),
+                        Span::styled(line, style),
+                    ]));
+                }
+            }
+        }
+        prefix_lines(&mut lines, details, "  └ ", "    ");
+        lines
+    }
+}
+
+impl Repository {
+    fn discover(cwd: &Path) -> Self {
+        let root = command_output(cwd, &["rev-parse", "--show-toplevel"])
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.to_path_buf());
+        let name = markdown::sanitize(
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace"),
+        );
+        let branch = command_output(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .map(|branch| markdown::sanitize(&branch));
+        Self { name, branch }
+    }
+}
+
+fn command_output(cwd: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(arguments)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn welcome_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
+    if available_width < 4 {
+        return Vec::new();
+    }
+    let maximum_content_width = usize::from(available_width.saturating_sub(4)).min(56);
+    let mut content = vec![Line::from(vec![
+        Span::from(">_ ").dim(),
+        Span::from("BetterCodex").bold(),
+        Span::from(format!(" (v{})", env!("CARGO_PKG_VERSION"))).dim(),
+    ])];
+    content.push(Line::default());
+    content.push(Line::from(vec![
+        Span::from("model:       ").dim(),
+        Span::from(MODEL),
+        Span::from(" max").dim(),
+    ]));
+    content.push(Line::from(vec![
+        Span::from("directory:   ").dim(),
+        Span::from(display_directory(cwd)),
+    ]));
+    content.push(Line::from(vec![
+        Span::from("permissions: ").dim(),
+        Span::from("current user"),
+    ]));
+    let content = content
+        .into_iter()
+        .map(|line| truncate_line(line, maximum_content_width))
+        .collect::<Vec<_>>();
+    with_card_border(content)
+}
+
+fn with_card_border(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let content_width = lines.iter().map(line_width).max().unwrap_or_default();
+    let border_style = Style::default().fg(RULE);
+    let mut output = Vec::with_capacity(lines.len().saturating_add(2));
+    output.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(content_width.saturating_add(2))),
+        border_style,
+    )));
+    for mut line in lines {
+        let used = line_width(&line);
+        let mut spans = vec![Span::styled("│ ", border_style)];
+        spans.append(&mut line.spans);
+        spans.push(Span::styled(
+            " ".repeat(content_width.saturating_sub(used)),
+            border_style,
+        ));
+        spans.push(Span::styled(" │", border_style));
+        output.push(Line::from(spans));
+    }
+    output.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(content_width.saturating_add(2))),
+        border_style,
+    )));
+    output
+}
+
+fn display_directory(cwd: &Path) -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return markdown::sanitize(&cwd.display().to_string());
+    };
+    cwd.strip_prefix(&home).map_or_else(
+        |_| markdown::sanitize(&cwd.display().to_string()),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                markdown::sanitize(&format!("~/{}", relative.display()))
+            }
+        },
+    )
+}
+
+fn display_tool_path(path: &Path, cwd: &Path) -> String {
+    if path.is_relative() {
+        return markdown::sanitize(&path.display().to_string());
+    }
+    if let Ok(relative) = path.strip_prefix(cwd) {
+        return markdown::sanitize(&relative.display().to_string());
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return markdown::sanitize(&path.display().to_string());
+    };
+    path.strip_prefix(home).map_or_else(
+        |_| markdown::sanitize(&path.display().to_string()),
+        |relative| markdown::sanitize(&format!("~/{}", relative.display())),
+    )
+}
+
+fn user_message_lines(message: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+    let message = markdown::sanitize(message);
+    let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS + 1).max(1);
+    let wrapped = editor::wrap_text(message.trim_end_matches(['\r', '\n']), wrap_width);
+    let mut lines = vec![Line::default().style(style)];
+    for (index, content) in wrapped.into_iter().enumerate() {
+        lines.push(
+            Line::from(vec![
+                Span::styled(if index == 0 { "› " } else { "  " }, style.bold().dim()),
+                Span::styled(content, style),
+            ])
+            .style(style),
+        );
+    }
+    lines.push(Line::default().style(style));
+    lines
+}
+
+fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
+    let rendered = markdown::render(message);
+    let mut wrapped = Vec::new();
+    for line in rendered {
+        wrapped.extend(wrap_styled_line(&line, width.saturating_sub(2).max(1)));
+    }
+    prefix_styled_lines(wrapped, "• ", "  ")
+}
+
+fn reasoning_lines(message: &str, width: u16) -> Vec<Line<'static>> {
+    let style = Style::default().fg(MUTED).italic();
+    let mut lines = Vec::new();
+    for (index, line) in editor::wrap_text(
+        markdown::sanitize(message).trim_end_matches(['\r', '\n']),
+        width.saturating_sub(2).max(1),
+    )
+    .into_iter()
+    .enumerate()
+    {
+        lines.push(Line::from(vec![
+            Span::styled(if index == 0 { "• " } else { "  " }, style),
+            Span::styled(line, style),
+        ]));
+    }
+    lines
+}
+
+fn command_lines(tool: &ToolEntry, command: &str, width: u16) -> Vec<Line<'static>> {
+    let (bullet, title) = match tool.succeeded() {
+        None => (activity_marker(Some(tool.started_at)), "Running"),
+        Some(true) => ("•".green().bold(), "Ran"),
+        Some(false) => ("•".red().bold(), "Ran"),
+    };
+    let prefix_width = line_width(&Line::from(vec![
+        bullet.clone(),
+        " ".into(),
+        title.bold(),
+        " ".into(),
+    ]));
+    let mut command_rows = editor::wrap_text(
+        markdown::sanitize(command).trim_end_matches(['\r', '\n']),
+        width.saturating_sub(prefix_width as u16).max(1),
+    );
+    if command_rows.is_empty() {
+        command_rows.push(String::new());
+    }
+    let first = command_rows.remove(0);
+    let mut lines = vec![Line::from(vec![
+        bullet,
+        " ".into(),
+        title.bold(),
+        " ".into(),
+        Span::from(first).cyan(),
+    ])];
+    let omitted = command_rows
+        .len()
+        .saturating_sub(COMMAND_CONTINUATION_MAX_ROWS);
+    for row in command_rows.into_iter().take(COMMAND_CONTINUATION_MAX_ROWS) {
+        lines.push(Line::from(vec!["  │ ".dim(), Span::from(row).cyan()]));
+    }
+    if omitted > 0 {
+        lines.push(Line::from(vec![
+            "  │ ".dim(),
+            format!("… +{omitted} lines").dim(),
+        ]));
+    }
+    if let Some(outcome) = &tool.outcome {
+        match &outcome.output {
+            Ok(output) => {
+                let text = output
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    lines.push(Line::from(vec!["  └ ".dim(), "(no output)".dim()]));
+                } else {
+                    append_bounded_output(text, width, &mut lines);
+                }
+            }
+            Err(error) => append_bounded_output(error, width, &mut lines),
+        }
+    }
+    lines
+}
+
+fn interaction_lines(
+    tool: &ToolEntry,
+    command: &str,
+    input: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let bullet = match tool.succeeded() {
+        None => activity_marker(Some(tool.started_at)),
+        Some(true) => "•".green().bold(),
+        Some(false) => "•".red().bold(),
+    };
+    let detail = if input.is_empty() {
+        format!("Waited for `{command}`")
+    } else {
+        format!(
+            "Interacted with `{command}`, sent `{}`",
+            summarize_interaction_input(input)
+        )
+    };
+    let rows = editor::wrap_text(&detail, width.saturating_sub(4).max(1));
+    let mut lines = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if index == 0 {
+                Line::from(vec![bullet.clone(), " ".into(), Span::from(row)])
+            } else {
+                Line::from(vec!["  │ ".dim(), Span::from(row)])
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(outcome) = &tool.outcome {
+        match &outcome.output {
+            Ok(output) => {
+                if let Some(output) = output.get("output").and_then(Value::as_str)
+                    && !output.is_empty()
+                {
+                    append_bounded_output(output, width, &mut lines);
+                }
+            }
+            Err(error) => append_bounded_output(error, width, &mut lines),
+        }
+    }
+    lines
+}
+
+fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
+    let active = tools.iter().any(|tool| tool.outcome.is_none());
+    let started = tools
+        .iter()
+        .find(|tool| tool.outcome.is_none())
+        .map(|tool| tool.started_at);
+    let mut lines = vec![Line::from(vec![
+        if active {
+            activity_marker(started)
+        } else {
+            "•".dim()
+        },
+        " ".into(),
+        if active {
+            "Exploring".bold()
+        } else {
+            "Explored".bold()
+        },
+    ])];
+    let mut details: Vec<(&str, Vec<Span<'static>>)> = Vec::new();
+    let mut read_names = Vec::<String>::new();
+    let flush_reads = |details: &mut Vec<(&str, Vec<Span<'static>>)>, names: &mut Vec<String>| {
+        if names.is_empty() {
+            return;
+        }
+        let mut spans = Vec::new();
+        for (index, name) in std::mem::take(names).into_iter().enumerate() {
+            if index > 0 {
+                spans.push(", ".dim());
+            }
+            spans.push(name.into());
+        }
+        details.push(("Read", spans));
+    };
+    for tool in tools {
+        let ToolDisplay::Command { parsed, .. } = &tool.display else {
+            continue;
+        };
+        for parsed in parsed {
+            match parsed {
+                ParsedCommand::Read { name, .. } => {
+                    if !read_names.contains(name) {
+                        read_names.push(name.clone());
+                    }
+                }
+                ParsedCommand::ListFiles { cmd, path } => {
+                    flush_reads(&mut details, &mut read_names);
+                    details.push((
+                        "List",
+                        vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
+                    ));
+                }
+                ParsedCommand::Search { cmd, query, path } => {
+                    flush_reads(&mut details, &mut read_names);
+                    let spans = match (query, path) {
+                        (Some(query), Some(path)) => {
+                            vec![query.clone().into(), " in ".dim(), path.clone().into()]
+                        }
+                        (Some(query), None) => vec![query.clone().into()],
+                        _ => vec![cmd.clone().into()],
+                    };
+                    details.push(("Search", spans));
+                }
+                ParsedCommand::Unknown { .. } => {}
+            }
+        }
+    }
+    flush_reads(&mut details, &mut read_names);
+    let detail_width = width.saturating_sub(4).max(1);
+    let mut wrapped_details = Vec::new();
+    for (title, spans) in details {
+        let title = format!("{title} ");
+        let title_width = UnicodeWidthStr::width(title.as_str()) as u16;
+        let wrapped = wrap_styled_line(
+            &Line::from(spans),
+            detail_width.saturating_sub(title_width).max(1),
+        );
+        for (index, mut row) in wrapped.into_iter().enumerate() {
+            let mut spans = vec![if index == 0 {
+                Span::from(title.clone()).cyan()
+            } else {
+                Span::from(" ".repeat(usize::from(title_width)))
+            }];
+            spans.append(&mut row.spans);
+            wrapped_details.push(Line::from(spans));
+        }
+    }
+    for (index, mut detail) in wrapped_details.into_iter().enumerate() {
+        let mut spans = vec![if index == 0 {
+            "  └ ".dim()
+        } else {
+            "    ".into()
+        }];
+        spans.append(&mut detail.spans);
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn view_image_lines(outcome: Option<&ToolOutcome>, path: &str, width: u16) -> Vec<Line<'static>> {
+    match outcome.map(|outcome| &outcome.output) {
+        None => vec![Line::from(vec![
+            activity_marker(None),
+            " ".into(),
+            "Viewing Image".bold(),
+        ])],
+        Some(Ok(_)) => vec![
+            Line::from(vec!["• ".dim(), "Viewed Image".bold()]),
+            truncate_line(
+                Line::from(vec!["  └ ".dim(), Span::from(path.to_string()).dim()]),
+                usize::from(width),
+            ),
+        ],
+        Some(Err(error)) => failed_tool_lines("Failed to view image", error, width),
+    }
+}
+
+fn generic_tool_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
+    match tool.outcome.as_ref().map(|outcome| &outcome.output) {
+        None => vec![Line::from(vec![
+            activity_marker(Some(tool.started_at)),
+            " ".into(),
+            "Running".bold(),
+            " ".into(),
+            Span::from(tool.name.clone()).cyan(),
+        ])],
+        Some(Ok(output)) => {
+            let mut lines = vec![Line::from(vec![
+                "• ".dim(),
+                "Called".bold(),
+                " ".into(),
+                Span::from(tool.name.clone()).cyan(),
+            ])];
+            append_bounded_output(&output.to_string(), width, &mut lines);
+            lines
+        }
+        Some(Err(error)) => failed_tool_lines(&format!("Failed {}", tool.name), error, width),
+    }
+}
+
+fn failed_tool_lines(title: &str, error: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        "✗ ".red().bold(),
+        Span::from(title.to_string()).bold(),
+    ])];
+    append_bounded_output(error, width, &mut lines);
+    lines
+}
+
+fn append_bounded_output(output: &str, width: u16, lines: &mut Vec<Line<'static>>) {
+    let mut rendered = Vec::new();
+    for raw in output.lines() {
+        let ansi = ansi_escape_line(raw);
+        rendered.extend(wrap_styled_line(&ansi, width.saturating_sub(4).max(1)));
+    }
+    if rendered.is_empty() {
+        rendered.push(Line::from("(no output)").dim());
+    }
+    let rendered = middle_truncate_lines(rendered, TOOL_OUTPUT_MAX_ROWS);
+    for (index, mut line) in rendered.into_iter().enumerate() {
+        for span in &mut line.spans {
+            span.style = span.style.add_modifier(Modifier::DIM);
+        }
+        let mut spans = vec![if index == 0 {
+            "  └ ".dim()
+        } else {
+            "    ".into()
+        }];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+}
+
+fn middle_truncate_lines(lines: Vec<Line<'static>>, maximum: usize) -> Vec<Line<'static>> {
+    if lines.len() <= maximum {
+        return lines;
+    }
+    let head = maximum.saturating_sub(1) / 2;
+    let tail = maximum.saturating_sub(head + 1);
+    let omitted = lines.len().saturating_sub(head + tail);
+    let mut kept = lines[..head].to_vec();
+    kept.push(Line::from(format!(
+        "… +{omitted} lines (ctrl + t to view transcript)"
+    )));
+    kept.extend(lines[lines.len() - tail..].iter().cloned());
+    kept
+}
+
+fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut rows = Vec::new();
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for span in &line.spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+            if used + grapheme_width > width && used > 0 {
+                if !content.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut content), span.style));
+                }
+                rows.push(Line::from(std::mem::take(&mut spans)).style(line.style));
+                used = 0;
+            }
+            content.push_str(grapheme);
+            used += grapheme_width;
+        }
+        if !content.is_empty() {
+            spans.push(Span::styled(content, span.style));
+        }
+    }
+    if !spans.is_empty() || rows.is_empty() {
+        rows.push(Line::from(spans).style(line.style));
+    }
+    rows
+}
+
+fn prefix_styled_lines(
+    lines: Vec<Line<'static>>,
+    initial: &'static str,
+    subsequent: &'static str,
+) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            let mut spans = vec![if index == 0 {
+                Span::from(initial).dim()
+            } else {
+                Span::from(subsequent)
+            }];
+            spans.append(&mut line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+fn prefix_lines(
+    output: &mut Vec<Line<'static>>,
+    lines: Vec<Line<'static>>,
+    initial: &'static str,
+    subsequent: &'static str,
+) {
+    for (index, mut line) in lines.into_iter().enumerate() {
+        let mut spans = vec![if index == 0 {
+            Span::from(initial).dim()
+        } else {
+            Span::from(subsequent)
+        }];
+        spans.append(&mut line.spans);
+        output.push(Line::from(spans));
+    }
+}
+
+fn append_history_cell(
+    mut cell: Vec<Line<'static>>,
+    output: &mut Vec<Line<'static>>,
+    emitted: &mut bool,
+) {
+    if cell.is_empty() {
+        return;
+    }
+    if *emitted {
+        output.push(Line::default());
+    } else {
+        *emitted = true;
+    }
+    output.append(&mut cell);
+}
+
+fn line_count_spans(added: usize, removed: usize) -> Vec<Span<'static>> {
+    vec![
+        "(".into(),
+        format!("+{added}").green(),
+        " ".into(),
+        format!("-{removed}").red(),
+        ")".into(),
+    ]
+}
+
+fn rendered_line_count(lines: &[Line<'static>], width: u16) -> u16 {
+    if lines.is_empty() {
+        return 0;
+    }
+    Paragraph::new(Text::from(lines.to_vec()))
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1))
+        .try_into()
+        .unwrap_or(u16::MAX)
+}
+
+fn user_message_style_for(background: Option<(u8, u8, u8)>) -> Style {
+    // Codex normally gets this value from the bounded OSC 11 startup probe. Multiplexers can
+    // swallow the response even when the underlying terminal is a dark true-color terminal; use
+    // BetterCodex's accepted dark canvas in that case so the composer does not silently lose the
+    // Codex backfill that distinguishes user-authored text.
+    let background = background.unwrap_or((31, 31, 31));
+    let light =
+        0.299 * background.0 as f32 + 0.587 * background.1 as f32 + 0.114 * background.2 as f32
+            > 128.0;
+    let (overlay, alpha) = if light {
+        ((0, 0, 0), 0.04)
+    } else {
+        ((255, 255, 255), 0.12)
+    };
+    let (red, green, blue) = blend(overlay, background, alpha);
+    Style::default().bg(Color::Rgb(red, green, blue))
+}
+
+fn activity_marker(started_at: Option<Instant>) -> Span<'static> {
+    let elapsed = started_at
+        .map(|started| started.elapsed())
+        .unwrap_or_default();
+    if supports_true_color() {
+        shimmer_spans("•")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "•".into())
+    } else if (elapsed.as_millis() / 600).is_multiple_of(2) {
+        "•".into()
+    } else {
+        "◦".dim()
+    }
+}
+
+fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
+    let started = PROCESS_START.get_or_init(Instant::now);
+    shimmer_spans_at(
+        text,
+        started.elapsed(),
+        TERMINAL_COLORS.get().copied(),
+        supports_true_color(),
+    )
+}
+
+fn shimmer_spans_at(
+    text: &str,
+    elapsed: Duration,
+    terminal_colors: Option<TerminalColors>,
+    true_color: bool,
+) -> Vec<Span<'static>> {
+    let characters = text.chars().collect::<Vec<_>>();
+    if characters.is_empty() {
+        return Vec::new();
+    }
+
+    let padding = 10_usize;
+    let period = characters.len() + padding * 2;
+    let position = ((elapsed.as_secs_f32() % 2.0) / 2.0 * period as f32) as isize;
+    let band_half_width = 5.0_f32;
+    let base_color = terminal_colors
+        .map(|colors| colors.foreground)
+        .unwrap_or((128, 128, 128));
+    let highlight_color = terminal_colors
+        .map(|colors| colors.background)
+        .unwrap_or((255, 255, 255));
+
+    characters
+        .into_iter()
+        .enumerate()
+        .map(|(index, character)| {
+            let distance = ((index + padding) as isize - position).abs() as f32;
+            let intensity = if distance <= band_half_width {
+                let phase = std::f32::consts::PI * (distance / band_half_width);
+                0.5 * (1.0 + phase.cos())
+            } else {
+                0.0
+            };
+            let style = if true_color {
+                let color = blend(highlight_color, base_color, intensity.clamp(0.0, 1.0) * 0.9);
+                Style::default()
+                    .fg(Color::Rgb(color.0, color.1, color.2))
+                    .add_modifier(Modifier::BOLD)
+            } else if intensity < 0.2 {
+                Style::default().add_modifier(Modifier::DIM)
+            } else if intensity < 0.6 {
+                Style::default()
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            Span::styled(character.to_string(), style)
+        })
+        .collect()
+}
+
+fn supports_true_color() -> bool {
+    supports_color::on_cached(supports_color::Stream::Stdout).is_some_and(|level| level.has_16m)
+}
+
+fn blend(foreground: (u8, u8, u8), background: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
+    (
+        (foreground.0 as f32 * alpha + background.0 as f32 * (1.0 - alpha)) as u8,
+        (foreground.1 as f32 * alpha + background.1 as f32 * (1.0 - alpha)) as u8,
+        (foreground.2 as f32 * alpha + background.2 as f32 * (1.0 - alpha)) as u8,
+    )
+}
+
+fn summarize_interaction_input(input: &str) -> String {
+    let sanitized = input.replace('\n', "\\n").replace('`', "\\`");
+    let mut characters = sanitized.chars();
+    let preview = characters.by_ref().take(80).collect::<String>();
+    if characters.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn first_display_line(source: &str) -> String {
+    let first = source.lines().next().unwrap_or(source).trim();
+    let mut characters = first.chars();
+    let shortened = characters.by_ref().take(100).collect::<String>();
+    if characters.next().is_some() || source.lines().nth(1).is_some() {
+        format!("{shortened} …")
+    } else {
+        shortened
+    }
+}
+
+fn format_context_usage(tokens: Option<u64>) -> String {
+    let Some(tokens) = tokens else {
+        return "? of 353K".to_string();
+    };
+    let percent = (tokens as f64 / EFFECTIVE_CONTEXT_WINDOW as f64 * 100.0).clamp(0.0, 100.0);
+    if percent > 0.0 && percent < 1.0 {
+        format!("{percent:.1}% of 353K")
+    } else {
+        format!("{percent:.0}% of 353K")
+    }
+}
+
+fn format_elapsed(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!(
+            "{}h {:02}m {:02}s",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        ),
+    }
+}
+
+fn shortcut_line(key: &'static str, description: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::from(format!("{key:<22}")),
+        Span::from(description).dim(),
+    ])
+}
+
+fn centered(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
+    let width = preferred_width.min(area.width.saturating_sub(2)).max(1);
+    let height = preferred_height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if line_width(&line) <= width {
+        return line;
+    }
+    if width == 0 {
+        return Line::default();
+    }
+    let target = width.saturating_sub(1);
+    let mut used = 0;
+    let mut spans = Vec::new();
+    'spans: for span in line.spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if used + grapheme_width > target {
+                if !content.is_empty() {
+                    spans.push(Span::styled(content, span.style));
+                }
+                break 'spans;
+            }
+            content.push_str(grapheme);
+            used += grapheme_width;
+        }
+        if !content.is_empty() {
+            spans.push(Span::styled(content, span.style));
+        }
+    }
+    spans.push(Span::styled("…", Style::default().fg(MUTED)));
+    Line::from(spans).style(line.style)
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn context_usage_matches_the_preserved_contract() {
+        assert_eq!(format_context_usage(None), "? of 353K");
+        assert_eq!(format_context_usage(Some(1_000)), "0.3% of 353K");
+        assert_eq!(format_context_usage(Some(70_680)), "20% of 353K");
+        assert_eq!(format_context_usage(Some(u64::MAX)), "100% of 353K");
+    }
+
+    #[test]
+    fn status_line_matches_the_preserved_field_order() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.repository = Repository {
+            name: "pi".to_string(),
+            branch: Some("main".to_string()),
+        };
+        view.context_tokens = Some(70_680);
+        assert_eq!(
+            plain(&view.status_line(80)),
+            " gpt-5.6-sol max │ pi / main │ 20% of 353K"
+        );
+    }
+
+    #[test]
+    fn initial_viewport_contains_only_the_codex_composer() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        assert_eq!(view.desired_height(88, 24), 6);
+        let history = view.take_pending_history_lines(88);
+        assert!(
+            history
+                .iter()
+                .any(|line| plain(line).contains("BetterCodex"))
+        );
+        assert_eq!(view.desired_height(88, 24), 6);
+
+        let backend = TestBackend::new(88, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(!rendered.contains(">_ BetterCodex"));
+        assert!(!rendered.contains("Ask BetterCodex to do anything"));
+        assert!(rendered.lines().any(|line| line.trim() == "›"));
+        assert!(rendered.contains("gpt-5.6-sol max"));
+    }
+
+    #[test]
+    fn busy_status_matches_codex_activity_and_composer_spacing() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        let _ = view.take_pending_history_lines(60);
+
+        let height = view.desired_height(60, 24);
+        assert_eq!(height, 8);
+        let backend = TestBackend::new(60, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let status_y = rows
+            .iter()
+            .position(|row| row.contains("Working ("))
+            .unwrap() as u16;
+        assert_eq!(buffer[(0, status_y)].symbol(), "•");
+        assert!(rows[usize::from(status_y)].contains("• Working ("));
+        assert!(rows[usize::from(status_y)].contains("• esc to interrupt)"));
+        assert!(
+            !rendered
+                .chars()
+                .any(|character| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character))
+        );
+
+        let composer_background = view.user_message_style.bg.unwrap();
+        let composer_y = (0..height)
+            .find(|&y| buffer[(0, y)].bg == composer_background)
+            .unwrap();
+        assert_eq!(composer_y, status_y + 2, "{rendered}");
+        assert_eq!(buffer[(0, status_y + 1)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn shimmer_uses_the_terminal_palette_for_its_sweep() {
+        let colors = TerminalColors {
+            foreground: (220, 220, 220),
+            background: (20, 20, 20),
+        };
+        let spans = shimmer_spans_at("Working", Duration::from_millis(741), Some(colors), true);
+
+        assert_eq!(spans.len(), "Working".chars().count());
+        assert_eq!(spans[0].content.as_ref(), "W");
+        assert_ne!(spans[0].style.fg, spans[6].style.fg);
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn slash_commands_render_below_the_composer_like_codex() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        for character in "/ex".chars() {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+
+        let height = view.desired_height(60, 24);
+        assert_eq!(height, 5);
+        let backend = TestBackend::new(60, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let composer_y = rows.iter().position(|row| row.contains("/ex")).unwrap();
+        let command_y = rows
+            .iter()
+            .position(|row| row.contains("/exit  leave BetterCodex"))
+            .unwrap();
+        assert!(command_y > composer_y, "{rendered}");
+        assert_eq!(buffer[(2, composer_y as u16)].symbol(), "/");
+        assert_eq!(buffer[(2, command_y as u16)].symbol(), "/");
+        assert_eq!(buffer[(9, command_y as u16)].fg, Color::Cyan);
+        assert!(
+            buffer[(2, command_y as u16)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(!rendered.contains("Commands"), "{rendered}");
+        assert!(!rendered.contains('┌'), "{rendered}");
+        assert!(!rendered.contains("gpt-5.6-sol"), "{rendered}");
+    }
+
+    #[test]
+    fn welcome_card_uses_codex_content_width_instead_of_terminal_width() {
+        let lines = welcome_lines(Path::new("/tmp/bettercodex"), 100);
+        let widest_content = lines[1..lines.len() - 1]
+            .iter()
+            .map(line_width)
+            .max()
+            .unwrap();
+        assert_eq!(line_width(&lines[0]), widest_content);
+        assert!(line_width(&lines[0]) < 60);
+    }
+
+    #[test]
+    fn resize_reflow_rebuilds_finalized_history_from_source() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        assert!(
+            view.take_pending_history_lines(80)
+                .iter()
+                .any(|line| plain(line).contains("BetterCodex"))
+        );
+        view.start_turn("a user message that wraps at the narrower width");
+        let _ = view.take_pending_history_lines(80);
+        view.handle_agent_event(AgentEvent::ModelTextDelta("assistant reply".to_string()));
+        view.handle_agent_event(AgentEvent::ModelItemCompleted);
+        let _ = view.take_pending_history_lines(80);
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Resize(32, 18)),
+            Action::None
+        );
+        assert!(view.take_resize_reflow_request());
+        let replay = view
+            .history_lines_for_resize_reflow(32)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(replay.contains("BetterCodex"), "{replay}");
+        assert!(replay.contains("› a user message"), "{replay}");
+        assert!(replay.contains("• assistant reply"), "{replay}");
+        assert!(!view.welcome_pending);
+        assert_eq!(view.committed_entries, 2);
+    }
+
+    #[test]
+    fn user_message_and_composer_share_codex_background() {
+        let style = user_message_style_for(Some((31, 31, 31)));
+        let lines = user_message_lines("test", 40, style);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(plain(&lines[1]), "› test");
+        assert_eq!(lines[0].style.bg, style.bg);
+        assert_eq!(lines[1].style.bg, style.bg);
+        assert_eq!(lines[2].style.bg, style.bg);
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.user_message_style = style;
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 1)].bg, style.bg.unwrap());
+    }
+
+    #[test]
+    fn submitted_user_message_keeps_its_background_in_scrollback() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+
+        let lines = view.take_pending_history_lines(40);
+        let buffer = crate::tui::terminal::render_history_lines(&lines, 40);
+        let background = view.user_message_style.bg.unwrap();
+
+        assert_eq!(lines.len(), 3);
+        for y in 0..3 {
+            for x in 0..40 {
+                assert_eq!(buffer[(x, y)].bg, background);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_exec_uses_codex_command_cell_shape() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:cmd".to_string(),
+            name: "exec_command".to_string(),
+            input: Some(json!({"cmd": "cargo test"})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:cmd".to_string(),
+            output: Ok(json!({"exit_code": 0, "output": "21 passed\n"})),
+            duration: Duration::from_millis(50),
+        });
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("• Ran cargo test"));
+        assert!(rendered.contains("  └ 21 passed"));
+        assert!(!rendered.contains("exec ·"));
+    }
+
+    #[test]
+    fn write_stdin_uses_codex_interaction_cell_and_keeps_output() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:start".to_string(),
+            name: "exec_command".to_string(),
+            input: Some(json!({"cmd": "bash"})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:start".to_string(),
+            output: Ok(json!({"session_id": 42, "output": ""})),
+            duration: Duration::from_millis(10),
+        });
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:input".to_string(),
+            name: "write_stdin".to_string(),
+            input: Some(json!({"session_id": 42, "chars": "echo ready\n"})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:input".to_string(),
+            output: Ok(json!({"exit_code": 0, "output": "ready\n"})),
+            duration: Duration::from_millis(10),
+        });
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("• Interacted with `bash`, sent `echo ready\\n`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  └ ready"), "{rendered}");
+    }
+
+    #[test]
+    fn read_commands_use_codex_explored_cell() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:read".to_string(),
+            name: "exec_command".to_string(),
+            input: Some(json!({"cmd": "sed -n '1,20p' src/main.rs"})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:read".to_string(),
+            output: Ok(json!({"exit_code": 0, "output": "fn main() {}\n"})),
+            duration: Duration::from_millis(10),
+        });
+        view.seal_exploration();
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("• Explored"), "{rendered}");
+        assert!(rendered.contains("Read main.rs"), "{rendered}");
+        assert!(!rendered.contains("fn main"), "{rendered}");
+    }
+
+    #[test]
+    fn sequential_read_commands_stay_in_one_codex_explored_cell() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        for (call_id, command) in [
+            ("cell:one", "cat src/main.rs"),
+            ("cell:two", "cat src/api.rs"),
+        ] {
+            view.handle_agent_event(AgentEvent::ToolStarted {
+                call_id: call_id.to_string(),
+                name: "exec_command".to_string(),
+                input: Some(json!({"cmd": command})),
+            });
+            view.handle_agent_event(AgentEvent::ToolCompleted {
+                call_id: call_id.to_string(),
+                output: Ok(json!({"exit_code": 0, "output": "ignored\n"})),
+                duration: Duration::from_millis(10),
+            });
+            assert!(view.take_pending_history_lines(80).is_empty());
+        }
+        view.handle_agent_event(AgentEvent::ModelTextDelta("done".to_string()));
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered.matches("• Explored").count(), 1, "{rendered}");
+        assert!(rendered.contains("main.rs"), "{rendered}");
+        assert!(rendered.contains("api.rs"), "{rendered}");
+    }
+
+    #[test]
+    fn plan_and_image_cells_match_codex_labels() {
+        let plan = PlanDisplay::parse(Some(&json!({
+            "plan": [
+                {"step": "Port viewport", "status": "completed"},
+                {"step": "Port tools", "status": "in_progress"}
+            ]
+        })));
+        let outcome = ToolOutcome {
+            output: Ok(json!("Plan updated")),
+        };
+        let rendered = plan
+            .display_lines(Some(&outcome), 80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("• Updated Plan"));
+        assert!(rendered.contains("✔ Port viewport"));
+        assert!(rendered.contains("□ Port tools"));
+
+        let image = view_image_lines(Some(&outcome), "screen.png", 80);
+        assert_eq!(plain(&image[0]), "• Viewed Image");
+        assert_eq!(plain(&image[1]), "  └ screen.png");
+    }
+
+    #[test]
+    fn patch_summary_matches_codex_structure() {
+        let patch = PatchDisplay::parse(
+            "*** Begin Patch\n*** Add File: new.txt\n+alpha\n+beta\n*** End Patch",
+            Path::new("/tmp"),
+        );
+        let outcome = ToolOutcome {
+            output: Ok(json!("Done!")),
+        };
+        let lines = patch.display_lines(
+            Some(&outcome),
+            80,
+            user_message_style_for(Some((31, 31, 31))),
+        );
+        let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("• Added new.txt (+2 -0)"));
+        assert!(rendered.contains("1 +alpha"));
+        assert!(rendered.contains("2 +beta"));
+        assert_eq!(
+            lines
+                .iter()
+                .find(|line| plain(line).contains("+alpha"))
+                .and_then(|line| line.style.bg),
+            Some(Color::Rgb(33, 58, 43))
+        );
+    }
+
+    #[test]
+    fn patch_hunk_rows_use_source_line_numbers() {
+        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.txt");
+        std::fs::write(
+            &path,
+            (1..=9)
+                .map(|number| format!("line {number}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let patch = PatchDisplay::parse(
+            "*** Begin Patch\n*** Update File: sample.txt\n@@ line 5\n-line 6\n+six\n line 7\n*** End Patch",
+            &root,
+        );
+        let rendered = patch
+            .display_lines(
+                Some(&ToolOutcome {
+                    output: Ok(json!("Done!")),
+                }),
+                80,
+                user_message_style_for(Some((31, 31, 31))),
+            )
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(rendered.contains("6 -line 6"), "{rendered}");
+        assert!(rendered.contains("6 +six"), "{rendered}");
+        assert!(rendered.contains("7  line 7"), "{rendered}");
+    }
+
+    #[test]
+    fn composer_supports_multiline_editing_and_submission() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        for character in "first".chars() {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+        view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )));
+        for character in "second".chars() {
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Submit("first\nsecond".to_string())
+        );
+    }
+
+    #[test]
+    fn rendering_survives_tiny_terminal_sizes() {
+        for (width, height) in [(1, 1), (2, 3), (4, 4), (7, 6), (20, 8)] {
+            let mut view = View::new(Path::new("/tmp/bettercodex"));
+            view.welcome_pending = false;
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| view.render(frame)).unwrap();
+        }
+    }
+
+    fn plain(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn render_buffer(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area;
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}

@@ -1,5 +1,10 @@
 # Chat composer and status line
 
+> Historical reference: the 2026-08-04 Codex TUI port superseded the unfilled,
+> ruled composer below. BetterCodex now uses Codex's palette-derived filled
+> composer and user-message cells while retaining the fixed BetterCodex status
+> fields and context semantics documented here.
+
 ## Accepted appearance
 
 The combined composer and status line is the canonical reference:
@@ -30,6 +35,18 @@ over as a Pi compatibility layer.
 
 The old implementation intentionally overlaid only the prompt glyph and visual
 styling on the host editor. It did not replace the editor state machine.
+
+## Slash completion contract
+
+The active Rust TUI follows Codex's bottom-pane layout for slash commands:
+
+- render matching commands in the footer slot directly below the composer;
+- replace the status line while the completion list is open and restore it
+  when the list closes;
+- use the editor's two-column left inset and align descriptions from the
+  widest visible command; and
+- render the selected row in cyan without a title, border, or separate
+  selection marker.
 
 ## Status-line contract
 

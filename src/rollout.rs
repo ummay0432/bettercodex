@@ -1,0 +1,549 @@
+use crate::MODEL;
+use crate::usage::TokenUsage;
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::ops::Deref;
+use std::ops::DerefMut;
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+use uuid::Uuid;
+
+const ROLLOUT_VERSION: u32 = 1;
+const STATE_DIRECTORY: &str = "bettercodex";
+const SESSIONS_DIRECTORY: &str = "sessions";
+const INSTALLATION_ID_FILE: &str = "installation_id";
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionIdentity {
+    pub(crate) installation_id: String,
+    pub(crate) session_id: String,
+    pub(crate) thread_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionMetadata {
+    pub(crate) version: u32,
+    pub(crate) identity: SessionIdentity,
+    pub(crate) cwd: PathBuf,
+    pub(crate) created_at_unix_ms: u64,
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeSelector {
+    LatestForCwd,
+    Id(Uuid),
+}
+
+pub(crate) struct LoadedRollout {
+    pub(crate) rollout: Rollout,
+    pub(crate) metadata: SessionMetadata,
+    pub(crate) history: Vec<Value>,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) usage_history_estimate: Option<u64>,
+    pub(crate) compaction_count: u64,
+    pub(crate) unfinished_turn: Option<String>,
+}
+
+pub(crate) struct Rollout {
+    file: LockedRolloutFile,
+    path: PathBuf,
+    metadata: SessionMetadata,
+}
+
+struct LockedRolloutFile(File);
+
+impl Deref for LockedRolloutFile {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for LockedRolloutFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for LockedRolloutFile {
+    fn drop(&mut self) {
+        // Unlock explicitly: a concurrently forked command can briefly inherit
+        // the close-on-exec descriptor and would otherwise extend ownership.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RolloutRecord {
+    Session {
+        metadata: SessionMetadata,
+    },
+    HistoryAppend {
+        items: Vec<Value>,
+    },
+    HistoryReplace {
+        reason: HistoryReplacement,
+        items: Vec<Value>,
+    },
+    Usage {
+        usage: TokenUsage,
+        history_estimate: u64,
+    },
+    TurnStarted {
+        turn_id: String,
+    },
+    TurnFinished {
+        turn_id: String,
+        outcome: TurnOutcome,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HistoryReplacement {
+    Initial,
+    Compaction,
+    Normalization,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TurnOutcome {
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+impl Rollout {
+    pub(crate) fn create(cwd: &Path) -> Result<Self> {
+        Self::create_in(&state_root()?, cwd)
+    }
+
+    pub(crate) fn create_in(root: &Path, cwd: &Path) -> Result<Self> {
+        prepare_private_directory(root)?;
+        let sessions = root.join(SESSIONS_DIRECTORY);
+        prepare_private_directory(&sessions)?;
+
+        let identity = SessionIdentity {
+            installation_id: installation_id(root)?,
+            session_id: Uuid::new_v4().to_string(),
+            thread_id: Uuid::new_v4().to_string(),
+        };
+        let metadata = SessionMetadata {
+            version: ROLLOUT_VERSION,
+            identity,
+            cwd: cwd.to_path_buf(),
+            created_at_unix_ms: unix_timestamp_millis(),
+            model: MODEL.to_string(),
+            reasoning_effort: "max".to_string(),
+        };
+        let path = sessions.join(format!("{}.jsonl", metadata.identity.session_id));
+        let file = lock_rollout(open_private_append(&path, true)?, &path)?;
+        let mut rollout = Self {
+            file,
+            path,
+            metadata: metadata.clone(),
+        };
+        rollout.write_record(&RolloutRecord::Session { metadata })?;
+        Ok(rollout)
+    }
+
+    pub(crate) fn resume(selector: ResumeSelector, cwd: &Path) -> Result<LoadedRollout> {
+        Self::resume_in(&state_root()?, selector, cwd)
+    }
+
+    pub(crate) fn resume_in(
+        root: &Path,
+        selector: ResumeSelector,
+        cwd: &Path,
+    ) -> Result<LoadedRollout> {
+        let sessions = root.join(SESSIONS_DIRECTORY);
+        let path = match selector {
+            ResumeSelector::Id(id) => sessions.join(format!("{id}.jsonl")),
+            ResumeSelector::LatestForCwd => {
+                latest_rollout_for_cwd(&sessions, cwd)?.ok_or_else(|| {
+                    anyhow!("no saved BetterCodex session exists for {}", cwd.display())
+                })?
+            }
+        };
+        load_rollout(path)
+    }
+
+    pub(crate) fn identity(&self) -> &SessionIdentity {
+        &self.metadata.identity
+    }
+
+    pub(crate) fn append_history(&mut self, items: &[Value]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.write_record(&RolloutRecord::HistoryAppend {
+            items: items.to_vec(),
+        })
+    }
+
+    pub(crate) fn replace_history(
+        &mut self,
+        items: &[Value],
+        reason: HistoryReplacement,
+    ) -> Result<()> {
+        self.write_record(&RolloutRecord::HistoryReplace {
+            reason,
+            items: items.to_vec(),
+        })
+    }
+
+    pub(crate) fn record_usage(&mut self, usage: &TokenUsage, history_estimate: u64) -> Result<()> {
+        self.write_record(&RolloutRecord::Usage {
+            usage: usage.clone(),
+            history_estimate,
+        })
+    }
+
+    pub(crate) fn start_turn(&mut self, turn_id: &str) -> Result<()> {
+        self.write_record(&RolloutRecord::TurnStarted {
+            turn_id: turn_id.to_string(),
+        })
+    }
+
+    pub(crate) fn finish_turn(&mut self, turn_id: &str, outcome: TurnOutcome) -> Result<()> {
+        self.write_record(&RolloutRecord::TurnFinished {
+            turn_id: turn_id.to_string(),
+            outcome,
+        })
+    }
+
+    fn write_record(&mut self, record: &RolloutRecord) -> Result<()> {
+        let mut bytes = serde_json::to_vec(record).context("failed to encode session record")?;
+        bytes.push(b'\n');
+        self.file
+            .write_all(&bytes)
+            .with_context(|| format!("failed to append {}", self.path.display()))?;
+        self.file
+            .flush()
+            .with_context(|| format!("failed to flush {}", self.path.display()))?;
+        self.file
+            .sync_data()
+            .with_context(|| format!("failed to persist {}", self.path.display()))
+    }
+}
+
+fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
+    let mut file = lock_rollout(open_private_append(&path, false)?, &path)?;
+    let original_length = file.metadata()?.len();
+    let mut reader = BufReader::new(&*file);
+    let mut metadata = None;
+    let mut history = Vec::new();
+    let mut usage = None;
+    let mut usage_history_estimate = None;
+    let mut compaction_count = 0_u64;
+    let mut unfinished_turn = None;
+    let mut line_number = 0_usize;
+    let mut valid_length = 0_u64;
+    let mut valid_record_needs_newline = false;
+
+    loop {
+        let mut line = Vec::new();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        let terminated = line.last() == Some(&b'\n');
+        if terminated {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            valid_length = valid_length.saturating_add(bytes_read as u64);
+            valid_record_needs_newline = !terminated;
+            continue;
+        }
+        let record = match serde_json::from_slice::<RolloutRecord>(&line) {
+            Ok(record) => record,
+            Err(_) if !terminated => break,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("invalid session record at {}:{line_number}", path.display())
+                });
+            }
+        };
+        valid_length = valid_length.saturating_add(bytes_read as u64);
+        valid_record_needs_newline = !terminated;
+        match record {
+            RolloutRecord::Session {
+                metadata: session_metadata,
+            } => {
+                if metadata.replace(session_metadata).is_some() {
+                    return Err(anyhow!(
+                        "{} contains multiple session headers",
+                        path.display()
+                    ));
+                }
+            }
+            RolloutRecord::HistoryAppend { items } => history.extend(items),
+            RolloutRecord::HistoryReplace { reason, items } => {
+                if reason == HistoryReplacement::Compaction {
+                    compaction_count = compaction_count.saturating_add(1);
+                }
+                history = items;
+                usage = None;
+                usage_history_estimate = None;
+            }
+            RolloutRecord::Usage {
+                usage: new_usage,
+                history_estimate,
+            } => {
+                usage = Some(new_usage);
+                usage_history_estimate = Some(history_estimate);
+            }
+            RolloutRecord::TurnStarted { turn_id } => unfinished_turn = Some(turn_id),
+            RolloutRecord::TurnFinished { turn_id, .. } => {
+                if unfinished_turn.as_deref() == Some(turn_id.as_str()) {
+                    unfinished_turn = None;
+                }
+            }
+        }
+    }
+
+    drop(reader);
+    repair_rollout_tail(
+        &mut file,
+        &path,
+        original_length,
+        valid_length,
+        valid_record_needs_newline,
+    )?;
+
+    let metadata = metadata.ok_or_else(|| anyhow!("{} has no session header", path.display()))?;
+    if metadata.version != ROLLOUT_VERSION {
+        return Err(anyhow!(
+            "{} uses unsupported session version {}",
+            path.display(),
+            metadata.version
+        ));
+    }
+    if metadata.model != MODEL || metadata.reasoning_effort != "max" {
+        return Err(anyhow!(
+            "saved session uses {} at {}; BetterCodex requires {MODEL} at max",
+            metadata.model,
+            metadata.reasoning_effort
+        ));
+    }
+
+    let rollout = Rollout {
+        file,
+        path,
+        metadata: metadata.clone(),
+    };
+    Ok(LoadedRollout {
+        rollout,
+        metadata,
+        history,
+        usage,
+        usage_history_estimate,
+        compaction_count,
+        unfinished_turn,
+    })
+}
+
+fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>> {
+    let entries = match std::fs::read_dir(sessions) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to list saved BetterCodex sessions"),
+    };
+    let mut latest = None::<(u128, u64, PathBuf)>;
+    for entry in entries {
+        let entry = entry.context("failed to inspect a saved BetterCodex session")?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(metadata) = read_metadata(&path)? else {
+            continue;
+        };
+        if metadata.cwd != cwd {
+            continue;
+        }
+        let modified_at = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(u128::from(metadata.created_at_unix_ms) * 1_000_000);
+        let candidate = (modified_at, metadata.created_at_unix_ms, path);
+        if latest
+            .as_ref()
+            .is_none_or(|current| (candidate.0, candidate.1) > (current.0, current.1))
+        {
+            latest = Some(candidate);
+        }
+    }
+    Ok(latest.map(|(_, _, path)| path))
+}
+
+fn repair_rollout_tail(
+    file: &mut File,
+    path: &Path,
+    original_length: u64,
+    valid_length: u64,
+    needs_newline: bool,
+) -> Result<()> {
+    if original_length == valid_length && !needs_newline {
+        return Ok(());
+    }
+    if original_length != valid_length {
+        file.set_len(valid_length)
+            .with_context(|| format!("failed to truncate saved session {}", path.display()))?;
+    }
+    if needs_newline {
+        file.write_all(b"\n")?;
+    }
+    file.sync_data()
+        .with_context(|| format!("failed to persist repaired session {}", path.display()))
+}
+
+fn read_metadata(path: &Path) -> Result<Option<SessionMetadata>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
+    let mut lines = BufReader::new(file).split(b'\n');
+    let Some(line) = lines.next() else {
+        return Ok(None);
+    };
+    let line = line?;
+    let Ok(RolloutRecord::Session { metadata }) = serde_json::from_slice(&line) else {
+        return Ok(None);
+    };
+    Ok(Some(metadata))
+}
+
+fn state_root() -> Result<PathBuf> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .ok_or_else(|| anyhow!("cannot locate BetterCodex state: HOME is not set"))?;
+    Ok(codex_home.join(STATE_DIRECTORY))
+}
+
+fn installation_id(root: &Path) -> Result<String> {
+    let path = root.join(INSTALLATION_ID_FILE);
+    if let Ok(value) = std::fs::read_to_string(&path)
+        && let Ok(id) = Uuid::parse_str(value.trim())
+    {
+        return Ok(id.to_string());
+    }
+
+    let value = Uuid::new_v4().to_string();
+    let temporary = root.join(format!(
+        ".{INSTALLATION_ID_FILE}.tmp-{}-{}",
+        std::process::id(),
+        Uuid::new_v4(),
+    ));
+    let mut file = open_private_replace(&temporary)?;
+    file.write_all(value.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    let linked = std::fs::hard_link(&temporary, &path);
+    let _ = std::fs::remove_file(&temporary);
+    match linked {
+        Ok(()) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(&path)?;
+            Uuid::parse_str(existing.trim())
+                .map(|id| id.to_string())
+                .context("the BetterCodex installation ID is invalid")
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn prepare_private_directory(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create state directory {}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to protect state directory {}", path.display()))?;
+    Ok(())
+}
+
+fn open_private_append(path: &Path, create_new: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.append(true).read(true).write(true);
+    if create_new {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open session journal {}", path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
+    // The lock remains attached to Rollout's file descriptor for the complete
+    // process lifetime, covering both replay/repair and every later append.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(LockedRolloutFile(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Err(anyhow!(
+            "saved session {} is already open in another BetterCodex process",
+            path.display()
+        ));
+    }
+    Err(error).with_context(|| format!("failed to lock saved session {}", path.display()))
+}
+
+fn open_private_replace(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .with_context(|| format!("failed to open private file {}", path.display()))
+}
+
+fn unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[path = "rollout_tests.rs"]
+mod tests;
