@@ -134,6 +134,11 @@ impl Editor {
         self.replace_range_inner(self.cursor..self.cursor, value);
     }
 
+    pub(super) fn prepend(&mut self, value: &str) {
+        self.leave_history();
+        self.replace_range_inner(0..0, value);
+    }
+
     /// Insert a terminal paste using Codex's compact large-paste representation.
     pub(super) fn insert_paste(&mut self, value: String) {
         let char_count = value.chars().count();

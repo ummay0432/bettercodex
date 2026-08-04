@@ -2,6 +2,9 @@ use crate::context::ContextSnapshot;
 use serde_json::Value;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SteerId(pub(crate) u64);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentEvent {
     ModelTextDelta(String),
@@ -20,6 +23,7 @@ pub(crate) enum AgentEvent {
         duration: Duration,
     },
     ContextUpdated(ContextSnapshot),
+    SteeringCommitted(SteerId),
     CompactionStarted,
     CompactionCompleted,
 }

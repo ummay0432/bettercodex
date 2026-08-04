@@ -246,7 +246,7 @@ impl ApiClient {
         Self::new_with_base_url(auth, identity, compaction_count, BASE_URL.to_string())
     }
 
-    fn new_with_base_url(
+    pub(crate) fn new_with_base_url(
         auth: Auth,
         identity: &SessionIdentity,
         compaction_count: u64,

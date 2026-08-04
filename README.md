@@ -61,8 +61,13 @@ Prompt recall uses Codex's `${CODEX_HOME:-$HOME/.codex}/history.jsonl`, so
 existing Codex prompts and resumed BetterCodex prompts are available in the
 composer. The core shortcuts are:
 
-- `Enter` submits, or steers an active turn. `Tab` never sends or queues a
-  prompt; it is used only to accept an active completion.
+- `Enter` submits, or queues steering for the next model/tool boundary of an
+  active turn. Pending steering stays visible above the composer; `Esc`
+  interrupts and sends it immediately.
+- `Tab` submits when idle and queues a FIFO follow-up while a turn is active.
+  `Alt+Up` or `Shift+Left` pulls the latest queued follow-up back into the
+  composer. Active file and slash completion still take precedence over these
+  bindings.
 - `Shift+Enter` or `Ctrl+J` inserts a newline.
 - `Esc` interrupts an active turn; `Ctrl+C` exits.
 - `Up` and `Down` move through older and newer prompt history.

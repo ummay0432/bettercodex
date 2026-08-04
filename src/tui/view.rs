@@ -6,6 +6,7 @@ use super::file_search::FileSearchPopup;
 use super::file_search::FileSearchUpdate;
 use super::file_search::is_horizontal_whitespace;
 use super::markdown;
+use super::pending_input::PendingInput;
 use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
 use super::resume_picker::ResumePickerAction;
@@ -17,6 +18,7 @@ use crate::agent::SubmitOutcome;
 use crate::context::ContextSnapshot;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
+use crate::events::SteerId;
 use codex_ansi_escape::ansi_escape_line;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::parse_command::parse_command;
@@ -97,6 +99,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 pub(super) enum Action {
     None,
     Submit(String),
+    Queue(String),
     Cancel,
     Clear,
     OpenResumePicker,
@@ -123,7 +126,7 @@ pub(super) struct View {
     turn_had_work: bool,
     reasoning_status: ReasoningStatus,
     status_detail: Option<String>,
-    queued: usize,
+    pending_input: PendingInput,
     assistant_received_this_turn: bool,
     composer_text_width: u16,
     overlay: Option<Overlay>,
@@ -317,7 +320,7 @@ impl View {
             turn_had_work: false,
             reasoning_status: ReasoningStatus::default(),
             status_detail: None,
-            queued: 0,
+            pending_input: PendingInput::default(),
             assistant_received_this_turn: false,
             composer_text_width: 1,
             overlay: None,
@@ -382,6 +385,46 @@ impl View {
         self.status_detail = None;
     }
 
+    pub(super) fn add_pending_steer(&mut self, id: SteerId, prompt: String) {
+        self.pending_input.add_steer(id, prompt);
+    }
+
+    pub(super) fn queue_follow_up(&mut self, prompt: String) {
+        self.pending_input.queue_follow_up(prompt);
+    }
+
+    pub(super) fn pop_next_queued_follow_up(&mut self) -> Option<String> {
+        self.pending_input.pop_next_follow_up()
+    }
+
+    pub(super) fn has_pending_steers(&self) -> bool {
+        self.pending_input.has_steers()
+    }
+
+    pub(super) fn take_pending_steers(&mut self) -> Vec<String> {
+        self.pending_input.take_steers()
+    }
+
+    pub(super) fn restore_pending_input_to_composer(&mut self) {
+        let prompts = self.pending_input.take_all();
+        self.restore_prompts_to_composer(prompts);
+    }
+
+    fn restore_prompts_to_composer(&mut self, prompts: Vec<String>) {
+        if prompts.is_empty() {
+            return;
+        }
+        let restored = prompts.join("\n\n");
+        if self.editor.is_empty() {
+            self.editor.set_text(restored);
+        } else {
+            self.editor.prepend(&format!("{restored}\n\n"));
+        }
+        self.file_search.dismiss();
+        self.dismissed_slash = None;
+        self.slash_selection = 0;
+    }
+
     pub(super) fn finish_turn(&mut self, result: anyhow::Result<SubmitOutcome>) {
         self.close_streaming_entries();
         self.seal_exploration();
@@ -425,10 +468,6 @@ impl View {
             self.interrupting = true;
             self.status_detail = None;
         }
-    }
-
-    pub(super) fn set_queued(&mut self, queued: usize) {
-        self.queued = queued;
     }
 
     pub(super) fn set_context_tokens(&mut self, tokens: Option<u64>) {
@@ -517,7 +556,7 @@ impl View {
         self.resize_reflow_requested = false;
         self.context_tokens = None;
         self.reasoning_status.reset();
-        self.queued = 0;
+        self.pending_input.clear();
         self.overlay = None;
         self.file_search = FileSearchPopup::default();
         self.slash_selection = 0;
@@ -611,6 +650,11 @@ impl View {
                 self.context_tokens = snapshot.measured.then_some(snapshot.used_tokens);
                 if let Some(Overlay::Context(context)) = self.overlay.as_mut() {
                     context.update(snapshot);
+                }
+            }
+            AgentEvent::SteeringCommitted(id) => {
+                if let Some(prompt) = self.pending_input.commit_steer(id) {
+                    self.add_user_message(&prompt);
                 }
             }
             AgentEvent::CompactionStarted => {
@@ -707,6 +751,18 @@ impl View {
             self.overlay = Some(Overlay::Shortcuts);
             return Action::None;
         }
+        let edit_queued = (key.code == KeyCode::Up && alt && !control && !shift)
+            || (key.code == KeyCode::Left && shift && !control && !alt);
+        if edit_queued
+            && self.pending_input.has_follow_ups()
+            && !self.file_search.is_active()
+            && self.slash_matches().is_empty()
+        {
+            if let Some(prompt) = self.pending_input.pop_latest_follow_up() {
+                self.restore_prompts_to_composer(vec![prompt]);
+            }
+            return Action::None;
+        }
 
         if self.file_search.is_active() {
             if key.code == KeyCode::Up
@@ -761,6 +817,14 @@ impl View {
                 }
                 _ => {}
             }
+        }
+
+        if key.code == KeyCode::Tab && !shift && !alt && !control {
+            return if self.busy {
+                self.queue_action()
+            } else {
+                self.submit_action()
+            };
         }
 
         let previous_text = self.editor.text().to_string();
@@ -899,7 +963,7 @@ impl View {
             "/context" => Action::ShowContext,
             "/help" => {
                 self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
+                    "Enter submit/steer · Tab queue follow-up · Alt+Up edit queue · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
                         .to_string(),
                 ));
                 Action::None
@@ -910,6 +974,22 @@ impl View {
             }
             _ => Action::Submit(prompt),
         }
+    }
+
+    fn queue_action(&mut self) -> Action {
+        if self.editor.text().trim().is_empty() {
+            return Action::None;
+        }
+        if is_local_command(self.editor.text().trim()) {
+            self.entries.push(TranscriptEntry::Notice(
+                "Slash commands cannot be queued; use Enter or wait for the active turn"
+                    .to_string(),
+            ));
+            return Action::None;
+        }
+        let prompt = self.editor.take();
+        self.editor.remember(&prompt);
+        Action::Queue(prompt)
     }
 
     fn close_streaming_entries(&mut self) {
@@ -1077,6 +1157,7 @@ impl View {
             .desired_height(self.composer_text_width)
             .max(1)
             .saturating_add(2);
+        let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
         let status_height = u16::from(self.busy);
         let status_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(status_height);
         let bottom_spacing = 1;
@@ -1089,7 +1170,7 @@ impl View {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
         };
         let overlay_height = match self.overlay.as_ref() {
-            Some(Overlay::Shortcuts) => 15,
+            Some(Overlay::Shortcuts) => 17,
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(picker)) => picker.preferred_height(),
             Some(Overlay::Tools(_)) => TOOL_CATALOGUE_VIEWPORT_HEIGHT,
@@ -1097,6 +1178,7 @@ impl View {
         };
         active_height
             .saturating_add(bottom_spacing)
+            .saturating_add(pending_height)
             .saturating_add(status_height)
             .saturating_add(status_composer_spacing)
             .saturating_add(composer_height)
@@ -1144,7 +1226,16 @@ impl View {
         } else {
             0
         };
-        let composer_height_limit = height_above_trailing.saturating_sub(status_reserve);
+        let pending_lines = self.pending_input.lines();
+        let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
+        let pending_height = requested_pending_height.min(
+            height_above_trailing
+                .saturating_sub(status_reserve)
+                .saturating_sub(minimum_composer_height),
+        );
+        let composer_height_limit = height_above_trailing
+            .saturating_sub(status_reserve)
+            .saturating_sub(pending_height);
         let editor_height_limit = composer_height_limit.saturating_sub(2).max(1);
         let editor_layout = self
             .editor
@@ -1182,7 +1273,25 @@ impl View {
             area.width,
             status_height,
         );
-        let history_bottom = status_area.y.saturating_sub(1).max(area.y);
+        let pending_bottom = if status_height > 0 {
+            status_area.y
+        } else {
+            composer_area.y
+        };
+        let pending_area = Rect::new(
+            area.x,
+            pending_bottom.saturating_sub(pending_height),
+            area.width,
+            pending_height,
+        );
+        let content_bottom = if pending_height > 0 {
+            pending_area.y
+        } else if status_height > 0 {
+            status_area.y
+        } else {
+            composer_area.y
+        };
+        let history_bottom = content_bottom.saturating_sub(1).max(area.y);
         let history_area = Rect::new(
             area.x,
             area.y,
@@ -1191,6 +1300,18 @@ impl View {
         );
 
         self.render_active_history(frame, history_area, prepared);
+        if pending_height > 0 {
+            frame.render_widget(
+                Paragraph::new(
+                    pending_lines
+                        .into_iter()
+                        .take(usize::from(pending_height))
+                        .map(|line| truncate_line(line, usize::from(pending_area.width)))
+                        .collect::<Vec<_>>(),
+                ),
+                pending_area,
+            );
+        }
         if status_height > 0 {
             frame.render_widget(
                 Paragraph::new(truncate_line(
@@ -1315,7 +1436,7 @@ impl View {
     }
 
     fn render_shortcuts(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered(area, 58, 13);
+        let popup = centered(area, 62, 15);
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .title(" Keyboard shortcuts ")
@@ -1325,7 +1446,9 @@ impl View {
         frame.render_widget(block, popup);
         let lines = vec![
             shortcut_line("Enter", "submit prompt"),
-            shortcut_line("Enter while working", "send steering input"),
+            shortcut_line("Enter while working", "steer after current model step"),
+            shortcut_line("Tab while working", "queue a follow-up turn"),
+            shortcut_line("Alt+Up / Shift+Left", "edit last queued follow-up"),
             shortcut_line("Option+Left / Right", "jump by word"),
             shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
             shortcut_line("@", "find and insert a file path"),
@@ -1476,9 +1599,15 @@ impl View {
             spans.push(Span::from(" · ").dim());
             spans.push(Span::from(detail.to_string()).dim());
         }
-        if self.queued > 0 {
+        let pending_steers = self.pending_input.steer_count();
+        let queued_follow_ups = self.pending_input.follow_up_count();
+        if pending_steers > 0 {
             spans.push(Span::from(" · ").dim());
-            spans.push(Span::from(format!("{} queued", self.queued)).dim());
+            spans.push(Span::from(format!("{pending_steers} steering")).dim());
+        }
+        if queued_follow_ups > 0 {
+            spans.push(Span::from(" · ").dim());
+            spans.push(Span::from(format!("{queued_follow_ups} queued")).dim());
         }
         Line::from(spans)
     }
@@ -1519,6 +1648,18 @@ impl View {
         }
         lines
     }
+}
+
+fn is_local_command(command: &str) -> bool {
+    if let Some(arguments) = command.strip_prefix("/resume")
+        && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
+    {
+        return true;
+    }
+    matches!(
+        command,
+        "/q" | "/quit" | "/exit" | "/clear" | "/context" | "/help" | "/tools"
+    )
 }
 
 impl TranscriptEntry {
@@ -3519,25 +3660,125 @@ mod tests {
     }
 
     #[test]
-    fn tab_never_submits_or_queues_plain_composer_text() {
+    fn tab_submits_when_idle_and_queues_a_follow_up_while_busy() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.editor.set_text("keep this draft");
+        view.editor.set_text("submit while idle");
         assert_eq!(
             view.handle_terminal_event(Event::Key(
                 KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
             )),
-            Action::None
+            Action::Submit("submit while idle".to_string())
         );
-        assert_eq!(view.editor.text(), "keep this draft");
+        assert!(view.editor.is_empty());
 
         view.busy = true;
+        view.editor.set_text("queue while busy");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
+            )),
+            Action::Queue("queue while busy".to_string())
+        );
+        assert!(view.editor.is_empty());
+
+        let session_id = Uuid::new_v4();
+        view.editor.set_text(format!("/resume {session_id}"));
         assert_eq!(
             view.handle_terminal_event(Event::Key(
                 KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
             )),
             Action::None
         );
-        assert_eq!(view.editor.text(), "keep this draft");
+        assert_eq!(view.editor.text(), format!("/resume {session_id}"));
+        assert!(view.entries.iter().any(|entry| {
+            matches!(entry, TranscriptEntry::Notice(notice) if notice.contains("cannot be queued"))
+        }));
+    }
+
+    #[test]
+    fn queued_follow_up_can_be_pulled_back_ahead_of_the_current_draft() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.queue_follow_up("first queued".to_string());
+        view.queue_follow_up("second queued".to_string());
+        view.editor.set_text("current draft");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT,))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "second queued\n\ncurrent draft");
+        assert_eq!(view.pending_input.follow_up_count(), 1);
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::SHIFT,
+            ))),
+            Action::None
+        );
+        assert_eq!(
+            view.editor.text(),
+            "first queued\n\nsecond queued\n\ncurrent draft"
+        );
+        assert_eq!(view.pending_input.follow_up_count(), 0);
+    }
+
+    #[test]
+    fn pending_steer_stays_in_the_preview_until_the_agent_commits_it() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("initial prompt");
+        let (handle, _control) = crate::agent::TurnControl::channel();
+        let id = handle
+            .steer(crate::input::UserInput::text("change direction"))
+            .unwrap();
+        view.add_pending_steer(id, "change direction".to_string());
+
+        let height = view.desired_height(88, 30);
+        let backend = TestBackend::new(88, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("Steering after the current model step"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("change direction"), "{rendered}");
+        assert_eq!(view.pending_input.steer_count(), 1);
+        assert!(!view.entries.iter().any(
+            |entry| matches!(entry, TranscriptEntry::User(prompt) if prompt == "change direction")
+        ));
+        let tiny_backend = TestBackend::new(2, 1);
+        let mut tiny_terminal = Terminal::new(tiny_backend).unwrap();
+        tiny_terminal.draw(|frame| view.render(frame)).unwrap();
+
+        view.handle_agent_event(AgentEvent::SteeringCommitted(id));
+
+        assert_eq!(view.pending_input.steer_count(), 0);
+        assert!(view.entries.iter().any(
+            |entry| matches!(entry, TranscriptEntry::User(prompt) if prompt == "change direction")
+        ));
+    }
+
+    #[test]
+    fn interrupted_pending_input_is_restored_before_the_existing_draft() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let (handle, _control) = crate::agent::TurnControl::channel();
+        let id = handle
+            .steer(crate::input::UserInput::text("pending steer"))
+            .unwrap();
+        view.add_pending_steer(id, "pending steer".to_string());
+        view.queue_follow_up("queued follow-up".to_string());
+        view.editor.set_text("current draft");
+
+        view.restore_pending_input_to_composer();
+
+        assert_eq!(
+            view.editor.text(),
+            "pending steer\n\nqueued follow-up\n\ncurrent draft"
+        );
+        assert_eq!(view.pending_input.steer_count(), 0);
+        assert_eq!(view.pending_input.follow_up_count(), 0);
     }
 
     #[test]

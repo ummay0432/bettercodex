@@ -8,6 +8,7 @@ use crate::compaction::InitialContextInjection;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
 use crate::events::AgentEvent;
+use crate::events::SteerId;
 use crate::input::UserInput;
 use crate::rollout::LoadedRollout;
 use crate::rollout::ResumeSelector;
@@ -20,10 +21,10 @@ use anyhow::Result;
 use anyhow::anyhow;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::future::pending;
 use std::path::Path;
 use std::path::PathBuf;
-use tokio::sync::mpsc::UnboundedReceiver;
+use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
@@ -40,12 +41,23 @@ pub(crate) enum SubmitOutcome {
 #[derive(Clone)]
 pub(crate) struct TurnHandle {
     cancellation: CancellationToken,
-    steering: UnboundedSender<UserInput>,
+    steering: Arc<Mutex<SteeringState>>,
 }
 
 pub(crate) struct TurnControl {
     cancellation: CancellationToken,
-    steering: Option<UnboundedReceiver<UserInput>>,
+    steering: Option<Arc<Mutex<SteeringState>>>,
+}
+
+struct SteeringState {
+    accepting: bool,
+    next_id: u64,
+    queued: VecDeque<SteeringInput>,
+}
+
+struct SteeringInput {
+    id: SteerId,
+    input: UserInput,
 }
 
 impl TurnHandle {
@@ -53,25 +65,34 @@ impl TurnHandle {
         self.cancellation.cancel();
     }
 
-    pub(crate) fn steer(&self, input: UserInput) -> Result<()> {
-        self.steering
-            .send(input)
-            .map_err(|_| anyhow!("the active turn already finished"))
+    pub(crate) fn steer(&self, input: UserInput) -> Result<SteerId> {
+        let mut steering = lock_steering(&self.steering);
+        if !steering.accepting {
+            return Err(anyhow!("the active turn already finished"));
+        }
+        let id = SteerId(steering.next_id);
+        steering.next_id = steering.next_id.wrapping_add(1);
+        steering.queued.push_back(SteeringInput { id, input });
+        Ok(id)
     }
 }
 
 impl TurnControl {
     pub(crate) fn channel() -> (TurnHandle, Self) {
         let cancellation = CancellationToken::new();
-        let (steering, steering_rx) = unbounded_channel();
+        let steering = Arc::new(Mutex::new(SteeringState {
+            accepting: true,
+            next_id: 0,
+            queued: VecDeque::new(),
+        }));
         (
             TurnHandle {
                 cancellation: cancellation.clone(),
-                steering,
+                steering: Arc::clone(&steering),
             },
             Self {
                 cancellation,
-                steering: Some(steering_rx),
+                steering: Some(steering),
             },
         )
     }
@@ -80,6 +101,37 @@ impl TurnControl {
         Self {
             cancellation,
             steering: None,
+        }
+    }
+
+    fn drain_steering(&self, pending: &mut VecDeque<SteeringInput>) {
+        let Some(steering) = &self.steering else {
+            return;
+        };
+        pending.append(&mut lock_steering(steering).queued);
+    }
+
+    /// Atomically stop accepting steering if no input is waiting.
+    ///
+    /// This closes the race between the final queue check and turn completion:
+    /// a concurrent sender either lands in `pending` or observes a closed turn.
+    fn close_if_idle(&self, pending: &mut VecDeque<SteeringInput>) -> bool {
+        let Some(steering) = &self.steering else {
+            return true;
+        };
+        let mut steering = lock_steering(steering);
+        if steering.queued.is_empty() {
+            steering.accepting = false;
+            true
+        } else {
+            pending.append(&mut steering.queued);
+            false
+        }
+    }
+
+    fn close(&self) {
+        if let Some(steering) = &self.steering {
+            lock_steering(steering).accepting = false;
         }
     }
 }
@@ -181,14 +233,15 @@ impl Agent {
         &mut self,
         input: UserInput,
         events: Option<UnboundedSender<AgentEvent>>,
-        mut control: TurnControl,
+        control: TurnControl,
     ) -> Result<SubmitOutcome> {
         if input.is_empty() {
             return Err(anyhow!("prompt and image list are both empty"));
         }
         let turn_id = self.api.begin_turn().to_string();
         self.conversation.start_turn(&turn_id)?;
-        let result = self.run_turn(input, &events, &mut control).await;
+        let result = self.run_turn(input, &events, &control).await;
+        control.close();
         let outcome = match &result {
             Ok(SubmitOutcome::Completed(_)) => TurnOutcome::Completed,
             Ok(SubmitOutcome::Cancelled) => {
@@ -205,11 +258,11 @@ impl Agent {
         &mut self,
         input: UserInput,
         events: &Option<UnboundedSender<AgentEvent>>,
-        control: &mut TurnControl,
+        control: &TurnControl,
     ) -> Result<SubmitOutcome> {
         if !self
             .record_incoming_user(
-                input,
+                IncomingUserInput::Initial(input),
                 events,
                 &control.cancellation,
                 CompactionPhase::PreTurn,
@@ -226,11 +279,11 @@ impl Agent {
         let mut can_record_pending_steering = false;
         loop {
             if can_record_pending_steering {
-                drain_available_steering(&mut control.steering, &mut pending_steering);
+                control.drain_steering(&mut pending_steering);
                 while let Some(input) = pending_steering.pop_front() {
                     if !self
                         .record_incoming_user(
-                            input,
+                            IncomingUserInput::Steering(input),
                             events,
                             &control.cancellation,
                             CompactionPhase::MidTurn,
@@ -243,12 +296,8 @@ impl Agent {
             }
             can_record_pending_steering = true;
 
-            let response = match self
-                .sample_with_recovery(events, control, &mut pending_steering)
-                .await?
-            {
+            let response = match self.sample_with_recovery(events, control).await? {
                 SamplingOutcome::Response(response) => response,
-                SamplingOutcome::Steered => continue,
                 SamplingOutcome::Cancelled => return Ok(SubmitOutcome::Cancelled),
             };
             if !response.text.trim().is_empty() {
@@ -261,8 +310,11 @@ impl Agent {
 
             let mut tool_calls = response.tool_calls.into_iter();
             if tool_calls.len() == 0 {
-                drain_available_steering(&mut control.steering, &mut pending_steering);
+                control.drain_steering(&mut pending_steering);
                 if !pending_steering.is_empty() {
+                    continue;
+                }
+                if !control.close_if_idle(&mut pending_steering) {
                     continue;
                 }
                 if transcript.is_empty() {
@@ -272,8 +324,14 @@ impl Agent {
             }
 
             while let Some(tool_call) = tool_calls.next() {
-                let output = self
-                    .execute_tool(&tool_call, events, control, &mut pending_steering)
+                let context = self.api.tool_turn_context(self.conversation.items());
+                let output = tool_call
+                    .execute(
+                        &self.tools,
+                        context,
+                        events.clone(),
+                        control.cancellation.clone(),
+                    )
                     .await;
                 self.conversation.extend(tool_call.output_items(&output))?;
                 self.emit_context(events);
@@ -307,8 +365,7 @@ impl Agent {
     async fn sample_with_recovery(
         &mut self,
         events: &Option<UnboundedSender<AgentEvent>>,
-        control: &mut TurnControl,
-        pending_steering: &mut VecDeque<UserInput>,
+        control: &TurnControl,
     ) -> Result<SamplingOutcome> {
         let mut retries = 0_usize;
         loop {
@@ -333,12 +390,6 @@ impl Agent {
                     tokio::select! {
                         result = &mut response => break SamplingWait::Finished(result),
                         _ = control.cancellation.cancelled() => break SamplingWait::Cancelled,
-                        steering = receive_steering(&mut control.steering) => {
-                            match steering {
-                                Some(input) => break SamplingWait::Steered(input),
-                                None => control.steering = None,
-                            }
-                        }
                         item = completed_rx.recv(), if !completed_closed => {
                             match item {
                                 Some(item) => {
@@ -364,17 +415,6 @@ impl Agent {
                     self.api.abandon_response();
                     return Ok(SamplingOutcome::Cancelled);
                 }
-                SamplingWait::Steered(input) => {
-                    self.api.abandon_response();
-                    if observed_item {
-                        self.conversation.mark_stream_interrupted(
-                            "the user sent steering input while the response was still streaming",
-                        )?;
-                    }
-                    pending_steering.push_back(input);
-                    drain_available_steering(&mut control.steering, pending_steering);
-                    return Ok(SamplingOutcome::Steered);
-                }
                 SamplingWait::Finished(Err(error)) => {
                     self.api.abandon_response();
                     if observed_item {
@@ -398,51 +438,11 @@ impl Agent {
                             .unwrap_or_else(|| retry_delay(retries.saturating_sub(1))),
                     );
                     tokio::pin!(delay);
-                    loop {
-                        tokio::select! {
-                            _ = &mut delay => break,
-                            _ = control.cancellation.cancelled() => {
-                                return Ok(SamplingOutcome::Cancelled);
-                            }
-                            steering = receive_steering(&mut control.steering), if control.steering.is_some() => {
-                                match steering {
-                                    Some(input) => {
-                                        pending_steering.push_back(input);
-                                        drain_available_steering(&mut control.steering, pending_steering);
-                                        return Ok(SamplingOutcome::Steered);
-                                    }
-                                    None => control.steering = None,
-                                }
-                            }
+                    tokio::select! {
+                        _ = &mut delay => {}
+                        _ = control.cancellation.cancelled() => {
+                            return Ok(SamplingOutcome::Cancelled);
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    async fn execute_tool(
-        &self,
-        tool_call: &crate::tools::ToolCall,
-        events: &Option<UnboundedSender<AgentEvent>>,
-        control: &mut TurnControl,
-        pending_steering: &mut VecDeque<UserInput>,
-    ) -> ToolResult {
-        let context = self.api.tool_turn_context(self.conversation.items());
-        let execution = tool_call.execute(
-            &self.tools,
-            context,
-            events.clone(),
-            control.cancellation.clone(),
-        );
-        tokio::pin!(execution);
-        loop {
-            tokio::select! {
-                output = &mut execution => return output,
-                steering = receive_steering(&mut control.steering) => {
-                    match steering {
-                        Some(input) => pending_steering.push_back(input),
-                        None => control.steering = None,
                     }
                 }
             }
@@ -474,11 +474,15 @@ impl Agent {
 
     async fn record_incoming_user(
         &mut self,
-        input: UserInput,
+        input: IncomingUserInput,
         events: &Option<UnboundedSender<AgentEvent>>,
         cancellation: &CancellationToken,
         phase: CompactionPhase,
     ) -> Result<bool> {
+        let (input, steering_id) = match input {
+            IncomingUserInput::Initial(input) => (input, None),
+            IncomingUserInput::Steering(steering) => (steering.input, Some(steering.id)),
+        };
         if input.is_empty() {
             return Err(anyhow!("prompt and image list are both empty"));
         }
@@ -498,6 +502,9 @@ impl Agent {
             return Ok(false);
         }
         self.conversation.extend([projected])?;
+        if let Some(id) = steering_id {
+            emit(events, AgentEvent::SteeringCommitted(id));
+        }
         self.emit_context(events);
         Ok(true)
     }
@@ -513,45 +520,22 @@ impl Agent {
 enum SamplingWait {
     Finished(std::result::Result<ModelResponse, ApiError>),
     Cancelled,
-    Steered(UserInput),
 }
 
 enum SamplingOutcome {
     Response(ModelResponse),
     Cancelled,
-    Steered,
 }
 
-async fn receive_steering(
-    steering: &mut Option<UnboundedReceiver<UserInput>>,
-) -> Option<UserInput> {
-    match steering {
-        Some(steering) => steering.recv().await,
-        None => pending().await,
-    }
+enum IncomingUserInput {
+    Initial(UserInput),
+    Steering(SteeringInput),
 }
 
-fn drain_available_steering(
-    steering: &mut Option<UnboundedReceiver<UserInput>>,
-    pending: &mut VecDeque<UserInput>,
-) {
-    let Some(receiver) = steering.as_mut() else {
-        return;
-    };
-    let mut disconnected = false;
-    loop {
-        match receiver.try_recv() {
-            Ok(input) => pending.push_back(input),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                disconnected = true;
-                break;
-            }
-        }
-    }
-    if disconnected {
-        *steering = None;
-    }
+fn lock_steering(steering: &Mutex<SteeringState>) -> std::sync::MutexGuard<'_, SteeringState> {
+    steering
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf> {
@@ -569,3 +553,7 @@ fn emit(events: &Option<UnboundedSender<AgentEvent>>, event: AgentEvent) {
         let _ = events.send(event);
     }
 }
+
+#[cfg(test)]
+#[path = "agent_tests.rs"]
+mod tests;

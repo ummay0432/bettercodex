@@ -2,6 +2,7 @@ mod context_window;
 mod editor;
 mod file_search;
 mod markdown;
+mod pending_input;
 mod reasoning_status;
 mod resume_picker;
 mod terminal;
@@ -25,7 +26,6 @@ use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures::StreamExt;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::future::pending;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -63,7 +63,7 @@ struct Runtime {
     turn: Option<TurnTask>,
     turn_events: Option<UnboundedReceiver<AgentEvent>>,
     turn_handle: Option<TurnHandle>,
-    queued: VecDeque<String>,
+    submit_steers_after_interrupt: bool,
     exit_after_turn: bool,
     context_snapshot: ContextSnapshot,
     file_search: FileSearchManager,
@@ -96,7 +96,7 @@ impl Runtime {
             turn: None,
             turn_events: None,
             turn_handle: None,
-            queued: VecDeque::new(),
+            submit_steers_after_interrupt: false,
             exit_after_turn: false,
             context_snapshot,
             file_search,
@@ -199,15 +199,32 @@ impl Runtime {
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.turn_handle = None;
+                    let completed = matches!(&result, Ok(SubmitOutcome::Completed(_)));
                     self.view.finish_turn(result);
                     redraw = true;
 
                     if self.exit_after_turn {
                         break;
                     }
-                    if let Some(prompt) = self.queued.pop_front() {
-                        self.view.set_queued(self.queued.len());
-                        self.start_turn(prompt);
+                    if completed {
+                        self.submit_steers_after_interrupt = false;
+                        if let Some(prompt) = self.view.pop_next_queued_follow_up() {
+                            self.start_turn(prompt);
+                        }
+                    } else if self.submit_steers_after_interrupt {
+                        self.submit_steers_after_interrupt = false;
+                        let steers = self.view.take_pending_steers();
+                        if steers.is_empty() {
+                            self.view.restore_pending_input_to_composer();
+                        } else {
+                            self.view.add_notice(
+                                "Model interrupted to submit steering input".to_string(),
+                            );
+                            let prompt = steers.join("\n\n");
+                            self.start_turn(prompt);
+                        }
+                    } else {
+                        self.view.restore_pending_input_to_composer();
                     }
                 }
                 _ = receive_frame_tick(animate, &mut ticks) => redraw = true,
@@ -222,21 +239,27 @@ impl Runtime {
             Action::Submit(prompt) => {
                 self.persist_prompt(&prompt);
                 if self.turn.is_some() {
-                    if self
+                    let steering = self
                         .turn_handle
                         .as_ref()
-                        .is_some_and(|turn| turn.steer(UserInput::text(&prompt)).is_ok())
-                    {
-                        self.view.add_user_message(&prompt);
-                    } else {
-                        self.queued.push_back(prompt);
-                        self.view.set_queued(self.queued.len());
+                        .and_then(|turn| turn.steer(UserInput::text(&prompt)).ok());
+                    match steering {
+                        Some(id) => self.view.add_pending_steer(id, prompt),
+                        None => self.view.queue_follow_up(prompt),
                     }
                 } else {
                     self.start_turn(prompt);
                 }
             }
-            Action::Cancel => self.cancel_turn(),
+            Action::Queue(prompt) => {
+                self.persist_prompt(&prompt);
+                if self.turn.is_some() {
+                    self.view.queue_follow_up(prompt);
+                } else {
+                    self.start_turn(prompt);
+                }
+            }
+            Action::Cancel => self.interrupt_turn(),
             Action::Clear => {
                 if self.turn.is_none() {
                     let agent = Agent::new(&self.cwd)?;
@@ -244,7 +267,7 @@ impl Runtime {
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.prompt_history = Some(prompt_history);
-                    self.queued.clear();
+                    self.submit_steers_after_interrupt = false;
                     self.view.clear();
                 }
             }
@@ -335,7 +358,7 @@ impl Runtime {
         self.cwd = cwd.clone();
         self.context_snapshot = context_snapshot;
         self.agent = Some(agent);
-        self.queued.clear();
+        self.submit_steers_after_interrupt = false;
         self.exit_after_turn = false;
         self.file_search = file_search;
         self.file_search_updates = file_search_updates;
@@ -367,6 +390,11 @@ impl Runtime {
             turn.cancel();
             self.view.set_interrupting();
         }
+    }
+
+    fn interrupt_turn(&mut self) {
+        self.submit_steers_after_interrupt = self.view.has_pending_steers();
+        self.cancel_turn();
     }
 
     fn drain_agent_events(&mut self) {
