@@ -25,6 +25,7 @@ use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
@@ -668,7 +669,7 @@ struct ProcessSnapshot {
 #[derive(Default)]
 struct PendingOutput {
     head: Vec<u8>,
-    tail: Vec<u8>,
+    tail: VecDeque<u8>,
     omitted: usize,
 }
 
@@ -683,18 +684,23 @@ impl PendingOutput {
         }
 
         if bytes.len() >= RETAINED_TAIL_BYTES {
-            self.omitted += self.tail.len() + bytes.len() - RETAINED_TAIL_BYTES;
+            self.omitted = self
+                .omitted
+                .saturating_add(self.tail.len())
+                .saturating_add(bytes.len().saturating_sub(RETAINED_TAIL_BYTES));
             self.tail.clear();
             self.tail
-                .extend_from_slice(&bytes[bytes.len() - RETAINED_TAIL_BYTES..]);
+                .extend(&bytes[bytes.len() - RETAINED_TAIL_BYTES..]);
             return;
         }
         let excess = (self.tail.len() + bytes.len()).saturating_sub(RETAINED_TAIL_BYTES);
         if excess > 0 {
-            self.tail.drain(..excess);
-            self.omitted += excess;
+            // A Vec shifts the entire retained tail on every process read after reaching the
+            // limit. Advancing VecDeque's front keeps append work proportional to new output.
+            drop(self.tail.drain(..excess));
+            self.omitted = self.omitted.saturating_add(excess);
         }
-        self.tail.extend_from_slice(bytes);
+        self.tail.extend(bytes);
     }
 
     fn take(&mut self) -> PendingOutputSnapshot {
@@ -706,19 +712,27 @@ impl PendingOutput {
             .saturating_add(omitted_bytes);
         let mut bytes = std::mem::take(&mut self.head);
         if omitted_bytes > 0 {
-            bytes
-                .extend_from_slice(format!("\n... {omitted_bytes} bytes omitted ...\n").as_bytes());
+            let marker = format!("\n... {omitted_bytes} bytes omitted ...\n");
+            bytes.reserve(marker.len().saturating_add(self.tail.len()));
+            bytes.extend_from_slice(marker.as_bytes());
+        } else {
+            bytes.reserve(self.tail.len());
         }
-        bytes.extend_from_slice(&std::mem::take(&mut self.tail));
+        bytes.extend(std::mem::take(&mut self.tail));
         self.omitted = 0;
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        };
         PendingOutputSnapshot {
-            text: String::from_utf8_lossy(&bytes).into_owned(),
+            text,
             total_bytes,
             omitted_bytes,
         }
     }
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct PendingOutputSnapshot {
     text: String,
     total_bytes: usize,
@@ -957,6 +971,43 @@ mod tests {
         assert!(rendered.ends_with(&"x".repeat(RETAINED_TAIL_BYTES)));
     }
 
+    #[test]
+    fn retained_output_ring_preserves_order_across_many_reads() {
+        let omitted_bytes = RETAINED_TAIL_BYTES / 2 + 137;
+        let input_bytes = RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + omitted_bytes;
+        let bytes = (0..input_bytes)
+            .map(|index| b'a' + u8::try_from(index % 26).unwrap())
+            .collect::<Vec<_>>();
+        let mut output = PendingOutput::default();
+        for chunk in bytes.chunks(8_191) {
+            output.append(chunk);
+        }
+
+        let snapshot = output.take();
+
+        let expected = format!(
+            "{}\n... {omitted_bytes} bytes omitted ...\n{}",
+            String::from_utf8_lossy(&bytes[..RETAINED_HEAD_BYTES]),
+            String::from_utf8_lossy(&bytes[bytes.len() - RETAINED_TAIL_BYTES..]),
+        );
+        assert_eq!(
+            snapshot,
+            PendingOutputSnapshot {
+                text: expected,
+                total_bytes: input_bytes,
+                omitted_bytes,
+            }
+        );
+    }
+
+    #[test]
+    fn retained_output_replaces_invalid_utf8() {
+        let mut output = PendingOutput::default();
+        output.append(b"before\x80after");
+
+        assert_eq!(output.take().text, "before\u{fffd}after");
+    }
+
     #[tokio::test]
     async fn process_store_matches_codex_soft_cap_and_exited_lru_policy() {
         let manager = ProcessManager::new(std::env::current_dir().unwrap());
@@ -1069,6 +1120,43 @@ mod tests {
         );
         assert!(completed["original_token_count"].as_u64().is_some());
         assert!(completed.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn noisy_command_returns_bounded_head_and_tail() {
+        let cwd = std::env::current_dir().unwrap();
+        let manager = ProcessManager::new(cwd);
+        let generated_bytes = RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + 256 * 1024;
+        let command = format!(
+            "printf 'BEGIN\\n'; yes 0123456789abcdef | head -c {generated_bytes}; printf '\\nEND\\n'"
+        );
+
+        let result = manager
+            .exec_command(
+                json!({
+                    "cmd": command,
+                    "shell": "/bin/sh",
+                    "login": false,
+                    "yield_time_ms": 5_000,
+                    "max_output_tokens": 10_000,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let output = result["output"].as_str().unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert!(result.get("session_id").is_none());
+        assert!(output.starts_with("Warning: truncated output"));
+        assert!(output.contains("BEGIN\n"));
+        assert!(output.ends_with("\nEND\n"));
+        assert!(output.len() < generated_bytes);
+        assert!(
+            result["original_token_count"]
+                .as_u64()
+                .is_some_and(|tokens| tokens > 300_000)
+        );
     }
 
     #[tokio::test]
