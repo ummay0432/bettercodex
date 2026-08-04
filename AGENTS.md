@@ -77,6 +77,32 @@ the invoking user's permissions; BetterCodex does not sandbox them.
 - `preserve/README.md`: points to the old system prompt, terminal design, Pi
   request identity, and lessons learned.
 
+## Success criteria
+
+Your work is complete only when all three success criteria are satisfied:
+
+- System quality: Judge the affected system, not diff size. Do not preserve an inferior
+  implementation or introduce avoidable debt or sprawl just to keep the change small.
+  Inspect the implementation path and relevant callers, callees, interfaces, and data
+  models for concrete opportunities to remove debt or make the system simpler, more
+  efficient, smaller, faster, more responsive, or easier to maintain. Choose refactor
+  depth and evidence with engineering judgment. Refactor autonomously when repository
+  evidence supports a clear net improvement and relevant validation can cover it, even
+  when the debt predates the request. Prefer root-cause solutions, direct paths, deletion,
+  and consolidation over special cases, workarounds, duplicate paths, compatibility
+  layers, or temporary scaffolding. Remove what the result makes obsolete.
+
+- Scope and complexity: Keep product behavior within the request; do not equate that with
+  minimizing engineering scope. Changes may extend through affected code and dependencies
+  for a coherent, validated improvement. Avoid unrelated features or redesign,
+  unnecessary dependencies, speculative architecture, impossible-state handling, and
+  hypothetical abstractions. Add complexity only when it removes greater present
+  complexity or protects a real system boundary.
+
+- Correctness: The requested behavior works, affected behavior has not regressed, and
+  relevant validation supports both. Report the evidence, failures, and anything
+  unvalidated.
+
 ## Working in this repository
 
 Do not let AGENTS.md override how the System prompt tells you to work. Ignore
