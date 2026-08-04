@@ -45,7 +45,8 @@ The fixed choices for now are:
 
 - model: `gpt-5.6-sol`;
 - reasoning effort: `max`;
-- context window: 372,000 tokens; and
+- context window: 372,000 tokens;
+- maximum output tokens: 128,000; and
 - automatic compaction: 95%, or 353,400 tokens.
 
 The 372,000-token window is a BetterCodex choice. It is not the public API limit
