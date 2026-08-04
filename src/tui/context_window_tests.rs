@@ -1,48 +1,50 @@
 use super::*;
+use crate::context::AUTO_COMPACT_TOKEN_LIMIT;
 use crate::context::ContextSection;
+use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 fn snapshot(measured: bool) -> ContextSnapshot {
     ContextSnapshot {
-        used_tokens: 74_400,
-        context_window: 372_000,
-        compact_at_tokens: 353_400,
+        used_tokens: 70_680,
+        context_window: EFFECTIVE_CONTEXT_WINDOW,
+        compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
         measured,
         sections: vec![
             ContextSection {
                 kind: ContextKind::SystemPrompt,
-                tokens: 3_720,
+                tokens: 3_534,
                 items: 1,
             },
             ContextSection {
                 kind: ContextKind::ToolCatalogue,
-                tokens: 7_440,
+                tokens: 7_068,
                 items: 1,
             },
             ContextSection {
                 kind: ContextKind::RepositoryInstructions,
-                tokens: 3_720,
+                tokens: 3_534,
                 items: 1,
             },
             ContextSection {
                 kind: ContextKind::UserMessages,
-                tokens: 11_160,
+                tokens: 10_602,
                 items: 3,
             },
             ContextSection {
                 kind: ContextKind::AssistantMessages,
-                tokens: 14_880,
+                tokens: 14_136,
                 items: 2,
             },
             ContextSection {
                 kind: ContextKind::ToolActivity,
-                tokens: 11_160,
+                tokens: 10_602,
                 items: 4,
             },
             ContextSection {
                 kind: ContextKind::Reasoning,
-                tokens: 22_320,
+                tokens: 21_204,
                 items: 2,
             },
         ],
@@ -106,11 +108,11 @@ fn renders_capacity_grid_categories_and_compaction_headroom() {
     assert_eq!(buffer[(PREFERRED_WIDTH - 1, 0)].symbol(), "┐");
     assert_eq!(buffer[(PREFERRED_WIDTH, 0)].symbol(), " ");
     assert!(rendered.contains("Context"), "{rendered}");
-    assert!(rendered.contains("74.4K / 372K tokens"), "{rendered}");
+    assert!(rendered.contains("70.7K / 353.4K tokens"), "{rendered}");
     assert!(rendered.contains("20.0% used"), "{rendered}");
-    assert!(rendered.contains("Auto-compact at 353.4K"), "{rendered}");
+    assert!(rendered.contains("Auto-compact at 334.8K"), "{rendered}");
     assert!(
-        !rendered.contains("Auto-compact at 353.4K  ·"),
+        !rendered.contains("Auto-compact at 334.8K  ·"),
         "{rendered}"
     );
     assert!(rendered.contains("System prompt"), "{rendered}");

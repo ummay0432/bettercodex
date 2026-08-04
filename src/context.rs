@@ -25,9 +25,11 @@ const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 const MAX_CONTEXT_NOTICE_TEXT_TOKENS: usize = 9_900;
 const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
 const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;
+// Codex derives these independently from the resolved raw model context: 95% is the
+// usable hard window, while automatic compaction starts at 90% of the raw window.
 pub(crate) const RAW_CONTEXT_WINDOW: u64 = 372_000;
 pub(crate) const EFFECTIVE_CONTEXT_WINDOW: u64 = RAW_CONTEXT_WINDOW * 95 / 100;
-const COMPACT_AT_TOKENS: u64 = EFFECTIVE_CONTEXT_WINDOW;
+pub(crate) const AUTO_COMPACT_TOKEN_LIMIT: u64 = RAW_CONTEXT_WINDOW * 90 / 100;
 static CONTEXT_PREFIX_TOKEN_ESTIMATES: LazyLock<[u64; 2]> = LazyLock::new(|| {
     let [tools_item, system_prompt_item] = crate::api::context_prefix_items();
     [
@@ -306,8 +308,8 @@ impl Conversation {
 
         ContextSnapshot {
             used_tokens,
-            context_window: RAW_CONTEXT_WINDOW,
-            compact_at_tokens: EFFECTIVE_CONTEXT_WINDOW,
+            context_window: EFFECTIVE_CONTEXT_WINDOW,
+            compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: measured_total.is_some(),
             sections,
         }
@@ -333,11 +335,11 @@ impl Conversation {
     }
 
     pub(crate) fn needs_compaction(&self) -> bool {
-        self.projected_tokens(&[]) >= COMPACT_AT_TOKENS
+        self.projected_tokens(&[]) >= AUTO_COMPACT_TOKEN_LIMIT
     }
 
     pub(crate) fn needs_compaction_with(&self, additional: &[Value]) -> bool {
-        self.projected_tokens(additional) >= COMPACT_AT_TOKENS
+        self.projected_tokens(additional) >= AUTO_COMPACT_TOKEN_LIMIT
     }
 
     pub(crate) fn mark_interrupted(&mut self) -> Result<()> {

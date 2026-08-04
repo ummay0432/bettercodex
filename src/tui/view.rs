@@ -3011,6 +3011,7 @@ fn line_width(line: &Line<'_>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::AUTO_COMPACT_TOKEN_LIMIT;
     use crate::context::ContextKind;
     use crate::context::ContextSection;
     use codex_file_search::FileMatch;
@@ -3782,13 +3783,13 @@ mod tests {
         assert!(view.overlay.is_none());
 
         view.show_context(ContextSnapshot {
-            used_tokens: 74_400,
-            context_window: 372_000,
-            compact_at_tokens: 353_400,
+            used_tokens: 70_680,
+            context_window: EFFECTIVE_CONTEXT_WINDOW,
+            compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: true,
             sections: vec![ContextSection {
                 kind: ContextKind::UserMessages,
-                tokens: 74_400,
+                tokens: 70_680,
                 items: 4,
             }],
         });
@@ -3800,24 +3801,24 @@ mod tests {
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(rendered.contains("Context"), "{rendered}");
-        assert!(rendered.contains("74.4K / 372K tokens"), "{rendered}");
+        assert!(rendered.contains("70.7K / 353.4K tokens"), "{rendered}");
         assert!(rendered.contains("User messages"), "{rendered}");
         assert!(rendered.contains("Auto-compact reserve"), "{rendered}");
 
         view.handle_agent_event(AgentEvent::ContextUpdated(ContextSnapshot {
-            used_tokens: 111_600,
-            context_window: 372_000,
-            compact_at_tokens: 353_400,
+            used_tokens: 106_020,
+            context_window: EFFECTIVE_CONTEXT_WINDOW,
+            compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: true,
             sections: vec![ContextSection {
                 kind: ContextKind::AssistantMessages,
-                tokens: 111_600,
+                tokens: 106_020,
                 items: 6,
             }],
         }));
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("111.6K / 372K tokens"), "{rendered}");
+        assert!(rendered.contains("106K / 353.4K tokens"), "{rendered}");
         assert!(rendered.contains("Assistant messages"), "{rendered}");
 
         assert_eq!(

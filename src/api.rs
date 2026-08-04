@@ -4,7 +4,7 @@ use crate::auth::AuthSnapshot;
 use crate::auth::SharedAuth;
 use crate::compaction;
 use crate::compaction::CompactionPhase;
-use crate::context::RAW_CONTEXT_WINDOW;
+use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::rollout::SessionIdentity;
@@ -673,7 +673,7 @@ impl ApiClient {
         let mut prompt_history = history.to_vec();
         compaction::trim_tool_outputs_to_fit(
             &mut prompt_history,
-            RAW_CONTEXT_WINDOW.saturating_sub(prefix_tokens),
+            EFFECTIVE_CONTEXT_WINDOW.saturating_sub(prefix_tokens),
         );
         let mut request_history = prompt_history.clone();
         request_history.push(trigger);

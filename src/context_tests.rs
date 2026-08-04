@@ -473,8 +473,8 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
         conversation.context_snapshot(),
         ContextSnapshot {
             used_tokens: estimated_total,
-            context_window: RAW_CONTEXT_WINDOW,
-            compact_at_tokens: EFFECTIVE_CONTEXT_WINDOW,
+            context_window: EFFECTIVE_CONTEXT_WINDOW,
+            compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: false,
             sections: sections.clone(),
         }
@@ -486,8 +486,8 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
         conversation.context_snapshot(),
         ContextSnapshot {
             used_tokens: estimated_total,
-            context_window: RAW_CONTEXT_WINDOW,
-            compact_at_tokens: EFFECTIVE_CONTEXT_WINDOW,
+            context_window: EFFECTIVE_CONTEXT_WINDOW,
+            compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: false,
             sections: sections.clone(),
         },
@@ -990,21 +990,28 @@ fn resume_replaces_stale_world_state_without_losing_the_usage_baseline() {
 }
 
 #[test]
-fn compaction_boundary_is_exactly_ninety_five_percent() {
+fn compaction_boundary_matches_codex_ninety_percent_auto_compact_limit() {
     assert_eq!(RAW_CONTEXT_WINDOW, 372_000);
     assert_eq!(EFFECTIVE_CONTEXT_WINDOW, 353_400);
+    assert_eq!(AUTO_COMPACT_TOKEN_LIMIT, 334_800);
     let (root, cwd) = temporary_repository("threshold");
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     conversation.usage = Some(TokenUsage {
-        input_tokens: EFFECTIVE_CONTEXT_WINDOW - 1,
-        total_tokens: EFFECTIVE_CONTEXT_WINDOW - 1,
+        input_tokens: AUTO_COMPACT_TOKEN_LIMIT - 1,
+        total_tokens: AUTO_COMPACT_TOKEN_LIMIT - 1,
         ..TokenUsage::default()
     });
     conversation.usage_history_estimate = Some(estimated_tokens(conversation.items()));
 
     assert!(!conversation.needs_compaction());
     assert!(conversation.needs_compaction_with(&[json!("four")]));
+    conversation.usage = Some(TokenUsage {
+        input_tokens: AUTO_COMPACT_TOKEN_LIMIT,
+        total_tokens: AUTO_COMPACT_TOKEN_LIMIT,
+        ..TokenUsage::default()
+    });
+    assert!(conversation.needs_compaction());
 
     drop(conversation);
     std::fs::remove_dir_all(root).unwrap();

@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::RAW_CONTEXT_WINDOW;
 use futures::SinkExt;
 use futures::StreamExt;
 use std::io::Read;
@@ -864,6 +865,74 @@ async fn remote_compaction_v2_uses_the_responses_stream_and_builds_bounded_histo
             "phase": "pre_turn",
             "strategy": "memento",
         })
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn remote_compaction_request_is_bounded_by_the_effective_context_window() {
+    let compaction =
+        json!({"type": "compaction_summary", "id": "cmp_fixture", "encrypted_content": "opaque"});
+    let (base_url, requests, server) = spawn_http_server(vec![HttpReply::ok(
+        "text/event-stream",
+        completed_sse("resp_compact", &compaction),
+    )]);
+    let mut client = test_client(base_url);
+    client.prefer_websocket = false;
+
+    let call = json!({
+        "type": "custom_tool_call",
+        "id": "ctc_1",
+        "call_id": "call_1",
+        "name": "exec",
+        "input": "text(true)",
+    });
+    let empty_output = json!({
+        "type": "custom_tool_call_output",
+        "id": "ctco_1",
+        "call_id": "call_1",
+        "name": "exec",
+        "output": "",
+    });
+    let fixed_history = vec![user_message("keep"), call, empty_output.clone()];
+    let trigger = compaction::compaction_trigger();
+    let prefix_tokens = estimated_tokens(&compose_input(fixed_history.clone(), true))
+        .saturating_sub(estimated_tokens(&fixed_history))
+        .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
+    let target_request_tokens =
+        EFFECTIVE_CONTEXT_WINDOW + (RAW_CONTEXT_WINDOW - EFFECTIVE_CONTEXT_WINDOW) / 2;
+    let fixed_tokens = estimated_tokens(&fixed_history);
+    let payload_tokens = target_request_tokens
+        .saturating_sub(prefix_tokens)
+        .saturating_sub(fixed_tokens);
+    let mut oversized_output = empty_output;
+    oversized_output["output"] =
+        Value::String("x".repeat(usize::try_from(payload_tokens.saturating_mul(4)).unwrap()));
+    let history = vec![
+        fixed_history[0].clone(),
+        fixed_history[1].clone(),
+        oversized_output,
+    ];
+    let request_tokens = prefix_tokens.saturating_add(estimated_tokens(&history));
+    assert!(request_tokens > EFFECTIVE_CONTEXT_WINDOW);
+    assert!(request_tokens <= RAW_CONTEXT_WINDOW);
+
+    client
+        .compact(&history, CompactionPhase::MidTurn)
+        .await
+        .unwrap();
+
+    let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    let request_body: Value = serde_json::from_slice(&request.body).unwrap();
+    let sent_output = request_body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output"))
+        .unwrap();
+    assert_eq!(
+        sent_output["output"],
+        "Output exceeded the available model context and was truncated"
     );
     server.join().unwrap();
 }
