@@ -97,7 +97,7 @@ audit date they cost:
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Current `<environment_context>` developer item | 276 | 85 | 69 |
-| Current repository-onboarding user item | 10,743 | 2,388 | 2,686 |
+| Current repository-onboarding user item | 8,598 | 2,054 | 2,150 |
 
 Those two rows are snapshots, not constants. The environment fields change
 with the working directory, shell, date, and timezone. Repository instruction
