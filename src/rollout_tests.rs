@@ -160,6 +160,97 @@ fn latest_resume_prefers_the_most_recently_used_matching_session() {
 }
 
 #[test]
+fn session_listing_drives_resume_and_uses_the_first_real_user_message() {
+    let root = temporary_directory("rollout-list");
+    let first_cwd = root.join("first");
+    let second_cwd = root.join("second");
+    std::fs::create_dir_all(&first_cwd).unwrap();
+    std::fs::create_dir_all(&second_cwd).unwrap();
+
+    let mut first = Rollout::create_in(&root, &first_cwd).unwrap();
+    let first_id = Uuid::parse_str(&first.identity().session_id).unwrap();
+    let first_created = first.metadata.created_at_unix_ms;
+    let first_path = first.path.clone();
+    let initial = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "# Repository onboarding from AGENTS.md for /tmp\nignored",
+        }],
+    });
+    let interruption = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "<turn_aborted>ignored</turn_aborted>"}],
+    });
+    let first_prompt = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "  inspect\n  the   picker  "}],
+    });
+    first
+        .replace_history(std::slice::from_ref(&initial), HistoryReplacement::Initial)
+        .unwrap();
+    first
+        .append_history(std::slice::from_ref(&interruption))
+        .unwrap();
+    first
+        .append_history(std::slice::from_ref(&first_prompt))
+        .unwrap();
+    drop(first);
+
+    let mut second = Rollout::create_in(&root, &second_cwd).unwrap();
+    let second_id = Uuid::parse_str(&second.identity().session_id).unwrap();
+    let second_created = second.metadata.created_at_unix_ms;
+    let second_path = second.path.clone();
+    let image_prompt = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_image", "image_url": "data:image/png;base64,fixture"}],
+    });
+    second
+        .append_history(std::slice::from_ref(&image_prompt))
+        .unwrap();
+    drop(second);
+
+    for (path, seconds) in [(&first_path, 1_000), (&second_path, 2_000)] {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        list_sessions_in(&root).unwrap(),
+        [
+            SessionSummary {
+                id: second_id,
+                cwd: second_cwd.clone(),
+                created_at_unix_ms: second_created,
+                updated_at_unix_ms: 2_000_000,
+                preview: Some("Image attachment".to_string()),
+            },
+            SessionSummary {
+                id: first_id,
+                cwd: first_cwd.clone(),
+                created_at_unix_ms: first_created,
+                updated_at_unix_ms: 1_000_000,
+                preview: Some("inspect the picker".to_string()),
+            },
+        ]
+    );
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(first_id), &second_cwd).unwrap();
+    assert_eq!(loaded.metadata.cwd, first_cwd);
+    assert_eq!(loaded.history, [initial, interruption, first_prompt]);
+    drop(loaded);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn an_active_session_cannot_be_resumed_concurrently() {
     let root = temporary_directory("rollout-exclusive");
     let cwd = root.join("repo");

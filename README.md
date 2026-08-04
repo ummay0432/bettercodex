@@ -44,6 +44,12 @@ canonical working directory; an explicit ID resumes its saved working
 directory. An active journal has one process owner, so a concurrent resume
 fails instead of interleaving two inference histories.
 
+Inside the TUI, `/resume` opens a searchable picker scoped to the current
+working directory. `Tab` toggles all BetterCodex sessions, `Up` and `Down`
+browse, and `Enter` switches sessions without risking the current session if
+loading the target fails. `/resume SESSION_ID` switches directly. Resume is
+disabled while an agent turn is active.
+
 With no arguments, `bcodex` opens the interactive TUI. Assistant text and
 reasoning stream into the transcript, tool calls update in place, and the
 footer shows the fixed model, Git repository, branch, and effective context
@@ -66,9 +72,9 @@ composer. The core shortcuts are:
 - The mouse wheel and the terminal's normal scrollback controls browse the
   finalized transcript.
 - `?` on an empty composer opens the shortcut reference.
-- Typing `/` opens completion for `/clear`, `/context`, `/help`, `/tools`, and
-  one combined `/quit`, `/exit` entry; type `/q` and press `Enter` to quit
-  quickly. `/context` opens a colored breakdown of the raw window, current
+- Typing `/` opens completion for `/clear`, `/context`, `/resume`, `/help`,
+  `/tools`, and one combined `/quit`, `/exit` entry; type `/q` and press `Enter`
+  to quit quickly. `/context` opens a colored breakdown of the raw window, current
   request categories, free space before auto-compaction, and reserved headroom.
 - Typing `@` opens Git-ignore-aware fuzzy file search. `Up` and `Down` select a
   result, `Enter` or `Tab` inserts its repository-relative path, and `Esc`

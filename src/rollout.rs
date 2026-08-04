@@ -30,6 +30,7 @@ const STATE_DIRECTORY: &str = "bettercodex";
 const SESSIONS_DIRECTORY: &str = "sessions";
 const INSTALLATION_ID_FILE: &str = "installation_id";
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_SESSION_PREVIEW_CHARS: usize = 160;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionIdentity {
@@ -52,6 +53,15 @@ pub(crate) struct SessionMetadata {
 pub(crate) enum ResumeSelector {
     LatestForCwd,
     Id(Uuid),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionSummary {
+    pub(crate) id: Uuid,
+    pub(crate) cwd: PathBuf,
+    pub(crate) created_at_unix_ms: u64,
+    pub(crate) updated_at_unix_ms: u64,
+    pub(crate) preview: Option<String>,
 }
 
 pub(crate) struct LoadedRollout {
@@ -131,6 +141,30 @@ type RolloutRecord = RolloutRecordData;
 // them into a short-lived record.
 type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value]>;
 
+#[derive(Debug, Deserialize)]
+struct PreviewHistoryRecord {
+    #[serde(default)]
+    items: Vec<PreviewItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewItem {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    content: Vec<PreviewContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewContent {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    text: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HistoryReplacement {
@@ -184,6 +218,10 @@ impl Rollout {
 
     pub(crate) fn resume(selector: ResumeSelector, cwd: &Path) -> Result<LoadedRollout> {
         Self::resume_in(&state_root()?, selector, cwd)
+    }
+
+    pub(crate) fn list_sessions() -> Result<Vec<SessionSummary>> {
+        list_sessions_in(&state_root()?)
     }
 
     pub(crate) fn resume_in(
@@ -476,6 +514,163 @@ fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>
         }
     }
     Ok(latest.map(|(_, _, path)| path))
+}
+
+fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
+    let sessions_directory = root.join(SESSIONS_DIRECTORY);
+    let entries = match std::fs::read_dir(&sessions_directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("failed to list saved BetterCodex sessions"),
+    };
+    let mut sessions = Vec::new();
+    for entry in entries {
+        let entry = entry.context("failed to inspect a saved BetterCodex session")?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let modified_at = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        if let Some(summary) = read_session_summary(&path, modified_at)? {
+            sessions.push(summary);
+        }
+    }
+    sessions.sort_unstable_by(|left, right| {
+        right
+            .updated_at_unix_ms
+            .cmp(&left.updated_at_unix_ms)
+            .then_with(|| right.created_at_unix_ms.cmp(&left.created_at_unix_ms))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(sessions)
+}
+
+fn read_session_summary(
+    path: &Path,
+    modified_at: Option<SystemTime>,
+) -> Result<Option<SessionSummary>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
+    let mut lines = BufReader::new(file).split(b'\n');
+    let Some(header) = lines.next() else {
+        return Ok(None);
+    };
+    let header = header?;
+    let Ok(RolloutRecord::Session { metadata }) = serde_json::from_slice(&header) else {
+        return Ok(None);
+    };
+    if metadata.version != ROLLOUT_VERSION
+        || metadata.model != MODEL
+        || metadata.reasoning_effort != "max"
+    {
+        return Ok(None);
+    }
+    let Ok(id) = Uuid::parse_str(&metadata.identity.session_id) else {
+        return Ok(None);
+    };
+    if path.file_stem().and_then(|stem| stem.to_str())
+        != Some(metadata.identity.session_id.as_str())
+    {
+        return Ok(None);
+    }
+
+    let mut preview = None;
+    for line in lines {
+        let line =
+            line.with_context(|| format!("failed to inspect saved session {}", path.display()))?;
+        // BetterCodex writes the externally tagged record type first. Avoid decoding initial
+        // context, reasoning, and tool payloads while looking for the first real user message.
+        if !line.starts_with(br#"{"type":"history_append""#) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<PreviewHistoryRecord>(&line) else {
+            continue;
+        };
+        if let Some(found) = preview_from_items(&record.items) {
+            preview = Some(found);
+            break;
+        }
+    }
+
+    let updated_at_unix_ms = modified_at
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| duration.as_millis().try_into().ok())
+        .unwrap_or(metadata.created_at_unix_ms);
+    Ok(Some(SessionSummary {
+        id,
+        cwd: metadata.cwd,
+        created_at_unix_ms: metadata.created_at_unix_ms,
+        updated_at_unix_ms,
+        preview,
+    }))
+}
+
+fn preview_from_items(items: &[PreviewItem]) -> Option<String> {
+    for item in items {
+        if item.kind != "message" || item.role != "user" {
+            continue;
+        }
+        let text = item
+            .content
+            .iter()
+            .filter(|content| content.kind == "input_text")
+            .map(|content| content.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if crate::context::is_contextual_user_text(&text) {
+            continue;
+        }
+        if let Some(preview) = normalized_preview(&text) {
+            return Some(preview);
+        }
+        if item
+            .content
+            .iter()
+            .any(|content| content.kind == "input_image")
+        {
+            return Some("Image attachment".to_string());
+        }
+    }
+    None
+}
+
+fn normalized_preview(text: &str) -> Option<String> {
+    let mut preview = String::new();
+    let mut chars = 0_usize;
+    let mut truncated = false;
+    for word in text.split_whitespace() {
+        if chars > 0 {
+            if chars == MAX_SESSION_PREVIEW_CHARS {
+                truncated = true;
+                break;
+            }
+            preview.push(' ');
+            chars += 1;
+        }
+        let remaining = MAX_SESSION_PREVIEW_CHARS.saturating_sub(chars);
+        let mut word_chars = word.chars();
+        for character in word_chars.by_ref().take(remaining) {
+            preview.push(character);
+            chars += 1;
+        }
+        if word_chars.next().is_some() {
+            truncated = true;
+            break;
+        }
+    }
+    if preview.is_empty() {
+        return None;
+    }
+    if truncated {
+        if chars == MAX_SESSION_PREVIEW_CHARS {
+            preview.pop();
+        }
+        preview.push('…');
+    }
+    Some(preview)
 }
 
 fn repair_rollout_tail(

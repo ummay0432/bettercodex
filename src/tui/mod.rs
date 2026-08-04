@@ -3,6 +3,7 @@ mod editor;
 mod file_search;
 mod markdown;
 mod reasoning_status;
+mod resume_picker;
 mod terminal;
 mod tool_catalogue;
 mod view;
@@ -14,6 +15,9 @@ use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
 use crate::prompt_history::PromptHistory;
+use crate::rollout::ResumeSelector;
+use crate::rollout::Rollout;
+use crate::rollout::SessionSummary;
 use anyhow::Context;
 use anyhow::Result;
 use crossterm::event::EventStream;
@@ -31,11 +35,14 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use tokio::time::Interval;
 use tokio::time::MissedTickBehavior;
+use uuid::Uuid;
 use view::Action;
 use view::View;
 
 type TurnResult = (Agent, Result<SubmitOutcome>);
 type TurnTask = JoinHandle<TurnResult>;
+type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
+type ResumeTask = JoinHandle<Result<ResumedSession>>;
 const FRAME_INTERVAL: Duration = Duration::from_millis(32);
 const MAX_READY_AGENT_EVENTS: usize = 4_096;
 
@@ -62,19 +69,23 @@ struct Runtime {
     file_search: FileSearchManager,
     file_search_updates: UnboundedReceiver<FileSearchUpdate>,
     prompt_history: Option<PromptHistory>,
+    session_scan: Option<SessionScanTask>,
+    resume_task: Option<ResumeTask>,
     view: View,
+}
+
+struct ResumedSession {
+    agent: Agent,
+    prompt_history: PromptHistory,
+    composer_history: Vec<String>,
 }
 
 impl Runtime {
     fn new(agent: Agent, cwd: PathBuf) -> Result<Self> {
         let mut view = View::new(&cwd);
         view.set_context_tokens(agent.context_tokens());
-        let resumed_prompts = agent.prompt_history();
-        let prompt_history = PromptHistory::open(agent.session_id())?;
-        view.seed_prompt_history(prompt_history_for_session(
-            prompt_history.entries(),
-            resumed_prompts,
-        ));
+        let (prompt_history, composer_history) = prompt_history_for_agent(&agent)?;
+        view.seed_prompt_history(composer_history);
         let context_snapshot = agent.context_snapshot();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
@@ -91,6 +102,8 @@ impl Runtime {
             file_search,
             file_search_updates,
             prompt_history: Some(prompt_history),
+            session_scan: None,
+            resume_task: None,
         })
     }
 
@@ -158,6 +171,26 @@ impl Runtime {
                         redraw = true;
                     }
                 }
+                completion = receive_session_scan(&mut self.session_scan) => {
+                    self.session_scan = None;
+                    match completion.context("session listing task stopped unexpectedly")? {
+                        Ok(sessions) => self.view.set_resume_sessions(sessions),
+                        Err(error) => self.view.resume_listing_failed(format!(
+                            "Could not list saved BetterCodex sessions: {error:#}"
+                        )),
+                    }
+                    redraw = true;
+                }
+                completion = receive_resume_completion(&mut self.resume_task) => {
+                    self.resume_task = None;
+                    match completion.context("session resume task stopped unexpectedly")? {
+                        Ok(session) => self.activate_resumed_session(session),
+                        Err(error) => self.view.resume_failed(format!(
+                            "Could not resume the selected BetterCodex session: {error:#}"
+                        )),
+                    }
+                    redraw = true;
+                }
                 completion = receive_turn_completion(&mut self.turn) => {
                     let (agent, result) = completion.context("agent task stopped unexpectedly")?;
                     self.turn = None;
@@ -207,12 +240,16 @@ impl Runtime {
             Action::Clear => {
                 if self.turn.is_none() {
                     let agent = Agent::new(&self.cwd)?;
+                    let prompt_history = PromptHistory::open(agent.session_id())?;
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
+                    self.prompt_history = Some(prompt_history);
                     self.queued.clear();
                     self.view.clear();
                 }
             }
+            Action::OpenResumePicker => self.open_resume_picker()?,
+            Action::ResumeSession(id) => self.start_resume(id)?,
             Action::ShowContext => {
                 if let Some(agent) = &self.agent {
                     self.context_snapshot = agent.context_snapshot();
@@ -240,6 +277,71 @@ impl Runtime {
             self.view
                 .add_notice(format!("Prompt history could not be saved: {error:#}"));
         }
+    }
+
+    fn open_resume_picker(&mut self) -> Result<()> {
+        let current_session = self.current_session_id()?;
+        self.view.show_resume_picker(current_session);
+        if self.session_scan.is_none() {
+            self.session_scan = Some(tokio::task::spawn_blocking(Rollout::list_sessions));
+        }
+        Ok(())
+    }
+
+    fn start_resume(&mut self, target: Uuid) -> Result<()> {
+        let current_session = self.current_session_id()?;
+        if target == current_session {
+            self.view.close_resume_picker();
+            return Ok(());
+        }
+        if self.resume_task.is_some() {
+            return Ok(());
+        }
+        self.view.show_resume_progress(current_session, target);
+        let requested_cwd = self.cwd.clone();
+        self.resume_task = Some(tokio::task::spawn_blocking(move || {
+            let agent = Agent::resume(&requested_cwd, ResumeSelector::Id(target))?;
+            let (prompt_history, composer_history) = prompt_history_for_agent(&agent)?;
+            Ok(ResumedSession {
+                agent,
+                prompt_history,
+                composer_history,
+            })
+        }));
+        Ok(())
+    }
+
+    fn current_session_id(&self) -> Result<Uuid> {
+        let session_id = self
+            .agent
+            .as_ref()
+            .expect("an idle runtime always owns its agent")
+            .session_id();
+        Uuid::parse_str(session_id).context("the active BetterCodex session ID is invalid")
+    }
+
+    fn activate_resumed_session(&mut self, session: ResumedSession) {
+        let ResumedSession {
+            agent,
+            prompt_history,
+            composer_history,
+        } = session;
+        let cwd = agent.cwd().to_path_buf();
+        let context_snapshot = agent.context_snapshot();
+        let context_tokens = agent.context_tokens();
+        let (file_search_updates_tx, file_search_updates) = unbounded_channel();
+        let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
+
+        self.cwd = cwd.clone();
+        self.context_snapshot = context_snapshot;
+        self.agent = Some(agent);
+        self.queued.clear();
+        self.exit_after_turn = false;
+        self.file_search = file_search;
+        self.file_search_updates = file_search_updates;
+        self.prompt_history = Some(prompt_history);
+        self.view
+            .switch_session(&cwd, context_tokens, composer_history);
     }
 
     fn start_turn(&mut self, prompt: String) {
@@ -298,6 +400,13 @@ fn prompt_history_for_session(persistent: &[String], resumed: Vec<String>) -> Ve
     history
 }
 
+fn prompt_history_for_agent(agent: &Agent) -> Result<(PromptHistory, Vec<String>)> {
+    let prompt_history = PromptHistory::open(agent.session_id())?;
+    let composer_history =
+        prompt_history_for_session(prompt_history.entries(), agent.prompt_history());
+    Ok((prompt_history, composer_history))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReceiverState {
     Open,
@@ -342,6 +451,24 @@ async fn receive_turn_completion(
 ) -> std::result::Result<TurnResult, tokio::task::JoinError> {
     match turn {
         Some(turn) => turn.await,
+        None => pending().await,
+    }
+}
+
+async fn receive_session_scan(
+    task: &mut Option<SessionScanTask>,
+) -> std::result::Result<Result<Vec<SessionSummary>>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => pending().await,
+    }
+}
+
+async fn receive_resume_completion(
+    task: &mut Option<ResumeTask>,
+) -> std::result::Result<Result<ResumedSession>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
         None => pending().await,
     }
 }

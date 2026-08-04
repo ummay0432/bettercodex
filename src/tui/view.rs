@@ -7,6 +7,8 @@ use super::file_search::FileSearchUpdate;
 use super::file_search::is_horizontal_whitespace;
 use super::markdown;
 use super::reasoning_status::ReasoningStatus;
+use super::resume_picker::ResumePicker;
+use super::resume_picker::ResumePickerAction;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
 use super::tool_catalogue::VIEWPORT_HEIGHT as TOOL_CATALOGUE_VIEWPORT_HEIGHT;
@@ -48,6 +50,7 @@ use std::time::Duration;
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use uuid::Uuid;
 
 const MUTED: Color = Color::Indexed(245);
 const RULE: Color = Color::Indexed(8);
@@ -67,6 +70,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "context",
         aliases: &[],
         description: "visualize current context usage",
+    },
+    SlashCommand {
+        name: "resume",
+        aliases: &[],
+        description: "resume a saved session",
     },
     SlashCommand {
         name: "help",
@@ -91,6 +99,8 @@ pub(super) enum Action {
     Submit(String),
     Cancel,
     Clear,
+    OpenResumePicker,
+    ResumeSession(Uuid),
     ShowContext,
     Quit,
 }
@@ -274,6 +284,7 @@ impl SlashCommand {
 enum Overlay {
     Shortcuts,
     Context(ContextWindowView),
+    Resume(ResumePicker),
     Tools(ToolCatalogueView),
 }
 
@@ -428,6 +439,67 @@ impl View {
         self.overlay = Some(Overlay::Context(ContextWindowView::new(snapshot)));
     }
 
+    pub(super) fn show_resume_picker(&mut self, current_session: Uuid) {
+        self.overlay = Some(Overlay::Resume(ResumePicker::loading(
+            &self.cwd,
+            current_session,
+        )));
+    }
+
+    pub(super) fn show_resume_progress(&mut self, current_session: Uuid, target: Uuid) {
+        if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
+            picker.begin_resume(target);
+        } else {
+            self.overlay = Some(Overlay::Resume(ResumePicker::resuming(
+                &self.cwd,
+                current_session,
+                target,
+            )));
+        }
+    }
+
+    pub(super) fn set_resume_sessions(&mut self, sessions: Vec<crate::rollout::SessionSummary>) {
+        if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
+            picker.set_sessions(sessions);
+        }
+    }
+
+    pub(super) fn resume_failed(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
+            picker.set_error(error);
+        } else {
+            self.entries
+                .push(TranscriptEntry::Error(markdown::sanitize(&error)));
+        }
+    }
+
+    pub(super) fn resume_listing_failed(&mut self, error: impl Into<String>) {
+        if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
+            picker.set_listing_error(error);
+        }
+    }
+
+    pub(super) fn close_resume_picker(&mut self) {
+        if matches!(self.overlay.as_ref(), Some(Overlay::Resume(_))) {
+            self.overlay = None;
+        }
+    }
+
+    pub(super) fn switch_session(
+        &mut self,
+        cwd: &Path,
+        context_tokens: Option<u64>,
+        prompt_history: impl IntoIterator<Item = String>,
+    ) {
+        let user_message_style = self.user_message_style;
+        *self = Self::new(cwd);
+        self.user_message_style = user_message_style;
+        self.context_tokens = context_tokens;
+        self.editor.seed_history(prompt_history);
+        self.clear_requested = true;
+    }
+
     pub(super) fn file_search_query(&self) -> &str {
         self.file_search.query()
     }
@@ -555,6 +627,12 @@ impl View {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
             }
+            Event::Paste(text) if matches!(self.overlay.as_ref(), Some(Overlay::Resume(_))) => {
+                if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
+                    picker.handle_paste(&text);
+                }
+                Action::None
+            }
             Event::Paste(_) if self.overlay.is_some() => Action::None,
             Event::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -583,6 +661,16 @@ impl View {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
+            return match picker.handle_key(key) {
+                ResumePickerAction::None => Action::None,
+                ResumePickerAction::Close => {
+                    self.overlay = None;
+                    Action::None
+                }
+                ResumePickerAction::Resume(id) => Action::ResumeSession(id),
+            };
+        }
         if control && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
@@ -590,6 +678,7 @@ impl View {
             let close = match overlay {
                 Overlay::Shortcuts => true,
                 Overlay::Context(context) => context.handle_key(key.code) == ContextAction::Close,
+                Overlay::Resume(_) => unreachable!("resume picker keys are handled above"),
                 Overlay::Tools(catalogue) => {
                     catalogue.handle_key(key.code) == CatalogueAction::Close
                 }
@@ -774,7 +863,31 @@ impl View {
         }
         let prompt = self.editor.take();
         self.editor.remember(&prompt);
-        match prompt.trim() {
+        let command = prompt.trim();
+        if let Some(arguments) = command.strip_prefix("/resume")
+            && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
+        {
+            if self.busy {
+                self.entries.push(TranscriptEntry::Notice(
+                    "Interrupt the active turn before resuming another session".to_string(),
+                ));
+                return Action::None;
+            }
+            let arguments = arguments.trim();
+            if arguments.is_empty() {
+                return Action::OpenResumePicker;
+            }
+            return match Uuid::parse_str(arguments) {
+                Ok(id) => Action::ResumeSession(id),
+                Err(_) => {
+                    self.entries.push(TranscriptEntry::Error(
+                        "`/resume` expects one BetterCodex session UUID".to_string(),
+                    ));
+                    Action::None
+                }
+            };
+        }
+        match command {
             "/q" | "/quit" | "/exit" => Action::Quit,
             "/clear" if self.busy => {
                 self.entries.push(TranscriptEntry::Notice(
@@ -978,6 +1091,7 @@ impl View {
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => 15,
             Some(Overlay::Context(context)) => context.preferred_height(width),
+            Some(Overlay::Resume(picker)) => picker.preferred_height(),
             Some(Overlay::Tools(_)) => TOOL_CATALOGUE_VIEWPORT_HEIGHT,
             None => 0,
         };
@@ -1093,6 +1207,7 @@ impl View {
         match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
             Some(Overlay::Context(context)) => context.render(frame, area),
+            Some(Overlay::Resume(picker)) => picker.render(frame, area),
             Some(Overlay::Tools(catalogue)) => catalogue.render(frame, area),
             None => {}
         }
@@ -3277,6 +3392,129 @@ mod tests {
             Action::None
         );
         assert_eq!(view.editor.text(), "/tools");
+    }
+
+    #[test]
+    fn resume_slash_command_opens_the_picker_and_accepts_an_explicit_id() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        for character in "/res".chars() {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+
+        let height = view.desired_height(72, 24);
+        let backend = TestBackend::new(72, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("/resume  resume a saved session"),
+            "{rendered}"
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::OpenResumePicker
+        );
+
+        let id = Uuid::new_v4();
+        view.editor.set_text(format!("/resume {id}"));
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::ResumeSession(id)
+        );
+    }
+
+    #[test]
+    fn resume_is_not_sent_to_the_model_or_switched_during_an_active_turn() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.start_turn("working");
+        view.editor.set_text("/resume not-a-session");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        let height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("Interrupt the active turn before resuming another session"),
+            "{rendered}"
+        );
+        assert!(!view.entries.iter().any(|entry| {
+            matches!(entry, TranscriptEntry::User(prompt) if prompt == "/resume not-a-session")
+        }));
+    }
+
+    #[test]
+    fn switching_sessions_resets_transcript_and_reseeds_prompt_recall() {
+        let mut view = View::new(Path::new("/tmp/old-session"));
+        view.welcome_pending = false;
+        view.add_notice("old transcript");
+        view.show_resume_picker(Uuid::new_v4());
+
+        view.switch_session(
+            Path::new("/tmp/resumed-session"),
+            Some(42_000),
+            ["resumed prompt".to_string()],
+        );
+
+        assert_eq!(view.cwd, Path::new("/tmp/resumed-session"));
+        assert!(view.entries.is_empty());
+        assert!(view.overlay.is_none());
+        assert_eq!(view.context_tokens, Some(42_000));
+        assert!(view.take_clear_request());
+        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(view.editor.text(), "resumed prompt");
+    }
+
+    #[test]
+    fn resume_overlay_renders_and_dispatches_the_selected_saved_session() {
+        let current = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.show_resume_picker(current);
+        view.set_resume_sessions(vec![crate::rollout::SessionSummary {
+            id: target,
+            cwd: PathBuf::from("/tmp/bettercodex"),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            preview: Some("Continue the saved work".to_string()),
+        }]);
+
+        let height = view.desired_height(88, 24);
+        let backend = TestBackend::new(88, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("Resume a previous session"), "{rendered}");
+        assert!(rendered.contains("Continue the saved work"), "{rendered}");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::ResumeSession(target)
+        );
     }
 
     #[test]
