@@ -755,11 +755,29 @@ mod tests {
         let repainted = output.screen();
         assert!(repainted.contains("history row"), "{repainted}");
         assert!(
-            repainted.contains("Inspecting viewport state"),
+            repainted.contains("Inspecting viewport state ("),
             "{repainted}"
         );
+        assert!(repainted.contains(" • esc to interrupt)"), "{repainted}");
         assert!(repainted.contains('›'), "{repainted}");
         assert!(repainted.contains(MODEL), "{repainted}");
+        let parser = output.parser.borrow();
+        let screen = parser.screen();
+        let activity_row = (0..SCREEN_HEIGHT)
+            .find(|&row| {
+                (0..WIDTH)
+                    .filter_map(|column| screen.cell(row, column))
+                    .map(vt100::Cell::contents)
+                    .collect::<String>()
+                    .contains("Inspecting viewport state")
+            })
+            .expect("rendered activity row");
+        assert!(
+            (0..WIDTH).all(|column| screen
+                .cell(activity_row, column)
+                .is_some_and(|cell| cell.bgcolor() == vt100::Color::Default)),
+            "activity row retained a stale background"
+        );
     }
 
     #[test]
