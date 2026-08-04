@@ -10,6 +10,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::BufWriter;
 use std::io::Write;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -28,6 +29,7 @@ const ROLLOUT_VERSION: u32 = 1;
 const STATE_DIRECTORY: &str = "bettercodex";
 const SESSIONS_DIRECTORY: &str = "sessions";
 const INSTALLATION_ID_FILE: &str = "installation_id";
+const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionIdentity {
@@ -95,16 +97,16 @@ impl Drop for LockedRolloutFile {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum RolloutRecord {
+enum RolloutRecordData<Items = Vec<Value>> {
     Session {
         metadata: SessionMetadata,
     },
     HistoryAppend {
-        items: Vec<Value>,
+        items: Items,
     },
     HistoryReplace {
         reason: HistoryReplacement,
-        items: Vec<Value>,
+        items: Items,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_usage: Option<TokenUsage>,
     },
@@ -122,6 +124,12 @@ enum RolloutRecord {
         outcome: TurnOutcome,
     },
 }
+
+type RolloutRecord = RolloutRecordData;
+// History items can contain multi-megabyte images and tool results. Keep the journal schema
+// shared with replay while borrowing those payloads on the write path instead of deep-cloning
+// them into a short-lived record.
+type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value]>;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -203,9 +211,8 @@ impl Rollout {
         if items.is_empty() {
             return Ok(());
         }
-        self.write_record(&RolloutRecord::HistoryAppend {
-            items: items.to_vec(),
-        })
+        let record = BorrowedRolloutRecord::HistoryAppend { items };
+        self.write_record(&record)
     }
 
     pub(crate) fn replace_history(
@@ -213,11 +220,12 @@ impl Rollout {
         items: &[Value],
         reason: HistoryReplacement,
     ) -> Result<()> {
-        self.write_record(&RolloutRecord::HistoryReplace {
+        let record = BorrowedRolloutRecord::HistoryReplace {
             reason,
-            items: items.to_vec(),
+            items,
             response_usage: None,
-        })
+        };
+        self.write_record(&record)
     }
 
     pub(crate) fn replace_compacted_history(
@@ -225,11 +233,12 @@ impl Rollout {
         items: &[Value],
         response_usage: Option<&TokenUsage>,
     ) -> Result<()> {
-        self.write_record(&RolloutRecord::HistoryReplace {
+        let record = BorrowedRolloutRecord::HistoryReplace {
             reason: HistoryReplacement::Compaction,
-            items: items.to_vec(),
+            items,
             response_usage: response_usage.cloned(),
-        })
+        };
+        self.write_record(&record)
     }
 
     pub(crate) fn record_usage(
@@ -258,15 +267,37 @@ impl Rollout {
         })
     }
 
-    fn write_record(&mut self, record: &RolloutRecord) -> Result<()> {
-        let mut bytes = serde_json::to_vec(record).context("failed to encode session record")?;
-        bytes.push(b'\n');
-        self.file
-            .write_all(&bytes)
-            .with_context(|| format!("failed to append {}", self.path.display()))?;
-        self.file
-            .flush()
-            .with_context(|| format!("failed to flush {}", self.path.display()))?;
+    fn write_record(&mut self, record: &impl Serialize) -> Result<()> {
+        let record_start = self.file.metadata()?.len();
+        // Stream through a fixed-size buffer: buffering the complete JSON value would briefly
+        // duplicate the active history. Restore the prior boundary if serialization or I/O stops
+        // mid-record so a later append cannot turn a recoverable tail into interior corruption.
+        let append_result = {
+            let mut writer = BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, &mut *self.file);
+            serde_json::to_writer(&mut writer, record)
+                .context("failed to encode session record")
+                .and_then(|()| {
+                    writer
+                        .write_all(b"\n")
+                        .context("failed to terminate session record")
+                })
+                .and_then(|()| writer.flush().context("failed to flush session record"))
+        };
+        if let Err(error) = append_result {
+            self.file.set_len(record_start).with_context(|| {
+                format!(
+                    "failed to restore {} after an incomplete session record: {error:#}",
+                    self.path.display()
+                )
+            })?;
+            self.file.sync_data().with_context(|| {
+                format!(
+                    "failed to persist the restored session journal {}",
+                    self.path.display()
+                )
+            })?;
+            return Err(error).with_context(|| format!("failed to append {}", self.path.display()));
+        }
         self.file
             .sync_data()
             .with_context(|| format!("failed to persist {}", self.path.display()))

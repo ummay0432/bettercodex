@@ -30,6 +30,51 @@ fn legacy_history_replacements_default_missing_response_usage() {
 }
 
 #[test]
+fn failed_streamed_record_is_rolled_back_before_later_appends() {
+    struct PartialRecord;
+
+    impl serde::Serialize for PartialRecord {
+        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeSeq;
+
+            let mut sequence = serializer.serialize_seq(Some(2))?;
+            sequence.serialize_element(&"x".repeat(JOURNAL_BUFFER_BYTES * 2))?;
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
+        }
+    }
+
+    let root = temporary_directory("rollout-stream-rollback");
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.clone();
+    let valid_length = rollout.file.metadata().unwrap().len();
+
+    let error = rollout.write_record(&PartialRecord).unwrap_err();
+    assert!(error.to_string().contains("failed to append"));
+    assert_eq!(rollout.file.metadata().unwrap().len(), valid_length);
+
+    let item = json!({"type": "message", "role": "user"});
+    rollout.append_history(std::slice::from_ref(&item)).unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(
+        &root,
+        ResumeSelector::Id(Uuid::parse_str(&session_id).unwrap()),
+        &cwd,
+    )
+    .unwrap();
+    assert_eq!(loaded.history, vec![item]);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn rollout_replays_replacements_usage_and_turn_state() {
     let root = temporary_directory("rollout-replay");
     let cwd = root.join("repo");

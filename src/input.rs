@@ -54,7 +54,7 @@ impl FromStr for ImageDetail {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct UserInput {
     text: String,
     images: Vec<Value>,

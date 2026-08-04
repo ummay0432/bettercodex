@@ -1,5 +1,4 @@
 use crate::compaction::InitialContextInjection;
-use crate::input::UserInput;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
 use crate::rollout::Rollout;
@@ -179,13 +178,6 @@ impl Conversation {
 
     pub(crate) fn finish_turn(&mut self, turn_id: &str, outcome: TurnOutcome) -> Result<()> {
         self.rollout.finish_turn(turn_id, outcome)
-    }
-
-    pub(crate) fn push_user(&mut self, input: UserInput) -> Result<()> {
-        if input.is_empty() {
-            anyhow::bail!("prompt and image list are both empty");
-        }
-        self.extend([input.into_message()])
     }
 
     pub(crate) fn extend(&mut self, items: impl IntoIterator<Item = Value>) -> Result<()> {

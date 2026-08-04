@@ -475,7 +475,10 @@ impl Agent {
         cancellation: &CancellationToken,
         phase: CompactionPhase,
     ) -> Result<bool> {
-        let projected = input.clone().into_message();
+        if input.is_empty() {
+            return Err(anyhow!("prompt and image list are both empty"));
+        }
+        let projected = input.into_message();
         if self
             .conversation
             .needs_compaction_with(std::slice::from_ref(&projected))
@@ -490,7 +493,7 @@ impl Agent {
         {
             return Ok(false);
         }
-        self.conversation.push_user(input)?;
+        self.conversation.extend([projected])?;
         self.emit_context(events);
         Ok(true)
     }
