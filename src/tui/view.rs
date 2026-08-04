@@ -480,6 +480,14 @@ impl View {
         let slash_matches = self.slash_matches();
         if !slash_matches.is_empty() {
             match key.code {
+                KeyCode::Enter if !shift && !alt && !control => {
+                    let selection = self.slash_selection.min(slash_matches.len() - 1);
+                    self.editor
+                        .set_text(format!("/{}", slash_matches[selection].name));
+                    self.dismissed_slash = None;
+                    self.slash_selection = selection;
+                    return self.submit_action(false);
+                }
                 KeyCode::Tab => {
                     let selection = self.slash_selection.min(slash_matches.len() - 1);
                     self.editor
@@ -2570,6 +2578,51 @@ mod tests {
         assert!(!rendered.contains("Commands"), "{rendered}");
         assert!(!rendered.contains('┌'), "{rendered}");
         assert!(!rendered.contains("gpt-5.6-sol"), "{rendered}");
+    }
+
+    #[test]
+    fn enter_dispatches_the_selected_slash_command_from_a_partial_name() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        for character in "/too".chars() {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+
+        let height = view.desired_height(60, 24);
+        let backend = TestBackend::new(60, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("/tools  inspect the active tool catalogue"));
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(view.editor.is_empty());
+        assert!(view.entries.is_empty());
+        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Tools(_))));
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE,))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "/tools");
     }
 
     #[test]
