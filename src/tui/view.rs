@@ -51,7 +51,6 @@ use unicode_width::UnicodeWidthStr;
 
 const MUTED: Color = Color::Indexed(245);
 const RULE: Color = Color::Indexed(8);
-const MAX_EDITOR_ROWS: u16 = 8;
 const LIVE_PREFIX_COLS: u16 = 2;
 const TOOL_OUTPUT_MAX_ROWS: usize = 5;
 const COMMAND_CONTINUATION_MAX_ROWS: usize = 2;
@@ -532,7 +531,7 @@ impl View {
             Event::Paste(_) if self.overlay.is_some() => Action::None,
             Event::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                self.editor.insert(&text);
+                self.editor.insert_paste(text);
                 self.dismissed_slash = None;
                 self.slash_selection = 0;
                 Action::None
@@ -931,10 +930,11 @@ impl View {
         active_height: u16,
     ) -> u16 {
         self.composer_text_width = width.saturating_sub(3).max(1);
-        let editor = self
+        let composer_height = self
             .editor
-            .layout(self.composer_text_width, MAX_EDITOR_ROWS);
-        let composer_height = (editor.lines.len() as u16).max(1).saturating_add(2);
+            .desired_height(self.composer_text_width)
+            .max(1)
+            .saturating_add(2);
         let status_height = u16::from(self.busy);
         let status_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(status_height);
         let bottom_spacing = 1;
@@ -978,22 +978,36 @@ impl View {
             return;
         }
         self.composer_text_width = area.width.saturating_sub(3).max(1);
-        let editor_layout = self
-            .editor
-            .layout(self.composer_text_width, MAX_EDITOR_ROWS);
-        let editor_rows = (editor_layout.lines.len() as u16).max(1);
-        let composer_height = editor_rows.saturating_add(2).min(area.height);
         let popup_height = if self.overlay.is_some() {
             0
         } else {
             self.completion_popup_height(area.width)
         };
-        let trailing_height = if popup_height > 0 {
+        let requested_trailing_height = if popup_height > 0 {
             popup_height
         } else {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
-        }
-        .min(area.height.saturating_sub(composer_height));
+        };
+        // Like Codex, let the composer consume the available terminal height before its textarea
+        // scrolls. The footer/completion area and active-work status retain their own rows.
+        let minimum_composer_height = area.height.min(3);
+        let trailing_height =
+            requested_trailing_height.min(area.height.saturating_sub(minimum_composer_height));
+        let height_above_trailing = area.height.saturating_sub(trailing_height);
+        let status_reserve = if self.busy {
+            STATUS_LINE_HEIGHT
+                .saturating_add(ACTIVITY_COMPOSER_GAP)
+                .min(height_above_trailing.saturating_sub(minimum_composer_height))
+        } else {
+            0
+        };
+        let composer_height_limit = height_above_trailing.saturating_sub(status_reserve);
+        let editor_height_limit = composer_height_limit.saturating_sub(2).max(1);
+        let editor_layout = self
+            .editor
+            .layout(self.composer_text_width, editor_height_limit);
+        let editor_rows = (editor_layout.lines.len() as u16).max(1);
+        let composer_height = editor_rows.saturating_add(2).min(composer_height_limit);
         let composer_y = area
             .bottom()
             .saturating_sub(composer_height.saturating_add(trailing_height));
@@ -1097,10 +1111,17 @@ impl View {
         let text_y = area.y.saturating_add(1);
         let text_x = area.x.saturating_add(LIVE_PREFIX_COLS);
         let text_width = area.right().saturating_sub(text_x).saturating_sub(1).max(1);
-        let lines = if layout.lines.is_empty() {
+        let super::editor::EditorLayout {
+            lines,
+            paste_ranges,
+            cursor_row,
+            cursor_column,
+            ..
+        } = layout;
+        let lines = if lines.is_empty() {
             vec![String::new()]
         } else {
-            layout.lines
+            lines
         };
         for (index, text) in lines.iter().enumerate() {
             let Ok(index) = u16::try_from(index) else {
@@ -1111,7 +1132,13 @@ impl View {
                 break;
             }
             frame.render_widget(
-                Paragraph::new(Line::from(text.clone())),
+                Paragraph::new(editor_line(
+                    text,
+                    paste_ranges
+                        .get(usize::from(index))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )),
                 Rect::new(text_x, y, text_width, 1),
             );
         }
@@ -1134,10 +1161,10 @@ impl View {
 
         if self.overlay.is_none() {
             let cursor_x = text_x
-                .saturating_add(layout.cursor_column)
+                .saturating_add(cursor_column)
                 .min(area.right().saturating_sub(1));
             let cursor_y = text_y
-                .saturating_add(layout.cursor_row)
+                .saturating_add(cursor_row)
                 .min(area.bottom().saturating_sub(2));
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
@@ -2727,6 +2754,26 @@ fn first_display_line(source: &str) -> String {
     }
 }
 
+fn editor_line(text: &str, paste_ranges: &[std::ops::Range<usize>]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(paste_ranges.len().saturating_mul(2).saturating_add(1));
+    let mut cursor = 0;
+    for range in paste_ranges {
+        debug_assert!(range.start >= cursor && range.end <= text.len());
+        if cursor < range.start {
+            spans.push(Span::raw(text[cursor..range.start].to_string()));
+        }
+        spans.push(Span::styled(
+            text[range.clone()].to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+        cursor = range.end;
+    }
+    if cursor < text.len() || spans.is_empty() {
+        spans.push(Span::raw(text[cursor..].to_string()));
+    }
+    Line::from(spans)
+}
+
 fn format_context_usage(tokens: Option<u64>) -> String {
     let Some(tokens) = tokens else {
         return "? of 353K".to_string();
@@ -3883,6 +3930,86 @@ mod tests {
             ))),
             Action::Submit("first\nsecond".to_string())
         );
+    }
+
+    #[test]
+    fn large_terminal_paste_renders_compact_and_submits_full_content() {
+        const WIDTH: u16 = 80;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        let paste = "x".repeat(1_001);
+        let placeholder = "[Pasted Content 1001 chars]";
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Paste(paste.clone())),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), placeholder);
+        assert_eq!(view.desired_height(WIDTH, 24), 5);
+
+        let backend = TestBackend::new(WIDTH, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let placeholder_y = rendered
+            .lines()
+            .position(|line| line.contains(placeholder))
+            .expect("rendered compact paste") as u16;
+        assert!(
+            (2..2 + placeholder.len() as u16).all(|x| buffer[(x, placeholder_y)].fg == Color::Cyan),
+            "{rendered}"
+        );
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Submit(paste)
+        );
+        assert!(view.editor.is_empty());
+    }
+
+    #[test]
+    fn composer_grows_to_available_height_before_scrolling() {
+        const WIDTH: u16 = 40;
+        let input = (1..=12)
+            .map(|row| format!("row-{row:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.editor.set_text(input);
+
+        let expanded_height = view.desired_height(WIDTH, 30);
+        assert_eq!(expanded_height, 16);
+        let backend = TestBackend::new(WIDTH, expanded_height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let expanded = render_buffer(terminal.backend().buffer());
+        assert!(expanded.contains("row-01"), "{expanded}");
+        assert!(expanded.contains("row-12"), "{expanded}");
+
+        let clipped_height = view.desired_height(WIDTH, 8);
+        assert_eq!(clipped_height, 8);
+        let backend = TestBackend::new(WIDTH, clipped_height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let at_end = render_buffer(terminal.backend().buffer());
+        assert!(!at_end.contains("row-01"), "{at_end}");
+        assert!(at_end.contains("row-12"), "{at_end}");
+
+        for _ in 0..11 {
+            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        }
+        let backend = TestBackend::new(WIDTH, clipped_height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let at_start = render_buffer(terminal.backend().buffer());
+        assert!(at_start.contains("row-01"), "{at_start}");
+        assert!(!at_start.contains("row-12"), "{at_start}");
     }
 
     #[test]

@@ -3,6 +3,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+/// Match Codex's threshold for replacing a paste with a compact composer element.
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 
 #[derive(Debug, Default)]
 pub(super) struct Editor {
@@ -12,11 +14,21 @@ pub(super) struct Editor {
     history: Vec<String>,
     history_index: Option<usize>,
     saved_draft: String,
+    pending_pastes: Vec<PendingPaste>,
+}
+
+#[derive(Debug)]
+struct PendingPaste {
+    placeholder: String,
+    content: String,
+    range: Range<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct EditorLayout {
     pub(super) lines: Vec<String>,
+    /// Byte ranges within each visible line that represent compacted pastes.
+    pub(super) paste_ranges: Vec<Vec<Range<usize>>>,
     pub(super) cursor_row: u16,
     pub(super) cursor_column: u16,
     pub(super) total_lines: u16,
@@ -39,10 +51,18 @@ impl Editor {
         self.text = text.into();
         self.cursor = self.text.len();
         self.preferred_column = None;
+        self.pending_pastes.clear();
     }
 
     pub(super) fn take(&mut self) -> String {
-        let text = std::mem::take(&mut self.text);
+        let text = if self.pending_pastes.is_empty() {
+            std::mem::take(&mut self.text)
+        } else {
+            let expanded = self.expanded_text();
+            self.text.clear();
+            self.pending_pastes.clear();
+            expanded
+        };
         self.cursor = 0;
         self.preferred_column = None;
         self.history_index = None;
@@ -111,17 +131,30 @@ impl Editor {
 
     pub(super) fn insert(&mut self, value: &str) {
         self.leave_history();
-        self.text.insert_str(self.cursor, value);
-        self.cursor += value.len();
-        self.preferred_column = None;
+        self.replace_range_inner(self.cursor..self.cursor, value);
+    }
+
+    /// Insert a terminal paste using Codex's compact large-paste representation.
+    pub(super) fn insert_paste(&mut self, value: String) {
+        let char_count = value.chars().count();
+        if char_count <= LARGE_PASTE_CHAR_THRESHOLD {
+            self.insert(&value);
+            return;
+        }
+
+        let placeholder = self.next_large_paste_placeholder(char_count);
+        let start = self.cursor;
+        self.insert(&placeholder);
+        self.pending_pastes.push(PendingPaste {
+            range: start..start + placeholder.len(),
+            placeholder,
+            content: value,
+        });
     }
 
     pub(super) fn replace_range(&mut self, range: Range<usize>, value: &str) {
         self.leave_history();
-        let start = range.start;
-        self.text.replace_range(range, value);
-        self.cursor = start + value.len();
-        self.preferred_column = None;
+        self.replace_range_inner(range, value);
     }
 
     pub(super) fn insert_newline(&mut self) {
@@ -130,19 +163,18 @@ impl Editor {
 
     pub(super) fn backspace(&mut self) {
         self.leave_history();
-        let previous = previous_boundary(&self.text, self.cursor);
+        let previous = self.previous_atomic_boundary(self.cursor);
         if previous < self.cursor {
-            self.text.replace_range(previous..self.cursor, "");
-            self.cursor = previous;
+            self.replace_range_inner(previous..self.cursor, "");
         }
         self.preferred_column = None;
     }
 
     pub(super) fn delete(&mut self) {
         self.leave_history();
-        let next = next_boundary(&self.text, self.cursor);
+        let next = self.next_atomic_boundary(self.cursor);
         if next > self.cursor {
-            self.text.replace_range(self.cursor..next, "");
+            self.replace_range_inner(self.cursor..next, "");
         }
         self.preferred_column = None;
     }
@@ -150,8 +182,7 @@ impl Editor {
     pub(super) fn delete_previous_word(&mut self) {
         self.leave_history();
         let start = beginning_of_previous_word(&self.text, self.cursor);
-        self.text.replace_range(start..self.cursor, "");
-        self.cursor = start;
+        self.replace_range_inner(start..self.cursor, "");
         self.preferred_column = None;
     }
 
@@ -160,8 +191,7 @@ impl Editor {
         let start = self.text[..self.cursor]
             .rfind('\n')
             .map_or(0, |index| index + 1);
-        self.text.replace_range(start..self.cursor, "");
-        self.cursor = start;
+        self.replace_range_inner(start..self.cursor, "");
         self.preferred_column = None;
     }
 
@@ -171,30 +201,32 @@ impl Editor {
             .find('\n')
             .map_or(self.text.len(), |index| self.cursor + index);
         if end == self.cursor && end < self.text.len() {
-            self.text.replace_range(end..=end, "");
+            self.replace_range_inner(end..end + 1, "");
         } else {
-            self.text.replace_range(self.cursor..end, "");
+            self.replace_range_inner(self.cursor..end, "");
         }
         self.preferred_column = None;
     }
 
     pub(super) fn move_left(&mut self) {
-        self.cursor = previous_boundary(&self.text, self.cursor);
+        self.cursor = self.previous_atomic_boundary(self.cursor);
         self.preferred_column = None;
     }
 
     pub(super) fn move_right(&mut self) {
-        self.cursor = next_boundary(&self.text, self.cursor);
+        self.cursor = self.next_atomic_boundary(self.cursor);
         self.preferred_column = None;
     }
 
     pub(super) fn move_word_left(&mut self) {
-        self.cursor = beginning_of_previous_word(&self.text, self.cursor);
+        let position = beginning_of_previous_word(&self.text, self.cursor);
+        self.cursor = self.atomic_start_boundary(position);
         self.preferred_column = None;
     }
 
     pub(super) fn move_word_right(&mut self) {
-        self.cursor = end_of_next_word(&self.text, self.cursor);
+        let position = end_of_next_word(&self.text, self.cursor);
+        self.cursor = self.atomic_end_boundary(position);
         self.preferred_column = None;
     }
 
@@ -202,6 +234,7 @@ impl Editor {
         self.cursor = self.text[..self.cursor]
             .rfind('\n')
             .map_or(0, |index| index + 1);
+        self.cursor = self.atomic_start_boundary(self.cursor);
         self.preferred_column = None;
     }
 
@@ -209,6 +242,7 @@ impl Editor {
         self.cursor = self.text[self.cursor..]
             .find('\n')
             .map_or(self.text.len(), |index| self.cursor + index);
+        self.cursor = self.atomic_end_boundary(self.cursor);
         self.preferred_column = None;
     }
 
@@ -225,7 +259,15 @@ impl Editor {
             .preferred_column
             .unwrap_or_else(|| display_width(&self.text[ranges[current].start..self.cursor]));
         self.preferred_column = Some(column);
-        self.cursor = byte_at_column(&self.text, &ranges[target], column);
+        let position = byte_at_column(&self.text, &ranges[target], column);
+        self.cursor = self.nearest_atomic_boundary(position);
+    }
+
+    pub(super) fn desired_height(&self, width: u16) -> u16 {
+        visual_ranges(&self.text, usize::from(width.max(1)))
+            .len()
+            .try_into()
+            .unwrap_or(u16::MAX)
     }
 
     pub(super) fn layout(&self, width: u16, max_height: u16) -> EditorLayout {
@@ -238,21 +280,175 @@ impl Editor {
             .saturating_sub(max_height)
             .min(ranges.len().saturating_sub(max_height));
         let end = (first + max_height).min(ranges.len());
-        let lines = ranges[first..end]
+        let visible_ranges = &ranges[first..end];
+        let lines = visible_ranges
             .iter()
             .map(|range| self.text[range.clone()].replace('\t', " "))
             .collect();
+        let paste_ranges = visible_ranges
+            .iter()
+            .map(|line| {
+                let mut highlights = self
+                    .pending_pastes
+                    .iter()
+                    .filter_map(|paste| {
+                        let start = paste.range.start.max(line.start);
+                        let end = paste.range.end.min(line.end);
+                        (start < end).then_some(start - line.start..end - line.start)
+                    })
+                    .collect::<Vec<_>>();
+                highlights.sort_by_key(|range| range.start);
+                highlights
+            })
+            .collect();
         EditorLayout {
             lines,
+            paste_ranges,
             cursor_row: (cursor_line - first) as u16,
             cursor_column: display_width(&self.text[ranges[cursor_line].start..self.cursor]) as u16,
             total_lines: ranges.len().try_into().unwrap_or(u16::MAX),
         }
     }
 
+    fn replace_range_inner(&mut self, range: Range<usize>, value: &str) {
+        let range = self.atomic_edit_range(range);
+        let start = range.start;
+        let removed_len = range.end - range.start;
+        let inserted_len = value.len();
+
+        self.pending_pastes.retain_mut(|paste| {
+            if paste.range.end <= range.start {
+                return true;
+            }
+            if paste.range.start >= range.end {
+                shift_range(&mut paste.range, removed_len, inserted_len);
+                return true;
+            }
+            false
+        });
+        self.text.replace_range(range, value);
+        self.cursor = start + inserted_len;
+        self.preferred_column = None;
+    }
+
+    fn atomic_edit_range(&self, mut range: Range<usize>) -> Range<usize> {
+        if range.is_empty() {
+            let position = self.nearest_atomic_boundary(range.start);
+            return position..position;
+        }
+        for paste in &self.pending_pastes {
+            if range.start > paste.range.start && range.start < paste.range.end {
+                range.start = paste.range.start;
+            }
+            if range.end > paste.range.start && range.end < paste.range.end {
+                range.end = paste.range.end;
+            }
+        }
+        range
+    }
+
+    fn previous_atomic_boundary(&self, position: usize) -> usize {
+        self.pending_pastes
+            .iter()
+            .find(|paste| position > paste.range.start && position <= paste.range.end)
+            .map_or_else(
+                || previous_boundary(&self.text, position),
+                |paste| paste.range.start,
+            )
+    }
+
+    fn next_atomic_boundary(&self, position: usize) -> usize {
+        self.pending_pastes
+            .iter()
+            .find(|paste| position >= paste.range.start && position < paste.range.end)
+            .map_or_else(
+                || next_boundary(&self.text, position),
+                |paste| paste.range.end,
+            )
+    }
+
+    fn nearest_atomic_boundary(&self, position: usize) -> usize {
+        let Some(paste) = self
+            .pending_pastes
+            .iter()
+            .find(|paste| position > paste.range.start && position < paste.range.end)
+        else {
+            return position;
+        };
+        if position - paste.range.start < paste.range.end - position {
+            paste.range.start
+        } else {
+            paste.range.end
+        }
+    }
+
+    fn atomic_start_boundary(&self, position: usize) -> usize {
+        self.pending_pastes
+            .iter()
+            .find(|paste| position > paste.range.start && position < paste.range.end)
+            .map_or(position, |paste| paste.range.start)
+    }
+
+    fn atomic_end_boundary(&self, position: usize) -> usize {
+        self.pending_pastes
+            .iter()
+            .find(|paste| position > paste.range.start && position < paste.range.end)
+            .map_or(position, |paste| paste.range.end)
+    }
+
+    fn next_large_paste_placeholder(&self, char_count: usize) -> String {
+        let base = format!("[Pasted Content {char_count} chars]");
+        let prefix = format!("{base} #");
+        let mut max_suffix = 0usize;
+        for paste in &self.pending_pastes {
+            if paste.placeholder == base {
+                max_suffix = max_suffix.max(1);
+            } else if let Some(suffix) = paste.placeholder.strip_prefix(&prefix)
+                && let Ok(value) = suffix.parse::<usize>()
+            {
+                max_suffix = max_suffix.max(value);
+            }
+        }
+        if max_suffix == 0 {
+            base
+        } else {
+            format!("{base} #{}", max_suffix + 1)
+        }
+    }
+
+    fn expanded_text(&self) -> String {
+        let mut pastes = self.pending_pastes.iter().collect::<Vec<_>>();
+        pastes.sort_by_key(|paste| paste.range.start);
+        let mut expanded = String::with_capacity(self.text.len());
+        let mut cursor = 0;
+        for paste in pastes {
+            debug_assert_eq!(
+                self.text.get(paste.range.clone()),
+                Some(paste.placeholder.as_str())
+            );
+            expanded.push_str(&self.text[cursor..paste.range.start]);
+            expanded.push_str(&paste.content);
+            cursor = paste.range.end;
+        }
+        expanded.push_str(&self.text[cursor..]);
+        expanded
+    }
+
     fn leave_history(&mut self) {
         self.history_index = None;
         self.saved_draft.clear();
+    }
+}
+
+fn shift_range(range: &mut Range<usize>, removed_len: usize, inserted_len: usize) {
+    if inserted_len >= removed_len {
+        let shift = inserted_len - removed_len;
+        range.start = range.start.saturating_add(shift);
+        range.end = range.end.saturating_add(shift);
+    } else {
+        let shift = removed_len - inserted_len;
+        range.start = range.start.saturating_sub(shift);
+        range.end = range.end.saturating_sub(shift);
     }
 }
 
@@ -565,5 +761,45 @@ mod tests {
         editor.replace_range("inspect ".len().."inspect @vie".len(), "src/tui/view.rs");
         assert_eq!(editor.text(), "inspect src/tui/view.rs next");
         assert_eq!(editor.cursor(), "inspect src/tui/view.rs".len());
+    }
+
+    #[test]
+    fn large_pastes_are_compact_elements_until_submission() {
+        let mut editor = Editor::default();
+        let paste = "🦀".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        let placeholder = format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 1);
+
+        editor.insert("before ");
+        editor.insert_paste(paste.clone());
+        editor.insert(" after");
+
+        assert_eq!(editor.text(), format!("before {placeholder} after"));
+        let layout = editor.layout(80, 10);
+        let expected_ranges = [std::iter::once(7..7 + placeholder.len()).collect::<Vec<_>>()];
+        assert_eq!(layout.paste_ranges, expected_ranges);
+        assert_eq!(editor.take(), format!("before {paste} after"));
+        assert!(editor.is_empty());
+    }
+
+    #[test]
+    fn paste_elements_are_atomic_and_same_size_labels_remain_unique() {
+        let mut editor = Editor::default();
+        let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 4);
+        let base = format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 4);
+        let second = format!("{base} #2");
+
+        editor.insert_paste(paste.clone());
+        editor.insert_paste(paste.clone());
+        assert_eq!(editor.text(), format!("{base}{second}"));
+
+        editor.backspace();
+        assert_eq!(editor.text(), base);
+        editor.move_left();
+        assert_eq!(editor.cursor(), 0);
+        editor.move_right();
+        assert_eq!(editor.cursor(), base.len());
+
+        editor.insert_paste(paste);
+        assert_eq!(editor.text(), format!("{base}{second}"));
     }
 }
