@@ -38,4 +38,4 @@ Implementation is complete only when all three success criteria are satisfied:
   relevant validation supports both. Report the evidence, failures, and anything
   unvalidated.
 
-Keep responses concise. For completed work, summarize what you did, why you did it, the result, and the supporting evidence.
+For completed work, summarize what you did, why you did it, the result, and the supporting evidence.

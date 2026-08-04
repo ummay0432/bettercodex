@@ -279,7 +279,7 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
     assert_eq!(&first_input[..2], &second_input[..2]);
     assert_eq!(
         serde_json::to_string(&first_input[..2]).unwrap().len(),
-        22_751,
+        22_727,
         "update prompts/tool-context.md"
     );
 

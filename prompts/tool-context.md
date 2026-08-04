@@ -60,15 +60,15 @@ it does not remove the cached prefix from the active context window.
 
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable prefix: `additional_tools` plus cached system-prompt item | 22,751 | 5,609 | 5,688 |
+| Complete stable prefix: `additional_tools` plus cached system-prompt item | 22,727 | 5,605 | 5,682 |
 | Complete `additional_tools` developer item | 20,028 | 5,074 | 5,007 |
 | Top-level `exec` specification | 18,614 | 4,747 | 4,654 |
 | `exec` description only | 17,705 | 4,245 | 4,427 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
 | Top-level `wait` specification | 1,356 | 315 | 339 |
 | `wait` description only | 769 | 181 | 193 |
-| Cached system-prompt message item | 2,720 | 534 | 680 |
-| `prompts/system.md` text only | 2,553 | 483 | 639 |
+| Cached system-prompt message item | 2,696 | 530 | 674 |
+| `prompts/system.md` text only | 2,529 | 479 | 633 |
 
 The `exec` description contains the Code Mode runtime instructions and every
 nested tool declaration. This is the text-only breakdown:
