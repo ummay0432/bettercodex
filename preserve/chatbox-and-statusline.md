@@ -60,6 +60,10 @@ composer prompt:
 gpt-5.6-sol max │ pi / main │ 20% of 353K
 ```
 
+Render the footer immediately below the filled composer without a blank row.
+While a turn is active, retain one blank row between the activity line and the
+top of the composer.
+
 The fields are:
 
 1. **Model and reasoning effort** — model ID in normal terminal text, followed
