@@ -1,6 +1,7 @@
 mod agent;
 mod api;
 mod auth;
+mod compaction;
 mod context;
 mod events;
 mod input;
@@ -8,6 +9,7 @@ mod rollout;
 mod tools;
 mod tui;
 mod usage;
+mod web_search;
 
 use agent::Agent;
 use anyhow::Result;

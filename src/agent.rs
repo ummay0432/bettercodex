@@ -2,7 +2,9 @@ use crate::api::ApiClient;
 use crate::api::ApiError;
 use crate::api::ModelResponse;
 use crate::auth::Auth;
-use crate::context::CompactionPlacement;
+use crate::compaction::CompactionPhase;
+use crate::compaction::InitialContextInjection;
+use crate::context::ContextSnapshot;
 use crate::context::Conversation;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
@@ -97,7 +99,7 @@ impl Agent {
         let conversation = Conversation::new(&cwd, rollout)?;
         let auth = Auth::load()?;
         let api = ApiClient::new(auth, &identity, 0)?;
-        let tools = ToolRuntime::new(cwd.clone());
+        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
         Ok(Self {
             cwd,
             api,
@@ -119,7 +121,7 @@ impl Agent {
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
         let api = ApiClient::new(auth, &identity, compaction_count)?;
-        let tools = ToolRuntime::new(cwd.clone());
+        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
         Ok(Self {
             cwd,
             api,
@@ -138,6 +140,10 @@ impl Agent {
 
     pub(crate) fn context_tokens(&self) -> Option<u64> {
         self.conversation.context_tokens()
+    }
+
+    pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
+        self.conversation.context_snapshot()
     }
 
     pub(crate) async fn submit(&mut self, prompt: &str) -> Result<String> {
@@ -197,25 +203,41 @@ impl Agent {
         events: &Option<UnboundedSender<AgentEvent>>,
         control: &mut TurnControl,
     ) -> Result<SubmitOutcome> {
-        let projected = input.clone().into_message();
-        if self
-            .conversation
-            .needs_compaction_with(std::slice::from_ref(&projected))
-            && !self
-                .run_compaction(events, &control.cancellation, CompactionPlacement::PreTurn)
-                .await?
+        if !self
+            .record_incoming_user(
+                input,
+                events,
+                &control.cancellation,
+                CompactionPhase::PreTurn,
+            )
+            .await?
         {
             return Ok(SubmitOutcome::Cancelled);
         }
-        self.conversation.push_user(input)?;
 
         let mut transcript = Vec::new();
         let mut pending_steering = VecDeque::new();
+        // Sample the fresh turn input first. After a mid-turn compact, sample the
+        // compacted tool continuation once before inserting queued steering.
+        let mut can_record_pending_steering = false;
         loop {
-            drain_available_steering(&mut control.steering, &mut pending_steering);
-            while let Some(input) = pending_steering.pop_front() {
-                self.conversation.push_user(input)?;
+            if can_record_pending_steering {
+                drain_available_steering(&mut control.steering, &mut pending_steering);
+                while let Some(input) = pending_steering.pop_front() {
+                    if !self
+                        .record_incoming_user(
+                            input,
+                            events,
+                            &control.cancellation,
+                            CompactionPhase::MidTurn,
+                        )
+                        .await?
+                    {
+                        return Ok(SubmitOutcome::Cancelled);
+                    }
+                }
             }
+            can_record_pending_steering = true;
 
             let response = match self
                 .sample_with_recovery(events, control, &mut pending_steering)
@@ -229,9 +251,7 @@ impl Agent {
                 transcript.push(response.text.trim().to_string());
             }
             self.conversation.record_usage(response.usage)?;
-            if let Some(tokens) = self.conversation.context_tokens() {
-                emit(events, AgentEvent::UsageUpdated(tokens));
-            }
+            self.emit_context(events);
             emit(events, AgentEvent::ModelResponseCompleted);
 
             let mut tool_calls = response.tool_calls.into_iter();
@@ -251,6 +271,7 @@ impl Agent {
                     .execute_tool(&tool_call, events, control, &mut pending_steering)
                     .await;
                 self.conversation.extend(tool_call.output_items(&output))?;
+                self.emit_context(events);
                 if control.cancellation.is_cancelled() {
                     for pending in tool_calls {
                         let output = ToolResult::text(
@@ -261,12 +282,19 @@ impl Agent {
                     return Ok(SubmitOutcome::Cancelled);
                 }
             }
-            if self.conversation.needs_compaction()
-                && !self
-                    .run_compaction(events, &control.cancellation, CompactionPlacement::MidTurn)
+            if self.conversation.needs_compaction() {
+                if !self
+                    .run_compaction(
+                        events,
+                        &control.cancellation,
+                        CompactionPhase::MidTurn,
+                        InitialContextInjection::BeforeLastUserMessage,
+                    )
                     .await?
-            {
-                return Ok(SubmitOutcome::Cancelled);
+                {
+                    return Ok(SubmitOutcome::Cancelled);
+                }
+                can_record_pending_steering = false;
             }
         }
     }
@@ -285,13 +313,13 @@ impl Agent {
             let wait = {
                 let api = &mut self.api;
                 let conversation = &mut self.conversation;
+                // Keep one stable snapshot while completed stream items are journaled into the
+                // live conversation. The API consumes this allocation through request assembly.
                 let history = conversation.items().to_vec();
                 let response = async {
                     match events {
-                        Some(events) => {
-                            api.respond_streaming(&history, &completed_tx, events).await
-                        }
-                        None => api.respond(&history, &completed_tx).await,
+                        Some(events) => api.respond_streaming(history, &completed_tx, events).await,
+                        None => api.respond(history, &completed_tx).await,
                     }
                 };
                 tokio::pin!(response);
@@ -391,8 +419,13 @@ impl Agent {
         control: &mut TurnControl,
         pending_steering: &mut VecDeque<UserInput>,
     ) -> ToolResult {
-        let execution =
-            tool_call.execute(&self.tools, events.clone(), control.cancellation.clone());
+        let context = self.api.tool_turn_context(self.conversation.items());
+        let execution = tool_call.execute(
+            &self.tools,
+            context,
+            events.clone(),
+            control.cancellation.clone(),
+        );
         tokio::pin!(execution);
         loop {
             tokio::select! {
@@ -411,19 +444,55 @@ impl Agent {
         &mut self,
         events: &Option<UnboundedSender<AgentEvent>>,
         cancellation: &CancellationToken,
-        placement: CompactionPlacement,
+        phase: CompactionPhase,
+        initial_context_injection: InitialContextInjection,
     ) -> Result<bool> {
         emit(events, AgentEvent::CompactionStarted);
         self.conversation.normalize()?;
         let compacted = tokio::select! {
             _ = cancellation.cancelled() => return Ok(false),
-            compacted = self.api.compact(self.conversation.items()) => compacted?,
+            compacted = self.api.compact(self.conversation.items(), phase) => compacted?,
         };
         let _compaction_usage = compacted.usage;
         self.conversation
-            .replace_compacted(compacted.items, placement)?;
+            .replace_compacted(compacted.items, initial_context_injection)?;
+        self.emit_context(events);
         emit(events, AgentEvent::CompactionCompleted);
         Ok(true)
+    }
+
+    async fn record_incoming_user(
+        &mut self,
+        input: UserInput,
+        events: &Option<UnboundedSender<AgentEvent>>,
+        cancellation: &CancellationToken,
+        phase: CompactionPhase,
+    ) -> Result<bool> {
+        let projected = input.clone().into_message();
+        if self
+            .conversation
+            .needs_compaction_with(std::slice::from_ref(&projected))
+            && !self
+                .run_compaction(
+                    events,
+                    cancellation,
+                    phase,
+                    InitialContextInjection::AfterCompaction,
+                )
+                .await?
+        {
+            return Ok(false);
+        }
+        self.conversation.push_user(input)?;
+        self.emit_context(events);
+        Ok(true)
+    }
+
+    fn emit_context(&self, events: &Option<UnboundedSender<AgentEvent>>) {
+        emit(
+            events,
+            AgentEvent::ContextUpdated(self.conversation.context_snapshot()),
+        );
     }
 }
 

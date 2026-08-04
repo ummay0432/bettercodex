@@ -10,6 +10,7 @@
 use super::code_runtime;
 use super::code_runtime::CodeModeToolKind;
 use super::code_runtime::ToolDefinition;
+use super::code_runtime::ToolNamespaceDescription;
 use codex_protocol::ToolName;
 use serde_json::Value;
 use serde_json::json;
@@ -56,14 +57,32 @@ static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
             write_stdin_input_schema(),
             Some(unified_exec_output_schema()),
         ),
+        namespaced_function_tool(
+            crate::web_search::CODE_MODE_NAME,
+            crate::web_search::NAMESPACE,
+            crate::web_search::TOOL_NAME,
+            crate::web_search::DESCRIPTION,
+            crate::web_search::input_schema().clone(),
+        ),
     ]
 });
+
+static NAMESPACE_DESCRIPTIONS: LazyLock<BTreeMap<String, ToolNamespaceDescription>> =
+    LazyLock::new(|| {
+        BTreeMap::from([(
+            crate::web_search::NAMESPACE.to_string(),
+            ToolNamespaceDescription {
+                name: crate::web_search::NAMESPACE.to_string(),
+                description: format!("Tools in the {} namespace.", crate::web_search::NAMESPACE),
+            },
+        )])
+    });
 
 static EXEC_DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     code_runtime::build_exec_tool_description(
         &CORE_TOOLS,
         &[],
-        &BTreeMap::new(),
+        &NAMESPACE_DESCRIPTIONS,
         code_runtime::DEFAULT_EXEC_YIELD_TIME_MS,
         true,
     )
@@ -192,6 +211,23 @@ fn function_tool(
         kind: CodeModeToolKind::Function,
         input_schema: Some(input_schema),
         output_schema,
+    }
+}
+
+fn namespaced_function_tool(
+    code_mode_name: &str,
+    namespace: &str,
+    name: &str,
+    description: &str,
+    input_schema: Value,
+) -> ToolDefinition {
+    ToolDefinition {
+        name: code_mode_name.to_string(),
+        tool_name: ToolName::namespaced(namespace, name),
+        description: description.to_string(),
+        kind: CodeModeToolKind::Function,
+        input_schema: Some(input_schema),
+        output_schema: None,
     }
 }
 
@@ -381,7 +417,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogue_contains_only_the_fixed_core_tools() {
+    fn catalogue_contains_the_fixed_tools_and_codex_web_namespace() {
         assert_eq!(
             core_tools()
                 .iter()
@@ -393,6 +429,7 @@ mod tests {
                 "update_plan",
                 "view_image",
                 "write_stdin",
+                "web__run",
             ]
         );
     }
@@ -405,6 +442,8 @@ mod tests {
         assert!(text.contains("exec_command(args:"));
         assert!(text.contains("Promise<{"));
         assert!(text.contains("### `apply_patch`"));
+        assert!(text.contains("## web\nTools in the web namespace."));
+        assert!(text.contains("### `web__run`"));
     }
 
     #[test]
@@ -454,10 +493,10 @@ mod tests {
     #[test]
     fn documented_tool_context_byte_counts_do_not_drift() {
         let tools = specifications();
-        assert_eq!(text().len(), 7_307, "update prompts/tool-context.md");
+        assert_eq!(text().len(), 17_705, "update prompts/tool-context.md");
         assert_eq!(
             serde_json::to_string(&tools[0]).unwrap().len(),
-            7_783,
+            18_614,
             "update prompts/tool-context.md"
         );
         assert_eq!(
@@ -472,7 +511,7 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_string(&item).unwrap().len(),
-            9_197,
+            20_028,
             "update prompts/tool-context.md"
         );
     }

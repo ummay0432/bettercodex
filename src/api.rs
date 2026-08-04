@@ -1,10 +1,18 @@
 use crate::MODEL;
 use crate::auth::Auth;
+use crate::auth::AuthSnapshot;
+use crate::auth::SharedAuth;
+use crate::compaction;
+use crate::compaction::CompactionPhase;
+use crate::context::RAW_CONTEXT_WINDOW;
+use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::rollout::SessionIdentity;
 use crate::tools;
 use crate::tools::ToolCall;
 use crate::usage::TokenUsage;
+use crate::web_search::ToolTurnContext;
+use crate::web_search::WebSearchClient;
 use anyhow::Context;
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
@@ -14,6 +22,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -29,9 +38,25 @@ use websocket::WebSocketConnection;
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 const MAX_HTTP_ATTEMPTS: usize = 3;
+const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: usize = 2;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_STREAM_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
+static CONTEXT_PREFIX_ITEMS: LazyLock<[Value; 2]> = LazyLock::new(|| {
+    [
+        json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": tools::specifications(),
+        }),
+        json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": SYSTEM_PROMPT.trim()}],
+        }),
+    ]
+});
 
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -109,7 +134,7 @@ impl std::error::Error for ApiError {}
 
 pub(crate) struct ApiClient {
     client: reqwest::Client,
-    auth: Auth,
+    auth: SharedAuth,
     base_url: String,
     installation_id: String,
     session_id: String,
@@ -128,6 +153,37 @@ struct WebSocketBaseline {
     request: Value,
     response_id: String,
     output: Vec<Value>,
+}
+
+enum WebSocketRequestRestoration {
+    Full,
+    Delta { input_prefix: Vec<Value> },
+}
+
+impl WebSocketRequestRestoration {
+    fn restore(self, request: &mut Value) -> ApiResult<()> {
+        let object = request
+            .as_object_mut()
+            .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
+        object.remove("type");
+        match self {
+            Self::Full => {}
+            Self::Delta { mut input_prefix } => {
+                object.remove("previous_response_id");
+                let incremental_input = object
+                    .remove("input")
+                    .ok_or_else(|| ApiError::fatal("WebSocket delta request omitted input"))?;
+                let Value::Array(incremental_input) = incremental_input else {
+                    return Err(ApiError::fatal(
+                        "WebSocket delta request input was not an array",
+                    ));
+                };
+                input_prefix.extend(incremental_input);
+                object.insert("input".to_string(), Value::Array(input_prefix));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct ModelResponse {
@@ -170,7 +226,7 @@ impl ApiClient {
             .context("failed to create HTTP client")?;
         Ok(Self {
             client,
-            auth,
+            auth: SharedAuth::new(auth),
             base_url,
             installation_id: identity.installation_id.clone(),
             session_id: identity.session_id.clone(),
@@ -191,6 +247,22 @@ impl ApiClient {
         &self.turn_id
     }
 
+    pub(crate) fn web_search_client(&self) -> WebSearchClient {
+        WebSearchClient::new(
+            self.client.clone(),
+            self.auth.clone(),
+            self.base_url.clone(),
+            self.session_id.clone(),
+        )
+    }
+
+    pub(crate) fn tool_turn_context(&self, history: &[Value]) -> ToolTurnContext {
+        ToolTurnContext {
+            history: history.to_vec(),
+            turn_metadata: self.turn_metadata(RequestKind::Turn).to_string(),
+        }
+    }
+
     pub(crate) fn abandon_response(&mut self) {
         self.websocket = None;
         self.websocket_baseline = None;
@@ -207,39 +279,49 @@ impl ApiClient {
 
     pub(crate) async fn respond(
         &mut self,
-        history: &[Value],
+        history: Vec<Value>,
         completed_items: &UnboundedSender<Value>,
     ) -> ApiResult<ModelResponse> {
-        self.respond_with_events(history, completed_items, None)
+        self.respond_with_events(history, completed_items, None, RequestKind::Turn)
             .await
     }
 
     pub(crate) async fn respond_streaming(
         &mut self,
-        history: &[Value],
+        history: Vec<Value>,
         completed_items: &UnboundedSender<Value>,
         events: &UnboundedSender<AgentEvent>,
     ) -> ApiResult<ModelResponse> {
-        self.respond_with_events(history, completed_items, Some(events))
+        self.respond_with_events(history, completed_items, Some(events), RequestKind::Turn)
             .await
     }
 
     async fn respond_with_events(
         &mut self,
-        history: &[Value],
+        history: Vec<Value>,
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
+        request_kind: RequestKind,
     ) -> ApiResult<ModelResponse> {
         let mut refreshed_websocket_auth = false;
         let mut retried_full_websocket_request = false;
+        // Build once from the owned sampling snapshot. Retries mutate only transport fields, and
+        // a successful WebSocket response moves this request into the next delta baseline.
+        let mut request = self.build_request(history, request_kind);
         loop {
-            let request = self.build_request(history);
             if self.prefer_websocket {
                 match self
-                    .respond_websocket(&request, completed_items, events)
+                    .respond_websocket(&mut request, completed_items, events, request_kind)
                     .await
                 {
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        self.websocket_baseline = Some(WebSocketBaseline {
+                            request,
+                            response_id: response.response_id.clone(),
+                            output: response.items.clone(),
+                        });
+                        return Ok(response);
+                    }
                     Err(error)
                         if error.kind == ApiErrorKind::Unauthorized
                             && !refreshed_websocket_auth =>
@@ -263,6 +345,7 @@ impl ApiClient {
                     Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
                         if self.explicit_cache {
                             self.disable_explicit_cache();
+                            disable_explicit_cache_for_request(&mut request)?;
                             continue;
                         }
                         return Err(error);
@@ -277,11 +360,14 @@ impl ApiClient {
                 }
             }
 
-            let request = self.build_request(history);
-            match self.respond_http(&request, completed_items, events).await {
+            match self
+                .respond_http(&request, completed_items, events, request_kind)
+                .await
+            {
                 Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
                     if self.explicit_cache {
                         self.disable_explicit_cache();
+                        disable_explicit_cache_for_request(&mut request)?;
                     } else {
                         return Err(error);
                     }
@@ -296,9 +382,10 @@ impl ApiClient {
         request: &Value,
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
+        request_kind: RequestKind,
     ) -> ApiResult<ModelResponse> {
         let response = self
-            .post("responses", request, "text/event-stream", RequestKind::Turn)
+            .post("responses", request, "text/event-stream", request_kind)
             .await?;
         self.capture_turn_state(response.headers());
         collect_http_stream(response, completed_items, events).await
@@ -306,17 +393,23 @@ impl ApiClient {
 
     async fn respond_websocket(
         &mut self,
-        logical_request: &Value,
+        logical_request: &mut Value,
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
+        request_kind: RequestKind,
     ) -> ApiResult<ModelResponse> {
-        self.ensure_websocket().await?;
-        let wire_request = self.websocket_request(logical_request)?;
-        self.websocket
+        self.ensure_websocket(request_kind).await?;
+        // Serialize a delta in place, then restore the logical request for retries and baseline
+        // retention. Input values move between vectors instead of being deep-cloned.
+        let restoration = self.prepare_websocket_request(logical_request)?;
+        let send_result = self
+            .websocket
             .as_mut()
             .ok_or_else(|| ApiError::websocket_unavailable("Responses WebSocket is unavailable"))?
-            .send(&wire_request, STREAM_IDLE_TIMEOUT)
-            .await?;
+            .send(logical_request, STREAM_IDLE_TIMEOUT)
+            .await;
+        restoration.restore(logical_request)?;
+        send_result?;
 
         let mut collected = CollectedResponse::default();
         loop {
@@ -341,24 +434,19 @@ impl ApiClient {
                 break;
             }
         }
-        let response = collected.finish(events)?;
-        self.websocket_baseline = Some(WebSocketBaseline {
-            request: logical_request.clone(),
-            response_id: response.response_id.clone(),
-            output: response.items.clone(),
-        });
-        Ok(response)
+        collected.finish(events)
     }
 
-    async fn ensure_websocket(&mut self) -> ApiResult<()> {
+    async fn ensure_websocket(&mut self, request_kind: RequestKind) -> ApiResult<()> {
         if self.websocket.is_some() {
             return Ok(());
         }
-        self.auth
-            .refresh_if_needed(&self.client)
+        let auth = self
+            .auth
+            .refreshed_snapshot(&self.client)
             .await
             .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
-        let mut headers = self.request_headers("*/*", RequestKind::Turn)?;
+        let mut headers = self.request_headers("*/*", request_kind, &auth)?;
         insert_header(&mut headers, "originator", "codex_cli_rs")?;
         insert_header(&mut headers, "openai-beta", RESPONSES_WEBSOCKET_BETA)?;
         let url = websocket_url(&self.base_url, "responses")?;
@@ -368,123 +456,140 @@ impl ApiClient {
         Ok(())
     }
 
-    fn websocket_request(&self, request: &Value) -> ApiResult<Value> {
-        let mut wire = request.clone();
-        let object = wire
+    fn prepare_websocket_request(
+        &self,
+        request: &mut Value,
+    ) -> ApiResult<WebSocketRequestRestoration> {
+        let incremental = if let Some(baseline) = &self.websocket_baseline {
+            if !request_properties_match(&baseline.request, request) {
+                None
+            } else {
+                let previous_input = baseline
+                    .request
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| ApiError::fatal("previous Responses request omitted input"))?;
+                let current_input = request
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
+                let baseline_length = previous_input.len().saturating_add(baseline.output.len());
+                if current_input.len() <= baseline_length {
+                    None
+                } else {
+                    let expected = previous_input.iter().chain(&baseline.output);
+                    expected
+                        .zip(current_input.iter().take(baseline_length))
+                        .all(|(previous, current)| previous == current)
+                        .then(|| (baseline.response_id.clone(), baseline_length))
+                }
+            }
+        } else {
+            None
+        };
+
+        let object = request
             .as_object_mut()
             .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
         object.insert(
             "type".to_string(),
             Value::String("response.create".to_string()),
         );
-
-        let Some(baseline) = &self.websocket_baseline else {
-            return Ok(wire);
+        let Some((previous_response_id, baseline_length)) = incremental else {
+            return Ok(WebSocketRequestRestoration::Full);
         };
-        if !request_properties_match(&baseline.request, request) {
-            return Ok(wire);
-        }
-        let previous_input = baseline
-            .request
-            .get("input")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ApiError::fatal("previous Responses request omitted input"))?;
-        let current_input = request
-            .get("input")
-            .and_then(Value::as_array)
+        let full_input = object
+            .remove("input")
             .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
-        let baseline_length = previous_input.len().saturating_add(baseline.output.len());
-        if current_input.len() <= baseline_length {
-            return Ok(wire);
-        }
-        let expected = previous_input.iter().chain(&baseline.output);
-        if !expected
-            .zip(current_input.iter().take(baseline_length))
-            .all(|(previous, current)| previous == current)
-        {
-            return Ok(wire);
-        }
+        let Value::Array(mut input_prefix) = full_input else {
+            return Err(ApiError::fatal("Responses request input was not an array"));
+        };
+        let incremental_input = input_prefix.split_off(baseline_length);
+        object.insert("input".to_string(), Value::Array(incremental_input));
         object.insert(
             "previous_response_id".to_string(),
-            Value::String(baseline.response_id.clone()),
+            Value::String(previous_response_id),
         );
-        object.insert(
-            "input".to_string(),
-            Value::Array(current_input[baseline_length..].to_vec()),
-        );
-        Ok(wire)
+        Ok(WebSocketRequestRestoration::Delta { input_prefix })
     }
 
-    pub(crate) async fn compact(&mut self, history: &[Value]) -> ApiResult<CompactionResult> {
+    pub(crate) async fn compact(
+        &mut self,
+        history: &[Value],
+        phase: CompactionPhase,
+    ) -> ApiResult<CompactionResult> {
         if history.is_empty() {
             return Ok(CompactionResult {
                 items: Vec::new(),
                 usage: None,
             });
         }
-        let body = json!({
-            "model": MODEL,
-            "input": compose_input(history, false),
-            "instructions": "",
-            "parallel_tool_calls": false,
-            "reasoning": {"effort": "max", "context": "all_turns"},
-            "text": {"verbosity": "low"},
-        });
-        let response = self
-            .post(
-                "responses/compact",
-                &body,
-                "application/json",
-                RequestKind::Compaction,
-            )
-            .await?;
-        self.capture_turn_state(response.headers());
-        let payload: Value = response.json().await.map_err(|error| {
-            ApiError::fatal(format!("failed to decode compacted conversation: {error}"))
-        })?;
-        let output = payload
-            .get("output")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| ApiError::fatal("compaction response did not contain output items"))?;
-        let compaction_items = output
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.get("type").and_then(Value::as_str),
-                    Some("compaction" | "compaction_summary")
+        let trigger = compaction::compaction_trigger();
+        let prefix_tokens = estimated_tokens(context_prefix_items())
+            .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
+        let mut prompt_history = history.to_vec();
+        compaction::trim_tool_outputs_to_fit(
+            &mut prompt_history,
+            RAW_CONTEXT_WINDOW.saturating_sub(prefix_tokens),
+        );
+        let mut request_history = prompt_history.clone();
+        request_history.push(trigger);
+        let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_kind = RequestKind::Compaction(phase);
+        let mut retries = 0_usize;
+        let response = loop {
+            match self
+                .respond_with_events(
+                    request_history.clone(),
+                    &completed_items,
+                    None,
+                    request_kind,
                 )
-            })
-            .count();
-        if compaction_items != 1 {
-            return Err(ApiError::fatal(format!(
-                "compaction response contained {compaction_items} compaction items; expected exactly one"
-            )));
-        }
-        let usage = payload.get("usage").and_then(parse_usage);
+                .await
+            {
+                Ok(response) => break response,
+                Err(error) if error.is_retryable() => {
+                    if retries >= MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES {
+                        if self.fall_back_to_http() {
+                            retries = 0;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    let delay = error.retry_after().unwrap_or_else(|| retry_delay(retries));
+                    retries = retries.saturating_add(1);
+                    sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let compaction_output =
+            compaction::opaque_compaction_item(&response.items).map_err(ApiError::fatal)?;
+        let items = compaction::build_compacted_history(&prompt_history, compaction_output);
         self.window = self.window.saturating_add(1);
         self.websocket_baseline = None;
         Ok(CompactionResult {
-            items: output,
-            usage,
+            items,
+            usage: response.usage,
         })
     }
 
-    fn build_request(&self, history: &[Value]) -> Value {
+    fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> Value {
+        let input = compose_input(history, self.explicit_cache);
         let mut request = json!({
             "model": MODEL,
             "instructions": "",
-            "input": compose_input(history, self.explicit_cache),
             "tool_choice": "auto",
             "parallel_tool_calls": false,
-            "reasoning": {"effort": "max", "context": "all_turns"},
+            "reasoning": {"effort": "max", "summary": "auto", "context": "all_turns"},
             "store": false,
             "stream": true,
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": self.session_id,
             "text": {"verbosity": "low"},
-            "client_metadata": self.client_metadata(),
+            "client_metadata": self.client_metadata(request_kind),
         });
+        request["input"] = Value::Array(input);
         if self.explicit_cache {
             request["prompt_cache_options"] = json!({"mode": "explicit", "ttl": "30m"});
         }
@@ -496,8 +601,8 @@ impl ApiClient {
         self.abandon_response();
     }
 
-    fn client_metadata(&self) -> Map<String, Value> {
-        let turn_metadata = self.turn_metadata(RequestKind::Turn).to_string();
+    fn client_metadata(&self, request_kind: RequestKind) -> Map<String, Value> {
+        let turn_metadata = self.turn_metadata(request_kind).to_string();
         Map::from_iter([
             (
                 "x-codex-installation-id".to_string(),
@@ -524,7 +629,7 @@ impl ApiClient {
     }
 
     fn turn_metadata(&self, request_kind: RequestKind) -> Value {
-        json!({
+        let mut metadata = json!({
             "installation_id": self.installation_id,
             "session_id": self.session_id,
             "thread_id": self.thread_id,
@@ -534,23 +639,34 @@ impl ApiClient {
             "sandbox": "danger-full-access",
             "code_mode_tool_names": tools::code_mode_tool_names(),
             "turn_started_at_unix_ms": unix_timestamp_millis(),
-        })
+        });
+        if let RequestKind::Compaction(phase) = request_kind {
+            metadata["compaction"] = json!({
+                "trigger": "auto",
+                "reason": "context_limit",
+                "implementation": "responses_compaction_v2",
+                "phase": phase.as_str(),
+                "strategy": "memento",
+            });
+        }
+        metadata
     }
 
     fn window_id(&self) -> String {
         format!("{}:{}", self.thread_id, self.window)
     }
 
-    fn request_headers(&self, accept: &str, request_kind: RequestKind) -> ApiResult<HeaderMap> {
+    fn request_headers(
+        &self,
+        accept: &str,
+        request_kind: RequestKind,
+        auth: &AuthSnapshot,
+    ) -> ApiResult<HeaderMap> {
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, "accept", accept)?;
-        insert_header(
-            &mut headers,
-            "authorization",
-            &format!("Bearer {}", self.auth.access_token()),
-        )?;
-        if let Some(account_id) = self.auth.account_id() {
-            insert_header(&mut headers, "chatgpt-account-id", account_id)?;
+        headers.insert("authorization", auth.authorization.clone());
+        if let Some(account_id) = &auth.account_id {
+            headers.insert("chatgpt-account-id", account_id.clone());
         }
         insert_header(&mut headers, "session-id", &self.session_id)?;
         insert_header(&mut headers, "thread-id", &self.thread_id)?;
@@ -571,6 +687,11 @@ impl ApiClient {
             "x-openai-internal-codex-responses-lite",
             "true",
         )?;
+        insert_header(
+            &mut headers,
+            "x-codex-beta-features",
+            REMOTE_COMPACTION_V2_FEATURE,
+        )?;
         if let Some(turn_state) = &self.turn_state {
             insert_header(&mut headers, "x-codex-turn-state", turn_state)?;
         }
@@ -584,8 +705,9 @@ impl ApiClient {
         accept: &str,
         request_kind: RequestKind,
     ) -> ApiResult<reqwest::Response> {
-        self.auth
-            .refresh_if_needed(&self.client)
+        let mut auth = self
+            .auth
+            .refreshed_snapshot(&self.client)
             .await
             .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
         let url = format!(
@@ -599,7 +721,7 @@ impl ApiClient {
             let response = self
                 .client
                 .post(&url)
-                .headers(self.request_headers(accept, request_kind)?)
+                .headers(self.request_headers(accept, request_kind, &auth)?)
                 .json(body)
                 .send()
                 .await;
@@ -623,6 +745,11 @@ impl ApiClient {
             if status == StatusCode::UNAUTHORIZED && !refreshed_after_unauthorized {
                 self.auth
                     .force_refresh(&self.client)
+                    .await
+                    .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
+                auth = self
+                    .auth
+                    .snapshot()
                     .await
                     .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
                 refreshed_after_unauthorized = true;
@@ -677,40 +804,37 @@ impl ApiClient {
 #[derive(Clone, Copy)]
 enum RequestKind {
     Turn,
-    Compaction,
+    Compaction(CompactionPhase),
 }
 
 impl RequestKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Turn => "turn",
-            Self::Compaction => "compaction",
+            Self::Compaction(_) => "compaction",
         }
     }
 }
 
-fn compose_input(history: &[Value], explicit_cache: bool) -> Vec<Value> {
-    let tools_item = json!({
-        "type": "additional_tools",
-        "role": "developer",
-        "tools": tools::specifications(),
-    });
-    let mut input = history.to_vec();
-    let tools_position = input
+fn compose_input(mut history: Vec<Value>, explicit_cache: bool) -> Vec<Value> {
+    let [tools_item, mut system_item] = (*context_prefix_items()).clone();
+    if explicit_cache {
+        mark_cache_breakpoint(&mut system_item);
+    }
+    let tools_position = history
         .iter()
         .position(|item| is_additional_tools_item(item, &tools_item));
     if tools_position.is_none() {
-        input.insert(0, tools_item);
+        history.insert(0, tools_item);
     }
 
-    let system_position = input.iter().position(is_system_prompt_item);
-    let system_item = system_prompt_item(explicit_cache);
+    let system_position = history.iter().position(is_system_prompt_item);
     match system_position {
-        Some(index) if explicit_cache => mark_cache_breakpoint(&mut input[index]),
+        Some(index) if explicit_cache => mark_cache_breakpoint(&mut history[index]),
         Some(_) => {}
-        None => input.insert(1, system_item),
+        None => history.insert(1, system_item),
     }
-    input
+    history
 }
 
 fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
@@ -719,16 +843,8 @@ fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
         .all(|field| item.get(field) == expected.get(field))
 }
 
-fn system_prompt_item(explicit_cache: bool) -> Value {
-    let mut item = json!({
-        "type": "message",
-        "role": "developer",
-        "content": [{"type": "input_text", "text": SYSTEM_PROMPT.trim()}],
-    });
-    if explicit_cache {
-        mark_cache_breakpoint(&mut item);
-    }
-    item
+pub(crate) fn context_prefix_items() -> &'static [Value; 2] {
+    &CONTEXT_PREFIX_ITEMS
 }
 
 fn is_system_prompt_item(item: &Value) -> bool {
@@ -751,17 +867,44 @@ fn mark_cache_breakpoint(item: &mut Value) {
     }
 }
 
-fn request_properties_match(previous: &Value, current: &Value) -> bool {
-    let mut previous = previous.clone();
-    let mut current = current.clone();
-    for request in [&mut previous, &mut current] {
-        if let Some(object) = request.as_object_mut() {
-            object.remove("input");
-            object.remove("client_metadata");
-            object.remove("stream_options");
+fn disable_explicit_cache_for_request(request: &mut Value) -> ApiResult<()> {
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
+    object.remove("prompt_cache_options");
+    let input = object
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
+    for item in input.iter_mut().filter(|item| is_system_prompt_item(item)) {
+        if let Some(content) = item
+            .pointer_mut("/content/0")
+            .and_then(Value::as_object_mut)
+        {
+            content.remove("prompt_cache_breakpoint");
         }
     }
-    previous == current
+    Ok(())
+}
+
+fn request_properties_match(previous: &Value, current: &Value) -> bool {
+    let (Some(previous), Some(current)) = (previous.as_object(), current.as_object()) else {
+        return false;
+    };
+    let is_reusable_property =
+        |name: &str| !matches!(name, "input" | "client_metadata" | "stream_options");
+    let previous_count = previous
+        .keys()
+        .filter(|name| is_reusable_property(name))
+        .count();
+    let current_count = current
+        .keys()
+        .filter(|name| is_reusable_property(name))
+        .count();
+    previous_count == current_count
+        && previous
+            .iter()
+            .all(|(name, value)| !is_reusable_property(name) || current.get(name) == Some(value))
 }
 
 async fn collect_http_stream(
@@ -907,7 +1050,12 @@ fn process_event_value(
             if let Some(delta) = event.get("delta").and_then(Value::as_str)
                 && let Some(events) = events
             {
-                let _ = events.send(AgentEvent::ReasoningDelta(delta.to_string()));
+                let _ = events.send(AgentEvent::ReasoningSummaryDelta(delta.to_string()));
+            }
+        }
+        Some("response.reasoning_summary_part.added") => {
+            if let Some(events) = events {
+                let _ = events.send(AgentEvent::ReasoningSummarySectionStarted);
             }
         }
         Some("response.output_item.done") => {

@@ -1,5 +1,7 @@
+mod context_window;
 mod editor;
 mod markdown;
+mod reasoning_status;
 mod terminal;
 mod tool_catalogue;
 mod view;
@@ -7,6 +9,7 @@ mod view;
 use crate::agent::Agent;
 use crate::agent::SubmitOutcome;
 use crate::agent::TurnHandle;
+use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
 use anyhow::Context;
@@ -47,6 +50,7 @@ struct Runtime {
     turn_handle: Option<TurnHandle>,
     queued: VecDeque<String>,
     exit_after_turn: bool,
+    context_snapshot: ContextSnapshot,
     view: View,
 }
 
@@ -54,6 +58,7 @@ impl Runtime {
     fn new(agent: Agent, cwd: PathBuf) -> Self {
         let mut view = View::new(&cwd);
         view.set_context_tokens(agent.context_tokens());
+        let context_snapshot = agent.context_snapshot();
         Self {
             view,
             cwd,
@@ -63,6 +68,7 @@ impl Runtime {
             turn_handle: None,
             queued: VecDeque::new(),
             exit_after_turn: false,
+            context_snapshot,
         }
     }
 
@@ -108,6 +114,9 @@ impl Runtime {
                 }
                 event = receive_agent_event(&mut self.turn_events) => {
                     if let Some(event) = event {
+                        if let AgentEvent::ContextUpdated(snapshot) = &event {
+                            self.context_snapshot = snapshot.clone();
+                        }
                         self.view.handle_agent_event(event);
                         dirty = true;
                     } else {
@@ -115,12 +124,13 @@ impl Runtime {
                     }
                 }
                 completion = receive_turn_completion(&mut self.turn) => {
-                    let completion = completion.context("agent task stopped unexpectedly")?;
+                    let (agent, result) = completion.context("agent task stopped unexpectedly")?;
                     self.turn = None;
                     self.drain_agent_events();
-                    self.agent = Some(completion.0);
+                    self.context_snapshot = agent.context_snapshot();
+                    self.agent = Some(agent);
                     self.turn_handle = None;
-                    self.view.finish_turn(completion.1);
+                    self.view.finish_turn(result);
                     dirty = true;
 
                     if self.exit_after_turn {
@@ -167,10 +177,18 @@ impl Runtime {
             Action::Cancel => self.cancel_turn(),
             Action::Clear => {
                 if self.turn.is_none() {
-                    self.agent = Some(Agent::new(&self.cwd)?);
+                    let agent = Agent::new(&self.cwd)?;
+                    self.context_snapshot = agent.context_snapshot();
+                    self.agent = Some(agent);
                     self.queued.clear();
                     self.view.clear();
                 }
+            }
+            Action::ShowContext => {
+                if let Some(agent) = &self.agent {
+                    self.context_snapshot = agent.context_snapshot();
+                }
+                self.view.show_context(self.context_snapshot.clone());
             }
             Action::Quit => {
                 if self.turn.is_some() {

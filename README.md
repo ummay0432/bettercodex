@@ -61,7 +61,9 @@ The core shortcuts are:
 - The mouse wheel and the terminal's normal scrollback controls browse the
   finalized transcript.
 - `?` on an empty composer opens the shortcut reference.
-- Typing `/` opens completion for `/clear`, `/help`, and `/exit`.
+- Typing `/` opens completion for `/clear`, `/context`, `/help`, `/tools`, and
+  `/exit`. `/context` opens a colored breakdown of the raw window, current
+  request categories, free space before auto-compaction, and reserved headroom.
 
 When stdin or stdout is redirected, no-argument invocation falls back to the
 plain line interface. Passing a prompt remains a one-shot invocation.

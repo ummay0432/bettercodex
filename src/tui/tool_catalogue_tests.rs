@@ -28,7 +28,8 @@ fn renders_a_compact_catalogue_attached_to_the_left_edge() {
             "│  ├─ ● exec_command           │",
             "│  ├─ ● update_plan            │",
             "│  ├─ ● view_image             │",
-            "│  └─ ● write_stdin            │",
+            "│  ├─ ● write_stdin            │",
+            "│  └─ ● web__run               │",
             "└──────────────────────────────┘",
         ]
         .join("\n")

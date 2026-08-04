@@ -12,9 +12,11 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use tokio::sync::Mutex;
 
 const ACCESS_TOKEN_ENV: &str = "CODEX_ACCESS_TOKEN";
 const ACCOUNT_ID_ENV: &str = "CHATGPT_ACCOUNT_ID";
@@ -28,6 +30,16 @@ pub(crate) struct Auth {
     account_id: Option<String>,
     expires_at: Option<u64>,
     storage: Option<StoredAuth>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedAuth {
+    inner: Arc<Mutex<Auth>>,
+}
+
+pub(crate) struct AuthSnapshot {
+    pub(crate) authorization: reqwest::header::HeaderValue,
+    pub(crate) account_id: Option<reqwest::header::HeaderValue>,
 }
 
 struct StoredAuth {
@@ -97,14 +109,6 @@ impl Auth {
             account_id,
             storage: Some(StoredAuth { path, document }),
         })
-    }
-
-    pub(crate) fn access_token(&self) -> &str {
-        &self.access_token
-    }
-
-    pub(crate) fn account_id(&self) -> Option<&str> {
-        self.account_id.as_deref()
     }
 
     pub(crate) async fn refresh_if_needed(&mut self, client: &reqwest::Client) -> Result<()> {
@@ -196,6 +200,47 @@ impl Auth {
         }
         storage.document["last_refresh"] = Value::String(rfc3339_now()?);
         write_private_json(&storage.path, &storage.document)
+    }
+
+    fn snapshot(&self) -> Result<AuthSnapshot> {
+        let authorization =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.access_token))
+                .context("ChatGPT access token is not a valid HTTP header")?;
+        let account_id = self
+            .account_id
+            .as_deref()
+            .map(reqwest::header::HeaderValue::from_str)
+            .transpose()
+            .context("ChatGPT account ID is not a valid HTTP header")?;
+        Ok(AuthSnapshot {
+            authorization,
+            account_id,
+        })
+    }
+}
+
+impl SharedAuth {
+    pub(crate) fn new(auth: Auth) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(auth)),
+        }
+    }
+
+    pub(crate) async fn refreshed_snapshot(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<AuthSnapshot> {
+        let mut auth = self.inner.lock().await;
+        auth.refresh_if_needed(client).await?;
+        auth.snapshot()
+    }
+
+    pub(crate) async fn force_refresh(&self, client: &reqwest::Client) -> Result<()> {
+        self.inner.lock().await.force_refresh(client).await
+    }
+
+    pub(crate) async fn snapshot(&self) -> Result<AuthSnapshot> {
+        self.inner.lock().await.snapshot()
     }
 }
 

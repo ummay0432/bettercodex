@@ -38,13 +38,23 @@ fn assistant_item(text: &str) -> Value {
 }
 
 fn completed_sse(response_id: &str, item: &Value) -> String {
-    let item_done = json!({
-        "type": "response.output_item.done",
-        "output_index": 0,
-        "item": item,
-    });
-    let completed = completed_event(response_id, item);
-    format!("data: {item_done}\n\ndata: {completed}\n\n")
+    completed_sse_with_items(response_id, std::slice::from_ref(item))
+}
+
+fn completed_sse_with_items(response_id: &str, items: &[Value]) -> String {
+    let mut stream = String::new();
+    for (output_index, item) in items.iter().enumerate() {
+        let item_done = json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        });
+        stream.push_str(&format!("data: {item_done}\n\n"));
+    }
+    let mut completed = completed_event(response_id, items.first().unwrap_or(&Value::Null));
+    completed["response"]["output"] = Value::Array(items.to_vec());
+    stream.push_str(&format!("data: {completed}\n\n"));
+    stream
 }
 
 fn completed_event(response_id: &str, item: &Value) -> Value {
@@ -152,6 +162,13 @@ fn extracts_text_and_forwards_streaming_events() {
     )
     .unwrap();
     process_event(
+        r#"{"type":"response.reasoning_summary_part.added","summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+        &mut collected,
+        &completed_items,
+        Some(&events),
+    )
+    .unwrap();
+    process_event(
         r#"{"type":"response.reasoning_summary_text.delta","delta":"checking"}"#,
         &mut collected,
         &completed_items,
@@ -165,7 +182,11 @@ fn extracts_text_and_forwards_streaming_events() {
     );
     assert_eq!(
         received.try_recv().unwrap(),
-        AgentEvent::ReasoningDelta("checking".to_string())
+        AgentEvent::ReasoningSummarySectionStarted
+    );
+    assert_eq!(
+        received.try_recv().unwrap(),
+        AgentEvent::ReasoningSummaryDelta("checking".to_string())
     );
 }
 
@@ -193,15 +214,23 @@ fn output_item_completion_closes_the_visible_stream() {
 #[test]
 fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
     let client = test_client("http://127.0.0.1:1".to_string());
-    let first = client.build_request(&[user_message("one")]);
-    let second = client.build_request(&[user_message("one"), user_message("two")]);
+    let first_message = user_message("one");
+    let first_text_allocation = first_message["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    let first = client.build_request(vec![first_message], RequestKind::Turn);
+    let second = client.build_request(
+        vec![user_message("one"), user_message("two")],
+        RequestKind::Turn,
+    );
     let first_input = first["input"].as_array().unwrap();
     let second_input = second["input"].as_array().unwrap();
 
     assert_eq!(first["model"], MODEL);
     assert_eq!(
         first["reasoning"],
-        json!({"effort": "max", "context": "all_turns"})
+        json!({"effort": "max", "summary": "auto", "context": "all_turns"})
     );
     assert_eq!(
         first["prompt_cache_options"],
@@ -211,20 +240,28 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
     assert_eq!(first_input[0]["type"], "additional_tools");
     assert_eq!(first_input[1]["role"], "developer");
     assert_eq!(
+        first_input.last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_ptr(),
+        first_text_allocation,
+        "request assembly must consume the sampling snapshot without cloning its payloads"
+    );
+    assert_eq!(
         first_input[1]["content"][0]["prompt_cache_breakpoint"],
         json!({"mode": "explicit"})
     );
     assert_eq!(&first_input[..2], &second_input[..2]);
     assert_eq!(
         serde_json::to_string(&first_input[..2]).unwrap().len(),
-        11_920,
+        22_751,
         "update prompts/tool-context.md"
     );
 
     let mut retained_prefix = first_input.to_vec();
     retained_prefix[0]["id"] = json!("at_compacted");
     retained_prefix[0]["status"] = json!("completed");
-    let recomposed = compose_input(&retained_prefix, true);
+    let recomposed = compose_input(retained_prefix, true);
     assert_eq!(
         recomposed
             .iter()
@@ -244,7 +281,7 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
 #[test]
 fn websocket_delta_requires_an_exact_prefix_and_new_input() {
     let mut client = test_client("http://127.0.0.1:1".to_string());
-    let first_request = client.build_request(&[user_message("one")]);
+    let first_request = client.build_request(vec![user_message("one")], RequestKind::Turn);
     let output = vec![assistant_item("first")];
     client.websocket_baseline = Some(WebSocketBaseline {
         request: first_request.clone(),
@@ -252,18 +289,75 @@ fn websocket_delta_requires_an_exact_prefix_and_new_input() {
         output: output.clone(),
     });
     let next_history = [vec![user_message("one")], output, vec![user_message("two")]].concat();
-    let next_request = client.build_request(&next_history);
-    let delta = client.websocket_request(&next_request).unwrap();
-    assert_eq!(delta["previous_response_id"], "resp_1");
-    assert_eq!(delta["input"], json!([user_message("two")]));
+    let mut next_request = client.build_request(next_history, RequestKind::Turn);
+    let appended_text_allocation =
+        next_request["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+    let logical_next_request = next_request.clone();
+    let restoration = client.prepare_websocket_request(&mut next_request).unwrap();
+    assert_eq!(next_request["previous_response_id"], "resp_1");
+    assert_eq!(next_request["input"], json!([user_message("two")]));
+    assert_eq!(
+        next_request["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_ptr(),
+        appended_text_allocation,
+        "delta preparation must move input values instead of cloning their payloads"
+    );
+    restoration.restore(&mut next_request).unwrap();
+    assert_eq!(next_request, logical_next_request);
+    assert_eq!(
+        next_request["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_ptr(),
+        appended_text_allocation,
+    );
 
-    let unchanged = client.websocket_request(&first_request).unwrap();
+    let mut unchanged = first_request.clone();
+    let restoration = client.prepare_websocket_request(&mut unchanged).unwrap();
     assert!(unchanged.get("previous_response_id").is_none());
+    restoration.restore(&mut unchanged).unwrap();
+    assert_eq!(unchanged, first_request);
 
-    let mut changed = next_request;
+    let mut changed = logical_next_request;
     changed["text"]["verbosity"] = json!("medium");
-    let full = client.websocket_request(&changed).unwrap();
-    assert!(full.get("previous_response_id").is_none());
+    let logical_changed = changed.clone();
+    let restoration = client.prepare_websocket_request(&mut changed).unwrap();
+    assert!(changed.get("previous_response_id").is_none());
+    restoration.restore(&mut changed).unwrap();
+    assert_eq!(changed, logical_changed);
+}
+
+#[test]
+fn remote_compaction_v2_reuses_the_turn_websocket_prefix() {
+    let mut client = test_client("http://127.0.0.1:1".to_string());
+    let user = user_message("one");
+    let output = assistant_item("first");
+    let first_request = client.build_request(vec![user.clone()], RequestKind::Turn);
+    client.websocket_baseline = Some(WebSocketBaseline {
+        request: first_request,
+        response_id: "resp_turn".to_string(),
+        output: vec![output.clone()],
+    });
+    let trigger = json!({"type": "compaction_trigger"});
+    let mut compact_request = client.build_request(
+        vec![user, output, trigger.clone()],
+        RequestKind::Compaction(CompactionPhase::MidTurn),
+    );
+    let logical_request = compact_request.clone();
+
+    let restoration = client
+        .prepare_websocket_request(&mut compact_request)
+        .unwrap();
+
+    assert_eq!(compact_request["previous_response_id"], "resp_turn");
+    assert_eq!(compact_request["input"], json!([trigger]));
+    restoration.restore(&mut compact_request).unwrap();
+    assert_eq!(compact_request, logical_request);
 }
 
 #[test]
@@ -293,7 +387,7 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
     let (completed_items, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let response = client
-        .respond(&[user_message("hello")], &completed_items)
+        .respond(vec![user_message("hello")], &completed_items)
         .await
         .unwrap();
     assert_eq!(response.text, "http");
@@ -334,7 +428,7 @@ async fn unsupported_explicit_cache_retries_without_cache_fields() {
     let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let response = client
-        .respond(&[user_message("hello")], &completed_items)
+        .respond(vec![user_message("hello")], &completed_items)
         .await
         .unwrap();
     assert_eq!(response.text, "fallback");
@@ -373,7 +467,7 @@ async fn repeated_cache_parameter_error_stops_after_the_single_fallback() {
     let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let error = match client
-        .respond(&[user_message("hello")], &completed_items)
+        .respond(vec![user_message("hello")], &completed_items)
         .await
     {
         Ok(_) => panic!("the repeated parameter error should be returned"),
@@ -404,7 +498,7 @@ async fn websocket_upgrade_failure_falls_back_to_http() {
     let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let response = client
-        .respond(&[user_message("hello")], &completed_items)
+        .respond(vec![user_message("hello")], &completed_items)
         .await
         .unwrap();
     assert_eq!(response.text, "https fallback");
@@ -421,45 +515,74 @@ async fn websocket_upgrade_failure_falls_back_to_http() {
 }
 
 #[tokio::test]
-async fn compaction_accepts_only_the_canonical_compaction_window() {
-    let mut retained = user_message("retained");
-    retained["id"] = json!("msg_retained");
-    retained["status"] = json!("completed");
-    let canonical = vec![
-        retained,
-        json!({"type": "compaction_summary", "id": "cmp_fixture", "encrypted_content": "opaque"}),
-    ];
-    let body = json!({
-        "output": canonical,
-        "usage": {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110},
-    });
-    let (base_url, requests, server) =
-        spawn_http_server(vec![HttpReply::ok("application/json", body.to_string())]);
+async fn remote_compaction_v2_uses_the_responses_stream_and_builds_bounded_history() {
+    let compaction =
+        json!({"type": "compaction_summary", "id": "cmp_fixture", "encrypted_content": "opaque"});
+    let ignored = assistant_item("ignored compact response text");
+    let (base_url, requests, server) = spawn_http_server(vec![HttpReply::ok(
+        "text/event-stream",
+        completed_sse_with_items("resp_compact", &[ignored, compaction.clone()]),
+    )]);
     let mut client = test_client(base_url);
     client.prefer_websocket = false;
 
-    let compacted = client.compact(&[user_message("old")]).await.unwrap();
-    assert_eq!(compacted.items, canonical);
-    assert_eq!(compacted.usage.unwrap().total_tokens, 110);
+    let compacted = client
+        .compact(&[user_message("old")], CompactionPhase::PreTurn)
+        .await
+        .unwrap();
+    assert_eq!(compacted.items, vec![user_message("old"), compaction]);
+    assert_eq!(compacted.usage.unwrap().total_tokens, 50);
     assert_eq!(client.window, 1);
     let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(request.path, "/responses/compact");
+    assert_eq!(request.path, "/responses");
+    assert!(
+        request
+            .headers
+            .contains("x-codex-beta-features: remote_compaction_v2")
+    );
     let request_body: Value = serde_json::from_slice(&request.body).unwrap();
-    assert_eq!(request_body["reasoning"]["context"], "all_turns");
-    assert!(request_body.get("prompt_cache_options").is_none());
+    assert_eq!(
+        request_body["reasoning"],
+        json!({"effort": "max", "summary": "auto", "context": "all_turns"})
+    );
+    assert_eq!(request_body["prompt_cache_key"], "session-test");
+    assert_eq!(
+        request_body["input"].as_array().unwrap().last().unwrap(),
+        &json!({"type": "compaction_trigger"})
+    );
+    let metadata: Value = serde_json::from_str(
+        request_body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        metadata["compaction"],
+        json!({
+            "trigger": "auto",
+            "reason": "context_limit",
+            "implementation": "responses_compaction_v2",
+            "phase": "pre_turn",
+            "strategy": "memento",
+        })
+    );
     server.join().unwrap();
 }
 
 #[tokio::test]
 async fn compaction_rejects_a_response_without_one_opaque_item() {
+    let ordinary = assistant_item("not compacted");
     let (base_url, _requests, server) = spawn_http_server(vec![HttpReply::ok(
-        "application/json",
-        json!({"output": [user_message("not compacted")]}).to_string(),
+        "text/event-stream",
+        completed_sse("resp_not_compacted", &ordinary),
     )]);
     let mut client = test_client(base_url);
     client.prefer_websocket = false;
 
-    let error = client.compact(&[user_message("old")]).await.unwrap_err();
+    let error = client
+        .compact(&[user_message("old")], CompactionPhase::MidTurn)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("expected exactly one"));
     assert_eq!(client.window, 0);
     server.join().unwrap();
@@ -527,10 +650,13 @@ async fn websocket_transport_reuses_a_response_with_an_input_delta() {
     let mut client = test_client(format!("http://{address}"));
     let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut history = vec![user_message("one")];
-    let first = client.respond(&history, &completed_items).await.unwrap();
+    let first = client
+        .respond(history.clone(), &completed_items)
+        .await
+        .unwrap();
     history.extend(first.items);
     history.push(user_message("two"));
-    let second = client.respond(&history, &completed_items).await.unwrap();
+    let second = client.respond(history, &completed_items).await.unwrap();
     assert_eq!(second.text, "second");
 
     let first_request = requests_rx.recv().await.unwrap();

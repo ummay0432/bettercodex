@@ -11,6 +11,7 @@ use super::code_runtime::NotificationFuture;
 use super::code_runtime::RuntimeResponse;
 use super::code_runtime::ToolInvocationFuture;
 use super::code_runtime::WaitRequest;
+use super::image_preparation::prepare_tool_output_images;
 use crate::events::AgentEvent;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -32,10 +33,9 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_OUTPUT_TOKENS: usize = 10_000;
-
 pub(super) struct CodeMode {
     session: Arc<InProcessCodeModeSession>,
+    tools: Arc<NestedTools>,
     notifications: Arc<Notifications>,
     ui_events: Arc<UiEvents>,
 }
@@ -45,15 +45,20 @@ impl CodeMode {
         let notifications = Arc::new(Notifications::default());
         let ui_events = Arc::new(UiEvents::default());
         let delegate = Arc::new(Delegate {
-            tools,
+            tools: Arc::clone(&tools),
             notifications: Arc::clone(&notifications),
             ui_events: Arc::clone(&ui_events),
         });
         Self {
             session: Arc::new(InProcessCodeModeSession::with_delegate(delegate)),
+            tools,
             notifications,
             ui_events,
         }
+    }
+
+    pub(super) fn prepare_turn(&self, context: crate::web_search::ToolTurnContext) {
+        self.tools.prepare_turn(context);
     }
 
     pub(super) async fn execute(
@@ -191,6 +196,7 @@ impl CodeMode {
                 text: format!("{status}\nWall time {wall_time_seconds:.1} seconds\nOutput:\n"),
             },
         );
+        prepare_tool_output_images(&mut items);
         for notification in notifications {
             output_items.push(json!({
                 "type": "custom_tool_call_output",
@@ -209,12 +215,7 @@ impl CodeMode {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let body = Value::Array(
-            items
-                .into_iter()
-                .map(serde_json::to_value)
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        );
+        let body = output_body(items)?;
         if !yielded {
             self.ui_events.close(&cell_id);
         }
@@ -394,7 +395,9 @@ fn truncate_items(
     items: Vec<FunctionCallOutputContentItem>,
     max_tokens: Option<usize>,
 ) -> Vec<FunctionCallOutputContentItem> {
-    let policy = TruncationPolicy::Tokens(max_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS));
+    let policy = TruncationPolicy::Tokens(
+        max_tokens.unwrap_or(code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
+    );
     if items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
@@ -403,6 +406,18 @@ fn truncate_items(
     }
 
     truncate_function_output_items_with_policy(&items, policy, estimate_audio_token_count)
+}
+
+fn output_body(items: Vec<FunctionCallOutputContentItem>) -> Result<Value> {
+    if let [FunctionCallOutputContentItem::InputText { text }] = items.as_slice() {
+        return Ok(Value::String(text.clone()));
+    }
+    Ok(Value::Array(
+        items
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    ))
 }
 
 fn into_protocol_items(
@@ -525,7 +540,6 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
             "hello\n"
         );
         assert!(result.preview.contains("{}:{}"), "{}", result.preview);
-        assert!(nested.plan.lock().unwrap().is_some());
         std::fs::remove_dir_all(cwd).unwrap();
     }
 
@@ -533,7 +547,11 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
     async fn view_image_dispatches_structured_image_content() {
         let cwd = temporary_directory("view-image");
         let image_path = cwd.join("sample.png");
-        std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nplaceholder").unwrap();
+        std::fs::write(
+            &image_path,
+            include_bytes!("../../preserve/assets/statusline.png"),
+        )
+        .unwrap();
         let nested = Arc::new(NestedTools::new(cwd.clone()));
         let mode = CodeMode::new(nested);
         let result = mode
@@ -551,9 +569,60 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
                 && item["detail"] == "original"
                 && item["image_url"]
                     .as_str()
-                    .is_some_and(|url| url.starts_with("data:application/octet-stream;base64,"))
+                    .is_some_and(|url| url.starts_with("data:image/png;base64,"))
         }));
         std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_view_image_is_replaced_at_the_model_facing_boundary() {
+        let cwd = temporary_directory("invalid-view-image");
+        std::fs::write(cwd.join("broken.png"), b"\x89PNG\r\n\x1a\nnot-an-image").unwrap();
+        let nested = Arc::new(NestedTools::new(cwd.clone()));
+        let mode = CodeMode::new(nested);
+        let result = mode
+            .execute(
+                "call-invalid-image",
+                r#"const result = await tools.view_image({path: "broken.png"}); image(result);"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let items = result.body.as_array().unwrap();
+        assert!(items.iter().any(|item| {
+            item == &json!({
+                "type": "input_text",
+                "text": "image content omitted because it could not be processed",
+            })
+        }));
+        assert!(!items.iter().any(|item| item["type"] == "input_image"));
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn text_only_single_item_result_uses_codex_plain_string_shape() {
+        let nested = Arc::new(NestedTools::new(PathBuf::from(".")));
+        let mode = CodeMode::new(nested);
+        let result = mode
+            .execute(
+                "call-no-output",
+                r#"store("answer", 42);"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result
+                .body
+                .as_str()
+                .is_some_and(|body| body.starts_with("Script completed\nWall time ")),
+            "{}",
+            result.body
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -592,7 +661,7 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
         assert!(
             result
                 .preview
-                .contains("apply_patch,exec_command,update_plan,view_image,write_stdin"),
+                .contains("apply_patch,exec_command,update_plan,view_image,write_stdin,web__run"),
             "{}",
             result.preview
         );

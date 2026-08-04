@@ -2,6 +2,7 @@ mod catalogue;
 mod code_mode;
 mod code_runtime;
 mod executor;
+mod image_preparation;
 mod patch;
 
 pub(crate) use catalogue::CatalogueRoute;
@@ -11,6 +12,8 @@ pub(crate) use executor::command_argv_for_display;
 use self::code_runtime::CodeModeNestedToolCall;
 use self::code_runtime::CodeModeToolKind;
 use crate::events::AgentEvent;
+use crate::web_search::ToolTurnContext;
+use crate::web_search::WebSearchClient;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -63,10 +66,11 @@ impl ToolCall {
     pub(crate) async fn execute(
         &self,
         runtime: &ToolRuntime,
+        context: ToolTurnContext,
         events: Option<UnboundedSender<AgentEvent>>,
         cancellation: CancellationToken,
     ) -> ToolResult {
-        self.try_execute(runtime, events, cancellation)
+        self.try_execute(runtime, context, events, cancellation)
             .await
             .unwrap_or_else(|error| ToolResult::text(format!("{error:#}")))
     }
@@ -91,9 +95,11 @@ impl ToolCall {
     async fn try_execute(
         &self,
         runtime: &ToolRuntime,
+        context: ToolTurnContext,
         events: Option<UnboundedSender<AgentEvent>>,
         cancellation: CancellationToken,
     ) -> Result<ToolResult> {
+        runtime.code_mode.prepare_turn(context);
         match self {
             Self::Custom {
                 call_id,
@@ -125,8 +131,8 @@ pub(crate) struct ToolRuntime {
 }
 
 impl ToolRuntime {
-    pub(crate) fn new(cwd: PathBuf) -> Self {
-        let nested = Arc::new(NestedTools::new(cwd));
+    pub(crate) fn new(cwd: PathBuf, web_search: WebSearchClient) -> Self {
+        let nested = Arc::new(NestedTools::with_web_search(cwd, web_search));
         Self {
             code_mode: code_mode::CodeMode::new(nested),
         }
@@ -153,15 +159,28 @@ impl ToolResult {
 struct NestedTools {
     cwd: PathBuf,
     processes: executor::ProcessManager,
-    plan: Mutex<Option<UpdatePlanArgs>>,
+    web_search: WebSearchClient,
+    turn: Mutex<ToolTurnContext>,
 }
 
 impl NestedTools {
-    fn new(cwd: PathBuf) -> Self {
+    fn with_web_search(cwd: PathBuf, web_search: WebSearchClient) -> Self {
         Self {
             processes: executor::ProcessManager::new(cwd.clone()),
             cwd,
-            plan: Mutex::new(None),
+            web_search,
+            turn: Mutex::new(ToolTurnContext::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn new(cwd: PathBuf) -> Self {
+        Self::with_web_search(cwd, WebSearchClient::for_test())
+    }
+
+    fn prepare_turn(&self, context: ToolTurnContext) {
+        if let Ok(mut turn) = self.turn.lock() {
+            *turn = context;
         }
     }
 
@@ -170,22 +189,34 @@ impl NestedTools {
         invocation: CodeModeNestedToolCall,
         cancellation: CancellationToken,
     ) -> Result<Value> {
-        if invocation.tool_name.namespace.is_some() {
-            return Err(anyhow!("unknown nested tool `{}`", invocation.tool_name));
-        }
+        let namespace = invocation.tool_name.namespace.as_deref();
         let name = invocation.tool_name.name.as_str();
-        match (name, invocation.tool_kind) {
-            ("exec_command", CodeModeToolKind::Function) => {
+        match (namespace, name, invocation.tool_kind) {
+            (
+                Some(crate::web_search::NAMESPACE),
+                crate::web_search::TOOL_NAME,
+                CodeModeToolKind::Function,
+            ) => {
+                let context = self
+                    .turn
+                    .lock()
+                    .map_err(|_| anyhow!("web search turn context lock was poisoned"))?
+                    .clone();
+                self.web_search
+                    .run(invocation.input, &context, cancellation)
+                    .await
+            }
+            (None, "exec_command", CodeModeToolKind::Function) => {
                 self.processes
                     .exec_command(function_input(name, invocation.input)?, cancellation)
                     .await
             }
-            ("write_stdin", CodeModeToolKind::Function) => {
+            (None, "write_stdin", CodeModeToolKind::Function) => {
                 self.processes
                     .write_stdin(function_input(name, invocation.input)?, cancellation)
                     .await
             }
-            ("apply_patch", CodeModeToolKind::Freeform) => {
+            (None, "apply_patch", CodeModeToolKind::Freeform) => {
                 let input = freeform_input(name, invocation.input)?;
                 let cwd = self.cwd.clone();
                 let _output = tokio::task::spawn_blocking(move || patch::apply(&cwd, &input))
@@ -193,27 +224,23 @@ impl NestedTools {
                     .context("apply_patch task failed")??;
                 Ok(json!({}))
             }
-            ("update_plan", CodeModeToolKind::Function) => {
+            (None, "update_plan", CodeModeToolKind::Function) => {
                 self.update_plan(function_input(name, invocation.input)?)
             }
-            ("view_image", CodeModeToolKind::Function) => {
+            (None, "view_image", CodeModeToolKind::Function) => {
                 let cwd = self.cwd.clone();
                 let input = function_input(name, invocation.input)?;
                 tokio::task::spawn_blocking(move || view_image(&cwd, input))
                     .await
                     .context("view_image task failed")?
             }
-            _ => Err(anyhow!("unknown nested tool `{name}`")),
+            _ => Err(anyhow!("unknown nested tool `{}`", invocation.tool_name)),
         }
     }
 
     fn update_plan(&self, input: Value) -> Result<Value> {
-        let arguments: UpdatePlanArgs = serde_json::from_value(input)
+        serde_json::from_value::<UpdatePlanArgs>(input)
             .map_err(|error| anyhow!("failed to parse function arguments: {error}"))?;
-        *self
-            .plan
-            .lock()
-            .map_err(|_| anyhow!("plan lock was poisoned"))? = Some(arguments);
         Ok(json!({}))
     }
 }

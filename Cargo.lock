@@ -317,6 +317,7 @@ dependencies = [
  "anyhow",
  "base64",
  "codex-ansi-escape",
+ "codex-client",
  "codex-code-mode-protocol",
  "codex-protocol",
  "codex-shell-command",
@@ -332,6 +333,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "reqwest",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "supports-color",
@@ -713,6 +715,19 @@ source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397df
 dependencies = [
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "codex-client"
+version = "0.0.0"
+source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
+dependencies = [
+ "codex-http-client",
+ "eventsource-stream",
+ "futures",
+ "http",
+ "rand 0.9.5",
+ "tokio",
 ]
 
 [[package]]
@@ -1736,6 +1751,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "eventsource-stream"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
+dependencies = [
+ "futures-core",
+ "nom 7.1.3",
+ "pin-project-lite",
 ]
 
 [[package]]

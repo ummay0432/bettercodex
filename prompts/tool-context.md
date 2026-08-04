@@ -60,10 +60,10 @@ it does not remove the cached prefix from the active context window.
 
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable prefix: `additional_tools` plus cached system-prompt item | 11,920 | 2,838 | 2,980 |
-| Complete `additional_tools` developer item | 9,197 | 2,303 | 2,300 |
-| Top-level `exec` specification | 7,783 | 1,976 | 1,946 |
-| `exec` description only | 7,307 | 1,731 | 1,827 |
+| Complete stable prefix: `additional_tools` plus cached system-prompt item | 22,751 | 5,609 | 5,688 |
+| Complete `additional_tools` developer item | 20,028 | 5,074 | 5,007 |
+| Top-level `exec` specification | 18,614 | 4,747 | 4,654 |
+| `exec` description only | 17,705 | 4,245 | 4,427 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
 | Top-level `wait` specification | 1,356 | 315 | 339 |
 | `wait` description only | 769 | 181 | 193 |
@@ -81,6 +81,7 @@ nested tool declaration. This is the text-only breakdown:
 | `update_plan` | 498 | 126 | 125 |
 | `view_image` | 654 | 153 | 164 |
 | `write_stdin` | 1,168 | 266 | 292 |
+| `web` namespace and `web__run` | 10,396 | 2,513 | 2,599 |
 
 The full `exec` description is stored verbatim in
 [`tool-catalogue.md`](tool-catalogue.md). A snapshot test compares that file to
@@ -122,9 +123,11 @@ NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 ```
 
-The description exposes five nested tools through the JavaScript `tools`
-object: `apply_patch`, `exec_command`, `update_plan`, `view_image`, and
-`write_stdin`.
+The description exposes six nested tools through the JavaScript `tools`
+object: `apply_patch`, `exec_command`, `update_plan`, `view_image`,
+`write_stdin`, and the namespaced `web__run` (`web.run`). The web tool uses
+Codex's exact command schema and description for search, open/fetch, click,
+find, PDF screenshots, finance, weather, sports, time, and image search.
 
 ### `wait`
 
@@ -212,9 +215,10 @@ client metadata. The map connects each normalized JavaScript name to its
 canonical tool name and namespace. It is transport metadata, not an input item,
 so it has no model-context token charge.
 
-Codex can conditionally add hosted web search, `request_user_input`, MCP tools,
-apps, plugins, image generation, dynamic namespaces, and multi-agent tools.
-Those tools depend on provider capabilities, account state, configuration,
-installed integrations, or collaboration mode. They are not part of Codex's
-fixed single-environment Code Mode catalogue and BetterCodex does not inject
-them as unconditional tools.
+Codex conditionally adds standalone web search, `request_user_input`, MCP
+tools, apps, plugins, image generation, dynamic namespaces, and multi-agent
+tools. BetterCodex deliberately fixes Codex's standalone `web.run` into its
+catalogue and routes it to `alpha/search` with the same ChatGPT credentials,
+live external access, direct-caller setting, session ID, model, bounded recent
+conversation tail, and 10,000-token output budget. The other conditional tools
+remain outside BetterCodex until there is a concrete product use for them.

@@ -1,10 +1,12 @@
+use crate::context::ContextSnapshot;
 use serde_json::Value;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentEvent {
     ModelTextDelta(String),
-    ReasoningDelta(String),
+    ReasoningSummarySectionStarted,
+    ReasoningSummaryDelta(String),
     ModelItemCompleted,
     ModelResponseCompleted,
     ToolStarted {
@@ -17,7 +19,7 @@ pub(crate) enum AgentEvent {
         output: Result<Value, String>,
         duration: Duration,
     },
-    UsageUpdated(u64),
+    ContextUpdated(ContextSnapshot),
     CompactionStarted,
     CompactionCompleted,
 }

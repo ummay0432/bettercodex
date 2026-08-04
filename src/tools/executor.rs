@@ -22,6 +22,7 @@ use portable_pty::PtySize;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Read;
@@ -31,8 +32,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
@@ -47,6 +46,7 @@ const MAX_EXEC_YIELD: Duration = Duration::from_secs(30);
 const DEFAULT_WRITE_YIELD: Duration = Duration::from_millis(250);
 const DEFAULT_POLL_YIELD: Duration = Duration::from_secs(5);
 const MAX_POLL_YIELD: Duration = Duration::from_secs(5 * 60);
+const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 const MAX_PROCESSES: usize = 64;
 const RETAINED_HEAD_BYTES: usize = 512 * 1024;
 const RETAINED_TAIL_BYTES: usize = 512 * 1024;
@@ -65,18 +65,31 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
 
 pub(super) struct ProcessManager {
     cwd: PathBuf,
-    active_sessions: AtomicUsize,
-    sessions: Mutex<HashMap<i32, Arc<ProcessSession>>>,
-    reserved_session_ids: Mutex<HashSet<i32>>,
+    store: Mutex<ProcessStore>,
+}
+
+#[derive(Default)]
+struct ProcessStore {
+    sessions: HashMap<i32, ProcessEntry>,
+    reserved_session_ids: HashSet<i32>,
+}
+
+struct ProcessEntry {
+    session: Arc<ProcessSession>,
+    last_used: Instant,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProcessStorage {
+    Stored,
+    Transient,
 }
 
 impl ProcessManager {
     pub(super) fn new(cwd: PathBuf) -> Self {
         Self {
             cwd,
-            active_sessions: AtomicUsize::new(0),
-            sessions: Mutex::new(HashMap::new()),
-            reserved_session_ids: Mutex::new(HashSet::new()),
+            store: Mutex::new(ProcessStore::default()),
         }
     }
 
@@ -96,7 +109,6 @@ impl ProcessManager {
                 get_shell_by_model_provided_path(&PathBuf::from(shell))
             });
         let login = arguments.login.unwrap_or(true);
-        let reservation = self.reserve_session()?;
         let session_id_reservation = self.reserve_session_id()?;
         let session_id = session_id_reservation.session_id;
         let session = if arguments.tty.unwrap_or(false) {
@@ -104,12 +116,14 @@ impl ProcessManager {
         } else {
             spawn_piped(&shell, login, &arguments.cmd, &workdir)?
         };
-        self.sessions
-            .lock()
-            .map_err(|_| anyhow!("process table lock was poisoned"))?
-            .insert(session_id, Arc::clone(&session));
-        session_id_reservation.commit();
-        reservation.commit();
+        let started = Instant::now();
+        let storage = if session.has_exited() {
+            ProcessStorage::Transient
+        } else {
+            self.store_session(session_id, Arc::clone(&session), started)?;
+            session_id_reservation.commit();
+            ProcessStorage::Stored
+        };
 
         let yield_time = bounded_duration(
             arguments.yield_time_ms,
@@ -117,11 +131,12 @@ impl ProcessManager {
             MIN_EXEC_YIELD,
             MAX_EXEC_YIELD,
         );
-        let started = Instant::now();
         tokio::select! {
             _ = cancellation.cancelled() => {
                 session.kill();
-                self.remove_session(session_id)?;
+                if storage == ProcessStorage::Stored {
+                    self.remove_session(session_id)?;
+                }
                 return Err(anyhow!("exec_command was interrupted"));
             }
             _ = session.wait(yield_time) => {}
@@ -131,6 +146,7 @@ impl ProcessManager {
             session,
             started.elapsed(),
             arguments.max_output_tokens,
+            storage,
         )
     }
 
@@ -142,13 +158,26 @@ impl ProcessManager {
         let arguments: WriteStdinArgs = serde_json::from_value(input)
             .map_err(|error| anyhow!("failed to parse function arguments: {error}"))?;
         let session = self
-            .sessions
+            .store
             .lock()
             .map_err(|_| anyhow!("process table lock was poisoned"))?
+            .sessions
             .get(&arguments.session_id)
-            .cloned()
+            .map(|entry| Arc::clone(&entry.session))
             .ok_or_else(|| anyhow!("Unknown process id {}", arguments.session_id))?;
-        let _interaction = session.interaction.lock().await;
+        let _interaction = Arc::clone(&session.interaction).lock_owned().await;
+        {
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| anyhow!("process table lock was poisoned"))?;
+            let entry = store
+                .sessions
+                .get_mut(&arguments.session_id)
+                .filter(|entry| Arc::ptr_eq(&entry.session, &session))
+                .ok_or_else(|| anyhow!("Unknown process id {}", arguments.session_id))?;
+            entry.last_used = Instant::now();
+        }
 
         let has_input = !arguments.chars.is_empty();
         if has_input {
@@ -196,6 +225,7 @@ impl ProcessManager {
             Arc::clone(&session),
             started.elapsed(),
             arguments.max_output_tokens,
+            ProcessStorage::Stored,
         )
     }
 
@@ -205,9 +235,24 @@ impl ProcessManager {
         session: Arc<ProcessSession>,
         wall_time: Duration,
         max_output_tokens: Option<usize>,
+        storage: ProcessStorage,
     ) -> Result<Value> {
-        let snapshot = session.snapshot()?;
-        if snapshot.finished {
+        let snapshot = match storage {
+            ProcessStorage::Stored => {
+                let store = self
+                    .store
+                    .lock()
+                    .map_err(|_| anyhow!("process table lock was poisoned"))?;
+                store
+                    .sessions
+                    .get(&session_id)
+                    .filter(|entry| Arc::ptr_eq(&entry.session, &session))
+                    .ok_or_else(|| anyhow!("Unknown process id {session_id}"))?;
+                session.snapshot()?
+            }
+            ProcessStorage::Transient => session.snapshot()?,
+        };
+        if storage == ProcessStorage::Stored && snapshot.exited {
             self.remove_session(session_id)?;
         }
         let original_token_count =
@@ -227,7 +272,7 @@ impl ProcessManager {
         if let Some(exit_code) = snapshot.exit_code {
             result["exit_code"] = json!(exit_code);
         }
-        if !snapshot.finished {
+        if storage == ProcessStorage::Stored && !snapshot.exited {
             result["session_id"] = json!(session_id);
         }
         result["original_token_count"] = json!(original_token_count);
@@ -235,17 +280,17 @@ impl ProcessManager {
     }
 
     fn reserve_session_id(&self) -> Result<SessionIdReservation<'_>> {
-        let mut reserved_session_ids = self
-            .reserved_session_ids
+        let mut store = self
+            .store
             .lock()
             .map_err(|_| anyhow!("process ID table lock was poisoned"))?;
         loop {
             let bytes = *Uuid::new_v4().as_bytes();
             let random = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let candidate = 1_000 + (random % 99_000) as i32;
-            if reserved_session_ids.insert(candidate) {
+            if store.reserved_session_ids.insert(candidate) {
                 return Ok(SessionIdReservation {
-                    reserved_session_ids: &self.reserved_session_ids,
+                    store: &self.store,
                     session_id: candidate,
                     committed: false,
                 });
@@ -253,38 +298,119 @@ impl ProcessManager {
         }
     }
 
-    fn reserve_session(&self) -> Result<SessionReservation<'_>> {
-        self.active_sessions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_PROCESSES).then_some(active + 1)
-            })
-            .map_err(|_| anyhow!("exec_command process limit of {MAX_PROCESSES} was reached"))?;
-        Ok(SessionReservation {
-            active_sessions: &self.active_sessions,
-            committed: false,
-        })
-    }
-
     fn remove_session(&self, session_id: i32) -> Result<()> {
-        let removed = self
-            .sessions
+        let mut store = self
+            .store
             .lock()
-            .map_err(|_| anyhow!("process table lock was poisoned"))?
-            .remove(&session_id)
-            .is_some();
-        self.reserved_session_ids
-            .lock()
-            .map_err(|_| anyhow!("process ID table lock was poisoned"))?
-            .remove(&session_id);
+            .map_err(|_| anyhow!("process table lock was poisoned"))?;
+        let removed = store.sessions.remove(&session_id).is_some();
         if removed {
-            self.active_sessions.fetch_sub(1, Ordering::AcqRel);
+            store.reserved_session_ids.remove(&session_id);
         }
         Ok(())
     }
+
+    fn store_session(
+        &self,
+        session_id: i32,
+        session: Arc<ProcessSession>,
+        started_at: Instant,
+    ) -> Result<()> {
+        let pruned_entry = {
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| anyhow!("process table lock was poisoned"))?;
+            let pruned = Self::prune_processes_if_needed(&mut store.sessions);
+            store.sessions.insert(
+                session_id,
+                ProcessEntry {
+                    session,
+                    last_used: started_at,
+                },
+            );
+            if let Some((pruned_id, _)) = pruned.as_ref() {
+                store.reserved_session_ids.remove(pruned_id);
+            }
+            pruned.map(|(_, entry)| entry)
+        };
+        if let Some(pruned_entry) = pruned_entry {
+            pruned_entry.session.kill();
+        }
+        Ok(())
+    }
+
+    fn prune_processes_if_needed(
+        sessions: &mut HashMap<i32, ProcessEntry>,
+    ) -> Option<(i32, ProcessEntry)> {
+        if sessions.len() < MAX_PROCESSES {
+            return None;
+        }
+
+        let mut metadata = sessions
+            .iter()
+            .map(|(id, entry)| (*id, entry.last_used, entry.session.has_exited()))
+            .collect::<Vec<_>>();
+        let mut found_locked_exited_process = false;
+
+        while let Some(session_id) = process_id_to_prune_from_meta(&metadata) {
+            let candidate = sessions
+                .get(&session_id)
+                .map(|entry| Arc::clone(&entry.session));
+            let candidate_has_exited = candidate
+                .as_ref()
+                .is_some_and(|session| session.has_exited());
+            if found_locked_exited_process && !candidate_has_exited {
+                return None;
+            }
+
+            if let Some(interaction) = candidate
+                .as_ref()
+                .map(|session| Arc::clone(&session.interaction))
+                && let Ok(_interaction) = interaction.try_lock_owned()
+                && let Some(entry) = sessions.remove(&session_id)
+            {
+                return Some((session_id, entry));
+            }
+            found_locked_exited_process |=
+                candidate_has_exited || candidate.is_some_and(|session| session.has_exited());
+            metadata.retain(|(id, _, _)| *id != session_id);
+        }
+
+        None
+    }
+}
+
+fn process_id_to_prune_from_meta(metadata: &[(i32, Instant, bool)]) -> Option<i32> {
+    if metadata.is_empty() {
+        return None;
+    }
+
+    let mut by_recency = metadata.to_vec();
+    by_recency.sort_by_key(|(_, last_used, _)| Reverse(*last_used));
+    let protected = by_recency
+        .iter()
+        .take(8)
+        .map(|(session_id, _, _)| *session_id)
+        .collect::<HashSet<_>>();
+
+    let mut least_recently_used = metadata.to_vec();
+    least_recently_used.sort_by_key(|(_, last_used, _)| *last_used);
+    if let Some((session_id, _, _)) = least_recently_used
+        .iter()
+        .find(|(session_id, _, exited)| !protected.contains(session_id) && *exited)
+    {
+        return Some(*session_id);
+    }
+
+    least_recently_used
+        .into_iter()
+        .find(|(session_id, _, _)| !protected.contains(session_id))
+        .map(|(session_id, _, _)| session_id)
 }
 
 struct SessionIdReservation<'a> {
-    reserved_session_ids: &'a Mutex<HashSet<i32>>,
+    store: &'a Mutex<ProcessStore>,
     session_id: i32,
     committed: bool,
 }
@@ -298,39 +424,20 @@ impl SessionIdReservation<'_> {
 impl Drop for SessionIdReservation<'_> {
     fn drop(&mut self) {
         if !self.committed
-            && let Ok(mut reserved_session_ids) = self.reserved_session_ids.lock()
+            && let Ok(mut store) = self.store.lock()
         {
-            reserved_session_ids.remove(&self.session_id);
-        }
-    }
-}
-
-struct SessionReservation<'a> {
-    active_sessions: &'a AtomicUsize,
-    committed: bool,
-}
-
-impl SessionReservation<'_> {
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for SessionReservation<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.active_sessions.fetch_sub(1, Ordering::AcqRel);
+            store.reserved_session_ids.remove(&self.session_id);
         }
     }
 }
 
 impl Drop for ProcessManager {
     fn drop(&mut self) {
-        let Ok(sessions) = self.sessions.get_mut() else {
+        let Ok(store) = self.store.get_mut() else {
             return;
         };
-        for session in sessions.values() {
-            session.kill();
+        for entry in store.sessions.values() {
+            entry.session.kill();
         }
     }
 }
@@ -360,7 +467,7 @@ struct ProcessSession {
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     notify: Notify,
-    interaction: AsyncMutex<()>,
+    interaction: Arc<AsyncMutex<()>>,
     tty: bool,
     process_group_id: Option<i32>,
 }
@@ -383,7 +490,7 @@ impl ProcessSession {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             notify: Notify::new(),
-            interaction: AsyncMutex::new(()),
+            interaction: Arc::new(AsyncMutex::new(())),
             tty,
             process_group_id,
         })
@@ -421,13 +528,31 @@ impl ProcessSession {
 
     async fn wait(&self, duration: Duration) {
         let deadline = Instant::now() + duration;
+        let mut post_exit_deadline = None;
         loop {
             let notified = self.notify.notified();
-            let done = self.state.lock().is_ok_and(|state| state.finished());
-            if done || Instant::now() >= deadline {
+            let (exited, output_closed) = self
+                .state
+                .lock()
+                .map(|state| (state.exit_code.is_some(), state.readers == 0))
+                .unwrap_or((true, true));
+            if exited && output_closed {
                 return;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            let wait_deadline = if exited {
+                *post_exit_deadline.get_or_insert_with(|| {
+                    now + deadline
+                        .saturating_duration_since(now)
+                        .min(POST_EXIT_CLOSE_WAIT_CAP)
+                })
+            } else {
+                deadline
+            };
+            if now >= wait_deadline {
+                return;
+            }
+            let remaining = wait_deadline.saturating_duration_since(now);
             if timeout(remaining, notified).await.is_err() {
                 return;
             }
@@ -485,6 +610,12 @@ impl ProcessSession {
         }
     }
 
+    fn has_exited(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.exit_code.is_some())
+    }
+
     fn signal_process_group(&self, signal: i32) -> bool {
         let Some(process_group_id) = self.process_group_id else {
             return false;
@@ -512,7 +643,7 @@ impl ProcessSession {
         Ok(ProcessSnapshot {
             output: output.text,
             exit_code: state.exit_code,
-            finished: state.finished(),
+            exited: state.exit_code.is_some(),
             total_bytes: output.total_bytes,
             omitted_bytes: output.omitted_bytes,
         })
@@ -526,16 +657,10 @@ struct ProcessState {
     errors: Vec<String>,
 }
 
-impl ProcessState {
-    fn finished(&self) -> bool {
-        self.exit_code.is_some() && self.readers == 0
-    }
-}
-
 struct ProcessSnapshot {
     output: String,
     exit_code: Option<i32>,
-    finished: bool,
+    exited: bool,
     total_bytes: usize,
     omitted_bytes: usize,
 }
@@ -797,6 +922,27 @@ fn truncate_output(
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug)]
+    struct NoopKiller;
+
+    impl ChildKiller for NoopKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn fake_session(exited: bool) -> Arc<ProcessSession> {
+        let session = ProcessSession::new(None, Box::new(NoopKiller), 0, false, None);
+        if exited {
+            session.exited(0, None);
+        }
+        session
+    }
+
     #[test]
     fn retained_output_keeps_head_and_tail() {
         let mut output = PendingOutput::default();
@@ -811,15 +957,62 @@ mod tests {
         assert!(rendered.ends_with(&"x".repeat(RETAINED_TAIL_BYTES)));
     }
 
-    #[test]
-    fn process_reservations_are_bounded() {
+    #[tokio::test]
+    async fn process_store_matches_codex_soft_cap_and_exited_lru_policy() {
         let manager = ProcessManager::new(std::env::current_dir().unwrap());
-        let reservations = (0..MAX_PROCESSES)
-            .map(|_| manager.reserve_session().unwrap())
-            .collect::<Vec<_>>();
-        assert!(manager.reserve_session().is_err());
-        drop(reservations);
-        assert!(manager.reserve_session().is_ok());
+        let now = Instant::now();
+        {
+            let mut store = manager.store.lock().unwrap();
+            for offset in 0..MAX_PROCESSES {
+                let session_id = 1_000 + i32::try_from(offset).unwrap();
+                store.sessions.insert(
+                    session_id,
+                    ProcessEntry {
+                        session: fake_session(session_id == 1_001),
+                        last_used: now
+                            .checked_sub(Duration::from_secs(
+                                u64::try_from(MAX_PROCESSES - offset).unwrap(),
+                            ))
+                            .unwrap(),
+                    },
+                );
+                store.reserved_session_ids.insert(session_id);
+            }
+            store.reserved_session_ids.insert(2_000);
+        }
+
+        manager
+            .store_session(2_000, fake_session(false), now)
+            .unwrap();
+
+        {
+            let store = manager.store.lock().unwrap();
+            assert_eq!(store.sessions.len(), MAX_PROCESSES);
+            assert!(!store.sessions.contains_key(&1_001));
+            assert!(store.sessions.contains_key(&1_000));
+            assert!(store.sessions.contains_key(&2_000));
+            assert!(!store.reserved_session_ids.contains(&1_001));
+        }
+
+        let error = manager
+            .write_stdin(json!({"session_id": 1_001}), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Unknown process id 1001");
+    }
+
+    #[tokio::test]
+    async fn exited_process_uses_codex_output_close_grace() {
+        let session = ProcessSession::new(None, Box::new(NoopKiller), 1, false, None);
+        session.exited(0, None);
+        let started = Instant::now();
+
+        session.wait(Duration::from_secs(5)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let snapshot = session.snapshot().unwrap();
+        assert!(snapshot.exited);
+        assert_eq!(snapshot.exit_code, Some(0));
     }
 
     #[test]

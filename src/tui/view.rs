@@ -1,11 +1,16 @@
+use super::context_window::ContextAction;
+use super::context_window::ContextWindowView;
+use super::context_window::VIEWPORT_HEIGHT as CONTEXT_VIEWPORT_HEIGHT;
 use super::editor;
 use super::editor::Editor;
 use super::markdown;
+use super::reasoning_status::ReasoningStatus;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
 use super::tool_catalogue::VIEWPORT_HEIGHT as TOOL_CATALOGUE_VIEWPORT_HEIGHT;
 use crate::MODEL;
 use crate::agent::SubmitOutcome;
+use crate::context::ContextSnapshot;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
 use codex_ansi_escape::ansi_escape_line;
@@ -55,6 +60,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "start a fresh session",
     },
     SlashCommand {
+        name: "context",
+        description: "visualize current context usage",
+    },
+    SlashCommand {
         name: "help",
         description: "show keyboard shortcuts",
     },
@@ -75,6 +84,7 @@ pub(super) enum Action {
     Queue(String),
     Cancel,
     Clear,
+    ShowContext,
     Quit,
 }
 
@@ -92,6 +102,7 @@ pub(super) struct View {
     busy: bool,
     interrupting: bool,
     working_since: Option<Instant>,
+    reasoning_status: ReasoningStatus,
     status_detail: Option<String>,
     queued: usize,
     assistant_received_this_turn: bool,
@@ -107,7 +118,6 @@ pub(super) struct View {
 enum TranscriptEntry {
     User(String),
     Assistant { text: String, streaming: bool },
-    Reasoning { text: String, streaming: bool },
     Tool(ToolEntry),
     Exploration { tools: Vec<ToolEntry>, sealed: bool },
     Notice(String),
@@ -202,6 +212,7 @@ struct SlashCommand {
 
 enum Overlay {
     Shortcuts,
+    Context(ContextWindowView),
     Tools(ToolCatalogueView),
 }
 
@@ -230,6 +241,7 @@ impl View {
             busy: false,
             interrupting: false,
             working_since: None,
+            reasoning_status: ReasoningStatus::default(),
             status_detail: None,
             queued: 0,
             assistant_received_this_turn: false,
@@ -274,6 +286,7 @@ impl View {
         self.busy = true;
         self.interrupting = false;
         self.working_since = Some(Instant::now());
+        self.reasoning_status.reset();
         self.status_detail = None;
         self.assistant_received_this_turn = false;
     }
@@ -282,6 +295,7 @@ impl View {
         self.close_streaming_entries();
         self.seal_exploration();
         self.entries.push(TranscriptEntry::User(prompt.to_string()));
+        self.reasoning_status.reset();
         self.status_detail = None;
     }
 
@@ -292,6 +306,7 @@ impl View {
         self.busy = false;
         self.interrupting = false;
         self.working_since = None;
+        self.reasoning_status.reset();
         self.status_detail = None;
         match result {
             Ok(SubmitOutcome::Completed(answer)) => {
@@ -328,6 +343,10 @@ impl View {
         self.context_tokens = tokens;
     }
 
+    pub(super) fn show_context(&mut self, snapshot: ContextSnapshot) {
+        self.overlay = Some(Overlay::Context(ContextWindowView::new(snapshot)));
+    }
+
     pub(super) fn clear(&mut self) {
         self.entries.clear();
         self.committed_entries = 0;
@@ -336,6 +355,7 @@ impl View {
         self.clear_requested = true;
         self.resize_reflow_requested = false;
         self.context_tokens = None;
+        self.reasoning_status.reset();
         self.queued = 0;
         self.overlay = None;
         self.slash_selection = 0;
@@ -359,17 +379,13 @@ impl View {
                 }
                 self.status_detail = None;
             }
-            AgentEvent::ReasoningDelta(delta) => {
+            AgentEvent::ReasoningSummarySectionStarted => {
                 self.seal_exploration();
-                match self.entries.last_mut() {
-                    Some(TranscriptEntry::Reasoning { text, streaming }) if *streaming => {
-                        text.push_str(&delta);
-                    }
-                    _ => self.entries.push(TranscriptEntry::Reasoning {
-                        text: delta,
-                        streaming: true,
-                    }),
-                }
+                self.reasoning_status.reset();
+            }
+            AgentEvent::ReasoningSummaryDelta(delta) => {
+                self.seal_exploration();
+                self.reasoning_status.push_delta(&delta);
             }
             AgentEvent::ModelItemCompleted | AgentEvent::ModelResponseCompleted => {
                 self.close_streaming_entries();
@@ -413,9 +429,15 @@ impl View {
                 self.repository = Repository::discover(&self.cwd);
                 self.status_detail = self.latest_tool_activity();
             }
-            AgentEvent::UsageUpdated(tokens) => self.context_tokens = Some(tokens),
+            AgentEvent::ContextUpdated(snapshot) => {
+                self.context_tokens = snapshot.measured.then_some(snapshot.used_tokens);
+                if let Some(Overlay::Context(context)) = self.overlay.as_mut() {
+                    context.update(snapshot);
+                }
+            }
             AgentEvent::CompactionStarted => {
                 self.context_tokens = None;
+                self.reasoning_status.reset();
                 self.status_detail = Some("Compacting conversation".to_string());
             }
             AgentEvent::CompactionCompleted => self.status_detail = self.latest_tool_activity(),
@@ -452,11 +474,14 @@ impl View {
             return Action::Quit;
         }
         if let Some(overlay) = self.overlay.as_ref() {
-            let action = match overlay {
-                Overlay::Shortcuts => CatalogueAction::Close,
-                Overlay::Tools(catalogue) => catalogue.handle_key(key.code),
+            let close = match overlay {
+                Overlay::Shortcuts => true,
+                Overlay::Context(context) => context.handle_key(key.code) == ContextAction::Close,
+                Overlay::Tools(catalogue) => {
+                    catalogue.handle_key(key.code) == CatalogueAction::Close
+                }
             };
-            if action == CatalogueAction::Close {
+            if close {
                 self.overlay = None;
             }
             return Action::None;
@@ -576,6 +601,7 @@ impl View {
                 Action::None
             }
             "/clear" => Action::Clear,
+            "/context" => Action::ShowContext,
             "/help" => {
                 self.entries.push(TranscriptEntry::Notice(
                     "Enter submit/steer · Tab queue · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
@@ -595,8 +621,7 @@ impl View {
     fn close_streaming_entries(&mut self) {
         for entry in self.entries.iter_mut().rev() {
             match entry {
-                TranscriptEntry::Assistant { streaming, .. }
-                | TranscriptEntry::Reasoning { streaming, .. } => *streaming = false,
+                TranscriptEntry::Assistant { streaming, .. } => *streaming = false,
                 TranscriptEntry::User(_) => break,
                 TranscriptEntry::Tool(_)
                 | TranscriptEntry::Exploration { .. }
@@ -741,6 +766,7 @@ impl View {
         let trailing_height = if popup_height > 0 { popup_height } else { 2 };
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => 15,
+            Some(Overlay::Context(_)) => CONTEXT_VIEWPORT_HEIGHT,
             Some(Overlay::Tools(_)) => TOOL_CATALOGUE_VIEWPORT_HEIGHT,
             None => 0,
         };
@@ -827,6 +853,7 @@ impl View {
         }
         match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
+            Some(Overlay::Context(context)) => context.render(frame, area),
             Some(Overlay::Tools(catalogue)) => catalogue.render(frame, area),
             None => {}
         }
@@ -1015,7 +1042,7 @@ impl View {
         } else if self.status_detail.as_deref() == Some("Compacting conversation") {
             "Compacting"
         } else {
-            "Working"
+            self.reasoning_status.heading().unwrap_or("Working")
         };
         let mut spans = vec![activity_marker(self.working_since), " ".into()];
         spans.extend(shimmer_spans(heading));
@@ -1083,7 +1110,7 @@ impl TranscriptEntry {
     fn is_finalized(&self) -> bool {
         match self {
             Self::User(_) | Self::Notice(_) | Self::Error(_) => true,
-            Self::Assistant { streaming, .. } | Self::Reasoning { streaming, .. } => !streaming,
+            Self::Assistant { streaming, .. } => !streaming,
             Self::Tool(tool) => tool.outcome.is_some(),
             Self::Exploration { tools, sealed } => {
                 *sealed && tools.iter().all(|tool| tool.outcome.is_some())
@@ -1095,7 +1122,6 @@ impl TranscriptEntry {
         match self {
             Self::User(message) => user_message_lines(message, width, user_style),
             Self::Assistant { text, .. } => assistant_lines(text, width),
-            Self::Reasoning { text, .. } => reasoning_lines(text, width),
             Self::Tool(tool) => tool.display_lines(width, user_style),
             Self::Exploration { tools, .. } => exploration_lines(tools, width),
             Self::Notice(message) => vec![Line::from(vec![
@@ -1809,24 +1835,6 @@ fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
     prefix_styled_lines(wrapped, "• ", "  ")
 }
 
-fn reasoning_lines(message: &str, width: u16) -> Vec<Line<'static>> {
-    let style = Style::default().fg(MUTED).italic();
-    let mut lines = Vec::new();
-    for (index, line) in editor::wrap_text(
-        markdown::sanitize(message).trim_end_matches(['\r', '\n']),
-        width.saturating_sub(2).max(1),
-    )
-    .into_iter()
-    .enumerate()
-    {
-        lines.push(Line::from(vec![
-            Span::styled(if index == 0 { "• " } else { "  " }, style),
-            Span::styled(line, style),
-        ]));
-    }
-    lines
-}
-
 fn command_lines(tool: &ToolEntry, command: &str, width: u16) -> Vec<Line<'static>> {
     let (bullet, title) = match tool.succeeded() {
         None => (activity_marker(Some(tool.started_at)), "Running"),
@@ -2434,6 +2442,8 @@ fn line_width(line: &Line<'_>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextKind;
+    use crate::context::ContextSection;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
@@ -2518,6 +2528,46 @@ mod tests {
             .unwrap();
         assert_eq!(composer_y, status_y + 2, "{rendered}");
         assert_eq!(buffer[(0, status_y + 1)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn streamed_reasoning_sections_drive_the_rendered_activity_heading() {
+        fn render(view: &mut View) -> String {
+            let height = view.desired_height(72, 24);
+            let backend = TestBackend::new(72, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| view.render(frame)).unwrap();
+            render_buffer(terminal.backend().buffer())
+        }
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        let _ = view.take_pending_history_lines(72);
+
+        view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
+        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
+            "**Inspecting".to_string(),
+        ));
+        assert!(render(&mut view).contains("• Working ("));
+
+        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
+            " the request**\n\nI am reading the relevant code.".to_string(),
+        ));
+        let first_section = render(&mut view);
+        assert!(first_section.contains("• Inspecting the request ("));
+        assert!(!first_section.contains("I am reading the relevant code"));
+
+        view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
+        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
+            "**Running validation**".to_string(),
+        ));
+        let second_section = render(&mut view);
+        assert!(second_section.contains("• Running validation ("));
+        assert!(!second_section.contains("Inspecting the request"));
+
+        view.set_interrupting();
+        assert!(render(&mut view).contains("• Interrupting ("));
     }
 
     #[test]
@@ -2623,6 +2673,76 @@ mod tests {
             Action::None
         );
         assert_eq!(view.editor.text(), "/tools");
+    }
+
+    #[test]
+    fn context_command_opens_and_closes_the_rendered_window() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        for character in "/context".chars() {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::ShowContext
+        );
+        assert!(view.overlay.is_none());
+
+        view.show_context(ContextSnapshot {
+            used_tokens: 74_400,
+            context_window: 372_000,
+            compact_at_tokens: 353_400,
+            measured: true,
+            sections: vec![ContextSection {
+                kind: ContextKind::UserMessages,
+                tokens: 74_400,
+                items: 4,
+            }],
+        });
+        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Context(_))));
+        assert_eq!(view.desired_height(92, 30), CONTEXT_VIEWPORT_HEIGHT);
+
+        let backend = TestBackend::new(92, CONTEXT_VIEWPORT_HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("Context"), "{rendered}");
+        assert!(rendered.contains("74.4K / 372K tokens"), "{rendered}");
+        assert!(rendered.contains("User messages"), "{rendered}");
+        assert!(rendered.contains("Auto-compact reserve"), "{rendered}");
+
+        view.handle_agent_event(AgentEvent::ContextUpdated(ContextSnapshot {
+            used_tokens: 111_600,
+            context_window: 372_000,
+            compact_at_tokens: 353_400,
+            measured: true,
+            sections: vec![ContextSection {
+                kind: ContextKind::AssistantMessages,
+                tokens: 111_600,
+                items: 6,
+            }],
+        }));
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("111.6K / 372K tokens"), "{rendered}");
+        assert!(rendered.contains("Assistant messages"), "{rendered}");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert!(view.overlay.is_none());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::compaction::InitialContextInjection;
 use crate::rollout::ResumeSelector;
 
 fn temporary_repository(name: &str) -> (PathBuf, PathBuf) {
@@ -38,14 +39,16 @@ fn normalization_inserts_stable_outputs_and_removes_orphans() {
 }
 
 #[test]
-fn opaque_compaction_windows_keep_outputs_without_visible_calls() {
+fn opaque_compaction_windows_do_not_exempt_orphan_outputs() {
     let mut history = vec![
         json!({"type": "compaction_summary", "encrypted_content": "opaque"}),
         json!({"type": "function_call_output", "call_id": "retained", "output": "ok"}),
     ];
-    let expected = history.clone();
     normalize_history(&mut history);
-    assert_eq!(history, expected);
+    assert_eq!(
+        history,
+        vec![json!({"type": "compaction_summary", "encrypted_content": "opaque"})]
+    );
 }
 
 #[test]
@@ -90,6 +93,18 @@ fn original_image_estimate_uses_patch_dimensions_not_base64_size() {
 }
 
 #[test]
+fn encrypted_reasoning_uses_codex_model_visible_size_adjustment() {
+    let encrypted = "x".repeat(4_650);
+    let reasoning = json!({
+        "type": "reasoning",
+        "id": "rs_estimate",
+        "encrypted_content": encrypted,
+    });
+
+    assert_eq!(estimate_value_tokens(&reasoning), 710);
+}
+
+#[test]
 fn webp_extended_dimensions_are_included_in_image_budgeting() {
     let mut webp = vec![0_u8; 30];
     webp[..4].copy_from_slice(b"RIFF");
@@ -101,6 +116,196 @@ fn webp_extended_dimensions_are_included_in_image_budgeting() {
     webp[27..30].copy_from_slice(&height_minus_one[..3]);
 
     assert_eq!(image_dimensions(&webp), Some((640, 480)));
+}
+
+#[test]
+fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
+    let (root, cwd) = temporary_repository("context-snapshot");
+    std::fs::write(cwd.join("AGENTS.md"), "Keep the request accounting exact.").unwrap();
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let user = UserInput::text("inspect the context").into_message();
+    let assistant = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "working"}],
+    });
+    let reasoning = json!({
+        "type": "reasoning",
+        "id": "reasoning_context",
+        "encrypted_content": "opaque reasoning",
+    });
+    let tool_call = json!({
+        "type": "custom_tool_call",
+        "call_id": "call_context",
+        "name": "exec",
+        "input": "text('done')",
+    });
+    let tool_output = json!({
+        "type": "custom_tool_call_output",
+        "call_id": "call_context",
+        "name": "exec",
+        "output": "done",
+    });
+    let compacted = json!({
+        "type": "compaction_summary",
+        "id": "compact_context",
+        "encrypted_content": "opaque summary",
+    });
+    conversation
+        .extend([
+            user.clone(),
+            reasoning.clone(),
+            assistant.clone(),
+            tool_call.clone(),
+            tool_output.clone(),
+            compacted.clone(),
+        ])
+        .unwrap();
+
+    let [tools, system_prompt] = crate::api::context_prefix_items();
+    let environment = conversation.world_state.environment.clone();
+    let repository_instructions = conversation
+        .world_state
+        .repository_instructions
+        .clone()
+        .unwrap();
+    let sections = vec![
+        ContextSection {
+            kind: ContextKind::SystemPrompt,
+            tokens: estimate_value_tokens(system_prompt),
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::ToolCatalogue,
+            tokens: estimate_value_tokens(tools),
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::RepositoryInstructions,
+            tokens: estimate_value_tokens(&repository_instructions),
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::Environment,
+            tokens: estimate_value_tokens(&environment),
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::UserMessages,
+            tokens: estimate_value_tokens(&user),
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::AssistantMessages,
+            tokens: estimate_value_tokens(&assistant),
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::ToolActivity,
+            tokens: estimate_value_tokens(&tool_call) + estimate_value_tokens(&tool_output),
+            items: 2,
+        },
+        ContextSection {
+            kind: ContextKind::Reasoning,
+            tokens: estimate_value_tokens(&reasoning),
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::Compaction,
+            tokens: estimate_value_tokens(&compacted),
+            items: 1,
+        },
+    ];
+    let estimated_total = sections.iter().map(|section| section.tokens).sum();
+    assert_eq!(conversation.projected_tokens(&[]), estimated_total);
+    assert_eq!(
+        conversation.context_snapshot(),
+        ContextSnapshot {
+            used_tokens: estimated_total,
+            context_window: RAW_CONTEXT_WINDOW,
+            compact_at_tokens: EFFECTIVE_CONTEXT_WINDOW,
+            measured: false,
+            sections: sections.clone(),
+        }
+    );
+    conversation
+        .extend([(*tools).clone(), (*system_prompt).clone()])
+        .unwrap();
+    assert_eq!(
+        conversation.context_snapshot(),
+        ContextSnapshot {
+            used_tokens: estimated_total,
+            context_window: RAW_CONTEXT_WINDOW,
+            compact_at_tokens: EFFECTIVE_CONTEXT_WINDOW,
+            measured: false,
+            sections: sections.clone(),
+        },
+        "prefix items retained by compaction must not be counted twice"
+    );
+
+    let measured_total = estimated_total.saturating_add(10_000);
+    conversation
+        .record_usage(Some(TokenUsage {
+            input_tokens: measured_total.saturating_sub(100),
+            output_tokens: 100,
+            total_tokens: measured_total,
+            ..TokenUsage::default()
+        }))
+        .unwrap();
+    let measured = conversation.context_snapshot();
+    assert_eq!(measured.used_tokens, measured_total);
+    assert!(measured.measured);
+    assert_eq!(
+        measured
+            .sections
+            .iter()
+            .map(|section| section.tokens)
+            .sum::<u64>(),
+        measured_total
+    );
+    assert_eq!(
+        measured
+            .sections
+            .iter()
+            .map(|section| (section.kind, section.items))
+            .collect::<Vec<_>>(),
+        sections
+            .iter()
+            .map(|section| (section.kind, section.items))
+            .collect::<Vec<_>>()
+    );
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_repeated_context_snapshots() {
+    let (root, cwd) = temporary_repository("snapshot-benchmark");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let payload = "x".repeat(4_000);
+    let history = (0..350)
+        .map(|index| {
+            json!({
+                "type": "message",
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": [{"type": "input_text", "text": payload}],
+            })
+        })
+        .collect::<Vec<_>>();
+    conversation.extend(history).unwrap();
+
+    let started = std::time::Instant::now();
+    for _ in 0..500 {
+        std::hint::black_box(conversation.context_snapshot());
+    }
+    eprintln!("500 snapshots: {:?}", started.elapsed());
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -170,7 +375,7 @@ fn compaction_replaces_history_canonically_then_reinjects_world_state() {
     })];
 
     conversation
-        .replace_compacted(canonical.clone(), CompactionPlacement::PreTurn)
+        .replace_compacted(canonical.clone(), InitialContextInjection::AfterCompaction)
         .unwrap();
     assert_eq!(&conversation.items()[..canonical.len()], canonical);
     assert!(conversation.items().len() > canonical.len());
@@ -207,7 +412,7 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
     conversation
         .replace_compacted(
             vec![current_user.clone(), summary.clone()],
-            CompactionPlacement::MidTurn,
+            InitialContextInjection::BeforeLastUserMessage,
         )
         .unwrap();
     assert_eq!(conversation.items().last(), Some(&summary));
@@ -230,7 +435,51 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
 }
 
 #[test]
-fn retained_world_state_keeps_the_compact_endpoint_order_unchanged() {
+fn mid_turn_context_is_inserted_before_the_last_retained_agent_message() {
+    let (root, cwd) = temporary_repository("mid-turn-agent-message");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let world_state = conversation.world_state.items();
+    let current_user = UserInput::text("delegate this").into_message();
+    let agent_message = json!({
+        "type": "agent_message",
+        "author": "worker",
+        "recipient": "root",
+        "content": [{"type": "input_text", "text": "delegated context"}],
+    });
+    let summary = json!({
+        "type": "compaction_summary",
+        "id": "cmp_agent",
+        "encrypted_content": "opaque",
+    });
+
+    conversation
+        .replace_compacted(
+            vec![current_user, agent_message.clone(), summary.clone()],
+            InitialContextInjection::BeforeLastUserMessage,
+        )
+        .unwrap();
+
+    let agent_index = conversation
+        .items()
+        .iter()
+        .position(|item| item == &agent_message)
+        .unwrap();
+    assert!(world_state.into_iter().all(|world_item| {
+        conversation
+            .items()
+            .iter()
+            .position(|item| item == &world_item)
+            .is_some_and(|index| index < agent_index)
+    }));
+    assert_eq!(conversation.items().last(), Some(&summary));
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retained_world_state_keeps_remote_v2_history_order_unchanged() {
     let (root, cwd) = temporary_repository("retained-compaction-context");
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
@@ -249,7 +498,10 @@ fn retained_world_state_keeps_the_compact_endpoint_order_unchanged() {
     canonical.push(summary);
 
     conversation
-        .replace_compacted(canonical.clone(), CompactionPlacement::MidTurn)
+        .replace_compacted(
+            canonical.clone(),
+            InitialContextInjection::BeforeLastUserMessage,
+        )
         .unwrap();
     assert_eq!(conversation.items(), canonical);
 

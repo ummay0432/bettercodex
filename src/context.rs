@@ -1,3 +1,4 @@
+use crate::compaction::InitialContextInjection;
 use crate::input::UserInput;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
@@ -11,12 +12,16 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
+use std::io;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 64 * 1024;
+const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
+const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;
 pub(crate) const RAW_CONTEXT_WINDOW: u64 = 372_000;
 pub(crate) const EFFECTIVE_CONTEXT_WINDOW: u64 = RAW_CONTEXT_WINDOW * 95 / 100;
 const COMPACT_AT_TOKENS: u64 = EFFECTIVE_CONTEXT_WINDOW;
@@ -25,13 +30,53 @@ const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on pu
 const CRASH_GUIDANCE: &str = "The previous BetterCodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CompactionPlacement {
-    PreTurn,
-    MidTurn,
+pub(crate) enum ContextKind {
+    SystemPrompt,
+    ToolCatalogue,
+    RepositoryInstructions,
+    Environment,
+    UserMessages,
+    AssistantMessages,
+    ToolActivity,
+    Reasoning,
+    Compaction,
+    Other,
+}
+
+const CONTEXT_KINDS: [ContextKind; 10] = [
+    ContextKind::SystemPrompt,
+    ContextKind::ToolCatalogue,
+    ContextKind::RepositoryInstructions,
+    ContextKind::Environment,
+    ContextKind::UserMessages,
+    ContextKind::AssistantMessages,
+    ContextKind::ToolActivity,
+    ContextKind::Reasoning,
+    ContextKind::Compaction,
+    ContextKind::Other,
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContextSection {
+    pub(crate) kind: ContextKind,
+    /// Estimated share of the active total, calibrated to backend usage when available.
+    pub(crate) tokens: u64,
+    pub(crate) items: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContextSnapshot {
+    pub(crate) used_tokens: u64,
+    pub(crate) context_window: u64,
+    pub(crate) compact_at_tokens: u64,
+    /// Whether `used_tokens` came from Responses usage rather than only local estimation.
+    pub(crate) measured: bool,
+    pub(crate) sections: Vec<ContextSection>,
 }
 
 pub(crate) struct Conversation {
     history: Vec<Value>,
+    context_metrics: ContextMetrics,
     usage: Option<TokenUsage>,
     usage_history_estimate: Option<u64>,
     rollout: Rollout,
@@ -44,13 +89,24 @@ struct WorldState {
     repository_instructions: Option<Value>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ContextMetrics {
+    estimated_tokens: u64,
+    tokens: [u64; CONTEXT_KINDS.len()],
+    items: [usize; CONTEXT_KINDS.len()],
+    has_tools: bool,
+    has_system_prompt: bool,
+}
+
 impl Conversation {
     pub(crate) fn new(cwd: &Path, mut rollout: Rollout) -> Result<Self> {
         let world_state = WorldState::load(cwd)?;
         let history = world_state.items();
         rollout.replace_history(&history, HistoryReplacement::Initial)?;
+        let context_metrics = ContextMetrics::from_history(&history, &world_state);
         Ok(Self {
             history,
+            context_metrics,
             usage: None,
             usage_history_estimate: None,
             rollout,
@@ -68,8 +124,10 @@ impl Conversation {
             ..
         } = loaded;
         let world_state = WorldState::load(cwd)?;
+        let context_metrics = ContextMetrics::from_history(&history, &world_state);
         let mut conversation = Self {
             history,
+            context_metrics,
             usage,
             usage_history_estimate,
             rollout,
@@ -111,6 +169,7 @@ impl Conversation {
             return Ok(());
         }
         self.rollout.append_history(&items)?;
+        self.context_metrics.extend(&items, &self.world_state);
         self.history.extend(items);
         Ok(())
     }
@@ -118,12 +177,13 @@ impl Conversation {
     pub(crate) fn replace_compacted(
         &mut self,
         mut history: Vec<Value>,
-        placement: CompactionPlacement,
+        initial_context_injection: InitialContextInjection,
     ) -> Result<()> {
         self.world_state
-            .insert_missing_into(&mut history, placement);
+            .insert_missing_into(&mut history, initial_context_injection);
         self.rollout
             .replace_history(&history, HistoryReplacement::Compaction)?;
+        self.context_metrics = ContextMetrics::from_history(&history, &self.world_state);
         self.history = history;
         self.usage = None;
         self.usage_history_estimate = None;
@@ -138,7 +198,7 @@ impl Conversation {
         let Some(usage) = usage else {
             return Ok(());
         };
-        let history_estimate = estimated_tokens(&self.history);
+        let history_estimate = self.context_metrics.estimated_tokens;
         self.rollout.record_usage(&usage, history_estimate)?;
         self.usage = Some(usage);
         self.usage_history_estimate = Some(history_estimate);
@@ -146,17 +206,81 @@ impl Conversation {
     }
 
     pub(crate) fn context_tokens(&self) -> Option<u64> {
+        self.context_tokens_with_history_estimate(self.context_metrics.estimated_tokens)
+    }
+
+    fn context_tokens_with_history_estimate(&self, history_estimate: u64) -> Option<u64> {
         let usage = self.usage.as_ref()?;
         let baseline = self.usage_history_estimate?;
-        let growth = estimated_tokens(&self.history).saturating_sub(baseline);
+        let growth = history_estimate.saturating_sub(baseline);
         Some(usage.active_context_tokens().saturating_add(growth))
+    }
+
+    pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
+        let [tools_item, system_prompt_item] = crate::api::context_prefix_items();
+        let mut tokens = self.context_metrics.tokens;
+        let mut items = self.context_metrics.items;
+        if !self.context_metrics.has_tools {
+            record_context_item(
+                &mut tokens,
+                &mut items,
+                ContextKind::ToolCatalogue,
+                tools_item,
+            );
+        }
+        if !self.context_metrics.has_system_prompt {
+            record_context_item(
+                &mut tokens,
+                &mut items,
+                ContextKind::SystemPrompt,
+                system_prompt_item,
+            );
+        }
+
+        let mut sections = CONTEXT_KINDS
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| items[*index] > 0)
+            .map(|(index, kind)| ContextSection {
+                kind,
+                tokens: tokens[index],
+                items: items[index],
+            })
+            .collect::<Vec<_>>();
+        let estimated_total = sections.iter().map(|section| section.tokens).sum();
+        let measured_total =
+            self.context_tokens_with_history_estimate(self.context_metrics.estimated_tokens);
+        let used_tokens = measured_total.unwrap_or(estimated_total);
+        if measured_total.is_some() {
+            scale_context_sections(&mut sections, used_tokens);
+        }
+
+        ContextSnapshot {
+            used_tokens,
+            context_window: RAW_CONTEXT_WINDOW,
+            compact_at_tokens: EFFECTIVE_CONTEXT_WINDOW,
+            measured: measured_total.is_some(),
+            sections,
+        }
     }
 
     pub(crate) fn projected_tokens(&self, additional: &[Value]) -> u64 {
         let additional_tokens = estimated_tokens(additional);
         self.context_tokens()
-            .unwrap_or_else(|| estimated_tokens(&self.history))
+            .unwrap_or_else(|| self.estimated_context_tokens())
             .saturating_add(additional_tokens)
+    }
+
+    fn estimated_context_tokens(&self) -> u64 {
+        let [tools_item, system_prompt_item] = crate::api::context_prefix_items();
+        let mut estimate = self.context_metrics.estimated_tokens;
+        if !self.context_metrics.has_tools {
+            estimate = estimate.saturating_add(estimate_value_tokens(tools_item));
+        }
+        if !self.context_metrics.has_system_prompt {
+            estimate = estimate.saturating_add(estimate_value_tokens(system_prompt_item));
+        }
+        estimate
     }
 
     pub(crate) fn needs_compaction(&self) -> bool {
@@ -190,6 +314,7 @@ impl Conversation {
         }
         self.rollout
             .replace_history(&normalized, HistoryReplacement::Normalization)?;
+        self.context_metrics = ContextMetrics::from_history(&normalized, &self.world_state);
         self.history = normalized;
         self.usage = None;
         self.usage_history_estimate = None;
@@ -223,17 +348,21 @@ impl WorldState {
         items
     }
 
-    fn insert_missing_into(&self, history: &mut Vec<Value>, placement: CompactionPlacement) {
+    fn insert_missing_into(
+        &self,
+        history: &mut Vec<Value>,
+        initial_context_injection: InitialContextInjection,
+    ) {
         let missing = self.missing_from(history);
         if missing.is_empty() {
             return;
         }
-        match placement {
-            CompactionPlacement::PreTurn => history.extend(missing),
-            CompactionPlacement::MidTurn => {
+        match initial_context_injection {
+            InitialContextInjection::AfterCompaction => history.extend(missing),
+            InitialContextInjection::BeforeLastUserMessage => {
                 let insertion = history
                     .iter()
-                    .rposition(is_user_message)
+                    .rposition(is_initial_context_boundary)
                     .or_else(|| history.iter().rposition(is_compaction_item))
                     .unwrap_or(history.len());
                 history.splice(insertion..insertion, missing);
@@ -259,9 +388,98 @@ fn same_model_visible_message(left: &Value, right: &Value) -> bool {
         .all(|field| left.get(field) == right.get(field))
 }
 
+fn same_additional_tools_item(item: &Value, expected: &Value) -> bool {
+    ["type", "role", "tools"]
+        .into_iter()
+        .all(|field| item.get(field) == expected.get(field))
+}
+
+fn same_system_prompt_item(item: &Value, expected: &Value) -> bool {
+    item.get("type") == expected.get("type")
+        && item.get("role") == expected.get("role")
+        && item.pointer("/content/0/text") == expected.pointer("/content/0/text")
+}
+
+fn context_kind(item: &Value) -> ContextKind {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => match item.get("role").and_then(Value::as_str) {
+            Some("user") => ContextKind::UserMessages,
+            Some("assistant") => ContextKind::AssistantMessages,
+            _ => ContextKind::Other,
+        },
+        Some("reasoning") => ContextKind::Reasoning,
+        Some("compaction" | "compaction_summary") => ContextKind::Compaction,
+        Some(item_type) if item_type.ends_with("_call") || item_type.ends_with("_call_output") => {
+            ContextKind::ToolActivity
+        }
+        _ => ContextKind::Other,
+    }
+}
+
+fn record_context_item(
+    tokens: &mut [u64; CONTEXT_KINDS.len()],
+    items: &mut [usize; CONTEXT_KINDS.len()],
+    kind: ContextKind,
+    item: &Value,
+) -> u64 {
+    let index = context_kind_index(kind);
+    let estimated = estimate_value_tokens(item);
+    tokens[index] = tokens[index].saturating_add(estimated);
+    items[index] = items[index].saturating_add(1);
+    estimated
+}
+
+fn context_kind_index(kind: ContextKind) -> usize {
+    match kind {
+        ContextKind::SystemPrompt => 0,
+        ContextKind::ToolCatalogue => 1,
+        ContextKind::RepositoryInstructions => 2,
+        ContextKind::Environment => 3,
+        ContextKind::UserMessages => 4,
+        ContextKind::AssistantMessages => 5,
+        ContextKind::ToolActivity => 6,
+        ContextKind::Reasoning => 7,
+        ContextKind::Compaction => 8,
+        ContextKind::Other => 9,
+    }
+}
+
+fn scale_context_sections(sections: &mut [ContextSection], target: u64) {
+    let estimated = sections.iter().map(|section| section.tokens).sum::<u64>();
+    if estimated == 0 || estimated == target {
+        return;
+    }
+
+    let denominator = u128::from(estimated);
+    let mut allocated = 0_u64;
+    let mut remainders = Vec::with_capacity(sections.len());
+    for (index, section) in sections.iter_mut().enumerate() {
+        let scaled = u128::from(section.tokens) * u128::from(target);
+        section.tokens = u64::try_from(scaled / denominator).unwrap_or(u64::MAX);
+        allocated = allocated.saturating_add(section.tokens);
+        remainders.push((index, scaled % denominator));
+    }
+    remainders.sort_by(|(left_index, left), (right_index, right)| {
+        right.cmp(left).then_with(|| left_index.cmp(right_index))
+    });
+    let remaining = usize::try_from(target.saturating_sub(allocated)).unwrap_or(usize::MAX);
+    for (index, _) in remainders.into_iter().take(remaining) {
+        sections[index].tokens = sections[index].tokens.saturating_add(1);
+    }
+}
+
 fn is_user_message(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("message")
         && item.get("role").and_then(Value::as_str) == Some("user")
+}
+
+fn is_initial_context_boundary(item: &Value) -> bool {
+    is_user_message(item)
+        || (item.get("type").and_then(Value::as_str) == Some("agent_message")
+            && !item
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.starts_with("Message Type: FINAL_ANSWER\n")))
 }
 
 fn is_compaction_item(item: &Value) -> bool {
@@ -408,43 +626,134 @@ fn find_project_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn estimated_tokens(items: &[Value]) -> u64 {
-    items.iter().map(estimate_value_tokens).sum()
+    items
+        .iter()
+        .map(estimate_value_tokens)
+        .fold(0_u64, u64::saturating_add)
 }
 
 fn estimate_value_tokens(value: &Value) -> u64 {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) => 1,
-        Value::String(text) => text.len().div_ceil(4) as u64,
-        Value::Array(values) => values.iter().map(estimate_value_tokens).sum(),
-        Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str) == Some("input_image") {
-                return object
-                    .get("image_url")
-                    .and_then(Value::as_str)
-                    .map(estimate_image_tokens)
-                    .unwrap_or(4_096);
+    let item_type = value.get("type").and_then(Value::as_str);
+    if matches!(
+        item_type,
+        Some("reasoning" | "compaction" | "compaction_summary" | "context_compaction")
+    ) && let Some(encrypted) = value.get("encrypted_content").and_then(Value::as_str)
+    {
+        return estimate_reasoning_bytes(encrypted.len()).div_ceil(4);
+    }
+
+    let mut bytes = serde_json::to_vec(value)
+        .map(|serialized| serialized.len() as u64)
+        .unwrap_or_default();
+    visit_model_content(
+        value,
+        &mut |content| match content.get("type").and_then(Value::as_str) {
+            Some("input_image") => {
+                let Some(image_url) = content.get("image_url").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(payload) = base64_data_url_payload(image_url, "image/") else {
+                    return;
+                };
+                let replacement =
+                    if content.get("detail").and_then(Value::as_str) == Some("original") {
+                        estimate_image_tokens(image_url).saturating_mul(4)
+                    } else {
+                        RESIZED_IMAGE_BYTES_ESTIMATE
+                    };
+                bytes = bytes
+                    .saturating_sub(payload.len() as u64)
+                    .saturating_add(replacement);
             }
-            object
-                .iter()
-                .map(|(key, value)| key.len().div_ceil(4) as u64 + estimate_value_tokens(value))
-                .sum()
+            Some("input_audio") => {
+                let Some(audio_url) = content.get("audio_url").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(payload) = base64_data_url_payload(audio_url, "audio/") else {
+                    return;
+                };
+                let replacement =
+                    u64::try_from(codex_utils_audio::estimate_audio_token_count(audio_url))
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(4);
+                bytes = bytes
+                    .saturating_sub(payload.len() as u64)
+                    .saturating_add(replacement);
+            }
+            Some("encrypted_content")
+                if matches!(item_type, Some("function_call_output" | "agent_message")) =>
+            {
+                let Some(encrypted) = content.get("encrypted_content").and_then(Value::as_str)
+                else {
+                    return;
+                };
+                bytes = bytes
+                    .saturating_sub(encrypted.len() as u64)
+                    .saturating_add((encrypted.len() as u64).saturating_mul(9).div_ceil(16));
+            }
+            _ => {}
+        },
+    );
+    bytes.div_ceil(4)
+}
+
+fn estimate_reasoning_bytes(encoded_len: usize) -> u64 {
+    (encoded_len as u64)
+        .saturating_mul(3)
+        .checked_div(4)
+        .unwrap_or_default()
+        .saturating_sub(650)
+}
+
+fn visit_model_content(value: &Value, visitor: &mut impl FnMut(&Value)) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                visit_model_content(value, visitor);
+            }
         }
+        Value::Object(object) => {
+            visitor(value);
+            for value in object.values() {
+                visit_model_content(value, visitor);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
+fn base64_data_url_payload<'a>(url: &'a str, media_type_prefix: &str) -> Option<&'a str> {
+    if !url
+        .get(.."data:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return None;
+    }
+    let (metadata, payload) = url.split_once(',')?;
+    let mut metadata_parts = metadata.get("data:".len()..)?.split(';');
+    let mime_type = metadata_parts.next().unwrap_or_default();
+    let has_base64_marker = metadata_parts.any(|part| part.eq_ignore_ascii_case("base64"));
+    mime_type
+        .get(..media_type_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(media_type_prefix))
+        .then_some(())?;
+    has_base64_marker.then_some(payload)
+}
+
 fn estimate_image_tokens(image_url: &str) -> u64 {
-    let Some((_, encoded)) = image_url.split_once(";base64,") else {
-        return 4_096;
+    let Some(encoded) = base64_data_url_payload(image_url, "image/") else {
+        return RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4);
     };
     use base64::Engine;
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return 4_096;
+        return RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4);
     };
     image_dimensions(&bytes)
         .map(|(width, height)| {
             u64::from(width.div_ceil(32)).saturating_mul(u64::from(height.div_ceil(32)))
         })
-        .unwrap_or_else(|| (bytes.len().div_ceil(1024) as u64).max(1))
+        .map(|patches| patches.min(ORIGINAL_IMAGE_MAX_PATCHES))
+        .unwrap_or_else(|| RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4))
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -518,7 +827,6 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn normalize_history(items: &mut Vec<Value>) {
-    let has_compaction = items.iter().any(is_compaction_item);
     let calls = items
         .iter()
         .filter_map(call_descriptor)
@@ -530,7 +838,7 @@ fn normalize_history(items: &mut Vec<Value>) {
             return true;
         };
         if !calls.contains_key(call_id) {
-            return has_compaction;
+            return false;
         }
         if item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
             && calls

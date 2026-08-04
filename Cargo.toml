@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow = "1"
 base64 = "0.22.1"
 codex-ansi-escape = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-client = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-code-mode-protocol = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-protocol = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-shell-command = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
@@ -29,6 +30,7 @@ portable-pty = "0.9.0"
 pulldown-cmark = { version = "0.10", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color", "unstable-rendered-line-info"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+schemars = "0.8.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 supports-color = "3.0.2"
