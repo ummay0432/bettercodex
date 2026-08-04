@@ -67,6 +67,18 @@ a current, demonstrated product requirement cannot be met in core.
 - Prefer direct core changes over monkeypatches, global proxies, generated
   overlays, duplicate package identities, or installation-time rewriting.
 
+### Keep upstream repository automation inert until it is tailored
+
+The first private push inherited OpenAI's Dependabot schedule and immediately
+created update branches, pull requests, and dozens of CI jobs. That automation
+targets upstream's release process and can consume private-repository Actions
+resources without helping a one-operator downstream.
+
+The reset therefore removed `.github/dependabot.yaml` and disabled GitHub
+Actions at the repository level. Keep the workflow sources for future use, but
+re-enable automation only after selecting the checks, schedules, permissions,
+and cost appropriate for BetterCodex.
+
 ### Preserve native ChatGPT authentication
 
 Use Codex's own login, account selection, request identity, catalog, transport,
