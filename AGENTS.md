@@ -118,6 +118,9 @@ name the actual file, source, and required action. Do not hide them behind
 phrases such as “general behavior,” “project context,” “take precedence,” or
 “handle appropriately.”
 
+Do not alter Codex-derived agent-facing context in `prompts/*.md`, tool
+descriptions, or model-visible errors without explicit user permission.
+
 Before editing `AGENTS.md`, read `docs/writing-a-good-claude-md.md`. Keep this
 file to facts and instructions useful in almost every BetterCodex session. Put
 details needed only for inference work in `docs/gpt-5.6-sol-harness.md`, and put
