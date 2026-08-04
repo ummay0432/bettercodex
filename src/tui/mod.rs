@@ -13,12 +13,14 @@ use crate::agent::TurnHandle;
 use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
+use crate::prompt_history::PromptHistory;
 use anyhow::Context;
 use anyhow::Result;
 use crossterm::event::EventStream;
 use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::pending;
 use std::path::PathBuf;
@@ -38,7 +40,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(32);
 const MAX_READY_AGENT_EVENTS: usize = 4_096;
 
 pub(crate) async fn run(agent: Agent, cwd: PathBuf) -> Result<()> {
-    let mut runtime = Runtime::new(agent, cwd);
+    let mut runtime = Runtime::new(agent, cwd)?;
     let mut session = terminal::TerminalSession::enter()?;
     runtime
         .view
@@ -59,17 +61,24 @@ struct Runtime {
     context_snapshot: ContextSnapshot,
     file_search: FileSearchManager,
     file_search_updates: UnboundedReceiver<FileSearchUpdate>,
+    prompt_history: Option<PromptHistory>,
     view: View,
 }
 
 impl Runtime {
-    fn new(agent: Agent, cwd: PathBuf) -> Self {
+    fn new(agent: Agent, cwd: PathBuf) -> Result<Self> {
         let mut view = View::new(&cwd);
         view.set_context_tokens(agent.context_tokens());
+        let resumed_prompts = agent.prompt_history();
+        let prompt_history = PromptHistory::open(agent.session_id())?;
+        view.seed_prompt_history(prompt_history_for_session(
+            prompt_history.entries(),
+            resumed_prompts,
+        ));
         let context_snapshot = agent.context_snapshot();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
-        Self {
+        Ok(Self {
             view,
             cwd,
             agent: Some(agent),
@@ -81,7 +90,8 @@ impl Runtime {
             context_snapshot,
             file_search,
             file_search_updates,
-        }
+            prompt_history: Some(prompt_history),
+        })
     }
 
     async fn event_loop(&mut self, terminal: &mut terminal::AppTerminal) -> Result<()> {
@@ -177,6 +187,7 @@ impl Runtime {
         match action {
             Action::None => {}
             Action::Submit(prompt) => {
+                self.persist_prompt(&prompt);
                 if self.turn.is_some() {
                     if self
                         .turn_handle
@@ -188,14 +199,6 @@ impl Runtime {
                         self.queued.push_back(prompt);
                         self.view.set_queued(self.queued.len());
                     }
-                } else {
-                    self.start_turn(prompt);
-                }
-            }
-            Action::Queue(prompt) => {
-                if self.turn.is_some() {
-                    self.queued.push_back(prompt);
-                    self.view.set_queued(self.queued.len());
                 } else {
                     self.start_turn(prompt);
                 }
@@ -226,6 +229,17 @@ impl Runtime {
             }
         }
         Ok(false)
+    }
+
+    fn persist_prompt(&mut self, prompt: &str) {
+        let Some(history) = self.prompt_history.as_mut() else {
+            return;
+        };
+        if let Err(error) = history.append(prompt) {
+            self.prompt_history = None;
+            self.view
+                .add_notice(format!("Prompt history could not be saved: {error:#}"));
+        }
     }
 
     fn start_turn(&mut self, prompt: String) {
@@ -270,6 +284,18 @@ impl Runtime {
         }
         self.view.handle_agent_event(event);
     }
+}
+
+fn prompt_history_for_session(persistent: &[String], resumed: Vec<String>) -> Vec<String> {
+    let resumed_set = resumed.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut history = persistent
+        .iter()
+        .filter(|prompt| !resumed_set.contains(prompt.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    drop(resumed_set);
+    history.extend(resumed);
+    history
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

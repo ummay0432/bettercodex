@@ -1,6 +1,7 @@
 use super::MAX_READY_AGENT_EVENTS;
 use super::ReceiverState;
 use super::drain_ready_agent_events;
+use super::prompt_history_for_session;
 use super::view::View;
 use crate::events::AgentEvent;
 use ratatui::Terminal;
@@ -8,6 +9,27 @@ use ratatui::backend::TestBackend;
 use std::path::Path;
 use std::time::Instant;
 use tokio::sync::mpsc::unbounded_channel;
+
+#[test]
+fn resumed_prompts_precede_global_duplicates_during_recall() {
+    let persistent = vec![
+        "global older".to_string(),
+        "resumed older".to_string(),
+        "global newer".to_string(),
+        "resumed newer".to_string(),
+    ];
+    let resumed = vec!["resumed older".to_string(), "resumed newer".to_string()];
+
+    assert_eq!(
+        prompt_history_for_session(&persistent, resumed),
+        [
+            "global older",
+            "global newer",
+            "resumed older",
+            "resumed newer",
+        ]
+    );
+}
 
 #[test]
 fn ready_stream_events_are_drained_before_the_terminal_frame() {

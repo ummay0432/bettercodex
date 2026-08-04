@@ -2,6 +2,8 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+
 #[derive(Debug, Default)]
 pub(super) struct Editor {
     text: String,
@@ -56,6 +58,12 @@ impl Editor {
         self.saved_draft.clear();
     }
 
+    pub(super) fn seed_history(&mut self, history: impl IntoIterator<Item = String>) {
+        for text in history {
+            self.remember(&text);
+        }
+    }
+
     pub(super) fn history_previous(&mut self) {
         if self.history.is_empty() {
             return;
@@ -90,14 +98,15 @@ impl Editor {
         self.history_index.is_some()
     }
 
-    pub(super) fn is_on_first_visual_line(&self, width: u16) -> bool {
-        let ranges = visual_ranges(&self.text, width.max(1) as usize);
-        line_for_cursor(&ranges, self.cursor) == 0
+    pub(super) fn can_recall_older(&self) -> bool {
+        !self.history.is_empty()
+            && (self.text.is_empty()
+                || (self.is_browsing_history()
+                    && (self.cursor == 0 || self.cursor == self.text.len())))
     }
 
-    pub(super) fn is_on_last_visual_line(&self, width: u16) -> bool {
-        let ranges = visual_ranges(&self.text, width.max(1) as usize);
-        line_for_cursor(&ranges, self.cursor) + 1 == ranges.len()
+    pub(super) fn can_recall_newer(&self) -> bool {
+        self.is_browsing_history() && (self.cursor == 0 || self.cursor == self.text.len())
     }
 
     pub(super) fn insert(&mut self, value: &str) {
@@ -140,23 +149,7 @@ impl Editor {
 
     pub(super) fn delete_previous_word(&mut self) {
         self.leave_history();
-        let mut start = self.cursor;
-        while start > 0 {
-            let previous = previous_boundary(&self.text, start);
-            let grapheme = &self.text[previous..start];
-            if !grapheme.chars().all(char::is_whitespace) {
-                break;
-            }
-            start = previous;
-        }
-        while start > 0 {
-            let previous = previous_boundary(&self.text, start);
-            let grapheme = &self.text[previous..start];
-            if grapheme.chars().all(char::is_whitespace) {
-                break;
-            }
-            start = previous;
-        }
+        let start = beginning_of_previous_word(&self.text, self.cursor);
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
         self.preferred_column = None;
@@ -196,42 +189,12 @@ impl Editor {
     }
 
     pub(super) fn move_word_left(&mut self) {
-        let mut cursor = self.cursor;
-        while cursor > 0 {
-            let previous = previous_boundary(&self.text, cursor);
-            if !self.text[previous..cursor].chars().all(char::is_whitespace) {
-                break;
-            }
-            cursor = previous;
-        }
-        while cursor > 0 {
-            let previous = previous_boundary(&self.text, cursor);
-            if self.text[previous..cursor].chars().all(char::is_whitespace) {
-                break;
-            }
-            cursor = previous;
-        }
-        self.cursor = cursor;
+        self.cursor = beginning_of_previous_word(&self.text, self.cursor);
         self.preferred_column = None;
     }
 
     pub(super) fn move_word_right(&mut self) {
-        let mut cursor = self.cursor;
-        while cursor < self.text.len() {
-            let next = next_boundary(&self.text, cursor);
-            if self.text[cursor..next].chars().all(char::is_whitespace) {
-                break;
-            }
-            cursor = next;
-        }
-        while cursor < self.text.len() {
-            let next = next_boundary(&self.text, cursor);
-            if !self.text[cursor..next].chars().all(char::is_whitespace) {
-                break;
-            }
-            cursor = next;
-        }
-        self.cursor = cursor;
+        self.cursor = end_of_next_word(&self.text, self.cursor);
         self.preferred_column = None;
     }
 
@@ -291,6 +254,93 @@ impl Editor {
         self.history_index = None;
         self.saved_draft.clear();
     }
+}
+
+fn is_word_separator(character: char) -> bool {
+    WORD_SEPARATORS.contains(character)
+}
+
+fn split_word_pieces(run: &str) -> Vec<(usize, &str)> {
+    let mut pieces = Vec::new();
+    for (segment_start, segment) in run.split_word_bound_indices() {
+        let mut piece_start = 0;
+        let mut characters = segment.char_indices();
+        let Some((_, first_character)) = characters.next() else {
+            continue;
+        };
+        let mut in_separator = is_word_separator(first_character);
+        for (index, character) in characters {
+            let is_separator = is_word_separator(character);
+            if is_separator != in_separator {
+                pieces.push((segment_start + piece_start, &segment[piece_start..index]));
+                piece_start = index;
+                in_separator = is_separator;
+            }
+        }
+        pieces.push((segment_start + piece_start, &segment[piece_start..]));
+    }
+    pieces
+}
+
+fn beginning_of_previous_word(text: &str, cursor: usize) -> usize {
+    let prefix = &text[..cursor];
+    let Some((first_non_whitespace, character)) = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_whitespace())
+    else {
+        return 0;
+    };
+    let run_start = prefix[..first_non_whitespace]
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let run_end = first_non_whitespace + character.len_utf8();
+    let mut pieces = split_word_pieces(&prefix[run_start..run_end])
+        .into_iter()
+        .rev()
+        .peekable();
+    let Some((piece_start, piece)) = pieces.next() else {
+        return run_start;
+    };
+    let mut start = run_start + piece_start;
+    if piece.chars().all(is_word_separator) {
+        while let Some((index, piece)) = pieces.peek() {
+            if !piece.chars().all(is_word_separator) {
+                break;
+            }
+            start = run_start + *index;
+            pieces.next();
+        }
+    }
+    start
+}
+
+fn end_of_next_word(text: &str, cursor: usize) -> usize {
+    let suffix = &text[cursor..];
+    let Some(first_non_whitespace) = suffix.find(|character: char| !character.is_whitespace())
+    else {
+        return text.len();
+    };
+    let run = &suffix[first_non_whitespace..];
+    let run = &run[..run.find(char::is_whitespace).unwrap_or(run.len())];
+    let mut pieces = split_word_pieces(run).into_iter().peekable();
+    let Some((piece_start, piece)) = pieces.next() else {
+        return cursor + first_non_whitespace;
+    };
+    let word_start = cursor + first_non_whitespace + piece_start;
+    let mut end = word_start + piece.len();
+    if piece.chars().all(is_word_separator) {
+        while let Some((index, piece)) = pieces.peek() {
+            if !piece.chars().all(is_word_separator) {
+                break;
+            }
+            end = cursor + first_non_whitespace + *index + piece.len();
+            pieces.next();
+        }
+    }
+    end
 }
 
 fn visual_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
@@ -457,6 +507,55 @@ mod tests {
         assert_eq!(editor.text(), "first");
         editor.history_next();
         assert_eq!(editor.text(), "draft");
+    }
+
+    #[test]
+    fn seeded_multiline_history_cycles_at_text_boundaries() {
+        let mut editor = Editor::default();
+        editor.seed_history([
+            "older\nmultiline".to_string(),
+            "newer\nmultiline".to_string(),
+        ]);
+
+        assert!(editor.can_recall_older());
+        editor.history_previous();
+        assert_eq!(editor.text(), "newer\nmultiline");
+        assert!(editor.can_recall_older());
+        editor.history_previous();
+        assert_eq!(editor.text(), "older\nmultiline");
+        assert!(editor.can_recall_newer());
+        editor.history_next();
+        assert_eq!(editor.text(), "newer\nmultiline");
+    }
+
+    #[test]
+    fn word_navigation_uses_codex_unicode_and_separator_boundaries() {
+        let mut editor = Editor::default();
+        editor.insert("alpha.beta gamma");
+
+        editor.move_word_left();
+        assert_eq!(editor.cursor(), 11);
+        editor.move_word_left();
+        assert_eq!(editor.cursor(), 6);
+        editor.move_word_left();
+        assert_eq!(editor.cursor(), 5);
+        editor.move_word_left();
+        assert_eq!(editor.cursor(), 0);
+
+        editor.move_word_right();
+        assert_eq!(editor.cursor(), 5);
+        editor.move_word_right();
+        assert_eq!(editor.cursor(), 6);
+        editor.move_word_right();
+        assert_eq!(editor.cursor(), 10);
+        editor.move_word_right();
+        assert_eq!(editor.cursor(), editor.text().len());
+
+        editor.set_text("你好世界");
+        editor.move_word_left();
+        assert_eq!(editor.cursor(), 9);
+        editor.move_word_right();
+        assert_eq!(editor.cursor(), editor.text().len());
     }
 
     #[test]

@@ -213,6 +213,16 @@ impl Conversation {
         &self.history
     }
 
+    pub(crate) fn prompt_history(&self) -> Vec<String> {
+        self.history
+            .iter()
+            .filter(|item| is_user_message(item) && !is_contextual_user_message(item))
+            .filter_map(message_text)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     pub(crate) fn record_usage(
         &mut self,
         usage: Option<TokenUsage>,

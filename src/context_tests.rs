@@ -1,5 +1,6 @@
 use super::*;
 use crate::compaction::InitialContextInjection;
+use crate::input::UserInput;
 use crate::rollout::ResumeSelector;
 
 fn temporary_repository(name: &str) -> (PathBuf, PathBuf) {
@@ -1006,5 +1007,32 @@ fn compaction_boundary_is_exactly_ninety_five_percent() {
     assert!(conversation.needs_compaction_with(&[json!("four")]));
 
     drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resumed_prompt_history_contains_user_inputs_but_not_context_notices() {
+    let (root, cwd) = temporary_repository("prompt-history");
+    let rollout_root = root.join("state");
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    conversation
+        .extend([UserInput::text("older prompt").into_message()])
+        .unwrap();
+    conversation.mark_interrupted().unwrap();
+    conversation
+        .extend([UserInput::text("newer prompt").into_message()])
+        .unwrap();
+    assert_eq!(
+        conversation.prompt_history(),
+        ["older prompt", "newer prompt"]
+    );
+    drop(conversation);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    let resumed = Conversation::resume(&cwd, loaded).unwrap();
+    assert_eq!(resumed.prompt_history(), ["older prompt", "newer prompt"]);
+    drop(resumed);
     std::fs::remove_dir_all(root).unwrap();
 }

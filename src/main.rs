@@ -5,6 +5,7 @@ mod compaction;
 mod context;
 mod events;
 mod input;
+mod prompt_history;
 mod rollout;
 mod tools;
 mod tui;

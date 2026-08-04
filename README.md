@@ -51,13 +51,16 @@ usage. Finalized cells stay in the terminal's normal scrollback; BetterCodex
 does not take over the alternate screen. Shell and patch tools run with the
 invoking user's permissions.
 
-The core shortcuts are:
+Prompt recall uses Codex's `${CODEX_HOME:-$HOME/.codex}/history.jsonl`, so
+existing Codex prompts and resumed BetterCodex prompts are available in the
+composer. The core shortcuts are:
 
-- `Enter` submits, or steers an active turn; `Tab` queues while working and
-  submits while idle.
+- `Enter` submits, or steers an active turn. `Tab` never sends or queues a
+  prompt; it is used only to accept an active completion.
 - `Shift+Enter` or `Ctrl+J` inserts a newline.
 - `Esc` interrupts an active turn; `Ctrl+C` exits.
-- `Up` and `Down` restore prompt history.
+- `Up` and `Down` move through older and newer prompt history.
+- `Option+Left` and `Option+Right` jump by word on macOS (`Alt` elsewhere).
 - The mouse wheel and the terminal's normal scrollback controls browse the
   finalized transcript.
 - `?` on an empty composer opens the shortcut reference.

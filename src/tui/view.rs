@@ -85,7 +85,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 pub(super) enum Action {
     None,
     Submit(String),
-    Queue(String),
     Cancel,
     Clear,
     ShowContext,
@@ -304,6 +303,14 @@ impl View {
                 background,
             });
         }
+    }
+
+    pub(super) fn seed_prompt_history(&mut self, history: impl IntoIterator<Item = String>) {
+        self.editor.seed_history(history);
+    }
+
+    pub(super) fn add_notice(&mut self, notice: impl Into<String>) {
+        self.entries.push(TranscriptEntry::Notice(notice.into()));
     }
 
     pub(super) fn take_clear_request(&mut self) -> bool {
@@ -622,7 +629,7 @@ impl View {
                         .set_text(format!("/{}", slash_matches[selection].name));
                     self.dismissed_slash = None;
                     self.slash_selection = selection;
-                    return self.submit_action(false);
+                    return self.submit_action();
                 }
                 KeyCode::Tab => {
                     let selection = self.slash_selection.min(slash_matches.len() - 1);
@@ -650,8 +657,7 @@ impl View {
         let previous_text = self.editor.text().to_string();
         match key.code {
             KeyCode::Enter if shift || alt || control => self.editor.insert_newline(),
-            KeyCode::Enter => return self.submit_action(false),
-            KeyCode::Tab if !self.editor.is_empty() => return self.submit_action(self.busy),
+            KeyCode::Enter => return self.submit_action(),
             KeyCode::Char('j') if control => self.editor.insert_newline(),
             KeyCode::Char('d') if control && self.editor.is_empty() => return Action::Quit,
             KeyCode::Char('d') if control => self.editor.delete(),
@@ -661,6 +667,8 @@ impl View {
             KeyCode::Char('k') if control => self.editor.kill_to_line_end(),
             KeyCode::Char('w') if control => self.editor.delete_previous_word(),
             KeyCode::Char('l') if control => {}
+            KeyCode::Char('b') if alt && !control => self.editor.move_word_left(),
+            KeyCode::Char('f') if alt && !control => self.editor.move_word_right(),
             KeyCode::Char(character) if (!control && !alt) || (control && alt) => {
                 let mut bytes = [0; 4];
                 self.editor.insert(character.encode_utf8(&mut bytes));
@@ -673,17 +681,10 @@ impl View {
             KeyCode::Right => self.editor.move_right(),
             KeyCode::Home => self.editor.move_home(),
             KeyCode::End => self.editor.move_end(),
-            KeyCode::Up
-                if self
-                    .editor
-                    .is_on_first_visual_line(self.composer_text_width) =>
-            {
+            KeyCode::Up if self.editor.can_recall_older() => {
                 self.editor.history_previous();
             }
-            KeyCode::Down
-                if self.editor.is_browsing_history()
-                    && self.editor.is_on_last_visual_line(self.composer_text_width) =>
-            {
+            KeyCode::Down if self.editor.can_recall_newer() => {
                 self.editor.history_next();
             }
             KeyCode::Up => self.editor.move_vertical(-1, self.composer_text_width),
@@ -734,7 +735,7 @@ impl View {
         }
     }
 
-    fn submit_action(&mut self, queued: bool) -> Action {
+    fn submit_action(&mut self) -> Action {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
@@ -752,7 +753,7 @@ impl View {
             "/context" => Action::ShowContext,
             "/help" => {
                 self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · Tab queue · @ files · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
+                    "Enter submit/steer · Up/Down history · Option+Left/Right jump by word · @ files · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
                         .to_string(),
                 ));
                 Action::None
@@ -761,7 +762,6 @@ impl View {
                 self.overlay = Some(Overlay::Tools(ToolCatalogueView::new()));
                 Action::None
             }
-            _ if queued => Action::Queue(prompt),
             _ => Action::Submit(prompt),
         }
     }
@@ -1150,7 +1150,7 @@ impl View {
         let lines = vec![
             shortcut_line("Enter", "submit prompt"),
             shortcut_line("Enter while working", "send steering input"),
-            shortcut_line("Tab while working", "queue next prompt"),
+            shortcut_line("Option+Left / Right", "jump by word"),
             shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
             shortcut_line("@", "find and insert a file path"),
             shortcut_line("Esc", "interrupt active turn"),
@@ -3138,6 +3138,82 @@ mod tests {
             Action::None
         );
         assert_eq!(view.editor.text(), "/tools");
+    }
+
+    #[test]
+    fn tab_never_submits_or_queues_plain_composer_text() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("keep this draft");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "keep this draft");
+
+        view.busy = true;
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "keep this draft");
+    }
+
+    #[test]
+    fn up_and_down_cycle_seeded_history_including_key_repeats() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.seed_prompt_history([
+            "older\nmultiline prompt".to_string(),
+            "newer\nmultiline prompt".to_string(),
+        ]);
+
+        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(view.editor.text(), "newer\nmultiline prompt");
+        view.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        )));
+        assert_eq!(view.editor.text(), "older\nmultiline prompt");
+        view.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        )));
+        assert_eq!(view.editor.text(), "newer\nmultiline prompt");
+        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(view.editor.is_empty());
+    }
+
+    #[test]
+    fn option_word_navigation_accepts_arrow_and_meta_key_encodings() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("alpha.beta gamma");
+
+        view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::ALT,
+        )));
+        assert_eq!(view.editor.cursor(), 11);
+        view.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('b'),
+            KeyModifiers::ALT,
+            KeyEventKind::Repeat,
+        )));
+        assert_eq!(view.editor.cursor(), 6);
+        view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::ALT,
+        )));
+        assert_eq!(view.editor.cursor(), 10);
+        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
+        assert_eq!(view.editor.cursor(), 6);
+        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
+        assert_eq!(view.editor.cursor(), 10);
+        assert_eq!(view.editor.text(), "alpha.beta gamma");
     }
 
     #[test]

@@ -146,6 +146,10 @@ impl Agent {
         self.conversation.context_snapshot()
     }
 
+    pub(crate) fn prompt_history(&self) -> Vec<String> {
+        self.conversation.prompt_history()
+    }
+
     pub(crate) async fn submit(&mut self, prompt: &str) -> Result<String> {
         self.submit_user_input(UserInput::text(prompt)).await
     }
