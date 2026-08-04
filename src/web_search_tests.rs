@@ -106,3 +106,33 @@ fn command_parser_preserves_search_and_fetch_operations() {
     );
     assert!(parse_commands(Some(json!([]))).is_err());
 }
+
+#[test]
+fn display_actions_match_codex_web_search_activity() {
+    assert_eq!(
+        action_for_display(Some(&json!({
+            "search_query": [{"q": "first"}, {"q": "second"}],
+        }))),
+        WebSearchAction::Search {
+            query: None,
+            queries: Some(vec!["first".to_string(), "second".to_string()]),
+        }
+    );
+    assert_eq!(
+        action_for_display(Some(&json!({
+            "open": [{"ref_id": "https://openai.com/research"}],
+        }))),
+        WebSearchAction::OpenPage {
+            url: Some("https://openai.com/research".to_string()),
+        }
+    );
+    assert_eq!(
+        action_for_display(Some(&json!({
+            "find": [{"ref_id": "turn0fetch0", "pattern": "Responses"}],
+        }))),
+        WebSearchAction::FindInPage {
+            url: None,
+            pattern: Some("Responses".to_string()),
+        }
+    );
+}

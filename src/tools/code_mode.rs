@@ -249,7 +249,7 @@ impl CodeModeSessionDelegate for Delegate {
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let call_id = format!("{}:{}", invocation.cell_id, invocation.runtime_tool_call_id);
-            let tool_name = invocation.tool_name.to_string();
+            let tool_name = display_tool_name(&invocation.tool_name);
             let sender = self.ui_events.sender_for(&invocation.cell_id);
             if let Some(sender) = &sender {
                 let _ = sender.send(AgentEvent::ToolStarted {
@@ -292,6 +292,13 @@ impl CodeModeSessionDelegate for Delegate {
     fn cell_closed(&self, cell_id: &CellId) {
         // The observer drains notifications after it receives the terminal event.
         self.ui_events.close(cell_id);
+    }
+}
+
+fn display_tool_name(tool_name: &codex_protocol::ToolName) -> String {
+    match tool_name.namespace.as_deref() {
+        Some(namespace) => format!("{namespace}.{}", tool_name.name),
+        None => tool_name.name.clone(),
     }
 }
 

@@ -21,6 +21,7 @@ use codex_client::RetryPolicy;
 use codex_client::run_with_retry;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::WebSearchAction;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
@@ -353,6 +354,12 @@ pub(crate) fn input_schema() -> &'static Value {
     &INPUT_SCHEMA
 }
 
+pub(crate) fn action_for_display(input: Option<&Value>) -> WebSearchAction {
+    parse_commands(input.cloned())
+        .map(|commands| command_action(&commands))
+        .unwrap_or(WebSearchAction::Other)
+}
+
 fn commands_schema() -> Value {
     let schema = SchemaSettings::draft2019_09()
         .with(|settings| {
@@ -391,6 +398,54 @@ fn parse_commands(input: Option<Value>) -> Result<SearchCommands> {
         Some(_) => Err(anyhow!(
             "tool `web.run` expects a JSON object for arguments"
         )),
+    }
+}
+
+fn command_action(commands: &SearchCommands) -> WebSearchAction {
+    commands
+        .search_query
+        .as_deref()
+        .and_then(query_action)
+        .or_else(|| commands.image_query.as_deref().and_then(query_action))
+        .or_else(|| {
+            commands
+                .open
+                .as_deref()
+                .and_then(|operations| operations.first())
+                .and_then(|operation| {
+                    reqwest::Url::parse(&operation.ref_id).is_ok().then(|| {
+                        WebSearchAction::OpenPage {
+                            url: Some(operation.ref_id.clone()),
+                        }
+                    })
+                })
+        })
+        .or_else(|| {
+            commands
+                .find
+                .as_deref()
+                .and_then(|operations| operations.first())
+                .map(|operation| WebSearchAction::FindInPage {
+                    url: reqwest::Url::parse(&operation.ref_id)
+                        .is_ok()
+                        .then(|| operation.ref_id.clone()),
+                    pattern: Some(operation.pattern.clone()),
+                })
+        })
+        .unwrap_or(WebSearchAction::Other)
+}
+
+fn query_action(queries: &[SearchQuery]) -> Option<WebSearchAction> {
+    match queries {
+        [] => None,
+        [query] => Some(WebSearchAction::Search {
+            query: Some(query.q.clone()),
+            queries: None,
+        }),
+        queries => Some(WebSearchAction::Search {
+            query: None,
+            queries: Some(queries.iter().map(|query| query.q.clone()).collect()),
+        }),
     }
 }
 

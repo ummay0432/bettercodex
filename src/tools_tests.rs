@@ -3,6 +3,7 @@ use super::ToolResult;
 use super::ToolRuntime;
 use crate::auth::Auth;
 use crate::auth::SharedAuth;
+use crate::events::AgentEvent;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use serde_json::json;
@@ -98,6 +99,7 @@ text(result);
 "#
         .to_string(),
     };
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let output = call
         .execute(
             &runtime,
@@ -109,10 +111,41 @@ text(result);
                 })],
                 r#"{"turn_id":"turn-test"}"#.to_string(),
             ),
-            None,
+            Some(events_tx),
             CancellationToken::new(),
         )
         .await;
+
+    let nested_call_id = match events_rx.recv().await.unwrap() {
+        AgentEvent::ToolStarted {
+            call_id,
+            name,
+            input,
+        } => {
+            assert_eq!(name, "web.run");
+            assert_eq!(
+                input,
+                Some(json!({
+                    "search_query": [{
+                        "q": "standalone web search",
+                        "domains": ["openai.com"],
+                    }],
+                    "open": [{"ref_id": "https://openai.com", "lineno": 12}],
+                }))
+            );
+            call_id
+        }
+        event => panic!("expected web search start event, got {event:?}"),
+    };
+    assert!(matches!(
+        events_rx.recv().await.unwrap(),
+        AgentEvent::ToolCompleted {
+            call_id,
+            output: Ok(output),
+            ..
+        } if call_id == nested_call_id && output == json!("Search result")
+    ));
+    assert!(events_rx.try_recv().is_err());
 
     assert!(
         output.preview.contains("Search result"),

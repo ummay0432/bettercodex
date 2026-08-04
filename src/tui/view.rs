@@ -145,6 +145,7 @@ enum ToolDisplay {
     Patch(PatchDisplay),
     Plan(PlanDisplay),
     ViewImage(String),
+    WebSearch(codex_protocol::models::WebSearchAction),
     Other,
 }
 
@@ -1193,6 +1194,9 @@ impl ToolEntry {
                     .map(|path| display_tool_path(Path::new(path), cwd))
                     .unwrap_or_else(|| "image".to_string()),
             ),
+            "web.run" => {
+                ToolDisplay::WebSearch(crate::web_search::action_for_display(input.as_ref()))
+            }
             _ => ToolDisplay::Other,
         };
         Self {
@@ -1220,6 +1224,7 @@ impl ToolEntry {
             ToolDisplay::Patch(_) => "Applying patch".to_string(),
             ToolDisplay::Plan(_) => "Updating plan".to_string(),
             ToolDisplay::ViewImage(path) => format!("Viewing {path}"),
+            ToolDisplay::WebSearch(_) => "Searching the web".to_string(),
             ToolDisplay::Other => self.name.clone(),
         }
     }
@@ -1243,6 +1248,7 @@ impl ToolEntry {
             }
             ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
             ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
+            ToolDisplay::WebSearch(action) => web_search_lines(self, action, width),
             ToolDisplay::Other => generic_tool_lines(self, width),
         }
     }
@@ -2052,6 +2058,84 @@ fn view_image_lines(outcome: Option<&ToolOutcome>, path: &str, width: u16) -> Ve
             ),
         ],
         Some(Err(error)) => failed_tool_lines("Failed to view image", error, width),
+    }
+}
+
+fn web_search_lines(
+    tool: &ToolEntry,
+    action: &codex_protocol::models::WebSearchAction,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
+        return failed_tool_lines("Failed to search the web", error, width);
+    }
+
+    let completed = tool.outcome.is_some();
+    let detail = if completed {
+        web_search_action_detail(action)
+    } else {
+        String::new()
+    };
+    let mut content = vec![
+        Span::from(if completed {
+            "Searched the web"
+        } else {
+            "Searching the web"
+        })
+        .bold(),
+    ];
+    if !detail.is_empty() {
+        content.push(" for ".into());
+        content.push(Span::from(detail));
+    }
+    let wrapped = wrap_styled_line(&Line::from(content), width.saturating_sub(2).max(1));
+    let bullet = if completed {
+        "•".dim()
+    } else {
+        activity_marker(Some(tool.started_at))
+    };
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            let mut spans = if index == 0 {
+                vec![bullet.clone(), " ".into()]
+            } else {
+                vec!["  ".into()]
+            };
+            spans.append(&mut line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn web_search_action_detail(action: &codex_protocol::models::WebSearchAction) -> String {
+    use codex_protocol::models::WebSearchAction;
+
+    match action {
+        WebSearchAction::Search { query, queries } => query
+            .clone()
+            .filter(|query| !query.is_empty())
+            .unwrap_or_else(|| {
+                let first = queries
+                    .as_ref()
+                    .and_then(|queries| queries.first())
+                    .cloned()
+                    .unwrap_or_default();
+                if queries.as_ref().is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
+                    format!("{first} ...")
+                } else {
+                    first
+                }
+            }),
+        WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
+        WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
+            (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
+            (Some(pattern), None) => format!("'{pattern}'"),
+            (None, Some(url)) => url.clone(),
+            (None, None) => String::new(),
+        },
+        WebSearchAction::Other => String::new(),
     }
 }
 
@@ -2894,6 +2978,39 @@ mod tests {
         assert!(rendered.contains("• Ran cargo test"));
         assert!(rendered.contains("  └ 21 passed"));
         assert!(!rendered.contains("exec ·"));
+    }
+
+    #[test]
+    fn web_search_uses_codex_activity_cell_and_hides_the_tool_payload() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:web".to_string(),
+            name: "web.run".to_string(),
+            input: Some(json!({
+                "search_query": [{"q": "OpenAI Codex GitHub official repository"}],
+            })),
+        });
+
+        assert_eq!(
+            view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
+            ["• Searching the web"]
+        );
+
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:web".to_string(),
+            output: Ok(json!(
+                "opaque search result that must remain model-facing only"
+            )),
+            duration: Duration::from_millis(50),
+        });
+        assert_eq!(
+            view.take_pending_history_lines(80)
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>(),
+            ["• Searched the web for OpenAI Codex GitHub official repository"]
+        );
     }
 
     #[test]
