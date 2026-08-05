@@ -75,6 +75,24 @@ static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
     ]
 });
 
+// The in-process V8 runtime needs names, descriptions, and calling kinds for
+// its globals and ALL_TOOLS. Input and output schemas are request-prompt data;
+// the session adapter immediately discards them. Strip those trees once rather
+// than cloning the complete catalogue for every exec cell.
+static RUNTIME_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
+    CORE_TOOLS
+        .iter()
+        .map(|tool| ToolDefinition {
+            name: tool.name.clone(),
+            tool_name: tool.tool_name.clone(),
+            description: tool.description.clone(),
+            kind: tool.kind,
+            input_schema: None,
+            output_schema: None,
+        })
+        .collect()
+});
+
 static NAMESPACE_DESCRIPTIONS: LazyLock<BTreeMap<String, ToolNamespaceDescription>> =
     LazyLock::new(|| {
         BTreeMap::from([(
@@ -96,9 +114,10 @@ static EXEC_DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-static DISPLAY_TOOLS: LazyLock<Vec<CatalogueTool>> = LazyLock::new(|| {
-    let mut tools = specifications()
-        .into_iter()
+static CATALOGUE_INSPECTION: LazyLock<CatalogueInspection> = LazyLock::new(|| {
+    let specifications = specifications();
+    let mut tools = specifications
+        .iter()
         .map(|specification| {
             let name = specification
                 .get("name")
@@ -115,7 +134,25 @@ static DISPLAY_TOOLS: LazyLock<Vec<CatalogueTool>> = LazyLock::new(|| {
         name: tool.name.clone(),
         route: CatalogueRoute::InsideExec,
     }));
-    tools
+    let item = json!({
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": specifications,
+    });
+    let request_bytes = u64::try_from(
+        serde_json::to_vec(&item)
+            .expect("the fixed tool catalogue is JSON serializable")
+            .len(),
+    )
+    .unwrap_or(u64::MAX);
+    CatalogueInspection {
+        tools,
+        metrics: CatalogueMetrics {
+            description_bytes: u64::try_from(text().len()).unwrap_or(u64::MAX),
+            request_bytes,
+            estimated_tokens: request_bytes.div_ceil(4),
+        },
+    }
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,8 +167,24 @@ pub(crate) struct CatalogueTool {
     pub(crate) route: CatalogueRoute,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogueMetrics {
+    pub(crate) description_bytes: u64,
+    pub(crate) request_bytes: u64,
+    pub(crate) estimated_tokens: u64,
+}
+
+struct CatalogueInspection {
+    tools: Vec<CatalogueTool>,
+    metrics: CatalogueMetrics,
+}
+
 pub(super) fn core_tools() -> &'static [ToolDefinition] {
     &CORE_TOOLS
+}
+
+pub(super) fn runtime_tools() -> &'static [ToolDefinition] {
+    &RUNTIME_TOOLS
 }
 
 pub(crate) fn text() -> &'static str {
@@ -139,7 +192,11 @@ pub(crate) fn text() -> &'static str {
 }
 
 pub(crate) fn display_tools() -> &'static [CatalogueTool] {
-    &DISPLAY_TOOLS
+    &CATALOGUE_INSPECTION.tools
+}
+
+pub(crate) fn metrics() -> CatalogueMetrics {
+    CATALOGUE_INSPECTION.metrics
 }
 
 pub(crate) fn specifications() -> Vec<Value> {
@@ -473,6 +530,30 @@ mod tests {
     }
 
     #[test]
+    fn runtime_catalogue_keeps_metadata_but_drops_prompt_only_schemas() {
+        assert_eq!(runtime_tools().len(), core_tools().len());
+        for (runtime, complete) in runtime_tools().iter().zip(core_tools()) {
+            assert_eq!(runtime.name, complete.name);
+            assert_eq!(runtime.tool_name, complete.tool_name);
+            assert_eq!(runtime.description, complete.description);
+            assert_eq!(runtime.kind, complete.kind);
+            assert_eq!(
+                (
+                    runtime.input_schema.as_ref(),
+                    runtime.output_schema.as_ref()
+                ),
+                (None, None)
+            );
+        }
+        let runtime_bytes = serde_json::to_vec(runtime_tools()).unwrap().len();
+        let complete_bytes = serde_json::to_vec(core_tools()).unwrap().len();
+        assert!(
+            runtime_bytes < complete_bytes,
+            "runtime metadata was {runtime_bytes} bytes versus {complete_bytes} complete bytes"
+        );
+    }
+
+    #[test]
     fn model_visible_catalogue_contains_typed_declarations() {
         let text = text();
         assert!(text.contains("fresh V8 isolate"));
@@ -553,6 +634,14 @@ mod tests {
             serde_json::to_string(&item).unwrap().len(),
             20_440,
             "update prompts/tool-context.md"
+        );
+        assert_eq!(
+            metrics(),
+            CatalogueMetrics {
+                description_bytes: 18_103,
+                request_bytes: 20_440,
+                estimated_tokens: 5_110,
+            }
         );
     }
 }

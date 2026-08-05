@@ -1,4 +1,5 @@
 use crate::repository;
+use crate::skill_settings;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -63,6 +64,7 @@ pub(crate) struct Skill {
     display_name: Option<String>,
     path: PathBuf,
     scope: SkillScope,
+    enabled: bool,
     allow_implicit_invocation: bool,
 }
 
@@ -84,6 +86,20 @@ impl Skill {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn allows_implicit_invocation(&self) -> bool {
+        self.allow_implicit_invocation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkillUpdate {
+    Enabled(bool),
+    AllowImplicitInvocation(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,7 +249,11 @@ impl SkillCatalog {
                 scope: *scope,
             })
             .collect::<Vec<_>>();
-        Self::load_from_roots(&borrowed)
+        let mut catalog = Self::load_from_roots(&borrowed);
+        if let Some(home) = bettercodex_home() {
+            catalog.apply_settings(&home.join(skill_settings::FILE_NAME));
+        }
+        catalog
     }
 
     fn load_from_roots(roots: &[SkillRoot<'_>]) -> Self {
@@ -286,7 +306,7 @@ impl SkillCatalog {
         let visible = self
             .skills
             .iter()
-            .filter(|skill| skill.allow_implicit_invocation)
+            .filter(|skill| skill.enabled && skill.allow_implicit_invocation)
             .collect::<Vec<_>>();
         if visible.is_empty() {
             return None;
@@ -352,6 +372,14 @@ impl SkillCatalog {
                 )));
                 continue;
             };
+            if !skill.enabled {
+                warnings.push(bounded_warning(format!(
+                    "Selected skill `${}` is disabled in {}",
+                    selection.name,
+                    settings_file_display()
+                )));
+                continue;
+            }
             if seen_paths.insert(skill.path.clone()) {
                 selected.push(skill);
             }
@@ -360,7 +388,10 @@ impl SkillCatalog {
         let mentions = extract_mentions(text);
         for path in mentions.paths {
             let path = Path::new(path.strip_prefix("skill://").unwrap_or(path));
-            if let Some(skill) = self.skills.iter().find(|skill| skill.path == path)
+            if let Some(skill) = self
+                .skills
+                .iter()
+                .find(|skill| skill.enabled && skill.path == path)
                 && seen_paths.insert(skill.path.clone())
             {
                 selected.push(skill);
@@ -368,10 +399,10 @@ impl SkillCatalog {
         }
 
         let mut counts = HashMap::<&str, usize>::new();
-        for skill in &self.skills {
+        for skill in self.skills.iter().filter(|skill| skill.enabled) {
             *counts.entry(skill.name.as_str()).or_default() += 1;
         }
-        for skill in &self.skills {
+        for skill in self.skills.iter().filter(|skill| skill.enabled) {
             if seen_paths.contains(&skill.path)
                 || blocked_names.contains(skill.name.as_str())
                 || !mentions.plain_names.contains(skill.name.as_str())
@@ -420,6 +451,46 @@ impl SkillCatalog {
 
         SkillInjectionOutcome { items, warnings }
     }
+
+    fn apply_settings(&mut self, path: &Path) {
+        let settings = match skill_settings::read(path) {
+            Ok(settings) => settings,
+            Err(error) => {
+                if self.warnings.len() < MAX_WARNINGS {
+                    self.warnings.push(bounded_warning(format!(
+                        "Could not load skill settings {}: {error:#}",
+                        path.display()
+                    )));
+                }
+                return;
+            }
+        };
+        for skill in &mut self.skills {
+            let Some(settings) = settings.skills.get(&skill.path) else {
+                continue;
+            };
+            if let Some(enabled) = settings.enabled {
+                skill.enabled = enabled;
+            }
+            if let Some(allow) = settings.allow_implicit_invocation {
+                skill.allow_implicit_invocation = allow;
+            }
+        }
+    }
+}
+
+pub(crate) fn save_skill_update(path: &Path, update: SkillUpdate) -> Result<()> {
+    let home = bettercodex_home().ok_or_else(|| {
+        anyhow!("cannot save skill settings because neither BCODEX_HOME nor HOME is set")
+    })?;
+    skill_settings::save(&home.join(skill_settings::FILE_NAME), path, update)
+}
+
+fn settings_file_display() -> String {
+    bettercodex_home().map_or_else(
+        || "${BCODEX_HOME:-$HOME/.bcodex}/skills.json".to_string(),
+        |home| home.join(skill_settings::FILE_NAME).display().to_string(),
+    )
 }
 
 pub(crate) fn is_mention_name_byte(byte: u8) -> bool {
@@ -603,6 +674,7 @@ fn load_skill(path: &Path, scope: SkillScope) -> Result<(Skill, Option<String>)>
             display_name,
             path: path.to_path_buf(),
             scope,
+            enabled: true,
             allow_implicit_invocation,
         },
         metadata_warning,

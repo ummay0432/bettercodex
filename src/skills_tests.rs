@@ -1,5 +1,7 @@
 use super::*;
+use crate::skill_settings;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use uuid::Uuid;
 
 fn temporary_root(name: &str) -> PathBuf {
@@ -120,6 +122,92 @@ fn metadata_controls_popup_labels_and_implicit_catalog_visibility_without_blocki
     let injection = catalog.explicit_injections("use $private-workflow", &[selected]);
     assert_eq!(injection.items.len(), 1);
     assert!(text_of(&injection.items[0]).contains("Follow this workflow."));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn saved_settings_independently_control_availability_and_implicit_injection() {
+    let root = temporary_root("settings");
+    let skills_root = root.join("skills");
+    let settings_path = root.join("home/skills.json");
+    let path = write_skill(
+        &skills_root,
+        "review",
+        "review",
+        "Review changes",
+        "REVIEW BODY",
+    )
+    .canonicalize()
+    .unwrap();
+    let roots = [SkillRoot {
+        path: &skills_root,
+        scope: SkillScope::Repository,
+    }];
+
+    skill_settings::save(&settings_path, &path, SkillUpdate::Enabled(false)).unwrap();
+    let mut disabled = SkillCatalog::load_from_roots(&roots);
+    disabled.apply_settings(&settings_path);
+    assert!(!disabled.skills()[0].is_enabled());
+    assert!(disabled.instructions_message(353_400).is_none());
+    let selected = SkillSelection::new("review", &path);
+    let blocked = disabled.explicit_injections("use $review", std::slice::from_ref(&selected));
+    assert!(blocked.items.is_empty());
+    assert!(blocked.warnings[0].contains("disabled"));
+
+    skill_settings::save(&settings_path, &path, SkillUpdate::Enabled(true)).unwrap();
+    skill_settings::save(
+        &settings_path,
+        &path,
+        SkillUpdate::AllowImplicitInvocation(false),
+    )
+    .unwrap();
+    let mut explicit_only = SkillCatalog::load_from_roots(&roots);
+    explicit_only.apply_settings(&settings_path);
+    assert!(explicit_only.skills()[0].is_enabled());
+    assert!(!explicit_only.skills()[0].allows_implicit_invocation());
+    assert!(explicit_only.instructions_message(353_400).is_none());
+    let injection = explicit_only.explicit_injections("use $review", &[selected]);
+    assert_eq!(injection.items.len(), 1);
+    assert!(text_of(&injection.items[0]).contains("REVIEW BODY"));
+
+    let document = skill_settings::read(&settings_path).unwrap();
+    assert_eq!(document.skills.get(&path).unwrap().enabled, Some(true));
+    assert_eq!(
+        document
+            .skills
+            .get(&path)
+            .unwrap()
+            .allow_implicit_invocation,
+        Some(false)
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn malformed_settings_fail_open_with_a_bounded_warning() {
+    let root = temporary_root("malformed-settings");
+    let skills_root = root.join("skills");
+    write_skill(&skills_root, "safe", "safe", "Safe workflow", "body");
+    let settings_path = root.join("skills.json");
+    fs::write(&settings_path, b"{not json").unwrap();
+    let mut catalog = SkillCatalog::load_from_roots(&[SkillRoot {
+        path: &skills_root,
+        scope: SkillScope::Repository,
+    }]);
+
+    catalog.apply_settings(&settings_path);
+
+    assert!(catalog.skills()[0].is_enabled());
+    assert!(catalog.skills()[0].allows_implicit_invocation());
+    assert_eq!(catalog.warnings().len(), 1);
+    assert!(catalog.warnings()[0].contains("Could not load skill settings"));
 
     fs::remove_dir_all(root).unwrap();
 }

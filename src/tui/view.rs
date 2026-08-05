@@ -11,9 +11,10 @@ use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
 use super::resume_picker::ResumePickerAction;
 use super::skill_popup::SkillPopup;
+use super::skills_view::SkillsView;
+use super::skills_view::SkillsViewAction;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
-use super::tool_catalogue::VIEWPORT_HEIGHT as TOOL_CATALOGUE_VIEWPORT_HEIGHT;
 use crate::MODEL;
 use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
@@ -24,6 +25,7 @@ use crate::events::SteerId;
 use crate::input::UserPrompt;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
+use crate::skills::SkillUpdate;
 use codex_ansi_escape::ansi_escape_line;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::parse_command::parse_command;
@@ -99,6 +101,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show keyboard shortcuts",
     },
     SlashCommand {
+        name: "skills",
+        aliases: &[],
+        description: "manage installed skills and invocation policy",
+    },
+    SlashCommand {
         name: "tools",
         aliases: &[],
         description: "inspect the active tool catalogue",
@@ -121,6 +128,7 @@ pub(super) enum Action {
     OpenResumePicker,
     ResumeSession(Uuid),
     ShowContext,
+    UpdateSkill { path: PathBuf, update: SkillUpdate },
     Quit,
 }
 
@@ -213,6 +221,7 @@ enum ToolDisplay {
         input: String,
     },
     Patch(PatchDisplay),
+    Papercut,
     Plan(PlanDisplay),
     ViewImage(String),
     WebSearch(codex_protocol::models::WebSearchAction),
@@ -316,6 +325,7 @@ enum Overlay {
     Shortcuts,
     Context(ContextWindowView),
     Resume(ResumePicker),
+    Skills(SkillsView),
     Tools(ToolCatalogueView),
 }
 
@@ -386,6 +396,16 @@ impl View {
     pub(super) fn set_skills(&mut self, skills: Vec<Skill>) {
         self.skills = skills;
         self.skill_popup.hide();
+    }
+
+    pub(super) fn skill_update_failed(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
+            skills.set_error(error);
+        } else {
+            self.entries
+                .push(TranscriptEntry::Error(markdown::sanitize(&error)));
+        }
     }
 
     pub(super) fn add_notice(&mut self, notice: impl Into<String>) {
@@ -714,6 +734,7 @@ impl View {
                         ToolDisplay::Command { .. }
                             | ToolDisplay::Interaction { .. }
                             | ToolDisplay::Patch(_)
+                            | ToolDisplay::Papercut
                             | ToolDisplay::WebSearch(_)
                             | ToolDisplay::Other
                     );
@@ -805,11 +826,22 @@ impl View {
         if control && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
+        if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
+            return match skills.handle_key(key, &self.skills) {
+                SkillsViewAction::None => Action::None,
+                SkillsViewAction::Close => {
+                    self.overlay = None;
+                    Action::None
+                }
+                SkillsViewAction::Update { path, update } => Action::UpdateSkill { path, update },
+            };
+        }
         if let Some(overlay) = self.overlay.as_ref() {
             let close = match overlay {
                 Overlay::Shortcuts => true,
                 Overlay::Context(context) => context.handle_key(key.code) == ContextAction::Close,
                 Overlay::Resume(_) => unreachable!("resume picker keys are handled above"),
+                Overlay::Skills(_) => unreachable!("skills keys are handled above"),
                 Overlay::Tools(catalogue) => {
                     catalogue.handle_key(key.code) == CatalogueAction::Close
                 }
@@ -1099,6 +1131,16 @@ impl View {
                 ));
                 Action::None
             }
+            "/skills" if self.busy => {
+                self.entries.push(TranscriptEntry::Error(
+                    "'/skills' is disabled while a task is in progress.".to_string(),
+                ));
+                Action::None
+            }
+            "/skills" => {
+                self.overlay = Some(Overlay::Skills(SkillsView::new()));
+                Action::None
+            }
             "/tools" => {
                 self.overlay = Some(Overlay::Tools(ToolCatalogueView::new()));
                 Action::None
@@ -1305,7 +1347,8 @@ impl View {
             Some(Overlay::Shortcuts) => 17,
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(picker)) => picker.preferred_height(),
-            Some(Overlay::Tools(_)) => TOOL_CATALOGUE_VIEWPORT_HEIGHT,
+            Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills),
+            Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
             None => 0,
         };
         active_height
@@ -1461,6 +1504,7 @@ impl View {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
             Some(Overlay::Context(context)) => context.render(frame, area),
             Some(Overlay::Resume(picker)) => picker.render(frame, area),
+            Some(Overlay::Skills(skills)) => skills.render(frame, area, &self.skills),
             Some(Overlay::Tools(catalogue)) => catalogue.render(frame, area),
             None => {}
         }
@@ -1809,7 +1853,14 @@ fn is_local_command(command: &str) -> bool {
     }
     matches!(
         command,
-        "/q" | "/quit" | "/exit" | "/compact" | "/clear" | "/context" | "/help" | "/tools"
+        "/q" | "/quit"
+            | "/exit"
+            | "/compact"
+            | "/clear"
+            | "/context"
+            | "/help"
+            | "/skills"
+            | "/tools"
     )
 }
 
@@ -1921,6 +1972,7 @@ impl ToolEntry {
                 input.as_ref().and_then(Value::as_str).unwrap_or_default(),
                 cwd,
             )),
+            "log_papercut" => ToolDisplay::Papercut,
             "update_plan" => ToolDisplay::Plan(PlanDisplay::parse(input.as_ref())),
             "view_image" => ToolDisplay::ViewImage(
                 input
@@ -1958,6 +2010,7 @@ impl ToolEntry {
             ToolDisplay::Command { command, .. } => first_display_line(command),
             ToolDisplay::Interaction { command, .. } => command.clone(),
             ToolDisplay::Patch(_) => "Applying patch".to_string(),
+            ToolDisplay::Papercut => "Logging papercut".to_string(),
             ToolDisplay::Plan(_) => "Updating plan".to_string(),
             ToolDisplay::ViewImage(path) => format!("Viewing {path}"),
             ToolDisplay::WebSearch(_) => "Searching the web".to_string(),
@@ -1982,6 +2035,7 @@ impl ToolEntry {
             ToolDisplay::Patch(patch) => {
                 patch.display_lines(self.outcome.as_ref(), width, user_style)
             }
+            ToolDisplay::Papercut => papercut_lines(self, width),
             ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
             ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
             ToolDisplay::WebSearch(action) => web_search_lines(self, action, width),
@@ -2786,10 +2840,10 @@ fn styled_skill_mentions(
     skill_ranges: &[std::ops::Range<usize>],
     style: Style,
 ) -> Vec<Span<'static>> {
-    let line_end = offset.saturating_add(text.len());
+    let end = offset.saturating_add(text.len());
     let ranges = skill_ranges.iter().filter_map(|range| {
         let start = range.start.max(offset);
-        let end = range.end.min(line_end);
+        let end = range.end.min(end);
         (start < end).then_some(start - offset..end - offset)
     });
     let mut spans = Vec::with_capacity(skill_ranges.len().saturating_mul(2).saturating_add(1));
@@ -3161,6 +3215,31 @@ fn generic_tool_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
         }
         Some(Err(error)) => failed_tool_lines(&format!("Failed {}", tool.name), error, width),
     }
+}
+
+fn papercut_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
+    let line = match tool.outcome.as_ref().map(|outcome| &outcome.output) {
+        None => Line::from(vec![
+            activity_marker(Some(tool.started_at)),
+            " ".into(),
+            "Logging papercut".bold(),
+        ]),
+        Some(Ok(output)) => {
+            let path = output
+                .get("path")
+                .and_then(Value::as_str)
+                .map(markdown::sanitize)
+                .unwrap_or_else(|| "PAPERCUTS.md".to_string());
+            Line::from(vec![
+                "• ".dim(),
+                "Logged papercut".bold(),
+                " to ".into(),
+                path.cyan(),
+            ])
+        }
+        Some(Err(error)) => return failed_tool_lines("Failed to log papercut", error, width),
+    };
+    wrap_styled_line(&line, width.max(1))
 }
 
 fn failed_tool_lines(title: &str, error: &str, width: u16) -> Vec<Line<'static>> {
@@ -4683,6 +4762,82 @@ mod tests {
     }
 
     #[test]
+    fn skills_command_renders_an_empty_manager_and_closes_without_model_input() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.editor.set_text("/ski");
+
+        let height = view.desired_height(88, 30);
+        let backend = TestBackend::new(88, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("/skills  manage installed skills and invocation policy"),
+            "{rendered}"
+        );
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(view.editor.is_empty());
+        assert!(view.entries.is_empty());
+        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Skills(_))));
+        let manager_height = match view.overlay.as_ref() {
+            Some(Overlay::Skills(skills)) => skills.preferred_height(&view.skills),
+            _ => panic!("expected skills overlay"),
+        };
+        assert_eq!(view.desired_height(88, 30), manager_height);
+
+        let backend = TestBackend::new(88, manager_height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("No skills installed."), "{rendered}");
+        assert!(rendered.contains("BCODEX_HOME"), "{rendered}");
+        assert!(rendered.contains("i implicit"), "{rendered}");
+        assert!(!rendered.contains(MODEL), "{rendered}");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert!(view.overlay.is_none());
+    }
+
+    #[test]
+    fn skills_command_is_not_opened_while_a_task_is_active() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.start_turn("working");
+        view.editor.set_text("/skills");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(view.overlay.is_none());
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("'/skills' is disabled while a task is in progress."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn tools_command_opens_and_closes_the_rendered_catalogue() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
@@ -4703,15 +4858,23 @@ mod tests {
             Action::None
         );
         assert!(matches!(view.overlay.as_ref(), Some(Overlay::Tools(_))));
-        assert_eq!(view.desired_height(88, 30), TOOL_CATALOGUE_VIEWPORT_HEIGHT);
+        let catalogue_height = match view.overlay.as_ref() {
+            Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
+            _ => panic!("expected tools overlay"),
+        };
+        assert_eq!(view.desired_height(88, 30), catalogue_height);
 
-        let backend = TestBackend::new(88, TOOL_CATALOGUE_VIEWPORT_HEIGHT);
+        let backend = TestBackend::new(88, catalogue_height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(rendered.contains("Request tools"), "{rendered}");
         assert!(rendered.contains("Inside exec"), "{rendered}");
         assert!(rendered.contains("apply_patch"), "{rendered}");
+        assert!(
+            rendered.contains("9 tools · ~5.1K prompt tokens"),
+            "{rendered}"
+        );
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "┌");
         assert!(!rendered.contains("available"), "{rendered}");
         assert!(!rendered.contains("Code Mode"), "{rendered}");
@@ -4832,6 +4995,36 @@ mod tests {
         assert!(rendered.contains("• Ran cargo test"));
         assert!(rendered.contains("  └ 21 passed"));
         assert!(!rendered.contains("exec ·"));
+    }
+
+    #[test]
+    fn papercut_tool_reports_the_repository_log_without_dumping_json() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:papercut".to_string(),
+            name: "log_papercut".to_string(),
+            input: Some(json!({
+                "message": "A diagnostic command was missing; document the replacement."
+            })),
+        });
+        assert_eq!(
+            view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
+            ["• Logging papercut"]
+        );
+
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:papercut".to_string(),
+            output: Ok(json!({"path": "PAPERCUTS.md"})),
+            duration: Duration::from_millis(2),
+        });
+        assert_eq!(
+            view.take_pending_history_lines(80)
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>(),
+            ["• Logged papercut to PAPERCUTS.md"]
+        );
     }
 
     #[test]

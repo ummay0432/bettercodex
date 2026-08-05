@@ -1,3 +1,4 @@
+use crate::tools::CatalogueMetrics;
 use crate::tools::CatalogueRoute;
 use crate::tools::CatalogueTool;
 use crossterm::event::KeyCode;
@@ -15,11 +16,10 @@ use ratatui::widgets::Paragraph;
 
 const RULE: Color = Color::Indexed(8);
 const PREFERRED_WIDTH: u16 = 32;
-const PREFERRED_HEIGHT: u16 = 14;
 
-pub(super) const VIEWPORT_HEIGHT: u16 = PREFERRED_HEIGHT;
-
-pub(super) struct ToolCatalogueView;
+pub(super) struct ToolCatalogueView {
+    metrics: CatalogueMetrics,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CatalogueAction {
@@ -29,7 +29,13 @@ pub(super) enum CatalogueAction {
 
 impl ToolCatalogueView {
     pub(super) fn new() -> Self {
-        Self
+        Self {
+            metrics: crate::tools::catalogue_metrics(),
+        }
+    }
+
+    pub(super) fn preferred_height(&self) -> u16 {
+        catalogue_content_height(crate::tools::display_tools()).saturating_add(2)
     }
 
     pub(super) fn handle_key(&self, code: KeyCode) -> CatalogueAction {
@@ -47,7 +53,7 @@ impl ToolCatalogueView {
             area.x,
             area.y,
             PREFERRED_WIDTH.min(area.width),
-            PREFERRED_HEIGHT.min(area.height),
+            self.preferred_height().min(area.height),
         );
         frame.render_widget(Clear, area);
         let block = Block::default()
@@ -61,13 +67,13 @@ impl ToolCatalogueView {
         }
 
         frame.render_widget(
-            Paragraph::new(catalogue_lines(crate::tools::display_tools())),
+            Paragraph::new(catalogue_lines(crate::tools::display_tools(), self.metrics)),
             inner,
         );
     }
 }
 
-fn catalogue_lines(tools: &[CatalogueTool]) -> Vec<Line<'static>> {
+fn catalogue_lines<'a>(tools: &'a [CatalogueTool], metrics: CatalogueMetrics) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     for (heading, route) in [
         ("Request tools", CatalogueRoute::Request),
@@ -93,11 +99,44 @@ fn catalogue_lines(tools: &[CatalogueTool]) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::from(branch).dim(),
                 Span::from("● ").green(),
-                Span::from(tool.name.clone()),
+                Span::from(tool.name.as_str()),
             ]));
         }
     }
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.push(
+        Line::from(format!(
+            "{} tools · ~{} prompt tokens",
+            tools.len(),
+            format_tokens(metrics.estimated_tokens),
+        ))
+        .dim(),
+    );
     lines
+}
+
+fn catalogue_content_height(tools: &[CatalogueTool]) -> u16 {
+    let groups = [CatalogueRoute::Request, CatalogueRoute::InsideExec]
+        .into_iter()
+        .filter(|route| tools.iter().any(|tool| tool.route == *route))
+        .count();
+    let lines = tools
+        .len()
+        .saturating_add(groups)
+        .saturating_add(groups.saturating_sub(1))
+        .saturating_add(1 + usize::from(!tools.is_empty()));
+    u16::try_from(lines).unwrap_or(u16::MAX)
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        let tenths = tokens.saturating_add(50) / 100;
+        format!("{}.{:01}K", tenths / 10, tenths % 10)
+    } else {
+        tokens.to_string()
+    }
 }
 
 #[cfg(test)]

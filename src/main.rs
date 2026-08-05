@@ -8,6 +8,7 @@ mod input;
 mod prompt_history;
 mod repository;
 mod rollout;
+mod skill_settings;
 mod skills;
 mod tools;
 mod tui;
@@ -51,6 +52,10 @@ async fn run() -> Result<()> {
         }
         Command::ToolCatalogue => {
             println!("{}", tools::catalogue_text());
+            Ok(())
+        }
+        Command::ToolCatalogueStats => {
+            println!("{}", tool_catalogue_stats());
             Ok(())
         }
         Command::Run(options) => run_agent(options, None).await,
@@ -114,6 +119,7 @@ enum Command {
     Help,
     Version,
     ToolCatalogue,
+    ToolCatalogueStats,
 }
 
 #[derive(Default)]
@@ -143,6 +149,11 @@ impl Command {
             .is_some_and(|argument| argument == "--tool-catalogue" || argument == "--tool-catalog")
         {
             return Ok(Self::ToolCatalogue);
+        }
+        if arguments.peek().is_some_and(|argument| {
+            argument == "--tool-catalogue-stats" || argument == "--tool-catalog-stats"
+        }) {
+            return Ok(Self::ToolCatalogueStats);
         }
 
         let resume = arguments
@@ -205,9 +216,35 @@ impl Command {
 
 fn print_help() {
     println!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn tool_catalogue_stats() -> String {
+    let tools = tools::display_tools();
+    let names = |route| {
+        tools
+            .iter()
+            .filter(|tool| tool.route == route)
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+    };
+    let request = names(tools::CatalogueRoute::Request);
+    let nested = names(tools::CatalogueRoute::InsideExec);
+    let metrics = tools::catalogue_metrics();
+    let window_share =
+        metrics.estimated_tokens as f64 * 100.0 / context::EFFECTIVE_CONTEXT_WINDOW as f64;
+    format!(
+        "Tool catalogue\n\nRequest tools ({}): {}\nInside exec ({}): {}\n\nExec description: {} bytes\nComplete additional_tools item: {} bytes\nEstimated context cost: {} tokens (bytes/4)\nEffective-window share: {window_share:.2}%",
+        request.len(),
+        request.join(", "),
+        nested.len(),
+        nested.join(", "),
+        metrics.description_bytes,
+        metrics.request_bytes,
+        metrics.estimated_tokens,
+    )
 }
 
 #[cfg(test)]
@@ -247,6 +284,18 @@ mod tests {
             Command::parse(["--tool-catalogue".to_string()]).unwrap(),
             Command::ToolCatalogue
         ));
+    }
+
+    #[test]
+    fn tool_catalogue_stats_are_derived_from_the_active_request() {
+        assert!(matches!(
+            Command::parse(["--tool-catalogue-stats".to_string()]).unwrap(),
+            Command::ToolCatalogueStats
+        ));
+        assert_eq!(
+            tool_catalogue_stats(),
+            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (7): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, web__run\n\nExec description: 18103 bytes\nComplete additional_tools item: 20440 bytes\nEstimated context cost: 5110 tokens (bytes/4)\nEffective-window share: 1.45%"
+        );
     }
 
     #[test]

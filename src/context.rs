@@ -236,6 +236,14 @@ impl Conversation {
         &self.world_state.skills
     }
 
+    pub(crate) fn reload_skills(&mut self, cwd: &Path) -> Result<()> {
+        let skills = SkillCatalog::load(cwd);
+        let mut world_state = self.world_state.clone();
+        world_state.skills_instructions = skills.instructions_message(EFFECTIVE_CONTEXT_WINDOW);
+        world_state.skills = skills;
+        self.replace_world_state(world_state)
+    }
+
     pub(crate) fn record_usage(
         &mut self,
         usage: Option<TokenUsage>,
@@ -398,7 +406,11 @@ impl Conversation {
     }
 
     fn refresh_world_state(&mut self) -> Result<()> {
-        let current = self.world_state.items();
+        self.replace_world_state(self.world_state.clone())
+    }
+
+    fn replace_world_state(&mut self, world_state: WorldState) -> Result<()> {
+        let current = world_state.items();
         let saved = self
             .history
             .iter()
@@ -411,6 +423,7 @@ impl Conversation {
                     .any(|existing| same_model_visible_message(existing, expected))
             });
         if already_current {
+            self.world_state = world_state;
             return Ok(());
         }
 
@@ -423,8 +436,9 @@ impl Conversation {
         refreshed.extend(current);
         self.rollout
             .replace_history(&refreshed, HistoryReplacement::ContextRefresh)?;
-        self.context_metrics = ContextMetrics::from_history(&refreshed, &self.world_state);
+        self.context_metrics = ContextMetrics::from_history(&refreshed, &world_state);
         self.history = refreshed;
+        self.world_state = world_state;
         Ok(())
     }
 }

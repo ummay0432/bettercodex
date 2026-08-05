@@ -5,7 +5,7 @@ use ratatui::backend::TestBackend;
 #[test]
 fn renders_a_compact_catalogue_attached_to_the_left_edge() {
     let catalogue = ToolCatalogueView::new();
-    let backend = TestBackend::new(88, VIEWPORT_HEIGHT);
+    let backend = TestBackend::new(88, catalogue.preferred_height());
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| catalogue.render(frame, frame.area()))
@@ -31,9 +31,22 @@ fn renders_a_compact_catalogue_attached_to_the_left_edge() {
             "│  ├─ ● view_image             │",
             "│  ├─ ● write_stdin            │",
             "│  └─ ● web__run               │",
+            "│                              │",
+            "│9 tools · ~5.1K prompt tokens │",
             "└──────────────────────────────┘",
         ]
         .join("\n")
+    );
+}
+
+#[test]
+fn preferred_height_is_derived_from_the_active_catalogue() {
+    let catalogue = ToolCatalogueView::new();
+    assert_eq!(
+        catalogue.preferred_height(),
+        u16::try_from(catalogue_lines(crate::tools::display_tools(), catalogue.metrics).len())
+            .unwrap()
+            .saturating_add(2)
     );
 }
 

@@ -234,6 +234,20 @@ impl Agent {
         self.conversation.skill_catalog().warnings()
     }
 
+    pub(crate) fn update_skill(
+        &mut self,
+        path: &Path,
+        update: crate::skills::SkillUpdate,
+    ) -> Result<()> {
+        if !self.skills().iter().any(|skill| skill.path() == path) {
+            return Err(anyhow!("skill {} is no longer available", path.display()));
+        }
+        crate::skills::save_skill_update(path, update)?;
+        self.conversation
+            .reload_skills(&self.cwd)
+            .context("skill setting was saved, but the active session could not reload skills")
+    }
+
     pub(crate) async fn submit(&mut self, prompt: &str) -> Result<String> {
         self.submit_user_input(UserInput::text(prompt)).await
     }

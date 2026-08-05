@@ -78,11 +78,12 @@ composer. The core shortcuts are:
   finalized transcript.
 - `?` on an empty composer opens the shortcut reference.
 - Typing `/` opens completion for `/clear`, `/context`, `/compact`, `/resume`,
-  `/help`, `/tools`, and one combined `/quit`, `/exit` entry; type `/q` and press
-  `Enter` to quit quickly. `/compact` manually compacts the current conversation
-  and can be interrupted with `Esc`. `/context` opens a colored breakdown of the
-  effective window, current request categories, free space before
-  auto-compaction, and reserved headroom.
+  `/help`, `/skills`, `/tools`, and one combined `/quit`, `/exit` entry; type
+  `/q` and press `Enter` to quit quickly. `/compact` manually compacts the current
+  conversation and can be interrupted with `Esc`. `/context` opens a colored
+  breakdown of the effective window, current request categories, free space
+  before auto-compaction, and reserved headroom. `/tools` shows the active
+  request and nested tools with their complete prompt-token estimate.
 - Typing `@` opens Git-ignore-aware fuzzy file search. `Up` and `Down` select a
   result, `Enter` or `Tab` inserts its repository-relative path, and `Esc`
   closes the search.
@@ -94,7 +95,12 @@ composer. The core shortcuts are:
 Each skill is a directory containing `SKILL.md`. Its YAML frontmatter supplies
 the name and description used by completion and by the model-visible catalogue;
 the remaining Markdown contains the workflow. BetterCodex ships no built-in
-skills.
+skills. `/skills` opens the skill manager. `Space` or `Enter` enables or disables
+the selected skill, while `i` independently controls implicit invocation. An
+enabled skill with implicit invocation off remains available through an explicit
+`$` mention but is omitted from the agent's default context, so the agent cannot
+invoke it proactively. Changes are saved by canonical skill path in
+`${BCODEX_HOME:-$HOME/.bcodex}/skills.json` and applied to the active session.
 
 When stdin or stdout is redirected, no-argument invocation falls back to the
 plain line interface. Passing a prompt remains a one-shot invocation.
@@ -129,6 +135,13 @@ from the binary:
 
 ```sh
 bcodex --tool-catalogue
+```
+
+For the active tool names and their complete model-context footprint without
+printing the catalogue itself:
+
+```sh
+bcodex --tool-catalogue-stats
 ```
 
 [`prompts/tool-context.md`](prompts/tool-context.md) records the complete

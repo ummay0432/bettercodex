@@ -2,6 +2,7 @@ use super::*;
 use crate::compaction::InitialContextInjection;
 use crate::input::UserInput;
 use crate::rollout::ResumeSelector;
+use std::fs;
 
 fn temporary_repository(name: &str) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!(
@@ -218,6 +219,86 @@ fn original_and_auto_image_estimates_use_patch_dimensions_not_base64_size() {
             "{detail} must retain the source patch dimensions"
         );
     }
+}
+
+#[test]
+fn reloading_skill_policy_replaces_the_saved_catalogue_without_blocking_explicit_use() {
+    let (root, cwd) = temporary_repository("reload-skills");
+    let skill_directory = cwd.join(".bcodex/skills/context-reload");
+    fs::create_dir_all(skill_directory.join("agents")).unwrap();
+    let skill_path = skill_directory.join("SKILL.md");
+    fs::write(
+        &skill_path,
+        "---\nname: context-reload\ndescription: Reload context policy\n---\n\nCONTEXT RELOAD BODY\n",
+    )
+    .unwrap();
+    fs::write(
+        skill_directory.join("agents/openai.yaml"),
+        "policy:\n  allow_implicit_invocation: true\n",
+    )
+    .unwrap();
+    let rollout_root = root.join("state");
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.clone();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    assert!(
+        conversation
+            .items()
+            .iter()
+            .filter_map(message_text)
+            .any(|text| text.starts_with("<skills>") && text.contains("context-reload"))
+    );
+
+    fs::write(
+        skill_directory.join("agents/openai.yaml"),
+        "policy:\n  allow_implicit_invocation: false\n",
+    )
+    .unwrap();
+    conversation.reload_skills(&cwd).unwrap();
+
+    assert!(
+        !conversation
+            .items()
+            .iter()
+            .filter_map(message_text)
+            .any(|text| text.starts_with("<skills>") && text.contains("context-reload")),
+        "the superseded implicitly invocable catalogue must not remain in history"
+    );
+    let skill = conversation
+        .skill_catalog()
+        .skills()
+        .iter()
+        .find(|skill| skill.name() == "context-reload")
+        .unwrap();
+    assert!(skill.is_enabled());
+    assert!(!skill.allows_implicit_invocation());
+    let injection = conversation.skill_catalog().explicit_injections(
+        "use $context-reload",
+        &[crate::skills::SkillSelection::new(
+            "context-reload",
+            skill_path.canonicalize().unwrap(),
+        )],
+    );
+    assert_eq!(injection.items.len(), 1);
+    assert!(
+        message_text(&injection.items[0])
+            .unwrap()
+            .contains("CONTEXT RELOAD BODY")
+    );
+
+    let journal = fs::read_to_string(
+        rollout_root
+            .join("sessions")
+            .join(format!("{session_id}.jsonl")),
+    )
+    .unwrap();
+    assert!(journal.lines().any(|line| {
+        let record: Value = serde_json::from_str(line).unwrap();
+        record["type"] == "history_replace" && record["reason"] == "context_refresh"
+    }));
+
+    drop(conversation);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

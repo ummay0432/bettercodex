@@ -6,6 +6,7 @@ mod pending_input;
 mod reasoning_status;
 mod resume_picker;
 mod skill_popup;
+mod skills_view;
 mod terminal;
 mod tool_catalogue;
 mod view;
@@ -312,6 +313,27 @@ impl Runtime {
                     self.context_snapshot = agent.context_snapshot();
                 }
                 self.view.show_context(self.context_snapshot.clone());
+            }
+            Action::UpdateSkill { path, update } => {
+                let result = self
+                    .agent
+                    .as_mut()
+                    .context("skills can only be changed while the agent is idle")?
+                    .update_skill(&path, update);
+                match result {
+                    Ok(()) => {
+                        let agent = self
+                            .agent
+                            .as_ref()
+                            .expect("an idle runtime owns its updated agent");
+                        self.context_snapshot = agent.context_snapshot();
+                        self.view.set_context_tokens(agent.context_tokens());
+                        self.view.set_skills(agent.skills().to_vec());
+                    }
+                    Err(error) => self
+                        .view
+                        .skill_update_failed(format!("Could not update skill: {error:#}")),
+                }
             }
             Action::Quit => {
                 if self.turn.is_some() {

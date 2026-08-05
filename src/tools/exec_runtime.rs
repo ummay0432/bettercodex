@@ -79,7 +79,7 @@ impl ToolRuntime {
             .session
             .execute(ExecuteRequest {
                 tool_call_id: call_id.to_string(),
-                enabled_tools: catalogue::core_tools().to_vec(),
+                enabled_tools: catalogue::runtime_tools().to_vec(),
                 source: parsed.code,
                 yield_time_ms: parsed.yield_time_ms,
                 max_output_tokens: Some(max_output_tokens),
@@ -653,6 +653,63 @@ text(`${first.path}:${second.path}`);
             std::fs::read_to_string(root.join("PAPERCUTS.md")).unwrap(),
             "# Papercuts\n\n- While running tests, the documented path was stale.\n- The formatter emitted a misleading error.\n"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_papercut_waiting_for_the_log_lock_stops_without_writing() {
+        let root = temporary_directory("papercut-cancel");
+        let cwd = root.join("src/nested");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let log_path = root.join("PAPERCUTS.md");
+        let initial = "# Papercuts\n\n- Existing note.\n";
+        std::fs::write(&log_path, initial).unwrap();
+        let held_log = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        held_log.lock().unwrap();
+
+        let runtime = runtime(cwd);
+        let cancellation = CancellationToken::new();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let execution = runtime.execute(
+            "call-cancel-papercut",
+            r#"await tools.log_papercut({message: "This must not be written."});"#,
+            Some(events_tx),
+            cancellation.clone(),
+        );
+        tokio::pin!(execution);
+
+        let started = tokio::select! {
+            _ = &mut execution => panic!("papercut finished before reaching the held lock"),
+            event = events_rx.recv() => event.expect("papercut start event"),
+        };
+        assert!(matches!(
+            started,
+            AgentEvent::ToolStarted { name, .. } if name == "log_papercut"
+        ));
+        // Give the blocking worker time to reach the contended lock; the old
+        // blocking File::lock implementation could not return after this point.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut execution)
+            .await
+            .expect("cancelled papercut remained blocked on the file lock")
+            .unwrap();
+        assert!(
+            result.preview.starts_with("Script terminated"),
+            "{}",
+            result.preview
+        );
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), initial);
+
+        held_log.unlock().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), initial);
         std::fs::remove_dir_all(root).unwrap();
     }
 

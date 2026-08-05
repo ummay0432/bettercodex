@@ -9,6 +9,7 @@ mod patch;
 const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
     code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
 
+pub(crate) use catalogue::CatalogueMetrics;
 pub(crate) use catalogue::CatalogueRoute;
 pub(crate) use catalogue::CatalogueTool;
 pub(crate) use exec_runtime::ToolRuntime;
@@ -294,6 +295,10 @@ pub(crate) fn catalogue_text() -> &'static str {
 
 pub(crate) fn display_tools() -> &'static [CatalogueTool] {
     catalogue::display_tools()
+}
+
+pub(crate) fn catalogue_metrics() -> CatalogueMetrics {
+    catalogue::metrics()
 }
 
 pub(crate) fn nested_tool_name_map() -> Value {

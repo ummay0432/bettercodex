@@ -5,17 +5,24 @@ use anyhow::anyhow;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
+use std::fs::File;
 use std::fs::OpenOptions;
+use std::fs::TryLockError;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::Duration;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub(super) const MAX_MESSAGE_CHARS: usize = 1_000;
 const FILE_NAME: &str = "PAPERCUTS.md";
 const FILE_HEADER: &str = "# Papercuts\n\n";
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Deserialize)]
 struct LogPapercutArgs {
@@ -36,14 +43,9 @@ pub(super) fn log(cwd: &Path, input: Value, cancellation: &CancellationToken) ->
     let path = root.join(FILE_NAME);
     ensure_regular_file_or_missing(&path)?;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("tools.log_papercut could not open {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("tools.log_papercut could not lock {}", path.display()))?;
+    let mut file = open_log(&path)?;
+    lock_for_append(&file, &path, cancellation)?;
+    ensure_not_cancelled(cancellation)?;
 
     let length = file
         .metadata()
@@ -66,9 +68,58 @@ pub(super) fn log(cwd: &Path, input: Value, cancellation: &CancellationToken) ->
     entry.push_str(&message);
     entry.push('\n');
 
+    ensure_not_cancelled(cancellation)?;
     file.write_all(entry.as_bytes())
         .with_context(|| format!("tools.log_papercut could not append to {}", path.display()))?;
     Ok(json!({"path": FILE_NAME}))
+}
+
+fn open_log(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        // BetterCodex targets Unix. O_NOFOLLOW closes the check/open race for
+        // symlinks, while O_NONBLOCK prevents a raced-in FIFO from hanging a
+        // blocking worker before the descriptor can be rejected below.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("tools.log_papercut could not open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("tools.log_papercut could not inspect {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "tools.log_papercut requires {} to be a regular file",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+fn lock_for_append(file: &File, path: &Path, cancellation: &CancellationToken) -> Result<()> {
+    let started_at = Instant::now();
+    loop {
+        ensure_not_cancelled(cancellation)?;
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if started_at.elapsed() < LOCK_WAIT_TIMEOUT => {
+                std::thread::sleep(LOCK_RETRY_DELAY);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(anyhow!(
+                    "tools.log_papercut could not lock {} within {} seconds; wait for the process writing the log to finish, then retry",
+                    path.display(),
+                    LOCK_WAIT_TIMEOUT.as_secs(),
+                ));
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| {
+                    format!("tools.log_papercut could not lock {}", path.display())
+                });
+            }
+        }
+    }
 }
 
 fn normalize_message(message: &str) -> Result<String> {

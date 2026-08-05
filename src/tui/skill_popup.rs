@@ -177,6 +177,9 @@ fn matching_skills(skills: &[Skill], query: &str) -> Vec<SkillMatch> {
         .iter()
         .enumerate()
         .filter_map(|(skill_index, skill)| {
+            if !skill.is_enabled() {
+                return None;
+            }
             if query.is_empty() {
                 return Some(SkillMatch {
                     skill_index,
@@ -226,7 +229,7 @@ fn active_token(
     bound_ranges: &[Range<usize>],
     skills: &[Skill],
 ) -> Option<ActiveToken> {
-    if skills.is_empty() {
+    if !skills.iter().any(Skill::is_enabled) {
         return None;
     }
     let cursor = previous_char_boundary(text, cursor.min(text.len()));
@@ -285,8 +288,9 @@ fn dollar_query_is_completable(query: &str, skills: &[Skill]) -> bool {
         .is_some_and(|byte| *byte == b'-' || byte.is_ascii_digit())
     {
         return skills.iter().any(|skill| {
-            fuzzy_match(skill.name(), query).is_some()
-                || fuzzy_match(skill.display_name(), query).is_some()
+            skill.is_enabled()
+                && (fuzzy_match(skill.name(), query).is_some()
+                    || fuzzy_match(skill.display_name(), query).is_some())
         });
     }
     true
