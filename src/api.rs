@@ -32,7 +32,6 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
-use tokio::time::timeout;
 use uuid::Uuid;
 
 #[path = "api_websocket.rs"]
@@ -49,6 +48,7 @@ const MAX_HTTP_RETRIES: usize = 4;
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: usize = 2;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const WEBSOCKET_PREWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STREAM_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16_000;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
@@ -77,6 +77,7 @@ pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 enum ApiErrorKind {
     Fatal,
     Retryable,
+    StreamIdle,
     Unauthorized,
     CacheUnsupported,
     PreviousResponseNotFound,
@@ -107,6 +108,10 @@ impl ApiError {
         Self::new(ApiErrorKind::Retryable, message)
     }
 
+    pub(super) fn stream_idle(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::StreamIdle, message)
+    }
+
     fn retryable_after(message: impl Into<String>, retry_after: Option<Duration>) -> Self {
         Self {
             kind: ApiErrorKind::Retryable,
@@ -130,6 +135,10 @@ impl ApiError {
                 | ApiErrorKind::PreviousResponseNotFound
                 | ApiErrorKind::WebSocketUnavailable
         )
+    }
+
+    pub(crate) fn is_stream_idle(&self) -> bool {
+        self.kind == ApiErrorKind::StreamIdle
     }
 
     pub(crate) fn retry_after(&self) -> Option<Duration> {
@@ -162,6 +171,7 @@ pub(crate) struct ApiClient {
     websocket: Option<WebSocketConnection>,
     websocket_reasoning_included: bool,
     websocket_baseline: Option<WebSocketBaseline>,
+    stream_idle_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -282,6 +292,7 @@ impl ApiClient {
             websocket: None,
             websocket_reasoning_included: false,
             websocket_baseline: None,
+            stream_idle_timeout: STREAM_IDLE_TIMEOUT,
         })
     }
 
@@ -317,6 +328,21 @@ impl ApiClient {
         }
         self.prefer_websocket = false;
         self.abandon_response();
+        true
+    }
+
+    fn recover_websocket_inactivity(
+        &mut self,
+        events: Option<&UnboundedSender<AgentEvent>>,
+    ) -> bool {
+        if !self.fall_back_to_http() {
+            return false;
+        }
+        if let Some(events) = events {
+            let _ = events.send(AgentEvent::Warning(
+                "Responses WebSocket became inactive; retrying once over HTTPS".to_string(),
+            ));
+        }
         true
     }
 
@@ -357,7 +383,7 @@ impl ApiClient {
                 Ok(()) => {}
                 Err(error) if error.kind == ApiErrorKind::Unauthorized => {
                     self.auth
-                        .force_refresh(&self.client)
+                        .force_refreshed_snapshot(&self.client)
                         .await
                         .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
                     refreshed_websocket_auth = true;
@@ -371,6 +397,11 @@ impl ApiClient {
                 }
                 Err(error) if error.kind == ApiErrorKind::WebSocketUnavailable => {
                     self.fall_back_to_http();
+                }
+                Err(error) if error.is_stream_idle() => {
+                    if !self.recover_websocket_inactivity(events) {
+                        return Err(error);
+                    }
                 }
                 Err(_) => {
                     // Warmup is an optimization. A normal full request remains the
@@ -404,7 +435,7 @@ impl ApiClient {
                             && !refreshed_websocket_auth =>
                     {
                         self.auth
-                            .force_refresh(&self.client)
+                            .force_refreshed_snapshot(&self.client)
                             .await
                             .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
                         refreshed_websocket_auth = true;
@@ -429,6 +460,11 @@ impl ApiClient {
                     }
                     Err(error) if error.kind == ApiErrorKind::WebSocketUnavailable => {
                         self.fall_back_to_http();
+                    }
+                    Err(error) if error.is_stream_idle() => {
+                        if !self.recover_websocket_inactivity(events) {
+                            return Err(error);
+                        }
                     }
                     Err(error) => {
                         self.abandon_response();
@@ -467,7 +503,9 @@ impl ApiClient {
         validate_server_model_header(response.headers())?;
         let server_reasoning_included = response.headers().contains_key("x-reasoning-included");
         self.capture_turn_state(response.headers());
-        let mut response = collect_http_stream(response, completed_items, events).await?;
+        let mut response =
+            collect_http_stream(response, completed_items, events, self.stream_idle_timeout)
+                .await?;
         response.server_reasoning_included = server_reasoning_included;
         Ok(response)
     }
@@ -501,6 +539,12 @@ impl ApiClient {
         mode: WebSocketRequestMode,
     ) -> ApiResult<ModelResponse> {
         self.ensure_websocket(request_kind).await?;
+        let idle_timeout = match mode {
+            WebSocketRequestMode::Inference => self.stream_idle_timeout,
+            WebSocketRequestMode::Warmup => {
+                self.stream_idle_timeout.min(WEBSOCKET_PREWARM_IDLE_TIMEOUT)
+            }
+        };
         // Serialize a delta in place, then restore the logical request for retries and baseline
         // retention. Input values move between vectors instead of being deep-cloned.
         let restoration = self.prepare_websocket_request(logical_request, mode)?;
@@ -508,7 +552,7 @@ impl ApiClient {
             .websocket
             .as_mut()
             .ok_or_else(|| ApiError::websocket_unavailable("Responses WebSocket is unavailable"))?
-            .send(logical_request, STREAM_IDLE_TIMEOUT)
+            .send(logical_request, idle_timeout)
             .await;
         restoration.restore(logical_request)?;
         send_result?;
@@ -521,7 +565,7 @@ impl ApiClient {
                 .ok_or_else(|| {
                     ApiError::websocket_unavailable("Responses WebSocket is unavailable")
                 })?
-                .next_text(STREAM_IDLE_TIMEOUT)
+                .next_text(idle_timeout)
                 .await?
                 .ok_or_else(|| ApiError::retryable("Responses WebSocket ended unexpectedly"))?;
             if text.len() > MAX_STREAM_EVENT_BYTES {
@@ -914,13 +958,9 @@ impl ApiClient {
                 return Ok(response);
             }
             if status == StatusCode::UNAUTHORIZED && !refreshed_after_unauthorized {
-                self.auth
-                    .force_refresh(&self.client)
-                    .await
-                    .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
                 auth = self
                     .auth
-                    .snapshot()
+                    .force_refreshed_snapshot(&self.client)
                     .await
                     .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
                 refreshed_after_unauthorized = true;
@@ -999,10 +1039,7 @@ impl RequestKind {
 }
 
 fn compose_input(mut history: Vec<Value>, explicit_cache: bool) -> Vec<Value> {
-    let [tools_item, mut system_item] = (*context_prefix_items()).clone();
-    if explicit_cache {
-        mark_cache_breakpoint(&mut system_item);
-    }
+    let [tools_item, system_item] = request_context_prefix(explicit_cache);
     let tools_position = history
         .iter()
         .position(|item| is_additional_tools_item(item, &tools_item));
@@ -1027,6 +1064,18 @@ fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
 
 pub(crate) fn context_prefix_items() -> &'static [Value; 2] {
     &CONTEXT_PREFIX_ITEMS
+}
+
+pub(crate) fn stable_request_prefix() -> [Value; 2] {
+    request_context_prefix(true)
+}
+
+fn request_context_prefix(explicit_cache: bool) -> [Value; 2] {
+    let [tools_item, mut system_item] = (*context_prefix_items()).clone();
+    if explicit_cache {
+        mark_cache_breakpoint(&mut system_item);
+    }
+    [tools_item, system_item]
 }
 
 fn is_system_prompt_item(item: &Value) -> bool {
@@ -1093,13 +1142,15 @@ async fn collect_http_stream(
     mut response: reqwest::Response,
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
+    idle_timeout: Duration,
 ) -> ApiResult<ModelResponse> {
     let mut decoder = SseDecoder::default();
     let mut collected = CollectedResponse::default();
+    let mut event_deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
-        let chunk = timeout(STREAM_IDLE_TIMEOUT, response.chunk())
+        let chunk = tokio::time::timeout_at(event_deadline, response.chunk())
             .await
-            .map_err(|_| ApiError::retryable("timed out waiting for the model response"))?
+            .map_err(|_| ApiError::stream_idle("model response was inactive for too long"))?
             .map_err(|error| {
                 ApiError::retryable(format!("failed to read model response: {error}"))
             })?;
@@ -1109,7 +1160,11 @@ async fn collect_http_stream(
             }
             break;
         };
-        for data in decoder.push(&chunk)? {
+        let decoded = decoder.push(&chunk)?;
+        if !decoded.is_empty() {
+            event_deadline = tokio::time::Instant::now() + idle_timeout;
+        }
+        for data in decoded {
             process_event(&data, &mut collected, completed_items, events)?;
         }
         if collected.completed {

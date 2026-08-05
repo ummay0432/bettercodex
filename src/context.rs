@@ -501,6 +501,10 @@ impl WorldState {
     }
 }
 
+pub(crate) fn initial_context_items(cwd: &Path) -> Result<Vec<Value>> {
+    Ok(WorldState::load(cwd)?.items())
+}
+
 impl ContextMetrics {
     fn from_history(history: &[Value], world_state: &WorldState) -> Self {
         let mut metrics = Self::default();

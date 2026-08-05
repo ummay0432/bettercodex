@@ -18,6 +18,7 @@ use codex_client::RequestCompression;
 use codex_client::ReqwestTransport;
 use codex_client::RetryOn;
 use codex_client::RetryPolicy;
+use codex_client::TransportError;
 use codex_client::run_with_retry;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -300,7 +301,7 @@ impl WebSearchClient {
         cancellation: CancellationToken,
     ) -> Result<Value> {
         let commands = parse_commands(input)?;
-        let auth = self
+        let mut auth = self
             .auth
             .refreshed_snapshot(&self.client)
             .await
@@ -318,22 +319,41 @@ impl WebSearchClient {
         };
         let body = serde_json::to_value(request)
             .context("failed to encode standalone web search request")?;
-        let request = Request {
-            method: reqwest::Method::POST,
-            url: format!("{}/{}", self.base_url.trim_end_matches('/'), SEARCH_PATH),
-            headers: search_headers(&context.turn_metadata, &auth)?,
-            body: Some(RequestBody::Json(body)),
-            compression: RequestCompression::None,
-            timeout: None,
-        };
         let transport = ReqwestTransport::new(self.client.clone());
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(anyhow!("web search cancelled")),
-            response = run_with_retry(
-                search_retry_policy(),
-                || request.clone(),
-                |request, _attempt| transport.execute(request),
-            ) => response,
+        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), SEARCH_PATH);
+        let mut refreshed_after_unauthorized = false;
+        let response = loop {
+            let request = Request {
+                method: reqwest::Method::POST,
+                url: url.clone(),
+                headers: search_headers(&context.turn_metadata, &auth)?,
+                body: Some(RequestBody::Json(body.clone())),
+                compression: RequestCompression::None,
+                timeout: None,
+            };
+            let result = tokio::select! {
+                _ = cancellation.cancelled() => return Err(anyhow!("web search cancelled")),
+                response = run_with_retry(
+                    search_retry_policy(),
+                    || request.clone(),
+                    |request, _attempt| transport.execute(request),
+                ) => response,
+            };
+            match result {
+                Err(TransportError::Http { status, .. })
+                    if status.as_u16() == 401 && !refreshed_after_unauthorized =>
+                {
+                    auth = tokio::select! {
+                        _ = cancellation.cancelled() => return Err(anyhow!("web search cancelled")),
+                        refreshed = self.auth.force_refreshed_snapshot(&self.client) => refreshed,
+                    }
+                    .context(
+                        "web search authentication was rejected and ChatGPT credential refresh failed",
+                    )?;
+                    refreshed_after_unauthorized = true;
+                }
+                result => break result,
+            }
         }
         .map_err(|error| anyhow!("standalone web search request failed: {error}"))?;
         let response: SearchResponse = serde_json::from_slice(&response.body)

@@ -58,9 +58,14 @@ reproducible estimates:
   used by BetterCodex for text history estimates.
 
 The JSON figures use compact serialization with sorted object keys. Counts are
-the audited 2026-08-05 snapshot. Prompt caching reduces repeated input billing;
-it does not remove the cached prefix from the active context window.
+the audited 2026-08-05 snapshot. `./scripts/dev.py tool-context --check`
+renders the actual request items and verifies the stable rows;
+`./scripts/dev.py tool-context --update` rewrites all three tables. The command
+uses pinned `tiktoken` 0.11.0 through `uv` when the module is not already
+installed. Prompt caching reduces repeated input billing; it does not remove
+the cached prefix from the active context window.
 
+<!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Complete stable prefix: `additional_tools` plus cached system-prompt item | 23,139 | 5,726 | 5,785 |
@@ -72,10 +77,12 @@ it does not remove the cached prefix from the active context window.
 | `wait` description only | 769 | 181 | 193 |
 | Cached system-prompt message item | 2,696 | 530 | 674 |
 | `prompts/system.md` text only | 2,529 | 479 | 633 |
+<!-- bcodex-tool-context:stable:end -->
 
 The `exec` description contains the Code Mode runtime instructions and every
 nested tool declaration. This is the text-only breakdown:
 
+<!-- bcodex-tool-context:sections:start -->
 | Section inside `exec` | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Runtime rules and global helpers | 3,375 | 806 | 844 |
@@ -84,8 +91,9 @@ nested tool declaration. This is the text-only breakdown:
 | `log_papercut` | 397 | 106 | 100 |
 | `update_plan` | 498 | 126 | 125 |
 | `view_image` | 654 | 153 | 164 |
-| `write_stdin` | 1,168 | 266 | 292 |
+| `write_stdin` | 1,169 | 267 | 293 |
 | `web` namespace and `web__run` | 10,396 | 2,513 | 2,599 |
+<!-- bcodex-tool-context:sections:end -->
 
 The full `exec` description is stored verbatim in
 [`tool-catalogue.md`](tool-catalogue.md). A snapshot test compares that file to
@@ -99,11 +107,13 @@ occupy the same context window. With the default embedded `papercut` skill
 implicitly invocable, they cost the following for the
 BetterCodex repository on the audit date:
 
+<!-- bcodex-tool-context:dynamic:start -->
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Current `<environment_context>` developer item | 276 | 85 | 69 |
 | Current repository-onboarding user item | 9,034 | 2,162 | 2,259 |
 | Current `<skills>` developer item | 3,012 | 693 | 753 |
+<!-- bcodex-tool-context:dynamic:end -->
 
 Those rows are snapshots, not constants. The environment fields change with the
 working directory, shell, date, and timezone. Repository instruction text

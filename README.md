@@ -120,9 +120,11 @@ plain line interface. Passing a prompt remains a one-shot invocation.
 The Responses client prefers WebSockets and reuses completed responses with a
 guarded incremental input delta. It reconnects with full history when that
 connection-local state is gone and falls back to HTTP SSE when WebSocket
-upgrade is unavailable. Stable request content uses an explicit prompt-cache
-breakpoint; cache reads and writes are recorded from backend usage rather than
-inferred.
+upgrade is unavailable. A five-minute model-event inactivity bound ignores
+WebSocket ping/pong and SSE keepalive traffic; an inactive WebSocket switches
+directly to one HTTP attempt instead of multiplying the wait across reconnects.
+Stable request content uses an explicit prompt-cache breakpoint; cache reads
+and writes are recorded from backend usage rather than inferred.
 
 ## Tools
 
@@ -160,6 +162,9 @@ bcodex --tool-catalogue-stats
 tool-related request prefix, the dynamic world-state messages beside it, and
 reproducible per-tool token-cost estimates.
 
+Developer worktree, disk preflight, startup benchmark, request-audit, and Git
+refspec workflows are documented in [`docs/development.md`](docs/development.md).
+
 ## Validate
 
 ```sh
@@ -167,5 +172,8 @@ cargo fmt --all --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+Use `./scripts/dev.py cargo …` instead when validating from a linked worktree;
+it isolates package artifacts without placing the large target under `/tmp`.
 
 Licensed under [Apache-2.0](LICENSE).

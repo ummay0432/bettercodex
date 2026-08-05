@@ -614,16 +614,17 @@ mod tests {
     #[test]
     fn documented_tool_context_byte_counts_do_not_drift() {
         let tools = specifications();
-        assert_eq!(text().len(), 18_103, "update prompts/tool-context.md");
+        let update = "run ./scripts/dev.py tool-context --update";
+        assert_eq!(text().len(), 18_103, "{update}");
         assert_eq!(
             serde_json::to_string(&tools[0]).unwrap().len(),
             19_026,
-            "update prompts/tool-context.md"
+            "{update}"
         );
         assert_eq!(
             serde_json::to_string(&tools[1]).unwrap().len(),
             1_356,
-            "update prompts/tool-context.md"
+            "{update}"
         );
         let item = json!({
             "type": "additional_tools",
@@ -633,7 +634,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&item).unwrap().len(),
             20_440,
-            "update prompts/tool-context.md"
+            "{update}"
         );
         assert_eq!(
             metrics(),

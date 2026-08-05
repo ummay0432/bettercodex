@@ -248,10 +248,11 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
         json!({"mode": "explicit"})
     );
     assert_eq!(&first_input[..2], &second_input[..2]);
+    assert_eq!(&first_input[..2], stable_request_prefix());
     assert_eq!(
         serde_json::to_string(&first_input[..2]).unwrap().len(),
         23_139,
-        "update prompts/tool-context.md"
+        "run ./scripts/dev.py tool-context --update"
     );
 
     let mut retained_prefix = first_input.to_vec();
@@ -615,6 +616,28 @@ async fn http_transport_collects_large_sse_events_from_small_http_chunks() {
     assert_eq!(response.text, text);
     assert_eq!(completed_rx.try_recv().unwrap(), item);
     assert!(completed_rx.try_recv().is_err());
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(2)).unwrap().path,
+        "/responses"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn http_keepalive_comments_do_not_hide_model_event_inactivity() {
+    let (base_url, requests, server) = spawn_idle_http_server();
+    let mut client = test_client(base_url);
+    client.prefer_websocket = false;
+    client.stream_idle_timeout = Duration::from_millis(50);
+    let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = client
+        .respond(vec![user_message("idle")], &completed_items)
+        .await
+        .err()
+        .expect("SSE comments must not keep a response alive without model events");
+
+    assert!(error.is_stream_idle());
     assert_eq!(
         requests.recv_timeout(Duration::from_secs(2)).unwrap().path,
         "/responses"
@@ -1139,6 +1162,106 @@ async fn websocket_prewarm_and_continuations_match_the_responses_contract() {
     server.await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_pings_do_not_hide_inactivity_and_recovery_goes_directly_to_https() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let item = assistant_item("https recovery");
+    let response_item = item.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_async_with_config(stream, Some(websocket::websocket_config()))
+            .await
+            .unwrap();
+
+        let Message::Text(warmup) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected warmup request")
+        };
+        let warmup: Value = serde_json::from_str(&warmup).unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_warm",
+                        "model": MODEL,
+                        "reasoning": {"context": "all_turns"},
+                        "output": [],
+                    },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let Message::Text(stalled) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected inference request")
+        };
+        let stalled: Value = serde_json::from_str(&stalled).unwrap();
+        for _ in 0..20 {
+            if websocket
+                .send(Message::Ping(Vec::new().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(websocket);
+
+        let (http_stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("client did not fall back to HTTPS")
+            .unwrap();
+        let mut http_stream = http_stream.into_std().unwrap();
+        http_stream.set_nonblocking(false).unwrap();
+        let http_request = read_request(&mut http_stream);
+        let body = completed_sse("resp_https_recovery", &response_item);
+        write!(
+            http_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+        .unwrap();
+        http_stream.flush().unwrap();
+        (warmup, stalled, http_request)
+    });
+
+    let mut client = test_client(format!("http://{address}"));
+    client.stream_idle_timeout = Duration::from_millis(50);
+    let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.respond_streaming(vec![user_message("recover me")], &completed_items, &events),
+    )
+    .await
+    .expect("response recovery timed out")
+    .unwrap();
+
+    assert_eq!(response.text, "https recovery");
+    assert!(!client.prefer_websocket);
+    let warnings = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::Warning(message) => Some(message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings,
+        ["Responses WebSocket became inactive; retrying once over HTTPS"]
+    );
+
+    let (warmup, stalled, http_request) = server.await.unwrap();
+    assert_eq!(warmup["generate"], false);
+    assert!(stalled.to_string().contains("recover me"));
+    assert_eq!(http_request.path, "/responses");
+    let http_body: Value = serde_json::from_slice(&http_request.body).unwrap();
+    assert!(http_body.to_string().contains("recover me"));
+}
+
 struct HttpReply {
     status: u16,
     content_type: &'static str,
@@ -1231,6 +1354,40 @@ fn spawn_http_server(
             }
             stream.flush().unwrap();
         }
+    });
+    (format!("http://{address}"), requests_rx, server)
+}
+
+fn spawn_idle_http_server() -> (
+    String,
+    std_mpsc::Receiver<CapturedRequest>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requests_tx, requests_rx) = std_mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        requests_tx.send(read_request(&mut stream)).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        let keepalive = b": keepalive\n\n";
+        for _ in 0..20 {
+            if write!(stream, "{:x}\r\n", keepalive.len())
+                .and_then(|()| stream.write_all(keepalive))
+                .and_then(|()| stream.write_all(b"\r\n"))
+                .and_then(|()| stream.flush())
+                .is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = stream.write_all(b"0\r\n\r\n");
     });
     (format!("http://{address}"), requests_rx, server)
 }

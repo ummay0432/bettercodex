@@ -59,6 +59,17 @@ async fn run() -> Result<()> {
             println!("{}", tool_catalogue_stats());
             Ok(())
         }
+        Command::ToolContextJson => {
+            let cwd = std::env::current_dir()?.canonicalize()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "stable_prefix": api::stable_request_prefix(),
+                    "world_state": context::initial_context_items(&cwd)?,
+                })
+            );
+            Ok(())
+        }
         Command::Run(options) => run_agent(options, None).await,
         Command::Resume { selector, options } => run_agent(options, Some(selector)).await,
     }
@@ -121,6 +132,7 @@ enum Command {
     Version,
     ToolCatalogue,
     ToolCatalogueStats,
+    ToolContextJson,
 }
 
 #[derive(Default)]
@@ -155,6 +167,12 @@ impl Command {
             argument == "--tool-catalogue-stats" || argument == "--tool-catalog-stats"
         }) {
             return Ok(Self::ToolCatalogueStats);
+        }
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--tool-context-json")
+        {
+            return Ok(Self::ToolContextJson);
         }
 
         let resume = arguments
@@ -217,7 +235,7 @@ impl Command {
 
 fn print_help() {
     println!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -284,6 +302,14 @@ mod tests {
         assert!(matches!(
             Command::parse(["--tool-catalogue".to_string()]).unwrap(),
             Command::ToolCatalogue
+        ));
+    }
+
+    #[test]
+    fn parses_tool_context_json_flag() {
+        assert!(matches!(
+            Command::parse(["--tool-context-json".to_string()]).unwrap(),
+            Command::ToolContextJson
         ));
     }
 

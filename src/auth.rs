@@ -6,6 +6,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::io::Write;
 #[cfg(unix)]
@@ -29,6 +30,7 @@ pub(crate) struct Auth {
     refresh_token: Option<String>,
     account_id: Option<String>,
     expires_at: Option<u64>,
+    refresh_url: Cow<'static, str>,
     storage: Option<StoredAuth>,
 }
 
@@ -62,6 +64,23 @@ impl Auth {
             refresh_token: None,
             account_id: Some("test-account".to_string()),
             expires_at: None,
+            refresh_url: Cow::Borrowed(REFRESH_URL),
+            storage: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refreshable_for_test(
+        access_token: impl Into<String>,
+        refresh_token: impl Into<String>,
+        refresh_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            access_token: access_token.into(),
+            refresh_token: Some(refresh_token.into()),
+            account_id: Some("test-account".to_string()),
+            expires_at: None,
+            refresh_url: Cow::Owned(refresh_url.into()),
             storage: None,
         }
     }
@@ -79,6 +98,7 @@ impl Auth {
                 access_token,
                 refresh_token: None,
                 account_id,
+                refresh_url: Cow::Borrowed(REFRESH_URL),
                 storage: None,
             });
         }
@@ -107,6 +127,7 @@ impl Auth {
             access_token,
             refresh_token,
             account_id,
+            refresh_url: Cow::Borrowed(REFRESH_URL),
             storage: Some(StoredAuth { path, document }),
         })
     }
@@ -131,7 +152,7 @@ impl Auth {
             anyhow!("the ChatGPT access token cannot be refreshed; run `codex login` and try again")
         })?;
         let response = client
-            .post(REFRESH_URL)
+            .post(self.refresh_url.as_ref())
             .json(&serde_json::json!({
                 "client_id": CLIENT_ID,
                 "grant_type": "refresh_token",
@@ -235,12 +256,13 @@ impl SharedAuth {
         auth.snapshot()
     }
 
-    pub(crate) async fn force_refresh(&self, client: &reqwest::Client) -> Result<()> {
-        self.inner.lock().await.force_refresh(client).await
-    }
-
-    pub(crate) async fn snapshot(&self) -> Result<AuthSnapshot> {
-        self.inner.lock().await.snapshot()
+    pub(crate) async fn force_refreshed_snapshot(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<AuthSnapshot> {
+        let mut auth = self.inner.lock().await;
+        auth.force_refresh(client).await?;
+        auth.snapshot()
     }
 }
 

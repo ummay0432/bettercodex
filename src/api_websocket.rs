@@ -6,7 +6,9 @@ use reqwest::header::HeaderMap;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async_with_config;
@@ -47,15 +49,18 @@ impl WebSocketConnection {
             self.stream.send(Message::Text(encoded.into())),
         )
         .await
-        .map_err(|_| ApiError::retryable("timed out sending Responses WebSocket request"))?
+        .map_err(|_| ApiError::stream_idle("Responses WebSocket send was inactive for too long"))?
         .map_err(|error| ApiError::retryable(format!("failed to send WebSocket request: {error}")))
     }
 
     pub(super) async fn next_text(&mut self, idle_timeout: Duration) -> ApiResult<Option<String>> {
+        let deadline = Instant::now() + idle_timeout;
         loop {
-            let message = timeout(idle_timeout, self.stream.next())
+            let message = timeout_at(deadline, self.stream.next())
                 .await
-                .map_err(|_| ApiError::retryable("timed out waiting for Responses WebSocket"))?;
+                .map_err(|_| {
+                    ApiError::stream_idle("Responses WebSocket was inactive for too long")
+                })?;
             let Some(message) = message else {
                 return Err(ApiError::retryable(
                     "WebSocket closed before response.completed",
@@ -64,9 +69,13 @@ impl WebSocketConnection {
             match message {
                 Ok(Message::Text(text)) => return Ok(Some(text.to_string())),
                 Ok(Message::Ping(payload)) => {
-                    self.stream
-                        .send(Message::Pong(payload))
+                    timeout_at(deadline, self.stream.send(Message::Pong(payload)))
                         .await
+                        .map_err(|_| {
+                            ApiError::stream_idle(
+                                "Responses WebSocket was inactive while answering a ping",
+                            )
+                        })?
                         .map_err(|error| {
                             ApiError::retryable(format!(
                                 "failed to answer Responses WebSocket ping: {error}"
