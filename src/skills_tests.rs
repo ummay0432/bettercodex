@@ -166,12 +166,9 @@ fn implicit_catalog_discloses_metadata_without_eagerly_injecting_the_skill_body(
 fn bundled_papercut_uses_progressive_disclosure_and_remains_explicitly_selectable() {
     let root = temporary_root("bundled-papercut");
     let home = root.join("home");
-    let system_root = system_skills::install(&home).unwrap();
-    let roots = [SkillRoot {
-        path: &system_root,
-        scope: SkillScope::System,
-    }];
-    let catalog = SkillCatalog::load_from_roots(&roots);
+    let cwd = root.join("repository");
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+    let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
 
     assert!(catalog.warnings().is_empty());
     assert_eq!(catalog.skills().len(), 1);
@@ -192,7 +189,7 @@ fn bundled_papercut_uses_progressive_disclosure_and_remains_explicitly_selectabl
     );
 
     let selection = SkillSelection::new("papercut", papercut.path());
-    let injection = catalog.explicit_injections("use $papercut", &[selection.clone()]);
+    let injection = catalog.explicit_injections("use $papercut", std::slice::from_ref(&selection));
     assert_eq!(injection.items.len(), 1);
     assert!(
         text_of(&injection.items[0])
@@ -206,8 +203,7 @@ fn bundled_papercut_uses_progressive_disclosure_and_remains_explicitly_selectabl
         SkillUpdate::AllowImplicitInvocation(false),
     )
     .unwrap();
-    let mut explicit_only = SkillCatalog::load_from_roots(&roots);
-    explicit_only.apply_settings(&settings_path);
+    let explicit_only = SkillCatalog::load_with_home(&cwd, Some(&home));
     assert!(explicit_only.instructions_message(353_400).is_none());
     assert_eq!(
         explicit_only
@@ -433,7 +429,7 @@ fn project_discovery_stops_at_the_git_boundary_and_uses_dot_bcodex_roots() {
     fs::create_dir_all(repository.join(".git")).unwrap();
     fs::create_dir_all(&nested).unwrap();
 
-    let roots = discovery_roots(&nested);
+    let roots = discovery_roots_with_home(&nested, None);
     let repository_roots = roots
         .iter()
         .filter(|(_, scope)| *scope == SkillScope::Repository)

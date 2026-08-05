@@ -560,6 +560,11 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
         .repository_instructions
         .clone()
         .unwrap();
+    let skills_instructions = conversation
+        .world_state
+        .skills_instructions
+        .clone()
+        .unwrap();
     let sections = vec![
         ContextSection {
             kind: ContextKind::SystemPrompt,
@@ -574,6 +579,11 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
         ContextSection {
             kind: ContextKind::RepositoryInstructions,
             tokens: estimate_value_tokens(&repository_instructions),
+            items: 1,
+        },
+        ContextSection {
+            kind: ContextKind::Skills,
+            tokens: estimate_value_tokens(&skills_instructions),
             items: 1,
         },
         ContextSection {

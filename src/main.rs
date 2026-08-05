@@ -10,6 +10,7 @@ mod repository;
 mod rollout;
 mod skill_settings;
 mod skills;
+mod system_skills;
 mod tools;
 mod tui;
 mod usage;

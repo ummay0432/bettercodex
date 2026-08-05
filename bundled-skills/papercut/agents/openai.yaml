@@ -1,0 +1,6 @@
+interface:
+  display_name: "Papercut Logger"
+  short_description: "Proactively record recurring workflow friction"
+
+policy:
+  allow_implicit_invocation: true

@@ -14,20 +14,6 @@ unfinished work or leave cleanup for the user.
 Parallelize independent tool calls; keep work sequential when one result determines the
 next action, synthesize parallel results before taking subsequent action.
 
-### Log papercuts
-
-A papercut is a small, non-blocking source of friction in the repository, tools, setup, or
-documentation that wastes time and could affect a future session. Examples include a
-dead-end tool call, unclear setup, flaky command, stale cache, misleading error, or
-undocumented gotcha.
-
-When you encounter one, immediately call
-`await tools.log_papercut({ message: "..." })`. Do not ask first; log it and continue
-working. In one or two sentences, state what you were doing, what got in the way, and the
-likely fix if known. Do not log the bug the user asked you to fix, an expected failure, a
-one-off mistake, a problem you fixed during the task, or secrets. Log each distinct
-papercut once per session. Use the tool instead of editing `PAPERCUTS.md` manually.
-
 Implementation is complete only when all three success criteria are satisfied:
 
 - System quality: Judge the affected system, not diff size. Do not preserve an inferior

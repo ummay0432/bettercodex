@@ -237,6 +237,10 @@ fn output_item_completion_closes_the_visible_stream() {
 
 #[test]
 fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
+    assert!(
+        !SYSTEM_PROMPT.to_ascii_lowercase().contains("papercut"),
+        "papercut policy belongs to the toggleable system skill"
+    );
     let client = test_client("http://127.0.0.1:1".to_string());
     let first_message = user_message("one");
     let first_text_allocation = first_message["content"][0]["text"]
@@ -282,7 +286,7 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
     assert_eq!(&first_input[..2], &second_input[..2]);
     assert_eq!(
         serde_json::to_string(&first_input[..2]).unwrap().len(),
-        23_932,
+        23_139,
         "update prompts/tool-context.md"
     );
 

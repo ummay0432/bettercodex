@@ -94,11 +94,22 @@ composer. The core shortcuts are:
 
 Each skill is a directory containing `SKILL.md`. Its YAML frontmatter supplies
 the name and description used by completion and by the model-visible catalogue;
-the remaining Markdown contains the workflow. BetterCodex ships no built-in
-skills. `/skills` opens the skill manager. `Space` or `Enter` enables or disables
-the selected skill, while `i` independently controls implicit invocation. An
-enabled skill with implicit invocation off remains available through an explicit
-`$` mention but is omitted from the agent's default context, so the agent cannot
+the remaining Markdown contains the workflow. Following OpenAI's progressive-
+disclosure design, the default context contains only each implicitly invocable
+skill's name, description, and path. The agent reads the full `SKILL.md` only
+after the description matches the task or the operator selects the skill.
+
+BetterCodex embeds one system skill, `papercut`, and materializes it under
+`${BCODEX_HOME:-$HOME/.bcodex}/skills/.system` so the advertised workflow is a
+real readable file. It replaces the former always-on System-prompt instructions:
+while implicit invocation is enabled, the description tells the agent to
+proactively log recurring workflow friction with `tools.log_papercut` and then
+continue working.
+
+`/skills` opens the skill manager. `Space` or `Enter` enables or disables the
+selected skill, while `i` independently controls implicit invocation. An enabled
+skill with implicit invocation off remains available through an explicit `$`
+mention but is omitted from the agent's default context, so the agent cannot
 invoke it proactively. Changes are saved by canonical skill path in
 `${BCODEX_HOME:-$HOME/.bcodex}/skills.json` and applied to the active session.
 

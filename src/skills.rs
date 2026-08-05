@@ -1,5 +1,6 @@
 use crate::repository;
 use crate::skill_settings;
+use crate::system_skills;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -52,6 +53,7 @@ const SKILLS_USAGE: &str = r#"- Discovery: The list above is the skills availabl
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SkillScope {
+    System,
     Repository,
     User,
 }
@@ -241,7 +243,17 @@ impl WarningCollector {
 
 impl SkillCatalog {
     pub(crate) fn load(cwd: &Path) -> Self {
-        let roots = discovery_roots(cwd);
+        let home = bettercodex_home();
+        Self::load_with_home(cwd, home.as_deref())
+    }
+
+    fn load_with_home(cwd: &Path, home: Option<&Path>) -> Self {
+        let installation_warning = home.and_then(|home| {
+            system_skills::install(home)
+                .err()
+                .map(|error| format!("Could not install bundled system skills: {error:#}"))
+        });
+        let roots = discovery_roots_with_home(cwd, home);
         let borrowed = roots
             .iter()
             .map(|(path, scope)| SkillRoot {
@@ -250,8 +262,13 @@ impl SkillCatalog {
             })
             .collect::<Vec<_>>();
         let mut catalog = Self::load_from_roots(&borrowed);
-        if let Some(home) = bettercodex_home() {
+        if let Some(home) = home {
             catalog.apply_settings(&home.join(skill_settings::FILE_NAME));
+        }
+        if let Some(warning) = installation_warning
+            && catalog.warnings.len() < MAX_WARNINGS
+        {
+            catalog.warnings.push(bounded_warning(warning));
         }
         catalog
     }
@@ -497,7 +514,10 @@ pub(crate) fn is_mention_name_byte(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':')
 }
 
-fn discovery_roots(cwd: &Path) -> Vec<(PathBuf, SkillScope)> {
+fn discovery_roots_with_home(
+    cwd: &Path,
+    bettercodex_home: Option<&Path>,
+) -> Vec<(PathBuf, SkillScope)> {
     let project_root = repository::find_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let mut directories = Vec::new();
     let mut directory = cwd;
@@ -522,8 +542,9 @@ fn discovery_roots(cwd: &Path) -> Vec<(PathBuf, SkillScope)> {
             )
         })
         .collect::<Vec<_>>();
-    if let Some(home) = bettercodex_home() {
+    if let Some(home) = bettercodex_home {
         roots.push((home.join(SKILLS_DIRECTORY), SkillScope::User));
+        roots.push((system_skills::root(home), SkillScope::System));
     }
     roots
 }

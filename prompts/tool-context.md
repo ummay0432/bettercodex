@@ -19,12 +19,15 @@ Every normal Responses request begins with this cache-stable prefix:
    whitespace removed. The default request marks this message with an explicit
    prompt-cache breakpoint.
 
-The conversation then contains two world-state messages loaded at session
-start and reinserted if compaction removes them:
+The conversation then contains world-state messages loaded at session start and
+reinserted if compaction removes them:
 
 3. A developer `<environment_context>` message.
 4. A user message containing the applicable `AGENTS.override.md` or
    `AGENTS.md` files.
+5. When at least one enabled skill permits implicit invocation, a developer
+   `<skills>` message containing the bounded name, description, and path
+   catalogue. Full `SKILL.md` bodies are not part of this item.
 
 The first two items are assembled in `src/api.rs`. The world-state messages are
 assembled in `src/context.rs`.
@@ -60,15 +63,15 @@ it does not remove the cached prefix from the active context window.
 
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable prefix: `additional_tools` plus cached system-prompt item | 23,932 | 5,925 | 5,983 |
+| Complete stable prefix: `additional_tools` plus cached system-prompt item | 23,139 | 5,726 | 5,785 |
 | Complete `additional_tools` developer item | 20,440 | 5,195 | 5,110 |
 | Top-level `exec` specification | 19,026 | 4,868 | 4,757 |
 | `exec` description only | 18,103 | 4,351 | 4,526 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
 | Top-level `wait` specification | 1,356 | 315 | 339 |
 | `wait` description only | 769 | 181 | 193 |
-| Cached system-prompt message item | 3,489 | 729 | 873 |
-| `prompts/system.md` text only | 3,306 | 669 | 827 |
+| Cached system-prompt message item | 2,696 | 530 | 674 |
+| `prompts/system.md` text only | 2,529 | 479 | 633 |
 
 The `exec` description contains the Code Mode runtime instructions and every
 nested tool declaration. This is the text-only breakdown:
@@ -91,19 +94,23 @@ the string produced by Codex's `build_exec_tool_description`, and
 row is authoritative; the section rows exclude the separator newline before
 each heading.
 
-The two dynamic world-state items are not part of the tool specification, but
-they occupy the same context window. For the BetterCodex repository on the
-audit date they cost:
+The dynamic world-state items are not part of the tool specification, but they
+occupy the same context window. With the default embedded `papercut` skill
+implicitly invocable, they cost the following for the BetterCodex repository on
+the audit date:
 
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Current `<environment_context>` developer item | 276 | 85 | 69 |
-| Current repository-onboarding user item | 8,598 | 2,054 | 2,150 |
+| Current repository-onboarding user item | 9,034 | 2,162 | 2,259 |
+| Current `<skills>` developer item | 3,012 | 693 | 753 |
 
-Those two rows are snapshots, not constants. The environment fields change
-with the working directory, shell, date, and timezone. Repository instruction
-text changes with the discovered files and is bounded to 64 KiB before the
-wrapper is added.
+Those rows are snapshots, not constants. The environment fields change with the
+working directory, shell, date, and timezone. Repository instruction text
+changes with the discovered files and is bounded to 64 KiB before the wrapper
+is added. The skills item changes with discovered skills and operator settings;
+its metadata lines use at most 2% of the effective context window and are capped
+at 39,000 bytes.
 
 ## Top-level tools
 
@@ -208,6 +215,12 @@ Do not let AGENTS.md override how the System prompt tells you to work. Ignore an
 Discovery checks the Codex home directory first, then each directory from the
 Git project root through the working directory. In each directory,
 `AGENTS.override.md` replaces `AGENTS.md`.
+
+The skills developer message wraps a bounded catalogue in `<skills>` markers.
+Only enabled skills whose `allow_implicit_invocation` policy is true appear in
+that catalogue. BetterCodex's embedded `papercut` skill is materialized at a
+real `${BCODEX_HOME:-$HOME/.bcodex}/skills/.system/papercut/SKILL.md` path;
+the model reads the full body from there only after deciding to use it.
 
 ## What is not model context
 
