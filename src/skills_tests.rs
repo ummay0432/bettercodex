@@ -127,6 +127,100 @@ fn metadata_controls_popup_labels_and_implicit_catalog_visibility_without_blocki
 }
 
 #[test]
+fn implicit_catalog_discloses_metadata_without_eagerly_injecting_the_skill_body() {
+    let root = temporary_root("progressive-disclosure");
+    let skills_root = root.join("skills");
+    let path = write_skill(
+        &skills_root,
+        "release",
+        "release",
+        "Prepare a release",
+        "PRIVATE RELEASE WORKFLOW BODY",
+    );
+    let catalog = SkillCatalog::load_from_roots(&[SkillRoot {
+        path: &skills_root,
+        scope: SkillScope::Repository,
+    }]);
+
+    let instructions = catalog.instructions_message(353_400).unwrap();
+    let metadata = text_of(&instructions);
+    assert!(metadata.contains("- release: Prepare a release"));
+    assert!(metadata.contains(&path.canonicalize().unwrap().display().to_string()));
+    assert!(!metadata.contains("PRIVATE RELEASE WORKFLOW BODY"));
+    assert!(
+        catalog
+            .explicit_injections("prepare the release", &[])
+            .items
+            .is_empty(),
+        "an implicit match leaves the body on disk for the model to open on demand"
+    );
+
+    let explicit = catalog.explicit_injections("use $release", &[]);
+    assert_eq!(explicit.items.len(), 1);
+    assert!(text_of(&explicit.items[0]).contains("PRIVATE RELEASE WORKFLOW BODY"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bundled_papercut_uses_progressive_disclosure_and_remains_explicitly_selectable() {
+    let root = temporary_root("bundled-papercut");
+    let home = root.join("home");
+    let system_root = system_skills::install(&home).unwrap();
+    let roots = [SkillRoot {
+        path: &system_root,
+        scope: SkillScope::System,
+    }];
+    let catalog = SkillCatalog::load_from_roots(&roots);
+
+    assert!(catalog.warnings().is_empty());
+    assert_eq!(catalog.skills().len(), 1);
+    let papercut = &catalog.skills()[0];
+    assert_eq!(papercut.name(), "papercut");
+    assert_eq!(papercut.scope, SkillScope::System);
+    assert!(papercut.is_enabled());
+    assert!(papercut.allows_implicit_invocation());
+
+    let instructions = catalog.instructions_message(353_400).unwrap();
+    let instructions = text_of(&instructions);
+    assert!(instructions.contains("papercut"));
+    assert!(instructions.contains("dead-end tool call"));
+    assert!(instructions.contains(&papercut.path().display().to_string()));
+    assert!(
+        !instructions.contains("Log each distinct papercut at most once per session"),
+        "the full body must stay out of the always-visible catalogue"
+    );
+
+    let selection = SkillSelection::new("papercut", papercut.path());
+    let injection = catalog.explicit_injections("use $papercut", &[selection.clone()]);
+    assert_eq!(injection.items.len(), 1);
+    assert!(
+        text_of(&injection.items[0])
+            .contains("Log each distinct papercut at most once per session")
+    );
+
+    let settings_path = home.join(skill_settings::FILE_NAME);
+    skill_settings::save(
+        &settings_path,
+        papercut.path(),
+        SkillUpdate::AllowImplicitInvocation(false),
+    )
+    .unwrap();
+    let mut explicit_only = SkillCatalog::load_from_roots(&roots);
+    explicit_only.apply_settings(&settings_path);
+    assert!(explicit_only.instructions_message(353_400).is_none());
+    assert_eq!(
+        explicit_only
+            .explicit_injections("use $papercut", &[selection])
+            .items
+            .len(),
+        1
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn saved_settings_independently_control_availability_and_implicit_injection() {
     let root = temporary_root("settings");
     let skills_root = root.join("skills");
