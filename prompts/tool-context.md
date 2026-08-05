@@ -140,6 +140,33 @@ rule requires at least a 35% catalogue reduction with no lower aggregate or
 per-case pass count; differing cases receive one additional matched repetition,
 with all outcomes retained.
 
+The frozen 2026-08-05 run evaluated 12 cases twice per arm in randomized order.
+Both catalogues passed every hard grade and every case was tied 2/2, so the
+predeclared extra-repetition rule did not trigger. The candidate met the
+catalogue-reduction threshold and the no-regression acceptance rules:
+
+| Recorded measure | Previous catalogue | Concise catalogue | Change |
+| --- | ---: | ---: | ---: |
+| Hard-graded passes | 24/24 | 24/24 | tied |
+| Complete catalogue `o200k` estimate | 5,195 | 2,939 | -43.4% |
+| Median first-request backend input tokens | 6,106.5 | 3,992.5 | -34.6% |
+| Aggregate backend input tokens | 613,340 | 539,250 | -12.1% |
+| Aggregate output tokens | 16,658 | 18,083 | +8.6% |
+| Aggregate reasoning-output tokens | 9,177 | 9,616 | +4.8% |
+| Aggregate wall time | 544.538 s | 688.638 s | +26.5% |
+
+The result does not justify claiming universal equivalence or a speedup. It is
+one GPT-5.6 Sol run over 12 fixture tasks with two repetitions, and hard grades
+measure observable task and tool behavior rather than subjective answer
+quality. The concise arm was slower in 17 of 24 matched runs and made more web
+verification calls, contributing to higher output, reasoning, and wall-time
+totals despite lower input use. Those adverse measurements are retained rather
+than tuned away or excluded. The complete unfiltered 48-run artifact, including
+all outputs and tool calls, is
+[`evaluations/tool-catalogue/2026-08-05-matched-ab.json`](../evaluations/tool-catalogue/2026-08-05-matched-ab.json)
+(SHA-256
+`a7c5e790a4bdbc3a2ba5eb3cf33e8d802dfa5b6c9febbbb649858e8757d759cb`).
+
 The dynamic world-state items are not part of the tool specification, but they
 occupy the same context window. With the default embedded `papercut` skill
 implicitly invocable, they cost the following for the
