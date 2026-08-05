@@ -1,6 +1,0 @@
-interface:
-  display_name: "AnyDoc Reader"
-  short_description: "Read office files locally as Markdown"
-
-policy:
-  allow_implicit_invocation: true

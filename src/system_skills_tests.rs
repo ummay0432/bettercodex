@@ -4,7 +4,7 @@ use std::os::unix::fs::symlink;
 use uuid::Uuid;
 
 #[test]
-fn embedded_system_skills_are_materialized_privately_and_idempotently() {
+fn embedded_system_skill_is_materialized_privately_and_idempotently() {
     let home = std::env::temp_dir().join(format!(
         "bettercodex-system-skills-{}-{}",
         std::process::id(),
@@ -13,19 +13,7 @@ fn embedded_system_skills_are_materialized_privately_and_idempotently() {
 
     let installed_root = install(&home).unwrap();
     assert_eq!(installed_root, root(&home));
-    let expected: [(&str, &[u8]); 5] = [
-        (
-            "anydoc/SKILL.md",
-            include_bytes!("../bundled-skills/anydoc/SKILL.md"),
-        ),
-        (
-            "anydoc/agents/openai.yaml",
-            include_bytes!("../bundled-skills/anydoc/agents/openai.yaml"),
-        ),
-        (
-            "anydoc/LICENSE.txt",
-            include_bytes!("../bundled-skills/anydoc/LICENSE.txt"),
-        ),
+    let expected: [(&str, &[u8]); 2] = [
         (
             "papercut/SKILL.md",
             include_bytes!("../bundled-skills/papercut/SKILL.md"),
@@ -45,10 +33,12 @@ fn embedded_system_skills_are_materialized_privately_and_idempotently() {
     }
 
     assert_eq!(install(&home).unwrap(), installed_root);
-    std::fs::write(installed_root.join("stale"), "old bundled content").unwrap();
+    let retired_skill = installed_root.join("retired/SKILL.md");
+    std::fs::create_dir_all(retired_skill.parent().unwrap()).unwrap();
+    std::fs::write(&retired_skill, "old bundled content").unwrap();
     std::fs::write(installed_root.join(MARKER_FILE_NAME), "stale fingerprint\n").unwrap();
     assert_eq!(install(&home).unwrap(), installed_root);
-    assert!(!installed_root.join("stale").exists());
+    assert!(!retired_skill.exists());
 
     std::fs::remove_dir_all(home).unwrap();
 }

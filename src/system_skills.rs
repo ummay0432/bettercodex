@@ -26,19 +26,7 @@ struct EmbeddedFile {
     contents: &'static [u8],
 }
 
-const EMBEDDED_FILES: [EmbeddedFile; 5] = [
-    EmbeddedFile {
-        relative_path: "anydoc/SKILL.md",
-        contents: include_bytes!("../bundled-skills/anydoc/SKILL.md"),
-    },
-    EmbeddedFile {
-        relative_path: "anydoc/agents/openai.yaml",
-        contents: include_bytes!("../bundled-skills/anydoc/agents/openai.yaml"),
-    },
-    EmbeddedFile {
-        relative_path: "anydoc/LICENSE.txt",
-        contents: include_bytes!("../bundled-skills/anydoc/LICENSE.txt"),
-    },
+const EMBEDDED_FILES: &[EmbeddedFile] = &[
     EmbeddedFile {
         relative_path: "papercut/SKILL.md",
         contents: include_bytes!("../bundled-skills/papercut/SKILL.md"),
@@ -125,7 +113,7 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
 
     let install_result = (|| -> Result<()> {
         create_private_directory(&destination)?;
-        for embedded in &EMBEDDED_FILES {
+        for embedded in EMBEDDED_FILES {
             let path = destination.join(embedded.relative_path);
             let parent = path.parent().ok_or_else(|| {
                 anyhow!(
@@ -157,7 +145,7 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
 fn embedded_fingerprint() -> String {
     let mut hasher = DefaultHasher::new();
     FINGERPRINT_SALT.hash(&mut hasher);
-    for embedded in &EMBEDDED_FILES {
+    for embedded in EMBEDDED_FILES {
         embedded.relative_path.hash(&mut hasher);
         embedded.contents.hash(&mut hasher);
     }

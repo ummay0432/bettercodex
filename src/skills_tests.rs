@@ -163,7 +163,7 @@ fn implicit_catalog_discloses_metadata_without_eagerly_injecting_the_skill_body(
 }
 
 #[test]
-fn bundled_system_skills_use_progressive_disclosure_and_remain_explicitly_selectable() {
+fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selectable() {
     let root = temporary_root("bundled-system-skills");
     let home = root.join("home");
     let cwd = root.join("repository");
@@ -171,45 +171,25 @@ fn bundled_system_skills_use_progressive_disclosure_and_remain_explicitly_select
     let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
 
     assert!(catalog.warnings().is_empty());
-    assert_eq!(catalog.skills().len(), 2);
-    let anydoc = catalog
-        .skills()
-        .iter()
-        .find(|skill| skill.name() == "anydoc")
-        .unwrap();
+    assert_eq!(catalog.skills().len(), 1);
     let papercut = catalog
         .skills()
         .iter()
         .find(|skill| skill.name() == "papercut")
         .unwrap();
-    for skill in [anydoc, papercut] {
-        assert_eq!(skill.scope, SkillScope::System);
-        assert!(skill.is_enabled());
-        assert!(skill.allows_implicit_invocation());
-    }
+    assert_eq!(papercut.scope, SkillScope::System);
+    assert!(papercut.is_enabled());
+    assert!(papercut.allows_implicit_invocation());
 
     let instructions = catalog.instructions_message(353_400).unwrap();
     let instructions = text_of(&instructions);
-    assert!(instructions.contains("anydoc"));
-    assert!(instructions.contains("Proactively read local Word"));
-    assert!(instructions.contains(&anydoc.path().display().to_string()));
     assert!(instructions.contains("papercut"));
     assert!(instructions.contains("dead-end tool call"));
     assert!(instructions.contains(&papercut.path().display().to_string()));
     assert!(
-        !instructions.contains("@firecrawl/anydoc@0.1.3"),
-        "the AnyDoc workflow body must stay out of the always-visible catalogue"
-    );
-    assert!(
         !instructions.contains("Log each distinct papercut at most once per session"),
         "the papercut workflow body must stay out of the always-visible catalogue"
     );
-
-    let anydoc_selection = SkillSelection::new("anydoc", anydoc.path());
-    let anydoc_injection = catalog.explicit_injections("read this $anydoc", &[anydoc_selection]);
-    assert_eq!(anydoc_injection.items.len(), 1);
-    assert!(text_of(&anydoc_injection.items[0]).contains("@firecrawl/anydoc@0.1.3"));
-    assert!(text_of(&anydoc_injection.items[0]).contains("Merged cells can be\n   flattened"));
 
     let papercut_selection = SkillSelection::new("papercut", papercut.path());
     let papercut_injection =
@@ -228,10 +208,7 @@ fn bundled_system_skills_use_progressive_disclosure_and_remain_explicitly_select
     )
     .unwrap();
     let explicit_only = SkillCatalog::load_with_home(&cwd, Some(&home));
-    let instructions = explicit_only.instructions_message(353_400).unwrap();
-    let instructions = text_of(&instructions);
-    assert!(instructions.contains("anydoc"));
-    assert!(!instructions.contains("papercut"));
+    assert!(explicit_only.instructions_message(353_400).is_none());
     assert_eq!(
         explicit_only
             .explicit_injections("use $papercut", &[papercut_selection])
