@@ -86,6 +86,10 @@ composer. The core shortcuts are:
 - Typing `@` opens Git-ignore-aware fuzzy file search. `Up` and `Down` select a
   result, `Enter` or `Tab` inserts its repository-relative path, and `Esc`
   closes the search.
+- Typing `$` opens fuzzy completion for skills discovered under `.bcodex/skills`
+  from the repository root through the working directory and under
+  `${BCODEX_HOME:-$HOME/.bcodex}/skills`. `Enter` or `Tab` binds the selected
+  skill to that prompt; queued follow-ups and steering preserve the binding.
 
 When stdin or stdout is redirected, no-argument invocation falls back to the
 plain line interface. Passing a prompt remains a one-shot invocation.
@@ -103,10 +107,11 @@ BetterCodex always exposes one JavaScript tool runtime for Sol; there is no tool
 mode or selector. The Responses request exposes the freeform `exec` tool and its
 `wait` continuation tool. `exec` runs JavaScript in an embedded V8 isolate and
 gives that program the fixed nested catalogue: `apply_patch`, `exec_command`,
-`update_plan`, `view_image`, and `write_stdin`. This unconditionally ports the
-efficient orchestration path that upstream Codex calls `code_mode_only`, while
-command sessions persist across calls and run with the invoking user's
-permissions.
+`log_papercut`, `update_plan`, `view_image`, and `write_stdin`. This
+unconditionally ports the efficient orchestration path that upstream Codex
+calls `code_mode_only`, while command sessions persist across calls and run
+with the invoking user's permissions. `log_papercut` appends bounded friction
+notes to `PAPERCUTS.md` at the Git worktree root.
 
 Sol therefore gets programmatic composition, parallel calls, and intermediate
 result reduction by default. On the ChatGPT Responses Lite route this is a

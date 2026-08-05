@@ -62,6 +62,8 @@ the invoking user's permissions; BetterCodex does not sandbox them.
 
 - `src/main.rs`, `src/input.rs`, and `src/auth.rs`: CLI entry, user input, and
   ChatGPT authentication.
+- `src/repository.rs` and `src/skills.rs`: Git worktree discovery, local skill
+  discovery, prompt injection, and bounded skill metadata.
 - `src/agent.rs`, `src/context.rs`, and `src/rollout.rs`: turns, incremental
   conversation state, compaction, saved JSONL sessions, and resume.
 - `src/api.rs` and `src/api_websocket.rs`: Responses request assembly, HTTP/SSE,
