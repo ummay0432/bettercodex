@@ -200,6 +200,8 @@ fn injected_skill_bodies_and_catalog_metadata_are_bounded() {
     let outcome = catalog.explicit_injections("$large", &[selection]);
     assert_eq!(outcome.items.len(), 1);
     assert!(!text_of(&outcome.items[0]).contains("TAIL"));
+    assert!(text_of(&outcome.items[0]).contains("<skill_truncated>"));
+    assert!(text_of(&outcome.items[0]).contains(&path.display().to_string()));
     assert!(
         outcome
             .warnings
@@ -214,16 +216,31 @@ fn injected_skill_bodies_and_catalog_metadata_are_bounded() {
 }
 
 #[test]
-fn selected_mention_ranges_find_every_exact_token_without_prefix_collisions() {
-    let selections = vec![SkillSelection::new("manifest", "/tmp/manifest/SKILL.md")];
-    let text = "$manifest test $manifest-extra and $manifest";
-    assert_eq!(
-        mention_ranges(text, &selections),
-        vec![
-            0..9,
-            "$manifest test $manifest-extra and ".len()..text.len()
-        ]
-    );
+fn an_overfull_catalogue_is_bounded_and_reports_omitted_skills() {
+    let root = temporary_root("catalog-omission");
+    let skills_root = root.join("skills");
+    for index in 0..30 {
+        write_skill(
+            &skills_root,
+            &format!("skill-{index:02}"),
+            &format!("skill-{index:02}"),
+            "A deliberately long description for bounded catalogue allocation",
+            "body",
+        );
+    }
+    let catalog = SkillCatalog::load_from_roots(&[SkillRoot {
+        path: &skills_root,
+        scope: SkillScope::Repository,
+    }]);
+    let visible = catalog.skills().iter().collect::<Vec<_>>();
+    let (lines, omitted) = render_catalog_lines(&visible, 800);
+
+    assert!(omitted > 0);
+    assert!(lines_bytes(&lines) <= 800);
+    let message = catalog.instructions_message(10_000).unwrap();
+    assert!(text_of(&message).contains("additional skill(s) were omitted"));
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

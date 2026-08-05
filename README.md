@@ -91,6 +91,11 @@ composer. The core shortcuts are:
   `${BCODEX_HOME:-$HOME/.bcodex}/skills`. `Enter` or `Tab` binds the selected
   skill to that prompt; queued follow-ups and steering preserve the binding.
 
+Each skill is a directory containing `SKILL.md`. Its YAML frontmatter supplies
+the name and description used by completion and by the model-visible catalogue;
+the remaining Markdown contains the workflow. BetterCodex ships no built-in
+skills.
+
 When stdin or stdout is redirected, no-argument invocation falls back to the
 plain line interface. Passing a prompt remains a one-shot invocation.
 

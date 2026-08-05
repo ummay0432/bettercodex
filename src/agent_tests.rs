@@ -4,7 +4,10 @@ use crate::context::AUTO_COMPACT_TOKEN_LIMIT;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::estimated_tokens;
 use crate::input::ImageDetail;
+use crate::input::UserPrompt;
 use crate::rollout::SessionIdentity;
+use crate::skills::SkillMention;
+use crate::skills::SkillSelection;
 use crate::usage::TokenUsage;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -95,6 +98,105 @@ async fn steering_waits_for_the_response_boundary_and_enters_the_next_request() 
     assert!(response_boundary < committed, "{events:#?}");
 
     fixture.server.join().expect("server thread");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        write_sse_response(&mut stream, "skill accepted");
+        request
+    });
+
+    let root = std::env::temp_dir().join(format!(
+        "bettercodex-agent-skill-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let repository = root.join("repo");
+    let cwd = repository.join("service");
+    std::fs::create_dir_all(repository.join(".git")).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let repository_skill = repository.join(".bcodex/skills/demo/SKILL.md");
+    let service_skill = cwd.join(".bcodex/skills/demo/SKILL.md");
+    for (path, body) in [
+        (&repository_skill, "REPOSITORY SKILL BODY"),
+        (&service_skill, "SERVICE SKILL BODY"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!("---\nname: demo\ndescription: Demo workflow\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let identity: SessionIdentity = rollout.identity().clone();
+    let conversation = Conversation::new(&cwd, rollout).unwrap();
+    let mut api = ApiClient::new_with_base_url(
+        Auth::for_test("token-test"),
+        &identity,
+        0,
+        format!("http://{address}"),
+    )
+    .unwrap();
+    assert!(api.fall_back_to_http());
+    let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+    let mut agent = Agent {
+        cwd,
+        api,
+        conversation,
+        tools,
+    };
+    let prompt = UserPrompt::with_skill_mentions(
+        "use $demo now",
+        vec![SkillMention::new(
+            SkillSelection::new("demo", service_skill.canonicalize().unwrap()),
+            4..9,
+        )],
+    );
+    let (events_tx, _events_rx) = unbounded_channel();
+    let (_handle, control) = TurnControl::channel();
+
+    assert_eq!(
+        agent
+            .submit_with_control(UserInput::prompt(prompt), events_tx, control)
+            .await
+            .unwrap(),
+        SubmitOutcome::Completed("skill accepted".to_string())
+    );
+    assert_eq!(agent.prompt_history(), ["use $demo now"]);
+
+    let request: Value = serde_json::from_slice(&server.join().unwrap()).unwrap();
+    let input = request["input"].as_array().unwrap();
+    fn text(item: &Value) -> &str {
+        item.pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+    let catalog = input
+        .iter()
+        .find(|item| item["role"] == "developer" && text(item).starts_with("<skills>"))
+        .expect("model-visible skills catalogue");
+    assert_eq!(text(catalog).matches("- demo:").count(), 2);
+    let user_index = input
+        .iter()
+        .position(|item| item["role"] == "user" && text(item) == "use $demo now")
+        .expect("ordinary user prompt");
+    let injection_index = input
+        .iter()
+        .position(|item| item["role"] == "user" && text(item).starts_with("<skill>"))
+        .expect("selected skill injection");
+    assert!(user_index < injection_index);
+    assert!(text(&input[injection_index]).contains("SERVICE SKILL BODY"));
+    assert!(!text(&input[injection_index]).contains("REPOSITORY SKILL BODY"));
+
+    drop(agent);
     std::fs::remove_dir_all(root).unwrap();
 }
 

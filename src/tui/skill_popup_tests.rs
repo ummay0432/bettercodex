@@ -24,7 +24,7 @@ fn catalog() -> (PathBuf, SkillCatalog) {
         )
         .unwrap();
     }
-    let loaded = SkillCatalog::load(&repository).unwrap();
+    let loaded = SkillCatalog::load(&repository);
     (root, loaded)
 }
 

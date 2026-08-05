@@ -1,5 +1,6 @@
+use crate::input::UserPrompt;
+use crate::skills::SkillMention;
 use crate::skills::SkillSelection;
-use crate::skills::mention_ranges;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -17,19 +18,13 @@ pub(super) struct Editor {
     history_index: Option<usize>,
     saved_draft: String,
     pending_pastes: Vec<PendingPaste>,
-    skill_bindings: Vec<SkillBinding>,
+    skill_mentions: Vec<SkillMention>,
 }
 
 #[derive(Debug)]
 struct PendingPaste {
     placeholder: String,
     content: String,
-    range: Range<usize>,
-}
-
-#[derive(Debug)]
-struct SkillBinding {
-    selection: SkillSelection,
     range: Range<usize>,
 }
 
@@ -63,48 +58,25 @@ impl Editor {
         self.cursor = self.text.len();
         self.preferred_column = None;
         self.pending_pastes.clear();
-        self.skill_bindings.clear();
+        self.skill_mentions.clear();
     }
 
-    pub(super) fn set_prompt(&mut self, text: impl Into<String>, skills: &[SkillSelection]) {
+    pub(super) fn set_prompt(&mut self, text: impl Into<String>, mentions: &[SkillMention]) {
         self.set_text(text);
-        self.bind_skill_selections(skills, 0..self.text.len());
+        self.bind_skill_mentions(mentions, 0);
     }
 
-    pub(super) fn prepend_prompt(&mut self, text: &str, skills: &[SkillSelection]) {
+    pub(super) fn prepend_prompt(&mut self, text: &str, mentions: &[SkillMention]) {
         if text.is_empty() {
             return;
         }
         self.prepend(text);
-        self.bind_skill_selections(skills, 0..text.len());
+        self.bind_skill_mentions(mentions, 0);
     }
 
-    pub(super) fn take(&mut self) -> String {
-        let text = if self.pending_pastes.is_empty() {
-            std::mem::take(&mut self.text)
-        } else {
-            let expanded = self.expanded_text();
-            self.text.clear();
-            self.pending_pastes.clear();
-            expanded
-        };
-        self.cursor = 0;
-        self.preferred_column = None;
-        self.history_index = None;
-        self.saved_draft.clear();
-        self.skill_bindings.clear();
-        text
-    }
-
-    pub(super) fn take_with_skills(&mut self) -> (String, Vec<SkillSelection>) {
-        self.skill_bindings
-            .sort_by_key(|binding| binding.range.start);
-        let skills = self
-            .skill_bindings
-            .iter()
-            .map(|binding| binding.selection.clone())
-            .collect();
-        (self.take(), skills)
+    pub(super) fn take_prompt(&mut self) -> UserPrompt {
+        let (text, mentions) = self.take_contents();
+        UserPrompt::with_skill_mentions(text, mentions)
     }
 
     pub(super) fn remember(&mut self, text: &str) {
@@ -207,14 +179,15 @@ impl Editor {
         {
             return;
         }
-        self.skill_bindings.push(SkillBinding { selection, range });
+        self.skill_mentions
+            .push(SkillMention::new(selection, range));
     }
 
     pub(super) fn skill_ranges(&self) -> Vec<Range<usize>> {
         let mut ranges = self
-            .skill_bindings
+            .skill_mentions
             .iter()
-            .map(|binding| binding.range.clone())
+            .map(|mention| mention.range().clone())
             .collect::<Vec<_>>();
         ranges.sort_by_key(|range| range.start);
         ranges
@@ -368,11 +341,11 @@ impl Editor {
             .iter()
             .map(|line| {
                 let mut highlights = self
-                    .skill_bindings
+                    .skill_mentions
                     .iter()
-                    .filter_map(|binding| {
-                        let start = binding.range.start.max(line.start);
-                        let end = binding.range.end.min(line.end);
+                    .filter_map(|mention| {
+                        let start = mention.range().start.max(line.start);
+                        let end = mention.range().end.min(line.end);
                         (start < end).then_some(start - line.start..end - line.start)
                     })
                     .collect::<Vec<_>>();
@@ -406,12 +379,12 @@ impl Editor {
             }
             false
         });
-        self.skill_bindings.retain_mut(|binding| {
-            if binding.range.end <= range.start {
+        self.skill_mentions.retain_mut(|mention| {
+            if mention.range().end <= range.start {
                 return true;
             }
-            if binding.range.start >= range.end {
-                shift_range(&mut binding.range, removed_len, inserted_len);
+            if mention.range().start >= range.end {
+                shift_range(mention.range_mut(), removed_len, inserted_len);
                 return true;
             }
             false
@@ -525,21 +498,46 @@ impl Editor {
         self.pending_pastes
             .iter()
             .map(|paste| &paste.range)
-            .chain(self.skill_bindings.iter().map(|binding| &binding.range))
+            .chain(self.skill_mentions.iter().map(SkillMention::range))
     }
 
-    fn bind_skill_selections(&mut self, selections: &[SkillSelection], within: Range<usize>) {
-        for range in mention_ranges(&self.text[within.clone()], selections) {
-            let range = within.start + range.start..within.start + range.end;
-            let name = &self.text[range.start + 1..range.end];
-            if let Some(selection) = selections
-                .iter()
-                .find(|selection| selection.name() == name)
-                .cloned()
-            {
-                self.bind_skill(range, selection);
-            }
+    fn bind_skill_mentions(&mut self, mentions: &[SkillMention], offset: usize) {
+        for mention in mentions {
+            let range = offset.saturating_add(mention.range().start)
+                ..offset.saturating_add(mention.range().end);
+            self.bind_skill(range, mention.selection().clone());
         }
+    }
+
+    fn take_contents(&mut self) -> (String, Vec<SkillMention>) {
+        self.skill_mentions
+            .sort_by_key(|mention| mention.range().start);
+        let mut mentions = std::mem::take(&mut self.skill_mentions);
+        let text = if self.pending_pastes.is_empty() {
+            std::mem::take(&mut self.text)
+        } else {
+            for mention in &mut mentions {
+                let original_start = mention.range().start;
+                for paste in &self.pending_pastes {
+                    if paste.range.end <= original_start {
+                        shift_range(
+                            mention.range_mut(),
+                            paste.placeholder.len(),
+                            paste.content.len(),
+                        );
+                    }
+                }
+            }
+            let expanded = self.expanded_text();
+            self.text.clear();
+            self.pending_pastes.clear();
+            expanded
+        };
+        self.cursor = 0;
+        self.preferred_column = None;
+        self.history_index = None;
+        self.saved_draft.clear();
+        (text, mentions)
     }
 }
 
@@ -646,7 +644,7 @@ fn end_of_next_word(text: &str, cursor: usize) -> usize {
     end
 }
 
-fn visual_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
+pub(super) fn visual_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
     if text.is_empty() {
         return std::iter::once(0..0).collect();
     }
@@ -884,8 +882,51 @@ mod tests {
         let layout = editor.layout(80, 10);
         let expected_ranges = [std::iter::once(7..7 + placeholder.len()).collect::<Vec<_>>()];
         assert_eq!(layout.paste_ranges, expected_ranges);
-        assert_eq!(editor.take(), format!("before {paste} after"));
+        assert_eq!(
+            editor.take_prompt().as_str(),
+            format!("before {paste} after")
+        );
         assert!(editor.is_empty());
+    }
+
+    #[test]
+    fn skill_mentions_keep_exact_ranges_and_paths_through_take_restore_and_paste_expansion() {
+        let first = SkillSelection::new("demo", "/tmp/first/SKILL.md");
+        let second = SkillSelection::new("demo", "/tmp/second/SKILL.md");
+        let mut editor = Editor::default();
+        editor.set_text("$demo then $demo");
+        editor.bind_skill(0..5, first.clone());
+        editor.bind_skill(11..16, second.clone());
+
+        let prompt = editor.take_prompt();
+        assert_eq!(
+            prompt.skill_mentions(),
+            [
+                SkillMention::new(first.clone(), 0..5),
+                SkillMention::new(second.clone(), 11..16),
+            ]
+        );
+
+        editor.set_prompt(prompt.as_str(), prompt.skill_mentions());
+        assert_eq!(editor.skill_ranges(), [0..5, 11..16]);
+        assert_eq!(editor.take_prompt(), prompt);
+
+        let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        editor.insert_paste(paste.clone());
+        editor.insert(" $demo");
+        let visible_start = editor.text().len() - "$demo".len();
+        editor.bind_skill(visible_start..editor.text().len(), first.clone());
+
+        let expanded = editor.take_prompt();
+        let expanded_start = paste.len() + 1;
+        assert_eq!(expanded.as_str(), format!("{paste} $demo"));
+        assert_eq!(
+            expanded.skill_mentions(),
+            [SkillMention::new(
+                first,
+                expanded_start..expanded_start + "$demo".len(),
+            )]
+        );
     }
 
     #[test]

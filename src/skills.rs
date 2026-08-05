@@ -7,6 +7,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -31,17 +32,22 @@ const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
 const MAX_SKILLS_CONTEXT_BYTES: usize = 39_000;
 
 const SKILLS_USAGE: &str = r#"- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.
-- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
-- Missing/blocked: If a named skill is not in the list or its path cannot be read, say so briefly and continue with the best fallback.
+- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
+- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.
 - How to use a skill (progressive disclosure):
-  1) After deciding to use a skill, read its `SKILL.md` completely before taking task actions.
-  2) Resolve relative paths (for example `scripts/foo.py`) from the directory containing that `SKILL.md`.
-  3) Read only the referenced files required for the task; do not load unrelated references, scripts, or assets.
-  4) Prefer running or patching provided scripts over retyping large code blocks.
-  5) Reuse provided assets or templates instead of recreating them.
-- Coordination: If multiple skills apply, choose the minimal set that covers the request and state the order you will use them. Announce which skill(s) you are using and why in one short line.
-- Context hygiene: Avoid deep reference chasing. When variants exist, select only the relevant reference file(s).
-- Safety and fallback: If a skill cannot be applied cleanly, state the issue, choose the next-best approach, and continue."#;
+  1) After deciding to use a skill, open the listed path and read its `SKILL.md` completely before taking task actions. If a read is truncated or paginated, continue until EOF.
+  2) When `SKILL.md` references relative paths (for example `scripts/foo.py`), resolve them relative to the directory containing that `SKILL.md` first, and only consider other paths if needed.
+  3) If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the files required for the task. Read only the relevant files, not the whole folder.
+  4) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.
+  5) If `assets/` or templates exist, reuse them instead of recreating them.
+- Coordination and sequencing:
+  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.
+  - Announce which skill(s) you're using and why in one short line. If you skip an obvious skill, say why.
+- Context hygiene:
+  - Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file.
+  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.
+  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.
+- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue."#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SkillScope {
@@ -96,6 +102,36 @@ impl SkillSelection {
 
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SkillMention {
+    selection: SkillSelection,
+    range: Range<usize>,
+}
+
+impl SkillMention {
+    pub(crate) fn new(selection: SkillSelection, range: Range<usize>) -> Self {
+        Self { selection, range }
+    }
+
+    pub(crate) fn selection(&self) -> &SkillSelection {
+        &self.selection
+    }
+
+    pub(crate) fn range(&self) -> &Range<usize> {
+        &self.range
+    }
+
+    pub(crate) fn range_mut(&mut self) -> &mut Range<usize> {
+        &mut self.range
+    }
+
+    pub(crate) fn shifted(mut self, offset: usize) -> Self {
+        self.range.start = self.range.start.saturating_add(offset);
+        self.range.end = self.range.end.saturating_add(offset);
+        self
     }
 }
 
@@ -188,7 +224,7 @@ impl WarningCollector {
 }
 
 impl SkillCatalog {
-    pub(crate) fn load(cwd: &Path) -> Result<Self> {
+    pub(crate) fn load(cwd: &Path) -> Self {
         let roots = discovery_roots(cwd);
         let borrowed = roots
             .iter()
@@ -197,7 +233,7 @@ impl SkillCatalog {
                 scope: *scope,
             })
             .collect::<Vec<_>>();
-        Ok(Self::load_from_roots(&borrowed))
+        Self::load_from_roots(&borrowed)
     }
 
     fn load_from_roots(roots: &[SkillRoot<'_>]) -> Self {
@@ -263,7 +299,22 @@ impl SkillCatalog {
             .try_into()
             .unwrap_or(usize::MAX);
         let line_budget = line_budget.min(MAX_SKILLS_CONTEXT_BYTES);
-        let lines = render_catalog_lines(&visible, line_budget);
+        let (mut lines, mut omitted) = render_catalog_lines(&visible, line_budget);
+        if omitted > 0 {
+            loop {
+                let notice = format!(
+                    "- Exceeded skills context budget; {omitted} additional skill(s) were omitted."
+                );
+                if lines_bytes(&lines).saturating_add(notice.len() + 1) <= line_budget {
+                    lines.push(notice);
+                    break;
+                }
+                if lines.pop().is_none() {
+                    break;
+                }
+                omitted = omitted.saturating_add(1);
+            }
+        }
         let body = format!(
             "<skills>\n\n## Skills\nA skill is a set of local instructions stored in a `SKILL.md` file. The list below contains the skills available in this session. Each entry includes its name, description, and file path.\n### Available skills\n{}\n### How to use skills\n{}\n\n</skills>",
             lines.join("\n"),
@@ -336,6 +387,12 @@ impl SkillCatalog {
         for skill in selected {
             match read_skill_prompt(&skill.path) {
                 Ok((contents, truncated)) => {
+                    let path = escape_xml(&skill.path.to_string_lossy());
+                    let truncation_notice = truncated.then(|| {
+                        format!(
+                            "\n<skill_truncated>The injected copy reached BetterCodex's {MAX_SKILL_PROMPT_BYTES}-byte item limit. Read the complete SKILL.md at {path} before acting.</skill_truncated>"
+                        )
+                    });
                     if truncated {
                         warnings.push(bounded_warning(format!(
                             "Skill `{}` exceeded the {}-byte prompt limit and was truncated",
@@ -343,9 +400,9 @@ impl SkillCatalog {
                         )));
                     }
                     let name = escape_xml(&skill.name);
-                    let path = escape_xml(&skill.path.to_string_lossy());
                     let prompt = format!(
-                        "<skill>\n<name>{name}</name>\n<path>{path}</path>\n{contents}\n</skill>"
+                        "<skill>\n<name>{name}</name>\n<path>{path}</path>\n{contents}{}\n</skill>",
+                        truncation_notice.as_deref().unwrap_or_default(),
                     );
                     items.push(json!({
                         "type": "message",
@@ -363,38 +420,6 @@ impl SkillCatalog {
 
         SkillInjectionOutcome { items, warnings }
     }
-}
-
-pub(crate) fn mention_ranges(text: &str, selections: &[SkillSelection]) -> Vec<Range<usize>> {
-    if selections.is_empty() {
-        return Vec::new();
-    }
-    let names = selections
-        .iter()
-        .map(|selection| selection.name.as_str())
-        .collect::<HashSet<_>>();
-    let bytes = text.as_bytes();
-    let mut ranges = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'$' {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        index += 1;
-        let name_start = index;
-        while bytes
-            .get(index)
-            .is_some_and(|byte| is_mention_name_byte(*byte))
-        {
-            index += 1;
-        }
-        if index > name_start && names.contains(&text[name_start..index]) {
-            ranges.push(start..index);
-        }
-    }
-    ranges
 }
 
 pub(crate) fn is_mention_name_byte(byte: u8) -> bool {
@@ -774,27 +799,14 @@ fn read_skill_prompt(path: &Path) -> Result<(String, bool)> {
     }
 }
 
-fn render_catalog_lines(skills: &[&Skill], budget: usize) -> Vec<String> {
+fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize) {
     let minimum = skills
         .iter()
         .map(|skill| catalog_line(skill, ""))
         .collect::<Vec<_>>();
-    let full_descriptions = skills
-        .iter()
-        .map(|skill| truncate_chars(&skill.description, MAX_DESCRIPTION_CHARS))
-        .collect::<Vec<_>>();
-    let full = skills
-        .iter()
-        .zip(&full_descriptions)
-        .map(|(skill, description)| catalog_line(skill, description))
-        .collect::<Vec<_>>();
-    if lines_bytes(&full) <= budget {
-        return full;
-    }
-
     if lines_bytes(&minimum) > budget {
         let mut used = 0_usize;
-        return minimum
+        let included = minimum
             .into_iter()
             .take_while(|line| {
                 let cost = line.len().saturating_add(1);
@@ -804,35 +816,63 @@ fn render_catalog_lines(skills: &[&Skill], budget: usize) -> Vec<String> {
                 used = used.saturating_add(cost);
                 true
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let omitted = skills.len().saturating_sub(included.len());
+        return (included, omitted);
     }
 
-    let mut allocations = vec![0_usize; skills.len()];
-    let mut rendered = minimum;
-    loop {
-        let mut changed = false;
-        for index in 0..skills.len() {
-            if allocations[index] >= full_descriptions[index].chars().count() {
-                continue;
-            }
-            let next = allocations[index] + 1;
-            let description = truncate_chars(&full_descriptions[index], next);
-            let candidate = catalog_line(skills[index], &description);
-            let current_cost = rendered[index].len();
-            let candidate_total = lines_bytes(&rendered)
-                .saturating_sub(current_cost)
-                .saturating_add(candidate.len());
-            if candidate_total <= budget {
-                allocations[index] = next;
-                rendered[index] = candidate;
-                changed = true;
-            }
+    let full_descriptions = skills
+        .iter()
+        .map(|skill| {
+            skill
+                .description
+                .chars()
+                .take(MAX_DESCRIPTION_CHARS)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let full = skills
+        .iter()
+        .zip(&full_descriptions)
+        .map(|(skill, description)| catalog_line(skill, &description.iter().collect::<String>()))
+        .collect::<Vec<_>>();
+    if lines_bytes(&full) <= budget {
+        return (full, 0);
+    }
+
+    // Distribute the remaining bytes one character per skill at a time. Tracking only the
+    // incremental UTF-8 cost keeps this linear in the bounded output budget instead of rebuilding
+    // and recounting the complete catalogue for every character granted.
+    let mut used = lines_bytes(&minimum);
+    let mut descriptions = vec![String::new(); skills.len()];
+    let mut next_char = vec![0_usize; skills.len()];
+    let mut pending = full_descriptions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, description)| (!description.is_empty()).then_some(index))
+        .collect::<VecDeque<_>>();
+    while let Some(index) = pending.pop_front() {
+        let character = full_descriptions[index][next_char[index]];
+        let separator_cost = usize::from(next_char[index] == 0);
+        let cost = character.len_utf8().saturating_add(separator_cost);
+        if used.saturating_add(cost) > budget {
+            continue;
         }
-        if !changed {
-            break;
+        descriptions[index].push(character);
+        next_char[index] += 1;
+        used = used.saturating_add(cost);
+        if next_char[index] < full_descriptions[index].len() {
+            pending.push_back(index);
         }
     }
-    rendered
+    (
+        skills
+            .iter()
+            .zip(descriptions)
+            .map(|(skill, description)| catalog_line(skill, &description))
+            .collect(),
+        0,
+    )
 }
 
 fn catalog_line(skill: &Skill, description: &str) -> String {
@@ -849,10 +889,6 @@ fn lines_bytes(lines: &[String]) -> usize {
     lines
         .iter()
         .fold(0_usize, |total, line| total.saturating_add(line.len() + 1))
-}
-
-fn truncate_chars(value: &str, limit: usize) -> String {
-    value.chars().take(limit).collect()
 }
 
 fn truncate_bytes(value: &str, limit: usize) -> String {

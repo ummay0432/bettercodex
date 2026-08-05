@@ -1,3 +1,4 @@
+use crate::skills::SkillMention;
 use crate::skills::SkillSelection;
 use anyhow::Context;
 use anyhow::Result;
@@ -16,47 +17,66 @@ const MAX_TOTAL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UserPrompt {
     text: String,
-    skills: Vec<SkillSelection>,
+    skill_mentions: Vec<SkillMention>,
 }
 
 impl UserPrompt {
     pub(crate) fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            skills: Vec::new(),
+            skill_mentions: Vec::new(),
         }
     }
 
-    pub(crate) fn with_skills(text: impl Into<String>, skills: Vec<SkillSelection>) -> Self {
+    pub(crate) fn with_skill_mentions(
+        text: impl Into<String>,
+        mut skill_mentions: Vec<SkillMention>,
+    ) -> Self {
+        skill_mentions.sort_by_key(|mention| mention.range().start);
         Self {
             text: text.into(),
-            skills,
+            skill_mentions,
         }
     }
 
     pub(crate) fn joined(prompts: Vec<Self>) -> Self {
         let mut text = String::new();
-        let mut skills = Vec::new();
+        let mut skill_mentions = Vec::new();
         for prompt in prompts {
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
+            let offset = text.len();
             text.push_str(&prompt.text);
-            skills.extend(prompt.skills);
+            skill_mentions.extend(
+                prompt
+                    .skill_mentions
+                    .into_iter()
+                    .map(|mention| mention.shifted(offset)),
+            );
         }
-        Self { text, skills }
+        Self {
+            text,
+            skill_mentions,
+        }
     }
 
     pub(crate) fn as_str(&self) -> &str {
         &self.text
     }
 
-    pub(crate) fn skills(&self) -> &[SkillSelection] {
-        &self.skills
+    pub(crate) fn skill_mentions(&self) -> &[SkillMention] {
+        &self.skill_mentions
     }
 
     pub(crate) fn into_parts(self) -> (String, Vec<SkillSelection>) {
-        (self.text, self.skills)
+        (
+            self.text,
+            self.skill_mentions
+                .into_iter()
+                .map(|mention| mention.selection().clone())
+                .collect(),
+        )
     }
 }
 
@@ -240,6 +260,35 @@ mod tests {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "inspect"}],
             })
+        );
+    }
+
+    #[test]
+    fn joined_prompts_shift_exact_skill_mentions_with_their_text() {
+        let first = UserPrompt::with_skill_mentions(
+            "use $demo",
+            vec![SkillMention::new(
+                SkillSelection::new("demo", "/first/SKILL.md"),
+                4..9,
+            )],
+        );
+        let second = UserPrompt::with_skill_mentions(
+            "$demo again",
+            vec![SkillMention::new(
+                SkillSelection::new("demo", "/second/SKILL.md"),
+                0..5,
+            )],
+        );
+
+        let joined = UserPrompt::joined(vec![first, second]);
+
+        assert_eq!(joined.as_str(), "use $demo\n\n$demo again");
+        assert_eq!(
+            joined.skill_mentions(),
+            [
+                SkillMention::new(SkillSelection::new("demo", "/first/SKILL.md"), 4..9,),
+                SkillMention::new(SkillSelection::new("demo", "/second/SKILL.md"), 11..16,),
+            ]
         );
     }
 

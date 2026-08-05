@@ -423,7 +423,7 @@ impl Conversation {
 
 impl WorldState {
     fn load(cwd: &Path) -> Result<Self> {
-        let skills = SkillCatalog::load(cwd)?;
+        let skills = SkillCatalog::load(cwd);
         let skills_instructions = skills.instructions_message(EFFECTIVE_CONTEXT_WINDOW);
         Ok(Self {
             environment: message("developer", environment_context(cwd)),

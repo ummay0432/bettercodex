@@ -24,7 +24,6 @@ use crate::events::SteerId;
 use crate::input::UserPrompt;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
-use crate::skills::mention_ranges;
 use codex_ansi_escape::ansi_escape_line;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::parse_command::parse_command;
@@ -469,10 +468,11 @@ impl View {
         }
         let restored = UserPrompt::joined(prompts);
         if self.editor.is_empty() {
-            self.editor.set_prompt(restored.as_str(), restored.skills());
+            self.editor
+                .set_prompt(restored.as_str(), restored.skill_mentions());
         } else {
             let text = format!("{}\n\n", restored.as_str());
-            self.editor.prepend_prompt(&text, restored.skills());
+            self.editor.prepend_prompt(&text, restored.skill_mentions());
         }
         self.file_search.dismiss();
         self.skill_popup.hide();
@@ -1048,7 +1048,8 @@ impl View {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
-        let (text, skills) = self.editor.take_with_skills();
+        let prompt = self.editor.take_prompt();
+        let text = prompt.as_str().to_string();
         self.editor.remember(&text);
         let command = text.trim();
         if let Some(arguments) = command.strip_prefix("/resume")
@@ -1102,7 +1103,7 @@ impl View {
                 self.overlay = Some(Overlay::Tools(ToolCatalogueView::new()));
                 Action::None
             }
-            _ => Action::Submit(UserPrompt::with_skills(text, skills)),
+            _ => Action::Submit(prompt),
         }
     }
 
@@ -1117,9 +1118,10 @@ impl View {
             ));
             return Action::None;
         }
-        let (text, skills) = self.editor.take_with_skills();
+        let prompt = self.editor.take_prompt();
+        let text = prompt.as_str().to_string();
         self.editor.remember(&text);
-        Action::Queue(UserPrompt::with_skills(text, skills))
+        Action::Queue(prompt)
     }
 
     fn close_streaming_entries(&mut self) {
@@ -2730,29 +2732,68 @@ fn display_tool_path(path: &Path, cwd: &Path) -> String {
 }
 
 fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Line<'static>> {
-    let message_text = markdown::sanitize(message.as_str());
+    let (message_text, skill_ranges) = sanitized_prompt(message);
+    let message_text = message_text.trim_end_matches(['\r', '\n']);
     let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS + 1).max(1);
-    let wrapped = editor::wrap_text(message_text.trim_end_matches(['\r', '\n']), wrap_width);
+    let wrapped = editor::visual_ranges(message_text, usize::from(wrap_width))
+        .into_iter()
+        .map(|range| {
+            styled_skill_mentions(
+                &message_text[range.clone()],
+                range.start,
+                &skill_ranges,
+                style,
+            )
+        })
+        .collect::<Vec<_>>();
     let mut lines = vec![Line::default().style(style)];
-    for (index, content) in wrapped.into_iter().enumerate() {
+    for (index, mut content) in wrapped.into_iter().enumerate() {
         let mut spans = vec![Span::styled(
             if index == 0 { "› " } else { "  " },
             style.bold().dim(),
         )];
-        spans.extend(styled_skill_mentions(&content, message.skills(), style));
+        spans.append(&mut content);
         lines.push(Line::from(spans).style(style));
     }
     lines.push(Line::default().style(style));
     lines
 }
 
+fn sanitized_prompt(message: &UserPrompt) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut text = String::with_capacity(message.as_str().len());
+    let mut ranges = Vec::with_capacity(message.skill_mentions().len());
+    let mut cursor = 0_usize;
+    for mention in message.skill_mentions() {
+        let range = mention.range();
+        if range.start < cursor
+            || range.end > message.as_str().len()
+            || message.as_str().get(range.clone())
+                != Some(format!("${}", mention.selection().name()).as_str())
+        {
+            continue;
+        }
+        text.push_str(&markdown::sanitize(&message.as_str()[cursor..range.start]));
+        let start = text.len();
+        text.push_str(&markdown::sanitize(&message.as_str()[range.clone()]));
+        ranges.push(start..text.len());
+        cursor = range.end;
+    }
+    text.push_str(&markdown::sanitize(&message.as_str()[cursor..]));
+    (text, ranges)
+}
+
 fn styled_skill_mentions(
     text: &str,
-    skills: &[SkillSelection],
+    offset: usize,
+    skill_ranges: &[std::ops::Range<usize>],
     style: Style,
 ) -> Vec<Span<'static>> {
-    let ranges = mention_ranges(text, skills);
-    let mut spans = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(1));
+    let end = offset.saturating_add(text.len());
+    let ranges = skill_ranges
+        .iter()
+        .filter(|range| range.start >= offset && range.end <= end)
+        .map(|range| range.start - offset..range.end - offset);
+    let mut spans = Vec::with_capacity(skill_ranges.len().saturating_mul(2).saturating_add(1));
     let mut cursor = 0_usize;
     for range in ranges {
         if cursor < range.start {
@@ -3533,6 +3574,8 @@ mod tests {
     use crate::context::AUTO_COMPACT_TOKEN_LIMIT;
     use crate::context::ContextKind;
     use crate::context::ContextSection;
+    use crate::skills::SkillCatalog;
+    use crate::skills::SkillMention;
     use codex_file_search::FileMatch;
     use codex_file_search::MatchType;
     use ratatui::Terminal;
@@ -3586,6 +3629,109 @@ mod tests {
         assert!(!rendered.contains("Ask BetterCodex to do anything"));
         assert!(rendered.lines().any(|line| line.trim() == "›"));
         assert!(rendered.contains("gpt-5.6-sol max"));
+    }
+
+    #[test]
+    fn skill_completion_after_words_binds_and_keeps_only_the_selected_occurrence_cyan() {
+        let root = std::env::temp_dir().join(format!("bettercodex-view-skill-{}", Uuid::new_v4()));
+        let cwd = root.join("repo");
+        let skill_directory = cwd.join(".bcodex/skills/manifest");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::create_dir_all(&skill_directory).unwrap();
+        let skill_path = skill_directory.join("SKILL.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: manifest\ndescription: Write a routing manifest\n---\n\nFollow the manifest workflow.\n",
+        )
+        .unwrap();
+        let catalog = SkillCatalog::load(&cwd);
+        let mut view = View::with_skills(&cwd, catalog.skills().to_vec());
+        view.welcome_pending = false;
+        view.editor.set_text("manual $manifest then $mani");
+
+        assert_eq!(view.handle_terminal_event(Event::FocusGained), Action::None);
+        assert!(view.skill_popup.is_active());
+        let popup_height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, popup_height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let popup_buffer = terminal.backend().buffer();
+        let popup = render_buffer(popup_buffer);
+        let popup_y = popup
+            .lines()
+            .position(|line| line.contains("[Skill]"))
+            .unwrap() as u16;
+        assert_eq!(popup_buffer[(2, popup_y)].fg, Color::Cyan);
+        assert!(popup_buffer[(2, popup_y)].modifier.contains(Modifier::BOLD));
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        let completed = "manual $manifest then $manifest ";
+        let selected_start = "manual $manifest then ".len();
+        let selected_range = selected_start..selected_start + "$manifest".len();
+        assert_eq!(view.editor.text(), completed);
+        assert_eq!(
+            view.editor.skill_ranges().as_slice(),
+            std::slice::from_ref(&selected_range)
+        );
+
+        let composer_height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, composer_height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let composer_buffer = terminal.backend().buffer();
+        let composer = render_buffer(composer_buffer);
+        let composer_y = composer
+            .lines()
+            .position(|line| line.contains(completed.trim_end()))
+            .unwrap() as u16;
+        let row = composer.lines().nth(usize::from(composer_y)).unwrap();
+        let first = row.find("$manifest").unwrap() as u16;
+        let second = row.rfind("$manifest").unwrap() as u16;
+        assert_ne!(composer_buffer[(first, composer_y)].fg, Color::Cyan);
+        assert_eq!(composer_buffer[(second, composer_y)].fg, Color::Cyan);
+
+        let prompt = match view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) {
+            Action::Submit(prompt) => prompt,
+            action => panic!("expected submitted skill prompt, got {action:?}"),
+        };
+        assert_eq!(prompt.as_str(), completed);
+        assert_eq!(
+            prompt.skill_mentions(),
+            [SkillMention::new(
+                SkillSelection::new("manifest", skill_path.canonicalize().unwrap()),
+                selected_range,
+            )]
+        );
+
+        let mut restored = View::with_skills(&cwd, catalog.skills().to_vec());
+        restored.queue_follow_up(prompt.clone());
+        restored.restore_pending_input_to_composer();
+        assert_eq!(restored.editor.take_prompt(), prompt);
+
+        view.start_turn(prompt);
+        let history = view.take_pending_history_lines(80);
+        let prompt_line = history
+            .iter()
+            .find(|line| plain(line).contains(completed.trim_end()))
+            .unwrap();
+        let cyan_mentions = prompt_line
+            .spans
+            .iter()
+            .filter(|span| span.style.fg == Some(Color::Cyan))
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(cyan_mentions, ["$manifest"]);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
