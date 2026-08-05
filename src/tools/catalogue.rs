@@ -42,6 +42,12 @@ static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
             Some(unified_exec_output_schema()),
         ),
         function_tool(
+            "log_papercut",
+            "Appends one papercut note to `PAPERCUTS.md` at the Git repository root, creating the file on first use.",
+            log_papercut_input_schema(),
+            Some(log_papercut_output_schema()),
+        ),
+        function_tool(
             "update_plan",
             "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.",
             update_plan_input_schema(),
@@ -282,6 +288,35 @@ fn exec_command_input_schema() -> Value {
     })
 }
 
+fn log_papercut_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "maxLength": super::papercuts::MAX_MESSAGE_CHARS,
+                "description": "One or two sentences describing what caused friction and the likely fix when known."
+            }
+        },
+        "required": ["message"],
+        "additionalProperties": false
+    })
+}
+
+fn log_papercut_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Repository-relative path to the papercut log."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
 fn write_stdin_input_schema() -> Value {
     json!({
         "type": "object",
@@ -428,6 +463,7 @@ mod tests {
             [
                 "apply_patch",
                 "exec_command",
+                "log_papercut",
                 "update_plan",
                 "view_image",
                 "write_stdin",
@@ -442,6 +478,8 @@ mod tests {
         assert!(text.contains("fresh V8 isolate"));
         assert!(text.contains("### `exec_command`"));
         assert!(text.contains("exec_command(args:"));
+        assert!(text.contains("### `log_papercut`"));
+        assert!(text.contains("log_papercut(args:"));
         assert!(text.contains("Promise<{"));
         assert!(text.contains("### `apply_patch`"));
         assert!(text.contains("## web\nTools in the web namespace."));
@@ -495,10 +533,10 @@ mod tests {
     #[test]
     fn documented_tool_context_byte_counts_do_not_drift() {
         let tools = specifications();
-        assert_eq!(text().len(), 17_705, "update prompts/tool-context.md");
+        assert_eq!(text().len(), 18_103, "update prompts/tool-context.md");
         assert_eq!(
             serde_json::to_string(&tools[0]).unwrap().len(),
-            18_614,
+            19_026,
             "update prompts/tool-context.md"
         );
         assert_eq!(
@@ -513,7 +551,7 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_string(&item).unwrap().len(),
-            20_028,
+            20_440,
             "update prompts/tool-context.md"
         );
     }

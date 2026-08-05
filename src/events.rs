@@ -23,6 +23,7 @@ pub(crate) enum AgentEvent {
         duration: Duration,
     },
     ContextUpdated(ContextSnapshot),
+    Warning(String),
     SteeringCommitted(SteerId),
     CompactionStarted,
     CompactionCompleted,

@@ -4,6 +4,7 @@ use crate::api::ModelResponse;
 use crate::api::retry_delay;
 use crate::auth::Auth;
 use crate::compaction::CompactionPhase;
+use crate::compaction::CompactionRequest;
 use crate::compaction::InitialContextInjection;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
@@ -40,10 +41,16 @@ pub(crate) enum SubmitOutcome {
     Cancelled,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompactionOutcome {
+    Completed,
+    Cancelled,
+}
+
 #[derive(Clone)]
 pub(crate) struct TurnHandle {
     cancellation: CancellationToken,
-    steering: Arc<Mutex<SteeringState>>,
+    steering: Option<Arc<Mutex<SteeringState>>>,
 }
 
 pub(crate) struct TurnControl {
@@ -68,7 +75,11 @@ impl TurnHandle {
     }
 
     pub(crate) fn steer(&self, input: UserInput) -> Result<SteerId> {
-        let mut steering = lock_steering(&self.steering);
+        let steering = self
+            .steering
+            .as_ref()
+            .ok_or_else(|| anyhow!("the active task does not accept steering"))?;
+        let mut steering = lock_steering(steering);
         if !steering.accepting {
             return Err(anyhow!("the active turn already finished"));
         }
@@ -90,12 +101,23 @@ impl TurnControl {
         (
             TurnHandle {
                 cancellation: cancellation.clone(),
-                steering: Arc::clone(&steering),
+                steering: Some(Arc::clone(&steering)),
             },
             Self {
                 cancellation,
                 steering: Some(steering),
             },
+        )
+    }
+
+    pub(crate) fn non_steerable_channel() -> (TurnHandle, Self) {
+        let cancellation = CancellationToken::new();
+        (
+            TurnHandle {
+                cancellation: cancellation.clone(),
+                steering: None,
+            },
+            Self::cancellation_only(cancellation),
         )
     }
 
@@ -204,6 +226,14 @@ impl Agent {
         self.conversation.prompt_history()
     }
 
+    pub(crate) fn skills(&self) -> &[crate::skills::Skill] {
+        self.conversation.skill_catalog().skills()
+    }
+
+    pub(crate) fn skill_warnings(&self) -> &[String] {
+        self.conversation.skill_catalog().warnings()
+    }
+
     pub(crate) async fn submit(&mut self, prompt: &str) -> Result<String> {
         self.submit_user_input(UserInput::text(prompt)).await
     }
@@ -229,6 +259,37 @@ impl Agent {
         control: TurnControl,
     ) -> Result<SubmitOutcome> {
         self.submit_input(input, Some(events), control).await
+    }
+
+    pub(crate) async fn compact_with_control(
+        &mut self,
+        events: UnboundedSender<AgentEvent>,
+        control: TurnControl,
+    ) -> Result<CompactionOutcome> {
+        let turn_id = self.api.begin_turn().to_string();
+        self.conversation.start_turn(&turn_id)?;
+        let result = self
+            .run_compaction(
+                &Some(events),
+                &control.cancellation,
+                CompactionRequest::Manual,
+                InitialContextInjection::AfterCompaction,
+            )
+            .await;
+        control.close();
+        let outcome = match &result {
+            Ok(true) => TurnOutcome::Completed,
+            Ok(false) => TurnOutcome::Interrupted,
+            Err(_) => TurnOutcome::Failed,
+        };
+        self.conversation.finish_turn(&turn_id, outcome)?;
+        result.map(|completed| {
+            if completed {
+                CompactionOutcome::Completed
+            } else {
+                CompactionOutcome::Cancelled
+            }
+        })
     }
 
     async fn submit_input(
@@ -352,7 +413,7 @@ impl Agent {
                     .run_compaction(
                         events,
                         &control.cancellation,
-                        CompactionPhase::MidTurn,
+                        CompactionRequest::Automatic(CompactionPhase::MidTurn),
                         InitialContextInjection::BeforeLastUserMessage,
                     )
                     .await?
@@ -372,6 +433,14 @@ impl Agent {
         let mut retries = 0_usize;
         loop {
             self.conversation.normalize()?;
+            // Preserve the backend usage baseline for old history. Re-estimating the complete
+            // rendered input here can substantially overcount a valid long-running session.
+            let active_context_tokens = self.conversation.projected_tokens(&[]);
+            if active_context_tokens > EFFECTIVE_CONTEXT_WINDOW {
+                return Err(anyhow!(
+                    "active conversation requires {active_context_tokens} tokens, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window"
+                ));
+            }
             let (completed_tx, mut completed_rx) = unbounded_channel::<Value>();
             let mut observed_item = false;
             let wait = {
@@ -455,7 +524,7 @@ impl Agent {
         &mut self,
         events: &Option<UnboundedSender<AgentEvent>>,
         cancellation: &CancellationToken,
-        phase: CompactionPhase,
+        compaction: CompactionRequest,
         initial_context_injection: InitialContextInjection,
     ) -> Result<bool> {
         if cancellation.is_cancelled() {
@@ -464,7 +533,7 @@ impl Agent {
         emit(events, AgentEvent::CompactionStarted);
         self.conversation.normalize()?;
         let compacted = {
-            let request = self.api.compact(self.conversation.items(), phase);
+            let request = self.api.compact(self.conversation.items(), compaction);
             tokio::pin!(request);
             tokio::select! {
                 biased;
@@ -504,36 +573,42 @@ impl Agent {
         if input.is_empty() {
             return Err(anyhow!("prompt and image list are both empty"));
         }
-        let projected = input.into_message();
-        let incoming_tokens = estimated_tokens(std::slice::from_ref(&projected));
+        let (user_message, prompt_text, selected_skills) = input.into_message_and_skills();
+        let injections = self
+            .conversation
+            .skill_catalog()
+            .explicit_injections(&prompt_text, &selected_skills);
+        for warning in injections.warnings {
+            emit(events, AgentEvent::Warning(warning));
+        }
+        let mut projected = Vec::with_capacity(injections.items.len().saturating_add(1));
+        projected.push(user_message);
+        projected.extend(injections.items);
+        let incoming_tokens = estimated_tokens(&projected);
         if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
             return Err(anyhow!(
                 "input alone is estimated at {incoming_tokens} tokens, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
-        if self
-            .conversation
-            .needs_compaction_with(std::slice::from_ref(&projected))
+        if self.conversation.needs_compaction_with(&projected)
             && !self
                 .run_compaction(
                     events,
                     cancellation,
-                    phase,
+                    CompactionRequest::Automatic(phase),
                     InitialContextInjection::AfterCompaction,
                 )
                 .await?
         {
             return Ok(false);
         }
-        let projected_tokens = self
-            .conversation
-            .projected_tokens(std::slice::from_ref(&projected));
+        let projected_tokens = self.conversation.projected_tokens(&projected);
         if projected_tokens > EFFECTIVE_CONTEXT_WINDOW {
             return Err(anyhow!(
                 "input would require an estimated {projected_tokens} tokens after compaction, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
-        self.conversation.extend([projected])?;
+        self.conversation.extend(projected)?;
         if let Some(id) = steering_id {
             emit(events, AgentEvent::SteeringCommitted(id));
         }

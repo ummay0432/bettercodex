@@ -5,6 +5,7 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::estimated_tokens;
 use crate::input::ImageDetail;
 use crate::rollout::SessionIdentity;
+use crate::usage::TokenUsage;
 use futures::SinkExt;
 use futures::StreamExt;
 use serde_json::json;
@@ -133,7 +134,9 @@ async fn cancelling_compaction_reconnects_before_the_next_turn() {
     let (root, mut agent) = test_websocket_agent(&format!("http://{address}"));
     let large_text =
         "x".repeat(usize::try_from(AUTO_COMPACT_TOKEN_LIMIT.saturating_mul(4)).unwrap());
-    let large_message = UserInput::text(large_text.clone()).into_message();
+    let large_message = UserInput::text(large_text.clone())
+        .into_message_and_skills()
+        .0;
     let incoming_tokens = estimated_tokens(std::slice::from_ref(&large_message));
     assert!(incoming_tokens >= AUTO_COMPACT_TOKEN_LIMIT);
     assert!(incoming_tokens <= EFFECTIVE_CONTEXT_WINDOW);
@@ -167,6 +170,153 @@ async fn cancelling_compaction_reconnects_before_the_next_turn() {
     assert!(next_request.get("previous_response_id").is_none());
     assert!(next_request.to_string().contains("next turn"));
     assert_eq!(agent.prompt_history(), vec!["next turn".to_string()]);
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn manual_compaction_uses_a_standalone_turn_and_replaces_saved_history() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requests_tx, requests_rx) = std_mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        requests_tx.send(read_request(&mut stream)).unwrap();
+        write_sse_items_response(
+            &mut stream,
+            "resp_manual_compact",
+            &[json!({
+                "type": "compaction_summary",
+                "id": "cmp_manual",
+                "encrypted_content": "opaque",
+            })],
+        );
+    });
+
+    let (root, mut agent) = test_agent(&format!("http://{address}"));
+    let retained_user = UserInput::text("retain this user request")
+        .into_message_and_skills()
+        .0;
+    agent
+        .conversation
+        .extend([
+            retained_user,
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "earlier answer"}],
+            }),
+        ])
+        .unwrap();
+    let session_id = agent.session_id().to_string();
+    let (events_tx, mut events_rx) = unbounded_channel();
+    let (handle, control) = TurnControl::non_steerable_channel();
+    assert!(
+        handle
+            .steer(UserInput::text("cannot steer compaction"))
+            .is_err(),
+        "manual compaction is a non-steerable standalone turn"
+    );
+
+    assert_eq!(
+        timeout(
+            Duration::from_secs(5),
+            agent.compact_with_control(events_tx, control),
+        )
+        .await
+        .expect("manual compaction timed out")
+        .unwrap(),
+        CompactionOutcome::Completed
+    );
+    server.join().unwrap();
+
+    let request: Value = serde_json::from_slice(
+        &requests_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("manual compaction request"),
+    )
+    .unwrap();
+    assert_eq!(
+        request["input"].as_array().unwrap().last().unwrap(),
+        &json!({"type": "compaction_trigger"})
+    );
+    let metadata: Value = serde_json::from_str(
+        request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["request_kind"], "compaction");
+    assert_eq!(
+        metadata["compaction"],
+        json!({
+            "trigger": "manual",
+            "reason": "user_requested",
+            "implementation": "responses_compaction_v2",
+            "phase": "standalone_turn",
+            "strategy": "memento",
+        })
+    );
+
+    assert_eq!(
+        agent.prompt_history(),
+        vec!["retain this user request".to_string()]
+    );
+    assert_eq!(
+        agent
+            .conversation
+            .items()
+            .iter()
+            .filter(|item| item["type"] == "compaction_summary")
+            .count(),
+        1
+    );
+    assert!(
+        agent
+            .conversation
+            .items()
+            .iter()
+            .any(|item| item["role"] == "developer"),
+        "current environment context must be reinjected"
+    );
+    assert!(matches!(
+        events_rx.try_recv(),
+        Ok(AgentEvent::CompactionStarted)
+    ));
+    assert!(matches!(
+        events_rx.try_recv(),
+        Ok(AgentEvent::ContextUpdated(_))
+    ));
+    assert!(matches!(
+        events_rx.try_recv(),
+        Ok(AgentEvent::CompactionCompleted)
+    ));
+
+    let journal = std::fs::read_to_string(
+        root.join("state")
+            .join("sessions")
+            .join(format!("{session_id}.jsonl")),
+    )
+    .unwrap();
+    let records = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let started = records
+        .iter()
+        .position(|record| record["type"] == "turn_started")
+        .unwrap();
+    let replaced = records
+        .iter()
+        .position(|record| record["type"] == "history_replace" && record["reason"] == "compaction")
+        .unwrap();
+    let finished = records
+        .iter()
+        .position(|record| record["type"] == "turn_finished" && record["outcome"] == "completed")
+        .unwrap();
+    assert!(started < replaced && replaced < finished, "{records:#?}");
+    assert_eq!(records[started]["turn_id"], records[finished]["turn_id"]);
 
     drop(agent);
     std::fs::remove_dir_all(root).unwrap();
@@ -215,7 +365,7 @@ async fn input_is_rechecked_after_successful_compaction_before_sampling() {
     let (root, mut agent) = test_websocket_agent(&format!("http://{address}"));
     let text =
         "x".repeat(usize::try_from((EFFECTIVE_CONTEXT_WINDOW - 1_000).saturating_mul(4)).unwrap());
-    let message = UserInput::text(text.clone()).into_message();
+    let message = UserInput::text(text.clone()).into_message_and_skills().0;
     let incoming_tokens = estimated_tokens(std::slice::from_ref(&message));
     assert!(incoming_tokens <= EFFECTIVE_CONTEXT_WINDOW);
     assert!(incoming_tokens >= AUTO_COMPACT_TOKEN_LIMIT);
@@ -262,6 +412,97 @@ async fn individually_oversized_text_and_image_batches_are_rejected_without_comp
     let error = agent.submit_user_input(images).await.unwrap_err();
     assert!(error.to_string().contains("input alone"), "{error:#}");
     assert!(agent.prompt_history().is_empty());
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backend_usage_is_not_overridden_by_a_larger_full_history_estimate() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to accept sampling request: {error}"),
+            }
+        };
+        let request = read_request(&mut stream);
+        write_sse_response(&mut stream, "measured context accepted");
+        Some(request)
+    });
+    let (root, mut agent) = test_agent(&format!("http://{address}"));
+
+    let prefix_tokens = estimated_tokens(crate::api::context_prefix_items());
+    let baseline_text_tokens = EFFECTIVE_CONTEXT_WINDOW
+        .saturating_sub(prefix_tokens)
+        .saturating_sub(2_000);
+    let baseline = UserInput::text(
+        "x".repeat(usize::try_from(baseline_text_tokens.saturating_mul(4)).unwrap()),
+    )
+    .into_message_and_skills()
+    .0;
+    let call = json!({
+        "type": "custom_tool_call",
+        "call_id": "call_measured_context",
+        "name": "exec",
+        "input": "text(true)",
+    });
+    agent.conversation.extend([baseline, call]).unwrap();
+    // The server's count includes the full request and is authoritative for existing history.
+    // This deliberately models a session where conservative bytes/4 replay accounting is higher.
+    let measured_tokens = AUTO_COMPACT_TOKEN_LIMIT - 15_000;
+    agent
+        .conversation
+        .record_usage(
+            Some(TokenUsage {
+                input_tokens: measured_tokens,
+                total_tokens: measured_tokens,
+                ..TokenUsage::default()
+            }),
+            true,
+        )
+        .unwrap();
+    agent
+        .conversation
+        .extend([json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call_measured_context",
+            "output": [{"type": "input_text", "text": "x".repeat(12_000)}],
+        })])
+        .unwrap();
+
+    let heuristic_request_tokens =
+        prefix_tokens.saturating_add(estimated_tokens(agent.conversation.items()));
+    assert!(heuristic_request_tokens > EFFECTIVE_CONTEXT_WINDOW);
+    assert!(agent.conversation.projected_tokens(&[]) < AUTO_COMPACT_TOKEN_LIMIT);
+
+    let (_handle, control) = TurnControl::channel();
+    let outcome = timeout(
+        Duration::from_secs(5),
+        agent.sample_with_recovery(&None, &control),
+    )
+    .await;
+    let request = server.join().expect("single-response server");
+    let response = match outcome.expect("sampling timed out").unwrap() {
+        SamplingOutcome::Response(response) => response,
+        SamplingOutcome::Cancelled => panic!("sampling was cancelled"),
+    };
+    assert_eq!(response.text, "measured context accepted");
+    let request: Value = serde_json::from_slice(&request.expect("sampling request")).unwrap();
+    assert!(
+        estimated_tokens(request["input"].as_array().unwrap()) > EFFECTIVE_CONTEXT_WINDOW,
+        "the fixture must cover the heuristic false positive"
+    );
 
     drop(agent);
     std::fs::remove_dir_all(root).unwrap();
@@ -504,18 +745,35 @@ fn write_sse_response(stream: &mut TcpStream, answer: &str) {
         "role": "assistant",
         "content": [{"type": "output_text", "text": answer}],
     });
-    let item_done = json!({
-        "type": "response.output_item.done",
-        "output_index": 0,
-        "item": item,
-    });
+    write_sse_items_response(
+        stream,
+        &format!("resp_{}", answer.replace(' ', "_")),
+        &[item],
+    );
+}
+
+fn write_sse_items_response(stream: &mut TcpStream, response_id: &str, items: &[Value]) {
+    let item_events = items
+        .iter()
+        .enumerate()
+        .map(|(output_index, item)| {
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                })
+            )
+        })
+        .collect::<String>();
     let completed = json!({
         "type": "response.completed",
         "response": {
-            "id": format!("resp_{}", answer.replace(' ', "_")),
+            "id": response_id,
             "model": crate::MODEL,
             "reasoning": {"context": "all_turns"},
-            "output": [item],
+            "output": items,
             "usage": {
                 "input_tokens": 10,
                 "output_tokens": 2,
@@ -523,7 +781,7 @@ fn write_sse_response(stream: &mut TcpStream, answer: &str) {
             },
         },
     });
-    let body = format!("data: {item_done}\n\ndata: {completed}\n\n");
+    let body = format!("{item_events}data: {completed}\n\n");
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nopenai-model: {}\r\nConnection: close\r\n\r\n{}",

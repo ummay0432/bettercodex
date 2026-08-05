@@ -5,16 +5,19 @@ mod markdown;
 mod pending_input;
 mod reasoning_status;
 mod resume_picker;
+mod skill_popup;
 mod terminal;
 mod tool_catalogue;
 mod view;
 
 use crate::agent::Agent;
+use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
 use crate::agent::TurnHandle;
 use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
+use crate::input::UserPrompt;
 use crate::prompt_history::PromptHistory;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
@@ -39,12 +42,27 @@ use uuid::Uuid;
 use view::Action;
 use view::View;
 
-type TurnResult = (Agent, Result<SubmitOutcome>);
+type TurnResult = (Agent, TurnCompletion);
 type TurnTask = JoinHandle<TurnResult>;
 type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
 const FRAME_INTERVAL: Duration = Duration::from_millis(32);
 const MAX_READY_AGENT_EVENTS: usize = 4_096;
+
+enum TurnCompletion {
+    Submission(Result<SubmitOutcome>),
+    Compaction(Result<CompactionOutcome>),
+}
+
+impl TurnCompletion {
+    fn completed(&self) -> bool {
+        matches!(
+            self,
+            Self::Submission(Ok(SubmitOutcome::Completed(_)))
+                | Self::Compaction(Ok(CompactionOutcome::Completed))
+        )
+    }
+}
 
 pub(crate) async fn run(agent: Agent, cwd: PathBuf) -> Result<()> {
     let mut runtime = Runtime::new(agent, cwd)?;
@@ -83,6 +101,10 @@ struct ResumedSession {
 impl Runtime {
     fn new(agent: Agent, cwd: PathBuf) -> Result<Self> {
         let mut view = View::new(&cwd);
+        view.set_skills(agent.skills().to_vec());
+        for warning in agent.skill_warnings() {
+            view.add_notice(format!("Skill warning: {warning}"));
+        }
         view.set_context_tokens(agent.context_tokens());
         let (prompt_history, composer_history) = prompt_history_for_agent(&agent)?;
         view.seed_prompt_history(composer_history);
@@ -192,15 +214,18 @@ impl Runtime {
                     redraw = true;
                 }
                 completion = receive_turn_completion(&mut self.turn) => {
-                    let (agent, result) = completion.context("agent task stopped unexpectedly")?;
+                    let (agent, completion) = completion.context("agent task stopped unexpectedly")?;
                     self.turn = None;
                     self.drain_agent_events();
                     self.turn_events = None;
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.turn_handle = None;
-                    let completed = matches!(&result, Ok(SubmitOutcome::Completed(_)));
-                    self.view.finish_turn(result);
+                    let completed = completion.completed();
+                    match completion {
+                        TurnCompletion::Submission(result) => self.view.finish_turn(result),
+                        TurnCompletion::Compaction(result) => self.view.finish_compaction(result),
+                    }
                     redraw = true;
 
                     if self.exit_after_turn {
@@ -220,7 +245,7 @@ impl Runtime {
                             self.view.add_notice(
                                 "Model interrupted to submit steering input".to_string(),
                             );
-                            let prompt = steers.join("\n\n");
+                            let prompt = UserPrompt::joined(steers);
                             self.start_turn(prompt);
                         }
                     } else {
@@ -237,12 +262,12 @@ impl Runtime {
         match action {
             Action::None => {}
             Action::Submit(prompt) => {
-                self.persist_prompt(&prompt);
+                self.persist_prompt(prompt.as_str());
                 if self.turn.is_some() {
                     let steering = self
                         .turn_handle
                         .as_ref()
-                        .and_then(|turn| turn.steer(UserInput::text(&prompt)).ok());
+                        .and_then(|turn| turn.steer(UserInput::prompt(prompt.clone())).ok());
                     match steering {
                         Some(id) => self.view.add_pending_steer(id, prompt),
                         None => self.view.queue_follow_up(prompt),
@@ -252,7 +277,7 @@ impl Runtime {
                 }
             }
             Action::Queue(prompt) => {
-                self.persist_prompt(&prompt);
+                self.persist_prompt(prompt.as_str());
                 if self.turn.is_some() {
                     self.view.queue_follow_up(prompt);
                 } else {
@@ -260,6 +285,7 @@ impl Runtime {
                 }
             }
             Action::Cancel => self.interrupt_turn(),
+            Action::Compact => self.start_compaction(),
             Action::Clear => {
                 if self.turn.is_none() {
                     let agent = Agent::new(&self.cwd)?;
@@ -269,6 +295,14 @@ impl Runtime {
                     self.prompt_history = Some(prompt_history);
                     self.submit_steers_after_interrupt = false;
                     self.view.clear();
+                    let agent = self
+                        .agent
+                        .as_ref()
+                        .expect("a cleared runtime owns its replacement agent");
+                    self.view.set_skills(agent.skills().to_vec());
+                    for warning in agent.skill_warnings() {
+                        self.view.add_notice(format!("Skill warning: {warning}"));
+                    }
                 }
             }
             Action::OpenResumePicker => self.open_resume_picker()?,
@@ -352,6 +386,8 @@ impl Runtime {
         let cwd = agent.cwd().to_path_buf();
         let context_snapshot = agent.context_snapshot();
         let context_tokens = agent.context_tokens();
+        let skills = agent.skills().to_vec();
+        let skill_warnings = agent.skill_warnings().to_vec();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
 
@@ -364,24 +400,43 @@ impl Runtime {
         self.file_search_updates = file_search_updates;
         self.prompt_history = Some(prompt_history);
         self.view
-            .switch_session(&cwd, context_tokens, composer_history);
+            .switch_session(&cwd, context_tokens, composer_history, skills);
+        for warning in skill_warnings {
+            self.view.add_notice(format!("Skill warning: {warning}"));
+        }
     }
 
-    fn start_turn(&mut self, prompt: String) {
+    fn start_turn(&mut self, prompt: UserPrompt) {
         let mut agent = self
             .agent
             .take()
             .expect("an idle runtime always owns its agent");
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::channel();
-        self.view.start_turn(&prompt);
+        self.view.start_turn(prompt.clone());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
         self.turn = Some(tokio::spawn(async move {
             let result = agent
-                .submit_with_control(UserInput::text(prompt), events_tx, turn_control)
+                .submit_with_control(UserInput::prompt(prompt), events_tx, turn_control)
                 .await;
-            (agent, result)
+            (agent, TurnCompletion::Submission(result))
+        }));
+    }
+
+    fn start_compaction(&mut self) {
+        let mut agent = self
+            .agent
+            .take()
+            .expect("an idle runtime always owns its agent");
+        let (events_tx, events_rx) = unbounded_channel();
+        let (turn_handle, turn_control) = crate::agent::TurnControl::non_steerable_channel();
+        self.view.start_compaction();
+        self.turn_events = Some(events_rx);
+        self.turn_handle = Some(turn_handle);
+        self.turn = Some(tokio::spawn(async move {
+            let result = agent.compact_with_control(events_tx, turn_control).await;
+            (agent, TurnCompletion::Compaction(result))
         }));
     }
 

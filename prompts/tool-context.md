@@ -55,20 +55,20 @@ reproducible estimates:
   used by BetterCodex for text history estimates.
 
 The JSON figures use compact serialization with sorted object keys. Counts are
-the audited 2026-08-04 snapshot. Prompt caching reduces repeated input billing;
+the audited 2026-08-05 snapshot. Prompt caching reduces repeated input billing;
 it does not remove the cached prefix from the active context window.
 
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable prefix: `additional_tools` plus cached system-prompt item | 22,727 | 5,605 | 5,682 |
-| Complete `additional_tools` developer item | 20,028 | 5,074 | 5,007 |
-| Top-level `exec` specification | 18,614 | 4,747 | 4,654 |
-| `exec` description only | 17,705 | 4,245 | 4,427 |
+| Complete stable prefix: `additional_tools` plus cached system-prompt item | 23,932 | 5,925 | 5,983 |
+| Complete `additional_tools` developer item | 20,440 | 5,195 | 5,110 |
+| Top-level `exec` specification | 19,026 | 4,868 | 4,757 |
+| `exec` description only | 18,103 | 4,351 | 4,526 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
 | Top-level `wait` specification | 1,356 | 315 | 339 |
 | `wait` description only | 769 | 181 | 193 |
-| Cached system-prompt message item | 2,696 | 530 | 674 |
-| `prompts/system.md` text only | 2,529 | 479 | 633 |
+| Cached system-prompt message item | 3,489 | 729 | 873 |
+| `prompts/system.md` text only | 3,306 | 669 | 827 |
 
 The `exec` description contains the Code Mode runtime instructions and every
 nested tool declaration. This is the text-only breakdown:
@@ -78,6 +78,7 @@ nested tool declaration. This is the text-only breakdown:
 | Runtime rules and global helpers | 3,375 | 806 | 844 |
 | `apply_patch` | 233 | 59 | 59 |
 | `exec_command` | 1,374 | 321 | 344 |
+| `log_papercut` | 397 | 106 | 100 |
 | `update_plan` | 498 | 126 | 125 |
 | `view_image` | 654 | 153 | 164 |
 | `write_stdin` | 1,168 | 266 | 292 |
@@ -123,11 +124,11 @@ NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 ```
 
-The description exposes six nested tools through the JavaScript `tools`
-object: `apply_patch`, `exec_command`, `update_plan`, `view_image`,
-`write_stdin`, and the namespaced `web__run` (`web.run`). The web tool uses
-Codex's exact command schema and description for search, open/fetch, click,
-find, PDF screenshots, finance, weather, sports, time, and image search.
+The description exposes seven nested tools through the JavaScript `tools`
+object: `apply_patch`, `exec_command`, `log_papercut`, `update_plan`,
+`view_image`, `write_stdin`, and the namespaced `web__run` (`web.run`). The web
+tool uses Codex's exact command schema and description for search, open/fetch,
+click, find, PDF screenshots, finance, weather, sports, time, and image search.
 
 ### `wait`
 

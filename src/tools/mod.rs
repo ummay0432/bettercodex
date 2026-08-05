@@ -3,6 +3,7 @@ mod code_runtime;
 mod exec_runtime;
 mod executor;
 mod image_preparation;
+mod papercuts;
 mod patch;
 
 const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
@@ -200,10 +201,18 @@ impl NestedTools {
             (None, "apply_patch", NestedToolKind::Freeform) => {
                 let input = freeform_input(name, invocation.input)?;
                 let cwd = self.cwd.clone();
-                let _output = tokio::task::spawn_blocking(move || patch::apply(&cwd, &input))
-                    .await
-                    .context("apply_patch task failed")??;
+                let _output =
+                    tokio::task::spawn_blocking(move || patch::apply(&cwd, &input, &cancellation))
+                        .await
+                        .context("apply_patch task failed")??;
                 Ok(json!({}))
+            }
+            (None, "log_papercut", NestedToolKind::Function) => {
+                let cwd = self.cwd.clone();
+                let input = function_input(name, invocation.input)?;
+                tokio::task::spawn_blocking(move || papercuts::log(&cwd, input, &cancellation))
+                    .await
+                    .context("log_papercut task failed")?
             }
             (None, "update_plan", NestedToolKind::Function) => {
                 self.update_plan(function_input(name, invocation.input)?)

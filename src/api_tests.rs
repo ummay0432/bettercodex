@@ -1,4 +1,6 @@
 use super::*;
+use crate::compaction::CompactionPhase;
+use crate::compaction::CompactionRequest;
 use crate::context::RAW_CONTEXT_WINDOW;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -280,7 +282,7 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
     assert_eq!(&first_input[..2], &second_input[..2]);
     assert_eq!(
         serde_json::to_string(&first_input[..2]).unwrap().len(),
-        22_727,
+        23_932,
         "update prompts/tool-context.md"
     );
 
@@ -302,23 +304,6 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
             .count(),
         1
     );
-}
-
-#[tokio::test]
-async fn responses_transport_rejects_a_full_input_above_the_effective_window() {
-    let mut client = test_client("http://127.0.0.1:1".to_string());
-    assert!(client.fall_back_to_http());
-    let history = vec![user_message(&"x".repeat(
-        usize::try_from(EFFECTIVE_CONTEXT_WINDOW.saturating_mul(4)).unwrap(),
-    ))];
-    let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let error = match client.respond(history, &completed_items).await {
-        Ok(_) => panic!("oversized request reached the transport"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind, ApiErrorKind::Fatal);
-    assert!(error.to_string().contains("effective context window"));
 }
 
 #[test]
@@ -356,6 +341,7 @@ fn request_bakes_in_the_fixed_exec_runtime() {
         json!({
             "apply_patch": {"name": "apply_patch", "namespace": null},
             "exec_command": {"name": "exec_command", "namespace": null},
+            "log_papercut": {"name": "log_papercut", "namespace": null},
             "update_plan": {"name": "update_plan", "namespace": null},
             "view_image": {"name": "view_image", "namespace": null},
             "web__run": {"name": "run", "namespace": "web"},
@@ -463,7 +449,7 @@ fn remote_compaction_v2_reuses_the_turn_websocket_prefix() {
     let trigger = json!({"type": "compaction_trigger"});
     let mut compact_request = client.build_request(
         vec![user, output, trigger.clone()],
-        RequestKind::Compaction(CompactionPhase::MidTurn),
+        RequestKind::Compaction(CompactionRequest::Automatic(CompactionPhase::MidTurn)),
     );
     let logical_request = compact_request.clone();
 
@@ -844,7 +830,10 @@ async fn remote_compaction_v2_uses_the_responses_stream_and_builds_bounded_histo
     client.prefer_websocket = false;
 
     let compacted = client
-        .compact(&[user_message("old")], CompactionPhase::PreTurn)
+        .compact(
+            &[user_message("old")],
+            CompactionRequest::Automatic(CompactionPhase::PreTurn),
+        )
         .await
         .unwrap();
     assert_eq!(compacted.items, vec![user_message("old"), compaction]);
@@ -935,7 +924,10 @@ async fn remote_compaction_request_is_bounded_by_the_effective_context_window() 
     assert!(request_tokens <= RAW_CONTEXT_WINDOW);
 
     client
-        .compact(&history, CompactionPhase::MidTurn)
+        .compact(
+            &history,
+            CompactionRequest::Automatic(CompactionPhase::MidTurn),
+        )
         .await
         .unwrap();
 
@@ -965,7 +957,10 @@ async fn compaction_rejects_a_response_without_one_opaque_item() {
     client.prefer_websocket = false;
 
     let error = client
-        .compact(&[user_message("old")], CompactionPhase::MidTurn)
+        .compact(
+            &[user_message("old")],
+            CompactionRequest::Automatic(CompactionPhase::MidTurn),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("expected exactly one"));

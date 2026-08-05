@@ -144,7 +144,7 @@ fn normalization_preserves_the_backend_usage_baseline_for_local_repairs() {
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     conversation
         .extend([
-            UserInput::text("run the tool").into_message(),
+            UserInput::text("run the tool").into_message_and_skills().0,
             json!({
                 "id": "fc_missing_output",
                 "type": "function_call",
@@ -244,14 +244,14 @@ fn backend_usage_adds_past_reasoning_only_when_the_server_omits_it() {
     });
     conversation
         .extend([
-            UserInput::text("first turn").into_message(),
+            UserInput::text("first turn").into_message_and_skills().0,
             reasoning.clone(),
             json!({
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "first response"}],
             }),
-            UserInput::text("second turn").into_message(),
+            UserInput::text("second turn").into_message_and_skills().0,
         ])
         .unwrap();
     let usage = TokenUsage {
@@ -293,7 +293,9 @@ fn contextual_user_messages_do_not_turn_current_reasoning_into_past_reasoning() 
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     conversation
         .extend([
-            UserInput::text("real user turn").into_message(),
+            UserInput::text("real user turn")
+                .into_message_and_skills()
+                .0,
             json!({
                 "type": "reasoning",
                 "id": "rs_current",
@@ -374,7 +376,9 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
     std::fs::write(cwd.join("AGENTS.md"), "Keep the request accounting exact.").unwrap();
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
-    let user = UserInput::text("inspect the context").into_message();
+    let user = UserInput::text("inspect the context")
+        .into_message_and_skills()
+        .0;
     let assistant = json!({
         "type": "message",
         "role": "assistant",
@@ -553,7 +557,9 @@ fn cached_context_metrics_follow_every_history_mutation() {
 
     conversation
         .extend([
-            UserInput::text("measure this turn").into_message(),
+            UserInput::text("measure this turn")
+                .into_message_and_skills()
+                .0,
             json!({
                 "id": "fc_metrics",
                 "type": "function_call",
@@ -749,7 +755,7 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     let world_state = conversation.world_state.items();
-    let current_user = UserInput::text("current turn").into_message();
+    let current_user = UserInput::text("current turn").into_message_and_skills().0;
     let summary = json!({
         "type": "compaction_summary",
         "id": "cmp_mid",
@@ -788,7 +794,7 @@ fn mid_turn_context_is_inserted_before_the_last_retained_agent_message() {
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     let world_state = conversation.world_state.items();
-    let current_user = UserInput::text("delegate this").into_message();
+    let current_user = UserInput::text("delegate this").into_message_and_skills().0;
     let agent_message = json!({
         "type": "agent_message",
         "author": "worker",
@@ -832,7 +838,7 @@ fn retained_world_state_keeps_remote_v2_history_order_unchanged() {
     let (root, cwd) = temporary_repository("retained-compaction-context");
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
-    let current_user = UserInput::text("current turn").into_message();
+    let current_user = UserInput::text("current turn").into_message_and_skills().0;
     let summary = json!({
         "type": "compaction_summary",
         "id": "cmp_retained",
@@ -949,7 +955,9 @@ fn resume_replaces_stale_world_state_without_losing_the_usage_baseline() {
     let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     conversation
-        .extend([UserInput::text("saved user turn").into_message()])
+        .extend([UserInput::text("saved user turn")
+            .into_message_and_skills()
+            .0])
         .unwrap();
     let usage = TokenUsage {
         input_tokens: 19_000,
@@ -1025,11 +1033,11 @@ fn resumed_prompt_history_contains_user_inputs_but_not_context_notices() {
     let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     conversation
-        .extend([UserInput::text("older prompt").into_message()])
+        .extend([UserInput::text("older prompt").into_message_and_skills().0])
         .unwrap();
     conversation.mark_interrupted().unwrap();
     conversation
-        .extend([UserInput::text("newer prompt").into_message()])
+        .extend([UserInput::text("newer prompt").into_message_and_skills().0])
         .unwrap();
     assert_eq!(
         conversation.prompt_history(),

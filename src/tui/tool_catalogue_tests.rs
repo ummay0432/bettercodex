@@ -26,6 +26,7 @@ fn renders_a_compact_catalogue_attached_to_the_left_edge() {
             "│Inside exec                   │",
             "│  ├─ ● apply_patch            │",
             "│  ├─ ● exec_command           │",
+            "│  ├─ ● log_papercut           │",
             "│  ├─ ● update_plan            │",
             "│  ├─ ● view_image             │",
             "│  ├─ ● write_stdin            │",

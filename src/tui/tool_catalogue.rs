@@ -15,7 +15,7 @@ use ratatui::widgets::Paragraph;
 
 const RULE: Color = Color::Indexed(8);
 const PREFERRED_WIDTH: u16 = 32;
-const PREFERRED_HEIGHT: u16 = 13;
+const PREFERRED_HEIGHT: u16 = 14;
 
 pub(super) const VIEWPORT_HEIGHT: u16 = PREFERRED_HEIGHT;
 

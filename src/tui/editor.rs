@@ -1,3 +1,5 @@
+use crate::skills::SkillSelection;
+use crate::skills::mention_ranges;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -15,6 +17,7 @@ pub(super) struct Editor {
     history_index: Option<usize>,
     saved_draft: String,
     pending_pastes: Vec<PendingPaste>,
+    skill_bindings: Vec<SkillBinding>,
 }
 
 #[derive(Debug)]
@@ -24,11 +27,19 @@ struct PendingPaste {
     range: Range<usize>,
 }
 
+#[derive(Debug)]
+struct SkillBinding {
+    selection: SkillSelection,
+    range: Range<usize>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct EditorLayout {
     pub(super) lines: Vec<String>,
     /// Byte ranges within each visible line that represent compacted pastes.
     pub(super) paste_ranges: Vec<Vec<Range<usize>>>,
+    /// Byte ranges within each visible line that represent selected skill mentions.
+    pub(super) skill_ranges: Vec<Vec<Range<usize>>>,
     pub(super) cursor_row: u16,
     pub(super) cursor_column: u16,
     pub(super) total_lines: u16,
@@ -52,6 +63,20 @@ impl Editor {
         self.cursor = self.text.len();
         self.preferred_column = None;
         self.pending_pastes.clear();
+        self.skill_bindings.clear();
+    }
+
+    pub(super) fn set_prompt(&mut self, text: impl Into<String>, skills: &[SkillSelection]) {
+        self.set_text(text);
+        self.bind_skill_selections(skills, 0..self.text.len());
+    }
+
+    pub(super) fn prepend_prompt(&mut self, text: &str, skills: &[SkillSelection]) {
+        if text.is_empty() {
+            return;
+        }
+        self.prepend(text);
+        self.bind_skill_selections(skills, 0..text.len());
     }
 
     pub(super) fn take(&mut self) -> String {
@@ -67,7 +92,19 @@ impl Editor {
         self.preferred_column = None;
         self.history_index = None;
         self.saved_draft.clear();
+        self.skill_bindings.clear();
         text
+    }
+
+    pub(super) fn take_with_skills(&mut self) -> (String, Vec<SkillSelection>) {
+        self.skill_bindings
+            .sort_by_key(|binding| binding.range.start);
+        let skills = self
+            .skill_bindings
+            .iter()
+            .map(|binding| binding.selection.clone())
+            .collect();
+        (self.take(), skills)
     }
 
     pub(super) fn remember(&mut self, text: &str) {
@@ -160,6 +197,27 @@ impl Editor {
     pub(super) fn replace_range(&mut self, range: Range<usize>, value: &str) {
         self.leave_history();
         self.replace_range_inner(range, value);
+    }
+
+    pub(super) fn bind_skill(&mut self, range: Range<usize>, selection: SkillSelection) {
+        if self.text.get(range.clone()) != Some(format!("${}", selection.name()).as_str())
+            || self
+                .atomic_ranges()
+                .any(|atomic| ranges_overlap(atomic, &range))
+        {
+            return;
+        }
+        self.skill_bindings.push(SkillBinding { selection, range });
+    }
+
+    pub(super) fn skill_ranges(&self) -> Vec<Range<usize>> {
+        let mut ranges = self
+            .skill_bindings
+            .iter()
+            .map(|binding| binding.range.clone())
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start);
+        ranges
     }
 
     pub(super) fn insert_newline(&mut self) {
@@ -306,9 +364,26 @@ impl Editor {
                 highlights
             })
             .collect();
+        let skill_ranges = visible_ranges
+            .iter()
+            .map(|line| {
+                let mut highlights = self
+                    .skill_bindings
+                    .iter()
+                    .filter_map(|binding| {
+                        let start = binding.range.start.max(line.start);
+                        let end = binding.range.end.min(line.end);
+                        (start < end).then_some(start - line.start..end - line.start)
+                    })
+                    .collect::<Vec<_>>();
+                highlights.sort_by_key(|range| range.start);
+                highlights
+            })
+            .collect();
         EditorLayout {
             lines,
             paste_ranges,
+            skill_ranges,
             cursor_row: (cursor_line - first) as u16,
             cursor_column: display_width(&self.text[ranges[cursor_line].start..self.cursor]) as u16,
             total_lines: ranges.len().try_into().unwrap_or(u16::MAX),
@@ -331,6 +406,16 @@ impl Editor {
             }
             false
         });
+        self.skill_bindings.retain_mut(|binding| {
+            if binding.range.end <= range.start {
+                return true;
+            }
+            if binding.range.start >= range.end {
+                shift_range(&mut binding.range, removed_len, inserted_len);
+                return true;
+            }
+            false
+        });
         self.text.replace_range(range, value);
         self.cursor = start + inserted_len;
         self.preferred_column = None;
@@ -341,64 +426,56 @@ impl Editor {
             let position = self.nearest_atomic_boundary(range.start);
             return position..position;
         }
-        for paste in &self.pending_pastes {
-            if range.start > paste.range.start && range.start < paste.range.end {
-                range.start = paste.range.start;
+        for atomic in self.atomic_ranges() {
+            if range.start > atomic.start && range.start < atomic.end {
+                range.start = atomic.start;
             }
-            if range.end > paste.range.start && range.end < paste.range.end {
-                range.end = paste.range.end;
+            if range.end > atomic.start && range.end < atomic.end {
+                range.end = atomic.end;
             }
         }
         range
     }
 
     fn previous_atomic_boundary(&self, position: usize) -> usize {
-        self.pending_pastes
-            .iter()
-            .find(|paste| position > paste.range.start && position <= paste.range.end)
+        self.atomic_ranges()
+            .find(|range| position > range.start && position <= range.end)
             .map_or_else(
                 || previous_boundary(&self.text, position),
-                |paste| paste.range.start,
+                |range| range.start,
             )
     }
 
     fn next_atomic_boundary(&self, position: usize) -> usize {
-        self.pending_pastes
-            .iter()
-            .find(|paste| position >= paste.range.start && position < paste.range.end)
-            .map_or_else(
-                || next_boundary(&self.text, position),
-                |paste| paste.range.end,
-            )
+        self.atomic_ranges()
+            .find(|range| position >= range.start && position < range.end)
+            .map_or_else(|| next_boundary(&self.text, position), |range| range.end)
     }
 
     fn nearest_atomic_boundary(&self, position: usize) -> usize {
-        let Some(paste) = self
-            .pending_pastes
-            .iter()
-            .find(|paste| position > paste.range.start && position < paste.range.end)
+        let Some(range) = self
+            .atomic_ranges()
+            .find(|range| position > range.start && position < range.end)
         else {
             return position;
         };
-        if position - paste.range.start < paste.range.end - position {
-            paste.range.start
+        if position - range.start < range.end - position {
+            range.start
         } else {
-            paste.range.end
+            range.end
         }
     }
 
     fn atomic_start_boundary(&self, position: usize) -> usize {
-        self.pending_pastes
-            .iter()
-            .find(|paste| position > paste.range.start && position < paste.range.end)
-            .map_or(position, |paste| paste.range.start)
+        self.atomic_ranges()
+            .find(|range| position > range.start && position < range.end)
+            .map_or(position, |range| range.start)
     }
 
     fn atomic_end_boundary(&self, position: usize) -> usize {
-        self.pending_pastes
-            .iter()
-            .find(|paste| position > paste.range.start && position < paste.range.end)
-            .map_or(position, |paste| paste.range.end)
+        self.atomic_ranges()
+            .find(|range| position > range.start && position < range.end)
+            .map_or(position, |range| range.end)
     }
 
     fn next_large_paste_placeholder(&self, char_count: usize) -> String {
@@ -443,6 +520,31 @@ impl Editor {
         self.history_index = None;
         self.saved_draft.clear();
     }
+
+    fn atomic_ranges(&self) -> impl Iterator<Item = &Range<usize>> {
+        self.pending_pastes
+            .iter()
+            .map(|paste| &paste.range)
+            .chain(self.skill_bindings.iter().map(|binding| &binding.range))
+    }
+
+    fn bind_skill_selections(&mut self, selections: &[SkillSelection], within: Range<usize>) {
+        for range in mention_ranges(&self.text[within.clone()], selections) {
+            let range = within.start + range.start..within.start + range.end;
+            let name = &self.text[range.start + 1..range.end];
+            if let Some(selection) = selections
+                .iter()
+                .find(|selection| selection.name() == name)
+                .cloned()
+            {
+                self.bind_skill(range, selection);
+            }
+        }
+    }
+}
+
+fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
 }
 
 fn shift_range(range: &mut Range<usize>, removed_len: usize, inserted_len: usize) {

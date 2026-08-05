@@ -68,6 +68,20 @@ declare const tools: { exec_command(args: {
 }>; };
 ```
 
+### `log_papercut`
+Appends one papercut note to `PAPERCUTS.md` at the Git repository root, creating the file on first use.
+
+exec tool declaration:
+```ts
+declare const tools: { log_papercut(args: {
+  // One or two sentences describing what caused friction and the likely fix when known.
+  message: string;
+}): Promise<{
+  // Repository-relative path to the papercut log.
+  path: string;
+}>; };
+```
+
 ### `update_plan`
 Updates the task plan.
 Provide an optional explanation and a list of plan items, each with a step and status.

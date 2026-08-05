@@ -324,6 +324,7 @@ dependencies = [
  "codex-protocol",
  "codex-shell-command",
  "codex-utils-audio",
+ "codex-utils-fuzzy-match",
  "codex-utils-image",
  "codex-utils-output-truncation",
  "codex-utils-rustls-provider",
@@ -338,6 +339,7 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "serde_yaml",
  "supports-color",
  "tokio",
  "tokio-tungstenite",
@@ -949,6 +951,11 @@ dependencies = [
  "sha1",
  "tokio",
 ]
+
+[[package]]
+name = "codex-utils-fuzzy-match"
+version = "0.0.0"
+source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
 
 [[package]]
 name = "codex-utils-home-dir"
@@ -5103,6 +5110,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "serial2"
 version = "0.2.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6376,6 +6396,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

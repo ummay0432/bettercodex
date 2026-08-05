@@ -1,7 +1,13 @@
 use super::apply;
+use anyhow::Result;
 use std::path::Path;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+fn apply_patch(root: &Path, input: &str) -> Result<String> {
+    apply(root, input, &CancellationToken::new())
+}
 
 struct TempDir(PathBuf);
 
@@ -30,7 +36,7 @@ fn applies_add_update_delete_and_move() {
     std::fs::write(root.path().join("delete.txt"), "old\n").unwrap();
     std::fs::write(root.path().join("move.txt"), "move me\n").unwrap();
 
-    let result = apply(
+    let result = apply_patch(
         root.path(),
         "*** Begin Patch\n*** Add File: nested/new.txt\n+new\n*** Update File: update.txt\n@@\n one\n-two\n+three\n*** Delete File: delete.txt\n*** Update File: move.txt\n*** Move to: moved.txt\n@@\n move me\n*** End Patch\n",
     )
@@ -67,7 +73,7 @@ fn uses_anchors_and_end_of_file() {
     let root = TempDir::new();
     std::fs::write(root.path().join("file.txt"), "first\nsection\nold\nlast\n").unwrap();
 
-    apply(
+    apply_patch(
         root.path(),
         "*** Begin Patch\n*** Update File: file.txt\n@@ section\n-old\n+new\n@@\n last\n+tail\n*** End of File\n*** End Patch",
     )
@@ -84,7 +90,7 @@ fn patches_paths_outside_the_working_directory_with_user_permissions() {
     let root = TempDir::new();
     let work = root.path().join("work");
     std::fs::create_dir(&work).unwrap();
-    apply(
+    apply_patch(
         &work,
         "*** Begin Patch\n*** Add File: ../escape.txt\n+no\n*** End Patch\n",
     )
@@ -99,7 +105,7 @@ fn patches_paths_outside_the_working_directory_with_user_permissions() {
 #[test]
 fn preserves_codex_partial_application_on_later_failure() {
     let root = TempDir::new();
-    let error = apply(
+    let error = apply_patch(
         root.path(),
         "*** Begin Patch\n*** Add File: staged.txt\n+not yet\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch\n",
     )
@@ -113,12 +119,29 @@ fn preserves_codex_partial_application_on_later_failure() {
 }
 
 #[test]
+fn a_cancelled_patch_does_not_start_mutating_files() {
+    let root = TempDir::new();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = apply(
+        root.path(),
+        "*** Begin Patch\n*** Add File: should-not-exist.txt\n+no\n*** End Patch",
+        &cancellation,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "apply_patch was interrupted");
+    assert!(!root.path().join("should-not-exist.txt").exists());
+}
+
+#[test]
 fn leaves_files_unchanged_when_context_does_not_match() {
     let root = TempDir::new();
     let path = root.path().join("file.txt");
     std::fs::write(&path, "actual\n").unwrap();
 
-    let error = apply(
+    let error = apply_patch(
         root.path(),
         "*** Begin Patch\n*** Update File: file.txt\n@@\n-expected\n+replacement\n*** End Patch\n",
     )
@@ -134,7 +157,7 @@ fn matches_codex_whitespace_and_unicode_tolerance() {
     let path = root.path().join("file.txt");
     std::fs::write(&path, "  title — ‘quoted’  \n").unwrap();
 
-    apply(
+    apply_patch(
         root.path(),
         "*** Begin Patch\n*** Update File: file.txt\n@@\n-title - 'quoted'\n+replaced\n*** End Patch",
     )
@@ -146,7 +169,7 @@ fn matches_codex_whitespace_and_unicode_tolerance() {
 #[test]
 fn accepts_codex_lenient_heredoc_wrapper_and_marker_padding() {
     let root = TempDir::new();
-    apply(
+    apply_patch(
         root.path(),
         "<<'EOF'\n  *** Begin Patch  \n*** Add File: made.txt\n+yes\n  *** End Patch  \nEOF\n",
     )
@@ -161,7 +184,7 @@ fn accepts_codex_lenient_heredoc_wrapper_and_marker_padding() {
 #[test]
 fn matches_codex_empty_add_and_empty_patch_failures() {
     let root = TempDir::new();
-    apply(
+    apply_patch(
         root.path(),
         "*** Begin Patch\n*** Add File: empty.txt\n*** End Patch",
     )
@@ -170,8 +193,14 @@ fn matches_codex_empty_add_and_empty_patch_failures() {
         std::fs::read(root.path().join("empty.txt")).unwrap(),
         Vec::<u8>::new(),
     );
+    apply_patch(
+        root.path(),
+        "*** Begin Patch\n*** Add File: blank.txt\n+\n*** End Patch",
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(root.path().join("blank.txt")).unwrap(), b"\n",);
 
-    let error = apply(root.path(), "*** Begin Patch\n*** End Patch").unwrap_err();
+    let error = apply_patch(root.path(), "*** Begin Patch\n*** End Patch").unwrap_err();
     assert_eq!(error.to_string(), "No files were modified.");
 }
 
@@ -181,7 +210,7 @@ fn pure_additions_preserve_codex_trailing_blank_line_position() {
     let path = root.path().join("file.txt");
     std::fs::write(&path, "first\n\n").unwrap();
 
-    apply(
+    apply_patch(
         root.path(),
         "*** Begin Patch\n*** Update File: file.txt\n@@\n+inserted\n*** End Patch",
     )
@@ -196,11 +225,26 @@ fn permits_codex_blank_lines_after_end_of_file_marker() {
     let path = root.path().join("file.txt");
     std::fs::write(&path, "old\n").unwrap();
 
-    apply(
+    apply_patch(
         root.path(),
         "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End of File\n\n*** End Patch",
     )
     .unwrap();
 
     assert_eq!(std::fs::read_to_string(path).unwrap(), "new\n");
+}
+
+#[test]
+fn overlapping_end_of_file_chunks_keep_codex_reverse_application_order() {
+    let root = TempDir::new();
+    let path = root.path().join("file.txt");
+    std::fs::write(&path, "old\n").unwrap();
+
+    apply_patch(
+        root.path(),
+        "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+first\n*** End of File\n@@\n-old\n+second\n*** End of File\n*** End Patch",
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "first\n");
 }

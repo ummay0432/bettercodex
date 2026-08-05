@@ -619,6 +619,93 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn papercut_tool_creates_and_appends_the_git_root_log() {
+        let root = temporary_directory("papercut");
+        let cwd = root.join("src/nested");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let runtime = runtime(cwd);
+        assert!(!root.join("PAPERCUTS.md").exists());
+        let result = runtime
+            .execute(
+                "call-papercut",
+                r#"
+const first = await tools.log_papercut({
+  message: "While running tests,\n  the documented path was stale.",
+});
+const second = await tools.log_papercut({
+  message: "The formatter emitted a misleading error.",
+});
+text(`${first.path}:${second.path}`);
+"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.preview.contains("PAPERCUTS.md:PAPERCUTS.md"),
+            "{}",
+            result.preview
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("PAPERCUTS.md")).unwrap(),
+            "# Papercuts\n\n- While running tests, the documented path was stale.\n- The formatter emitted a misleading error.\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_exec_stops_in_flight_patch_mutations() {
+        let cwd = temporary_directory("cancel-patch");
+        let runtime = runtime(cwd.clone());
+        let cancellation = CancellationToken::new();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let execution = runtime.execute(
+            "call-cancel-patch",
+            r#"
+const repeated = "*** Add File: scratch.txt\n+partial\n".repeat(10000);
+const patch = `*** Begin Patch
+${repeated}*** Add File: completed.txt
++done
+*** End Patch`;
+await tools.apply_patch(patch);
+"#,
+            Some(events_tx),
+            cancellation.clone(),
+        );
+        tokio::pin!(execution);
+
+        let started = tokio::select! {
+            _ = &mut execution => panic!("patch finished before cancellation"),
+            event = events_rx.recv() => event.expect("patch start event"),
+        };
+        assert!(matches!(
+            started,
+            AgentEvent::ToolStarted { name, .. } if name == "apply_patch"
+        ));
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut execution)
+            .await
+            .expect("cancelled patch did not stop")
+            .unwrap();
+        assert!(
+            result.preview.starts_with("Script terminated"),
+            "{}",
+            result.preview
+        );
+        assert!(!cwd.join("completed.txt").exists());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !cwd.join("completed.txt").exists(),
+            "patch continued mutating files after exec termination"
+        );
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn view_image_dispatches_structured_image_content() {
         let cwd = temporary_directory("view-image");
         let image_path = cwd.join("sample.png");
@@ -729,9 +816,9 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
             .await
             .unwrap();
         assert!(
-            result
-                .preview
-                .contains("apply_patch,exec_command,update_plan,view_image,write_stdin,web__run"),
+            result.preview.contains(
+                "apply_patch,exec_command,log_papercut,update_plan,view_image,write_stdin,web__run"
+            ),
             "{}",
             result.preview
         );

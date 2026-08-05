@@ -1,8 +1,10 @@
 use crate::compaction::InitialContextInjection;
+use crate::repository;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
 use crate::rollout::Rollout;
 use crate::rollout::TurnOutcome;
+use crate::skills::SkillCatalog;
 use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
@@ -41,9 +43,10 @@ const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bf
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
 const CRASH_GUIDANCE: &str = "The previous BetterCodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
 const REPOSITORY_ONBOARDING_PREFIX: &str = "# Repository onboarding from AGENTS.md for ";
-const CONTEXTUAL_USER_PREFIXES: [&str; 4] = [
+const CONTEXTUAL_USER_PREFIXES: [&str; 5] = [
     REPOSITORY_ONBOARDING_PREFIX,
     "<environment_context>",
+    "<skill>",
     "<turn_aborted>",
     "<response_interrupted>",
 ];
@@ -53,6 +56,7 @@ pub(crate) enum ContextKind {
     SystemPrompt,
     ToolCatalogue,
     RepositoryInstructions,
+    Skills,
     Environment,
     UserMessages,
     AssistantMessages,
@@ -62,10 +66,11 @@ pub(crate) enum ContextKind {
     Other,
 }
 
-const CONTEXT_KINDS: [ContextKind; 10] = [
+const CONTEXT_KINDS: [ContextKind; 11] = [
     ContextKind::SystemPrompt,
     ContextKind::ToolCatalogue,
     ContextKind::RepositoryInstructions,
+    ContextKind::Skills,
     ContextKind::Environment,
     ContextKind::UserMessages,
     ContextKind::AssistantMessages,
@@ -107,6 +112,8 @@ pub(crate) struct Conversation {
 struct WorldState {
     environment: Value,
     repository_instructions: Option<Value>,
+    skills_instructions: Option<Value>,
+    skills: SkillCatalog,
 }
 
 /// Aggregate request accounting kept in lockstep with `Conversation::history`.
@@ -223,6 +230,10 @@ impl Conversation {
             .filter(|text| !text.is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    pub(crate) fn skill_catalog(&self) -> &SkillCatalog {
+        &self.world_state.skills
     }
 
     pub(crate) fn record_usage(
@@ -412,16 +423,23 @@ impl Conversation {
 
 impl WorldState {
     fn load(cwd: &Path) -> Result<Self> {
+        let skills = SkillCatalog::load(cwd)?;
+        let skills_instructions = skills.instructions_message(EFFECTIVE_CONTEXT_WINDOW);
         Ok(Self {
             environment: message("developer", environment_context(cwd)),
             repository_instructions: repository_instructions(cwd)?
                 .map(|instructions| message("user", instructions)),
+            skills_instructions,
+            skills,
         })
     }
 
     fn items(&self) -> Vec<Value> {
         let mut items = vec![self.environment.clone()];
         if let Some(instructions) = &self.repository_instructions {
+            items.push(instructions.clone());
+        }
+        if let Some(instructions) = &self.skills_instructions {
             items.push(instructions.clone());
         }
         items
@@ -488,6 +506,12 @@ impl ContextMetrics {
                 .is_some_and(|instructions| same_model_visible_message(item, instructions))
             {
                 ContextKind::RepositoryInstructions
+            } else if world_state
+                .skills_instructions
+                .as_ref()
+                .is_some_and(|instructions| same_model_visible_message(item, instructions))
+            {
+                ContextKind::Skills
             } else {
                 context_kind(item)
             };
@@ -567,13 +591,14 @@ fn context_kind_index(kind: ContextKind) -> usize {
         ContextKind::SystemPrompt => 0,
         ContextKind::ToolCatalogue => 1,
         ContextKind::RepositoryInstructions => 2,
-        ContextKind::Environment => 3,
-        ContextKind::UserMessages => 4,
-        ContextKind::AssistantMessages => 5,
-        ContextKind::ToolActivity => 6,
-        ContextKind::Reasoning => 7,
-        ContextKind::Compaction => 8,
-        ContextKind::Other => 9,
+        ContextKind::Skills => 3,
+        ContextKind::Environment => 4,
+        ContextKind::UserMessages => 5,
+        ContextKind::AssistantMessages => 6,
+        ContextKind::ToolActivity => 7,
+        ContextKind::Reasoning => 8,
+        ContextKind::Compaction => 9,
+        ContextKind::Other => 10,
     }
 }
 
@@ -631,7 +656,8 @@ fn is_generated_world_state_message(item: &Value) -> bool {
     let Some(text) = message_text(item).map(str::trim_start) else {
         return false;
     };
-    (role == Some("developer") && text.starts_with("<environment_context>"))
+    (role == Some("developer")
+        && (text.starts_with("<environment_context>") || text.starts_with("<skills>")))
         || (role == Some("user")
             && text.starts_with(REPOSITORY_ONBOARDING_PREFIX)
             && text.trim_end().ends_with("# End repository onboarding"))
@@ -697,7 +723,7 @@ fn repository_instructions(cwd: &Path) -> Result<Option<String>> {
         candidates.push(path);
     }
 
-    let project_root = find_project_root(&cwd).unwrap_or_else(|| cwd.clone());
+    let project_root = repository::find_root(&cwd).unwrap_or_else(|| cwd.clone());
     let mut directories = Vec::new();
     let mut directory = cwd.as_path();
     loop {
@@ -779,12 +805,6 @@ fn codex_home() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-}
-
-fn find_project_root(cwd: &Path) -> Option<PathBuf> {
-    cwd.ancestors()
-        .find(|directory| directory.join(".git").exists())
-        .map(Path::to_path_buf)
 }
 
 pub(crate) fn estimated_tokens(items: &[Value]) -> u64 {

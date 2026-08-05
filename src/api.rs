@@ -3,7 +3,7 @@ use crate::auth::Auth;
 use crate::auth::AuthSnapshot;
 use crate::auth::SharedAuth;
 use crate::compaction;
-use crate::compaction::CompactionPhase;
+use crate::compaction::CompactionRequest;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
@@ -347,16 +347,6 @@ impl ApiClient {
         // Build once from the owned sampling snapshot. Retries mutate only transport fields, and
         // a successful WebSocket response moves this request into the next delta baseline.
         let mut request = self.build_request(history, request_kind);
-        let input = request
-            .get("input")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
-        let request_tokens = estimated_tokens(input);
-        if request_tokens > EFFECTIVE_CONTEXT_WINDOW {
-            return Err(ApiError::fatal(format!(
-                "Responses input is estimated at {request_tokens} tokens, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window"
-            )));
-        }
         if self.prefer_websocket && !self.websocket_prewarm_attempted {
             self.websocket_prewarm_attempted = true;
             match self.prewarm_websocket().await {
@@ -666,7 +656,7 @@ impl ApiClient {
     pub(crate) async fn compact(
         &mut self,
         history: &[Value],
-        phase: CompactionPhase,
+        compaction: CompactionRequest,
     ) -> ApiResult<CompactionResult> {
         if history.is_empty() {
             return Ok(CompactionResult {
@@ -688,7 +678,7 @@ impl ApiClient {
         let mut request_history = prompt_history.clone();
         request_history.push(trigger);
         let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
-        let request_kind = RequestKind::Compaction(phase);
+        let request_kind = RequestKind::Compaction(compaction);
         let mut retries = 0_usize;
         let response = loop {
             match self
@@ -795,12 +785,12 @@ impl ApiClient {
             "code_mode_tool_names": tools::nested_tool_name_map(),
             "turn_started_at_unix_ms": self.turn_started_at_unix_ms,
         });
-        if let RequestKind::Compaction(phase) = request_kind {
+        if let RequestKind::Compaction(compaction) = request_kind {
             metadata["compaction"] = json!({
-                "trigger": "auto",
-                "reason": "context_limit",
+                "trigger": compaction.trigger(),
+                "reason": compaction.reason(),
                 "implementation": "responses_compaction_v2",
-                "phase": phase.as_str(),
+                "phase": compaction.phase(),
                 "strategy": "memento",
             });
         }
@@ -991,7 +981,7 @@ impl ApiClient {
 enum RequestKind {
     Turn,
     Prewarm,
-    Compaction(CompactionPhase),
+    Compaction(CompactionRequest),
 }
 
 impl RequestKind {

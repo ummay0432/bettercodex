@@ -10,15 +10,21 @@ use super::pending_input::PendingInput;
 use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
 use super::resume_picker::ResumePickerAction;
+use super::skill_popup::SkillPopup;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
 use super::tool_catalogue::VIEWPORT_HEIGHT as TOOL_CATALOGUE_VIEWPORT_HEIGHT;
 use crate::MODEL;
+use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
 use crate::context::ContextSnapshot;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
+use crate::input::UserPrompt;
+use crate::skills::Skill;
+use crate::skills::SkillSelection;
+use crate::skills::mention_ranges;
 use codex_ansi_escape::ansi_escape_line;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::parse_command::parse_command;
@@ -43,7 +49,9 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -59,6 +67,9 @@ const RULE: Color = Color::Indexed(8);
 const LIVE_PREFIX_COLS: u16 = 2;
 const TOOL_OUTPUT_MAX_ROWS: usize = 5;
 const COMMAND_CONTINUATION_MAX_ROWS: usize = 2;
+const MAX_PATCH_PREVIEW_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PATCH_PREVIEW_ROWS: usize = 1_000;
+const MAX_PATCH_PREVIEW_ROW_BYTES: usize = 2 * 1024;
 const ACTIVITY_COMPOSER_GAP: u16 = 1;
 const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
@@ -72,6 +83,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "context",
         aliases: &[],
         description: "visualize current context usage",
+    },
+    SlashCommand {
+        name: "compact",
+        aliases: &[],
+        description: "summarize conversation to prevent hitting the context limit",
     },
     SlashCommand {
         name: "resume",
@@ -98,9 +114,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Action {
     None,
-    Submit(String),
-    Queue(String),
+    Submit(UserPrompt),
+    Queue(UserPrompt),
     Cancel,
+    Compact,
     Clear,
     OpenResumePicker,
     ResumeSession(Uuid),
@@ -119,6 +136,8 @@ pub(super) struct View {
     resize_reflow_requested: bool,
     editor: Editor,
     file_search: FileSearchPopup,
+    skill_popup: SkillPopup,
+    skills: Vec<Skill>,
     context_tokens: Option<u64>,
     busy: bool,
     interrupting: bool,
@@ -151,7 +170,7 @@ impl PreparedView {
 
 #[derive(Debug)]
 enum TranscriptEntry {
-    User(String),
+    User(UserPrompt),
     Assistant {
         text: String,
         streaming: bool,
@@ -217,6 +236,16 @@ struct PatchFile {
     move_to: Option<String>,
     kind: PatchKind,
     rows: Vec<PatchRow>,
+    added: usize,
+    removed: Option<usize>,
+    omission: Option<PatchPreviewOmission>,
+    source_omission_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PatchPreviewOmission {
+    Rows(usize),
+    FileBytes(u64),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -302,6 +331,10 @@ static TERMINAL_COLORS: OnceLock<TerminalColors> = OnceLock::new();
 
 impl View {
     pub(super) fn new(cwd: &Path) -> Self {
+        Self::with_skills(cwd, Vec::new())
+    }
+
+    pub(super) fn with_skills(cwd: &Path, skills: Vec<Skill>) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             repository: Repository::discover(cwd),
@@ -313,6 +346,8 @@ impl View {
             resize_reflow_requested: false,
             editor: Editor::default(),
             file_search: FileSearchPopup::default(),
+            skill_popup: SkillPopup::default(),
+            skills,
             context_tokens: None,
             busy: false,
             interrupting: false,
@@ -349,6 +384,11 @@ impl View {
         self.editor.seed_history(history);
     }
 
+    pub(super) fn set_skills(&mut self, skills: Vec<Skill>) {
+        self.skills = skills;
+        self.skill_popup.hide();
+    }
+
     pub(super) fn add_notice(&mut self, notice: impl Into<String>) {
         self.entries.push(TranscriptEntry::Notice(notice.into()));
     }
@@ -365,9 +405,10 @@ impl View {
         self.busy
     }
 
-    pub(super) fn start_turn(&mut self, prompt: &str) {
+    pub(super) fn start_turn(&mut self, prompt: impl Into<UserPrompt>) {
+        let prompt = prompt.into();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::User(prompt.to_string()));
+        self.entries.push(TranscriptEntry::User(prompt));
         self.busy = true;
         self.interrupting = false;
         self.working_since = Some(Instant::now());
@@ -377,23 +418,35 @@ impl View {
         self.assistant_received_this_turn = false;
     }
 
-    pub(super) fn add_user_message(&mut self, prompt: &str) {
+    pub(super) fn start_compaction(&mut self) {
+        self.seal_exploration();
+        self.context_tokens = None;
+        self.busy = true;
+        self.interrupting = false;
+        self.working_since = Some(Instant::now());
+        self.turn_had_work = false;
+        self.reasoning_status.reset();
+        self.status_detail = Some("Compacting conversation".to_string());
+        self.assistant_received_this_turn = false;
+    }
+
+    pub(super) fn add_user_message(&mut self, prompt: &UserPrompt) {
         self.close_streaming_entries();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::User(prompt.to_string()));
+        self.entries.push(TranscriptEntry::User(prompt.clone()));
         self.reasoning_status.reset();
         self.status_detail = None;
     }
 
-    pub(super) fn add_pending_steer(&mut self, id: SteerId, prompt: String) {
+    pub(super) fn add_pending_steer(&mut self, id: SteerId, prompt: UserPrompt) {
         self.pending_input.add_steer(id, prompt);
     }
 
-    pub(super) fn queue_follow_up(&mut self, prompt: String) {
+    pub(super) fn queue_follow_up(&mut self, prompt: UserPrompt) {
         self.pending_input.queue_follow_up(prompt);
     }
 
-    pub(super) fn pop_next_queued_follow_up(&mut self) -> Option<String> {
+    pub(super) fn pop_next_queued_follow_up(&mut self) -> Option<UserPrompt> {
         self.pending_input.pop_next_follow_up()
     }
 
@@ -401,7 +454,7 @@ impl View {
         self.pending_input.has_steers()
     }
 
-    pub(super) fn take_pending_steers(&mut self) -> Vec<String> {
+    pub(super) fn take_pending_steers(&mut self) -> Vec<UserPrompt> {
         self.pending_input.take_steers()
     }
 
@@ -410,17 +463,19 @@ impl View {
         self.restore_prompts_to_composer(prompts);
     }
 
-    fn restore_prompts_to_composer(&mut self, prompts: Vec<String>) {
+    fn restore_prompts_to_composer(&mut self, prompts: Vec<UserPrompt>) {
         if prompts.is_empty() {
             return;
         }
-        let restored = prompts.join("\n\n");
+        let restored = UserPrompt::joined(prompts);
         if self.editor.is_empty() {
-            self.editor.set_text(restored);
+            self.editor.set_prompt(restored.as_str(), restored.skills());
         } else {
-            self.editor.prepend(&format!("{restored}\n\n"));
+            let text = format!("{}\n\n", restored.as_str());
+            self.editor.prepend_prompt(&text, restored.skills());
         }
         self.file_search.dismiss();
+        self.skill_popup.hide();
         self.dismissed_slash = None;
         self.slash_selection = 0;
     }
@@ -455,6 +510,28 @@ impl View {
             Ok(SubmitOutcome::Cancelled) => self
                 .entries
                 .push(TranscriptEntry::Notice("Turn interrupted".to_string())),
+            Err(error) => self
+                .entries
+                .push(TranscriptEntry::Error(markdown::sanitize(&format!(
+                    "{error:#}"
+                )))),
+        }
+    }
+
+    pub(super) fn finish_compaction(&mut self, result: anyhow::Result<CompactionOutcome>) {
+        self.working_since = None;
+        self.busy = false;
+        self.interrupting = false;
+        self.reasoning_status.reset();
+        self.status_detail = None;
+        match result {
+            Ok(CompactionOutcome::Completed) => {
+                self.entries
+                    .push(TranscriptEntry::Notice("Context compacted".to_string()));
+            }
+            Ok(CompactionOutcome::Cancelled) => self.entries.push(TranscriptEntry::Notice(
+                "Compaction interrupted".to_string(),
+            )),
             Err(error) => self
                 .entries
                 .push(TranscriptEntry::Error(markdown::sanitize(&format!(
@@ -530,9 +607,10 @@ impl View {
         cwd: &Path,
         context_tokens: Option<u64>,
         prompt_history: impl IntoIterator<Item = String>,
+        skills: Vec<Skill>,
     ) {
         let user_message_style = self.user_message_style;
-        *self = Self::new(cwd);
+        *self = Self::with_skills(cwd, skills);
         self.user_message_style = user_message_style;
         self.context_tokens = context_tokens;
         self.editor.seed_history(prompt_history);
@@ -559,6 +637,7 @@ impl View {
         self.pending_input.clear();
         self.overlay = None;
         self.file_search = FileSearchPopup::default();
+        self.skill_popup = SkillPopup::default();
         self.slash_selection = 0;
         self.dismissed_slash = None;
         self.process_commands.clear();
@@ -652,6 +731,7 @@ impl View {
                     context.update(snapshot);
                 }
             }
+            AgentEvent::Warning(message) => self.add_notice(format!("Warning: {message}")),
             AgentEvent::SteeringCommitted(id) => {
                 if let Some(prompt) = self.pending_input.commit_steer(id) {
                     self.add_user_message(&prompt);
@@ -693,9 +773,16 @@ impl View {
         };
         if self.editor.is_browsing_history() {
             self.file_search.hide();
+            self.skill_popup.hide();
         } else {
             self.file_search
                 .sync(self.editor.text(), self.editor.cursor());
+            self.skill_popup.sync(
+                self.editor.text(),
+                self.editor.cursor(),
+                &self.editor.skill_ranges(),
+                &self.skills,
+            );
         }
         action
     }
@@ -733,6 +820,10 @@ impl View {
             return Action::None;
         }
         if key.code == KeyCode::Esc {
+            if self.skill_popup.is_active() {
+                self.skill_popup.dismiss();
+                return Action::None;
+            }
             if self.file_search.is_active() {
                 self.file_search.dismiss();
                 return Action::None;
@@ -755,6 +846,7 @@ impl View {
             || (key.code == KeyCode::Left && shift && !control && !alt);
         if edit_queued
             && self.pending_input.has_follow_ups()
+            && !self.skill_popup.is_active()
             && !self.file_search.is_active()
             && self.slash_matches().is_empty()
         {
@@ -762,6 +854,37 @@ impl View {
                 self.restore_prompts_to_composer(vec![prompt]);
             }
             return Action::None;
+        }
+
+        if self.skill_popup.is_active() {
+            if key.code == KeyCode::Up
+                || (key.code == KeyCode::Char('p') && control && !alt && !shift)
+            {
+                self.skill_popup.move_up();
+                return Action::None;
+            }
+            if key.code == KeyCode::Down
+                || (key.code == KeyCode::Char('n') && control && !alt && !shift)
+            {
+                self.skill_popup.move_down();
+                return Action::None;
+            }
+            if matches!(key.code, KeyCode::Tab)
+                || (key.code == KeyCode::Enter && !shift && !alt && !control)
+            {
+                if let Some((range, skill)) = self.skill_popup.selected_skill(&self.skills) {
+                    let inserted = format!("${}", skill.name());
+                    let start = range.start;
+                    self.editor.replace_range(range, &inserted);
+                    self.editor.bind_skill(
+                        start..start.saturating_add(inserted.len()),
+                        SkillSelection::new(skill.name(), skill.path()),
+                    );
+                    self.advance_past_completion_separator();
+                }
+                self.skill_popup.hide();
+                return Action::None;
+            }
         }
 
         if self.file_search.is_active() {
@@ -925,9 +1048,9 @@ impl View {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
-        let prompt = self.editor.take();
-        self.editor.remember(&prompt);
-        let command = prompt.trim();
+        let (text, skills) = self.editor.take_with_skills();
+        self.editor.remember(&text);
+        let command = text.trim();
         if let Some(arguments) = command.strip_prefix("/resume")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
@@ -953,6 +1076,13 @@ impl View {
         }
         match command {
             "/q" | "/quit" | "/exit" => Action::Quit,
+            "/compact" if self.busy => {
+                self.entries.push(TranscriptEntry::Error(
+                    "'/compact' is disabled while a task is in progress.".to_string(),
+                ));
+                Action::None
+            }
+            "/compact" => Action::Compact,
             "/clear" if self.busy => {
                 self.entries.push(TranscriptEntry::Notice(
                     "Interrupt the active turn before starting a fresh session".to_string(),
@@ -963,7 +1093,7 @@ impl View {
             "/context" => Action::ShowContext,
             "/help" => {
                 self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · Tab queue follow-up · Alt+Up edit queue · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
+                    "Enter submit/steer · Tab queue follow-up · Alt+Up edit queue · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · $ skills · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
                         .to_string(),
                 ));
                 Action::None
@@ -972,7 +1102,7 @@ impl View {
                 self.overlay = Some(Overlay::Tools(ToolCatalogueView::new()));
                 Action::None
             }
-            _ => Action::Submit(prompt),
+            _ => Action::Submit(UserPrompt::with_skills(text, skills)),
         }
     }
 
@@ -987,9 +1117,9 @@ impl View {
             ));
             return Action::None;
         }
-        let prompt = self.editor.take();
-        self.editor.remember(&prompt);
-        Action::Queue(prompt)
+        let (text, skills) = self.editor.take_with_skills();
+        self.editor.remember(&text);
+        Action::Queue(UserPrompt::with_skills(text, skills))
     }
 
     fn close_streaming_entries(&mut self) {
@@ -1379,6 +1509,7 @@ impl View {
         let super::editor::EditorLayout {
             lines,
             paste_ranges,
+            skill_ranges,
             cursor_row,
             cursor_column,
             ..
@@ -1400,6 +1531,10 @@ impl View {
                 Paragraph::new(editor_line(
                     text,
                     paste_ranges
+                        .get(usize::from(index))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    skill_ranges
                         .get(usize::from(index))
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
@@ -1452,6 +1587,7 @@ impl View {
             shortcut_line("Option+Left / Right", "jump by word"),
             shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
             shortcut_line("@", "find and insert a file path"),
+            shortcut_line("$", "mention an installed skill"),
             shortcut_line("Esc", "interrupt active turn"),
             shortcut_line("Up / Down", "restore prompt history"),
             shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
@@ -1463,7 +1599,18 @@ impl View {
     }
 
     fn render_completion_popup(&self, frame: &mut Frame<'_>, area: Rect) {
-        if self.file_search.is_active() {
+        if self.skill_popup.is_active() {
+            if area.is_empty() {
+                return;
+            }
+            let lines = self
+                .skill_popup
+                .lines(&self.skills)
+                .into_iter()
+                .map(|line| truncate_line(line, usize::from(area.width)))
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines), area);
+        } else if self.file_search.is_active() {
             if area.is_empty() {
                 return;
             }
@@ -1543,7 +1690,9 @@ impl View {
     }
 
     fn completion_popup_height(&self, width: u16) -> u16 {
-        if self.file_search.is_active() {
+        if self.skill_popup.is_active() {
+            self.skill_popup.height()
+        } else if self.file_search.is_active() {
             self.file_search.height()
         } else {
             self.slash_popup_height(width)
@@ -1658,7 +1807,7 @@ fn is_local_command(command: &str) -> bool {
     }
     matches!(
         command,
-        "/q" | "/quit" | "/exit" | "/clear" | "/context" | "/help" | "/tools"
+        "/q" | "/quit" | "/exit" | "/compact" | "/clear" | "/context" | "/help" | "/tools"
     )
 }
 
@@ -1852,9 +2001,15 @@ impl ToolEntry {
 
 impl PatchDisplay {
     fn parse(source: &str, cwd: &Path) -> Self {
-        let lines = source.replace("\r\n", "\n");
+        let lines = if source.contains("\r\n") {
+            Cow::Owned(source.replace("\r\n", "\n"))
+        } else {
+            Cow::Borrowed(source)
+        };
         let lines = lines.lines().collect::<Vec<_>>();
         let mut files = Vec::new();
+        let mut remaining_preview_rows = MAX_PATCH_PREVIEW_ROWS;
+        let mut remaining_source_preview_bytes = MAX_PATCH_PREVIEW_SOURCE_BYTES;
         let mut index = 0;
         while index < lines.len() {
             let line = lines[index];
@@ -1877,12 +2032,23 @@ impl PatchDisplay {
                 index += 1;
             }
             let mut rows = Vec::new();
+            let mut added = 0_usize;
+            let mut removed = 0_usize;
+            let mut omitted_rows = 0_usize;
             let mut old_line = 1_usize;
             let mut new_line = 1_usize;
-            let original = matches!(kind, PatchKind::Update)
-                .then(|| std::fs::read_to_string(cwd.join(path)).ok())
-                .flatten()
-                .unwrap_or_default();
+            let (original, source_omission_bytes) = if matches!(kind, PatchKind::Update) {
+                match read_patch_preview_source(
+                    &cwd.join(path),
+                    &mut remaining_source_preview_bytes,
+                ) {
+                    PatchPreviewSource::Text(text) => (text, None),
+                    PatchPreviewSource::Omitted(bytes) => (String::new(), Some(bytes)),
+                    PatchPreviewSource::Unavailable => (String::new(), None),
+                }
+            } else {
+                (String::new(), None)
+            };
             let original_lines = original.lines().collect::<Vec<_>>();
             let mut search_start = 0_usize;
             let mut line_delta = 0_isize;
@@ -1924,55 +2090,84 @@ impl PatchDisplay {
                     hunk_located = true;
                 }
                 if let Some(text) = line.strip_prefix('+') {
-                    rows.push(PatchRow {
-                        number: new_line,
-                        kind: PatchRowKind::Add,
-                        text: text.to_string(),
-                    });
+                    added = added.saturating_add(1);
+                    push_patch_preview_row(
+                        &mut rows,
+                        &mut remaining_preview_rows,
+                        &mut omitted_rows,
+                        PatchRow {
+                            number: new_line,
+                            kind: PatchRowKind::Add,
+                            text: bounded_patch_row(text),
+                        },
+                    );
                     new_line += 1;
                     line_delta += 1;
                 } else if let Some(text) = line.strip_prefix('-') {
-                    rows.push(PatchRow {
-                        number: old_line,
-                        kind: PatchRowKind::Delete,
-                        text: text.to_string(),
-                    });
+                    removed = removed.saturating_add(1);
+                    push_patch_preview_row(
+                        &mut rows,
+                        &mut remaining_preview_rows,
+                        &mut omitted_rows,
+                        PatchRow {
+                            number: old_line,
+                            kind: PatchRowKind::Delete,
+                            text: bounded_patch_row(text),
+                        },
+                    );
                     old_line += 1;
                     line_delta -= 1;
                 } else if let Some(text) = line.strip_prefix(' ') {
-                    rows.push(PatchRow {
-                        number: new_line,
-                        kind: PatchRowKind::Context,
-                        text: text.to_string(),
-                    });
+                    push_patch_preview_row(
+                        &mut rows,
+                        &mut remaining_preview_rows,
+                        &mut omitted_rows,
+                        PatchRow {
+                            number: new_line,
+                            kind: PatchRowKind::Context,
+                            text: bounded_patch_row(text),
+                        },
+                    );
                     old_line += 1;
                     new_line += 1;
                 } else if line.is_empty() {
-                    rows.push(PatchRow {
-                        number: new_line,
-                        kind: PatchRowKind::Context,
-                        text: String::new(),
-                    });
+                    push_patch_preview_row(
+                        &mut rows,
+                        &mut remaining_preview_rows,
+                        &mut omitted_rows,
+                        PatchRow {
+                            number: new_line,
+                            kind: PatchRowKind::Context,
+                            text: String::new(),
+                        },
+                    );
                     old_line += 1;
                     new_line += 1;
                 }
                 search_start = old_line.saturating_sub(1);
             }
-            if matches!(kind, PatchKind::Delete)
-                && rows.is_empty()
-                && let Ok(content) = std::fs::read_to_string(cwd.join(path))
-            {
-                rows.extend(content.lines().enumerate().map(|(index, text)| PatchRow {
-                    number: index + 1,
-                    kind: PatchRowKind::Delete,
-                    text: text.to_string(),
-                }));
+            let mut removed = Some(removed);
+            let mut omission =
+                (omitted_rows > 0).then_some(PatchPreviewOmission::Rows(omitted_rows));
+            if matches!(kind, PatchKind::Delete) && rows.is_empty() && omitted_rows == 0 {
+                let preview = deleted_file_preview(
+                    &cwd.join(path),
+                    &mut remaining_preview_rows,
+                    &mut remaining_source_preview_bytes,
+                );
+                rows = preview.rows;
+                removed = preview.removed;
+                omission = preview.omission;
             }
             files.push(PatchFile {
                 path: path.to_string(),
                 move_to,
                 kind,
                 rows,
+                added,
+                removed,
+                omission,
+                source_omission_bytes,
             });
         }
         Self { files }
@@ -1997,7 +2192,9 @@ impl PatchDisplay {
             };
         }
         let total_added = self.files.iter().map(PatchFile::added).sum::<usize>();
-        let total_removed = self.files.iter().map(PatchFile::removed).sum::<usize>();
+        let total_removed = self.files.iter().try_fold(0_usize, |total, file| {
+            file.removed().map(|removed| total.saturating_add(removed))
+        });
         let mut lines = Vec::new();
         let mut header = vec!["• ".dim()];
         if let [file] = self.files.as_slice() {
@@ -2036,6 +2233,23 @@ impl PatchDisplay {
             for row in &file.rows {
                 lines.extend(patch_row_lines(row, width, number_width, user_style));
             }
+            if let Some(omission) = file.omission {
+                let notice = match omission {
+                    PatchPreviewOmission::Rows(rows) => {
+                        format!("    … {rows} diff rows omitted …")
+                    }
+                    PatchPreviewOmission::FileBytes(bytes) => {
+                        format!("    … deleted-file preview omitted ({bytes} bytes) …")
+                    }
+                };
+                lines.push(truncate_line(Line::from(notice).dim(), usize::from(width)));
+            }
+            if let Some(bytes) = file.source_omission_bytes {
+                let notice = format!(
+                    "    … source preview omitted ({bytes} bytes); line numbers are patch-relative …"
+                );
+                lines.push(truncate_line(Line::from(notice).dim(), usize::from(width)));
+            }
         }
         if let Some(error) = failure {
             lines.push(Line::default());
@@ -2044,6 +2258,129 @@ impl PatchDisplay {
         }
         lines
     }
+}
+
+struct DeletedFilePreview {
+    rows: Vec<PatchRow>,
+    removed: Option<usize>,
+    omission: Option<PatchPreviewOmission>,
+}
+
+enum PatchPreviewSource {
+    Text(String),
+    Omitted(u64),
+    Unavailable,
+}
+
+fn read_patch_preview_source(path: &Path, remaining_bytes: &mut usize) -> PatchPreviewSource {
+    let Ok(metadata) = path.metadata() else {
+        return PatchPreviewSource::Unavailable;
+    };
+    let reported_bytes = metadata.len();
+    let Ok(metadata_bytes) = usize::try_from(reported_bytes) else {
+        return PatchPreviewSource::Omitted(reported_bytes);
+    };
+    if !metadata.is_file() || metadata_bytes > *remaining_bytes {
+        return PatchPreviewSource::Omitted(reported_bytes);
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return PatchPreviewSource::Omitted(reported_bytes);
+    };
+    let mut bytes = Vec::with_capacity(metadata_bytes);
+    let read_limit = remaining_bytes.saturating_add(1);
+    if file
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return PatchPreviewSource::Omitted(reported_bytes);
+    }
+    if bytes.len() > *remaining_bytes {
+        return PatchPreviewSource::Omitted(
+            reported_bytes.max(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+        );
+    }
+    let read_bytes = bytes.len();
+    let Ok(text) = String::from_utf8(bytes) else {
+        return PatchPreviewSource::Omitted(
+            reported_bytes.max(u64::try_from(read_bytes).unwrap_or(u64::MAX)),
+        );
+    };
+    *remaining_bytes -= read_bytes;
+    PatchPreviewSource::Text(text)
+}
+
+fn deleted_file_preview(
+    path: &Path,
+    remaining_rows: &mut usize,
+    remaining_bytes: &mut usize,
+) -> DeletedFilePreview {
+    let content = match read_patch_preview_source(path, remaining_bytes) {
+        PatchPreviewSource::Text(content) => content,
+        PatchPreviewSource::Omitted(bytes) => {
+            return DeletedFilePreview {
+                rows: Vec::new(),
+                removed: None,
+                omission: Some(PatchPreviewOmission::FileBytes(bytes)),
+            };
+        }
+        PatchPreviewSource::Unavailable => {
+            return DeletedFilePreview {
+                rows: Vec::new(),
+                removed: None,
+                omission: None,
+            };
+        }
+    };
+
+    let mut rows = Vec::new();
+    let mut removed = 0_usize;
+    let mut omitted = 0_usize;
+    for (index, text) in content.lines().enumerate() {
+        removed = removed.saturating_add(1);
+        push_patch_preview_row(
+            &mut rows,
+            remaining_rows,
+            &mut omitted,
+            PatchRow {
+                number: index.saturating_add(1),
+                kind: PatchRowKind::Delete,
+                text: bounded_patch_row(text),
+            },
+        );
+    }
+    DeletedFilePreview {
+        rows,
+        removed: Some(removed),
+        omission: (omitted > 0).then_some(PatchPreviewOmission::Rows(omitted)),
+    }
+}
+
+fn push_patch_preview_row(
+    rows: &mut Vec<PatchRow>,
+    remaining_rows: &mut usize,
+    omitted_rows: &mut usize,
+    row: PatchRow,
+) {
+    if *remaining_rows == 0 {
+        *omitted_rows = omitted_rows.saturating_add(1);
+    } else {
+        rows.push(row);
+        *remaining_rows -= 1;
+    }
+}
+
+fn bounded_patch_row(text: &str) -> String {
+    if text.len() <= MAX_PATCH_PREVIEW_ROW_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_PATCH_PREVIEW_ROW_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = text[..end].to_string();
+    bounded.push('…');
+    bounded
 }
 
 fn patch_hunk_old_lines<'a>(lines: &'a [&'a str], start: usize) -> Option<Vec<&'a str>> {
@@ -2182,17 +2519,11 @@ fn patch_row_lines(
 
 impl PatchFile {
     fn added(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|row| matches!(row.kind, PatchRowKind::Add))
-            .count()
+        self.added
     }
 
-    fn removed(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|row| matches!(row.kind, PatchRowKind::Delete))
-            .count()
+    fn removed(&self) -> Option<usize> {
+        self.removed
     }
 
     fn display_path(&self) -> String {
@@ -2398,22 +2729,45 @@ fn display_tool_path(path: &Path, cwd: &Path) -> String {
     )
 }
 
-fn user_message_lines(message: &str, width: u16, style: Style) -> Vec<Line<'static>> {
-    let message = markdown::sanitize(message);
+fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Line<'static>> {
+    let message_text = markdown::sanitize(message.as_str());
     let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS + 1).max(1);
-    let wrapped = editor::wrap_text(message.trim_end_matches(['\r', '\n']), wrap_width);
+    let wrapped = editor::wrap_text(message_text.trim_end_matches(['\r', '\n']), wrap_width);
     let mut lines = vec![Line::default().style(style)];
     for (index, content) in wrapped.into_iter().enumerate() {
-        lines.push(
-            Line::from(vec![
-                Span::styled(if index == 0 { "› " } else { "  " }, style.bold().dim()),
-                Span::styled(content, style),
-            ])
-            .style(style),
-        );
+        let mut spans = vec![Span::styled(
+            if index == 0 { "› " } else { "  " },
+            style.bold().dim(),
+        )];
+        spans.extend(styled_skill_mentions(&content, message.skills(), style));
+        lines.push(Line::from(spans).style(style));
     }
     lines.push(Line::default().style(style));
     lines
+}
+
+fn styled_skill_mentions(
+    text: &str,
+    skills: &[SkillSelection],
+    style: Style,
+) -> Vec<Span<'static>> {
+    let ranges = mention_ranges(text, skills);
+    let mut spans = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(1));
+    let mut cursor = 0_usize;
+    for range in ranges {
+        if cursor < range.start {
+            spans.push(Span::styled(text[cursor..range.start].to_string(), style));
+        }
+        spans.push(Span::styled(
+            text[range.clone()].to_string(),
+            style.fg(Color::Cyan),
+        ));
+        cursor = range.end;
+    }
+    if cursor < text.len() || spans.is_empty() {
+        spans.push(Span::styled(text[cursor..].to_string(), style));
+    }
+    spans
 }
 
 fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
@@ -2899,12 +3253,16 @@ fn append_history_cell(
     output.append(&mut cell);
 }
 
-fn line_count_spans(added: usize, removed: usize) -> Vec<Span<'static>> {
+fn line_count_spans(added: usize, removed: Option<usize>) -> Vec<Span<'static>> {
     vec![
         "(".into(),
         format!("+{added}").green(),
         " ".into(),
-        format!("-{removed}").red(),
+        format!(
+            "-{}",
+            removed.map_or_else(|| "?".to_string(), |count| count.to_string())
+        )
+        .red(),
         ")".into(),
     ]
 }
@@ -3048,10 +3406,30 @@ fn first_display_line(source: &str) -> String {
     }
 }
 
-fn editor_line(text: &str, paste_ranges: &[std::ops::Range<usize>]) -> Line<'static> {
-    let mut spans = Vec::with_capacity(paste_ranges.len().saturating_mul(2).saturating_add(1));
+fn editor_line(
+    text: &str,
+    paste_ranges: &[std::ops::Range<usize>],
+    skill_ranges: &[std::ops::Range<usize>],
+) -> Line<'static> {
+    let mut highlights = paste_ranges
+        .iter()
+        .chain(skill_ranges)
+        .cloned()
+        .collect::<Vec<_>>();
+    highlights.sort_by_key(|range| range.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(highlights.len());
+    for range in highlights {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    let mut spans = Vec::with_capacity(merged.len().saturating_mul(2).saturating_add(1));
     let mut cursor = 0;
-    for range in paste_ranges {
+    for range in &merged {
         debug_assert!(range.start >= cursor && range.end <= text.len());
         if cursor < range.start {
             spans.push(Span::raw(text[cursor..range.start].to_string()));
@@ -3161,6 +3539,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use serde_json::json;
     use std::time::Duration;
+
+    fn prompt(text: impl Into<String>) -> UserPrompt {
+        UserPrompt::text(text)
+    }
 
     #[test]
     fn context_usage_matches_the_preserved_contract() {
@@ -3537,6 +3919,80 @@ mod tests {
     }
 
     #[test]
+    fn compact_command_runs_as_an_interruptible_task_and_reports_completion() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.editor.set_text("/comp");
+
+        let height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered
+                .contains("/compact  summarize conversation to prevent hitting the context limit"),
+            "{rendered}"
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Compact
+        );
+        assert!(view.editor.is_empty());
+        assert!(view.entries.is_empty(), "the command is not a model prompt");
+
+        view.start_compaction();
+        let height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("Compacting ("), "{rendered}");
+        assert!(rendered.contains("esc to interrupt"), "{rendered}");
+
+        view.finish_compaction(Ok(CompactionOutcome::Completed));
+        let history = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(history.contains("Context compacted"), "{history}");
+        assert!(!view.is_busy());
+    }
+
+    #[test]
+    fn compact_command_is_not_sent_to_the_model_during_an_active_task() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.start_turn("working");
+        view.editor.set_text("/compact");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("'/compact' is disabled while a task is in progress."),
+            "{rendered}"
+        );
+        assert!(!view.entries.iter().any(|entry| {
+            matches!(entry, TranscriptEntry::User(prompt) if prompt.as_str() == "/compact")
+        }));
+    }
+
+    #[test]
     fn resume_slash_command_opens_the_picker_and_accepts_an_explicit_id() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
@@ -3601,7 +4057,7 @@ mod tests {
             "{rendered}"
         );
         assert!(!view.entries.iter().any(|entry| {
-            matches!(entry, TranscriptEntry::User(prompt) if prompt == "/resume not-a-session")
+            matches!(entry, TranscriptEntry::User(prompt) if prompt.as_str() == "/resume not-a-session")
         }));
     }
 
@@ -3616,6 +4072,7 @@ mod tests {
             Path::new("/tmp/resumed-session"),
             Some(42_000),
             ["resumed prompt".to_string()],
+            Vec::new(),
         );
 
         assert_eq!(view.cwd, Path::new("/tmp/resumed-session"));
@@ -3667,7 +4124,7 @@ mod tests {
             view.handle_terminal_event(Event::Key(
                 KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
             )),
-            Action::Submit("submit while idle".to_string())
+            Action::Submit(prompt("submit while idle"))
         );
         assert!(view.editor.is_empty());
 
@@ -3677,7 +4134,7 @@ mod tests {
             view.handle_terminal_event(Event::Key(
                 KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
             )),
-            Action::Queue("queue while busy".to_string())
+            Action::Queue(prompt("queue while busy"))
         );
         assert!(view.editor.is_empty());
 
@@ -3698,8 +4155,8 @@ mod tests {
     #[test]
     fn queued_follow_up_can_be_pulled_back_ahead_of_the_current_draft() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.queue_follow_up("first queued".to_string());
-        view.queue_follow_up("second queued".to_string());
+        view.queue_follow_up(prompt("first queued"));
+        view.queue_follow_up(prompt("second queued"));
         view.editor.set_text("current draft");
 
         assert_eq!(
@@ -3732,7 +4189,7 @@ mod tests {
         let id = handle
             .steer(crate::input::UserInput::text("change direction"))
             .unwrap();
-        view.add_pending_steer(id, "change direction".to_string());
+        view.add_pending_steer(id, prompt("change direction"));
 
         let height = view.desired_height(88, 30);
         let backend = TestBackend::new(88, height);
@@ -3746,7 +4203,7 @@ mod tests {
         assert!(rendered.contains("change direction"), "{rendered}");
         assert_eq!(view.pending_input.steer_count(), 1);
         assert!(!view.entries.iter().any(
-            |entry| matches!(entry, TranscriptEntry::User(prompt) if prompt == "change direction")
+            |entry| matches!(entry, TranscriptEntry::User(prompt) if prompt.as_str() == "change direction")
         ));
         let tiny_backend = TestBackend::new(2, 1);
         let mut tiny_terminal = Terminal::new(tiny_backend).unwrap();
@@ -3756,7 +4213,7 @@ mod tests {
 
         assert_eq!(view.pending_input.steer_count(), 0);
         assert!(view.entries.iter().any(
-            |entry| matches!(entry, TranscriptEntry::User(prompt) if prompt == "change direction")
+            |entry| matches!(entry, TranscriptEntry::User(prompt) if prompt.as_str() == "change direction")
         ));
     }
 
@@ -3767,8 +4224,8 @@ mod tests {
         let id = handle
             .steer(crate::input::UserInput::text("pending steer"))
             .unwrap();
-        view.add_pending_steer(id, "pending steer".to_string());
-        view.queue_follow_up("queued follow-up".to_string());
+        view.add_pending_steer(id, prompt("pending steer"));
+        view.queue_follow_up(prompt("queued follow-up"));
         view.editor.set_text("current draft");
 
         view.restore_pending_input_to_composer();
@@ -4164,7 +4621,7 @@ mod tests {
     #[test]
     fn user_message_and_composer_share_codex_background() {
         let style = user_message_style_for(Some((31, 31, 31)));
-        let lines = user_message_lines("test", 40, style);
+        let lines = user_message_lines(&prompt("test"), 40, style);
         assert_eq!(lines.len(), 3);
         assert_eq!(plain(&lines[1]), "› test");
         assert_eq!(lines[0].style.bg, style.bg);
@@ -4441,6 +4898,173 @@ mod tests {
     }
 
     #[test]
+    fn large_deleted_files_render_a_bounded_explicit_preview() {
+        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(u64::try_from(MAX_PATCH_PREVIEW_SOURCE_BYTES).unwrap() + 1)
+            .unwrap();
+
+        let patch = PatchDisplay::parse(
+            "*** Begin Patch\n*** Delete File: large.txt\n*** End Patch",
+            &root,
+        );
+        let rendered = patch
+            .display_lines(
+                Some(&ToolOutcome {
+                    output: Ok(json!("Done!")),
+                }),
+                80,
+                user_message_style_for(Some((31, 31, 31))),
+            )
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            rendered.contains("• Deleted large.txt (+0 -?)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("deleted-file preview omitted (2097153 bytes)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn large_updated_files_mark_patch_relative_line_numbers() {
+        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(u64::try_from(MAX_PATCH_PREVIEW_SOURCE_BYTES).unwrap() + 1)
+            .unwrap();
+
+        let patch = PatchDisplay::parse(
+            "*** Begin Patch\n*** Update File: large.txt\n@@\n-old\n+new\n*** End Patch",
+            &root,
+        );
+        let rendered = patch
+            .display_lines(
+                Some(&ToolOutcome {
+                    output: Ok(json!("Done!")),
+                }),
+                100,
+                user_message_style_for(Some((31, 31, 31))),
+            )
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            rendered.contains(
+                "source preview omitted (2097153 bytes); line numbers are patch-relative"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn updated_file_reads_share_one_global_preview_budget() {
+        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file_bytes = MAX_PATCH_PREVIEW_SOURCE_BYTES / 2 + 1;
+        for path in [root.join("first.txt"), root.join("second.txt")] {
+            let file = std::fs::File::create(path).unwrap();
+            file.set_len(u64::try_from(file_bytes).unwrap()).unwrap();
+        }
+
+        let patch = PatchDisplay::parse(
+            "*** Begin Patch\n*** Update File: first.txt\n@@\n-old\n+new\n*** Update File: second.txt\n@@\n-old\n+new\n*** End Patch",
+            &root,
+        );
+        let rendered = patch
+            .display_lines(
+                Some(&ToolOutcome {
+                    output: Ok(json!("Done!")),
+                }),
+                100,
+                user_message_style_for(Some((31, 31, 31))),
+            )
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(rendered.matches("source preview omitted").count(), 1);
+        assert!(
+            rendered.contains(&format!("source preview omitted ({file_bytes} bytes)")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn deleted_file_preview_caps_rows_without_losing_the_line_count() {
+        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let total_rows = MAX_PATCH_PREVIEW_ROWS + 5;
+        std::fs::write(
+            root.join("many-lines.txt"),
+            (1..=total_rows)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let patch = PatchDisplay::parse(
+            "*** Begin Patch\n*** Delete File: many-lines.txt\n*** End Patch",
+            &root,
+        );
+        let lines = patch.display_lines(
+            Some(&ToolOutcome {
+                output: Ok(json!("Done!")),
+            }),
+            80,
+            user_message_style_for(Some((31, 31, 31))),
+        );
+        let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(patch.files[0].rows.len(), MAX_PATCH_PREVIEW_ROWS);
+        assert!(
+            rendered.contains(&format!("(+0 -{total_rows})")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("… 5 diff rows omitted …"), "{rendered}");
+    }
+
+    #[test]
+    fn generated_patch_rows_are_bounded_before_rendering() {
+        let long_line = "x".repeat(MAX_PATCH_PREVIEW_ROW_BYTES * 2);
+        let patch = PatchDisplay::parse(
+            &format!("*** Begin Patch\n*** Add File: long.txt\n+{long_line}\n*** End Patch"),
+            Path::new("/tmp"),
+        );
+        let rendered = patch
+            .display_lines(
+                Some(&ToolOutcome {
+                    output: Ok(json!("Done!")),
+                }),
+                80,
+                user_message_style_for(Some((31, 31, 31))),
+            )
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains('…'), "{rendered}");
+        assert!(rendered.len() < long_line.len());
+    }
+
+    #[test]
     fn composer_supports_multiline_editing_and_submission() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         for character in "first".chars() {
@@ -4467,7 +5091,7 @@ mod tests {
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             ))),
-            Action::Submit("first\nsecond".to_string())
+            Action::Submit(prompt("first\nsecond"))
         );
     }
 
@@ -4506,7 +5130,7 @@ mod tests {
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             ))),
-            Action::Submit(paste)
+            Action::Submit(prompt(paste))
         );
         assert!(view.editor.is_empty());
     }

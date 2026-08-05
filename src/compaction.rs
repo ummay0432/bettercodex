@@ -19,11 +19,32 @@ pub(crate) enum CompactionPhase {
     MidTurn,
 }
 
-impl CompactionPhase {
-    pub(crate) fn as_str(self) -> &'static str {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactionRequest {
+    Automatic(CompactionPhase),
+    Manual,
+}
+
+impl CompactionRequest {
+    pub(crate) fn trigger(self) -> &'static str {
         match self {
-            Self::PreTurn => "pre_turn",
-            Self::MidTurn => "mid_turn",
+            Self::Automatic(_) => "auto",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Automatic(_) => "context_limit",
+            Self::Manual => "user_requested",
+        }
+    }
+
+    pub(crate) fn phase(self) -> &'static str {
+        match self {
+            Self::Automatic(CompactionPhase::PreTurn) => "pre_turn",
+            Self::Automatic(CompactionPhase::MidTurn) => "mid_turn",
+            Self::Manual => "standalone_turn",
         }
     }
 }

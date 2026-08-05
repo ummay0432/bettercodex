@@ -1,3 +1,4 @@
+use crate::skills::SkillSelection;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -11,6 +12,65 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 const MAX_TOTAL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UserPrompt {
+    text: String,
+    skills: Vec<SkillSelection>,
+}
+
+impl UserPrompt {
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            skills: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_skills(text: impl Into<String>, skills: Vec<SkillSelection>) -> Self {
+        Self {
+            text: text.into(),
+            skills,
+        }
+    }
+
+    pub(crate) fn joined(prompts: Vec<Self>) -> Self {
+        let mut text = String::new();
+        let mut skills = Vec::new();
+        for prompt in prompts {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&prompt.text);
+            skills.extend(prompt.skills);
+        }
+        Self { text, skills }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn skills(&self) -> &[SkillSelection] {
+        &self.skills
+    }
+
+    pub(crate) fn into_parts(self) -> (String, Vec<SkillSelection>) {
+        (self.text, self.skills)
+    }
+}
+
+impl From<&str> for UserPrompt {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<String> for UserPrompt {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ImageDetail {
@@ -58,6 +118,7 @@ impl FromStr for ImageDetail {
 pub(crate) struct UserInput {
     text: String,
     images: Vec<Value>,
+    selected_skills: Vec<SkillSelection>,
 }
 
 impl UserInput {
@@ -65,6 +126,16 @@ impl UserInput {
         Self {
             text: text.into(),
             images: Vec::new(),
+            selected_skills: Vec::new(),
+        }
+    }
+
+    pub(crate) fn prompt(prompt: UserPrompt) -> Self {
+        let (text, selected_skills) = prompt.into_parts();
+        Self {
+            text,
+            images: Vec::new(),
+            selected_skills,
         }
     }
 
@@ -98,6 +169,7 @@ impl UserInput {
         let input = Self {
             text: text.into(),
             images,
+            selected_skills: Vec::new(),
         };
         if input.is_empty() {
             return Err(anyhow!("prompt and image list are both empty"));
@@ -109,17 +181,21 @@ impl UserInput {
         self.text.trim().is_empty() && self.images.is_empty()
     }
 
-    pub(crate) fn into_message(self) -> Value {
+    pub(crate) fn into_message_and_skills(self) -> (Value, String, Vec<SkillSelection>) {
         let mut content = Vec::with_capacity(self.images.len() + 1);
         if !self.text.trim().is_empty() {
-            content.push(json!({"type": "input_text", "text": self.text}));
+            content.push(json!({"type": "input_text", "text": &self.text}));
         }
         content.extend(self.images);
-        json!({
-            "type": "message",
-            "role": "user",
-            "content": content,
-        })
+        (
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": content,
+            }),
+            self.text,
+            self.selected_skills,
+        )
     }
 }
 
@@ -158,7 +234,7 @@ mod tests {
     #[test]
     fn text_input_uses_the_responses_message_shape() {
         assert_eq!(
-            UserInput::text("inspect").into_message(),
+            UserInput::text("inspect").into_message_and_skills().0,
             json!({
                 "type": "message",
                 "role": "user",
@@ -178,7 +254,8 @@ mod tests {
 
         let message = UserInput::from_paths("", std::slice::from_ref(&path), ImageDetail::High)
             .unwrap()
-            .into_message();
+            .into_message_and_skills()
+            .0;
         assert_eq!(message["role"], "user");
         assert_eq!(message["content"][0]["type"], "input_image");
         assert_eq!(message["content"][0]["detail"], "high");

@@ -1,4 +1,5 @@
 use crate::events::SteerId;
+use crate::input::UserPrompt;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use std::collections::VecDeque;
@@ -9,34 +10,34 @@ const MAX_PREVIEW_CHARS: usize = 240;
 #[derive(Debug)]
 struct PendingSteer {
     id: SteerId,
-    prompt: String,
+    prompt: UserPrompt,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct PendingInput {
     steers: VecDeque<PendingSteer>,
-    follow_ups: VecDeque<String>,
+    follow_ups: VecDeque<UserPrompt>,
 }
 
 impl PendingInput {
-    pub(super) fn add_steer(&mut self, id: SteerId, prompt: String) {
+    pub(super) fn add_steer(&mut self, id: SteerId, prompt: UserPrompt) {
         self.steers.push_back(PendingSteer { id, prompt });
     }
 
-    pub(super) fn commit_steer(&mut self, id: SteerId) -> Option<String> {
+    pub(super) fn commit_steer(&mut self, id: SteerId) -> Option<UserPrompt> {
         let index = self.steers.iter().position(|steer| steer.id == id)?;
         self.steers.remove(index).map(|steer| steer.prompt)
     }
 
-    pub(super) fn queue_follow_up(&mut self, prompt: String) {
+    pub(super) fn queue_follow_up(&mut self, prompt: UserPrompt) {
         self.follow_ups.push_back(prompt);
     }
 
-    pub(super) fn pop_next_follow_up(&mut self) -> Option<String> {
+    pub(super) fn pop_next_follow_up(&mut self) -> Option<UserPrompt> {
         self.follow_ups.pop_front()
     }
 
-    pub(super) fn pop_latest_follow_up(&mut self) -> Option<String> {
+    pub(super) fn pop_latest_follow_up(&mut self) -> Option<UserPrompt> {
         self.follow_ups.pop_back()
     }
 
@@ -56,11 +57,11 @@ impl PendingInput {
         self.follow_ups.len()
     }
 
-    pub(super) fn take_steers(&mut self) -> Vec<String> {
+    pub(super) fn take_steers(&mut self) -> Vec<UserPrompt> {
         self.steers.drain(..).map(|steer| steer.prompt).collect()
     }
 
-    pub(super) fn take_all(&mut self) -> Vec<String> {
+    pub(super) fn take_all(&mut self) -> Vec<UserPrompt> {
         let mut prompts = self.take_steers();
         prompts.extend(self.follow_ups.drain(..));
         prompts
@@ -96,7 +97,7 @@ impl PendingInput {
             ]));
             append_messages(
                 &mut lines,
-                self.follow_ups.iter().map(String::as_str),
+                self.follow_ups.iter().map(UserPrompt::as_str),
                 self.follow_ups.len(),
                 true,
             );
