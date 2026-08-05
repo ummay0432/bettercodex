@@ -466,28 +466,32 @@ impl Agent {
             }
             let (completed_tx, mut completed_rx) = unbounded_channel::<Value>();
             let mut observed_item = false;
-            let wait = {
+            let (history, cursor) = self.conversation.take_history_for_sampling();
+            let mut request = self.api.build_sampling_request(history, cursor);
+            let wait: Result<SamplingWait> = {
                 let api = &mut self.api;
                 let conversation = &mut self.conversation;
-                // Keep one stable snapshot while completed stream items are journaled into the
-                // live conversation. The API consumes this allocation through request assembly.
-                let history = conversation.items().to_vec();
                 let response = async {
                     match events {
-                        Some(events) => api.respond_streaming(history, &completed_tx, events).await,
-                        None => api.respond(history, &completed_tx).await,
+                        Some(events) => {
+                            api.respond_sampling_streaming(&mut request, &completed_tx, events)
+                                .await
+                        }
+                        None => api.respond_sampling(&mut request, &completed_tx).await,
                     }
                 };
                 tokio::pin!(response);
                 let mut completed_closed = false;
                 loop {
                     tokio::select! {
-                        result = &mut response => break SamplingWait::Finished(result),
-                        _ = control.cancellation.cancelled() => break SamplingWait::Cancelled,
+                        result = &mut response => break Ok(SamplingWait::Finished(result)),
+                        _ = control.cancellation.cancelled() => break Ok(SamplingWait::Cancelled),
                         item = completed_rx.recv(), if !completed_closed => {
                             match item {
                                 Some(item) => {
-                                    conversation.extend([item])?;
+                                    if let Err(error) = conversation.extend([item]) {
+                                        break Err(error);
+                                    }
                                     observed_item = true;
                                 }
                                 None => completed_closed = true,
@@ -496,9 +500,24 @@ impl Agent {
                     }
                 }
             };
-            while let Ok(item) = completed_rx.try_recv() {
-                self.conversation.extend([item])?;
-                observed_item = true;
+            let mut trailing_error = None;
+            while wait.is_ok()
+                && let Ok(item) = completed_rx.try_recv()
+            {
+                match self.conversation.extend([item]) {
+                    Ok(()) => observed_item = true,
+                    Err(error) => {
+                        trailing_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            let (history, cursor) = request.into_history()?;
+            self.conversation
+                .restore_history_after_sampling(history, cursor)?;
+            let wait = wait?;
+            if let Some(error) = trailing_error {
+                return Err(error);
             }
 
             match wait {
@@ -555,8 +574,11 @@ impl Agent {
         }
         emit(events, AgentEvent::CompactionStarted);
         self.conversation.normalize()?;
+        let history_cursor = self.conversation.history_cursor();
         let compacted = {
-            let request = self.api.compact(self.conversation.items(), compaction);
+            let request =
+                self.api
+                    .compact_append_only(self.conversation.items(), history_cursor, compaction);
             tokio::pin!(request);
             tokio::select! {
                 biased;

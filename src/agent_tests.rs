@@ -101,6 +101,75 @@ async fn steering_waits_for_the_response_boundary_and_enters_the_next_request() 
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn websocket_sampling_moves_history_and_sends_only_the_append_only_delta() {
+    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut websocket = accept_websocket(&listener).await;
+        let warmup = read_websocket_request(&mut websocket).await.unwrap();
+        assert_eq!(warmup["generate"], false);
+        send_websocket_completion(&mut websocket, "resp_warm", &[]).await;
+
+        let first = read_websocket_request(&mut websocket).await.unwrap();
+        assert_eq!(first["previous_response_id"], "resp_warm");
+        assert!(first.to_string().contains("retained before sampling"));
+        assert!(first.to_string().contains("first prompt"));
+        send_websocket_text_response(&mut websocket, "resp_first", "first answer").await;
+
+        let second = read_websocket_request(&mut websocket).await.unwrap();
+        assert_eq!(second["previous_response_id"], "resp_first");
+        assert_eq!(
+            second["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "second prompt"}],
+            }])
+        );
+        send_websocket_text_response(&mut websocket, "resp_second", "second answer").await;
+    });
+
+    let (root, mut agent) = test_websocket_agent(&format!("http://{address}"));
+    let retained = UserInput::text(format!(
+        "retained before sampling {}",
+        "x".repeat(64 * 1024)
+    ))
+    .into_message_and_skills()
+    .0;
+    let retained_text = retained
+        .pointer("/content/0/text")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    let retained_allocation = retained_text.as_ptr();
+    let retained_text = retained_text.to_string();
+    agent.conversation.extend([retained]).unwrap();
+
+    assert_eq!(agent.submit("first prompt").await.unwrap(), "first answer");
+    assert_eq!(
+        agent.submit("second prompt").await.unwrap(),
+        "second answer"
+    );
+    server.await.unwrap();
+
+    let restored = agent
+        .conversation
+        .items()
+        .iter()
+        .filter_map(|item| item.pointer("/content/0/text").and_then(Value::as_str))
+        .find(|text| *text == retained_text)
+        .expect("retained message after both sampling requests");
+    assert_eq!(
+        restored.as_ptr(),
+        retained_allocation,
+        "sampling must restore the original message allocation instead of a deep clone"
+    );
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steering_compacts_before_an_instruction_boundary_restores_omitted_reasoning() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

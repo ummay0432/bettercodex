@@ -100,12 +100,33 @@ pub(crate) struct ContextSnapshot {
 
 pub(crate) struct Conversation {
     history: Vec<Value>,
+    history_lineage: Uuid,
     context_metrics: ContextMetrics,
     usage: Option<TokenUsage>,
     usage_history_estimate: Option<u64>,
     server_reasoning_included: bool,
     rollout: Rollout,
     world_state: WorldState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryCursor {
+    lineage: Uuid,
+    len: usize,
+}
+
+impl HistoryCursor {
+    pub(crate) fn len(self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn includes_response_after(self, previous: Self, response_items: usize) -> bool {
+        self.lineage == previous.lineage
+            && previous
+                .len
+                .checked_add(response_items)
+                .is_some_and(|minimum_len| self.len >= minimum_len)
+    }
 }
 
 #[derive(Clone)]
@@ -136,6 +157,7 @@ impl Conversation {
         let context_metrics = ContextMetrics::from_history(&history, &world_state);
         Ok(Self {
             history,
+            history_lineage: Uuid::new_v4(),
             context_metrics,
             usage: None,
             usage_history_estimate: None,
@@ -159,6 +181,7 @@ impl Conversation {
         let context_metrics = ContextMetrics::from_history(&history, &world_state);
         let mut conversation = Self {
             history,
+            history_lineage: Uuid::new_v4(),
             context_metrics,
             usage,
             usage_history_estimate,
@@ -212,6 +235,7 @@ impl Conversation {
             .replace_compacted_history(&history, response_usage.as_ref())?;
         self.context_metrics = ContextMetrics::from_history(&history, &self.world_state);
         self.history = history;
+        self.history_lineage = Uuid::new_v4();
         self.usage = None;
         self.usage_history_estimate = None;
         self.server_reasoning_included = false;
@@ -220,6 +244,31 @@ impl Conversation {
 
     pub(crate) fn items(&self) -> &[Value] {
         &self.history
+    }
+
+    pub(crate) fn history_cursor(&self) -> HistoryCursor {
+        HistoryCursor {
+            lineage: self.history_lineage,
+            len: self.history.len(),
+        }
+    }
+
+    pub(crate) fn take_history_for_sampling(&mut self) -> (Vec<Value>, HistoryCursor) {
+        let cursor = self.history_cursor();
+        (std::mem::take(&mut self.history), cursor)
+    }
+
+    pub(crate) fn restore_history_after_sampling(
+        &mut self,
+        mut history: Vec<Value>,
+        cursor: HistoryCursor,
+    ) -> Result<()> {
+        if self.history_lineage != cursor.lineage || history.len() != cursor.len {
+            anyhow::bail!("conversation changed while its sampling history was in flight");
+        }
+        history.append(&mut self.history);
+        self.history = history;
+        Ok(())
     }
 
     pub(crate) fn prompt_history(&self) -> Vec<String> {
@@ -394,6 +443,7 @@ impl Conversation {
             .replace_history(&normalized, HistoryReplacement::Normalization)?;
         self.context_metrics = ContextMetrics::from_history(&normalized, &self.world_state);
         self.history = normalized;
+        self.history_lineage = Uuid::new_v4();
         Ok(true)
     }
 
@@ -438,6 +488,7 @@ impl Conversation {
             .replace_history(&refreshed, HistoryReplacement::ContextRefresh)?;
         self.context_metrics = ContextMetrics::from_history(&refreshed, &world_state);
         self.history = refreshed;
+        self.history_lineage = Uuid::new_v4();
         self.world_state = world_state;
         Ok(())
     }

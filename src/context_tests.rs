@@ -743,6 +743,52 @@ fn cached_context_metrics_follow_every_history_mutation() {
 }
 
 #[test]
+fn sampling_history_cursor_tracks_appends_and_rejects_rewrites() {
+    let (root, cwd) = temporary_repository("sampling-history-cursor");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    conversation
+        .extend([UserInput::text("first").into_message_and_skills().0])
+        .unwrap();
+
+    let (history, first) = conversation.take_history_for_sampling();
+    assert!(conversation.items().is_empty());
+    conversation
+        .extend([message("assistant", "response".to_string())])
+        .unwrap();
+    conversation
+        .restore_history_after_sampling(history, first)
+        .unwrap();
+    assert_eq!(conversation.prompt_history(), ["first"]);
+
+    let (history, appended) = conversation.take_history_for_sampling();
+    assert!(appended.includes_response_after(first, 1));
+    conversation
+        .restore_history_after_sampling(history, appended)
+        .unwrap();
+
+    conversation
+        .replace_compacted(
+            vec![json!({
+                "type": "compaction_summary",
+                "id": "cmp_cursor",
+                "encrypted_content": "opaque",
+            })],
+            InitialContextInjection::AfterCompaction,
+            None,
+        )
+        .unwrap();
+    let (history, rewritten) = conversation.take_history_for_sampling();
+    assert!(!rewritten.includes_response_after(appended, 0));
+    conversation
+        .restore_history_after_sampling(history, rewritten)
+        .unwrap();
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[ignore = "manual performance measurement"]
 fn benchmark_repeated_context_snapshots() {
     let (root, cwd) = temporary_repository("snapshot-benchmark");

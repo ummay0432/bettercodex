@@ -5,6 +5,7 @@ use crate::auth::SharedAuth;
 use crate::compaction;
 use crate::compaction::CompactionRequest;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
+use crate::context::HistoryCursor;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::rollout::SessionIdentity;
@@ -174,11 +175,37 @@ pub(crate) struct ApiClient {
     stream_idle_timeout: Duration,
 }
 
-#[derive(Clone)]
 struct WebSocketBaseline {
-    request: Value,
+    properties: Map<String, Value>,
+    input: WebSocketBaselineInput,
     response_id: String,
-    output: Vec<Value>,
+}
+
+enum WebSocketBaselineInput {
+    Exact {
+        request: Vec<Value>,
+        output: Vec<Value>,
+    },
+    AppendOnly {
+        cursor: HistoryCursor,
+        request_len: usize,
+        response_items: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum RequestInputIdentity {
+    Exact,
+    AppendOnly {
+        cursor: HistoryCursor,
+        trailing_items: usize,
+    },
+}
+
+pub(crate) struct SamplingRequest {
+    request: Value,
+    cursor: HistoryCursor,
+    input_restoration: SamplingInputRestoration,
 }
 
 struct WebSocketRequestRestoration {
@@ -227,6 +254,152 @@ impl WebSocketRequestRestoration {
             object.insert("input".to_string(), Value::Array(input_prefix));
         }
         Ok(())
+    }
+}
+
+struct WebSocketRequestGuard<'a> {
+    request: &'a mut Value,
+    restoration: Option<WebSocketRequestRestoration>,
+}
+
+impl<'a> WebSocketRequestGuard<'a> {
+    fn new(request: &'a mut Value, restoration: WebSocketRequestRestoration) -> Self {
+        Self {
+            request,
+            restoration: Some(restoration),
+        }
+    }
+
+    fn request(&self) -> &Value {
+        self.request
+    }
+
+    fn restore(mut self) -> ApiResult<()> {
+        self.restore_inner()
+    }
+
+    fn restore_inner(&mut self) -> ApiResult<()> {
+        let Some(restoration) = self.restoration.take() else {
+            return Ok(());
+        };
+        restoration.restore(self.request)
+    }
+}
+
+impl Drop for WebSocketRequestGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore_inner();
+    }
+}
+
+struct SamplingInputRestoration {
+    inserted_tools: bool,
+    system_prompt: SamplingSystemPrompt,
+}
+
+enum SamplingSystemPrompt {
+    Inserted,
+    Existing,
+    Marked {
+        index: usize,
+        previous_breakpoint: Option<Value>,
+    },
+}
+
+impl WebSocketBaseline {
+    fn new(
+        request: &Value,
+        response: &ModelResponse,
+        input_identity: RequestInputIdentity,
+    ) -> ApiResult<Self> {
+        let request_input = request
+            .get("input")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
+        let input = match input_identity {
+            RequestInputIdentity::AppendOnly {
+                cursor,
+                trailing_items: 0,
+            } => WebSocketBaselineInput::AppendOnly {
+                cursor,
+                request_len: request_input.len(),
+                response_items: response.items.len(),
+            },
+            RequestInputIdentity::Exact | RequestInputIdentity::AppendOnly { .. } => {
+                WebSocketBaselineInput::Exact {
+                    request: request_input.clone(),
+                    output: response.items.clone(),
+                }
+            }
+        };
+        Ok(Self {
+            properties: reusable_request_properties(request)?,
+            input,
+            response_id: response.response_id.clone(),
+        })
+    }
+}
+
+impl SamplingRequest {
+    pub(crate) fn into_history(mut self) -> ApiResult<(Vec<Value>, HistoryCursor)> {
+        let input = self
+            .request
+            .as_object_mut()
+            .and_then(|request| request.remove("input"))
+            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
+        let Value::Array(input) = input else {
+            return Err(ApiError::fatal("Responses request input was not an array"));
+        };
+        Ok((self.input_restoration.restore(input)?, self.cursor))
+    }
+}
+
+impl SamplingInputRestoration {
+    fn restore(self, mut input: Vec<Value>) -> ApiResult<Vec<Value>> {
+        match self.system_prompt {
+            SamplingSystemPrompt::Inserted => {
+                if !input.get(1).is_some_and(is_system_prompt_item) {
+                    return Err(ApiError::fatal(
+                        "sampling request lost its inserted system prompt",
+                    ));
+                }
+                input.remove(1);
+            }
+            SamplingSystemPrompt::Existing => {}
+            SamplingSystemPrompt::Marked {
+                index,
+                previous_breakpoint,
+            } => {
+                let content = input
+                    .get_mut(index)
+                    .and_then(|item| item.pointer_mut("/content/0"))
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        ApiError::fatal("sampling request lost its marked system prompt")
+                    })?;
+                match previous_breakpoint {
+                    Some(breakpoint) => {
+                        content.insert("prompt_cache_breakpoint".to_string(), breakpoint);
+                    }
+                    None => {
+                        content.remove("prompt_cache_breakpoint");
+                    }
+                }
+            }
+        }
+        if self.inserted_tools {
+            let expected = &context_prefix_items()[0];
+            if !input
+                .first()
+                .is_some_and(|item| is_additional_tools_item(item, expected))
+            {
+                return Err(ApiError::fatal(
+                    "sampling request lost its inserted tool catalogue",
+                ));
+            }
+            input.remove(0);
+        }
+        Ok(input)
     }
 }
 
@@ -346,37 +519,54 @@ impl ApiClient {
         true
     }
 
-    pub(crate) async fn respond(
+    pub(crate) async fn respond_sampling(
         &mut self,
-        history: Vec<Value>,
+        request: &mut SamplingRequest,
         completed_items: &UnboundedSender<Value>,
     ) -> ApiResult<ModelResponse> {
-        self.respond_with_events(history, completed_items, None, RequestKind::Turn)
+        self.respond_sampling_with_events(request, completed_items, None)
             .await
     }
 
-    pub(crate) async fn respond_streaming(
+    pub(crate) async fn respond_sampling_streaming(
         &mut self,
-        history: Vec<Value>,
+        request: &mut SamplingRequest,
         completed_items: &UnboundedSender<Value>,
         events: &UnboundedSender<AgentEvent>,
     ) -> ApiResult<ModelResponse> {
-        self.respond_with_events(history, completed_items, Some(events), RequestKind::Turn)
+        self.respond_sampling_with_events(request, completed_items, Some(events))
             .await
     }
 
-    async fn respond_with_events(
+    async fn respond_sampling_with_events(
         &mut self,
-        history: Vec<Value>,
+        request: &mut SamplingRequest,
+        completed_items: &UnboundedSender<Value>,
+        events: Option<&UnboundedSender<AgentEvent>>,
+    ) -> ApiResult<ModelResponse> {
+        self.respond_request_with_events(
+            &mut request.request,
+            completed_items,
+            events,
+            RequestKind::Turn,
+            RequestInputIdentity::AppendOnly {
+                cursor: request.cursor,
+                trailing_items: 0,
+            },
+        )
+        .await
+    }
+
+    async fn respond_request_with_events(
+        &mut self,
+        request: &mut Value,
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
         request_kind: RequestKind,
+        input_identity: RequestInputIdentity,
     ) -> ApiResult<ModelResponse> {
         let mut refreshed_websocket_auth = false;
         let mut retried_full_websocket_request = false;
-        // Build once from the owned sampling snapshot. Retries mutate only transport fields, and
-        // a successful WebSocket response moves this request into the next delta baseline.
-        let mut request = self.build_request(history, request_kind);
         if self.prefer_websocket && !self.websocket_prewarm_attempted {
             self.websocket_prewarm_attempted = true;
             match self.prewarm_websocket().await {
@@ -392,7 +582,7 @@ impl ApiClient {
                 Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
                     if self.explicit_cache {
                         self.disable_explicit_cache();
-                        disable_explicit_cache_for_request(&mut request)?;
+                        disable_explicit_cache_for_request(request)?;
                     }
                 }
                 Err(error) if error.kind == ApiErrorKind::WebSocketUnavailable => {
@@ -414,20 +604,18 @@ impl ApiClient {
             if self.prefer_websocket {
                 match self
                     .respond_websocket(
-                        &mut request,
+                        request,
                         completed_items,
                         events,
                         request_kind,
                         WebSocketRequestMode::Inference,
+                        input_identity,
                     )
                     .await
                 {
                     Ok(response) => {
-                        self.websocket_baseline = Some(WebSocketBaseline {
-                            request,
-                            response_id: response.response_id.clone(),
-                            output: response.items.clone(),
-                        });
+                        self.websocket_baseline =
+                            Some(WebSocketBaseline::new(request, &response, input_identity)?);
                         return Ok(response);
                     }
                     Err(error)
@@ -453,7 +641,7 @@ impl ApiClient {
                     Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
                         if self.explicit_cache {
                             self.disable_explicit_cache();
-                            disable_explicit_cache_for_request(&mut request)?;
+                            disable_explicit_cache_for_request(request)?;
                             continue;
                         }
                         return Err(error);
@@ -474,13 +662,13 @@ impl ApiClient {
             }
 
             match self
-                .respond_http(&request, completed_items, events, request_kind)
+                .respond_http(request, completed_items, events, request_kind)
                 .await
             {
                 Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
                     if self.explicit_cache {
                         self.disable_explicit_cache();
-                        disable_explicit_cache_for_request(&mut request)?;
+                        disable_explicit_cache_for_request(request)?;
                     } else {
                         return Err(error);
                     }
@@ -520,13 +708,14 @@ impl ApiClient {
                 None,
                 RequestKind::Prewarm,
                 WebSocketRequestMode::Warmup,
+                RequestInputIdentity::Exact,
             )
             .await?;
-        self.websocket_baseline = Some(WebSocketBaseline {
-            request,
-            response_id: response.response_id,
-            output: response.items,
-        });
+        self.websocket_baseline = Some(WebSocketBaseline::new(
+            &request,
+            &response,
+            RequestInputIdentity::Exact,
+        )?);
         Ok(())
     }
 
@@ -537,6 +726,7 @@ impl ApiClient {
         events: Option<&UnboundedSender<AgentEvent>>,
         request_kind: RequestKind,
         mode: WebSocketRequestMode,
+        input_identity: RequestInputIdentity,
     ) -> ApiResult<ModelResponse> {
         self.ensure_websocket(request_kind).await?;
         let idle_timeout = match mode {
@@ -547,14 +737,15 @@ impl ApiClient {
         };
         // Serialize a delta in place, then restore the logical request for retries and baseline
         // retention. Input values move between vectors instead of being deep-cloned.
-        let restoration = self.prepare_websocket_request(logical_request, mode)?;
+        let restoration = self.prepare_websocket_request(logical_request, mode, input_identity)?;
+        let guard = WebSocketRequestGuard::new(logical_request, restoration);
         let send_result = self
             .websocket
             .as_mut()
             .ok_or_else(|| ApiError::websocket_unavailable("Responses WebSocket is unavailable"))?
-            .send(logical_request, idle_timeout)
+            .send(guard.request(), idle_timeout)
             .await;
-        restoration.restore(logical_request)?;
+        guard.restore()?;
         send_result?;
 
         let mut collected = CollectedResponse::default();
@@ -610,35 +801,64 @@ impl ApiClient {
         &self,
         request: &mut Value,
         mode: WebSocketRequestMode,
+        input_identity: RequestInputIdentity,
     ) -> ApiResult<WebSocketRequestRestoration> {
         let incremental = match mode {
             WebSocketRequestMode::Warmup => None,
             WebSocketRequestMode::Inference => {
                 if let Some(baseline) = &self.websocket_baseline {
-                    if !request_properties_match(&baseline.request, request) {
+                    if !request_properties_match(&baseline.properties, request) {
                         None
                     } else {
-                        let previous_input = baseline
-                            .request
-                            .get("input")
-                            .and_then(Value::as_array)
-                            .ok_or_else(|| {
-                                ApiError::fatal("previous Responses request omitted input")
-                            })?;
                         let current_input = request
                             .get("input")
                             .and_then(Value::as_array)
                             .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
-                        let baseline_length =
-                            previous_input.len().saturating_add(baseline.output.len());
-                        if current_input.len() < baseline_length {
-                            None
-                        } else {
-                            let expected = previous_input.iter().chain(&baseline.output);
-                            expected
-                                .zip(current_input.iter().take(baseline_length))
-                                .all(|(previous, current)| previous == current)
+                        match &baseline.input {
+                            WebSocketBaselineInput::Exact {
+                                request: previous_input,
+                                output,
+                            } => {
+                                let baseline_length =
+                                    previous_input.len().saturating_add(output.len());
+                                let expected = previous_input.iter().chain(output);
+                                (current_input.len() >= baseline_length
+                                    && expected
+                                        .zip(current_input.iter().take(baseline_length))
+                                        .all(|(previous, current)| previous == current))
                                 .then(|| (baseline.response_id.clone(), baseline_length))
+                            }
+                            WebSocketBaselineInput::AppendOnly {
+                                cursor: previous_cursor,
+                                request_len,
+                                response_items,
+                            } => match input_identity {
+                                RequestInputIdentity::AppendOnly {
+                                    cursor,
+                                    trailing_items,
+                                } => {
+                                    let baseline_length = request_len.checked_add(*response_items);
+                                    let appended_items = previous_cursor
+                                        .len()
+                                        .checked_add(*response_items)
+                                        .and_then(|minimum_len| {
+                                            cursor.len().checked_sub(minimum_len)
+                                        });
+                                    let expected_len = baseline_length
+                                        .and_then(|len| len.checked_add(appended_items?))
+                                        .and_then(|len| len.checked_add(trailing_items));
+                                    (cursor
+                                        .includes_response_after(*previous_cursor, *response_items)
+                                        && expected_len == Some(current_input.len()))
+                                    .then(|| {
+                                        (
+                                            baseline.response_id.clone(),
+                                            baseline_length.expect("expected length was validated"),
+                                        )
+                                    })
+                                }
+                                RequestInputIdentity::Exact => None,
+                            },
                         }
                     }
                 } else {
@@ -701,10 +921,28 @@ impl ApiClient {
         })
     }
 
-    pub(crate) async fn compact(
+    pub(crate) async fn compact_append_only(
+        &mut self,
+        history: &[Value],
+        cursor: HistoryCursor,
+        compaction: CompactionRequest,
+    ) -> ApiResult<CompactionResult> {
+        self.compact_with_identity(
+            history,
+            compaction,
+            RequestInputIdentity::AppendOnly {
+                cursor,
+                trailing_items: 1,
+            },
+        )
+        .await
+    }
+
+    async fn compact_with_identity(
         &mut self,
         history: &[Value],
         compaction: CompactionRequest,
+        mut input_identity: RequestInputIdentity,
     ) -> ApiResult<CompactionResult> {
         if history.is_empty() {
             return Ok(CompactionResult {
@@ -719,22 +957,27 @@ impl ApiClient {
             .saturating_sub(estimated_tokens(history))
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
         let mut prompt_history = history.to_vec();
-        compaction::trim_tool_outputs_to_fit(
+        let rewritten_outputs = compaction::trim_tool_outputs_to_fit(
             &mut prompt_history,
             EFFECTIVE_CONTEXT_WINDOW.saturating_sub(prefix_tokens),
         );
+        if rewritten_outputs > 0 {
+            input_identity = RequestInputIdentity::Exact;
+        }
         let mut request_history = prompt_history.clone();
         request_history.push(trigger);
         let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
         let request_kind = RequestKind::Compaction(compaction);
         let mut retries = 0_usize;
         let response = loop {
+            let mut request = self.build_request(request_history.clone(), request_kind);
             match self
-                .respond_with_events(
-                    request_history.clone(),
+                .respond_request_with_events(
+                    &mut request,
                     &completed_items,
                     None,
                     request_kind,
+                    input_identity,
                 )
                 .await
             {
@@ -767,6 +1010,23 @@ impl ApiClient {
 
     fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> Value {
         let input = compose_input(history, self.explicit_cache);
+        self.build_request_from_input(input, request_kind)
+    }
+
+    pub(crate) fn build_sampling_request(
+        &self,
+        history: Vec<Value>,
+        cursor: HistoryCursor,
+    ) -> SamplingRequest {
+        let (input, input_restoration) = compose_sampling_input(history, self.explicit_cache);
+        SamplingRequest {
+            request: self.build_request_from_input(input, RequestKind::Turn),
+            cursor,
+            input_restoration,
+        }
+    }
+
+    fn build_request_from_input(&self, input: Vec<Value>, request_kind: RequestKind) -> Value {
         let mut request = json!({
             "model": MODEL,
             "instructions": "",
@@ -1038,22 +1298,54 @@ impl RequestKind {
     }
 }
 
-fn compose_input(mut history: Vec<Value>, explicit_cache: bool) -> Vec<Value> {
-    let [tools_item, system_item] = request_context_prefix(explicit_cache);
-    let tools_position = history
-        .iter()
-        .position(|item| is_additional_tools_item(item, &tools_item));
-    if tools_position.is_none() {
-        history.insert(0, tools_item);
-    }
+fn compose_input(history: Vec<Value>, explicit_cache: bool) -> Vec<Value> {
+    compose_sampling_input(history, explicit_cache).0
+}
 
-    let system_position = history.iter().position(is_system_prompt_item);
-    match system_position {
-        Some(index) if explicit_cache => mark_cache_breakpoint(&mut history[index]),
-        Some(_) => {}
-        None => history.insert(1, system_item),
-    }
-    history
+fn compose_sampling_input(
+    mut history: Vec<Value>,
+    explicit_cache: bool,
+) -> (Vec<Value>, SamplingInputRestoration) {
+    let [tools_item, system_item] = request_context_prefix(explicit_cache);
+    let inserted_tools = if history
+        .iter()
+        .any(|item| is_additional_tools_item(item, &tools_item))
+    {
+        false
+    } else {
+        history.insert(0, tools_item);
+        true
+    };
+
+    let system_prompt = match history.iter().position(is_system_prompt_item) {
+        Some(index) if explicit_cache => {
+            let previous_breakpoint = history[index]
+                .pointer_mut("/content/0")
+                .and_then(Value::as_object_mut)
+                .and_then(|content| {
+                    content.insert(
+                        "prompt_cache_breakpoint".to_string(),
+                        json!({"mode": "explicit"}),
+                    )
+                });
+            SamplingSystemPrompt::Marked {
+                index,
+                previous_breakpoint,
+            }
+        }
+        Some(_) => SamplingSystemPrompt::Existing,
+        None => {
+            history.insert(1, system_item);
+            SamplingSystemPrompt::Inserted
+        }
+    };
+    (
+        history,
+        SamplingInputRestoration {
+            inserted_tools,
+            system_prompt,
+        },
+    )
 }
 
 fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
@@ -1118,24 +1410,33 @@ fn disable_explicit_cache_for_request(request: &mut Value) -> ApiResult<()> {
     Ok(())
 }
 
-fn request_properties_match(previous: &Value, current: &Value) -> bool {
-    let (Some(previous), Some(current)) = (previous.as_object(), current.as_object()) else {
+fn is_reusable_request_property(name: &str) -> bool {
+    !matches!(name, "input" | "client_metadata" | "stream_options")
+}
+
+fn reusable_request_properties(request: &Value) -> ApiResult<Map<String, Value>> {
+    let request = request
+        .as_object()
+        .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
+    Ok(request
+        .iter()
+        .filter(|(name, _)| is_reusable_request_property(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect())
+}
+
+fn request_properties_match(previous: &Map<String, Value>, current: &Value) -> bool {
+    let Some(current) = current.as_object() else {
         return false;
     };
-    let is_reusable_property =
-        |name: &str| !matches!(name, "input" | "client_metadata" | "stream_options");
-    let previous_count = previous
-        .keys()
-        .filter(|name| is_reusable_property(name))
-        .count();
     let current_count = current
         .keys()
-        .filter(|name| is_reusable_property(name))
+        .filter(|name| is_reusable_request_property(name))
         .count();
-    previous_count == current_count
+    previous.len() == current_count
         && previous
             .iter()
-            .all(|(name, value)| !is_reusable_property(name) || current.get(name) == Some(value))
+            .all(|(name, value)| current.get(name) == Some(value))
 }
 
 async fn collect_http_stream(

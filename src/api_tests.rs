@@ -23,6 +23,71 @@ fn test_client(base_url: String) -> ApiClient {
     ApiClient::new_with_base_url(Auth::for_test("token-test"), &identity, 0, base_url).unwrap()
 }
 
+trait TestApiClient {
+    async fn respond(
+        &mut self,
+        history: Vec<Value>,
+        completed_items: &UnboundedSender<Value>,
+    ) -> ApiResult<ModelResponse>;
+
+    async fn respond_streaming(
+        &mut self,
+        history: Vec<Value>,
+        completed_items: &UnboundedSender<Value>,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> ApiResult<ModelResponse>;
+
+    async fn compact(
+        &mut self,
+        history: &[Value],
+        compaction: CompactionRequest,
+    ) -> ApiResult<CompactionResult>;
+}
+
+impl TestApiClient for ApiClient {
+    async fn respond(
+        &mut self,
+        history: Vec<Value>,
+        completed_items: &UnboundedSender<Value>,
+    ) -> ApiResult<ModelResponse> {
+        let mut request = self.build_request(history, RequestKind::Turn);
+        self.respond_request_with_events(
+            &mut request,
+            completed_items,
+            None,
+            RequestKind::Turn,
+            RequestInputIdentity::Exact,
+        )
+        .await
+    }
+
+    async fn respond_streaming(
+        &mut self,
+        history: Vec<Value>,
+        completed_items: &UnboundedSender<Value>,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> ApiResult<ModelResponse> {
+        let mut request = self.build_request(history, RequestKind::Turn);
+        self.respond_request_with_events(
+            &mut request,
+            completed_items,
+            Some(events),
+            RequestKind::Turn,
+            RequestInputIdentity::Exact,
+        )
+        .await
+    }
+
+    async fn compact(
+        &mut self,
+        history: &[Value],
+        compaction: CompactionRequest,
+    ) -> ApiResult<CompactionResult> {
+        self.compact_with_identity(history, compaction, RequestInputIdentity::Exact)
+            .await
+    }
+}
+
 fn user_message(text: &str) -> Value {
     json!({
         "type": "message",
@@ -320,14 +385,48 @@ fn request_bakes_in_the_fixed_exec_runtime() {
 }
 
 #[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_long_context_sampling_handoff() {
+    const ITEMS: usize = 256;
+    const BYTES_PER_ITEM: usize = 8 * 1024;
+    const SAMPLES: usize = 32;
+
+    let history = (0..ITEMS)
+        .map(|index| user_message(&format!("{index}:{}", "x".repeat(BYTES_PER_ITEM))))
+        .collect::<Vec<_>>();
+    let clone_started = std::time::Instant::now();
+    for _ in 0..SAMPLES {
+        std::hint::black_box(history.clone());
+    }
+    let clone_elapsed = clone_started.elapsed();
+
+    let mut transferred = history;
+    let transfer_started = std::time::Instant::now();
+    for _ in 0..SAMPLES {
+        let (input, restoration) = compose_sampling_input(transferred, true);
+        transferred = restoration.restore(input).unwrap();
+        std::hint::black_box(&transferred);
+    }
+    let transfer_elapsed = transfer_started.elapsed();
+    eprintln!(
+        "{SAMPLES} handoffs of a {} MiB sampling history: clone {clone_elapsed:?}, transfer {transfer_elapsed:?}",
+        ITEMS * BYTES_PER_ITEM / (1024 * 1024),
+    );
+    assert_eq!(transferred.len(), ITEMS);
+}
+
+#[test]
 fn websocket_delta_requires_an_exact_prefix_and_allows_empty_input() {
     let mut client = test_client("http://127.0.0.1:1".to_string());
     let first_request = client.build_request(vec![user_message("one")], RequestKind::Turn);
     let output = vec![assistant_item("first")];
     client.websocket_baseline = Some(WebSocketBaseline {
-        request: first_request.clone(),
+        properties: reusable_request_properties(&first_request).unwrap(),
+        input: WebSocketBaselineInput::Exact {
+            request: first_request["input"].as_array().unwrap().clone(),
+            output: output.clone(),
+        },
         response_id: "resp_1".to_string(),
-        output: output.clone(),
     });
     let next_history = [
         vec![user_message("one")],
@@ -343,7 +442,11 @@ fn websocket_delta_requires_an_exact_prefix_and_allows_empty_input() {
             .as_ptr();
     let logical_next_request = next_request.clone();
     let restoration = client
-        .prepare_websocket_request(&mut next_request, WebSocketRequestMode::Inference)
+        .prepare_websocket_request(
+            &mut next_request,
+            WebSocketRequestMode::Inference,
+            RequestInputIdentity::Exact,
+        )
         .unwrap();
     assert_eq!(next_request["previous_response_id"], "resp_1");
     assert_eq!(next_request["input"], json!([user_message("two")]));
@@ -376,7 +479,11 @@ fn websocket_delta_requires_an_exact_prefix_and_allows_empty_input() {
     );
     let logical_empty_delta = empty_delta.clone();
     let restoration = client
-        .prepare_websocket_request(&mut empty_delta, WebSocketRequestMode::Inference)
+        .prepare_websocket_request(
+            &mut empty_delta,
+            WebSocketRequestMode::Inference,
+            RequestInputIdentity::Exact,
+        )
         .unwrap();
     assert_eq!(empty_delta["previous_response_id"], "resp_1");
     assert_eq!(empty_delta["input"], json!([]));
@@ -386,7 +493,11 @@ fn websocket_delta_requires_an_exact_prefix_and_allows_empty_input() {
 
     let mut unchanged = first_request.clone();
     let restoration = client
-        .prepare_websocket_request(&mut unchanged, WebSocketRequestMode::Inference)
+        .prepare_websocket_request(
+            &mut unchanged,
+            WebSocketRequestMode::Inference,
+            RequestInputIdentity::Exact,
+        )
         .unwrap();
     assert!(unchanged.get("previous_response_id").is_none());
     assert!(unchanged.get("stream").is_none());
@@ -397,7 +508,11 @@ fn websocket_delta_requires_an_exact_prefix_and_allows_empty_input() {
     changed["text"]["verbosity"] = json!("medium");
     let logical_changed = changed.clone();
     let restoration = client
-        .prepare_websocket_request(&mut changed, WebSocketRequestMode::Inference)
+        .prepare_websocket_request(
+            &mut changed,
+            WebSocketRequestMode::Inference,
+            RequestInputIdentity::Exact,
+        )
         .unwrap();
     assert!(changed.get("previous_response_id").is_none());
     restoration.restore(&mut changed).unwrap();
@@ -411,9 +526,12 @@ fn remote_compaction_v2_reuses_the_turn_websocket_prefix() {
     let output = assistant_item("first");
     let first_request = client.build_request(vec![user.clone()], RequestKind::Turn);
     client.websocket_baseline = Some(WebSocketBaseline {
-        request: first_request,
+        properties: reusable_request_properties(&first_request).unwrap(),
+        input: WebSocketBaselineInput::Exact {
+            request: first_request["input"].as_array().unwrap().clone(),
+            output: vec![output.clone()],
+        },
         response_id: "resp_turn".to_string(),
-        output: vec![output.clone()],
     });
     let trigger = json!({"type": "compaction_trigger"});
     let mut compact_request = client.build_request(
@@ -423,7 +541,11 @@ fn remote_compaction_v2_reuses_the_turn_websocket_prefix() {
     let logical_request = compact_request.clone();
 
     let restoration = client
-        .prepare_websocket_request(&mut compact_request, WebSocketRequestMode::Inference)
+        .prepare_websocket_request(
+            &mut compact_request,
+            WebSocketRequestMode::Inference,
+            RequestInputIdentity::Exact,
+        )
         .unwrap();
 
     assert_eq!(compact_request["previous_response_id"], "resp_turn");
