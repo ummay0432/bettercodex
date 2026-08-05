@@ -95,15 +95,15 @@ row is authoritative; the section rows exclude the separator newline before
 each heading.
 
 The dynamic world-state items are not part of the tool specification, but they
-occupy the same context window. With the default embedded `papercut` skill
-implicitly invocable, they cost the following for the BetterCodex repository on
-the audit date:
+occupy the same context window. With the default embedded `anydoc` and
+`papercut` skills implicitly invocable, they cost the following for the
+BetterCodex repository on the audit date:
 
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Current `<environment_context>` developer item | 276 | 85 | 69 |
 | Current repository-onboarding user item | 9,034 | 2,162 | 2,259 |
-| Current `<skills>` developer item | 3,012 | 693 | 753 |
+| Current `<skills>` developer item | 3,580 | 859 | 895 |
 
 Those rows are snapshots, not constants. The environment fields change with the
 working directory, shell, date, and timezone. Repository instruction text
@@ -218,9 +218,9 @@ Git project root through the working directory. In each directory,
 
 The skills developer message wraps a bounded catalogue in `<skills>` markers.
 Only enabled skills whose `allow_implicit_invocation` policy is true appear in
-that catalogue. BetterCodex's embedded `papercut` skill is materialized at a
-real `${BCODEX_HOME:-$HOME/.bcodex}/skills/.system/papercut/SKILL.md` path;
-the model reads the full body from there only after deciding to use it.
+that catalogue. BetterCodex's embedded `anydoc` and `papercut` skills are
+materialized at real `${BCODEX_HOME:-$HOME/.bcodex}/skills/.system/<name>/SKILL.md`
+paths; the model reads a full body from there only after deciding to use it.
 
 ## What is not model context
 

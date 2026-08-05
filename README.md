@@ -99,12 +99,21 @@ disclosure design, the default context contains only each implicitly invocable
 skill's name, description, and path. The agent reads the full `SKILL.md` only
 after the description matches the task or the operator selects the skill.
 
-BetterCodex embeds one system skill, `papercut`, and materializes it under
-`${BCODEX_HOME:-$HOME/.bcodex}/skills/.system` so the advertised workflow is a
-real readable file. It replaces the former always-on System-prompt instructions:
-while implicit invocation is enabled, the description tells the agent to
-proactively log recurring workflow friction with `tools.log_papercut` and then
-continue working.
+BetterCodex embeds two system skills and materializes them under
+`${BCODEX_HOME:-$HOME/.bcodex}/skills/.system` so each advertised workflow is a
+real readable file:
+
+- `anydoc` proactively turns local office documents, OpenDocument files, RTF,
+  EPUB, CSV, and text-based PDFs into bounded Markdown for a fast first reading.
+  It uses an installed `anydoc` command when available; otherwise it downloads
+  the pinned `@firecrawl/anydoc@0.1.3` package through Node.js 20+ on first use.
+  Conversion stays local. The workflow requires visual verification when layout,
+  exact spreadsheet display formatting, or embedded media matters, and it does
+  not upload scanned PDFs to an OCR service. The side-by-side measurements and
+  fidelity tradeoffs are recorded in [`docs/anydoc-benchmark.md`](docs/anydoc-benchmark.md).
+- `papercut` replaces the former always-on System-prompt instructions. While
+  implicit invocation is enabled, its description tells the agent to proactively
+  log recurring workflow friction with `tools.log_papercut` and then continue.
 
 `/skills` opens the skill manager. `Space` or `Enter` enables or disables the
 selected skill, while `i` independently controls implicit invocation. An enabled

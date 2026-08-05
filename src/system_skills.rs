@@ -26,7 +26,19 @@ struct EmbeddedFile {
     contents: &'static [u8],
 }
 
-const EMBEDDED_FILES: [EmbeddedFile; 2] = [
+const EMBEDDED_FILES: [EmbeddedFile; 5] = [
+    EmbeddedFile {
+        relative_path: "anydoc/SKILL.md",
+        contents: include_bytes!("../bundled-skills/anydoc/SKILL.md"),
+    },
+    EmbeddedFile {
+        relative_path: "anydoc/agents/openai.yaml",
+        contents: include_bytes!("../bundled-skills/anydoc/agents/openai.yaml"),
+    },
+    EmbeddedFile {
+        relative_path: "anydoc/LICENSE.txt",
+        contents: include_bytes!("../bundled-skills/anydoc/LICENSE.txt"),
+    },
     EmbeddedFile {
         relative_path: "papercut/SKILL.md",
         contents: include_bytes!("../bundled-skills/papercut/SKILL.md"),
