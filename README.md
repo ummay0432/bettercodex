@@ -163,7 +163,8 @@ tool-related request prefix, the dynamic world-state messages beside it, and
 reproducible per-tool token-cost estimates.
 
 Developer worktree, disk preflight, startup benchmark, request-audit, and Git
-refspec workflows are documented in [`docs/development.md`](docs/development.md).
+refspec workflows are documented in
+[`progressive_disclosure/development.md`](progressive_disclosure/development.md).
 
 ## Validate
 
