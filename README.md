@@ -77,11 +77,12 @@ composer. The core shortcuts are:
 - The mouse wheel and the terminal's normal scrollback controls browse the
   finalized transcript.
 - `?` on an empty composer opens the shortcut reference.
-- Typing `/` opens completion for `/clear`, `/context`, `/resume`, `/help`,
-  `/tools`, and one combined `/quit`, `/exit` entry; type `/q` and press `Enter`
-  to quit quickly. `/context` opens a colored breakdown of the effective window,
-  current request categories, free space before auto-compaction, and reserved
-  headroom.
+- Typing `/` opens completion for `/clear`, `/context`, `/compact`, `/resume`,
+  `/help`, `/tools`, and one combined `/quit`, `/exit` entry; type `/q` and press
+  `Enter` to quit quickly. `/compact` manually compacts the current conversation
+  and can be interrupted with `Esc`. `/context` opens a colored breakdown of the
+  effective window, current request categories, free space before
+  auto-compaction, and reserved headroom.
 - Typing `@` opens Git-ignore-aware fuzzy file search. `Up` and `Down` select a
   result, `Enter` or `Tab` inserts its repository-relative path, and `Esc`
   closes the search.
