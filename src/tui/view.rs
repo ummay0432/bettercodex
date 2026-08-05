@@ -2738,12 +2738,10 @@ fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Lin
     let wrapped = editor::visual_ranges(message_text, usize::from(wrap_width))
         .into_iter()
         .map(|range| {
-            styled_skill_mentions(
-                &message_text[range.clone()],
-                range.start,
-                &skill_ranges,
-                style,
-            )
+            // Match the composer: tabs occupy one visible cell. Replacing them here preserves
+            // byte offsets, so exact mention ranges remain valid after wrapping.
+            let content = message_text[range.clone()].replace('\t', " ");
+            styled_skill_mentions(&content, range.start, &skill_ranges, style)
         })
         .collect::<Vec<_>>();
     let mut lines = vec![Line::default().style(style)];
@@ -2788,11 +2786,12 @@ fn styled_skill_mentions(
     skill_ranges: &[std::ops::Range<usize>],
     style: Style,
 ) -> Vec<Span<'static>> {
-    let end = offset.saturating_add(text.len());
-    let ranges = skill_ranges
-        .iter()
-        .filter(|range| range.start >= offset && range.end <= end)
-        .map(|range| range.start - offset..range.end - offset);
+    let line_end = offset.saturating_add(text.len());
+    let ranges = skill_ranges.iter().filter_map(|range| {
+        let start = range.start.max(offset);
+        let end = range.end.min(line_end);
+        (start < end).then_some(start - offset..end - offset)
+    });
     let mut spans = Vec::with_capacity(skill_ranges.len().saturating_mul(2).saturating_add(1));
     let mut cursor = 0_usize;
     for range in ranges {
@@ -3716,6 +3715,15 @@ mod tests {
         restored.queue_follow_up(prompt.clone());
         restored.restore_pending_input_to_composer();
         assert_eq!(restored.editor.take_prompt(), prompt);
+
+        let narrow_cyan = user_message_lines(&prompt, 8, Style::default())
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style.fg == Some(Color::Cyan))
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(narrow_cyan, "$manifest");
 
         view.start_turn(prompt);
         let history = view.take_pending_history_lines(80);
