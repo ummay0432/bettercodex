@@ -117,7 +117,7 @@ struct WorldState {
 }
 
 /// Aggregate request accounting kept in lockstep with `Conversation::history`.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ContextMetrics {
     estimated_tokens: u64,
     tokens: [u64; CONTEXT_KINDS.len()],
@@ -254,12 +254,13 @@ impl Conversation {
     }
 
     pub(crate) fn context_tokens(&self) -> Option<u64> {
-        self.context_tokens_with_history_estimate(self.context_metrics.estimated_tokens)
+        self.context_tokens_with_metrics(&self.context_metrics)
     }
 
-    fn context_tokens_with_history_estimate(&self, history_estimate: u64) -> Option<u64> {
+    fn context_tokens_with_metrics(&self, metrics: &ContextMetrics) -> Option<u64> {
         let usage = self.usage.as_ref()?;
         let baseline = self.usage_history_estimate?;
+        let history_estimate = metrics.estimated_tokens;
         let active_context = if history_estimate >= baseline {
             usage
                 .active_context_tokens()
@@ -272,8 +273,7 @@ impl Conversation {
         let omitted_reasoning = if self.server_reasoning_included {
             0
         } else {
-            self.context_metrics
-                .encrypted_reasoning_before_last_instruction
+            metrics.encrypted_reasoning_before_last_instruction
         };
         Some(active_context.saturating_add(omitted_reasoning))
     }
@@ -310,8 +310,7 @@ impl Conversation {
             })
             .collect::<Vec<_>>();
         let estimated_total = sections.iter().map(|section| section.tokens).sum();
-        let measured_total =
-            self.context_tokens_with_history_estimate(self.context_metrics.estimated_tokens);
+        let measured_total = self.context_tokens_with_metrics(&self.context_metrics);
         let used_tokens = measured_total.unwrap_or(estimated_total);
         if measured_total.is_some() {
             scale_context_sections(&mut sections, used_tokens);
@@ -327,19 +326,28 @@ impl Conversation {
     }
 
     pub(crate) fn projected_tokens(&self, additional: &[Value]) -> u64 {
-        let additional_tokens = estimated_tokens(additional);
-        self.context_tokens()
-            .unwrap_or_else(|| self.estimated_context_tokens())
-            .saturating_add(additional_tokens)
+        if additional.is_empty() {
+            return self
+                .context_tokens()
+                .unwrap_or_else(|| self.estimated_context_tokens(&self.context_metrics));
+        }
+
+        // A real user message advances the instruction boundary used by Codex's
+        // X-Reasoning-Included fallback. Project the complete accounting state so
+        // prior encrypted reasoning cannot appear only after input admission.
+        let mut projected_metrics = self.context_metrics.clone();
+        projected_metrics.extend(additional, &self.world_state);
+        self.context_tokens_with_metrics(&projected_metrics)
+            .unwrap_or_else(|| self.estimated_context_tokens(&projected_metrics))
     }
 
-    fn estimated_context_tokens(&self) -> u64 {
+    fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
         let [tools_tokens, system_prompt_tokens] = *CONTEXT_PREFIX_TOKEN_ESTIMATES;
-        let mut estimate = self.context_metrics.estimated_tokens;
-        if !self.context_metrics.has_tools {
+        let mut estimate = metrics.estimated_tokens;
+        if !metrics.has_tools {
             estimate = estimate.saturating_add(tools_tokens);
         }
-        if !self.context_metrics.has_system_prompt {
+        if !metrics.has_system_prompt {
             estimate = estimate.saturating_add(system_prompt_tokens);
         }
         estimate

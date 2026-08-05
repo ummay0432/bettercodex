@@ -287,6 +287,61 @@ fn backend_usage_adds_past_reasoning_only_when_the_server_omits_it() {
 }
 
 #[test]
+fn projected_user_boundary_includes_reasoning_that_the_server_omitted() {
+    let (root, cwd) = temporary_repository("projected-reasoning-boundary");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let reasoning = json!({
+        "type": "reasoning",
+        "id": "rs_before_steering",
+        "encrypted_content": "x".repeat(110_000),
+    });
+    conversation
+        .extend([
+            UserInput::text("initial request")
+                .into_message_and_skills()
+                .0,
+            reasoning.clone(),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "working"}],
+            }),
+        ])
+        .unwrap();
+    let measured_tokens = AUTO_COMPACT_TOKEN_LIMIT - 10_000;
+    conversation
+        .record_usage(
+            Some(TokenUsage {
+                input_tokens: measured_tokens,
+                total_tokens: measured_tokens,
+                ..TokenUsage::default()
+            }),
+            false,
+        )
+        .unwrap();
+    let steering = UserInput::text("answer this while you work")
+        .into_message_and_skills()
+        .0;
+    let expected = measured_tokens
+        .saturating_add(estimate_value_tokens(&reasoning))
+        .saturating_add(estimate_value_tokens(&steering));
+
+    assert_eq!(conversation.context_tokens(), Some(measured_tokens));
+    assert_eq!(
+        conversation.projected_tokens(std::slice::from_ref(&steering)),
+        expected
+    );
+    assert!(conversation.needs_compaction_with(std::slice::from_ref(&steering)));
+
+    conversation.extend([steering]).unwrap();
+    assert_eq!(conversation.context_tokens(), Some(expected));
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn contextual_user_messages_do_not_turn_current_reasoning_into_past_reasoning() {
     let (root, cwd) = temporary_repository("contextual-reasoning-boundary");
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();

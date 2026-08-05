@@ -102,6 +102,159 @@ async fn steering_waits_for_the_response_boundary_and_enters_the_next_request() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steering_compacts_before_an_instruction_boundary_restores_omitted_reasoning() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requests_tx, mut requests) = unbounded_channel();
+    let (release_first, release_first_rx) = std_mpsc::channel();
+    let reasoning = json!({
+        "type": "reasoning",
+        "id": "rs_before_steering",
+        "encrypted_content": "x".repeat(110_000),
+    });
+    let measured_tokens = AUTO_COMPACT_TOKEN_LIMIT - 10_000;
+    let projected_with_reasoning =
+        measured_tokens.saturating_add(estimated_tokens(std::slice::from_ref(&reasoning)));
+    assert!(projected_with_reasoning > AUTO_COMPACT_TOKEN_LIMIT);
+    assert!(projected_with_reasoning < EFFECTIVE_CONTEXT_WINDOW);
+
+    let server_reasoning = reasoning.clone();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        requests_tx.send(read_request(&mut first)).unwrap();
+        release_first_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first response release");
+        write_sse_items_response_with_usage(
+            &mut first,
+            "resp_before_steering",
+            &[
+                server_reasoning,
+                json!({
+                    "id": "msg_before_steering",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "first answer"}],
+                }),
+            ],
+            json!({
+                "input_tokens": measured_tokens - 100,
+                "output_tokens": 100,
+                "total_tokens": measured_tokens,
+            }),
+        );
+
+        let (mut compact, _) = listener.accept().unwrap();
+        requests_tx.send(read_request(&mut compact)).unwrap();
+        write_sse_items_response(
+            &mut compact,
+            "resp_compact_before_steering",
+            &[json!({
+                "type": "compaction_summary",
+                "id": "cmp_before_steering",
+                "encrypted_content": "opaque",
+            })],
+        );
+
+        let (mut continuation, _) = listener.accept().unwrap();
+        requests_tx.send(read_request(&mut continuation)).unwrap();
+        write_sse_response(&mut continuation, "second answer");
+    });
+
+    let (root, mut agent) = test_agent(&format!("http://{address}"));
+    let (events_tx, mut events_rx) = unbounded_channel();
+    let (handle, control) = TurnControl::channel();
+    let task = tokio::spawn(async move {
+        let outcome = agent
+            .submit_with_control(UserInput::text("initial prompt"), events_tx, control)
+            .await;
+        (agent, outcome)
+    });
+
+    let first_request = timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("first request timed out")
+        .expect("first request");
+    let steer_id = handle
+        .steer(UserInput::text("steering instruction"))
+        .expect("active turn accepts steering");
+    release_first.send(()).unwrap();
+    let compact_request = timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("compaction request timed out")
+        .expect("compaction request");
+    let continuation_request = timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("continuation request timed out")
+        .expect("continuation request");
+
+    let (agent, outcome) = task.await.expect("agent task");
+    assert_eq!(
+        outcome.unwrap(),
+        SubmitOutcome::Completed("first answer\nsecond answer".to_string())
+    );
+    assert_eq!(
+        conversation_text(&first_request),
+        vec![("user".to_string(), "initial prompt".to_string())]
+    );
+
+    let compact_request: Value = serde_json::from_slice(&compact_request).unwrap();
+    assert_eq!(
+        compact_request["input"].as_array().unwrap().last().unwrap(),
+        &json!({"type": "compaction_trigger"})
+    );
+    let metadata: Value = serde_json::from_str(
+        compact_request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["compaction"]["phase"], "mid_turn");
+
+    let continuation: Value = serde_json::from_slice(&continuation_request).unwrap();
+    let input = continuation["input"].as_array().unwrap();
+    let compacted = input
+        .iter()
+        .position(|item| item["type"] == "compaction_summary")
+        .expect("opaque compaction item");
+    let steering = input
+        .iter()
+        .position(|item| {
+            item["role"] == "user"
+                && item.pointer("/content/0/text").and_then(Value::as_str)
+                    == Some("steering instruction")
+        })
+        .expect("steering instruction");
+    assert!(compacted < steering);
+    assert!(
+        input.iter().all(|item| item["type"] != "reasoning"),
+        "uncompacted reasoning reached the continuation request"
+    );
+    assert_eq!(
+        agent.prompt_history(),
+        vec![
+            "initial prompt".to_string(),
+            "steering instruction".to_string(),
+        ]
+    );
+
+    let events = std::iter::from_fn(|| events_rx.try_recv().ok()).collect::<Vec<_>>();
+    let compaction_started = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::CompactionStarted))
+        .expect("compaction start event");
+    let committed = events
+        .iter()
+        .position(|event| *event == AgentEvent::SteeringCommitted(steer_id))
+        .expect("steering commit event");
+    assert!(compaction_started < committed, "{events:#?}");
+
+    server.join().expect("server thread");
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -855,6 +1008,24 @@ fn write_sse_response(stream: &mut TcpStream, answer: &str) {
 }
 
 fn write_sse_items_response(stream: &mut TcpStream, response_id: &str, items: &[Value]) {
+    write_sse_items_response_with_usage(
+        stream,
+        response_id,
+        items,
+        json!({
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+        }),
+    );
+}
+
+fn write_sse_items_response_with_usage(
+    stream: &mut TcpStream,
+    response_id: &str,
+    items: &[Value],
+    usage: Value,
+) {
     let item_events = items
         .iter()
         .enumerate()
@@ -876,11 +1047,7 @@ fn write_sse_items_response(stream: &mut TcpStream, response_id: &str, items: &[
             "model": crate::MODEL,
             "reasoning": {"context": "all_turns"},
             "output": items,
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 2,
-                "total_tokens": 12,
-            },
+            "usage": usage,
         },
     });
     let body = format!("{item_events}data: {completed}\n\n");
