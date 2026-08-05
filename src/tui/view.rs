@@ -23,6 +23,7 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
+use crate::rollout::SessionTranscriptItem;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
 use crate::skills::SkillUpdate;
@@ -622,10 +623,41 @@ impl View {
         }
     }
 
+    pub(super) fn replay_transcript(
+        &mut self,
+        transcript: impl IntoIterator<Item = SessionTranscriptItem>,
+    ) {
+        self.entries
+            .extend(transcript.into_iter().map(|item| match item {
+                SessionTranscriptItem::User {
+                    mut text,
+                    image_count,
+                } => {
+                    if image_count > 0 {
+                        if !text.trim().is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        if image_count == 1 {
+                            text.push_str("[Image attachment]");
+                        } else {
+                            text.push_str(&format!("[{image_count} image attachments]"));
+                        }
+                    }
+                    TranscriptEntry::User(UserPrompt::text(text))
+                }
+                SessionTranscriptItem::Assistant { text } => TranscriptEntry::Assistant {
+                    text,
+                    streaming: false,
+                    rendered: None,
+                },
+            }));
+    }
+
     pub(super) fn switch_session(
         &mut self,
         cwd: &Path,
         context_tokens: Option<u64>,
+        transcript: impl IntoIterator<Item = SessionTranscriptItem>,
         prompt_history: impl IntoIterator<Item = String>,
         skills: Vec<Skill>,
     ) {
@@ -633,6 +665,7 @@ impl View {
         *self = Self::with_skills(cwd, skills);
         self.user_message_style = user_message_style;
         self.context_tokens = context_tokens;
+        self.replay_transcript(transcript);
         self.editor.seed_history(prompt_history);
         self.clear_requested = true;
     }
@@ -1346,7 +1379,7 @@ impl View {
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => 17,
             Some(Overlay::Context(context)) => context.preferred_height(width),
-            Some(Overlay::Resume(picker)) => picker.preferred_height(),
+            Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills),
             Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
             None => 0,
@@ -4295,7 +4328,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_sessions_resets_transcript_and_reseeds_prompt_recall() {
+    fn switching_sessions_replays_saved_transcript_and_reseeds_prompt_recall() {
         let mut view = View::new(Path::new("/tmp/old-session"));
         view.welcome_pending = false;
         view.add_notice("old transcript");
@@ -4304,15 +4337,39 @@ mod tests {
         view.switch_session(
             Path::new("/tmp/resumed-session"),
             Some(42_000),
+            [
+                SessionTranscriptItem::User {
+                    text: "saved question".to_string(),
+                    image_count: 1,
+                },
+                SessionTranscriptItem::Assistant {
+                    text: "Saved **answer**".to_string(),
+                },
+            ],
             ["resumed prompt".to_string()],
             Vec::new(),
         );
 
         assert_eq!(view.cwd, Path::new("/tmp/resumed-session"));
-        assert!(view.entries.is_empty());
+        assert_eq!(view.entries.len(), 2);
         assert!(view.overlay.is_none());
         assert_eq!(view.context_tokens, Some(42_000));
         assert!(view.take_clear_request());
+        let history = view
+            .take_pending_history_lines(80)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(history.contains("saved question"), "{history}");
+        assert!(history.contains("Image attachment"), "{history}");
+        assert!(history.contains("Saved answer"), "{history}");
+        assert!(!history.contains("old transcript"), "{history}");
         view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
         assert_eq!(view.editor.text(), "resumed prompt");
     }
@@ -4333,12 +4390,15 @@ mod tests {
         }]);
 
         let height = view.desired_height(88, 24);
+        assert_eq!(height, 24);
         let backend = TestBackend::new(88, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(rendered.contains("Resume a previous session"), "{rendered}");
         assert!(rendered.contains("Continue the saved work"), "{rendered}");
+        assert!(rendered.contains("Sort: [Updated] Created"), "{rendered}");
+        assert!(!rendered.contains('┌'), "{rendered}");
 
         assert_eq!(
             view.handle_terminal_event(Event::Key(KeyEvent::new(

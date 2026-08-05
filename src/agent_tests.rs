@@ -305,6 +305,7 @@ async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() 
         api,
         conversation,
         tools,
+        resumed_transcript: Vec::new(),
     };
     let prompt = UserPrompt::with_skill_mentions(
         "use $demo now",
@@ -807,6 +808,7 @@ fn test_agent_with_transport(base_url: &str, transport: TestTransport) -> (PathB
             api,
             conversation,
             tools,
+            resumed_transcript: Vec::new(),
         },
     )
 }

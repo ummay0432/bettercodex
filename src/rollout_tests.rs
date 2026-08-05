@@ -246,6 +246,77 @@ fn session_listing_drives_resume_and_uses_the_first_real_user_message() {
     let loaded = Rollout::resume_in(&root, ResumeSelector::Id(first_id), &second_cwd).unwrap();
     assert_eq!(loaded.metadata.cwd, first_cwd);
     assert_eq!(loaded.history, [initial, interruption, first_prompt]);
+    assert_eq!(
+        loaded.transcript,
+        [SessionTranscriptItem::User {
+            text: "  inspect\n  the   picker  ".to_string(),
+            image_count: 0,
+        }]
+    );
+    drop(loaded);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resume_reconstructs_the_visible_transcript_across_compaction() {
+    let root = temporary_directory("rollout-transcript");
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let contextual = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "<turn_aborted>hidden</turn_aborted>"}],
+    });
+    let user = json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "inspect this"},
+            {"type": "input_image", "image_url": "data:image/png;base64,fixture"},
+        ],
+    });
+    let first_answer = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "First answer"}],
+    });
+    let final_answer = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "After compaction"}],
+    });
+    rollout
+        .append_history(&[contextual, user.clone(), first_answer.clone()])
+        .unwrap();
+    rollout
+        .replace_compacted_history(&[user, first_answer], None)
+        .unwrap();
+    rollout
+        .append_history(std::slice::from_ref(&final_answer))
+        .unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+
+    assert_eq!(
+        loaded.transcript,
+        [
+            SessionTranscriptItem::User {
+                text: "inspect this".to_string(),
+                image_count: 1,
+            },
+            SessionTranscriptItem::Assistant {
+                text: "First answer".to_string(),
+            },
+            SessionTranscriptItem::Assistant {
+                text: "After compaction".to_string(),
+            },
+        ]
+    );
+    assert_eq!(loaded.history.last(), Some(&final_answer));
+
     drop(loaded);
     std::fs::remove_dir_all(root).unwrap();
 }

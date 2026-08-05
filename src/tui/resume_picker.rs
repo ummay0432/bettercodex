@@ -4,17 +4,15 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use ratatui::Frame;
-use ratatui::layout::Alignment;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use ratatui::widgets::Block;
-use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
+use std::cmp::Ordering;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -25,10 +23,13 @@ use uuid::Uuid;
 
 const MUTED: Color = Color::Indexed(245);
 const RULE: Color = Color::Indexed(8);
-const PREFERRED_WIDTH: u16 = 100;
-const MAX_VISIBLE_SESSIONS: usize = 6;
+const SELECTED: Color = Color::Yellow;
 const MAX_QUERY_CHARS: usize = 256;
-const PANEL_CHROME_HEIGHT: u16 = 5;
+const HORIZONTAL_CHROME_INSET: u16 = 1;
+const LIST_HORIZONTAL_INSET: u16 = 2;
+const FOOTER_HEIGHT: u16 = 3;
+const SESSION_ROW_HEIGHT: u16 = 3;
+const METADATA_DATE_WIDTH: usize = 12;
 
 pub(super) struct ResumePicker {
     cwd: PathBuf,
@@ -36,7 +37,9 @@ pub(super) struct ResumePicker {
     sessions: Option<Vec<SessionSummary>>,
     filtered: Vec<usize>,
     query: String,
-    show_all: bool,
+    filter: SessionFilter,
+    sort: SessionSort,
+    toolbar_focus: ToolbarControl,
     selected: usize,
     status: Option<PickerStatus>,
 }
@@ -44,6 +47,51 @@ pub(super) struct ResumePicker {
 enum PickerStatus {
     Resuming(Uuid),
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionFilter {
+    Cwd,
+    All,
+}
+
+impl SessionFilter {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Cwd => Self::All,
+            Self::All => Self::Cwd,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionSort {
+    Updated,
+    Created,
+}
+
+impl SessionSort {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Updated => Self::Created,
+            Self::Created => Self::Updated,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolbarControl {
+    Filter,
+    Sort,
+}
+
+impl ToolbarControl {
+    fn next(self) -> Self {
+        match self {
+            Self::Filter => Self::Sort,
+            Self::Sort => Self::Filter,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +109,9 @@ impl ResumePicker {
             sessions: None,
             filtered: Vec::new(),
             query: String::new(),
-            show_all: false,
+            filter: SessionFilter::Cwd,
+            sort: SessionSort::Updated,
+            toolbar_focus: ToolbarControl::Filter,
             selected: 0,
             status: None,
         }
@@ -97,15 +147,6 @@ impl ResumePicker {
         self.status = Some(PickerStatus::Resuming(target));
     }
 
-    pub(super) fn preferred_height(&self) -> u16 {
-        let rows = self
-            .sessions
-            .as_ref()
-            .map_or(1, |_| self.filtered.len().clamp(1, MAX_VISIBLE_SESSIONS))
-            .saturating_mul(2);
-        PANEL_CHROME_HEIGHT.saturating_add(u16::try_from(rows).unwrap_or(u16::MAX))
-    }
-
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> ResumePickerAction {
         if matches!(self.status, Some(PickerStatus::Resuming(_))) {
             return ResumePickerAction::None;
@@ -120,8 +161,15 @@ impl ResumePicker {
                 self.rebuild_filter();
             }
             KeyCode::Esc => return ResumePickerAction::Close,
-            KeyCode::Tab if self.sessions.is_some() => {
-                self.show_all = !self.show_all;
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.toolbar_focus = self.toolbar_focus.next();
+                self.clear_error();
+            }
+            KeyCode::Left | KeyCode::Right => {
+                match self.toolbar_focus {
+                    ToolbarControl::Filter => self.filter = self.filter.toggle(),
+                    ToolbarControl::Sort => self.sort = self.sort.toggle(),
+                }
                 self.clear_error();
                 self.rebuild_filter();
             }
@@ -142,12 +190,11 @@ impl ResumePicker {
                 self.clear_error();
             }
             KeyCode::PageUp => {
-                self.selected = self.selected.saturating_sub(MAX_VISIBLE_SESSIONS);
+                self.selected = self.selected.saturating_sub(10);
                 self.clear_error();
             }
             KeyCode::PageDown => {
-                self.selected = (self.selected + MAX_VISIBLE_SESSIONS)
-                    .min(self.filtered.len().saturating_sub(1));
+                self.selected = (self.selected + 10).min(self.filtered.len().saturating_sub(1));
                 self.clear_error();
             }
             KeyCode::Enter => {
@@ -193,7 +240,7 @@ impl ResumePicker {
             }
             if !self.query.is_empty() && !self.query.ends_with(char::is_whitespace) {
                 self.query.push(' ');
-                remaining -= 1;
+                remaining = remaining.saturating_sub(1);
             }
             for character in word.chars().take(remaining) {
                 self.query.push(character);
@@ -209,57 +256,37 @@ impl ResumePicker {
             return;
         }
         frame.render_widget(Clear, area);
-        let panel = Rect::new(
-            area.x,
-            area.y,
-            PREFERRED_WIDTH.min(area.width),
-            self.preferred_height().min(area.height),
+
+        let header = inset_row(area, area.y, HORIZONTAL_CHROME_INSET);
+        frame.render_widget(
+            Paragraph::new(Line::from("Resume a previous session").cyan().bold()),
+            header,
         );
-        let block = Block::default()
-            .title(" Resume a previous session ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(RULE));
-        let inner = block.inner(panel);
-        frame.render_widget(block, panel);
-        if inner.is_empty() {
-            return;
+
+        let search_y = area.y.saturating_add(2);
+        if search_y < area.bottom() {
+            let search = inset_row(area, search_y, HORIZONTAL_CHROME_INSET);
+            frame.render_widget(Paragraph::new(self.search_line(search.width)), search);
         }
 
-        let search_area = Rect::new(inner.x, inner.y, inner.width, 1);
-        let footer_height = u16::from(inner.height > 1);
-        let list_y = search_area.bottom().saturating_add(1).min(inner.bottom());
-        let list_area = Rect::new(
-            inner.x,
+        let list_y = area.y.saturating_add(4).min(area.bottom());
+        let available_after_chrome = area.bottom().saturating_sub(list_y);
+        let footer_height = FOOTER_HEIGHT.min(available_after_chrome);
+        let footer_y = area.bottom().saturating_sub(footer_height);
+        let list = Rect::new(
+            area.x.saturating_add(LIST_HORIZONTAL_INSET),
             list_y,
-            inner.width,
-            inner
-                .bottom()
-                .saturating_sub(list_y)
-                .saturating_sub(footer_height),
+            area.width
+                .saturating_sub(LIST_HORIZONTAL_INSET.saturating_mul(2)),
+            footer_y.saturating_sub(list_y),
         );
-        let footer_area = Rect::new(
-            inner.x,
-            inner.bottom().saturating_sub(footer_height),
-            inner.width,
-            footer_height,
-        );
+        self.render_sessions(frame, list);
 
-        frame.render_widget(
-            Paragraph::new(self.search_line(search_area.width)),
-            search_area,
-        );
-        self.render_sessions(frame, list_area);
-        if !footer_area.is_empty() {
-            let footer = if matches!(self.status, Some(PickerStatus::Resuming(_))) {
-                "please wait"
-            } else {
-                "enter resume · esc close · tab cwd/all · ↑/↓ browse"
-            };
-            frame.render_widget(
-                Paragraph::new(footer)
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(MUTED)),
-                footer_area,
+        if footer_height > 0 {
+            self.render_footer(
+                frame,
+                Rect::new(area.x, footer_y, area.width, footer_height),
+                list.height,
             );
         }
     }
@@ -268,108 +295,232 @@ impl ResumePicker {
         if let Some(status) = &self.status {
             return match status {
                 PickerStatus::Resuming(id) => Line::from(vec![
-                    Span::from("Resuming ").cyan().bold(),
+                    Span::from("Resuming ").bold(),
                     Span::from(id.to_string()).dim(),
+                    Span::from("…").dim(),
                 ]),
                 PickerStatus::Error(error) => Line::from(markdown::sanitize(error)).red(),
             };
         }
-        if self.sessions.is_none() {
-            return Line::from("Loading sessions…").dim();
-        }
+
         let search = if self.query.is_empty() {
-            "Type to search".to_string()
+            Span::from("Type to search").dim()
         } else {
-            format!("Search: {}", markdown::sanitize(&self.query))
+            Span::from(format!("Search: {}", markdown::sanitize(&self.query)))
         };
-        let filter = if self.show_all {
-            "Filter: Cwd [All]"
-        } else {
-            "Filter: [Cwd] All"
-        };
-        let search_width = UnicodeWidthStr::width(search.as_str());
-        let filter_width = UnicodeWidthStr::width(filter);
-        let gap = usize::from(width).saturating_sub(search_width + filter_width);
-        if gap >= 2 {
-            Line::from(vec![
-                Span::from(search),
-                Span::from(" ".repeat(gap)),
-                Span::from(filter).dim(),
-            ])
-        } else {
-            Line::from(search)
+        let mut toolbar = self.toolbar_line(false);
+        let search_width = search.width();
+        if search_width
+            .saturating_add(toolbar.width())
+            .saturating_add(2)
+            > usize::from(width)
+        {
+            toolbar = self.toolbar_line(true);
         }
+        let toolbar_width = toolbar.width();
+        if toolbar_width.saturating_add(2) >= usize::from(width) {
+            return Line::from(truncate_text(search.content.as_ref(), usize::from(width)));
+        }
+        let available_search = usize::from(width).saturating_sub(toolbar_width + 2);
+        let search = if search_width > available_search {
+            let text = truncate_text(search.content.as_ref(), available_search);
+            if self.query.is_empty() {
+                Span::from(text).dim()
+            } else {
+                Span::from(text)
+            }
+        } else {
+            search
+        };
+        let gap = usize::from(width).saturating_sub(search.width() + toolbar_width);
+        let mut spans = vec![search, Span::from(" ".repeat(gap))];
+        spans.extend(toolbar.spans);
+        Line::from(spans)
+    }
+
+    fn toolbar_line(&self, compact: bool) -> Line<'static> {
+        let mut spans = Vec::new();
+        if compact {
+            spans.push(Span::from("Filter:").dim());
+            spans.push(toolbar_value(
+                match self.filter {
+                    SessionFilter::Cwd => "Cwd",
+                    SessionFilter::All => "All",
+                },
+                true,
+                self.toolbar_focus == ToolbarControl::Filter,
+            ));
+            spans.push(Span::from("   "));
+            spans.push(Span::from("Sort:").dim());
+            spans.push(toolbar_value(
+                match self.sort {
+                    SessionSort::Updated => "Updated",
+                    SessionSort::Created => "Created",
+                },
+                true,
+                self.toolbar_focus == ToolbarControl::Sort,
+            ));
+        } else {
+            spans.push(Span::from("Filter: ").dim());
+            spans.push(toolbar_value(
+                "Cwd",
+                self.filter == SessionFilter::Cwd,
+                self.toolbar_focus == ToolbarControl::Filter,
+            ));
+            spans.push(toolbar_value(
+                "All",
+                self.filter == SessionFilter::All,
+                self.toolbar_focus == ToolbarControl::Filter,
+            ));
+            spans.push(Span::from("   "));
+            spans.push(Span::from("Sort: ").dim());
+            spans.push(toolbar_value(
+                "Updated",
+                self.sort == SessionSort::Updated,
+                self.toolbar_focus == ToolbarControl::Sort,
+            ));
+            spans.push(toolbar_value(
+                "Created",
+                self.sort == SessionSort::Created,
+                self.toolbar_focus == ToolbarControl::Sort,
+            ));
+        }
+        Line::from(spans)
     }
 
     fn render_sessions(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.is_empty() {
-            return;
-        }
-        if matches!(self.status, Some(PickerStatus::Resuming(_))) {
+        if area.is_empty() || matches!(self.status, Some(PickerStatus::Resuming(_))) {
             return;
         }
         let Some(sessions) = &self.sessions else {
-            return;
-        };
-        if self.filtered.is_empty() {
-            let message = if self.show_all || !self.query.is_empty() {
-                "No matching sessions"
-            } else {
-                "No sessions for this directory · Tab shows all"
-            };
             frame.render_widget(
-                Paragraph::new(message).style(Style::default().fg(MUTED)),
+                Paragraph::new(Line::from("Loading sessions…").italic().dim()),
                 area,
             );
             return;
+        };
+        if self.filtered.is_empty() {
+            let message = if self.query.is_empty() {
+                match self.filter {
+                    SessionFilter::Cwd => "No sessions for this directory",
+                    SessionFilter::All => "No sessions yet",
+                }
+            } else {
+                "No results for your search"
+            };
+            frame.render_widget(Paragraph::new(Line::from(message).italic().dim()), area);
+            return;
         }
 
-        let visible = usize::from(area.height / 2).max(1);
+        let visible = visible_session_count(area.height);
         let start = self
             .selected
             .saturating_add(1)
             .saturating_sub(visible)
             .min(self.filtered.len().saturating_sub(visible));
         let now = unix_timestamp_millis();
-        let mut lines = Vec::with_capacity(visible.saturating_mul(2));
+        let mut y = area.y;
         for (position, index) in self.filtered.iter().enumerate().skip(start).take(visible) {
+            if y >= area.bottom() {
+                break;
+            }
             let session = &sessions[*index];
             let selected = position == self.selected;
-            let marker = if selected { "› " } else { "  " };
-            let title = session
-                .preview
-                .as_deref()
-                .map(markdown::sanitize)
-                .unwrap_or_else(|| "New session".to_string());
-            let current_suffix = if session.id == self.current_session {
-                "  current"
-            } else {
-                ""
-            };
-            let title_width = usize::from(area.width)
-                .saturating_sub(UnicodeWidthStr::width(marker))
-                .saturating_sub(UnicodeWidthStr::width(current_suffix));
-            let title = truncate_text(&title, title_width);
-            let mut title_spans = vec![Span::from(marker), Span::from(title)];
-            if !current_suffix.is_empty() {
-                title_spans.push(Span::from(current_suffix).yellow().dim());
+            frame.render_widget(
+                Paragraph::new(session_title_line(
+                    session,
+                    selected,
+                    session.id == self.current_session,
+                    area.width,
+                )),
+                Rect::new(area.x, y, area.width, 1),
+            );
+            y = y.saturating_add(1);
+            if y >= area.bottom() {
+                break;
             }
-            let mut title_line = Line::from(title_spans);
-            if selected {
-                title_line = title_line.cyan().bold();
-            }
-            lines.push(title_line);
-
-            let id = session.id.to_string();
-            let age = format_relative_time(now, session.updated_at_unix_ms);
-            let cwd = markdown::sanitize(&session.cwd.display().to_string());
-            let fixed_width = UnicodeWidthStr::width(age.as_str())
-                .saturating_add(UnicodeWidthStr::width(&id[..8]))
-                .saturating_add(12);
-            let cwd = truncate_text(&cwd, usize::from(area.width).saturating_sub(fixed_width));
-            lines.push(Line::from(format!("  {}  ·  {}  ·  {}", age, cwd, &id[..8],)).dim());
+            frame.render_widget(
+                Paragraph::new(session_metadata_line(
+                    session,
+                    now,
+                    self.filter == SessionFilter::All,
+                    area.width,
+                )),
+                Rect::new(area.x, y, area.width, 1),
+            );
+            y = y.saturating_add(2);
         }
-        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect, list_height: u16) {
+        if area.is_empty() {
+            return;
+        }
+        let visible = visible_session_count(list_height);
+        frame.render_widget(
+            Paragraph::new(self.footer_separator(area.width, visible)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        if area.height == 1 {
+            return;
+        }
+        if matches!(self.status, Some(PickerStatus::Resuming(_))) {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::from(" resuming").bold(),
+                    Span::from(" selected session…").dim(),
+                ])),
+                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            );
+            return;
+        }
+
+        let escape_label = if self.query.is_empty() {
+            "exit"
+        } else {
+            "clear"
+        };
+        let first = [
+            ("enter", "resume"),
+            ("esc", escape_label),
+            ("ctrl+c", "exit"),
+            ("tab", "focus sort/filter"),
+            ("←/→", "change option"),
+        ];
+        frame.render_widget(
+            Paragraph::new(footer_hints(&first, area.width)),
+            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        );
+        if area.height > 2 {
+            let second = [("↑/↓", "browse"), ("home/end", "jump"), ("type", "search")];
+            frame.render_widget(
+                Paragraph::new(footer_hints(&second, area.width)),
+                Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+            );
+        }
+    }
+
+    fn footer_separator(&self, width: u16, visible: usize) -> Line<'static> {
+        let total = self.filtered.len();
+        let position = if total == 0 { 0 } else { self.selected + 1 };
+        let start = self
+            .selected
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(total.saturating_sub(visible));
+        let percent = if total <= visible {
+            100
+        } else {
+            let maximum = total.saturating_sub(visible);
+            start.saturating_mul(100) / maximum.max(1)
+        };
+        let label = format!(" {position} / {total} · {percent}% ");
+        let label_width = UnicodeWidthStr::width(label.as_str());
+        if label_width.saturating_add(1) >= usize::from(width) {
+            return Line::from(truncate_text(&label, usize::from(width))).dim();
+        }
+        let rule_width = usize::from(width).saturating_sub(label_width + 1);
+        Line::from(format!("{}{}─", "─".repeat(rule_width), label)).fg(RULE)
     }
 
     fn rebuild_filter(&mut self) {
@@ -381,10 +532,15 @@ impl ResumePicker {
             .unwrap_or_default()
             .iter()
             .enumerate()
-            .filter(|(_, session)| self.show_all || session.cwd == self.cwd)
+            .filter(|(_, session)| self.filter == SessionFilter::All || session.cwd == self.cwd)
             .filter(|(_, session)| session_matches(session, &query))
             .map(|(index, _)| index)
             .collect();
+        if let Some(sessions) = &self.sessions {
+            self.filtered.sort_unstable_by(|left, right| {
+                compare_sessions(&sessions[*left], &sessions[*right], self.sort)
+            });
+        }
         self.selected = selected_id
             .and_then(|id| {
                 self.filtered.iter().position(|index| {
@@ -409,6 +565,130 @@ impl ResumePicker {
     }
 }
 
+fn toolbar_value(label: &'static str, active: bool, focused: bool) -> Span<'static> {
+    if active {
+        let style = if focused {
+            Style::default().fg(Color::Magenta)
+        } else {
+            Style::default()
+        };
+        Span::styled(format!("[{label}]"), style)
+    } else {
+        Span::from(format!(" {label} ")).dim()
+    }
+}
+
+fn inset_row(area: Rect, y: u16, inset: u16) -> Rect {
+    Rect::new(
+        area.x.saturating_add(inset),
+        y,
+        area.width.saturating_sub(inset.saturating_mul(2)),
+        1,
+    )
+}
+
+fn visible_session_count(height: u16) -> usize {
+    usize::from(height.saturating_add(SESSION_ROW_HEIGHT - 1) / SESSION_ROW_HEIGHT).max(1)
+}
+
+fn session_title_line(
+    session: &SessionSummary,
+    selected: bool,
+    current: bool,
+    width: u16,
+) -> Line<'static> {
+    let marker = if selected { "❯ " } else { "  " };
+    let current = if current { "  current" } else { "" };
+    let title = session
+        .preview
+        .as_deref()
+        .map(markdown::sanitize)
+        .unwrap_or_else(|| "New session".to_string());
+    let title_width = usize::from(width)
+        .saturating_sub(UnicodeWidthStr::width(marker))
+        .saturating_sub(UnicodeWidthStr::width(current));
+    let title = truncate_text(&title, title_width);
+    let selected_style = Style::default().fg(SELECTED).bold();
+    let mut spans = vec![
+        Span::styled(
+            marker.to_string(),
+            if selected {
+                selected_style
+            } else {
+                Style::default()
+            },
+        ),
+        Span::styled(
+            title,
+            if selected {
+                selected_style
+            } else {
+                Style::default()
+            },
+        ),
+    ];
+    if !current.is_empty() {
+        spans.push(Span::from(current.to_string()).yellow().dim());
+    }
+    Line::from(spans)
+}
+
+fn session_metadata_line(
+    session: &SessionSummary,
+    now_unix_ms: u64,
+    show_cwd: bool,
+    width: u16,
+) -> Line<'static> {
+    let age = format_relative_time(now_unix_ms, session.updated_at_unix_ms);
+    let prefix = format!("  {age:<METADATA_DATE_WIDTH$}");
+    let suffix = format!("  {}", &session.id.to_string()[..8]);
+    let metadata = if show_cwd {
+        let cwd_prefix = "  ⌁ ";
+        let cwd_width = usize::from(width)
+            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
+            .saturating_sub(UnicodeWidthStr::width(cwd_prefix))
+            .saturating_sub(UnicodeWidthStr::width(suffix.as_str()));
+        format!(
+            "{prefix}{cwd_prefix}{}{suffix}",
+            truncate_text(&display_cwd(&session.cwd), cwd_width)
+        )
+    } else {
+        format!("{prefix}{suffix}")
+    };
+    Line::from(truncate_text(&metadata, usize::from(width)))
+        .fg(MUTED)
+        .dim()
+}
+
+fn footer_hints(hints: &[(&str, &str)], width: u16) -> Line<'static> {
+    let mut spans = vec![Span::from(" ")];
+    let mut used = 1_usize;
+    for (key, label) in hints {
+        let gap = if used == 1 { 0 } else { 3 };
+        let hint_width = UnicodeWidthStr::width(*key) + 1 + UnicodeWidthStr::width(*label);
+        if used.saturating_add(gap).saturating_add(hint_width) > usize::from(width) {
+            break;
+        }
+        if gap > 0 {
+            spans.push(Span::from(" ".repeat(gap)).dim());
+            used += gap;
+        }
+        spans.push(Span::from((*key).to_string()));
+        spans.push(Span::from(" "));
+        spans.push(Span::from((*label).to_string()).dim());
+        used += hint_width;
+    }
+    Line::from(spans)
+}
+
+fn compare_sessions(left: &SessionSummary, right: &SessionSummary, sort: SessionSort) -> Ordering {
+    let order = match sort {
+        SessionSort::Updated => right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms),
+        SessionSort::Created => right.created_at_unix_ms.cmp(&left.created_at_unix_ms),
+    };
+    order.then_with(|| right.id.cmp(&left.id))
+}
+
 fn session_matches(session: &SessionSummary, query: &str) -> bool {
     query.is_empty()
         || session.id.to_string().to_lowercase().contains(query)
@@ -431,11 +711,29 @@ fn unix_timestamp_millis() -> u64 {
 fn format_relative_time(now_unix_ms: u64, timestamp_unix_ms: u64) -> String {
     let seconds = now_unix_ms.saturating_sub(timestamp_unix_ms) / 1_000;
     match seconds {
-        0..=59 => "now".to_string(),
+        0 => "now".to_string(),
+        1..=59 => format!("{seconds}s ago"),
         60..=3_599 => format!("{}m ago", seconds / 60),
         3_600..=86_399 => format!("{}h ago", seconds / 3_600),
         _ => format!("{}d ago", seconds / 86_400),
     }
+}
+
+fn display_cwd(path: &Path) -> String {
+    let display = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
+        .map_or_else(
+            || path.display().to_string(),
+            |relative| {
+                if relative.as_os_str().is_empty() {
+                    "~".to_string()
+                } else {
+                    format!("~/{}", relative.display())
+                }
+            },
+        );
+    markdown::sanitize(&display)
 }
 
 fn truncate_text(text: &str, max_width: usize) -> String {

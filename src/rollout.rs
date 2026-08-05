@@ -64,10 +64,17 @@ pub(crate) struct SessionSummary {
     pub(crate) preview: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionTranscriptItem {
+    User { text: String, image_count: usize },
+    Assistant { text: String },
+}
+
 pub(crate) struct LoadedRollout {
     pub(crate) rollout: Rollout,
     pub(crate) metadata: SessionMetadata,
     pub(crate) history: Vec<Value>,
+    pub(crate) transcript: Vec<SessionTranscriptItem>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) usage_history_estimate: Option<u64>,
     pub(crate) server_reasoning_included: bool,
@@ -348,6 +355,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut reader = BufReader::new(&*file);
     let mut metadata = None;
     let mut history = Vec::new();
+    let mut transcript = Vec::new();
     let mut usage = None;
     let mut usage_history_estimate = None;
     let mut server_reasoning_included = false;
@@ -400,7 +408,10 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                     ));
                 }
             }
-            RolloutRecord::HistoryAppend { items } => history.extend(items),
+            RolloutRecord::HistoryAppend { items } => {
+                append_transcript_items(&mut transcript, &items);
+                history.extend(items);
+            }
             RolloutRecord::HistoryReplace {
                 reason,
                 items,
@@ -471,12 +482,58 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         rollout,
         metadata,
         history,
+        transcript,
         usage,
         usage_history_estimate,
         server_reasoning_included,
         compaction_count,
         unfinished_turn,
     })
+}
+
+fn append_transcript_items(transcript: &mut Vec<SessionTranscriptItem>, items: &[Value]) {
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(role) = item.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        let text_kind = match role {
+            "user" => "input_text",
+            "assistant" => "output_text",
+            _ => continue,
+        };
+        let text = content
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some(text_kind))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        match role {
+            "user" => {
+                let image_count = content
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+                    .count();
+                if (text.trim().is_empty() && image_count == 0)
+                    || crate::context::is_contextual_user_text(&text)
+                {
+                    continue;
+                }
+                transcript.push(SessionTranscriptItem::User { text, image_count });
+            }
+            "assistant" if !text.trim().is_empty() => {
+                transcript.push(SessionTranscriptItem::Assistant { text });
+            }
+            "assistant" => {}
+            _ => unreachable!("message roles were filtered above"),
+        }
+    }
 }
 
 fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>> {

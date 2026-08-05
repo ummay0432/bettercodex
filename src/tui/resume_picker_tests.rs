@@ -25,7 +25,7 @@ fn search_and_cwd_filter_select_the_matching_session() {
     picker.handle_paste("regression");
     assert!(picker.filtered.is_empty());
     assert_eq!(
-        picker.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        picker.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
         ResumePickerAction::None
     );
     assert_eq!(picker.filtered, vec![1]);
@@ -37,6 +37,36 @@ fn search_and_cwd_filter_select_the_matching_session() {
         picker.status,
         Some(PickerStatus::Resuming(id)) if id == other
     ));
+}
+
+#[test]
+fn tab_focuses_toolbar_and_arrows_change_the_selected_option() {
+    let current = Uuid::new_v4();
+    let newer_update = SessionSummary {
+        id: current,
+        cwd: PathBuf::from("/work/current"),
+        created_at_unix_ms: 1_000,
+        updated_at_unix_ms: 4_000,
+        preview: Some("Updated most recently".to_string()),
+    };
+    let newer_creation = SessionSummary {
+        id: Uuid::new_v4(),
+        cwd: PathBuf::from("/work/current"),
+        created_at_unix_ms: 3_000,
+        updated_at_unix_ms: 3_000,
+        preview: Some("Created most recently".to_string()),
+    };
+    let mut picker = ResumePicker::loading(Path::new("/work/current"), current);
+    picker.set_sessions(vec![newer_update, newer_creation]);
+    assert_eq!(picker.filtered, vec![0, 1]);
+
+    picker.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    picker.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+    assert_eq!(picker.toolbar_focus, ToolbarControl::Sort);
+    assert_eq!(picker.sort, SessionSort::Created);
+    assert_eq!(picker.filtered, vec![1, 0]);
+    assert_eq!(picker.selected, 1, "selection follows the same session");
 }
 
 #[test]
@@ -85,29 +115,34 @@ fn a_stale_listing_cannot_replace_direct_resume_progress() {
     ));
     assert_eq!(picker.sessions, Some(Vec::new()));
 
-    let backend = TestBackend::new(80, picker.preferred_height());
+    let backend = TestBackend::new(80, 18);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| picker.render(frame, frame.area()))
         .unwrap();
     let rendered = render_buffer(terminal.backend().buffer());
     assert!(rendered.contains("Resuming"), "{rendered}");
+    assert!(rendered.contains("resuming selected session"), "{rendered}");
     assert!(!rendered.contains("No sessions"), "{rendered}");
 }
 
 #[test]
-fn picker_renders_session_metadata_and_sanitizes_preview_text() {
+fn picker_matches_codex_full_screen_chrome_and_sanitizes_preview_text() {
     let current = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
     let other = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
     let now = unix_timestamp_millis();
     let mut picker = ResumePicker::loading(Path::new("/work/current"), current);
     picker.set_sessions(vec![
         summary(current, "/work/current", now, "Current work"),
-        summary(other, "/work/current", now, "\x1b[31mUnsafe title"),
+        summary(
+            other,
+            "/work/current",
+            now.saturating_sub(1_000),
+            "\x1b[31mUnsafe title",
+        ),
     ]);
 
-    let height = picker.preferred_height();
-    let backend = TestBackend::new(100, height);
+    let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| picker.render(frame, frame.area()))
@@ -117,17 +152,23 @@ fn picker_renders_session_metadata_and_sanitizes_preview_text() {
     assert!(rendered.contains("Resume a previous session"), "{rendered}");
     assert!(rendered.contains("Type to search"), "{rendered}");
     assert!(rendered.contains("Filter: [Cwd] All"), "{rendered}");
-    assert!(rendered.contains("Current work  current"), "{rendered}");
+    assert!(rendered.contains("Sort: [Updated] Created"), "{rendered}");
+    assert!(rendered.contains("❯ Current work  current"), "{rendered}");
     assert!(rendered.contains("Unsafe title"), "{rendered}");
     assert!(!rendered.contains('\x1b'), "{rendered:?}");
     assert!(rendered.contains("11111111"), "{rendered}");
     assert!(rendered.contains("enter resume"), "{rendered}");
+    assert!(rendered.contains("1 / 2 · 100%"), "{rendered}");
+    assert!(
+        !rendered.contains('┌') && !rendered.contains('┐'),
+        "{rendered}"
+    );
 }
 
 #[test]
-fn long_rows_keep_the_current_marker_and_short_session_id_visible() {
+fn all_filter_shows_abbreviated_cwd_and_keeps_short_id_visible() {
     let current = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
-    let cwd = format!("/{}", "directory".repeat(20));
+    let cwd = format!("/{}/{}", "directory".repeat(8), "nested".repeat(8));
     let mut picker = ResumePicker::loading(Path::new(&cwd), current);
     picker.set_sessions(vec![summary(
         current,
@@ -135,8 +176,9 @@ fn long_rows_keep_the_current_marker_and_short_session_id_visible() {
         unix_timestamp_millis(),
         &"conversation ".repeat(30),
     )]);
+    picker.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
-    let backend = TestBackend::new(48, picker.preferred_height());
+    let backend = TestBackend::new(64, 16);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| picker.render(frame, frame.area()))
@@ -144,13 +186,16 @@ fn long_rows_keep_the_current_marker_and_short_session_id_visible() {
     let rendered = render_buffer(terminal.backend().buffer());
 
     assert!(rendered.contains("current"), "{rendered}");
+    assert!(rendered.contains('⌁'), "{rendered}");
     assert!(rendered.contains("11111111"), "{rendered}");
     assert!(rendered.contains('…'), "{rendered}");
 }
 
 #[test]
-fn relative_time_uses_compact_codex_style_units() {
+fn relative_time_uses_codex_style_units() {
+    assert_eq!(format_relative_time(60_000, 60_000), "now");
     assert_eq!(format_relative_time(60_000, 59_001), "now");
+    assert_eq!(format_relative_time(60_000, 58_000), "2s ago");
     assert_eq!(format_relative_time(120_000, 60_000), "1m ago");
     assert_eq!(format_relative_time(7_200_000, 3_600_000), "1h ago");
     assert_eq!(format_relative_time(172_800_000, 86_400_000), "1d ago");

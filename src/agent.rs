@@ -16,6 +16,7 @@ use crate::input::UserInput;
 use crate::rollout::LoadedRollout;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
+use crate::rollout::SessionTranscriptItem;
 use crate::rollout::TurnOutcome;
 use crate::tools::ToolResult;
 use crate::tools::ToolRuntime;
@@ -165,6 +166,7 @@ pub(crate) struct Agent {
     api: ApiClient,
     conversation: Conversation,
     tools: ToolRuntime,
+    resumed_transcript: Vec<SessionTranscriptItem>,
 }
 
 impl Agent {
@@ -181,6 +183,7 @@ impl Agent {
             api,
             conversation,
             tools,
+            resumed_transcript: Vec::new(),
         })
     }
 
@@ -190,10 +193,11 @@ impl Agent {
         Self::from_loaded_rollout(loaded)
     }
 
-    fn from_loaded_rollout(loaded: LoadedRollout) -> Result<Self> {
+    fn from_loaded_rollout(mut loaded: LoadedRollout) -> Result<Self> {
         let cwd = canonical_directory(&loaded.metadata.cwd)?;
         let identity = loaded.metadata.identity.clone();
         let compaction_count = loaded.compaction_count;
+        let resumed_transcript = std::mem::take(&mut loaded.transcript);
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
         let api = ApiClient::new(auth, &identity, compaction_count)?;
@@ -203,6 +207,7 @@ impl Agent {
             api,
             conversation,
             tools,
+            resumed_transcript,
         })
     }
 
@@ -224,6 +229,10 @@ impl Agent {
 
     pub(crate) fn prompt_history(&self) -> Vec<String> {
         self.conversation.prompt_history()
+    }
+
+    pub(crate) fn take_resumed_transcript(&mut self) -> Vec<SessionTranscriptItem> {
+        std::mem::take(&mut self.resumed_transcript)
     }
 
     pub(crate) fn skills(&self) -> &[crate::skills::Skill] {

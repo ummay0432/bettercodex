@@ -23,6 +23,7 @@ use crate::prompt_history::PromptHistory;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionSummary;
+use crate::rollout::SessionTranscriptItem;
 use anyhow::Context;
 use anyhow::Result;
 use crossterm::event::EventStream;
@@ -97,11 +98,13 @@ struct ResumedSession {
     agent: Agent,
     prompt_history: PromptHistory,
     composer_history: Vec<String>,
+    transcript: Vec<SessionTranscriptItem>,
 }
 
 impl Runtime {
-    fn new(agent: Agent, cwd: PathBuf) -> Result<Self> {
+    fn new(mut agent: Agent, cwd: PathBuf) -> Result<Self> {
         let mut view = View::new(&cwd);
+        view.replay_transcript(agent.take_resumed_transcript());
         view.set_skills(agent.skills().to_vec());
         for warning in agent.skill_warnings() {
             view.add_notice(format!("Skill warning: {warning}"));
@@ -379,12 +382,14 @@ impl Runtime {
         self.view.show_resume_progress(current_session, target);
         let requested_cwd = self.cwd.clone();
         self.resume_task = Some(tokio::task::spawn_blocking(move || {
-            let agent = Agent::resume(&requested_cwd, ResumeSelector::Id(target))?;
+            let mut agent = Agent::resume(&requested_cwd, ResumeSelector::Id(target))?;
             let (prompt_history, composer_history) = prompt_history_for_agent(&agent)?;
+            let transcript = agent.take_resumed_transcript();
             Ok(ResumedSession {
                 agent,
                 prompt_history,
                 composer_history,
+                transcript,
             })
         }));
         Ok(())
@@ -404,6 +409,7 @@ impl Runtime {
             agent,
             prompt_history,
             composer_history,
+            transcript,
         } = session;
         let cwd = agent.cwd().to_path_buf();
         let context_snapshot = agent.context_snapshot();
@@ -422,7 +428,7 @@ impl Runtime {
         self.file_search_updates = file_search_updates;
         self.prompt_history = Some(prompt_history);
         self.view
-            .switch_session(&cwd, context_tokens, composer_history, skills);
+            .switch_session(&cwd, context_tokens, transcript, composer_history, skills);
         for warning in skill_warnings {
             self.view.add_notice(format!("Skill warning: {warning}"));
         }
