@@ -461,7 +461,7 @@ impl Agent {
             let active_context_tokens = self.conversation.projected_tokens(&[]);
             if active_context_tokens > EFFECTIVE_CONTEXT_WINDOW {
                 return Err(anyhow!(
-                    "active conversation requires {active_context_tokens} tokens, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window"
+                    "active conversation requires {active_context_tokens} tokens, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window"
                 ));
             }
             let (completed_tx, mut completed_rx) = unbounded_channel::<Value>();
@@ -632,7 +632,7 @@ impl Agent {
         let incoming_tokens = estimated_tokens(&projected);
         if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
             return Err(anyhow!(
-                "input alone is estimated at {incoming_tokens} tokens, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
+                "input alone is estimated at {incoming_tokens} tokens, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
         if self.conversation.needs_compaction_with(&projected)
@@ -650,7 +650,7 @@ impl Agent {
         let projected_tokens = self.conversation.projected_tokens(&projected);
         if projected_tokens > EFFECTIVE_CONTEXT_WINDOW {
             return Err(anyhow!(
-                "input would require an estimated {projected_tokens} tokens after compaction, exceeding BetterCodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
+                "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
         self.conversation.extend(projected)?;

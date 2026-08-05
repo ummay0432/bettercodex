@@ -1,4 +1,4 @@
-//! Materialization of BetterCodex's embedded system skills.
+//! Materialization of bettercodex's embedded system skills.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -41,7 +41,7 @@ pub(crate) fn root(home: &Path) -> PathBuf {
     home.join(SKILLS_DIRECTORY).join(SYSTEM_DIRECTORY)
 }
 
-/// Installs embedded system skills under the BetterCodex home.
+/// Installs embedded system skills under the bettercodex home.
 ///
 /// This follows Codex's on-disk progressive-disclosure design: the catalogue can
 /// advertise a real `SKILL.md` path while the full body stays out of model context

@@ -202,7 +202,7 @@ impl Runtime {
                     match completion.context("session listing task stopped unexpectedly")? {
                         Ok(sessions) => self.view.set_resume_sessions(sessions),
                         Err(error) => self.view.resume_listing_failed(format!(
-                            "Could not list saved BetterCodex sessions: {error:#}"
+                            "Could not list saved bettercodex sessions: {error:#}"
                         )),
                     }
                     redraw = true;
@@ -212,7 +212,7 @@ impl Runtime {
                     match completion.context("session resume task stopped unexpectedly")? {
                         Ok(session) => self.activate_resumed_session(session),
                         Err(error) => self.view.resume_failed(format!(
-                            "Could not resume the selected BetterCodex session: {error:#}"
+                            "Could not resume the selected bettercodex session: {error:#}"
                         )),
                     }
                     redraw = true;
@@ -401,7 +401,7 @@ impl Runtime {
             .as_ref()
             .expect("an idle runtime always owns its agent")
             .session_id();
-        Uuid::parse_str(session_id).context("the active BetterCodex session ID is invalid")
+        Uuid::parse_str(session_id).context("the active bettercodex session ID is invalid")
     }
 
     fn activate_resumed_session(&mut self, session: ResumedSession) {

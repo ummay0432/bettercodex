@@ -1,7 +1,7 @@
 //! Single-environment adaptation of Codex unified exec at
 //! `1669c2403f793d0230065397dfc25f52b844244e`.
 //!
-//! BetterCodex removes Codex's sandbox, approval, remote-environment, hook,
+//! bettercodex removes Codex's sandbox, approval, remote-environment, hook,
 //! and telemetry layers, while retaining its model-visible process/session,
 //! PTY, yield, environment, and output-truncation behavior.
 

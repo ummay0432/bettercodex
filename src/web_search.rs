@@ -483,7 +483,7 @@ fn search_headers(turn_metadata: &str, auth: &crate::auth::AuthSnapshot) -> Resu
     headers.insert(
         "version",
         HeaderValue::from_str(env!("CARGO_PKG_VERSION"))
-            .context("BetterCodex package version is not a valid HTTP header")?,
+            .context("bettercodex package version is not a valid HTTP header")?,
     );
     if !turn_metadata.is_empty() {
         headers.insert(

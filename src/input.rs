@@ -174,7 +174,7 @@ impl UserInput {
                 .filter(|total| *total <= MAX_TOTAL_IMAGE_BYTES)
                 .ok_or_else(|| {
                     anyhow!(
-                        "attached images exceed BetterCodex's {} MiB input limit",
+                        "attached images exceed bettercodex's {} MiB input limit",
                         MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
                     )
                 })?;

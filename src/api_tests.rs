@@ -316,7 +316,7 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
     assert_eq!(&first_input[..2], stable_request_prefix());
     assert_eq!(
         serde_json::to_string(&first_input[..2]).unwrap().len(),
-        23_139,
+        13_937,
         "run ./scripts/dev.py tool-context --update"
     );
 

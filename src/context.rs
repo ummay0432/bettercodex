@@ -41,7 +41,7 @@ static CONTEXT_PREFIX_TOKEN_ESTIMATES: LazyLock<[u64; 2]> = LazyLock::new(|| {
 });
 const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
-const CRASH_GUIDANCE: &str = "The previous BetterCodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
+const CRASH_GUIDANCE: &str = "The previous bettercodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
 const REPOSITORY_ONBOARDING_PREFIX: &str = "# Repository onboarding from AGENTS.md for ";
 const CONTEXTUAL_USER_PREFIXES: [&str; 5] = [
     REPOSITORY_ONBOARDING_PREFIX,

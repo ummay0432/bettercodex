@@ -1,13 +1,17 @@
 # Tool context sent to GPT-5.6 Sol
 
-This file records the BetterCodex tool-related input that enters the model's
+This file records the bettercodex tool-related input that enters the model's
 context window. It is documentation and is not itself sent to the model.
 
 The audit baseline is OpenAI Codex commit
-`1669c2403f793d0230065397dfc25f52b844244e`, which BetterCodex pins for the
-shared Code Mode protocol and utility crates. The same fixed Code Mode
-catalogue and specifications were rechecked against Codex commit
-`6d4d9442c7142c08ac5c5098dfd6e82d8cd9f65a` on 2026-08-04.
+`1669c2403f793d0230065397dfc25f52b844244e`, which bettercodex pins for the
+shared Code Mode protocol and utility crates. The fixed Code Mode catalogue and
+specifications were rechecked against Codex commit
+`6d4d9442c7142c08ac5c5098dfd6e82d8cd9f65a` on 2026-08-04, and the upstream
+description renderer was rechecked at
+[`fa5d5ae047d1891a2f816c22d9ed926a0728ba47`](https://github.com/openai/codex/blob/fa5d5ae047d1891a2f816c22d9ed926a0728ba47/codex-rs/code-mode-protocol/src/description.rs)
+on 2026-08-05. bettercodex keeps its runtime protocol and schema-to-TypeScript
+renderer but deliberately uses shorter descriptions for its fixed surface.
 
 ## Request order
 
@@ -55,7 +59,7 @@ reproducible estimates:
 - `o200k` is the token count of the compact JSON or exact text using
   `o200k_base` from `tiktoken`.
 - `bytes/4` is Codex's conservative `ceil(UTF-8 bytes / 4)` estimator, also
-  used by BetterCodex for text history estimates.
+  used by bettercodex for text history estimates.
 
 The JSON figures use compact serialization with sorted object keys. Counts are
 the audited 2026-08-05 snapshot. `./scripts/dev.py tool-context --check`
@@ -65,16 +69,22 @@ uses pinned `tiktoken` 0.11.0 through `uv` when the module is not already
 installed. Prompt caching reduces repeated input billing; it does not remove
 the cached prefix from the active context window.
 
+The previous catalogue snapshot was 20,440 bytes, 5,195 `o200k` tokens, and
+5,110 bytes/4 tokens. The current item retains the same two request tools, seven
+nested tools, input schemas, output schemas, JavaScript names, and runtime
+behavior while reducing those estimates by 45.0% of bytes, 43.4% of `o200k`
+tokens, and 45.0% of bytes/4 tokens.
+
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable prefix: `additional_tools` plus cached system-prompt item | 23,139 | 5,726 | 5,785 |
-| Complete `additional_tools` developer item | 20,440 | 5,195 | 5,110 |
-| Top-level `exec` specification | 19,026 | 4,868 | 4,757 |
-| `exec` description only | 18,103 | 4,351 | 4,526 |
+| Complete stable prefix: `additional_tools` plus cached system-prompt item | 13,937 | 3,470 | 3,485 |
+| Complete `additional_tools` developer item | 11,238 | 2,939 | 2,810 |
+| Top-level `exec` specification | 10,354 | 2,741 | 2,589 |
+| `exec` description only | 9,727 | 2,371 | 2,432 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
-| Top-level `wait` specification | 1,356 | 315 | 339 |
-| `wait` description only | 769 | 181 | 193 |
+| Top-level `wait` specification | 826 | 186 | 207 |
+| `wait` description only | 247 | 62 | 62 |
 | Cached system-prompt message item | 2,696 | 530 | 674 |
 | `prompts/system.md` text only | 2,529 | 479 | 633 |
 <!-- bcodex-tool-context:stable:end -->
@@ -85,33 +95,61 @@ nested tool declaration. This is the text-only breakdown:
 <!-- bcodex-tool-context:sections:start -->
 | Section inside `exec` | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Runtime rules and global helpers | 3,375 | 806 | 844 |
+| Runtime rules and global helpers | 989 | 221 | 248 |
 | `apply_patch` | 233 | 59 | 59 |
 | `exec_command` | 1,374 | 321 | 344 |
 | `log_papercut` | 397 | 106 | 100 |
 | `update_plan` | 498 | 126 | 125 |
 | `view_image` | 654 | 153 | 164 |
 | `write_stdin` | 1,169 | 267 | 293 |
-| `web` namespace and `web__run` | 10,396 | 2,513 | 2,599 |
+| `web` namespace and `web__run` | 4,406 | 1,118 | 1,102 |
 <!-- bcodex-tool-context:sections:end -->
 
 The full `exec` description is stored verbatim in
 [`tool-catalogue.md`](tool-catalogue.md). A snapshot test compares that file to
-the string produced by Codex's `build_exec_tool_description`, and
-`bcodex --tool-catalogue` prints the same generated string. The full-description
-row is authoritative; the section rows exclude the separator newline before
-each heading.
+the string produced by `src/tools/catalogue.rs`, and `bcodex --tool-catalogue`
+prints the same generated string. Tool declarations still use Codex's
+`render_code_mode_sample` and `render_json_schema_to_typescript`; only the fixed
+runtime preamble, web guidance, and `wait` description are concise
+bettercodex-owned text. The full-description row is authoritative; the section
+rows exclude the separator newline before each heading.
+
+## Description design and evaluation
+
+OpenAI's current [GPT-5.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model#favor-leaner-prompts)
+says to remove repeated instructions and examples, keep tool descriptions
+concise and precise, and rerun the same representative evaluations after each
+change. The [function-calling guide](https://developers.openai.com/api/docs/guides/function-calling#token-usage)
+confirms that tool definitions consume context and recommends shortening
+descriptions while retaining clear purpose, parameters, formats, outputs, and
+measured examples. The compact catalogue follows that boundary: it removes
+generic MCP, audio, and image-generation guidance and ten redundant web-call
+examples, but retains the typed input/output declarations and every web routing,
+source, citation, and quotation constraint applicable to this product.
+
+Published evidence is directionally supportive but not treated as proof for
+Sol. [EASYTOOL](https://aclanthology.org/2025.naacl-long.44/) found that
+standardized concise tool instructions reduced tokens and improved tool-use
+performance in its evaluated models and tasks. Conversely,
+[Tool Preferences in Agentic LLMs are Unreliable](https://aclanthology.org/2025.emnlp-main.1060/)
+found that description wording can strongly skew tool selection. That risk is
+why `scripts/evaluate_tool_catalogue.py` freezes hard-graded local mutation,
+session, image, planning, web-routing, citation, orchestration, wait, and helper
+cases before comparing matched baseline and candidate binaries. Its acceptance
+rule requires at least a 35% catalogue reduction with no lower aggregate or
+per-case pass count; differing cases receive one additional matched repetition,
+with all outcomes retained.
 
 The dynamic world-state items are not part of the tool specification, but they
 occupy the same context window. With the default embedded `papercut` skill
 implicitly invocable, they cost the following for the
-BetterCodex repository on the audit date:
+bettercodex repository on the audit date:
 
 <!-- bcodex-tool-context:dynamic:start -->
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Current `<environment_context>` developer item | 276 | 85 | 69 |
-| Current repository-onboarding user item | 9,034 | 2,162 | 2,259 |
+| Current repository-onboarding user item | 4,886 | 1,187 | 1,222 |
 | Current `<skills>` developer item | 3,012 | 693 | 753 |
 <!-- bcodex-tool-context:dynamic:end -->
 
@@ -144,23 +182,17 @@ SOURCE: /[\s\S]+/
 The description exposes seven nested tools through the JavaScript `tools`
 object: `apply_patch`, `exec_command`, `log_papercut`, `update_plan`,
 `view_image`, `write_stdin`, and the namespaced `web__run` (`web.run`). The web
-tool uses Codex's exact command schema and description for search, open/fetch,
-click, find, PDF screenshots, finance, weather, sports, time, and image search.
+tool uses Codex's exact command schema for search, open/fetch, click, find, PDF
+screenshots, finance, weather, sports, time, and image search. Its concise
+description preserves bettercodex's browsing, primary-source, citation, and
+quotation rules without Codex's broad-product examples and repetition.
 
 ### `wait`
 
 `wait` is a non-strict function tool. Its exact description is:
 
 ```text
-Waits on a yielded `exec` cell and returns new output or completion.
-- Use `wait` only after `exec` returns `Script running with cell ID ...`.
-- `cell_id` identifies the running `exec` cell to resume.
-- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
-- `max_tokens` limits how much new output this wait call returns. Defaults to 10000 tokens.
-- `terminate: true` stops the running cell; false or omitted waits for output.
-- `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
-- If the cell is still running, `wait` may yield again with the same `cell_id`.
-- If the cell has already finished, `wait` returns the completed result and closes the cell.
+Resume a yielded `exec` cell. Use only the `cell_id` returned by `exec`; call `wait` again while the cell remains active. Each call returns only new output. `terminate: true` stops the cell. Waiting and output default to 10000 ms and 10000 tokens.
 ```
 
 Its exact input schema is:
@@ -228,7 +260,7 @@ Git project root through the working directory. In each directory,
 
 The skills developer message wraps a bounded catalogue in `<skills>` markers.
 Only enabled skills whose `allow_implicit_invocation` policy is true appear in
-that catalogue. BetterCodex's embedded `papercut` skill is materialized at the
+that catalogue. bettercodex's embedded `papercut` skill is materialized at the
 real `${BCODEX_HOME:-$HOME/.bcodex}/skills/.system/papercut/SKILL.md` path; the
 model reads its full body only after deciding to use it.
 
@@ -241,8 +273,8 @@ so it has no model-context token charge.
 
 Codex conditionally adds standalone web search, `request_user_input`, MCP
 tools, apps, plugins, image generation, dynamic namespaces, and multi-agent
-tools. BetterCodex deliberately fixes Codex's standalone `web.run` into its
+tools. bettercodex deliberately fixes Codex's standalone `web.run` into its
 catalogue and routes it to `alpha/search` with the same ChatGPT credentials,
 live external access, direct-caller setting, session ID, model, bounded recent
 conversation tail, and 10,000-token output budget. The other conditional tools
-remain outside BetterCodex until there is a concrete product use for them.
+remain outside bettercodex until there is a concrete product use for them.

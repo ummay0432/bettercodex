@@ -1124,7 +1124,7 @@ fn resume_recovers_an_unfinished_turn_and_closes_its_journal_state() {
     assert!(resumed.items().iter().any(|item| {
         item["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("previous BetterCodex process ended"))
+            .is_some_and(|text| text.contains("previous bettercodex process ended"))
     }));
     drop(resumed);
 

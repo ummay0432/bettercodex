@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a matched, executable A/B evaluation of BetterCodex tool catalogues.
+"""Run a matched, executable A/B evaluation of bettercodex tool catalogues.
 
 This is intentionally separate from the deterministic test suite: it makes live
 GPT-5.6 Sol requests using the operator's existing Codex authentication. It

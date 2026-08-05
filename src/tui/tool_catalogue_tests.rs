@@ -32,7 +32,7 @@ fn renders_a_compact_catalogue_attached_to_the_left_edge() {
             "│  ├─ ● write_stdin            │",
             "│  └─ ● web__run               │",
             "│                              │",
-            "│9 tools · ~5.1K prompt tokens │",
+            "│9 tools · ~2.8K prompt tokens │",
             "└──────────────────────────────┘",
         ]
         .join("\n")

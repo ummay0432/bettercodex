@@ -60,7 +60,7 @@ pub(crate) fn save(path: &Path, skill_path: &Path, update: SkillUpdate) -> Resul
     directory.recursive(true).mode(0o700);
     directory.create(parent).with_context(|| {
         format!(
-            "failed to create BetterCodex home directory {}",
+            "failed to create bettercodex home directory {}",
             parent.display()
         )
     })?;

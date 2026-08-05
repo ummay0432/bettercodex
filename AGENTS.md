@@ -1,10 +1,10 @@
-# BetterCodex
+# bettercodex
 
-BetterCodex is my personal Codex CLI fork. It strips Codex back to a bare
+bettercodex is my personal Codex CLI fork. It strips Codex back to a bare
 coding-agent harness bespoke to how I work: one Cargo package, one `bcodex`
 binary, `gpt-5.6-sol`, the inference loop, local tools, and a terminal UI for
 one operator. Commands and patches run with the invoking user's permissions;
-BetterCodex does not sandbox them.
+bettercodex does not sandbox them.
 
 ## Start here
 
@@ -16,8 +16,6 @@ task-specific context; do not preload the whole folder:
 - [`progressive_disclosure/inference.md`](progressive_disclosure/inference.md): before changing requests, Responses items, history, reasoning, compaction, caching, streaming, recovery, tools, or saved sessions.
 - [`progressive_disclosure/terminal-ui.md`](progressive_disclosure/terminal-ui.md): before changing `src/tui/`, terminal lifecycle, rendering, composer behavior, or shortcuts.
 - [`progressive_disclosure/model-facing-context.md`](progressive_disclosure/model-facing-context.md): before changing `AGENTS.md`, `prompts/*.md`, tool descriptions, or model-visible errors.
-- [`README.md`](README.md): when changing installation, CLI usage, or documented operator behavior.
-- [`preserve/README.md`](preserve/README.md): only when historical design, accepted terminal references, or old implementation lessons matter.
 
 ## Repository map
 
@@ -31,14 +29,16 @@ task-specific context; do not preload the whole folder:
 
 ## Direct references
 
-These links describe upstream Codex or Rust, not BetterCodex behavior. Open only
-the exact source needed to compare or port the corresponding behavior:
+These links describe upstream Codex or Rust, not bettercodex behavior. If
+OpenAI documents the behavior you are working on, fetch the documentation
+before designing or changing it. Never rely on memory or make assumptions where
+an authoritative source exists. Apply the same rule to the official Rust sources below.
 
 - CLI interaction: [interactive CLI](https://developers.openai.com/codex/cli/features#running-in-interactive-mode) and [slash commands](https://developers.openai.com/codex/cli/slash-commands).
 - Agent context: [AGENTS.md](https://developers.openai.com/codex/guides/agents-md) and [skills](https://developers.openai.com/codex/skills).
 - Authentication and permissions: [authentication](https://developers.openai.com/codex/auth) and [security, sandboxing, and approvals](https://developers.openai.com/codex/security).
 - Automation: [non-interactive mode](https://developers.openai.com/codex/noninteractive) and [execution-policy rules](https://developers.openai.com/codex/exec-policy).
-- Configuration comparison: [basics](https://developers.openai.com/codex/config-basic), [advanced configuration](https://developers.openai.com/codex/config-advanced), [reference](https://developers.openai.com/codex/config-reference), and [sample](https://developers.openai.com/codex/config-sample). BetterCodex deliberately has no configuration framework.
+- Configuration comparison: [basics](https://developers.openai.com/codex/config-basic), [advanced configuration](https://developers.openai.com/codex/config-advanced), [reference](https://developers.openai.com/codex/config-reference), and [sample](https://developers.openai.com/codex/config-sample). bettercodex deliberately has no configuration framework.
 - Upstream implementation: [Codex source](https://github.com/openai/codex) and [Codex build instructions](https://github.com/openai/codex/blob/main/docs/install.md).
 - Rust language and tooling: [Book](https://doc.rust-lang.org/stable/book/), [standard library](https://doc.rust-lang.org/stable/std/), [Reference](https://doc.rust-lang.org/stable/reference/), [Cargo](https://doc.rust-lang.org/stable/cargo/), and [Clippy](https://doc.rust-lang.org/stable/clippy/).
 - Rust design and performance: [API Guidelines](https://rust-lang.github.io/api-guidelines/), [rustdoc](https://doc.rust-lang.org/stable/rustdoc/), [Performance Book](https://nnethercote.github.io/perf-book/introduction.html), and [Nomicon](https://doc.rust-lang.org/stable/nomicon/).

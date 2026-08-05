@@ -36,7 +36,7 @@ pub(super) fn log(cwd: &Path, input: Value, cancellation: &CancellationToken) ->
     let message = normalize_message(&arguments.message)?;
     let root = repository::find_root(cwd).ok_or_else(|| {
         anyhow!(
-            "tools.log_papercut could not find a Git repository from {}; start BetterCodex inside a Git worktree",
+            "tools.log_papercut could not find a Git repository from {}; start bettercodex inside a Git worktree",
             cwd.display()
         )
     })?;
@@ -79,7 +79,7 @@ fn open_log(path: &Path) -> Result<File> {
         .create(true)
         .read(true)
         .append(true)
-        // BetterCodex targets Unix. O_NOFOLLOW closes the check/open race for
+        // bettercodex targets Unix. O_NOFOLLOW closes the check/open race for
         // symlinks, while O_NONBLOCK prevents a raced-in FIFO from hanging a
         // blocking worker before the descriptor can be rejected below.
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

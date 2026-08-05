@@ -241,7 +241,7 @@ impl Rollout {
             ResumeSelector::Id(id) => sessions.join(format!("{id}.jsonl")),
             ResumeSelector::LatestForCwd => {
                 latest_rollout_for_cwd(&sessions, cwd)?.ok_or_else(|| {
-                    anyhow!("no saved BetterCodex session exists for {}", cwd.display())
+                    anyhow!("no saved bettercodex session exists for {}", cwd.display())
                 })?
             }
         };
@@ -467,7 +467,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     }
     if metadata.model != MODEL || metadata.reasoning_effort != "max" {
         return Err(anyhow!(
-            "saved session uses {} at {}; BetterCodex requires {MODEL} at max",
+            "saved session uses {} at {}; bettercodex requires {MODEL} at max",
             metadata.model,
             metadata.reasoning_effort
         ));
@@ -540,11 +540,11 @@ fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>
     let entries = match std::fs::read_dir(sessions) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("failed to list saved BetterCodex sessions"),
+        Err(error) => return Err(error).context("failed to list saved bettercodex sessions"),
     };
     let mut latest = None::<(u128, u64, PathBuf)>;
     for entry in entries {
-        let entry = entry.context("failed to inspect a saved BetterCodex session")?;
+        let entry = entry.context("failed to inspect a saved bettercodex session")?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
             continue;
@@ -578,11 +578,11 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
     let entries = match std::fs::read_dir(&sessions_directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).context("failed to list saved BetterCodex sessions"),
+        Err(error) => return Err(error).context("failed to list saved bettercodex sessions"),
     };
     let mut sessions = Vec::new();
     for entry in entries {
-        let entry = entry.context("failed to inspect a saved BetterCodex session")?;
+        let entry = entry.context("failed to inspect a saved bettercodex session")?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
             continue;
@@ -638,7 +638,7 @@ fn read_session_summary(
     for line in lines {
         let line =
             line.with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-        // BetterCodex writes the externally tagged record type first. Avoid decoding initial
+        // bettercodex writes the externally tagged record type first. Avoid decoding initial
         // context, reasoning, and tool payloads while looking for the first real user message.
         if !line.starts_with(br#"{"type":"history_append""#) {
             continue;
@@ -769,7 +769,7 @@ fn state_root() -> Result<PathBuf> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .ok_or_else(|| anyhow!("cannot locate BetterCodex state: HOME is not set"))?;
+        .ok_or_else(|| anyhow!("cannot locate bettercodex state: HOME is not set"))?;
     Ok(codex_home.join(STATE_DIRECTORY))
 }
 
@@ -799,7 +799,7 @@ fn installation_id(root: &Path) -> Result<String> {
             let existing = std::fs::read_to_string(&path)?;
             Uuid::parse_str(existing.trim())
                 .map(|id| id.to_string())
-                .context("the BetterCodex installation ID is invalid")
+                .context("the bettercodex installation ID is invalid")
         }
         Err(error) => Err(error.into()),
     }
@@ -840,7 +840,7 @@ fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
     let error = std::io::Error::last_os_error();
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return Err(anyhow!(
-            "saved session {} is already open in another BetterCodex process",
+            "saved session {} is already open in another bettercodex process",
             path.display()
         ));
     }

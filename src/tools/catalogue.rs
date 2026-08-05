@@ -1,12 +1,12 @@
 //! Fixed JavaScript tool catalogue ported from Codex's `code_mode_only` plan at
-//! `1669c2403f793d0230065397dfc25f52b844244e`. BetterCodex exposes this one
+//! `1669c2403f793d0230065397dfc25f52b844244e`. bettercodex exposes this one
 //! execution path unconditionally; it has no tool-mode selector.
 //!
 //! The schemas mirror `core/src/tools/handlers/{apply_patch_spec,plan_spec,
 //! shell_spec,view_image_spec}.rs`; the `exec` and `wait` wrappers mirror
-//! `core/src/tools/code_mode/{execute_spec,wait_spec}.rs`. The shared renderer
-//! remains in `codex-code-mode-protocol` so model-facing TypeScript generation
-//! cannot drift into a BetterCodex-specific format.
+//! `core/src/tools/code_mode/{execute_spec,wait_spec}.rs`. bettercodex retains
+//! Codex's schema-to-TypeScript renderer but uses a concise fixed-catalogue
+//! preamble instead of documenting integrations this binary does not expose.
 
 use super::code_runtime;
 use super::code_runtime::CodeModeToolKind as ToolKind;
@@ -27,7 +27,13 @@ PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
 NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 "#;
-const INCLUDE_FIXED_CATALOGUE: bool = true;
+const EXEC_RUNTIME_GUIDANCE: &str = r#"Execute raw JavaScript to orchestrate tool calls.
+- Input JavaScript directly, without JSON wrapping, quotes, or Markdown fences. A fresh V8 isolate supports top-level `await` but has no Node.js, filesystem, direct network access, console, or persistent global state.
+- Call the typed methods below as `await tools.name(args)`. Use `Promise.all` for independent calls. Tool results are strings or the documented objects; await all work before the script ends.
+- Emit output with `text(value)` or `image(dataUrlOrItem, detail?)`; `notify(value)` emits an interim tool output. `yield_control()` yields accumulated output while the script continues.
+- `store(key, value)` and `load(key)` persist serializable values across exec cells. `exit()` finishes successfully. `setTimeout` and `clearTimeout` are available.
+- An optional first line `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}` controls early yielding and the direct-output token budget; defaults are 10000 for both."#;
+const WAIT_DESCRIPTION: &str = "Resume a yielded `exec` cell. Use only the `cell_id` returned by `exec`; call `wait` again while the cell remains active. Each call returns only new output. `terminate: true` stops the cell. Waiting and output default to 10000 ms and 10000 tokens.";
 
 static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
     vec![
@@ -104,15 +110,7 @@ static NAMESPACE_DESCRIPTIONS: LazyLock<BTreeMap<String, ToolNamespaceDescriptio
         )])
     });
 
-static EXEC_DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    code_runtime::build_exec_tool_description(
-        &CORE_TOOLS,
-        &[],
-        &NAMESPACE_DESCRIPTIONS,
-        code_runtime::DEFAULT_EXEC_YIELD_TIME_MS,
-        INCLUDE_FIXED_CATALOGUE,
-    )
-});
+static EXEC_DESCRIPTION: LazyLock<String> = LazyLock::new(build_exec_description);
 
 static CATALOGUE_INSPECTION: LazyLock<CatalogueInspection> = LazyLock::new(|| {
     let specifications = specifications();
@@ -214,10 +212,7 @@ pub(crate) fn specifications() -> Vec<Value> {
         json!({
             "type": "function",
             "name": code_runtime::WAIT_TOOL_NAME,
-            "description": format!(
-                "Waits on a yielded `exec` cell and returns new output or completion.\n{}",
-                code_runtime::build_wait_tool_description().trim(),
-            ),
+            "description": WAIT_DESCRIPTION,
             "strict": false,
             "parameters": {
                 "type": "object",
@@ -244,6 +239,59 @@ pub(crate) fn specifications() -> Vec<Value> {
             }
         }),
     ]
+}
+
+fn build_exec_description() -> String {
+    let mut sections = vec![EXEC_RUNTIME_GUIDANCE.to_string()];
+    let mut current_namespace = None;
+    for tool in core_tools() {
+        let namespace = tool.tool_name.namespace.as_deref();
+        if namespace != current_namespace {
+            if let Some(namespace) = namespace
+                && let Some(description) = NAMESPACE_DESCRIPTIONS.get(namespace)
+            {
+                sections.push(format!(
+                    "## {}\n{}",
+                    description.name,
+                    description.description.trim()
+                ));
+            }
+            current_namespace = namespace;
+        }
+        let normalized_name = code_runtime::normalize_code_mode_identifier(&tool.name);
+        let heading = if normalized_name == tool.name {
+            format!("### `{normalized_name}`")
+        } else {
+            format!("### `{normalized_name}` (`{}`)", tool.name)
+        };
+        sections.push(format!("{heading}\n{}", render_tool_declaration(tool)));
+    }
+    sections.join("\n\n")
+}
+
+fn render_tool_declaration(tool: &ToolDefinition) -> String {
+    let (input_name, input_type) = match tool.kind {
+        ToolKind::Function => (
+            "args",
+            tool.input_schema
+                .as_ref()
+                .map(code_runtime::render_json_schema_to_typescript)
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        ToolKind::Freeform => ("input", "string".to_string()),
+    };
+    let output_type = tool
+        .output_schema
+        .as_ref()
+        .map(code_runtime::render_json_schema_to_typescript)
+        .unwrap_or_else(|| "unknown".to_string());
+    code_runtime::render_code_mode_sample(
+        tool.description.trim(),
+        &tool.name,
+        input_name,
+        input_type,
+        output_type,
+    )
 }
 
 pub(crate) fn nested_tool_name_map() -> Value {
@@ -568,6 +616,29 @@ mod tests {
     }
 
     #[test]
+    fn fixed_catalogue_omits_unavailable_integration_guidance() {
+        let text = text();
+        for omitted in [
+            "MCP tool",
+            "generatedImage",
+            "audio(",
+            "Examples of different commands",
+        ] {
+            assert!(!text.contains(omitted), "unexpected `{omitted}` in {text}");
+        }
+        for retained in [
+            "Promise.all",
+            "store(key, value)",
+            "yield_control()",
+            "primary sources",
+            "direct, descriptive Markdown links",
+            "Quote at most 25 words",
+        ] {
+            assert!(text.contains(retained), "missing `{retained}` in {text}");
+        }
+    }
+
+    #[test]
     fn readable_catalogue_snapshot_matches_the_request() {
         assert_eq!(
             text().trim_end(),
@@ -615,15 +686,15 @@ mod tests {
     fn documented_tool_context_byte_counts_do_not_drift() {
         let tools = specifications();
         let update = "run ./scripts/dev.py tool-context --update";
-        assert_eq!(text().len(), 18_103, "{update}");
+        assert_eq!(text().len(), 9_727, "{update}");
         assert_eq!(
             serde_json::to_string(&tools[0]).unwrap().len(),
-            19_026,
+            10_354,
             "{update}"
         );
         assert_eq!(
             serde_json::to_string(&tools[1]).unwrap().len(),
-            1_356,
+            826,
             "{update}"
         );
         let item = json!({
@@ -633,15 +704,15 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_string(&item).unwrap().len(),
-            20_440,
+            11_238,
             "{update}"
         );
         assert_eq!(
             metrics(),
             CatalogueMetrics {
-                description_bytes: 18_103,
-                request_bytes: 20_440,
-                estimated_tokens: 5_110,
+                description_bytes: 9_727,
+                request_bytes: 11_238,
+                estimated_tokens: 2_810,
             }
         );
     }

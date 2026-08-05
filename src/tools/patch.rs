@@ -2,7 +2,7 @@
 //! `1669c2403f793d0230065397dfc25f52b844244e`.
 //!
 //! The upstream crate is coupled to Codex's remote filesystem and sandbox
-//! abstractions. BetterCodex keeps the parser, fuzzy matching, sequential
+//! abstractions. bettercodex keeps the parser, fuzzy matching, sequential
 //! application, and output semantics while using `std::fs` with the invoking
 //! user's permissions.
 

@@ -1,4 +1,4 @@
-# BetterCodex development workflows
+# bettercodex development workflows
 
 Read this before changing Rust, build scripts, tests, performance, or
 installation behavior.
@@ -56,7 +56,7 @@ cargo install --locked --path . --force --root "$HOME/.local"
 ```
 
 Then run the relevant smoke test against `$HOME/.local/bin/bcodex`. Testing only
-`target/debug/bcodex` or `target/release/bcodex` does not finish a BetterCodex
+`target/debug/bcodex` or `target/release/bcodex` does not finish a bettercodex
 code change.
 
 ## Cargo worktrees and disk space
@@ -72,7 +72,7 @@ Do not point `CARGO_TARGET_DIR` at another active worktree. Use the helper for
 focused tests and for the complete validation sequence above.
 
 `./scripts/dev.py preflight` reports free space, the selected target, inactive
-per-worktree target directories, BetterCodex test/temp directories older than
+per-worktree target directories, bettercodex test/temp directories older than
 six hours, and a narrow `origin` fetch refspec. It never deletes anything.
 Review the reported paths and remove only inactive targets or expired temp
 directories. `cargo clean --target-dir /reported/target` is the safe Cargo

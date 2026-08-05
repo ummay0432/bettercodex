@@ -1,11 +1,11 @@
 # Product direction and scope
 
-Read this before changing what BetterCodex is, what it supports, or which
+Read this before changing what bettercodex is, what it supports, or which
 upstream Codex behavior belongs here.
 
-BetterCodex is my personal Codex CLI fork. I have been an avid Codex user since
+bettercodex is my personal Codex CLI fork. I have been an avid Codex user since
 forever, but Codex has grown into a product made for everyone. It is now full of
-compromises, bloat, and trash I do not need. BetterCodex strips it back to the
+compromises, bloat, and trash I do not need. bettercodex strips it back to the
 core and turns it into a harness bespoke to how I work.
 
 I am a CEO. My projects are fully AI-vibecoded, and many of them have run for
@@ -21,7 +21,7 @@ smallest patch, and stop as soon as a local test passes. Across years of agent
 sessions, each tiny patch stacks on the old garbage and compounds into technical
 debt and scope creep.
 
-BetterCodex is meant to give the agent the freedom to stretch its legs, live up
+bettercodex is meant to give the agent the freedom to stretch its legs, live up
 to its full potential, and give the work its all. I make the product decisions;
 the agent owns the engineering. The agent should not be afraid to refactor,
 delete, consolidate, or clean up clear garbage simply because the request named
@@ -51,14 +51,14 @@ framework, Node workspace, and Bazel build.
 - automatic compaction: 90% of the raw window, or 334,800 tokens (approximately
   95% of the effective window).
 
-The 372,000-token window is a BetterCodex choice. It is not the public API limit
+The 372,000-token window is a bettercodex choice. It is not the public API limit
 or the value in Codex's model catalog.
 
 The runtime is one Cargo package and one `bcodex` binary. It contains the
 inference loop and terminal UI for one operator. Commands and patches run with
-the invoking user's permissions; BetterCodex does not sandbox them.
+the invoking user's permissions; bettercodex does not sandbox them.
 
 Do not add another model, provider, binary, app server, SDK, MCP layer, plugin
 system, configuration framework, build system, or plugin hook unless the user
-gives a concrete BetterCodex use for it. Linux and macOS are the targets; do not
+gives a concrete bettercodex use for it. Linux and macOS are the targets; do not
 add Windows compatibility code.

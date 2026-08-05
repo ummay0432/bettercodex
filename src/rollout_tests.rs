@@ -335,7 +335,7 @@ fn an_active_session_cannot_be_resumed_concurrently() {
     assert!(
         error
             .to_string()
-            .contains("is already open in another BetterCodex process")
+            .contains("is already open in another bettercodex process")
     );
 
     let inherited_descriptor = rollout.file.try_clone().unwrap();
@@ -348,7 +348,7 @@ fn an_active_session_cannot_be_resumed_concurrently() {
     assert!(
         error
             .to_string()
-            .contains("is already open in another BetterCodex process")
+            .contains("is already open in another bettercodex process")
     );
     drop(resumed);
     let resumed = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();

@@ -438,7 +438,7 @@ impl SkillCatalog {
                     let path = escape_xml(&skill.path.to_string_lossy());
                     let truncation_notice = truncated.then(|| {
                         format!(
-                            "\n<skill_truncated>The injected copy reached BetterCodex's {MAX_SKILL_PROMPT_BYTES}-byte item limit. Read the complete SKILL.md at {path} before acting.</skill_truncated>"
+                            "\n<skill_truncated>The injected copy reached bettercodex's {MAX_SKILL_PROMPT_BYTES}-byte item limit. Read the complete SKILL.md at {path} before acting.</skill_truncated>"
                         )
                     });
                     if truncated {

@@ -98,7 +98,7 @@ async fn run_agent(options: RunOptions, resume: Option<ResumeSelector>) -> Resul
 
 async fn run_line_mode(agent: &mut Agent) -> Result<()> {
     eprintln!(
-        "BetterCodex · {MODEL} · max · session {}",
+        "bettercodex · {MODEL} · max · session {}",
         agent.session_id()
     );
     eprintln!("Commands run with your user permissions. Ctrl-D exits.\n");
@@ -321,7 +321,7 @@ mod tests {
         ));
         assert_eq!(
             tool_catalogue_stats(),
-            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (7): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, web__run\n\nExec description: 18103 bytes\nComplete additional_tools item: 20440 bytes\nEstimated context cost: 5110 tokens (bytes/4)\nEffective-window share: 1.45%"
+            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (7): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, web__run\n\nExec description: 9727 bytes\nComplete additional_tools item: 11238 bytes\nEstimated context cost: 2810 tokens (bytes/4)\nEffective-window share: 0.80%"
         );
     }
 

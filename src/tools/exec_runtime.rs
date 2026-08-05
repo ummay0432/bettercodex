@@ -1,7 +1,7 @@
-//! The fixed `exec`/`wait` runtime used by every BetterCodex turn.
+//! The fixed `exec`/`wait` runtime used by every bettercodex turn.
 //!
 //! Upstream Codex calls this mechanism Code Mode because its tool planner can
-//! choose other modes. BetterCodex has no planner or selector: this module is
+//! choose other modes. bettercodex has no planner or selector: this module is
 //! the only top-level tool execution path.
 
 use super::NestedTools;
@@ -475,6 +475,7 @@ fn into_protocol_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -766,11 +767,10 @@ await tools.apply_patch(patch);
     async fn view_image_dispatches_structured_image_content() {
         let cwd = temporary_directory("view-image");
         let image_path = cwd.join("sample.png");
-        std::fs::write(
-            &image_path,
-            include_bytes!("../../preserve/assets/statusline.png"),
-        )
-        .unwrap();
+        let image = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .unwrap();
+        std::fs::write(&image_path, image).unwrap();
         let runtime = runtime(cwd.clone());
         let result = runtime
             .execute(

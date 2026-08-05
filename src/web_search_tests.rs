@@ -50,7 +50,7 @@ fn command_schema_matches_the_codex_alpha_search_surface() {
             "nba", "wnba", "nfl", "nhl", "mlb", "epl", "ncaamb", "ncaawb", "ipl"
         ])
     );
-    assert_eq!(DESCRIPTION.len(), 7_507);
+    assert_eq!(DESCRIPTION.len(), 1_518);
 }
 
 #[test]

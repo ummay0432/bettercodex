@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, dependency-free developer workflows for BetterCodex."""
+"""Small, dependency-free developer workflows for bettercodex."""
 
 from __future__ import annotations
 
@@ -153,7 +153,7 @@ def command_preflight(_: argparse.Namespace) -> int:
     print(f"Filesystem:   {human_bytes(usage.free)} free of {human_bytes(usage.total)}")
     if usage.free < LOW_SPACE_BYTES:
         print(
-            f"WARNING: less than {human_bytes(LOW_SPACE_BYTES)} is free; a clean BetterCodex build can be large.",
+            f"WARNING: less than {human_bytes(LOW_SPACE_BYTES)} is free; a clean bettercodex build can be large.",
             file=sys.stderr,
         )
 
@@ -237,7 +237,7 @@ def default_benchmark_command() -> list[str]:
     binary = installed if installed.exists() else worktree_target() / "release" / "bcodex"
     if not binary.exists():
         raise RuntimeError(
-            f"no benchmark binary at {binary}; install BetterCodex or build it with ./scripts/dev.py cargo build --release"
+            f"no benchmark binary at {binary}; install bettercodex or build it with ./scripts/dev.py cargo build --release"
         )
     return [os.fspath(binary), "--version"]
 

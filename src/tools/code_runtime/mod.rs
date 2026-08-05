@@ -4,11 +4,11 @@
 //! `1669c2403f793d0230065397dfc25f52b844244e`,
 //! `codex-rs/code-mode-runtime/src`. The module paths are the only structural
 //! adaptation; the cell, yield, cancellation, and session mechanics remain
-//! upstream's implementation. BetterCodex links the standard `rusty_v8`
+//! upstream's implementation. bettercodex links the standard `rusty_v8`
 //! archive so one Cargo package builds on Linux and macOS. Codex release builds
 //! instead inject target-specific pointer-compression and V8-sandbox artifacts.
 //! Upstream protocol identifiers are retained in this port for source-level
-//! auditability; BetterCodex exposes the runtime unconditionally.
+//! auditability; bettercodex exposes the runtime unconditionally.
 
 mod cell_actor;
 mod runtime;

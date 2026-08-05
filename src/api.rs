@@ -1089,7 +1089,7 @@ impl ApiClient {
             "request_kind": request_kind.as_str(),
             "sandbox": "danger-full-access",
             // Responses Lite requires Codex's protocol key even though
-            // BetterCodex has one fixed tool runtime and no mode selector.
+            // bettercodex has one fixed tool runtime and no mode selector.
             "code_mode_tool_names": tools::nested_tool_name_map(),
             "turn_started_at_unix_ms": self.turn_started_at_unix_ms,
         });
@@ -1729,7 +1729,7 @@ fn validate_completed_response(response: &Value) -> ApiResult<()> {
         && context != "all_turns"
     {
         return Err(ApiError::fatal(format!(
-            "backend used reasoning.context `{context}`; BetterCodex requires `all_turns`"
+            "backend used reasoning.context `{context}`; bettercodex requires `all_turns`"
         )));
     }
     Ok(())
@@ -1787,7 +1787,7 @@ fn validate_server_model(model: &str) -> ApiResult<()> {
         return Ok(());
     }
     Err(ApiError::fatal(format!(
-        "backend returned model `{model}` for fixed BetterCodex model `{MODEL}`"
+        "backend returned model `{model}` for fixed bettercodex model `{MODEL}`"
     )))
 }
 

@@ -16,10 +16,10 @@ compaction, caching, streaming, recovery, tools, or saved sessions.
 ## Evidence and validation
 
 Keep public API contracts, upstream Codex implementation choices, and
-BetterCodex product decisions separate. One does not prove another. Use the
+bettercodex product decisions separate. One does not prove another. Use the
 public OpenAI documentation for wire contracts, the Codex source linked from
 `AGENTS.md` for upstream behavior, and this repository's source and tests for
-what BetterCodex actually does. Recheck live sources before porting behavior
+what bettercodex actually does. Recheck live sources before porting behavior
 that may have changed.
 
 `docs/5-5-prompt-guidance.md` is a local copy of public GPT-5.6 guidance. Read

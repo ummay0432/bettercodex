@@ -114,7 +114,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "quit",
         aliases: &["exit"],
-        description: "leave BetterCodex",
+        description: "leave bettercodex",
     },
 ];
 
@@ -1134,7 +1134,7 @@ impl View {
                 Ok(id) => Action::ResumeSession(id),
                 Err(_) => {
                     self.entries.push(TranscriptEntry::Error(
-                        "`/resume` expects one BetterCodex session UUID".to_string(),
+                        "`/resume` expects one bettercodex session UUID".to_string(),
                     ));
                     Action::None
                 }
@@ -2736,7 +2736,7 @@ fn welcome_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
     let maximum_content_width = usize::from(available_width.saturating_sub(4)).min(56);
     let mut content = vec![Line::from(vec![
         Span::from(">_ ").dim(),
-        Span::from("BetterCodex").bold(),
+        Span::from("bettercodex").bold(),
         Span::from(format!(" (v{})", env!("CARGO_PKG_VERSION"))).dim(),
     ])];
     content.push(Line::default());
@@ -3433,7 +3433,7 @@ fn rendered_line_count(lines: &[Line<'static>], width: u16) -> u16 {
 fn user_message_style_for(background: Option<(u8, u8, u8)>) -> Style {
     // Codex normally gets this value from the bounded OSC 11 startup probe. Multiplexers can
     // swallow the response even when the underlying terminal is a dark true-color terminal; use
-    // BetterCodex's accepted dark canvas in that case so the composer does not silently lose the
+    // bettercodex's accepted dark canvas in that case so the composer does not silently lose the
     // Codex backfill that distinguishes user-authored text.
     let background = background.unwrap_or((31, 31, 31));
     let light =
@@ -3728,7 +3728,7 @@ mod tests {
         assert!(
             history
                 .iter()
-                .any(|line| plain(line).contains("BetterCodex"))
+                .any(|line| plain(line).contains("bettercodex"))
         );
         assert_eq!(view.desired_height(88, 24), 5);
 
@@ -3736,8 +3736,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
-        assert!(!rendered.contains(">_ BetterCodex"));
-        assert!(!rendered.contains("Ask BetterCodex to do anything"));
+        assert!(!rendered.contains(">_ bettercodex"));
+        assert!(!rendered.contains("Ask bettercodex to do anything"));
         assert!(rendered.lines().any(|line| line.trim() == "›"));
         assert!(rendered.contains("gpt-5.6-sol max"));
     }
@@ -4074,7 +4074,7 @@ mod tests {
         let composer_y = rows.iter().position(|row| row.contains("/q")).unwrap();
         let command_y = rows
             .iter()
-            .position(|row| row.contains("/quit, /exit  leave BetterCodex"))
+            .position(|row| row.contains("/quit, /exit  leave bettercodex"))
             .unwrap();
         assert!(command_y > composer_y, "{rendered}");
         assert_eq!(buffer[(2, composer_y as u16)].symbol(), "/");
@@ -4932,7 +4932,7 @@ mod tests {
         assert!(rendered.contains("Inside exec"), "{rendered}");
         assert!(rendered.contains("apply_patch"), "{rendered}");
         assert!(
-            rendered.contains("9 tools · ~5.1K prompt tokens"),
+            rendered.contains("9 tools · ~2.8K prompt tokens"),
             "{rendered}"
         );
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "┌");
@@ -4969,7 +4969,7 @@ mod tests {
         assert!(
             view.take_pending_history_lines(80)
                 .iter()
-                .any(|line| plain(line).contains("BetterCodex"))
+                .any(|line| plain(line).contains("bettercodex"))
         );
         view.start_turn("a user message that wraps at the narrower width");
         let _ = view.take_pending_history_lines(80);
@@ -4988,7 +4988,7 @@ mod tests {
             .map(plain)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(replay.contains("BetterCodex"), "{replay}");
+        assert!(replay.contains("bettercodex"), "{replay}");
         assert!(replay.contains("› a user message"), "{replay}");
         assert!(replay.contains("• assistant reply"), "{replay}");
         assert!(!view.welcome_pending);
