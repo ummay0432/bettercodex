@@ -98,6 +98,34 @@ fn sse_decoder_handles_split_crlf_and_multiline_frames() {
 }
 
 #[test]
+fn sse_decoder_preserves_empty_data_lines_and_unterminated_events() {
+    let mut decoder = SseDecoder::default();
+    assert_eq!(
+        decoder.push(b"data:\ndata: second\n\n").unwrap(),
+        ["\nsecond"]
+    );
+    assert!(decoder.push(b"data: trailing").unwrap().is_empty());
+    assert_eq!(decoder.finish().unwrap(), ["trailing"]);
+}
+
+#[test]
+fn sse_decoder_reassembles_a_large_line_from_small_chunks() {
+    const PAYLOAD_BYTES: usize = 512 * 1_024;
+    const CHUNK_BYTES: usize = 127;
+    let event = format!("{{\"payload\":\"{}\"}}", "x".repeat(PAYLOAD_BYTES));
+    let frame = format!("data: {event}\n\n");
+    let mut decoder = SseDecoder::default();
+    let mut decoded = Vec::new();
+
+    for chunk in frame.as_bytes().chunks(CHUNK_BYTES) {
+        decoded.extend(decoder.push(chunk).unwrap());
+    }
+
+    assert_eq!(decoded, [event]);
+    assert!(decoder.buffer.is_empty());
+}
+
+#[test]
 fn sse_decoder_bounds_each_event_instead_of_the_transport_chunk() {
     let event = format!("data: {{\"payload\":\"{}\"}}\n\n", "x".repeat(1_024));
     let chunk = event.repeat(MAX_STREAM_EVENT_BYTES / event.len() + 1);
@@ -116,6 +144,31 @@ fn sse_decoder_rejects_an_oversized_non_data_line() {
 
     let error = decoder.push(line.as_bytes()).unwrap_err();
     assert!(error.to_string().contains("oversized SSE event"));
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_fragmented_large_sse_event() {
+    const CHUNK_BYTES: usize = 1_024;
+    let frame = format!(
+        "data: {{\"type\":\"response.created\",\"payload\":\"{}\"}}\n\n",
+        "x".repeat(MAX_STREAM_EVENT_BYTES - 128),
+    );
+    let mut decoder = SseDecoder::default();
+    let started = std::time::Instant::now();
+    let mut events = Vec::new();
+
+    for chunk in frame.as_bytes().chunks(CHUNK_BYTES) {
+        events.extend(decoder.push(chunk).unwrap());
+    }
+
+    assert_eq!(events.len(), 1);
+    std::hint::black_box(events);
+    eprintln!(
+        "{}-byte SSE frame in {CHUNK_BYTES}-byte chunks: {:?}",
+        frame.len(),
+        started.elapsed(),
+    );
 }
 
 #[test]
@@ -622,6 +675,39 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
         client_turn_metadata["turn_started_at_unix_ms"]
     );
     assert!(header_turn_metadata.get("code_mode_tool_names").is_none());
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn http_transport_collects_large_sse_events_from_small_http_chunks() {
+    let text = "x".repeat(256 * 1_024);
+    let item = json!({
+        "id": "msg_fragmented",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    });
+    let (base_url, requests, server) = spawn_http_server(vec![
+        HttpReply::ok("text/event-stream", completed_sse("resp_fragmented", &item))
+            .in_chunks_of(1_024),
+    ]);
+    let mut client = test_client(base_url);
+    client.prefer_websocket = false;
+    let (completed_items, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let response = client
+        .respond(vec![user_message("large response")], &completed_items)
+        .await
+        .unwrap();
+
+    assert_eq!(response.items.as_slice(), std::slice::from_ref(&item));
+    assert_eq!(response.text, text);
+    assert_eq!(completed_rx.try_recv().unwrap(), item);
+    assert!(completed_rx.try_recv().is_err());
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(2)).unwrap().path,
+        "/responses"
+    );
     server.join().unwrap();
 }
 
@@ -1147,6 +1233,7 @@ struct HttpReply {
     content_type: &'static str,
     body: String,
     headers: Vec<(&'static str, &'static str)>,
+    body_chunk_bytes: Option<usize>,
 }
 
 impl HttpReply {
@@ -1160,11 +1247,18 @@ impl HttpReply {
             content_type,
             body: body.into(),
             headers: Vec::new(),
+            body_chunk_bytes: None,
         }
     }
 
     fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
         self.headers.push((name, value));
+        self
+    }
+
+    fn in_chunks_of(mut self, bytes: usize) -> Self {
+        assert!(bytes > 0);
+        self.body_chunk_bytes = Some(bytes);
         self
     }
 }
@@ -1202,17 +1296,28 @@ fn spawn_http_server(
                 .iter()
                 .map(|(name, value)| format!("{name}: {value}\r\n"))
                 .collect::<String>();
+            let body_framing = reply.body_chunk_bytes.map_or_else(
+                || format!("Content-Length: {}\r\n", reply.body.len()),
+                |_| "Transfer-Encoding: chunked\r\n".to_string(),
+            );
             write!(
                 stream,
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
-                reply.status,
-                reason,
-                reply.content_type,
-                reply.body.len(),
-                extra_headers,
-                reply.body,
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{}{}Connection: close\r\n\r\n",
+                reply.status, reason, reply.content_type, body_framing, extra_headers,
             )
             .unwrap();
+            if let Some(chunk_bytes) = reply.body_chunk_bytes {
+                stream.set_nodelay(true).unwrap();
+                for chunk in reply.body.as_bytes().chunks(chunk_bytes) {
+                    write!(stream, "{:x}\r\n", chunk.len()).unwrap();
+                    stream.write_all(chunk).unwrap();
+                    stream.write_all(b"\r\n").unwrap();
+                    stream.flush().unwrap();
+                }
+                stream.write_all(b"0\r\n\r\n").unwrap();
+            } else {
+                stream.write_all(reply.body.as_bytes()).unwrap();
+            }
             stream.flush().unwrap();
         }
     });

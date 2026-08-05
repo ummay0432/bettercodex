@@ -14,7 +14,9 @@ use crate::usage::TokenUsage;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Context;
+use bytes::Buf;
 use bytes::Bytes;
+use bytes::BytesMut;
 use codex_client::backoff;
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_ENCODING;
@@ -1484,30 +1486,35 @@ fn text_from_items(items: &[Value]) -> String {
 
 #[derive(Default)]
 struct SseDecoder {
-    buffer: Vec<u8>,
-    data_lines: Vec<String>,
-    data_bytes: usize,
+    buffer: BytesMut,
+    scanned: usize,
+    event_data: String,
+    has_data: bool,
 }
 
 impl SseDecoder {
     fn push(&mut self, chunk: &[u8]) -> ApiResult<Vec<String>> {
         self.buffer.extend_from_slice(chunk);
-        let buffer = std::mem::take(&mut self.buffer);
         let mut events = Vec::new();
         let mut line_start = 0_usize;
-        for (newline, _) in buffer
+        let mut search_start = self.scanned;
+        while let Some(relative_newline) = self.buffer[search_start..]
             .iter()
-            .enumerate()
-            .filter(|(_, byte)| **byte == b'\n')
+            .position(|byte| *byte == b'\n')
         {
-            let mut line = &buffer[line_start..newline];
+            let newline = search_start + relative_newline;
+            let mut line = &self.buffer[line_start..newline];
             if line.last() == Some(&b'\r') {
                 line = &line[..line.len() - 1];
             }
-            self.process_line(line, &mut events)?;
+            Self::process_line(line, &mut self.event_data, &mut self.has_data, &mut events)?;
             line_start = newline.saturating_add(1);
+            search_start = line_start;
         }
-        self.buffer.extend_from_slice(&buffer[line_start..]);
+        self.buffer.advance(line_start);
+        // The retained suffix contains no newline. Resume at its end after the next chunk instead
+        // of rescanning an arbitrarily large partial event from its first byte.
+        self.scanned = self.buffer.len();
         if self.buffer.len() > MAX_STREAM_EVENT_BYTES {
             return Err(ApiError::fatal("model sent an oversized SSE event"));
         }
@@ -1518,39 +1525,51 @@ impl SseDecoder {
         let mut events = Vec::new();
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
-            self.process_line(&line, &mut events)?;
+            Self::process_line(&line, &mut self.event_data, &mut self.has_data, &mut events)?;
+            self.scanned = 0;
         }
-        if !self.data_lines.is_empty() {
-            events.push(self.take_event());
+        if self.has_data {
+            events.push(Self::take_event(&mut self.event_data, &mut self.has_data));
         }
         Ok(events)
     }
 
-    fn process_line(&mut self, line: &[u8], events: &mut Vec<String>) -> ApiResult<()> {
+    fn process_line(
+        line: &[u8],
+        event_data: &mut String,
+        has_data: &mut bool,
+        events: &mut Vec<String>,
+    ) -> ApiResult<()> {
         if line.len() > MAX_STREAM_EVENT_BYTES {
             return Err(ApiError::fatal("model sent an oversized SSE event"));
         }
         let line =
             std::str::from_utf8(line).map_err(|_| ApiError::fatal("SSE stream was not UTF-8"))?;
         if line.is_empty() {
-            if !self.data_lines.is_empty() {
-                events.push(self.take_event());
+            if *has_data {
+                events.push(Self::take_event(event_data, has_data));
             }
         } else if let Some(data) = line.strip_prefix("data:") {
             let data = data.strip_prefix(' ').unwrap_or(data);
-            self.data_bytes = self
-                .data_bytes
-                .checked_add(data.len() + usize::from(!self.data_lines.is_empty()))
+            let separator_bytes = usize::from(*has_data);
+            event_data
+                .len()
+                .checked_add(separator_bytes)
+                .and_then(|bytes| bytes.checked_add(data.len()))
                 .filter(|bytes| *bytes <= MAX_STREAM_EVENT_BYTES)
                 .ok_or_else(|| ApiError::fatal("model sent an oversized SSE event"))?;
-            self.data_lines.push(data.to_string());
+            if *has_data {
+                event_data.push('\n');
+            }
+            event_data.push_str(data);
+            *has_data = true;
         }
         Ok(())
     }
 
-    fn take_event(&mut self) -> String {
-        self.data_bytes = 0;
-        std::mem::take(&mut self.data_lines).join("\n")
+    fn take_event(event_data: &mut String, has_data: &mut bool) -> String {
+        *has_data = false;
+        std::mem::take(event_data)
     }
 }
 
