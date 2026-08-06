@@ -6,6 +6,9 @@ use super::file_search::FileSearchPopup;
 use super::file_search::FileSearchUpdate;
 use super::file_search::is_horizontal_whitespace;
 use super::markdown;
+use super::markdown_cache::MarkdownRenderCache;
+use super::palette;
+use super::palette::TerminalColors;
 use super::pending_input::PendingInput;
 use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
@@ -13,6 +16,8 @@ use super::resume_picker::ResumePickerAction;
 use super::skill_popup::SkillPopup;
 use super::skills_view::SkillsView;
 use super::skills_view::SkillsViewAction;
+use super::terminal_hyperlinks;
+use super::terminal_hyperlinks::HyperlinkLine;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
 use crate::MODEL;
@@ -167,7 +172,7 @@ pub(super) struct PreparedView {
     width: u16,
     height: u16,
     active_height: u16,
-    active_lines: Vec<Line<'static>>,
+    active_lines: Vec<HyperlinkLine>,
 }
 
 impl PreparedView {
@@ -182,7 +187,7 @@ enum TranscriptEntry {
     Assistant {
         text: String,
         streaming: bool,
-        rendered: Option<RenderedAssistant>,
+        rendered: MarkdownRenderCache,
     },
     Tool(ToolEntry),
     Exploration {
@@ -194,12 +199,6 @@ enum TranscriptEntry {
     FinalMessageSeparator {
         elapsed_seconds: Option<u64>,
     },
-}
-
-#[derive(Debug)]
-struct RenderedAssistant {
-    width: u16,
-    lines: Vec<Line<'static>>,
 }
 
 #[derive(Debug)]
@@ -330,14 +329,7 @@ enum Overlay {
     Tools(ToolCatalogueView),
 }
 
-#[derive(Clone, Copy)]
-struct TerminalColors {
-    foreground: (u8, u8, u8),
-    background: (u8, u8, u8),
-}
-
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
-static TERMINAL_COLORS: OnceLock<TerminalColors> = OnceLock::new();
 
 impl View {
     pub(super) fn new(cwd: &Path) -> Self {
@@ -382,12 +374,7 @@ impl View {
         background: Option<(u8, u8, u8)>,
     ) {
         self.user_message_style = user_message_style_for(background);
-        if let (Some(foreground), Some(background)) = (foreground, background) {
-            let _ = TERMINAL_COLORS.set(TerminalColors {
-                foreground,
-                background,
-            });
-        }
+        palette::set_terminal_colors(foreground, background);
     }
 
     pub(super) fn seed_prompt_history(&mut self, history: impl IntoIterator<Item = String>) {
@@ -520,7 +507,7 @@ impl View {
                     self.entries.push(TranscriptEntry::Assistant {
                         text: answer,
                         streaming: false,
-                        rendered: None,
+                        rendered: MarkdownRenderCache::default(),
                     });
                 }
                 if turn_had_work {
@@ -648,7 +635,7 @@ impl View {
                 SessionTranscriptItem::Assistant { text } => TranscriptEntry::Assistant {
                     text,
                     streaming: false,
-                    rendered: None,
+                    rendered: MarkdownRenderCache::default(),
                 },
             }));
     }
@@ -703,17 +690,14 @@ impl View {
                 self.assistant_received_this_turn = true;
                 match self.entries.last_mut() {
                     Some(TranscriptEntry::Assistant {
-                        text,
-                        streaming,
-                        rendered,
+                        text, streaming, ..
                     }) if *streaming => {
                         text.push_str(&delta);
-                        *rendered = None;
                     }
                     _ => self.entries.push(TranscriptEntry::Assistant {
                         text: delta,
                         streaming: true,
-                        rendered: None,
+                        rendered: MarkdownRenderCache::default(),
                     }),
                 }
                 self.status_detail = None;
@@ -1274,12 +1258,12 @@ impl View {
             })
     }
 
-    pub(super) fn take_pending_history_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    pub(super) fn take_pending_history_lines(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let width = width.max(1);
         let mut lines = Vec::new();
         if self.welcome_pending {
             append_history_cell(
-                welcome_lines(&self.cwd, width),
+                terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(&self.cwd, width)),
                 &mut lines,
                 &mut self.history_emitted,
             );
@@ -1292,7 +1276,7 @@ impl View {
         {
             let entry = &mut self.entries[self.committed_entries];
             append_history_cell(
-                entry.display_lines(width, self.user_message_style),
+                entry.display_lines(width, self.user_message_style, &self.cwd),
                 &mut lines,
                 &mut self.history_emitted,
             );
@@ -1306,7 +1290,7 @@ impl View {
     /// A terminal can reflow the mutable composer into scrollback before crossterm delivers the
     /// resize event. Codex repairs that state by clearing its terminal surface and replaying the
     /// retained transcript at the new width instead of trusting terminal-wrapped rows.
-    pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<Line<'static>> {
+    pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let width = width.max(1);
         while self
             .entries
@@ -1318,10 +1302,14 @@ impl View {
 
         let mut lines = Vec::new();
         let mut emitted = false;
-        append_history_cell(welcome_lines(&self.cwd, width), &mut lines, &mut emitted);
+        append_history_cell(
+            terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(&self.cwd, width)),
+            &mut lines,
+            &mut emitted,
+        );
         for entry in &mut self.entries[..self.committed_entries] {
             append_history_cell(
-                entry.display_lines(width, self.user_message_style),
+                entry.display_lines(width, self.user_message_style, &self.cwd),
                 &mut lines,
                 &mut emitted,
             );
@@ -1563,12 +1551,14 @@ impl View {
         if lines.is_empty() {
             return;
         }
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(terminal_hyperlinks::visible_lines_ref(&lines)))
+            .wrap(Wrap { trim: false });
         let overflow = usize::from(active_height).saturating_sub(usize::from(area.height));
         frame.render_widget(
             paragraph.scroll((u16::try_from(overflow).unwrap_or(u16::MAX), 0)),
             area,
         );
+        terminal_hyperlinks::mark_buffer_hyperlinks(frame.buffer_mut(), area, &lines, overflow);
     }
 
     fn render_composer(
@@ -1864,12 +1854,12 @@ impl View {
         truncate_line(Line::from(spans), usize::from(width))
     }
 
-    fn active_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    fn active_lines(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let mut lines = Vec::new();
         let mut emitted = self.history_emitted;
         for entry in &mut self.entries[self.committed_entries..] {
             append_history_cell(
-                entry.display_lines(width, self.user_message_style),
+                entry.display_lines(width, self.user_message_style, &self.cwd),
                 &mut lines,
                 &mut emitted,
             );
@@ -1912,33 +1902,14 @@ impl TranscriptEntry {
         }
     }
 
-    fn display_lines(&mut self, width: u16, user_style: Style) -> Vec<Line<'static>> {
-        match self {
+    fn display_lines(&mut self, width: u16, user_style: Style, cwd: &Path) -> Vec<HyperlinkLine> {
+        let plain_lines = match self {
             Self::User(message) => user_message_lines(message, width, user_style),
             Self::Assistant {
                 text,
                 streaming,
                 rendered,
-            } => {
-                if rendered.as_ref().is_none_or(|cached| cached.width != width) {
-                    *rendered = Some(RenderedAssistant {
-                        width,
-                        lines: assistant_lines(text, width),
-                    });
-                }
-                if *streaming {
-                    rendered
-                        .as_ref()
-                        .expect("streaming assistant rendering was cached")
-                        .lines
-                        .clone()
-                } else {
-                    rendered
-                        .take()
-                        .expect("finalized assistant rendering was cached")
-                        .lines
-                }
-            }
+            } => return assistant_lines(text, width, cwd, *streaming, rendered),
             Self::Tool(tool) => tool.display_lines(width, user_style),
             Self::Exploration { tools, .. } => exploration_lines(tools, width),
             Self::Notice(message) => vec![Line::from(vec![
@@ -1952,7 +1923,8 @@ impl TranscriptEntry {
             Self::FinalMessageSeparator { elapsed_seconds } => {
                 final_message_separator_lines(*elapsed_seconds, width)
             }
-        }
+        };
+        terminal_hyperlinks::plain_hyperlink_lines(plain_lines)
     }
 }
 
@@ -2897,13 +2869,19 @@ fn styled_skill_mentions(
     spans
 }
 
-fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
-    let rendered = markdown::render(message);
-    let mut wrapped = Vec::new();
-    for line in rendered {
-        wrapped.extend(wrap_styled_line(&line, width.saturating_sub(2).max(1)));
-    }
-    prefix_styled_lines(wrapped, "• ", "  ")
+fn assistant_lines(
+    message: &str,
+    width: u16,
+    cwd: &Path,
+    streaming: bool,
+    cache: &mut MarkdownRenderCache,
+) -> Vec<HyperlinkLine> {
+    let content_width = usize::from(width.saturating_sub(2).max(1));
+    terminal_hyperlinks::prefix_hyperlink_lines(
+        cache.render(message, content_width, cwd, streaming),
+        Span::from("• ").dim(),
+        Span::from("  "),
+    )
 }
 
 fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Vec<Line<'static>> {
@@ -3352,26 +3330,6 @@ fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     rows
 }
 
-fn prefix_styled_lines(
-    lines: Vec<Line<'static>>,
-    initial: &'static str,
-    subsequent: &'static str,
-) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            let mut spans = vec![if index == 0 {
-                Span::from(initial).dim()
-            } else {
-                Span::from(subsequent)
-            }];
-            spans.append(&mut line.spans);
-            Line::from(spans).style(line.style)
-        })
-        .collect()
-}
-
 fn prefix_lines(
     output: &mut Vec<Line<'static>>,
     lines: Vec<Line<'static>>,
@@ -3390,15 +3348,15 @@ fn prefix_lines(
 }
 
 fn append_history_cell(
-    mut cell: Vec<Line<'static>>,
-    output: &mut Vec<Line<'static>>,
+    mut cell: Vec<HyperlinkLine>,
+    output: &mut Vec<HyperlinkLine>,
     emitted: &mut bool,
 ) {
     if cell.is_empty() {
         return;
     }
     if *emitted {
-        output.push(Line::default());
+        output.push(HyperlinkLine::default());
     } else {
         *emitted = true;
     }
@@ -3419,11 +3377,11 @@ fn line_count_spans(added: usize, removed: Option<usize>) -> Vec<Span<'static>> 
     ]
 }
 
-fn rendered_line_count(lines: &[Line<'static>], width: u16) -> u16 {
+fn rendered_line_count(lines: &[HyperlinkLine], width: u16) -> u16 {
     if lines.is_empty() {
         return 0;
     }
-    Paragraph::new(Text::from(lines.to_vec()))
+    Paragraph::new(Text::from(terminal_hyperlinks::visible_lines_ref(lines)))
         .wrap(Wrap { trim: false })
         .line_count(width.max(1))
         .try_into()
@@ -3469,7 +3427,7 @@ fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
     shimmer_spans_at(
         text,
         started.elapsed(),
-        TERMINAL_COLORS.get().copied(),
+        palette::terminal_colors(),
         supports_true_color(),
     )
 }
@@ -4359,7 +4317,8 @@ mod tests {
             .take_pending_history_lines(80)
             .into_iter()
             .map(|line| {
-                line.spans
+                line.line
+                    .spans
                     .into_iter()
                     .map(|span| span.content.into_owned())
                     .collect::<String>()
@@ -5593,8 +5552,32 @@ mod tests {
         }
     }
 
-    fn plain(line: &Line<'_>) -> String {
-        line.spans
+    trait PlainLine {
+        fn line(&self) -> &Line<'_>;
+    }
+
+    impl PlainLine for Line<'_> {
+        fn line(&self) -> &Line<'_> {
+            self
+        }
+    }
+
+    impl PlainLine for HyperlinkLine {
+        fn line(&self) -> &Line<'_> {
+            &self.line
+        }
+    }
+
+    impl<T: PlainLine + ?Sized> PlainLine for &T {
+        fn line(&self) -> &Line<'_> {
+            (*self).line()
+        }
+    }
+
+    fn plain<T: PlainLine>(value: &T) -> String {
+        value
+            .line()
+            .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
