@@ -1,4 +1,5 @@
 mod clipboard;
+mod clipboard_paste;
 mod context_window;
 mod editor;
 mod file_search;
@@ -247,8 +248,19 @@ impl Runtime {
                     self.file_search
                         .on_query_changed(self.view.file_search_query());
                     redraw = true;
-                    if self.handle_action(action)? {
-                        break;
+                    match action {
+                        Action::Suspend => {
+                            drop(input);
+                            terminal.suspend_process()?;
+                            self.view.request_full_reflow();
+                            self.terminal_focused = true;
+                            input = EventStream::new();
+                        }
+                        action => {
+                            if self.handle_action(action)? {
+                                break;
+                            }
+                        }
                     }
                 }
                 event = receive_agent_event(&mut self.turn_events) => {
@@ -377,7 +389,7 @@ impl Runtime {
         match action {
             Action::None => {}
             Action::Submit(prompt) => {
-                self.persist_prompt(prompt.as_str());
+                self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
                     let steering = self
                         .turn_handle
@@ -392,7 +404,7 @@ impl Runtime {
                 }
             }
             Action::Queue(prompt) => {
-                self.persist_prompt(prompt.as_str());
+                self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
                     self.view.queue_follow_up(prompt);
                 } else {
@@ -424,6 +436,9 @@ impl Runtime {
                 let processes = self.processes.list_background_processes();
                 self.view.set_background_processes(processes.clone());
                 self.view.add_background_process_list(processes);
+            }
+            Action::Suspend => {
+                unreachable!("terminal lifecycle actions are handled by the event loop")
             }
             Action::Clear => {
                 if self.has_local_session_activity() {

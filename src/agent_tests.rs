@@ -454,12 +454,13 @@ async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() 
         tools,
         resumed_transcript: Vec::new(),
     };
-    let prompt = UserPrompt::with_skill_mentions(
+    let prompt = UserPrompt::with_attachments(
         "use $demo now",
         vec![SkillMention::new(
             SkillSelection::new("demo", service_skill.canonicalize().unwrap()),
             4..9,
         )],
+        Vec::new(),
     );
     let (events_tx, _events_rx) = unbounded_channel();
     let (_handle, control) = TurnControl::channel();

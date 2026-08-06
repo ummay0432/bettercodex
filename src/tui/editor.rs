@@ -1,3 +1,6 @@
+use crate::input::MAX_TOTAL_IMAGE_BYTES;
+use crate::input::PromptImage;
+use crate::input::PromptImageAttachment;
 use crate::input::UserPrompt;
 use crate::skills::SkillMention;
 use crate::skills::SkillSelection;
@@ -20,6 +23,7 @@ pub(super) struct Editor {
     saved_draft: String,
     pending_pastes: Vec<PendingPaste>,
     skill_mentions: Vec<SkillMention>,
+    image_attachments: Vec<PromptImageAttachment>,
     history_search: Option<HistorySearchSession>,
 }
 
@@ -55,6 +59,7 @@ struct EditorSnapshot {
     saved_draft: String,
     pending_pastes: Vec<PendingPaste>,
     skill_mentions: Vec<SkillMention>,
+    image_attachments: Vec<PromptImageAttachment>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,6 +69,8 @@ pub(super) struct EditorLayout {
     pub(super) paste_ranges: Vec<Vec<Range<usize>>>,
     /// Byte ranges within each visible line that represent selected skill mentions.
     pub(super) skill_ranges: Vec<Vec<Range<usize>>>,
+    /// Byte ranges within each visible line that represent attached images.
+    pub(super) image_ranges: Vec<Vec<Range<usize>>>,
     /// Byte ranges within each visible line matching the active Ctrl+R query.
     pub(super) history_search_ranges: Vec<Vec<Range<usize>>>,
     pub(super) cursor_row: u16,
@@ -82,6 +89,10 @@ impl Editor {
 
     pub(super) fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    pub(super) fn image_count(&self) -> usize {
+        self.image_attachments.len()
     }
 
     pub(super) fn history_search_active(&self) -> bool {
@@ -196,24 +207,52 @@ impl Editor {
         self.preferred_column = None;
         self.pending_pastes.clear();
         self.skill_mentions.clear();
+        self.image_attachments.clear();
     }
 
-    pub(super) fn set_prompt(&mut self, text: impl Into<String>, mentions: &[SkillMention]) {
-        self.set_text(text);
-        self.bind_skill_mentions(mentions, 0);
+    pub(super) fn set_user_prompt(&mut self, prompt: &UserPrompt) {
+        self.set_text(prompt.as_str());
+        self.bind_skill_mentions(prompt.skill_mentions(), 0);
+        self.bind_image_attachments(prompt.image_attachments(), 0);
     }
 
-    pub(super) fn prepend_prompt(&mut self, text: &str, mentions: &[SkillMention]) {
-        if text.is_empty() {
+    pub(super) fn prepend_user_prompt(&mut self, prompt: &UserPrompt) {
+        if prompt.as_str().is_empty() {
             return;
         }
-        self.prepend(text);
-        self.bind_skill_mentions(mentions, 0);
+        let text = format!("{}\n\n", prompt.as_str());
+        self.prepend(&text);
+        self.bind_skill_mentions(prompt.skill_mentions(), 0);
+        self.bind_image_attachments(prompt.image_attachments(), 0);
     }
 
     pub(super) fn take_prompt(&mut self) -> UserPrompt {
-        let (text, mentions) = self.take_contents();
-        UserPrompt::with_skill_mentions(text, mentions)
+        let (text, mentions, images) = self.take_contents();
+        UserPrompt::with_attachments(text, mentions, images)
+    }
+
+    pub(super) fn attach_image(&mut self, image: PromptImage) -> Result<(), String> {
+        let total = self
+            .image_attachments
+            .iter()
+            .map(|attachment| attachment.image().byte_len())
+            .try_fold(image.byte_len(), usize::checked_add)
+            .filter(|total| *total <= MAX_TOTAL_IMAGE_BYTES)
+            .ok_or_else(|| {
+                format!(
+                    "attached images exceed bettercodex's {} MiB input limit",
+                    MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
+                )
+            })?;
+        debug_assert!(total <= MAX_TOTAL_IMAGE_BYTES);
+        let placeholder = self.next_image_placeholder();
+        let start = self.cursor;
+        self.insert(&placeholder);
+        self.image_attachments.push(PromptImageAttachment::new(
+            image,
+            start..start.saturating_add(placeholder.len()),
+        ));
+        Ok(())
     }
 
     pub(super) fn remember(&mut self, text: &str) {
@@ -490,6 +529,22 @@ impl Editor {
                 highlights
             })
             .collect();
+        let image_ranges = visible_ranges
+            .iter()
+            .map(|line| {
+                let mut highlights = self
+                    .image_attachments
+                    .iter()
+                    .filter_map(|attachment| {
+                        let start = attachment.range().start.max(line.start);
+                        let end = attachment.range().end.min(line.end);
+                        (start < end).then_some(start - line.start..end - line.start)
+                    })
+                    .collect::<Vec<_>>();
+                highlights.sort_by_key(|range| range.start);
+                highlights
+            })
+            .collect();
         let search_ranges = self.history_search_match_ranges();
         let history_search_ranges = visible_ranges
             .iter()
@@ -508,6 +563,7 @@ impl Editor {
             lines,
             paste_ranges,
             skill_ranges,
+            image_ranges,
             history_search_ranges,
             cursor_row: (cursor_line - first) as u16,
             cursor_column: display_width(&self.text[ranges[cursor_line].start..self.cursor]) as u16,
@@ -537,6 +593,16 @@ impl Editor {
             }
             if mention.range().start >= range.end {
                 shift_range(mention.range_mut(), removed_len, inserted_len);
+                return true;
+            }
+            false
+        });
+        self.image_attachments.retain_mut(|attachment| {
+            if attachment.range().end <= range.start {
+                return true;
+            }
+            if attachment.range().start >= range.end {
+                shift_range(attachment.range_mut(), removed_len, inserted_len);
                 return true;
             }
             false
@@ -623,6 +689,19 @@ impl Editor {
         }
     }
 
+    fn next_image_placeholder(&self) -> String {
+        let mut number = 1_usize;
+        loop {
+            let placeholder = format!("[Image {number}]");
+            if self.image_attachments.iter().all(|attachment| {
+                self.text.get(attachment.range().clone()) != Some(placeholder.as_str())
+            }) {
+                return placeholder;
+            }
+            number = number.saturating_add(1);
+        }
+    }
+
     fn expanded_text(&self) -> String {
         let mut pastes = self.pending_pastes.iter().collect::<Vec<_>>();
         pastes.sort_by_key(|paste| paste.range.start);
@@ -702,6 +781,7 @@ impl Editor {
         self.preferred_column = None;
         self.pending_pastes.clear();
         self.skill_mentions.clear();
+        self.image_attachments.clear();
     }
 
     fn snapshot(&self) -> EditorSnapshot {
@@ -713,6 +793,7 @@ impl Editor {
             saved_draft: self.saved_draft.clone(),
             pending_pastes: self.pending_pastes.clone(),
             skill_mentions: self.skill_mentions.clone(),
+            image_attachments: self.image_attachments.clone(),
         }
     }
 
@@ -724,6 +805,7 @@ impl Editor {
         self.saved_draft = snapshot.saved_draft;
         self.pending_pastes = snapshot.pending_pastes;
         self.skill_mentions = snapshot.skill_mentions;
+        self.image_attachments = snapshot.image_attachments;
     }
 
     fn history_search_match_ranges(&self) -> Vec<Range<usize>> {
@@ -742,6 +824,11 @@ impl Editor {
             .iter()
             .map(|paste| &paste.range)
             .chain(self.skill_mentions.iter().map(SkillMention::range))
+            .chain(
+                self.image_attachments
+                    .iter()
+                    .map(PromptImageAttachment::range),
+            )
     }
 
     fn bind_skill_mentions(&mut self, mentions: &[SkillMention], offset: usize) {
@@ -752,10 +839,31 @@ impl Editor {
         }
     }
 
-    fn take_contents(&mut self) -> (String, Vec<SkillMention>) {
+    fn bind_image_attachments(&mut self, attachments: &[PromptImageAttachment], offset: usize) {
+        for attachment in attachments {
+            let range = offset.saturating_add(attachment.range().start)
+                ..offset.saturating_add(attachment.range().end);
+            if range.start < range.end
+                && range.end <= self.text.len()
+                && !self
+                    .atomic_ranges()
+                    .any(|atomic| ranges_overlap(atomic, &range))
+            {
+                self.image_attachments.push(PromptImageAttachment::new(
+                    attachment.image().clone(),
+                    range,
+                ));
+            }
+        }
+    }
+
+    fn take_contents(&mut self) -> (String, Vec<SkillMention>, Vec<PromptImageAttachment>) {
         self.skill_mentions
             .sort_by_key(|mention| mention.range().start);
         let mut mentions = std::mem::take(&mut self.skill_mentions);
+        self.image_attachments
+            .sort_by_key(|attachment| attachment.range().start);
+        let mut images = std::mem::take(&mut self.image_attachments);
         let text = if self.pending_pastes.is_empty() {
             std::mem::take(&mut self.text)
         } else {
@@ -771,6 +879,18 @@ impl Editor {
                     }
                 }
             }
+            for attachment in &mut images {
+                let original_start = attachment.range().start;
+                for paste in &self.pending_pastes {
+                    if paste.range.end <= original_start {
+                        shift_range(
+                            attachment.range_mut(),
+                            paste.placeholder.len(),
+                            paste.content.len(),
+                        );
+                    }
+                }
+            }
             let expanded = self.expanded_text();
             self.text.clear();
             self.pending_pastes.clear();
@@ -780,7 +900,7 @@ impl Editor {
         self.preferred_column = None;
         self.history_index = None;
         self.saved_draft.clear();
-        (text, mentions)
+        (text, mentions, images)
     }
 }
 
@@ -1192,7 +1312,7 @@ mod tests {
             ]
         );
 
-        editor.set_prompt(prompt.as_str(), prompt.skill_mentions());
+        editor.set_user_prompt(&prompt);
         assert_eq!(editor.skill_ranges(), [0..5, 11..16]);
         assert_eq!(editor.take_prompt(), prompt);
 
@@ -1234,6 +1354,30 @@ mod tests {
 
         editor.insert_paste(paste);
         assert_eq!(editor.text(), format!("{base}{second}"));
+    }
+
+    #[test]
+    fn image_attachments_are_atomic_composer_elements() {
+        let image = PromptImage::from_bytes(
+            std::path::Path::new("screen.png"),
+            b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            crate::input::ImageDetail::Original,
+        )
+        .unwrap();
+        let mut editor = Editor::default();
+        editor.insert("inspect ");
+        editor.attach_image(image).unwrap();
+
+        assert_eq!(editor.text(), "inspect [Image 1]");
+        assert_eq!(editor.image_count(), 1);
+        let layout = editor.layout(80, 8);
+        assert_eq!(layout.image_ranges.len(), 1);
+        assert_eq!(layout.image_ranges[0].len(), 1);
+        assert_eq!(layout.image_ranges[0][0], 8..17);
+
+        editor.backspace();
+        assert_eq!(editor.text(), "inspect ");
+        assert_eq!(editor.image_count(), 0);
     }
 
     #[test]

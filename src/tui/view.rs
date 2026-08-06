@@ -1,3 +1,4 @@
+use super::clipboard_paste;
 use super::context_window::ContextAction;
 use super::context_window::ContextWindowView;
 use super::editor;
@@ -171,6 +172,7 @@ pub(super) enum Action {
     ShowContext,
     ShowDiff,
     StopBackgroundProcesses,
+    Suspend,
     UpdateSkill {
         path: PathBuf,
         update: SkillUpdate,
@@ -231,7 +233,7 @@ impl PreparedView {
 
 #[derive(Debug)]
 enum TranscriptEntry {
-    User(UserPrompt),
+    User(DisplayedUserPrompt),
     Assistant {
         text: String,
         phase: Option<MessagePhase>,
@@ -251,6 +253,63 @@ enum TranscriptEntry {
     FinalMessageSeparator {
         elapsed_seconds: Option<u64>,
     },
+}
+
+#[derive(Debug)]
+struct DisplayedUserPrompt {
+    text: String,
+    model_text: String,
+    skill_mentions: Vec<crate::skills::SkillMention>,
+    image_ranges: Vec<std::ops::Range<usize>>,
+    image_count: usize,
+}
+
+impl DisplayedUserPrompt {
+    fn from_prompt(prompt: &UserPrompt) -> Self {
+        Self {
+            text: prompt.as_str().to_string(),
+            model_text: prompt.text_without_image_placeholders(),
+            skill_mentions: prompt.skill_mentions().to_vec(),
+            image_ranges: prompt
+                .image_attachments()
+                .iter()
+                .map(|attachment| attachment.range().clone())
+                .collect(),
+            image_count: prompt.image_count(),
+        }
+    }
+
+    fn replayed(mut text: String, image_count: usize) -> Self {
+        let model_text = text.clone();
+        let mut image_ranges = Vec::with_capacity(image_count);
+        for index in 0..image_count {
+            if !text.trim().is_empty() || index > 0 {
+                text.push_str("\n\n");
+            }
+            let start = text.len();
+            text.push_str(&format!("[Image {}]", index + 1));
+            image_ranges.push(start..text.len());
+        }
+        Self {
+            text,
+            model_text,
+            skill_mentions: Vec::new(),
+            image_ranges,
+            image_count,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn skill_mentions(&self) -> &[crate::skills::SkillMention] {
+        &self.skill_mentions
+    }
+
+    fn image_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.image_ranges
+    }
 }
 
 /// Rows from an in-flight assistant cell that have already moved into terminal scrollback.
@@ -482,10 +541,17 @@ impl View {
         self.action_required
     }
 
+    pub(super) fn request_full_reflow(&mut self) {
+        self.resize_reflow_requested = true;
+    }
+
     pub(super) fn start_turn(&mut self, prompt: impl Into<UserPrompt>) {
         let prompt = prompt.into();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::User(prompt));
+        self.entries
+            .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
+                &prompt,
+            )));
         self.busy = true;
         self.action_required = false;
         self.interrupting = false;
@@ -514,7 +580,10 @@ impl View {
     pub(super) fn add_user_message(&mut self, prompt: &UserPrompt) {
         self.close_streaming_entries();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::User(prompt.clone()));
+        self.entries
+            .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
+                prompt,
+            )));
         self.reasoning_status.reset();
         self.status_detail = None;
     }
@@ -550,11 +619,9 @@ impl View {
         }
         let restored = UserPrompt::joined(prompts);
         if self.editor.is_empty() {
-            self.editor
-                .set_prompt(restored.as_str(), restored.skill_mentions());
+            self.editor.set_user_prompt(&restored);
         } else {
-            let text = format!("{}\n\n", restored.as_str());
-            self.editor.prepend_prompt(&text, restored.skill_mentions());
+            self.editor.prepend_user_prompt(&restored);
         }
         self.file_search.dismiss();
         self.skill_popup.hide();
@@ -684,8 +751,8 @@ impl View {
             .iter()
             .filter_map(|entry| match entry {
                 TranscriptEntry::User(prompt) => Some(SessionTranscriptItem::User {
-                    text: prompt.as_str().to_string(),
-                    image_count: 0,
+                    text: prompt.model_text.clone(),
+                    image_count: prompt.image_count,
                 }),
                 TranscriptEntry::Assistant {
                     text,
@@ -758,21 +825,8 @@ impl View {
     ) {
         self.entries
             .extend(transcript.into_iter().map(|item| match item {
-                SessionTranscriptItem::User {
-                    mut text,
-                    image_count,
-                } => {
-                    if image_count > 0 {
-                        if !text.trim().is_empty() {
-                            text.push_str("\n\n");
-                        }
-                        if image_count == 1 {
-                            text.push_str("[Image attachment]");
-                        } else {
-                            text.push_str(&format!("[{image_count} image attachments]"));
-                        }
-                    }
-                    TranscriptEntry::User(UserPrompt::text(text))
+                SessionTranscriptItem::User { text, image_count } => {
+                    TranscriptEntry::User(DisplayedUserPrompt::replayed(text, image_count))
                 }
                 SessionTranscriptItem::Assistant { text, phase } => TranscriptEntry::Assistant {
                     text,
@@ -975,7 +1029,11 @@ impl View {
             Event::Paste(_) if self.overlay.is_some() => Action::None,
             Event::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                self.editor.insert_paste(text);
+                if let Some(image) = clipboard_paste::image_from_pasted_path(&text) {
+                    self.attach_image(image);
+                } else {
+                    self.editor.insert_paste(text);
+                }
                 self.dismissed_slash = None;
                 self.slash_selection = 0;
                 Action::None
@@ -1007,6 +1065,10 @@ impl View {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        if control && key.code == KeyCode::Char('z') {
+            return Action::Suspend;
+        }
+
         if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
             return match picker.handle_key(key) {
                 ResumePickerAction::None => Action::None,
@@ -1024,7 +1086,21 @@ impl View {
             return self.handle_history_search_key(key);
         }
         if control && key.code == KeyCode::Char('c') {
-            return Action::Quit;
+            if self.overlay.is_some() {
+                self.overlay = None;
+                return Action::None;
+            }
+            if !self.editor.is_empty() {
+                self.editor.set_text("");
+                self.file_search.hide();
+                self.skill_popup.hide();
+                return Action::None;
+            }
+            return if self.busy {
+                Action::Cancel
+            } else {
+                Action::Quit
+            };
         }
         if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
             return match skills.handle_key(key, &self.skills) {
@@ -1206,10 +1282,11 @@ impl View {
             KeyCode::Char('h') if control && alt && !shift => {
                 self.editor.delete_previous_word();
             }
-            KeyCode::Char('l') if control => {}
             KeyCode::Char('b') if alt && !control => self.editor.move_word_left(),
             KeyCode::Char('f') if alt && !control => self.editor.move_word_right(),
-            KeyCode::Char(character) if (!control && !alt) || (control && alt) => {
+            KeyCode::Char(character)
+                if ((!control && !alt) || (control && alt)) && !character.is_control() =>
+            {
                 let mut bytes = [0; 4];
                 self.editor.insert(character.encode_utf8(&mut bytes));
             }
@@ -1260,7 +1337,7 @@ impl View {
             KeyCode::Backspace => self.editor.history_search_backspace(),
             KeyCode::Char('h') if control => self.editor.history_search_backspace(),
             KeyCode::Char('u') if control => self.editor.history_search_clear(),
-            KeyCode::Char(character) if !control && !alt => {
+            KeyCode::Char(character) if !control && !alt && !character.is_control() => {
                 let mut bytes = [0; 4];
                 self.editor
                     .history_search_insert(character.encode_utf8(&mut bytes));
@@ -1315,15 +1392,29 @@ impl View {
         }
     }
 
+    fn attach_image(&mut self, image: Result<crate::input::PromptImage, String>) {
+        let result = image.and_then(|image| self.editor.attach_image(image));
+        if let Err(error) = result {
+            self.entries.push(TranscriptEntry::Error(format!(
+                "Failed to attach image: {error}"
+            )));
+        }
+        self.file_search.dismiss();
+        self.skill_popup.hide();
+        self.dismissed_slash = None;
+        self.slash_selection = 0;
+    }
+
     fn submit_action(&mut self) -> Action {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
         let prompt = self.editor.take_prompt();
-        let text = prompt.as_str().to_string();
-        self.editor.remember(&text);
-        let command = text.trim();
-        if let Some(shell_command) = command.strip_prefix('!') {
+        let history_text = prompt.text_without_image_placeholders();
+        self.editor.remember(&history_text);
+        let command = history_text.trim();
+        let local_command = prompt.image_count() == 0;
+        if local_command && let Some(shell_command) = command.strip_prefix('!') {
             let shell_command = shell_command.trim();
             if shell_command.is_empty() {
                 self.entries.push(TranscriptEntry::Notice(
@@ -1336,7 +1427,8 @@ impl View {
                 history_text: command.to_string(),
             };
         }
-        if let Some(arguments) = command.strip_prefix("/resume")
+        if local_command
+            && let Some(arguments) = command.strip_prefix("/resume")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
             if self.busy {
@@ -1360,6 +1452,7 @@ impl View {
             };
         }
         match command {
+            _ if !local_command => Action::Submit(prompt),
             "/q" | "/quit" | "/exit" => Action::Quit,
             "/compact" if self.busy => {
                 self.entries.push(TranscriptEntry::Error(
@@ -1386,10 +1479,7 @@ impl View {
             "/clear" => Action::Clear,
             "/context" => Action::ShowContext,
             "/help" => {
-                self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · !command run shell · Ctrl+R search history · Ctrl+O copy latest answer · Tab queue follow-up · Alt+Up edit queue · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · $ skills · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
-                        .to_string(),
-                ));
+                self.overlay = Some(Overlay::Shortcuts);
                 Action::None
             }
             "/ps" => Action::ListBackgroundProcesses,
@@ -1416,7 +1506,7 @@ impl View {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
-        if is_local_command(self.editor.text().trim()) {
+        if self.editor.image_count() == 0 && is_local_command(self.editor.text().trim()) {
             self.entries.push(TranscriptEntry::Notice(
                 "Slash commands cannot be queued; use Enter or wait for the active turn"
                     .to_string(),
@@ -1424,8 +1514,8 @@ impl View {
             return Action::None;
         }
         let prompt = self.editor.take_prompt();
-        let text = prompt.as_str().to_string();
-        self.editor.remember(&text);
+        self.editor
+            .remember(&prompt.text_without_image_placeholders());
         Action::Queue(prompt)
     }
 
@@ -1768,7 +1858,7 @@ impl View {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
         };
         let overlay_height = match self.overlay.as_ref() {
-            Some(Overlay::Shortcuts) => 17,
+            Some(Overlay::Shortcuts) => 22,
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills),
@@ -1980,6 +2070,7 @@ impl View {
             lines,
             paste_ranges,
             skill_ranges,
+            image_ranges,
             history_search_ranges,
             cursor_row,
             cursor_column,
@@ -2006,6 +2097,10 @@ impl View {
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
                     skill_ranges
+                        .get(usize::from(index))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    image_ranges
                         .get(usize::from(index))
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
@@ -2058,7 +2153,7 @@ impl View {
     }
 
     fn render_shortcuts(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered(area, 62, 15);
+        let popup = centered(area, 72, 20);
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .title(" Keyboard shortcuts ")
@@ -2083,7 +2178,8 @@ impl View {
             ),
             shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
             shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
-            shortcut_line("Ctrl+C", "exit"),
+            shortcut_line("Ctrl+C", "clear draft, interrupt work, or exit when idle"),
+            shortcut_line("Ctrl+Z", "suspend bettercodex on Unix"),
             Line::from(""),
             Line::from("Press any key to close").dim(),
         ];
@@ -3313,7 +3409,11 @@ fn display_tool_path(path: &Path, cwd: &Path) -> String {
     )
 }
 
-fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Line<'static>> {
+fn user_message_lines(
+    message: &DisplayedUserPrompt,
+    width: u16,
+    style: Style,
+) -> Vec<Line<'static>> {
     let (message_text, skill_ranges) = sanitized_prompt(message);
     let message_text = message_text.trim_end_matches(['\r', '\n']);
     let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS + 1).max(1);
@@ -3339,17 +3439,31 @@ fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Lin
     lines
 }
 
-fn sanitized_prompt(message: &UserPrompt) -> (String, Vec<std::ops::Range<usize>>) {
+fn sanitized_prompt(message: &DisplayedUserPrompt) -> (String, Vec<std::ops::Range<usize>>) {
     let mut text = String::with_capacity(message.as_str().len());
-    let mut ranges = Vec::with_capacity(message.skill_mentions().len());
+    let mut source_ranges = message
+        .skill_mentions()
+        .iter()
+        .filter_map(|mention| {
+            let range = mention.range();
+            (range.end <= message.as_str().len()
+                && message.as_str().get(range.clone())
+                    == Some(format!("${}", mention.selection().name()).as_str()))
+            .then_some(range.clone())
+        })
+        .chain(message.image_ranges().iter().filter_map(|range| {
+            message
+                .as_str()
+                .get(range.clone())
+                .is_some_and(|label| label.starts_with("[Image ") && label.ends_with(']'))
+                .then_some(range.clone())
+        }))
+        .collect::<Vec<_>>();
+    source_ranges.sort_by_key(|range| range.start);
+    let mut ranges = Vec::with_capacity(source_ranges.len());
     let mut cursor = 0_usize;
-    for mention in message.skill_mentions() {
-        let range = mention.range();
-        if range.start < cursor
-            || range.end > message.as_str().len()
-            || message.as_str().get(range.clone())
-                != Some(format!("${}", mention.selection().name()).as_str())
-        {
+    for range in source_ranges {
+        if range.start < cursor {
             continue;
         }
         text.push_str(&markdown::sanitize(&message.as_str()[cursor..range.start]));
@@ -4098,11 +4212,13 @@ fn editor_line(
     text: &str,
     paste_ranges: &[std::ops::Range<usize>],
     skill_ranges: &[std::ops::Range<usize>],
+    image_ranges: &[std::ops::Range<usize>],
     history_search_ranges: &[std::ops::Range<usize>],
 ) -> Line<'static> {
     let mut highlights = paste_ranges
         .iter()
         .chain(skill_ranges)
+        .chain(image_ranges)
         .chain(history_search_ranges)
         .cloned()
         .collect::<Vec<_>>();
@@ -4373,7 +4489,8 @@ mod tests {
         restored.restore_pending_input_to_composer();
         assert_eq!(restored.editor.take_prompt(), prompt);
 
-        let narrow_cyan = user_message_lines(&prompt, 8, Style::default())
+        let displayed = DisplayedUserPrompt::from_prompt(&prompt);
+        let narrow_cyan = user_message_lines(&displayed, 8, Style::default())
             .iter()
             .flat_map(|line| &line.spans)
             .filter(|span| span.style.fg == Some(Color::Cyan))
@@ -4981,7 +5098,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(history.contains("saved question"), "{history}");
-        assert!(history.contains("Image attachment"), "{history}");
+        assert!(history.contains("[Image 1]"), "{history}");
         assert!(history.contains("Saved answer"), "{history}");
         assert!(!history.contains("old transcript"), "{history}");
         view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
@@ -5436,6 +5553,96 @@ mod tests {
     }
 
     #[test]
+    fn help_opens_the_complete_shortcut_reference_without_clipping_the_footer() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.editor.set_text("/help");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(matches!(view.overlay, Some(Overlay::Shortcuts)));
+
+        let height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("Ctrl+Z"), "{rendered}");
+        assert!(rendered.contains("Press any key to close"), "{rendered}");
+    }
+
+    #[test]
+    fn ctrl_c_clears_a_draft_interrupts_work_and_only_quits_when_idle() {
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let mut draft = View::new(Path::new("/tmp/bettercodex"));
+        draft.editor.set_text("do not lose this accidentally");
+        assert_eq!(draft.handle_terminal_event(ctrl_c.clone()), Action::None);
+        assert!(draft.editor.is_empty());
+
+        let mut working = View::new(Path::new("/tmp/bettercodex"));
+        working.start_turn("run tests");
+        assert_eq!(
+            working.handle_terminal_event(ctrl_c.clone()),
+            Action::Cancel
+        );
+
+        let mut idle = View::new(Path::new("/tmp/bettercodex"));
+        assert_eq!(idle.handle_terminal_event(ctrl_c), Action::Quit);
+    }
+
+    #[test]
+    fn unwanted_ctrl_g_l_and_t_shortcuts_remain_unbound() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        for (character, raw_control) in [('g', '\u{7}'), ('l', '\u{c}'), ('t', '\u{14}')] {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::CONTROL,
+                ))),
+                Action::None
+            );
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(raw_control),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+        assert!(view.editor.is_empty());
+        assert!(view.overlay.is_none());
+    }
+
+    #[test]
+    fn pasted_image_paths_become_submitable_composer_attachments() {
+        let path =
+            std::env::temp_dir().join(format!("bettercodex-composer-image-{}.png", Uuid::new_v4()));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Paste(format!("\"{}\"", path.display()))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "[Image 1]");
+        assert_eq!(view.editor.image_count(), 1);
+        let Action::Submit(prompt) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("image-only composer should submit");
+        };
+        assert_eq!(prompt.image_count(), 1);
+        assert!(prompt.text_without_image_placeholders().is_empty());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn skills_command_renders_an_empty_manager_and_closes_without_model_input() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
@@ -5612,7 +5819,8 @@ mod tests {
     #[test]
     fn user_message_and_composer_share_codex_background() {
         let style = user_message_style_for(Some((31, 31, 31)));
-        let lines = user_message_lines(&prompt("test"), 40, style);
+        let prompt = prompt("test");
+        let lines = user_message_lines(&DisplayedUserPrompt::from_prompt(&prompt), 40, style);
         assert_eq!(lines.len(), 3);
         assert_eq!(plain(&lines[1]), "› test");
         assert_eq!(lines[0].style.bg, style.bg);

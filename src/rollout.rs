@@ -70,6 +70,7 @@ pub(crate) struct SessionSummary {
 pub(crate) enum SessionTranscriptItem {
     User {
         text: String,
+        #[serde(default)]
         image_count: usize,
     },
     Assistant {
