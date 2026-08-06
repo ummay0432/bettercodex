@@ -6,6 +6,7 @@ use crate::auth::Auth;
 use crate::compaction::CompactionPhase;
 use crate::compaction::CompactionRequest;
 use crate::compaction::InitialContextInjection;
+use crate::context::ActiveTurnContext;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
@@ -315,12 +316,14 @@ impl Agent {
     ) -> Result<CompactionOutcome> {
         let turn_id = self.api.begin_turn().to_string();
         self.conversation.start_turn(&turn_id)?;
+        let active_turn_context = ActiveTurnContext::default();
         let result = self
             .run_compaction(
                 &Some(events),
                 &control.cancellation,
                 CompactionRequest::Manual,
                 InitialContextInjection::AfterCompaction,
+                &active_turn_context,
             )
             .await;
         control.close();
@@ -370,12 +373,14 @@ impl Agent {
         events: &Option<UnboundedSender<AgentEvent>>,
         control: &TurnControl,
     ) -> Result<SubmitOutcome> {
+        let mut active_turn_context = ActiveTurnContext::default();
         if !self
             .record_incoming_user(
                 IncomingUserInput::Initial(input),
                 events,
                 &control.cancellation,
                 CompactionPhase::PreTurn,
+                &mut active_turn_context,
             )
             .await?
         {
@@ -396,6 +401,7 @@ impl Agent {
                             events,
                             &control.cancellation,
                             CompactionPhase::MidTurn,
+                            &mut active_turn_context,
                         )
                         .await?
                     {
@@ -468,6 +474,7 @@ impl Agent {
                         &control.cancellation,
                         CompactionRequest::Automatic(CompactionPhase::MidTurn),
                         InitialContextInjection::BeforeLastUserMessage,
+                        &active_turn_context,
                     )
                     .await?
                 {
@@ -598,6 +605,7 @@ impl Agent {
         cancellation: &CancellationToken,
         compaction: CompactionRequest,
         initial_context_injection: InitialContextInjection,
+        active_turn_context: &ActiveTurnContext,
     ) -> Result<bool> {
         if cancellation.is_cancelled() {
             return Ok(false);
@@ -624,11 +632,19 @@ impl Agent {
             return Ok(false);
         };
         let compacted = compacted?;
-        self.conversation.replace_compacted(
+        let replacement = self.conversation.replace_compacted(
             compacted.items,
             initial_context_injection,
+            active_turn_context,
             compacted.usage,
-        )?;
+        );
+        if let Err(error) = replacement {
+            // The server has completed a response that was not installed. Drop
+            // its connection-local baseline before any unchanged history is sent.
+            self.api.abandon_response();
+            return Err(error);
+        }
+        self.api.commit_compaction();
         self.emit_context(events);
         emit(events, AgentEvent::CompactionCompleted);
         Ok(true)
@@ -640,6 +656,7 @@ impl Agent {
         events: &Option<UnboundedSender<AgentEvent>>,
         cancellation: &CancellationToken,
         phase: CompactionPhase,
+        active_turn_context: &mut ActiveTurnContext,
     ) -> Result<bool> {
         let (input, steering_id) = match input {
             IncomingUserInput::Initial(input) => (input, None),
@@ -656,8 +673,9 @@ impl Agent {
         for warning in injections.warnings {
             emit(events, AgentEvent::Warning(warning));
         }
-        let mut projected = Vec::with_capacity(injections.items.len().saturating_add(1));
-        projected.extend(injections.items);
+        let skill_context = injections.items;
+        let mut projected = Vec::with_capacity(skill_context.len().saturating_add(1));
+        projected.extend(skill_context.iter().cloned());
         projected.push(user_message);
         let incoming_tokens = estimated_tokens(&projected);
         if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
@@ -672,6 +690,7 @@ impl Agent {
                     cancellation,
                     CompactionRequest::Automatic(phase),
                     InitialContextInjection::AfterCompaction,
+                    active_turn_context,
                 )
                 .await?
         {
@@ -684,6 +703,7 @@ impl Agent {
             ));
         }
         self.conversation.extend(projected)?;
+        active_turn_context.record_input(skill_context);
         if let Some(id) = steering_id {
             emit(events, AgentEvent::SteeringCommitted(id));
         }

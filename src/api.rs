@@ -441,6 +441,13 @@ impl ApiClient {
         self.window
     }
 
+    pub(crate) fn commit_compaction(&mut self) {
+        self.window = self.window.saturating_add(1);
+        // Compaction replaces history instead of appending to it, so no prefix
+        // from the compaction request is a valid baseline for the next sample.
+        self.websocket_baseline = None;
+    }
+
     pub(crate) fn web_search_client(&self) -> WebSearchClient {
         WebSearchClient::new(
             self.client.clone(),
@@ -702,7 +709,7 @@ impl ApiClient {
             if text.len() > MAX_STREAM_EVENT_BYTES {
                 return Err(ApiError::fatal("model sent an oversized WebSocket event"));
             }
-            let event: Value = serde_json::from_str(&text).map_err(|error| {
+            let event: Value = serde_json::from_str(text.as_str()).map_err(|error| {
                 ApiError::fatal(format!("failed to decode WebSocket event: {error}"))
             })?;
             self.capture_event_turn_state(&event);
@@ -885,10 +892,7 @@ impl ApiClient {
         mut input_identity: RequestInputIdentity,
     ) -> ApiResult<CompactionResult> {
         if history.is_empty() {
-            return Ok(CompactionResult {
-                items: Vec::new(),
-                usage: None,
-            });
+            return Err(ApiError::fatal("cannot compact an empty conversation"));
         }
         let trigger = compaction::compaction_trigger();
         let rendered_tokens = estimated_tokens(&compose_input(history.to_vec()));
@@ -937,11 +941,16 @@ impl ApiClient {
                 Err(error) => return Err(error),
             }
         };
-        let compaction_output =
-            compaction::opaque_compaction_item(&response.items).map_err(ApiError::fatal)?;
+        let compaction_output = match compaction::opaque_compaction_item(&response.items) {
+            Ok(compaction_output) => compaction_output,
+            Err(error) => {
+                // A completed but unusable response must not become the baseline
+                // for a later request using the unchanged conversation.
+                self.abandon_response();
+                return Err(ApiError::fatal(error));
+            }
+        };
         let items = compaction::build_compacted_history(&prompt_history, compaction_output);
-        self.window = self.window.saturating_add(1);
-        self.websocket_baseline = None;
         Ok(CompactionResult {
             items,
             usage: response.usage,
@@ -1460,17 +1469,17 @@ fn process_event_value(
             }
         }
         Some("response.output_text.delta") => {
-            if let Some(delta) = event.get("delta").and_then(Value::as_str)
+            if let Some(Value::String(delta)) = event.get_mut("delta")
                 && let Some(events) = events
             {
-                let _ = events.send(AgentEvent::ModelMessageDelta(delta.to_string()));
+                let _ = events.send(AgentEvent::ModelMessageDelta(std::mem::take(delta)));
             }
         }
         Some("response.reasoning_summary_text.delta") => {
-            if let Some(delta) = event.get("delta").and_then(Value::as_str)
+            if let Some(Value::String(delta)) = event.get_mut("delta")
                 && let Some(events) = events
             {
-                let _ = events.send(AgentEvent::ReasoningSummaryDelta(delta.to_string()));
+                let _ = events.send(AgentEvent::ReasoningSummaryDelta(std::mem::take(delta)));
             }
         }
         Some("response.reasoning_summary_part.added") => {

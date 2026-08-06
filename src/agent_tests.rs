@@ -521,6 +521,250 @@ async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() 
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_auto_compaction_preserves_active_skill_and_cold_resume_state() {
+    const CADENCES: usize = 3;
+    const USER_PROMPT: &str = "use $cadence through every tool continuation";
+    const SKILL_BODY: &str = "EXACT LONG-HORIZON CADENCE WORKFLOW";
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for request_index in 0..(CADENCES * 2 + 1) {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests.push(read_request(&mut stream));
+            if request_index % 2 == 0 && request_index < CADENCES * 2 {
+                let cadence = request_index / 2 + 1;
+                let tool_call = json!({
+                    "id": format!("ctc_cadence_{cadence}"),
+                    "type": "custom_tool_call",
+                    "call_id": format!("call_cadence_{cadence}"),
+                    "name": "exec",
+                    "input": format!("text(\"cadence {cadence}\")"),
+                });
+                let measured_tokens = AUTO_COMPACT_TOKEN_LIMIT + 1_000;
+                write_sse_items_response_with_usage(
+                    &mut stream,
+                    &format!("resp_work_{cadence}"),
+                    &[tool_call],
+                    json!({
+                        "input_tokens": measured_tokens - 100,
+                        "output_tokens": 100,
+                        "total_tokens": measured_tokens,
+                    }),
+                );
+            } else if request_index % 2 == 1 {
+                let cadence = request_index / 2 + 1;
+                write_sse_items_response(
+                    &mut stream,
+                    &format!("resp_compact_{cadence}"),
+                    &[json!({
+                        "type": "compaction",
+                        "id": format!("cmp_cadence_{cadence}"),
+                        "encrypted_content": format!("opaque-cadence-{cadence}"),
+                    })],
+                );
+            } else {
+                write_sse_response(&mut stream, "all cadences complete");
+            }
+        }
+        requests
+    });
+
+    let (root, mut agent) = test_agent(&format!("http://{address}"));
+    let skill_path = agent.cwd.join(".bcodex/skills/cadence/SKILL.md");
+    std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill_path,
+        format!(
+            "---\nname: cadence\ndescription: Long-horizon test workflow\n---\n\n{SKILL_BODY}\n"
+        ),
+    )
+    .unwrap();
+    let cwd = agent.cwd.clone();
+    agent.conversation.reload_skills(&cwd).unwrap();
+    let session_id = agent.session_id().parse::<Uuid>().unwrap();
+
+    assert_eq!(
+        timeout(Duration::from_secs(20), agent.submit(USER_PROMPT))
+            .await
+            .expect("multi-cadence turn timed out")
+            .unwrap(),
+        "all cadences complete"
+    );
+    assert_eq!(agent.api.compaction_count(), CADENCES as u64);
+    assert_eq!(agent.prompt_history(), [USER_PROMPT]);
+
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), CADENCES * 2 + 1);
+    let requests = requests
+        .iter()
+        .map(|request| serde_json::from_slice::<Value>(request).unwrap())
+        .collect::<Vec<_>>();
+    let first_input = requests[0]["input"].as_array().unwrap();
+    let skill_context = first_input
+        .iter()
+        .find(|item| {
+            item.pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.starts_with("<skill_context>"))
+        })
+        .cloned()
+        .expect("selected skill context in the first request");
+    assert!(skill_context.to_string().contains(SKILL_BODY));
+
+    for (request_index, request) in requests.iter().enumerate() {
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(
+            input.iter().filter(|item| *item == &skill_context).count(),
+            1,
+            "active skill context at request {request_index}"
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| {
+                    item.pointer("/content/0/text").and_then(Value::as_str) == Some(USER_PROMPT)
+                })
+                .count(),
+            1,
+            "operator prompt at request {request_index}"
+        );
+        let expected_window = request_index / 2;
+        assert!(
+            request["client_metadata"]["x-codex-window-id"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!(":{expected_window}")),
+            "window lineage at request {request_index}"
+        );
+
+        if request_index % 2 == 1 {
+            assert_eq!(input.last().unwrap()["type"], "compaction_trigger");
+        }
+        let installed_cadence = request_index / 2;
+        for cadence in 1..=CADENCES {
+            let count = input
+                .iter()
+                .filter(|item| item["id"] == format!("cmp_cadence_{cadence}"))
+                .count();
+            assert_eq!(
+                count,
+                usize::from(cadence == installed_cadence),
+                "canonical compaction item {cadence} at request {request_index}"
+            );
+        }
+        if request_index > 0 && request_index % 2 == 0 {
+            for cadence in 1..=installed_cadence {
+                assert!(
+                    !request
+                        .to_string()
+                        .contains(&format!("call_cadence_{cadence}")),
+                    "discarded tool cadence {cadence} leaked into request {request_index}"
+                );
+            }
+        }
+    }
+
+    drop(agent);
+    let rollout_root = root.join("state");
+    let mut loaded =
+        Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.compaction_count, CADENCES as u64);
+    assert_eq!(
+        loaded
+            .history
+            .iter()
+            .filter(|item| matches!(
+                item["type"].as_str(),
+                Some("compaction" | "compaction_summary")
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        loaded
+            .history
+            .iter()
+            .any(|item| item["id"] == "cmp_cadence_3")
+    );
+    assert_eq!(
+        loaded
+            .history
+            .iter()
+            .filter(|item| *item == &skill_context)
+            .count(),
+        1
+    );
+
+    let resume_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let resume_address = resume_listener.local_addr().unwrap();
+    let resume_server = thread::spawn(move || {
+        let (mut stream, _) = resume_listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        write_sse_response(&mut stream, "resume state accepted");
+        request
+    });
+    let identity = loaded.metadata.identity.clone();
+    let compaction_count = loaded.compaction_count;
+    let resumed_transcript = std::mem::take(&mut loaded.transcript);
+    let conversation = Conversation::resume(&cwd, loaded).unwrap();
+    let mut api = ApiClient::new_with_base_url(
+        Auth::for_test("token-test"),
+        &identity,
+        compaction_count,
+        format!("http://{resume_address}"),
+    )
+    .unwrap();
+    assert!(api.fall_back_to_http());
+    let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+    let mut resumed = Agent {
+        cwd: cwd.clone(),
+        api,
+        conversation,
+        tools,
+        resumed_transcript,
+    };
+    assert_eq!(
+        resumed.submit("verify the resumed state").await.unwrap(),
+        "resume state accepted"
+    );
+    let resume_request: Value = serde_json::from_slice(&resume_server.join().unwrap()).unwrap();
+    assert!(
+        resume_request["client_metadata"]["x-codex-window-id"]
+            .as_str()
+            .unwrap()
+            .ends_with(":3")
+    );
+    let resume_input = resume_request["input"].as_array().unwrap();
+    assert_eq!(
+        resume_input
+            .iter()
+            .filter(|item| matches!(
+                item["type"].as_str(),
+                Some("compaction" | "compaction_summary")
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        resume_input
+            .iter()
+            .any(|item| item["id"] == "cmp_cadence_3")
+    );
+    assert_eq!(
+        resume_input
+            .iter()
+            .filter(|item| *item == &skill_context)
+            .count(),
+        1
+    );
+
+    drop(resumed);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn cancelling_compaction_reconnects_before_the_next_turn() {
     let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -593,6 +837,82 @@ async fn cancelling_compaction_reconnects_before_the_next_turn() {
     assert!(next_request.get("previous_response_id").is_none());
     assert!(next_request.to_string().contains("next turn"));
     assert_eq!(agent.prompt_history(), vec!["next turn".to_string()]);
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn rejected_compaction_replacement_keeps_history_and_window_lineage_unchanged() {
+    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let oversized_encrypted =
+        "x".repeat(usize::try_from(AUTO_COMPACT_TOKEN_LIMIT.saturating_mul(6)).unwrap());
+    let server = tokio::spawn(async move {
+        let mut first = accept_websocket(&listener).await;
+        let warmup = read_websocket_request(&mut first).await.unwrap();
+        assert_eq!(warmup["generate"], false);
+        send_websocket_completion(&mut first, "resp_warm", &[]).await;
+
+        let compaction = read_websocket_request(&mut first).await.unwrap();
+        assert_eq!(
+            compaction["input"].as_array().unwrap().last().unwrap()["type"],
+            "compaction_trigger"
+        );
+        send_websocket_completion(
+            &mut first,
+            "resp_oversized_compaction",
+            &[json!({
+                "type": "compaction",
+                "id": "cmp_oversized_transport",
+                "encrypted_content": oversized_encrypted,
+            })],
+        )
+        .await;
+
+        assert!(
+            read_websocket_request(&mut first).await.is_none(),
+            "rejected compaction connection remained reusable"
+        );
+        let mut fresh = timeout(Duration::from_secs(5), accept_websocket(&listener))
+            .await
+            .expect("agent did not reconnect after rejecting compaction");
+        let next_request = read_websocket_request(&mut fresh).await.unwrap();
+        send_websocket_text_response(&mut fresh, "resp_after_rejection", "lineage preserved").await;
+        (compaction, next_request)
+    });
+
+    let (root, mut agent) = test_websocket_agent(&format!("http://{address}"));
+    let before = agent.conversation.items().to_vec();
+    let (events, _event_rx) = unbounded_channel();
+    let (_handle, control) = TurnControl::non_steerable_channel();
+    let error = agent
+        .compact_with_control(events, control)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("did not restore headroom"));
+    assert_eq!(agent.conversation.items(), before);
+    assert_eq!(agent.api.compaction_count(), 0);
+
+    assert_eq!(
+        agent.submit("continue unchanged").await.unwrap(),
+        "lineage preserved"
+    );
+    let (compaction, next_request) = server.await.unwrap();
+    assert!(
+        compaction["client_metadata"]["x-codex-window-id"]
+            .as_str()
+            .unwrap()
+            .ends_with(":0")
+    );
+    assert!(next_request.get("previous_response_id").is_none());
+    assert!(
+        next_request["client_metadata"]["x-codex-window-id"]
+            .as_str()
+            .unwrap()
+            .ends_with(":0")
+    );
+    assert_eq!(agent.prompt_history(), ["continue unchanged"]);
 
     drop(agent);
     std::fs::remove_dir_all(root).unwrap();

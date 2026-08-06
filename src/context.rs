@@ -47,16 +47,6 @@ const LEGACY_SKILLS_PREFIX: &str = "<skills>";
 const LEGACY_SKILL_CONTEXT_PREFIX: &str = "<skill>";
 const REPOSITORY_CONTEXT_PREFIX: &str = "<repository_context>";
 const AVAILABLE_SKILLS_PREFIX: &str = "<available_skills>";
-const CONTEXTUAL_USER_PREFIXES: [&str; 8] = [
-    LEGACY_REPOSITORY_ONBOARDING_PREFIX,
-    REPOSITORY_CONTEXT_PREFIX,
-    AVAILABLE_SKILLS_PREFIX,
-    "<environment_context>",
-    "<skill_context>",
-    LEGACY_SKILL_CONTEXT_PREFIX,
-    "<turn_aborted>",
-    "<response_interrupted>",
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContextKind {
@@ -120,6 +110,76 @@ pub(crate) struct Conversation {
 pub(crate) struct HistoryCursor {
     lineage: Uuid,
     len: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ActiveTurnContext {
+    // Keep one block per operator input, including empty blocks, so retained
+    // user messages can be matched newest-to-newest after remote truncation.
+    input_blocks: Vec<Vec<Value>>,
+}
+
+impl ActiveTurnContext {
+    pub(crate) fn record_input(&mut self, context: Vec<Value>) {
+        self.input_blocks.push(context);
+    }
+
+    fn preferred_world_state_insertion(&self, history: &[Value]) -> Option<usize> {
+        if self.input_blocks.is_empty() {
+            return None;
+        }
+        let user_indices = real_user_message_indices(history);
+        let retained_inputs = user_indices.len().min(self.input_blocks.len());
+        if retained_inputs > 0 {
+            return Some(user_indices[user_indices.len() - retained_inputs]);
+        }
+        history
+            .iter()
+            .rposition(is_initial_context_boundary)
+            .or_else(|| history.iter().rposition(is_compaction_item))
+    }
+
+    fn insert_into(
+        &self,
+        history: &mut Vec<Value>,
+        initial_context_injection: InitialContextInjection,
+    ) {
+        if !self.input_blocks.iter().any(|block| !block.is_empty()) {
+            return;
+        }
+        if initial_context_injection == InitialContextInjection::AfterCompaction {
+            history.extend(self.input_blocks.iter().flatten().cloned());
+            return;
+        }
+
+        let user_indices = real_user_message_indices(history);
+        let retained_inputs = user_indices.len().min(self.input_blocks.len());
+        let first_retained_block = self.input_blocks.len() - retained_inputs;
+        let fallback_insertion = if retained_inputs > 0 {
+            user_indices[user_indices.len() - retained_inputs]
+        } else {
+            history
+                .iter()
+                .rposition(is_initial_context_boundary)
+                .or_else(|| history.iter().rposition(is_compaction_item))
+                .unwrap_or(history.len())
+        };
+        for (block, user_index) in self.input_blocks[first_retained_block..]
+            .iter()
+            .zip(user_indices[user_indices.len() - retained_inputs..].iter())
+            .rev()
+        {
+            history.splice(*user_index..*user_index, block.iter().cloned());
+        }
+        // If remote retention dropped older current-turn user messages, keep
+        // their still-active context before the oldest surviving input.
+        for block in self.input_blocks[..first_retained_block].iter().rev() {
+            history.splice(
+                fallback_insertion..fallback_insertion,
+                block.iter().cloned(),
+            );
+        }
+    }
 }
 
 impl HistoryCursor {
@@ -250,13 +310,44 @@ impl Conversation {
         &mut self,
         mut history: Vec<Value>,
         initial_context_injection: InitialContextInjection,
+        active_turn_context: &ActiveTurnContext,
         response_usage: Option<TokenUsage>,
     ) -> Result<()> {
-        self.world_state
-            .insert_missing_into(&mut history, initial_context_injection);
+        let preferred_insertion = match initial_context_injection {
+            InitialContextInjection::AfterCompaction => None,
+            InitialContextInjection::BeforeLastUserMessage => {
+                active_turn_context.preferred_world_state_insertion(&history)
+            }
+        };
+        self.world_state.insert_missing_into(
+            &mut history,
+            initial_context_injection,
+            preferred_insertion,
+        );
+        active_turn_context.insert_into(&mut history, initial_context_injection);
+        let mut context_metrics = ContextMetrics::from_history(&history, &self.world_state);
+        let mut replacement_tokens = self.estimated_context_tokens(&context_metrics);
+        // Match Codex by retaining multimodal inputs outside the 64k text
+        // budget. Only shed the oldest images/audio when keeping all of them
+        // would make the replacement immediately trigger another compaction.
+        while replacement_tokens >= AUTO_COMPACT_TOKEN_LIMIT {
+            let tokens_to_remove = replacement_tokens
+                .saturating_sub(AUTO_COMPACT_TOKEN_LIMIT)
+                .saturating_add(1);
+            if trim_oldest_multimodal_inputs(&mut history, tokens_to_remove) == 0 {
+                break;
+            }
+            context_metrics = ContextMetrics::from_history(&history, &self.world_state);
+            replacement_tokens = self.estimated_context_tokens(&context_metrics);
+        }
+        if replacement_tokens >= AUTO_COMPACT_TOKEN_LIMIT {
+            anyhow::bail!(
+                "remote compaction replacement is estimated at {replacement_tokens} tokens and did not restore headroom below bettercodex's {AUTO_COMPACT_TOKEN_LIMIT}-token automatic-compaction threshold; the conversation was left unchanged"
+            );
+        }
         self.rollout
             .replace_compacted_history(&history, response_usage.as_ref())?;
-        self.context_metrics = ContextMetrics::from_history(&history, &self.world_state);
+        self.context_metrics = context_metrics;
         self.history = history;
         self.history_lineage = Uuid::new_v4();
         self.usage = None;
@@ -547,6 +638,7 @@ impl WorldState {
         &self,
         history: &mut Vec<Value>,
         initial_context_injection: InitialContextInjection,
+        preferred_insertion: Option<usize>,
     ) {
         let missing = self.missing_from(history);
         if missing.is_empty() {
@@ -555,11 +647,13 @@ impl WorldState {
         match initial_context_injection {
             InitialContextInjection::AfterCompaction => history.extend(missing),
             InitialContextInjection::BeforeLastUserMessage => {
-                let insertion = history
-                    .iter()
-                    .rposition(is_initial_context_boundary)
-                    .or_else(|| history.iter().rposition(is_compaction_item))
-                    .unwrap_or(history.len());
+                let insertion = preferred_insertion.unwrap_or_else(|| {
+                    history
+                        .iter()
+                        .rposition(is_initial_context_boundary)
+                        .or_else(|| history.iter().rposition(is_compaction_item))
+                        .unwrap_or(history.len())
+                });
                 history.splice(insertion..insertion, missing);
             }
         }
@@ -575,6 +669,49 @@ impl WorldState {
             })
             .collect()
     }
+}
+
+fn real_user_message_indices(history: &[Value]) -> Vec<usize> {
+    history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            (is_user_message(item) && !is_contextual_user_message(item)).then_some(index)
+        })
+        .collect()
+}
+
+fn trim_oldest_multimodal_inputs(history: &mut Vec<Value>, minimum_tokens: u64) -> u64 {
+    let mut removed_tokens = 0_u64;
+    for item in history.iter_mut() {
+        if removed_tokens >= minimum_tokens || !is_user_message(item) {
+            continue;
+        }
+        let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        content.retain(|content_item| {
+            let is_multimodal = matches!(
+                content_item.get("type").and_then(Value::as_str),
+                Some("input_image" | "input_audio")
+            );
+            if removed_tokens < minimum_tokens && is_multimodal {
+                removed_tokens =
+                    removed_tokens.saturating_add(estimate_value_tokens(content_item).max(1));
+                false
+            } else {
+                true
+            }
+        });
+    }
+    history.retain(|item| {
+        !is_user_message(item)
+            || item
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| !content.is_empty())
+    });
+    removed_tokens
 }
 
 pub(crate) fn initial_context_items(cwd: &Path) -> Result<Vec<Value>> {
@@ -730,9 +867,19 @@ pub(crate) fn is_contextual_user_message(item: &Value) -> bool {
 
 pub(crate) fn is_contextual_user_text(text: &str) -> bool {
     let text = text.trim_start();
-    CONTEXTUAL_USER_PREFIXES
-        .iter()
-        .any(|prefix| text.starts_with(prefix))
+    (text.starts_with(LEGACY_REPOSITORY_ONBOARDING_PREFIX)
+        && text.trim_end().ends_with("# End repository onboarding"))
+        || is_complete_context_wrapper(text, REPOSITORY_CONTEXT_PREFIX, "</repository_context>")
+        || is_complete_context_wrapper(text, AVAILABLE_SKILLS_PREFIX, "</available_skills>")
+        || is_complete_context_wrapper(text, "<environment_context>", "</environment_context>")
+        || is_complete_context_wrapper(text, "<skill_context>", "</skill_context>")
+        || is_complete_context_wrapper(text, LEGACY_SKILL_CONTEXT_PREFIX, "</skill>")
+        || is_complete_context_wrapper(text, "<turn_aborted>", "</turn_aborted>")
+        || is_complete_context_wrapper(text, "<response_interrupted>", "</response_interrupted>")
+}
+
+fn is_complete_context_wrapper(text: &str, opening: &str, closing: &str) -> bool {
+    text.starts_with(opening) && text.trim_end().ends_with(closing)
 }
 
 fn is_initial_context_boundary(item: &Value) -> bool {

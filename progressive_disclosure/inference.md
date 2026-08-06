@@ -12,6 +12,12 @@ compaction, caching, streaming, recovery, tools, or saved sessions.
   tokens.
 - Search for breakage in CLI arguments, saved JSONL sessions and resume,
   Responses request and output items, and model-visible tool names and schemas.
+- Install compaction transactionally: validate the opaque output, restore exact
+  turn-scoped context, prove the replacement restores automatic-compaction
+  headroom, and persist it before advancing cache/window lineage.
+- Exercise repeated compaction cadences and cold resume. A one-compaction test
+  cannot prove that older summaries, tool artifacts, or selected skill bodies
+  are replaced correctly over a long task.
 
 ## Evidence and validation
 

@@ -13,6 +13,7 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async_with_config;
 use tungstenite::Message;
+use tungstenite::Utf8Bytes;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::extensions::ExtensionsConfig;
 use tungstenite::extensions::compression::deflate::DeflateConfig;
@@ -53,7 +54,10 @@ impl WebSocketConnection {
         .map_err(|error| ApiError::retryable(format!("failed to send WebSocket request: {error}")))
     }
 
-    pub(super) async fn next_text(&mut self, idle_timeout: Duration) -> ApiResult<Option<String>> {
+    pub(super) async fn next_text(
+        &mut self,
+        idle_timeout: Duration,
+    ) -> ApiResult<Option<Utf8Bytes>> {
         let deadline = Instant::now() + idle_timeout;
         loop {
             let message = timeout_at(deadline, self.stream.next())
@@ -67,7 +71,7 @@ impl WebSocketConnection {
                 ));
             };
             match message {
-                Ok(Message::Text(text)) => return Ok(Some(text.to_string())),
+                Ok(Message::Text(text)) => return Ok(Some(text)),
                 Ok(Message::Ping(payload)) => {
                     timeout_at(deadline, self.stream.send(Message::Pong(payload)))
                         .await
