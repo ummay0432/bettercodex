@@ -242,7 +242,7 @@ def command_install(arguments: argparse.Namespace) -> int:
     environment["CARGO_TARGET_DIR"] = os.fspath(target)
 
     with install_lock(install_root):
-        for attempt in range(1, MAX_INSTALL_ATTEMPTS + 1):
+        for _ in range(MAX_INSTALL_ATTEMPTS):
             commit = canonical_main_commit(primary)
             validate_install_caller(worktree, commit)
             print(f"Installing committed main {commit[:12]} into {install_root}")

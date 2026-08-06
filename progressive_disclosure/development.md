@@ -46,6 +46,12 @@ error:
 ./scripts/dev.py cargo clippy --all-targets -- -D warnings
 ```
 
+Changes to `scripts/dev.py` must also pass its dependency-free unit tests:
+
+```sh
+python3 -m unittest -v scripts.dev_tests
+```
+
 Cargo can wait on a shared build lock. Let it finish; do not kill a Cargo or
 Rust process by PID to make the lock disappear.
 
