@@ -5,6 +5,7 @@ mod executor;
 mod image_preparation;
 mod papercuts;
 mod patch;
+mod process_session;
 
 const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
     code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
