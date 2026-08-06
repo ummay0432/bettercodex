@@ -168,11 +168,16 @@ pub(super) struct PreparedView {
     height: u16,
     active_height: u16,
     active_lines: Vec<Line<'static>>,
+    history_lines: Vec<Line<'static>>,
 }
 
 impl PreparedView {
     pub(super) fn height(&self) -> u16 {
         self.height
+    }
+
+    pub(super) fn take_history_lines(&mut self) -> Vec<Line<'static>> {
+        std::mem::take(&mut self.history_lines)
     }
 }
 
@@ -183,6 +188,7 @@ enum TranscriptEntry {
         text: String,
         streaming: bool,
         rendered: Option<RenderedAssistant>,
+        history: StreamedAssistantHistory,
     },
     Tool(ToolEntry),
     Exploration {
@@ -199,6 +205,17 @@ enum TranscriptEntry {
 #[derive(Debug)]
 struct RenderedAssistant {
     width: u16,
+    lines: Vec<Line<'static>>,
+}
+
+/// Rows from an in-flight assistant cell that have already moved into terminal scrollback.
+///
+/// The source text remains on the transcript entry so resize replay and finalization can rebuild
+/// the canonical Markdown rendering. Only the tail after `lines` remains mutable on screen.
+#[derive(Debug, Default)]
+struct StreamedAssistantHistory {
+    width: Option<u16>,
+    started: bool,
     lines: Vec<Line<'static>>,
 }
 
@@ -521,6 +538,7 @@ impl View {
                         text: answer,
                         streaming: false,
                         rendered: None,
+                        history: StreamedAssistantHistory::default(),
                     });
                 }
                 if turn_had_work {
@@ -649,6 +667,7 @@ impl View {
                     text,
                     streaming: false,
                     rendered: None,
+                    history: StreamedAssistantHistory::default(),
                 },
             }));
     }
@@ -706,6 +725,7 @@ impl View {
                         text,
                         streaming,
                         rendered,
+                        ..
                     }) if *streaming => {
                         text.push_str(&delta);
                         *rendered = None;
@@ -714,6 +734,7 @@ impl View {
                         text: delta,
                         streaming: true,
                         rendered: None,
+                        history: StreamedAssistantHistory::default(),
                     }),
                 }
                 self.status_detail = None;
@@ -1291,11 +1312,14 @@ impl View {
             .is_some_and(TranscriptEntry::is_finalized)
         {
             let entry = &mut self.entries[self.committed_entries];
-            append_history_cell(
-                entry.display_lines(width, self.user_message_style),
-                &mut lines,
-                &mut self.history_emitted,
-            );
+            let (cell, continuation) =
+                entry.display_lines_after_streamed_history(width, self.user_message_style);
+            if continuation {
+                lines.extend(cell);
+            } else {
+                append_history_cell(cell, &mut lines, &mut self.history_emitted);
+            }
+            entry.reset_streamed_history();
             self.committed_entries += 1;
         }
         lines
@@ -1308,6 +1332,9 @@ impl View {
     /// retained transcript at the new width instead of trusting terminal-wrapped rows.
     pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<Line<'static>> {
         let width = width.max(1);
+        for entry in &mut self.entries {
+            entry.reset_streamed_history();
+        }
         while self
             .entries
             .get(self.committed_entries)
@@ -1331,6 +1358,71 @@ impl View {
         lines
     }
 
+    /// Whether source-backed replay is needed before adding more terminal history.
+    ///
+    /// Width changes invalidate physical row boundaries. A completed stream can also reveal that
+    /// later Markdown changed a row which was already emitted; replay repairs that uncommon case
+    /// from the retained source before the finalized suffix is inserted.
+    pub(super) fn streamed_history_needs_reflow(&mut self, width: u16) -> bool {
+        let width = width.max(1);
+        self.entries[self.committed_entries..]
+            .iter_mut()
+            .any(|entry| entry.streamed_history_needs_reflow(width))
+    }
+
+    /// Move the oldest rendered rows of a growing assistant response into real terminal history.
+    ///
+    /// Keeping at least one row live prevents an unterminated final line from being committed while
+    /// it is still changing. In normal terminals the complete composer/status layout leaves a much
+    /// larger mutable tail; only rows that would otherwise be clipped are emitted.
+    fn spill_streaming_history(&mut self, width: u16, live_capacity: usize) -> Vec<Line<'static>> {
+        let history_was_emitted = self.history_emitted;
+        let Some(TranscriptEntry::Assistant {
+            text,
+            streaming: true,
+            rendered,
+            history,
+        }) = self.entries.get_mut(self.committed_entries)
+        else {
+            return Vec::new();
+        };
+
+        if history.started && history.width != Some(width) {
+            return Vec::new();
+        }
+        let rendered = cached_assistant_lines(text, rendered, width);
+        if history.lines.len() > rendered.len() {
+            return Vec::new();
+        }
+
+        let separator_rows = usize::from(!history.started && history_was_emitted);
+        let remaining_rows = rendered.len().saturating_sub(history.lines.len());
+        let mut rows_to_spill = separator_rows
+            .saturating_add(remaining_rows)
+            .saturating_sub(live_capacity);
+        if rows_to_spill == 0 {
+            return Vec::new();
+        }
+
+        let mut output = Vec::with_capacity(rows_to_spill);
+        if !history.started {
+            history.started = true;
+            history.width = Some(width);
+            self.history_emitted = true;
+            if history_was_emitted {
+                output.push(Line::default());
+                rows_to_spill = rows_to_spill.saturating_sub(1);
+            }
+        }
+
+        let start = history.lines.len();
+        let end = start.saturating_add(rows_to_spill).min(rendered.len());
+        let newly_emitted = rendered[start..end].to_vec();
+        output.extend(newly_emitted.iter().cloned());
+        history.lines.extend(newly_emitted);
+        output
+    }
+
     #[cfg(test)]
     pub(super) fn desired_height(&mut self, width: u16, screen_height: u16) -> u16 {
         let width = width.max(1);
@@ -1341,23 +1433,46 @@ impl View {
 
     pub(super) fn prepare(&mut self, width: u16, screen_height: u16) -> PreparedView {
         let width = width.max(1);
+        let (transcript_chrome_height, overlay_height) =
+            self.height_requirements(width, screen_height);
+        let live_capacity = usize::from(
+            screen_height
+                .max(1)
+                .saturating_sub(transcript_chrome_height)
+                .max(1),
+        );
+        let history_lines = self.spill_streaming_history(width, live_capacity);
         let active_lines = self.active_lines(width);
         let active_height = rendered_line_count(&active_lines, width);
-        let height = self.desired_height_with_active_history(width, screen_height, active_height);
+        let height = active_height
+            .saturating_add(transcript_chrome_height)
+            .max(overlay_height)
+            .clamp(1, screen_height.max(1));
         PreparedView {
             width,
             height,
             active_height,
             active_lines,
+            history_lines,
         }
     }
 
+    #[cfg(test)]
     fn desired_height_with_active_history(
         &mut self,
         width: u16,
         screen_height: u16,
         active_height: u16,
     ) -> u16 {
+        let (transcript_chrome_height, overlay_height) =
+            self.height_requirements(width, screen_height);
+        active_height
+            .saturating_add(transcript_chrome_height)
+            .max(overlay_height)
+            .clamp(1, screen_height.max(1))
+    }
+
+    fn height_requirements(&mut self, width: u16, screen_height: u16) -> (u16, u16) {
         self.composer_text_width = width.saturating_sub(3).max(1);
         let composer_height = self
             .editor
@@ -1367,7 +1482,7 @@ impl View {
         let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
         let status_height = u16::from(self.busy);
         let status_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(status_height);
-        let bottom_spacing = 1;
+        let bottom_spacing: u16 = 1;
         let popup_height = self.completion_popup_height(width);
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
         // extends downward from the composer instead of becoming an overlay above it.
@@ -1384,15 +1499,13 @@ impl View {
             Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
             None => 0,
         };
-        active_height
-            .saturating_add(bottom_spacing)
+        let transcript_chrome_height = bottom_spacing
             .saturating_add(pending_height)
             .saturating_add(status_height)
             .saturating_add(status_composer_spacing)
             .saturating_add(composer_height)
-            .saturating_add(trailing_height)
-            .max(overlay_height)
-            .clamp(1, screen_height.max(1))
+            .saturating_add(trailing_height);
+        (transcript_chrome_height, overlay_height)
     }
 
     #[cfg(test)]
@@ -1868,11 +1981,13 @@ impl View {
         let mut lines = Vec::new();
         let mut emitted = self.history_emitted;
         for entry in &mut self.entries[self.committed_entries..] {
-            append_history_cell(
-                entry.display_lines(width, self.user_message_style),
-                &mut lines,
-                &mut emitted,
-            );
+            let (cell, continuation) =
+                entry.display_lines_after_streamed_history(width, self.user_message_style);
+            if continuation {
+                lines.extend(cell);
+            } else {
+                append_history_cell(cell, &mut lines, &mut emitted);
+            }
         }
         lines
     }
@@ -1912,6 +2027,61 @@ impl TranscriptEntry {
         }
     }
 
+    fn display_lines_after_streamed_history(
+        &mut self,
+        width: u16,
+        user_style: Style,
+    ) -> (Vec<Line<'static>>, bool) {
+        match self {
+            Self::Assistant {
+                text,
+                streaming,
+                rendered,
+                history,
+            } if history.started && history.width == Some(width) => {
+                let rendered_lines = cached_assistant_lines(text, rendered, width);
+                let start = history.lines.len().min(rendered_lines.len());
+                let output = rendered_lines[start..].to_vec();
+                if !*streaming {
+                    *rendered = None;
+                }
+                (output, true)
+            }
+            _ => (self.display_lines(width, user_style), false),
+        }
+    }
+
+    fn streamed_history_needs_reflow(&mut self, width: u16) -> bool {
+        let Self::Assistant {
+            text,
+            streaming,
+            rendered,
+            history,
+        } = self
+        else {
+            return false;
+        };
+        if !history.started {
+            return false;
+        }
+        if history.width != Some(width) {
+            return true;
+        }
+        // Appending source normally changes only the retained live tail. Compare the canonical
+        // prefix once the item closes, when Markdown constructs such as reference links can no
+        // longer rewrite it again.
+        if *streaming {
+            return false;
+        }
+        !cached_assistant_lines(text, rendered, width).starts_with(&history.lines)
+    }
+
+    fn reset_streamed_history(&mut self) {
+        if let Self::Assistant { history, .. } = self {
+            *history = StreamedAssistantHistory::default();
+        }
+    }
+
     fn display_lines(&mut self, width: u16, user_style: Style) -> Vec<Line<'static>> {
         match self {
             Self::User(message) => user_message_lines(message, width, user_style),
@@ -1919,13 +2089,9 @@ impl TranscriptEntry {
                 text,
                 streaming,
                 rendered,
+                ..
             } => {
-                if rendered.as_ref().is_none_or(|cached| cached.width != width) {
-                    *rendered = Some(RenderedAssistant {
-                        width,
-                        lines: assistant_lines(text, width),
-                    });
-                }
+                let _ = cached_assistant_lines(text, rendered, width);
                 if *streaming {
                     rendered
                         .as_ref()
@@ -2904,6 +3070,23 @@ fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
         wrapped.extend(wrap_styled_line(&line, width.saturating_sub(2).max(1)));
     }
     prefix_styled_lines(wrapped, "• ", "  ")
+}
+
+fn cached_assistant_lines<'a>(
+    text: &str,
+    rendered: &'a mut Option<RenderedAssistant>,
+    width: u16,
+) -> &'a [Line<'static>] {
+    if rendered.as_ref().is_none_or(|cached| cached.width != width) {
+        *rendered = Some(RenderedAssistant {
+            width,
+            lines: assistant_lines(text, width),
+        });
+    }
+    &rendered
+        .as_ref()
+        .expect("assistant rendering was cached")
+        .lines
 }
 
 fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Vec<Line<'static>> {

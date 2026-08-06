@@ -143,18 +143,20 @@ impl Runtime {
         loop {
             if redraw {
                 let clear_requested = self.view.take_clear_request();
-                let resize_reflow_requested = self.view.take_resize_reflow_request();
+                let mut resize_reflow_requested = self.view.take_resize_reflow_request();
+                let width = terminal.width()?;
+                let screen_height = terminal.height()?;
+                resize_reflow_requested |= self.view.streamed_history_needs_reflow(width);
                 if clear_requested || resize_reflow_requested {
                     terminal.clear_screen()?;
                 }
-                let width = terminal.width()?;
-                let screen_height = terminal.height()?;
-                let history = if resize_reflow_requested && !clear_requested {
+                let mut history = if resize_reflow_requested && !clear_requested {
                     self.view.history_lines_for_resize_reflow(width)
                 } else {
                     self.view.take_pending_history_lines(width)
                 };
-                let prepared = self.view.prepare(width, screen_height);
+                let mut prepared = self.view.prepare(width, screen_height);
+                history.extend(prepared.take_history_lines());
                 let height = prepared.height();
                 terminal.insert_history_lines(history, height)?;
                 terminal.draw(height, |frame| self.view.render_prepared(frame, prepared))?;

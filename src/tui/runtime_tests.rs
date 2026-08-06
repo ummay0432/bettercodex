@@ -127,6 +127,102 @@ fn prepared_streaming_layout_tracks_new_deltas_and_finalizes_to_history() {
 }
 
 #[test]
+fn oversized_stream_moves_old_rows_to_history_before_completion() {
+    const WIDTH: u16 = 48;
+    const SCREEN_HEIGHT: u16 = 12;
+
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn("stream beyond the viewport");
+    let _ = view.take_pending_history_lines(WIDTH);
+    view.handle_agent_event(AgentEvent::ModelTextDelta(
+        (0..40)
+            .map(|index| format!("- stream row {index}\n"))
+            .collect(),
+    ));
+
+    let mut prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+    let mut emitted = prepared.take_history_lines();
+    let rendered = render_prepared_view(&mut view, WIDTH, prepared);
+    assert!(
+        emitted
+            .iter()
+            .any(|line| plain(line).ends_with("stream row 0")),
+        "{emitted:?}"
+    );
+    assert!(!rendered.contains("stream row 0"), "{rendered}");
+    assert!(rendered.contains("stream row 39"), "{rendered}");
+
+    view.handle_agent_event(AgentEvent::ModelTextDelta(
+        (40..45)
+            .map(|index| format!("- stream row {index}\n"))
+            .collect(),
+    ));
+    let mut prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+    let next = prepared.take_history_lines();
+    assert!(
+        next.first().is_some_and(|line| !plain(line).is_empty()),
+        "a streamed continuation must not add another cell separator: {next:?}"
+    );
+    emitted.extend(next);
+    assert!(render_prepared_view(&mut view, WIDTH, prepared).contains("stream row 44"));
+
+    view.handle_agent_event(AgentEvent::ModelItemCompleted);
+    assert!(!view.streamed_history_needs_reflow(WIDTH));
+    emitted.extend(view.take_pending_history_lines(WIDTH));
+    for index in 0..45 {
+        let suffix = format!("stream row {index}");
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|line| plain(line).ends_with(&suffix))
+                .count(),
+            1,
+            "row {index} was lost or duplicated in {emitted:?}"
+        );
+    }
+}
+
+#[test]
+fn completed_stream_requests_replay_if_markdown_rewrites_emitted_rows() {
+    const WIDTH: u16 = 48;
+    const SCREEN_HEIGHT: u16 = 12;
+
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn("render a late reference definition");
+    let _ = view.take_pending_history_lines(WIDTH);
+    let mut initial = String::from("[earlier reference][target]\n\n");
+    initial.push_str(
+        &(0..40)
+            .map(|index| format!("- filler row {index}\n"))
+            .collect::<String>(),
+    );
+    view.handle_agent_event(AgentEvent::ModelTextDelta(initial));
+    let mut prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+    let emitted = prepared.take_history_lines();
+    assert!(
+        emitted
+            .iter()
+            .any(|line| plain(line).contains("[earlier reference][target]")),
+        "{emitted:?}"
+    );
+
+    view.handle_agent_event(AgentEvent::ModelTextDelta(
+        "\n[target]: https://example.com\n".to_string(),
+    ));
+    view.handle_agent_event(AgentEvent::ModelItemCompleted);
+    assert!(view.streamed_history_needs_reflow(WIDTH));
+
+    let replay = view
+        .history_lines_for_resize_reflow(WIDTH)
+        .iter()
+        .map(plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(replay.contains("earlier reference"), "{replay}");
+    assert!(!replay.contains("[earlier reference][target]"), "{replay}");
+}
+
+#[test]
 fn prepared_layout_reflows_if_the_terminal_resizes_before_draw() {
     let mut view = View::new(Path::new("/tmp/bettercodex"));
     view.start_turn("render across a resize");
@@ -201,6 +297,14 @@ fn render_buffer(buffer: &ratatui::buffer::Buffer) -> String {
 
 fn render_view(view: &mut View, width: u16, screen_height: u16) -> String {
     let prepared = view.prepare(width, screen_height);
+    render_prepared_view(view, width, prepared)
+}
+
+fn render_prepared_view(
+    view: &mut View,
+    width: u16,
+    prepared: super::view::PreparedView,
+) -> String {
     let height = prepared.height();
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -208,4 +312,11 @@ fn render_view(view: &mut View, width: u16, screen_height: u16) -> String {
         .draw(|frame| view.render_prepared(frame, prepared))
         .unwrap();
     render_buffer(terminal.backend().buffer())
+}
+
+fn plain(line: &ratatui::text::Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }

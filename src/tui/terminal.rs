@@ -570,6 +570,8 @@ mod tests {
     use std::path::Path;
     use std::rc::Rc;
 
+    const TEST_SCROLLBACK_ROWS: usize = 512;
+
     #[derive(Clone)]
     struct SharedParser {
         parser: Rc<RefCell<vt100::Parser>>,
@@ -578,12 +580,30 @@ mod tests {
     impl SharedParser {
         fn new(width: u16, height: u16) -> Self {
             Self {
-                parser: Rc::new(RefCell::new(vt100::Parser::new(height, width, 0))),
+                parser: Rc::new(RefCell::new(vt100::Parser::new(
+                    height,
+                    width,
+                    TEST_SCROLLBACK_ROWS,
+                ))),
             }
         }
 
         fn screen(&self) -> String {
             self.parser.borrow().screen().contents()
+        }
+
+        fn history_contains(&self, needle: &str) -> bool {
+            let mut parser = self.parser.borrow_mut();
+            let mut found = false;
+            for offset in 1..=TEST_SCROLLBACK_ROWS {
+                parser.screen_mut().set_scrollback(offset);
+                found |= parser.screen().contents().contains(needle);
+                if found || parser.screen().scrollback() < offset {
+                    break;
+                }
+            }
+            parser.screen_mut().set_scrollback(0);
+            found
         }
     }
 
@@ -778,6 +798,59 @@ mod tests {
                 .is_some_and(|cell| cell.bgcolor() == vt100::Color::Default)),
             "activity row retained a stale background"
         );
+    }
+
+    #[test]
+    fn oversized_live_response_enters_terminal_scrollback_while_streaming() {
+        const WIDTH: u16 = 48;
+        const SCREEN_HEIGHT: u16 = 12;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let mut history = view.take_pending_history_lines(WIDTH);
+        view.start_turn("stream beyond the viewport");
+        history.extend(view.take_pending_history_lines(WIDTH));
+        let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+        let viewport_height = prepared.height();
+        let (mut terminal, output) = test_terminal(WIDTH, SCREEN_HEIGHT, viewport_height);
+        terminal
+            .insert_history_lines(history, viewport_height)
+            .unwrap();
+        terminal
+            .draw(viewport_height, |frame| {
+                view.render_prepared(frame, prepared);
+            })
+            .unwrap();
+
+        view.handle_agent_event(AgentEvent::ModelTextDelta(
+            (0..40)
+                .map(|index| format!("- stream row {index}\n"))
+                .collect(),
+        ));
+        let mut prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+        let streamed_history = prepared.take_history_lines();
+        assert!(
+            streamed_history.iter().any(|line| line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .ends_with("stream row 0")),
+            "{streamed_history:?}"
+        );
+        let viewport_height = prepared.height();
+        terminal
+            .insert_history_lines(streamed_history, viewport_height)
+            .unwrap();
+        terminal
+            .draw(viewport_height, |frame| {
+                view.render_prepared(frame, prepared);
+            })
+            .unwrap();
+
+        let current = output.screen();
+        assert!(current.contains("stream row 39"), "{current}");
+        assert!(current.contains(MODEL), "{current}");
+        assert!(output.history_contains("stream row 0"));
     }
 
     #[test]
