@@ -3,15 +3,19 @@
 //!
 //! The upstream crate is coupled to Codex's remote filesystem and sandbox
 //! abstractions. bettercodex keeps the parser, fuzzy matching, sequential
-//! application, and output semantics while using `std::fs` with the invoking
-//! user's permissions.
+//! semantics, and output contract while using `std::fs` with the invoking
+//! user's permissions. Every operation is prepared against an in-memory view
+//! before the first filesystem mutation, so a late invalid hunk cannot leave
+//! the earlier half of a patch applied.
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
@@ -25,71 +29,215 @@ pub(super) fn apply(root: &Path, input: &str, cancellation: &CancellationToken) 
     if operations.is_empty() {
         return Err(anyhow!("No files were modified."));
     }
-    let mut added = Vec::new();
-    let mut modified = Vec::new();
-    let mut deleted = Vec::new();
+    let prepared = PreparedPatch::build(&root, operations, cancellation)?;
+    // Cancellation is honored throughout parsing and preparation. Once the
+    // first mutation starts, finish the short commit without interruption so
+    // cancellation cannot itself strand a partially applied patch.
+    ensure_not_cancelled(cancellation)?;
+    prepared.commit()
+}
 
-    for operation in operations {
-        ensure_not_cancelled(cancellation)?;
-        match operation {
-            Operation::Add { path, content } => {
-                let target = resolve(&root, &path)?;
-                write_file(&target, &content, cancellation)?;
-                added.push(path);
-            }
-            Operation::Delete { path } => {
-                let target = resolve(&root, &path)?;
-                ensure_not_cancelled(cancellation)?;
-                std::fs::remove_file(&target)
-                    .with_context(|| format!("Failed to delete file {}", target.display()))?;
-                deleted.push(path);
-            }
-            Operation::Update {
-                path,
-                move_to,
-                chunks,
-            } => {
-                let source = resolve(&root, &path)?;
-                let content = std::fs::read_to_string(&source).with_context(|| {
-                    format!("Failed to read file to update {}", source.display())
-                })?;
-                ensure_not_cancelled(cancellation)?;
-                let content = apply_chunks(&content, &chunks, &path, cancellation)?;
-                ensure_not_cancelled(cancellation)?;
+struct PreparedPatch {
+    mutations: Vec<Mutation>,
+    added: Vec<PathBuf>,
+    modified: Vec<PathBuf>,
+    deleted: Vec<PathBuf>,
+}
 
-                if let Some(destination_path) = move_to {
-                    let destination = resolve(&root, &destination_path)?;
-                    if destination == source {
-                        write_file(&source, &content, cancellation)?;
-                        modified.push(path);
+impl PreparedPatch {
+    fn build(
+        root: &Path,
+        operations: Vec<Operation>,
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        let mut files = VirtualFiles::default();
+        let mut mutations = Vec::new();
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut deleted = Vec::new();
+
+        for operation in operations {
+            ensure_not_cancelled(cancellation)?;
+            match operation {
+                Operation::Add { path, content } => {
+                    let target = resolve(root, &path)?;
+                    let content = Arc::<str>::from(content);
+                    files.write(target.clone(), Arc::clone(&content));
+                    mutations.push(Mutation::Write {
+                        path: target,
+                        content,
+                    });
+                    added.push(path);
+                }
+                Operation::Delete { path } => {
+                    let target = resolve(root, &path)?;
+                    files.delete(&target)?;
+                    mutations.push(Mutation::Delete {
+                        path: target,
+                        error_context: DeleteErrorContext::DeleteFile,
+                    });
+                    deleted.push(path);
+                }
+                Operation::Update {
+                    path,
+                    move_to,
+                    chunks,
+                } => {
+                    let source = resolve(root, &path)?;
+                    let content = files.read_to_string(&source)?;
+                    ensure_not_cancelled(cancellation)?;
+                    let content =
+                        Arc::<str>::from(apply_chunks(&content, &chunks, &path, cancellation)?);
+                    ensure_not_cancelled(cancellation)?;
+
+                    if let Some(destination_path) = move_to {
+                        let destination = resolve(root, &destination_path)?;
+                        if destination == source {
+                            files.write(source.clone(), Arc::clone(&content));
+                            mutations.push(Mutation::Write {
+                                path: source,
+                                content,
+                            });
+                            modified.push(path);
+                        } else {
+                            files.write(destination.clone(), Arc::clone(&content));
+                            files.delete(&source)?;
+                            mutations.push(Mutation::Write {
+                                path: destination,
+                                content,
+                            });
+                            mutations.push(Mutation::Delete {
+                                path: source,
+                                error_context: DeleteErrorContext::RemoveOriginal,
+                            });
+                            modified.push(destination_path);
+                        }
                     } else {
-                        write_file(&destination, &content, cancellation)?;
-                        // Once the destination is committed, finish the move even if cancellation
-                        // arrives so an interrupted operation does not leave both paths behind.
-                        std::fs::remove_file(&source).with_context(|| {
-                            format!("Failed to remove original {}", source.display())
-                        })?;
-                        modified.push(destination_path);
+                        files.write(source.clone(), Arc::clone(&content));
+                        mutations.push(Mutation::Write {
+                            path: source,
+                            content,
+                        });
+                        modified.push(path);
                     }
-                } else {
-                    write_file(&source, &content, cancellation)?;
-                    modified.push(path);
                 }
             }
         }
+
+        Ok(Self {
+            mutations,
+            added,
+            modified,
+            deleted,
+        })
     }
 
-    let mut summary = String::from("Success. Updated the following files:\n");
-    for path in added {
-        summary.push_str(&format!("A {}\n", path.display()));
+    fn commit(self) -> Result<String> {
+        for mutation in self.mutations {
+            match mutation {
+                Mutation::Write { path, content } => write_file(&path, &content)?,
+                Mutation::Delete {
+                    path,
+                    error_context,
+                } => {
+                    std::fs::remove_file(&path).with_context(|| match error_context {
+                        DeleteErrorContext::DeleteFile => {
+                            format!("Failed to delete file {}", path.display())
+                        }
+                        DeleteErrorContext::RemoveOriginal => {
+                            format!("Failed to remove original {}", path.display())
+                        }
+                    })?;
+                }
+            }
+        }
+
+        let mut summary = String::from("Success. Updated the following files:\n");
+        for path in self.added {
+            summary.push_str(&format!("A {}\n", path.display()));
+        }
+        for path in self.modified {
+            summary.push_str(&format!("M {}\n", path.display()));
+        }
+        for path in self.deleted {
+            summary.push_str(&format!("D {}\n", path.display()));
+        }
+        Ok(summary)
     }
-    for path in modified {
-        summary.push_str(&format!("M {}\n", path.display()));
+}
+
+enum Mutation {
+    Write {
+        path: PathBuf,
+        content: Arc<str>,
+    },
+    Delete {
+        path: PathBuf,
+        error_context: DeleteErrorContext,
+    },
+}
+
+enum DeleteErrorContext {
+    DeleteFile,
+    RemoveOriginal,
+}
+
+#[derive(Default)]
+struct VirtualFiles {
+    files: HashMap<PathBuf, VirtualFile>,
+}
+
+impl VirtualFiles {
+    fn read_to_string(&mut self, path: &Path) -> Result<Arc<str>> {
+        if let Some(file) = self.files.get(path) {
+            return match file {
+                VirtualFile::Text(content) => Ok(Arc::clone(content)),
+                VirtualFile::Missing => Err(missing_file_error())
+                    .with_context(|| format!("Failed to read file to update {}", path.display())),
+            };
+        }
+
+        let content = Arc::<str>::from(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read file to update {}", path.display()))?,
+        );
+        self.files
+            .insert(path.to_path_buf(), VirtualFile::Text(Arc::clone(&content)));
+        Ok(content)
     }
-    for path in deleted {
-        summary.push_str(&format!("D {}\n", path.display()));
+
+    fn write(&mut self, path: PathBuf, content: Arc<str>) {
+        self.files.insert(path, VirtualFile::Text(content));
     }
-    Ok(summary)
+
+    fn delete(&mut self, path: &Path) -> Result<()> {
+        match self.files.get(path) {
+            Some(VirtualFile::Text(_)) => {}
+            Some(VirtualFile::Missing) => {
+                return Err(missing_file_error())
+                    .with_context(|| format!("Failed to delete file {}", path.display()));
+            }
+            None => {
+                let metadata = std::fs::symlink_metadata(path)
+                    .with_context(|| format!("Failed to delete file {}", path.display()))?;
+                if metadata.file_type().is_dir() {
+                    return Err(std::io::Error::from_raw_os_error(libc::EISDIR))
+                        .with_context(|| format!("Failed to delete file {}", path.display()));
+                }
+            }
+        }
+        self.files.insert(path.to_path_buf(), VirtualFile::Missing);
+        Ok(())
+    }
+}
+
+enum VirtualFile {
+    Text(Arc<str>),
+    Missing,
+}
+
+fn missing_file_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::ENOENT)
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
@@ -100,8 +248,7 @@ fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
     }
 }
 
-fn write_file(path: &Path, content: &str, cancellation: &CancellationToken) -> Result<()> {
-    ensure_not_cancelled(cancellation)?;
+fn write_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -109,7 +256,6 @@ fn write_file(path: &Path, content: &str, cancellation: &CancellationToken) -> R
             format!("Failed to create parent directories for {}", path.display())
         })?;
     }
-    ensure_not_cancelled(cancellation)?;
     std::fs::write(path, content)
         .with_context(|| format!("Failed to write file {}", path.display()))
 }

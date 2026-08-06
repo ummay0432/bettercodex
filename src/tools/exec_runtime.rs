@@ -627,6 +627,50 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_nested_patch_leaves_every_file_unchanged() {
+        let cwd = temporary_directory("failed-patch");
+        let existing = cwd.join("existing.txt");
+        std::fs::write(&existing, "before\n").unwrap();
+        let runtime = runtime(cwd.clone());
+        let result = runtime
+            .execute(
+                "call-failed-patch",
+                r#"
+await tools.apply_patch(`*** Begin Patch
+*** Add File: added.txt
++new
+*** Update File: existing.txt
+@@
+-before
++after
+*** Update File: missing.txt
+@@
+-missing
++replacement
+*** End Patch`);
+"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.preview.starts_with("Script failed"),
+            "{}",
+            result.preview
+        );
+        assert!(
+            result.preview.contains("Failed to read file to update"),
+            "{}",
+            result.preview
+        );
+        assert!(!cwd.join("added.txt").exists());
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), "before\n");
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn papercut_tool_creates_and_appends_the_git_root_log() {
         let root = temporary_directory("papercut");
         let cwd = root.join("src/nested");
