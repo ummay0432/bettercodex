@@ -2,9 +2,12 @@ use super::MAX_READY_AGENT_EVENTS;
 use super::ReceiverState;
 use super::drain_ready_agent_events;
 use super::prompt_history_for_session;
+use super::terminal;
+use super::terminal_hyperlinks;
 use super::view::View;
 use crate::assistant_message::AssistantMessage;
 use crate::events::AgentEvent;
+use crate::rollout::SessionTranscriptItem;
 use codex_protocol::models::MessagePhase;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -256,6 +259,70 @@ fn prepared_layout_reflows_if_the_terminal_resizes_before_draw() {
 }
 
 #[test]
+fn active_assistant_links_reach_the_ratatui_terminal_buffer_as_osc8() {
+    const DESTINATION: &str = "https://example.com/docs";
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn("render a link");
+    let _ = view.take_pending_history_lines(64);
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(format!(
+        "Read [the docs]({DESTINATION}) and {DESTINATION}."
+    )));
+
+    let rendered = render_view(&mut view, 64, 24);
+    assert!(
+        rendered.contains(&format!("\x1b]8;;{DESTINATION}\x07")),
+        "{rendered:?}"
+    );
+    let visible = terminal_hyperlinks::strip_osc8(&rendered);
+    assert!(visible.contains("the docs"), "{visible}");
+    assert!(visible.contains(DESTINATION), "{visible}");
+}
+
+#[test]
+fn finalized_scrollback_resize_and_resume_preserve_link_destinations() {
+    const DESTINATION: &str = "https://example.com/a_(b)";
+    let mut view = View::new(Path::new("/workspace/project"));
+    view.start_turn("render finalized links");
+    let _ = view.take_pending_history_lines(52);
+    let response = format!("A wrapped destination ({DESTINATION}).");
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(response.clone()));
+    view.handle_agent_event(completed_message(response));
+
+    let finalized = view.take_pending_history_lines(52);
+    assert!(
+        finalized
+            .iter()
+            .flat_map(|line| &line.hyperlinks)
+            .any(|link| { link.destination == DESTINATION })
+    );
+    let buffer = terminal::render_history_lines(&finalized, 52);
+    assert!(render_buffer(&buffer).contains(&format!("\x1b]8;;{DESTINATION}\x07")));
+
+    let resized = view.history_lines_for_resize_reflow(24);
+    assert!(
+        resized
+            .iter()
+            .flat_map(|line| &line.hyperlinks)
+            .any(|link| { link.destination == DESTINATION })
+    );
+
+    let mut resumed = View::new(Path::new("/workspace/project"));
+    resumed.replay_transcript([SessionTranscriptItem::Assistant {
+        text: format!("Resumed [{DESTINATION}]({DESTINATION})"),
+        phase: Some(MessagePhase::FinalAnswer),
+    }]);
+    let replay = resumed.take_pending_history_lines(36);
+    assert!(
+        replay
+            .iter()
+            .flat_map(|line| &line.hyperlinks)
+            .any(|link| { link.destination == DESTINATION })
+    );
+    let replay_buffer = terminal::render_history_lines(&replay, 36);
+    assert!(render_buffer(&replay_buffer).contains("\x1b]8;;https://example.com/a_(b)\x07"));
+}
+
+#[test]
 #[ignore = "manual performance measurement"]
 fn benchmark_streaming_markdown_event_burst() {
     const DELTAS: usize = 2_000;
@@ -323,8 +390,9 @@ fn render_prepared_view(
     render_buffer(terminal.backend().buffer())
 }
 
-fn plain(line: &ratatui::text::Line<'_>) -> String {
-    line.spans
+fn plain(line: &terminal_hyperlinks::HyperlinkLine) -> String {
+    line.line
+        .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect()

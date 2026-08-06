@@ -1,3 +1,4 @@
+use super::clipboard_paste;
 use super::context_window::ContextAction;
 use super::context_window::ContextWindowView;
 use super::editor;
@@ -6,6 +7,9 @@ use super::file_search::FileSearchPopup;
 use super::file_search::FileSearchUpdate;
 use super::file_search::is_horizontal_whitespace;
 use super::markdown;
+use super::markdown_cache::MarkdownRenderCache;
+use super::palette;
+use super::palette::TerminalColors;
 use super::pending_input::PendingInput;
 use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
@@ -13,6 +17,8 @@ use super::resume_picker::ResumePickerAction;
 use super::skill_popup::SkillPopup;
 use super::skills_view::SkillsView;
 use super::skills_view::SkillsViewAction;
+use super::terminal_hyperlinks;
+use super::terminal_hyperlinks::HyperlinkLine;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
 use crate::MODEL;
@@ -216,8 +222,8 @@ pub(super) struct PreparedView {
     width: u16,
     height: u16,
     active_height: u16,
-    active_lines: Vec<Line<'static>>,
-    history_lines: Vec<Line<'static>>,
+    active_lines: Vec<HyperlinkLine>,
+    history_lines: Vec<HyperlinkLine>,
 }
 
 impl PreparedView {
@@ -225,19 +231,19 @@ impl PreparedView {
         self.height
     }
 
-    pub(super) fn take_history_lines(&mut self) -> Vec<Line<'static>> {
+    pub(super) fn take_history_lines(&mut self) -> Vec<HyperlinkLine> {
         std::mem::take(&mut self.history_lines)
     }
 }
 
 #[derive(Debug)]
 enum TranscriptEntry {
-    User(UserPrompt),
+    User(DisplayedUserPrompt),
     Assistant {
         text: String,
         phase: Option<MessagePhase>,
         streaming: bool,
-        rendered: Option<RenderedAssistant>,
+        rendered: MarkdownRenderCache,
         history: StreamedAssistantHistory,
     },
     Tool(ToolEntry),
@@ -255,9 +261,60 @@ enum TranscriptEntry {
 }
 
 #[derive(Debug)]
-struct RenderedAssistant {
-    width: u16,
-    lines: Vec<Line<'static>>,
+struct DisplayedUserPrompt {
+    text: String,
+    model_text: String,
+    skill_mentions: Vec<crate::skills::SkillMention>,
+    image_ranges: Vec<std::ops::Range<usize>>,
+    image_count: usize,
+}
+
+impl DisplayedUserPrompt {
+    fn from_prompt(prompt: &UserPrompt) -> Self {
+        Self {
+            text: prompt.as_str().to_string(),
+            model_text: prompt.text_without_image_placeholders(),
+            skill_mentions: prompt.skill_mentions().to_vec(),
+            image_ranges: prompt
+                .image_attachments()
+                .iter()
+                .map(|attachment| attachment.range().clone())
+                .collect(),
+            image_count: prompt.image_count(),
+        }
+    }
+
+    fn replayed(mut text: String, image_count: usize) -> Self {
+        let model_text = text.clone();
+        let mut image_ranges = Vec::with_capacity(image_count);
+        for index in 0..image_count {
+            if !text.trim().is_empty() || index > 0 {
+                text.push_str("\n\n");
+            }
+            let start = text.len();
+            text.push_str(&format!("[Image {}]", index + 1));
+            image_ranges.push(start..text.len());
+        }
+        Self {
+            text,
+            model_text,
+            skill_mentions: Vec::new(),
+            image_ranges,
+            image_count,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn skill_mentions(&self) -> &[crate::skills::SkillMention] {
+        &self.skill_mentions
+    }
+
+    fn image_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.image_ranges
+    }
 }
 
 /// Rows from an in-flight assistant cell that have already moved into terminal scrollback.
@@ -268,7 +325,7 @@ struct RenderedAssistant {
 struct StreamedAssistantHistory {
     width: Option<u16>,
     started: bool,
-    lines: Vec<Line<'static>>,
+    lines: Vec<HyperlinkLine>,
 }
 
 #[derive(Debug)]
@@ -399,14 +456,7 @@ enum Overlay {
     Tools(ToolCatalogueView),
 }
 
-#[derive(Clone, Copy)]
-struct TerminalColors {
-    foreground: (u8, u8, u8),
-    background: (u8, u8, u8),
-}
-
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
-static TERMINAL_COLORS: OnceLock<TerminalColors> = OnceLock::new();
 
 impl View {
     pub(super) fn new(cwd: &Path) -> Self {
@@ -454,12 +504,7 @@ impl View {
         background: Option<(u8, u8, u8)>,
     ) {
         self.user_message_style = user_message_style_for(background);
-        if let (Some(foreground), Some(background)) = (foreground, background) {
-            let _ = TERMINAL_COLORS.set(TerminalColors {
-                foreground,
-                background,
-            });
-        }
+        palette::set_terminal_colors(foreground, background);
     }
 
     pub(super) fn seed_prompt_history(&mut self, history: impl IntoIterator<Item = String>) {
@@ -504,7 +549,10 @@ impl View {
     pub(super) fn start_turn(&mut self, prompt: impl Into<UserPrompt>) {
         let prompt = prompt.into();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::User(prompt));
+        self.entries
+            .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
+                &prompt,
+            )));
         self.busy = true;
         self.action_required = false;
         self.interrupting = None;
@@ -533,7 +581,10 @@ impl View {
     pub(super) fn add_user_message(&mut self, prompt: &UserPrompt) {
         self.close_streaming_entries();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::User(prompt.clone()));
+        self.entries
+            .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
+                prompt,
+            )));
         self.reasoning_status.reset();
         self.status_detail = None;
     }
@@ -565,11 +616,9 @@ impl View {
         }
         let restored = UserPrompt::joined(prompts);
         if self.editor.is_empty() {
-            self.editor
-                .set_prompt(restored.as_str(), restored.skill_mentions());
+            self.editor.set_user_prompt(&restored);
         } else {
-            let text = format!("{}\n\n", restored.as_str());
-            self.editor.prepend_prompt(&text, restored.skill_mentions());
+            self.editor.prepend_user_prompt(&restored);
         }
         self.file_search.dismiss();
         self.skill_popup.hide();
@@ -601,7 +650,7 @@ impl View {
                         text: answer,
                         phase: Some(MessagePhase::FinalAnswer),
                         streaming: false,
-                        rendered: None,
+                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     });
                 }
@@ -719,8 +768,8 @@ impl View {
             .iter()
             .filter_map(|entry| match entry {
                 TranscriptEntry::User(prompt) => Some(SessionTranscriptItem::User {
-                    text: prompt.as_str().to_string(),
-                    image_count: 0,
+                    text: prompt.model_text.clone(),
+                    image_count: prompt.image_count,
                 }),
                 TranscriptEntry::Assistant {
                     text,
@@ -793,27 +842,14 @@ impl View {
     ) {
         self.entries
             .extend(transcript.into_iter().map(|item| match item {
-                SessionTranscriptItem::User {
-                    mut text,
-                    image_count,
-                } => {
-                    if image_count > 0 {
-                        if !text.trim().is_empty() {
-                            text.push_str("\n\n");
-                        }
-                        if image_count == 1 {
-                            text.push_str("[Image attachment]");
-                        } else {
-                            text.push_str(&format!("[{image_count} image attachments]"));
-                        }
-                    }
-                    TranscriptEntry::User(UserPrompt::text(text))
+                SessionTranscriptItem::User { text, image_count } => {
+                    TranscriptEntry::User(DisplayedUserPrompt::replayed(text, image_count))
                 }
                 SessionTranscriptItem::Assistant { text, phase } => TranscriptEntry::Assistant {
                     text,
                     phase,
                     streaming: false,
-                    rendered: None,
+                    rendered: MarkdownRenderCache::default(),
                     history: StreamedAssistantHistory::default(),
                 },
             }));
@@ -877,7 +913,7 @@ impl View {
                         text: message.text,
                         phase: self.active_message_phase.clone(),
                         streaming: true,
-                        rendered: None,
+                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     });
                 }
@@ -887,19 +923,15 @@ impl View {
                 self.seal_exploration();
                 match self.entries.last_mut() {
                     Some(TranscriptEntry::Assistant {
-                        text,
-                        streaming,
-                        rendered,
-                        ..
+                        text, streaming, ..
                     }) if *streaming => {
                         text.push_str(&delta);
-                        *rendered = None;
                     }
                     _ => self.entries.push(TranscriptEntry::Assistant {
                         text: delta,
                         phase: self.active_message_phase.clone(),
                         streaming: true,
-                        rendered: None,
+                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     }),
                 }
@@ -1014,7 +1046,11 @@ impl View {
             Event::Paste(_) if self.overlay.is_some() => Action::None,
             Event::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                self.editor.insert_paste(text);
+                if let Some(image) = clipboard_paste::image_from_pasted_path(&text) {
+                    self.attach_image(image);
+                } else {
+                    self.editor.insert_paste(text);
+                }
                 self.dismissed_slash = None;
                 self.slash_selection = 0;
                 Action::None
@@ -1063,7 +1099,21 @@ impl View {
             return self.handle_history_search_key(key);
         }
         if control && key.code == KeyCode::Char('c') {
-            return Action::Quit;
+            if self.overlay.is_some() {
+                self.overlay = None;
+                return Action::None;
+            }
+            if !self.editor.is_empty() {
+                self.editor.set_text("");
+                self.file_search.hide();
+                self.skill_popup.hide();
+                return Action::None;
+            }
+            return if self.busy {
+                Action::Cancel
+            } else {
+                Action::Quit
+            };
         }
         if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
             return match skills.handle_key(key, &self.skills) {
@@ -1245,10 +1295,11 @@ impl View {
             KeyCode::Char('h') if control && alt && !shift => {
                 self.editor.delete_previous_word();
             }
-            KeyCode::Char('l') if control => {}
             KeyCode::Char('b') if alt && !control => self.editor.move_word_left(),
             KeyCode::Char('f') if alt && !control => self.editor.move_word_right(),
-            KeyCode::Char(character) if (!control && !alt) || (control && alt) => {
+            KeyCode::Char(character)
+                if ((!control && !alt) || (control && alt)) && !character.is_control() =>
+            {
                 let mut bytes = [0; 4];
                 self.editor.insert(character.encode_utf8(&mut bytes));
             }
@@ -1299,7 +1350,7 @@ impl View {
             KeyCode::Backspace => self.editor.history_search_backspace(),
             KeyCode::Char('h') if control => self.editor.history_search_backspace(),
             KeyCode::Char('u') if control => self.editor.history_search_clear(),
-            KeyCode::Char(character) if !control && !alt => {
+            KeyCode::Char(character) if !control && !alt && !character.is_control() => {
                 let mut bytes = [0; 4];
                 self.editor
                     .history_search_insert(character.encode_utf8(&mut bytes));
@@ -1354,15 +1405,29 @@ impl View {
         }
     }
 
+    fn attach_image(&mut self, image: Result<crate::input::PromptImage, String>) {
+        let result = image.and_then(|image| self.editor.attach_image(image));
+        if let Err(error) = result {
+            self.entries.push(TranscriptEntry::Error(format!(
+                "Failed to attach image: {error}"
+            )));
+        }
+        self.file_search.dismiss();
+        self.skill_popup.hide();
+        self.dismissed_slash = None;
+        self.slash_selection = 0;
+    }
+
     fn submit_action(&mut self) -> Action {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
         let prompt = self.editor.take_prompt();
-        let text = prompt.as_str().to_string();
-        self.editor.remember(&text);
-        let command = text.trim();
-        if let Some(shell_command) = command.strip_prefix('!') {
+        let history_text = prompt.text_without_image_placeholders();
+        self.editor.remember(&history_text);
+        let command = history_text.trim();
+        let local_command = prompt.image_count() == 0;
+        if local_command && let Some(shell_command) = command.strip_prefix('!') {
             let shell_command = shell_command.trim();
             if shell_command.is_empty() {
                 self.entries.push(TranscriptEntry::Notice(
@@ -1375,7 +1440,8 @@ impl View {
                 history_text: command.to_string(),
             };
         }
-        if let Some(arguments) = command.strip_prefix("/resume")
+        if local_command
+            && let Some(arguments) = command.strip_prefix("/resume")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
             if self.busy {
@@ -1399,6 +1465,7 @@ impl View {
             };
         }
         match command {
+            _ if !local_command => Action::Submit(prompt),
             "/q" | "/quit" | "/exit" => Action::Quit,
             "/compact" if self.busy => {
                 self.entries.push(TranscriptEntry::Error(
@@ -1425,10 +1492,7 @@ impl View {
             "/clear" => Action::Clear,
             "/context" => Action::ShowContext,
             "/help" => {
-                self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · !command run shell · Ctrl+R search history · Ctrl+O copy latest answer · Tab queue follow-up · Alt+Up edit queue · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · $ skills · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
-                        .to_string(),
-                ));
+                self.overlay = Some(Overlay::Shortcuts);
                 Action::None
             }
             "/ps" => Action::ListBackgroundProcesses,
@@ -1455,7 +1519,7 @@ impl View {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
-        if is_local_command(self.editor.text().trim()) {
+        if self.editor.image_count() == 0 && is_local_command(self.editor.text().trim()) {
             self.entries.push(TranscriptEntry::Notice(
                 "Slash commands cannot be queued; use Enter or wait for the active turn"
                     .to_string(),
@@ -1463,8 +1527,8 @@ impl View {
             return Action::None;
         }
         let prompt = self.editor.take_prompt();
-        let text = prompt.as_str().to_string();
-        self.editor.remember(&text);
+        self.editor
+            .remember(&prompt.text_without_image_placeholders());
         Action::Queue(prompt)
     }
 
@@ -1507,14 +1571,13 @@ impl View {
                 *text = message.text;
                 *phase = message.phase;
                 *streaming = false;
-                *rendered = None;
             }
             _ if !message.text.trim().is_empty() => {
                 self.entries.push(TranscriptEntry::Assistant {
                     text: message.text,
                     phase: message.phase,
                     streaming: false,
-                    rendered: None,
+                    rendered: MarkdownRenderCache::default(),
                     history: StreamedAssistantHistory::default(),
                 });
             }
@@ -1602,12 +1665,12 @@ impl View {
             })
     }
 
-    pub(super) fn take_pending_history_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    pub(super) fn take_pending_history_lines(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let width = width.max(1);
         let mut lines = Vec::new();
         if self.welcome_pending {
             append_history_cell(
-                welcome_lines(&self.cwd, width),
+                terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(&self.cwd, width)),
                 &mut lines,
                 &mut self.history_emitted,
             );
@@ -1619,8 +1682,11 @@ impl View {
             .is_some_and(TranscriptEntry::is_finalized)
         {
             let entry = &mut self.entries[self.committed_entries];
-            let (cell, continuation) =
-                entry.display_lines_after_streamed_history(width, self.user_message_style);
+            let (cell, continuation) = entry.display_lines_after_streamed_history(
+                width,
+                self.user_message_style,
+                &self.cwd,
+            );
             if continuation {
                 lines.extend(cell);
             } else {
@@ -1637,7 +1703,7 @@ impl View {
     /// A terminal can reflow the mutable composer into scrollback before crossterm delivers the
     /// resize event. Codex repairs that state by clearing its terminal surface and replaying the
     /// retained transcript at the new width instead of trusting terminal-wrapped rows.
-    pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<Line<'static>> {
+    pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let width = width.max(1);
         for entry in &mut self.entries {
             entry.reset_streamed_history();
@@ -1652,10 +1718,14 @@ impl View {
 
         let mut lines = Vec::new();
         let mut emitted = false;
-        append_history_cell(welcome_lines(&self.cwd, width), &mut lines, &mut emitted);
+        append_history_cell(
+            terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(&self.cwd, width)),
+            &mut lines,
+            &mut emitted,
+        );
         for entry in &mut self.entries[..self.committed_entries] {
             append_history_cell(
-                entry.display_lines(width, self.user_message_style),
+                entry.display_lines(width, self.user_message_style, &self.cwd),
                 &mut lines,
                 &mut emitted,
             );
@@ -1672,9 +1742,10 @@ impl View {
     /// from the retained source before the finalized suffix is inserted.
     pub(super) fn streamed_history_needs_reflow(&mut self, width: u16) -> bool {
         let width = width.max(1);
+        let cwd = &self.cwd;
         self.entries[self.committed_entries..]
             .iter_mut()
-            .any(|entry| entry.streamed_history_needs_reflow(width))
+            .any(|entry| entry.streamed_history_needs_reflow(width, cwd))
     }
 
     /// Move the oldest rendered rows of a growing assistant response into real terminal history.
@@ -1682,7 +1753,7 @@ impl View {
     /// Keeping at least one row live prevents an unterminated final line from being committed while
     /// it is still changing. In normal terminals the complete composer/status layout leaves a much
     /// larger mutable tail; only rows that would otherwise be clipped are emitted.
-    fn spill_streaming_history(&mut self, width: u16, live_capacity: usize) -> Vec<Line<'static>> {
+    fn spill_streaming_history(&mut self, width: u16, live_capacity: usize) -> Vec<HyperlinkLine> {
         let history_was_emitted = self.history_emitted;
         let Some(TranscriptEntry::Assistant {
             text,
@@ -1698,7 +1769,7 @@ impl View {
         if history.started && history.width != Some(width) {
             return Vec::new();
         }
-        let rendered = cached_assistant_lines(text, rendered, width);
+        let rendered = assistant_lines(text, width, &self.cwd, true, rendered);
         if history.lines.len() > rendered.len() {
             return Vec::new();
         }
@@ -1718,7 +1789,7 @@ impl View {
             history.width = Some(width);
             self.history_emitted = true;
             if history_was_emitted {
-                output.push(Line::default());
+                output.push(HyperlinkLine::default());
                 rows_to_spill = rows_to_spill.saturating_sub(1);
             }
         }
@@ -1800,7 +1871,7 @@ impl View {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
         };
         let overlay_height = match self.overlay.as_ref() {
-            Some(Overlay::Shortcuts) => 17,
+            Some(Overlay::Shortcuts) => 21,
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills),
@@ -1988,12 +2059,14 @@ impl View {
         if lines.is_empty() {
             return;
         }
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(terminal_hyperlinks::visible_lines_ref(&lines)))
+            .wrap(Wrap { trim: false });
         let overflow = usize::from(active_height).saturating_sub(usize::from(area.height));
         frame.render_widget(
             paragraph.scroll((u16::try_from(overflow).unwrap_or(u16::MAX), 0)),
             area,
         );
+        terminal_hyperlinks::mark_buffer_hyperlinks(frame.buffer_mut(), area, &lines, overflow);
     }
 
     fn render_composer(
@@ -2014,6 +2087,7 @@ impl View {
             lines,
             paste_ranges,
             skill_ranges,
+            image_ranges,
             history_search_ranges,
             cursor_row,
             cursor_column,
@@ -2040,6 +2114,10 @@ impl View {
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
                     skill_ranges
+                        .get(usize::from(index))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    image_ranges
                         .get(usize::from(index))
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
@@ -2092,7 +2170,7 @@ impl View {
     }
 
     fn render_shortcuts(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered(area, 62, 15);
+        let popup = centered(area, 72, 19);
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .title(" Keyboard shortcuts ")
@@ -2117,7 +2195,7 @@ impl View {
             ),
             shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
             shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
-            shortcut_line("Ctrl+C", "exit"),
+            shortcut_line("Ctrl+C", "clear draft, interrupt work, or exit when idle"),
             Line::from(""),
             Line::from("Press any key to close").dim(),
         ];
@@ -2359,12 +2437,15 @@ impl View {
         truncate_line(Line::from(spans), usize::from(width))
     }
 
-    fn active_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    fn active_lines(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let mut lines = Vec::new();
         let mut emitted = self.history_emitted;
         for entry in &mut self.entries[self.committed_entries..] {
-            let (cell, continuation) =
-                entry.display_lines_after_streamed_history(width, self.user_message_style);
+            let (cell, continuation) = entry.display_lines_after_streamed_history(
+                width,
+                self.user_message_style,
+                &self.cwd,
+            );
             if continuation {
                 lines.extend(cell);
             } else {
@@ -2423,7 +2504,8 @@ impl TranscriptEntry {
         &mut self,
         width: u16,
         user_style: Style,
-    ) -> (Vec<Line<'static>>, bool) {
+        cwd: &Path,
+    ) -> (Vec<HyperlinkLine>, bool) {
         match self {
             Self::Assistant {
                 text,
@@ -2432,19 +2514,16 @@ impl TranscriptEntry {
                 history,
                 ..
             } if history.started && history.width == Some(width) => {
-                let rendered_lines = cached_assistant_lines(text, rendered, width);
+                let rendered_lines = assistant_lines(text, width, cwd, *streaming, rendered);
                 let start = history.lines.len().min(rendered_lines.len());
                 let output = rendered_lines[start..].to_vec();
-                if !*streaming {
-                    *rendered = None;
-                }
                 (output, true)
             }
-            _ => (self.display_lines(width, user_style), false),
+            _ => (self.display_lines(width, user_style, cwd), false),
         }
     }
 
-    fn streamed_history_needs_reflow(&mut self, width: u16) -> bool {
+    fn streamed_history_needs_reflow(&mut self, width: u16, cwd: &Path) -> bool {
         let Self::Assistant {
             text,
             streaming,
@@ -2467,7 +2546,7 @@ impl TranscriptEntry {
         if *streaming {
             return false;
         }
-        !cached_assistant_lines(text, rendered, width).starts_with(&history.lines)
+        !assistant_lines(text, width, cwd, false, rendered).starts_with(&history.lines)
     }
 
     fn reset_streamed_history(&mut self) {
@@ -2476,29 +2555,15 @@ impl TranscriptEntry {
         }
     }
 
-    fn display_lines(&mut self, width: u16, user_style: Style) -> Vec<Line<'static>> {
-        match self {
+    fn display_lines(&mut self, width: u16, user_style: Style, cwd: &Path) -> Vec<HyperlinkLine> {
+        let plain_lines = match self {
             Self::User(message) => user_message_lines(message, width, user_style),
             Self::Assistant {
                 text,
                 streaming,
                 rendered,
                 ..
-            } => {
-                let _ = cached_assistant_lines(text, rendered, width);
-                if *streaming {
-                    rendered
-                        .as_ref()
-                        .expect("streaming assistant rendering was cached")
-                        .lines
-                        .clone()
-                } else {
-                    rendered
-                        .take()
-                        .expect("finalized assistant rendering was cached")
-                        .lines
-                }
-            }
+            } => return assistant_lines(text, width, cwd, *streaming, rendered),
             Self::Tool(tool) => tool.display_lines(width, user_style),
             Self::Exploration { tools, .. } => exploration_lines(tools, width),
             Self::Notice(message) => vec![Line::from(vec![
@@ -2514,7 +2579,8 @@ impl TranscriptEntry {
             Self::FinalMessageSeparator { elapsed_seconds } => {
                 final_message_separator_lines(*elapsed_seconds, width)
             }
-        }
+        };
+        terminal_hyperlinks::plain_hyperlink_lines(plain_lines)
     }
 }
 
@@ -3382,7 +3448,11 @@ fn display_tool_path(path: &Path, cwd: &Path) -> String {
     )
 }
 
-fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Line<'static>> {
+fn user_message_lines(
+    message: &DisplayedUserPrompt,
+    width: u16,
+    style: Style,
+) -> Vec<Line<'static>> {
     let (message_text, skill_ranges) = sanitized_prompt(message);
     let message_text = message_text.trim_end_matches(['\r', '\n']);
     let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS + 1).max(1);
@@ -3408,17 +3478,31 @@ fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Lin
     lines
 }
 
-fn sanitized_prompt(message: &UserPrompt) -> (String, Vec<std::ops::Range<usize>>) {
+fn sanitized_prompt(message: &DisplayedUserPrompt) -> (String, Vec<std::ops::Range<usize>>) {
     let mut text = String::with_capacity(message.as_str().len());
-    let mut ranges = Vec::with_capacity(message.skill_mentions().len());
+    let mut source_ranges = message
+        .skill_mentions()
+        .iter()
+        .filter_map(|mention| {
+            let range = mention.range();
+            (range.end <= message.as_str().len()
+                && message.as_str().get(range.clone())
+                    == Some(format!("${}", mention.selection().name()).as_str()))
+            .then_some(range.clone())
+        })
+        .chain(message.image_ranges().iter().filter_map(|range| {
+            message
+                .as_str()
+                .get(range.clone())
+                .is_some_and(|label| label.starts_with("[Image ") && label.ends_with(']'))
+                .then_some(range.clone())
+        }))
+        .collect::<Vec<_>>();
+    source_ranges.sort_by_key(|range| range.start);
+    let mut ranges = Vec::with_capacity(source_ranges.len());
     let mut cursor = 0_usize;
-    for mention in message.skill_mentions() {
-        let range = mention.range();
-        if range.start < cursor
-            || range.end > message.as_str().len()
-            || message.as_str().get(range.clone())
-                != Some(format!("${}", mention.selection().name()).as_str())
-        {
+    for range in source_ranges {
+        if range.start < cursor {
             continue;
         }
         text.push_str(&markdown::sanitize(&message.as_str()[cursor..range.start]));
@@ -3461,31 +3545,19 @@ fn styled_skill_mentions(
     spans
 }
 
-fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
-    let content_width = width.saturating_sub(2).max(1);
-    let rendered = markdown::render(message, content_width);
-    let mut wrapped = Vec::new();
-    for line in rendered {
-        wrapped.extend(wrap_styled_line(&line, content_width));
-    }
-    prefix_styled_lines(wrapped, "• ", "  ")
-}
-
-fn cached_assistant_lines<'a>(
-    text: &str,
-    rendered: &'a mut Option<RenderedAssistant>,
+fn assistant_lines(
+    message: &str,
     width: u16,
-) -> &'a [Line<'static>] {
-    if rendered.as_ref().is_none_or(|cached| cached.width != width) {
-        *rendered = Some(RenderedAssistant {
-            width,
-            lines: assistant_lines(text, width),
-        });
-    }
-    &rendered
-        .as_ref()
-        .expect("assistant rendering was cached")
-        .lines
+    cwd: &Path,
+    streaming: bool,
+    cache: &mut MarkdownRenderCache,
+) -> Vec<HyperlinkLine> {
+    let content_width = usize::from(width.saturating_sub(2).max(1));
+    terminal_hyperlinks::prefix_hyperlink_lines(
+        cache.render(message, content_width, cwd, streaming),
+        Span::from("• ").dim(),
+        Span::from("  "),
+    )
 }
 
 fn background_process_lines(processes: &[BackgroundProcess], width: u16) -> Vec<Line<'static>> {
@@ -3941,26 +4013,6 @@ fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     rows
 }
 
-fn prefix_styled_lines(
-    lines: Vec<Line<'static>>,
-    initial: &'static str,
-    subsequent: &'static str,
-) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            let mut spans = vec![if index == 0 {
-                Span::from(initial).dim()
-            } else {
-                Span::from(subsequent)
-            }];
-            spans.append(&mut line.spans);
-            Line::from(spans).style(line.style)
-        })
-        .collect()
-}
-
 fn prefix_lines(
     output: &mut Vec<Line<'static>>,
     lines: Vec<Line<'static>>,
@@ -3979,15 +4031,15 @@ fn prefix_lines(
 }
 
 fn append_history_cell(
-    mut cell: Vec<Line<'static>>,
-    output: &mut Vec<Line<'static>>,
+    mut cell: Vec<HyperlinkLine>,
+    output: &mut Vec<HyperlinkLine>,
     emitted: &mut bool,
 ) {
     if cell.is_empty() {
         return;
     }
     if *emitted {
-        output.push(Line::default());
+        output.push(HyperlinkLine::default());
     } else {
         *emitted = true;
     }
@@ -4008,11 +4060,11 @@ fn line_count_spans(added: usize, removed: Option<usize>) -> Vec<Span<'static>> 
     ]
 }
 
-fn rendered_line_count(lines: &[Line<'static>], width: u16) -> u16 {
+fn rendered_line_count(lines: &[HyperlinkLine], width: u16) -> u16 {
     if lines.is_empty() {
         return 0;
     }
-    Paragraph::new(Text::from(lines.to_vec()))
+    Paragraph::new(Text::from(terminal_hyperlinks::visible_lines_ref(lines)))
         .wrap(Wrap { trim: false })
         .line_count(width.max(1))
         .try_into()
@@ -4058,7 +4110,7 @@ fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
     shimmer_spans_at(
         text,
         started.elapsed(),
-        TERMINAL_COLORS.get().copied(),
+        palette::terminal_colors(),
         supports_true_color(),
     )
 }
@@ -4151,11 +4203,13 @@ fn editor_line(
     text: &str,
     paste_ranges: &[std::ops::Range<usize>],
     skill_ranges: &[std::ops::Range<usize>],
+    image_ranges: &[std::ops::Range<usize>],
     history_search_ranges: &[std::ops::Range<usize>],
 ) -> Line<'static> {
     let mut highlights = paste_ranges
         .iter()
         .chain(skill_ranges)
+        .chain(image_ranges)
         .chain(history_search_ranges)
         .cloned()
         .collect::<Vec<_>>();
@@ -4436,7 +4490,8 @@ mod tests {
         restored.restore_pending_input_to_composer();
         assert_eq!(restored.editor.take_prompt(), prompt);
 
-        let narrow_cyan = user_message_lines(&prompt, 8, Style::default())
+        let displayed = DisplayedUserPrompt::from_prompt(&prompt);
+        let narrow_cyan = user_message_lines(&displayed, 8, Style::default())
             .iter()
             .flat_map(|line| &line.spans)
             .filter(|span| span.style.fg == Some(Color::Cyan))
@@ -5109,7 +5164,8 @@ mod tests {
             .take_pending_history_lines(80)
             .into_iter()
             .map(|line| {
-                line.spans
+                line.line
+                    .spans
                     .into_iter()
                     .map(|span| span.content.into_owned())
                     .collect::<String>()
@@ -5117,7 +5173,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(history.contains("saved question"), "{history}");
-        assert!(history.contains("Image attachment"), "{history}");
+        assert!(history.contains("[Image 1]"), "{history}");
         assert!(history.contains("Saved answer"), "{history}");
         assert!(!history.contains("old transcript"), "{history}");
         view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
@@ -5692,6 +5748,100 @@ mod tests {
     }
 
     #[test]
+    fn help_opens_the_complete_shortcut_reference_without_clipping_the_footer() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.editor.set_text("/help");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(matches!(view.overlay, Some(Overlay::Shortcuts)));
+
+        let height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("Press any key to close"), "{rendered}");
+    }
+
+    #[test]
+    fn ctrl_c_clears_a_draft_interrupts_work_and_only_quits_when_idle() {
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let mut draft = View::new(Path::new("/tmp/bettercodex"));
+        draft.editor.set_text("do not lose this accidentally");
+        assert_eq!(draft.handle_terminal_event(ctrl_c.clone()), Action::None);
+        assert!(draft.editor.is_empty());
+
+        let mut working = View::new(Path::new("/tmp/bettercodex"));
+        working.start_turn("run tests");
+        assert_eq!(
+            working.handle_terminal_event(ctrl_c.clone()),
+            Action::Cancel
+        );
+
+        let mut idle = View::new(Path::new("/tmp/bettercodex"));
+        assert_eq!(idle.handle_terminal_event(ctrl_c), Action::Quit);
+    }
+
+    #[test]
+    fn unwanted_ctrl_g_l_t_and_z_shortcuts_remain_unbound() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        for (character, raw_control) in [
+            ('g', '\u{7}'),
+            ('l', '\u{c}'),
+            ('t', '\u{14}'),
+            ('z', '\u{1a}'),
+        ] {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::CONTROL,
+                ))),
+                Action::None
+            );
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(raw_control),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+        }
+        assert!(view.editor.is_empty());
+        assert!(view.overlay.is_none());
+    }
+
+    #[test]
+    fn pasted_image_paths_become_submitable_composer_attachments() {
+        let path =
+            std::env::temp_dir().join(format!("bettercodex-composer-image-{}.png", Uuid::new_v4()));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Paste(format!("\"{}\"", path.display()))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "[Image 1]");
+        assert_eq!(view.editor.image_count(), 1);
+        let Action::Submit(prompt) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("image-only composer should submit");
+        };
+        assert_eq!(prompt.image_count(), 1);
+        assert!(prompt.text_without_image_placeholders().is_empty());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn skills_command_renders_an_empty_manager_and_closes_without_model_input() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
@@ -5868,7 +6018,8 @@ mod tests {
     #[test]
     fn user_message_and_composer_share_codex_background() {
         let style = user_message_style_for(Some((31, 31, 31)));
-        let lines = user_message_lines(&prompt("test"), 40, style);
+        let prompt = prompt("test");
+        let lines = user_message_lines(&DisplayedUserPrompt::from_prompt(&prompt), 40, style);
         assert_eq!(lines.len(), 3);
         assert_eq!(plain(&lines[1]), "› test");
         assert_eq!(lines[0].style.bg, style.bg);
@@ -6525,8 +6676,32 @@ mod tests {
         }
     }
 
-    fn plain(line: &Line<'_>) -> String {
-        line.spans
+    trait PlainLine {
+        fn line(&self) -> &Line<'_>;
+    }
+
+    impl PlainLine for Line<'_> {
+        fn line(&self) -> &Line<'_> {
+            self
+        }
+    }
+
+    impl PlainLine for HyperlinkLine {
+        fn line(&self) -> &Line<'_> {
+            &self.line
+        }
+    }
+
+    impl<T: PlainLine + ?Sized> PlainLine for &T {
+        fn line(&self) -> &Line<'_> {
+            (*self).line()
+        }
+    }
+
+    fn plain<T: PlainLine>(value: &T) -> String {
+        value
+            .line()
+            .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()

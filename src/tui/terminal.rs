@@ -1,3 +1,5 @@
+use super::terminal_hyperlinks;
+use super::terminal_hyperlinks::HyperlinkLine;
 use anyhow::Context;
 use anyhow::Result;
 use crossterm::cursor::MoveTo;
@@ -29,6 +31,7 @@ use ratatui::backend::IntoCrossterm;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::layout::Size;
+#[cfg(test)]
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
@@ -163,7 +166,7 @@ where
 
     pub(super) fn insert_history_lines(
         &mut self,
-        lines: Vec<Line<'static>>,
+        lines: Vec<HyperlinkLine>,
         next_viewport_height: u16,
     ) -> Result<()> {
         if lines.is_empty() {
@@ -327,12 +330,12 @@ where
 /// paragraph collapses that background to the text itself. Codex's scrollback writer clears each
 /// row with the `Line` style before writing its spans; using that style as the per-line paragraph
 /// style preserves the same behavior while retaining Ratatui's wrapping here.
-pub(super) fn render_history_lines(lines: &[Line<'static>], width: u16) -> Buffer {
+pub(super) fn render_history_lines(lines: &[HyperlinkLine], width: u16) -> Buffer {
     let width = width.max(1);
     let rendered_height = lines
         .iter()
         .map(|line| {
-            Paragraph::new(line.clone())
+            Paragraph::new(line.line.clone())
                 .wrap(Wrap { trim: false })
                 .line_count(width)
                 .max(1)
@@ -348,7 +351,7 @@ pub(super) fn render_history_lines(lines: &[Line<'static>], width: u16) -> Buffe
         if y >= rendered_height {
             break;
         }
-        let paragraph = Paragraph::new(line.clone())
+        let paragraph = Paragraph::new(line.line.clone())
             .style(line.style)
             .wrap(Wrap { trim: false });
         let line_height = u16::try_from(paragraph.line_count(width).max(1)).unwrap_or(u16::MAX);
@@ -356,6 +359,8 @@ pub(super) fn render_history_lines(lines: &[Line<'static>], width: u16) -> Buffe
         paragraph.render(Rect::new(0, y, width, height), &mut buffer);
         y = y.saturating_add(height);
     }
+
+    terminal_hyperlinks::mark_buffer_hyperlinks(&mut buffer, area, lines, /*scroll_rows*/ 0);
 
     buffer
 }
@@ -564,8 +569,10 @@ fn parse_osc_component(value: &str) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::MODEL;
+    use crate::assistant_message::AssistantMessage;
     use crate::events::AgentEvent;
     use crate::tui::view::View;
+    use codex_protocol::models::MessagePhase;
     use ratatui::backend::ClearType as BackendClearType;
     use ratatui::backend::WindowSize;
     use ratatui::buffer::Cell;
@@ -579,6 +586,7 @@ mod tests {
     #[derive(Clone)]
     struct SharedParser {
         parser: Rc<RefCell<vt100::Parser>>,
+        bytes: Rc<RefCell<Vec<u8>>>,
     }
 
     impl SharedParser {
@@ -589,6 +597,7 @@ mod tests {
                     width,
                     TEST_SCROLLBACK_ROWS,
                 ))),
+                bytes: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
@@ -609,10 +618,15 @@ mod tests {
             parser.screen_mut().set_scrollback(0);
             found
         }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes.borrow().clone()
+        }
     }
 
     impl Write for SharedParser {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.borrow_mut().extend_from_slice(buffer);
             self.parser.borrow_mut().write(buffer)
         }
 
@@ -761,6 +775,7 @@ mod tests {
 
         let history = (0..viewport_height)
             .map(|row| Line::from(format!("history row {row}")))
+            .map(HyperlinkLine::from)
             .collect();
         terminal
             .insert_history_lines(history, viewport_height)
@@ -865,6 +880,60 @@ mod tests {
     }
 
     #[test]
+    fn active_and_finalized_assistant_links_emit_osc8_to_the_terminal() {
+        const WIDTH: u16 = 64;
+        const SCREEN_HEIGHT: u16 = 14;
+        const DESTINATION: &str = "https://example.com/terminal";
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let _ = view.take_pending_history_lines(WIDTH);
+        view.start_turn("render terminal links");
+        let _ = view.take_pending_history_lines(WIDTH);
+        let response = format!("Open [the terminal test]({DESTINATION}).");
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(response.clone()));
+
+        let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
+        let viewport_height = prepared.height();
+        let (mut terminal, output) = test_terminal(WIDTH, SCREEN_HEIGHT, viewport_height);
+        terminal
+            .draw(viewport_height, |frame| {
+                view.render_prepared(frame, prepared)
+            })
+            .unwrap();
+        let opening = format!("\x1b]8;;{DESTINATION}\x07");
+        let active_output = output.bytes();
+        assert!(
+            active_output
+                .windows(opening.len())
+                .any(|window| window == opening.as_bytes()),
+            "active terminal output did not contain an OSC 8 hyperlink"
+        );
+
+        view.handle_agent_event(AgentEvent::ModelMessageCompleted(AssistantMessage {
+            text: response,
+            phase: Some(MessagePhase::FinalAnswer),
+        }));
+        let history = view.take_pending_history_lines(WIDTH);
+        terminal
+            .insert_history_lines(history, viewport_height)
+            .unwrap();
+        let output = output.bytes();
+        assert!(
+            output
+                .windows(opening.len())
+                .any(|window| window == opening.as_bytes()),
+            "terminal output did not contain OSC 8 opening sequence"
+        );
+        let closing = b"\x1b]8;;\x07";
+        assert!(
+            output
+                .windows(closing.len())
+                .any(|window| window == closing),
+            "terminal output did not close OSC 8 hyperlinks"
+        );
+    }
+
+    #[test]
     fn history_rows_do_not_emit_terminal_width_padding() {
         let area = Rect::new(0, 0, 12, 2);
         let mut buffer = Buffer::empty(area);
@@ -888,6 +957,7 @@ mod tests {
             Line::from("plain"),
         ];
 
+        let lines = terminal_hyperlinks::plain_hyperlink_lines(lines);
         let buffer = render_history_lines(&lines, 12);
 
         for y in 0..3 {

@@ -30,6 +30,26 @@ fn legacy_history_replacements_default_missing_response_usage() {
 }
 
 #[test]
+fn transcript_snapshots_from_before_image_counts_remain_resumable() {
+    let record: RolloutRecord = serde_json::from_value(json!({
+        "type": "transcript_snapshot",
+        "items": [{"kind": "user", "text": "legacy prompt"}],
+    }))
+    .unwrap();
+
+    let RolloutRecord::TranscriptSnapshot { items } = record else {
+        panic!("expected transcript snapshot");
+    };
+    assert_eq!(
+        items,
+        [SessionTranscriptItem::User {
+            text: "legacy prompt".to_string(),
+            image_count: 0,
+        }]
+    );
+}
+
+#[test]
 fn fork_records_restore_the_transcript_and_compaction_window() {
     let root = temporary_directory("rollout-fork");
     let cwd = root.join("repo");

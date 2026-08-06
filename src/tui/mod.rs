@@ -1,19 +1,30 @@
 mod clipboard;
+mod clipboard_paste;
 mod context_window;
 mod editor;
 mod file_search;
 mod git_diff;
 mod markdown;
+mod markdown_cache;
+mod markdown_render;
+mod markdown_style;
+mod markdown_text_merge;
 mod notifications;
+mod palette;
 mod pending_input;
 mod reasoning_status;
+mod render;
 mod resume_picker;
 mod skill_popup;
 mod skills_view;
+mod table_detect;
 mod terminal;
+mod terminal_hyperlinks;
 mod terminal_title;
 mod tool_catalogue;
 mod view;
+mod width;
+mod wrapping;
 
 use crate::agent::Agent;
 use crate::agent::CompactionOutcome;
@@ -358,7 +369,7 @@ impl Runtime {
         match action {
             Action::None => {}
             Action::Submit(prompt) => {
-                self.persist_prompt(prompt.as_str());
+                self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
                     let steering = self
                         .turn_handle
@@ -373,7 +384,7 @@ impl Runtime {
                 }
             }
             Action::Queue(prompt) => {
-                self.persist_prompt(prompt.as_str());
+                self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
                     self.view.queue_follow_up(prompt);
                 } else {
