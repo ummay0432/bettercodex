@@ -173,6 +173,12 @@ pub(super) enum Action {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InterruptIntent {
+    StopTurn,
+    SubmitSteering,
+}
+
 pub(super) struct View {
     cwd: PathBuf,
     repository: Repository,
@@ -190,7 +196,7 @@ pub(super) struct View {
     background_processes: Vec<BackgroundProcess>,
     busy: bool,
     action_required: bool,
-    interrupting: bool,
+    interrupting: Option<InterruptIntent>,
     working_since: Option<Instant>,
     turn_had_work: bool,
     reasoning_status: ReasoningStatus,
@@ -425,7 +431,7 @@ impl View {
             background_processes: Vec::new(),
             busy: false,
             action_required: false,
-            interrupting: false,
+            interrupting: None,
             working_since: None,
             turn_had_work: false,
             reasoning_status: ReasoningStatus::default(),
@@ -501,7 +507,7 @@ impl View {
         self.entries.push(TranscriptEntry::User(prompt));
         self.busy = true;
         self.action_required = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
@@ -515,7 +521,7 @@ impl View {
         self.context_tokens = None;
         self.busy = true;
         self.action_required = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
@@ -548,10 +554,6 @@ impl View {
         self.pending_input.has_steers()
     }
 
-    pub(super) fn take_pending_steers(&mut self) -> Vec<UserPrompt> {
-        self.pending_input.take_steers()
-    }
-
     pub(super) fn restore_pending_input_to_composer(&mut self) {
         let prompts = self.pending_input.take_all();
         self.restore_prompts_to_composer(prompts);
@@ -575,7 +577,10 @@ impl View {
         self.slash_selection = 0;
     }
 
-    pub(super) fn finish_turn(&mut self, result: anyhow::Result<SubmitOutcome>) {
+    pub(super) fn finish_turn(
+        &mut self,
+        result: anyhow::Result<SubmitOutcome>,
+    ) -> Option<UserPrompt> {
         self.close_streaming_entries();
         self.seal_exploration();
         self.finish_incomplete_tools();
@@ -585,7 +590,7 @@ impl View {
             .map(|started| started.elapsed().as_secs());
         let turn_had_work = std::mem::take(&mut self.turn_had_work);
         self.busy = false;
-        self.interrupting = false;
+        let interrupt_intent = self.interrupting.take();
         self.reasoning_status.reset();
         self.status_detail = None;
         self.action_required = result.is_err();
@@ -604,22 +609,39 @@ impl View {
                     self.entries
                         .push(TranscriptEntry::FinalMessageSeparator { elapsed_seconds });
                 }
+                None
             }
-            Ok(SubmitOutcome::Cancelled) => self
-                .entries
-                .push(TranscriptEntry::Notice("Turn interrupted".to_string())),
-            Err(error) => self
-                .entries
-                .push(TranscriptEntry::Error(markdown::sanitize(&format!(
-                    "{error:#}"
-                )))),
+            Ok(SubmitOutcome::Cancelled) => {
+                let steers = if interrupt_intent == Some(InterruptIntent::SubmitSteering) {
+                    self.pending_input.take_steers()
+                } else {
+                    Vec::new()
+                };
+                if steers.is_empty() {
+                    self.entries
+                        .push(TranscriptEntry::Notice("Turn interrupted".to_string()));
+                    None
+                } else {
+                    self.entries.push(TranscriptEntry::Notice(
+                        "Model interrupted to submit steering input".to_string(),
+                    ));
+                    Some(UserPrompt::joined(steers))
+                }
+            }
+            Err(error) => {
+                self.entries
+                    .push(TranscriptEntry::Error(markdown::sanitize(&format!(
+                        "{error:#}"
+                    ))));
+                None
+            }
         }
     }
 
     pub(super) fn finish_compaction(&mut self, result: anyhow::Result<CompactionOutcome>) {
         self.working_since = None;
         self.busy = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.reasoning_status.reset();
         self.status_detail = None;
         self.action_required = result.is_err();
@@ -639,9 +661,9 @@ impl View {
         }
     }
 
-    pub(super) fn set_interrupting(&mut self) {
+    pub(super) fn set_interrupting(&mut self, intent: InterruptIntent) {
         if self.busy {
-            self.interrupting = true;
+            self.interrupting = Some(intent);
             self.status_detail = None;
         }
     }
@@ -2228,7 +2250,7 @@ impl View {
             .working_since
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        let heading = if self.interrupting {
+        let heading = if self.interrupting.is_some() {
             "Interrupting"
         } else if self.status_detail.as_deref() == Some("Compacting conversation") {
             "Compacting"
@@ -4597,7 +4619,7 @@ mod tests {
         view.handle_agent_event(AgentEvent::ModelMessageDelta("Done.".to_string()));
         view.handle_agent_event(completed_message("Done."));
         view.working_since = Some(Instant::now() - Duration::from_secs(125));
-        view.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
+        let _ = view.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
 
         let height = view.desired_height(WIDTH, 30);
         let backend = TestBackend::new(WIDTH, height);
@@ -4634,7 +4656,7 @@ mod tests {
         view.start_turn("render a table");
         view.handle_agent_event(AgentEvent::ModelMessageDelta(answer.to_string()));
         view.handle_agent_event(completed_message(answer));
-        view.finish_turn(Ok(SubmitOutcome::Completed(answer.to_string())));
+        let _ = view.finish_turn(Ok(SubmitOutcome::Completed(answer.to_string())));
 
         let height = view.desired_height(WIDTH, 30);
         let backend = TestBackend::new(WIDTH, height);
@@ -4662,7 +4684,7 @@ mod tests {
         }));
 
         assert!(!view.terminal_assistant_received_this_turn);
-        view.finish_turn(Ok(SubmitOutcome::Completed("Finished.".to_string())));
+        let _ = view.finish_turn(Ok(SubmitOutcome::Completed("Finished.".to_string())));
 
         let assistant_phases = view
             .entries
@@ -4708,7 +4730,7 @@ mod tests {
         conversational.welcome_pending = false;
         conversational.start_turn("test");
         conversational.working_since = Some(Instant::now() - Duration::from_secs(125));
-        conversational.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
+        let _ = conversational.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
         assert!(
             conversational
                 .take_pending_history_lines(80)
@@ -4753,7 +4775,7 @@ mod tests {
         assert!(second_section.contains("• Running validation ("));
         assert!(!second_section.contains("Inspecting the request"));
 
-        view.set_interrupting();
+        view.set_interrupting(InterruptIntent::StopTurn);
         assert!(render(&mut view).contains("• Interrupting ("));
     }
 
@@ -5239,6 +5261,97 @@ mod tests {
     }
 
     #[test]
+    fn plain_interruption_renders_one_plain_notice() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("initial prompt");
+        view.set_interrupting(InterruptIntent::StopTurn);
+
+        assert_eq!(
+            view.finish_turn(Ok(SubmitOutcome::Cancelled)),
+            None
+        );
+
+        let rendered = view
+            .take_pending_history_lines(88)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered.matches("Turn interrupted").count(), 1, "{rendered}");
+        assert!(
+            !rendered.contains("Model interrupted to submit steering input"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn steering_interruption_replaces_the_plain_notice() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("initial prompt");
+        let steering = prompt("change direction");
+        let (handle, _control) = crate::agent::TurnControl::channel();
+        let id = handle
+            .steer(crate::input::UserInput::text(steering.as_str()))
+            .unwrap();
+        view.add_pending_steer(id, steering.clone());
+        view.set_interrupting(InterruptIntent::SubmitSteering);
+
+        let submitted = view
+            .finish_turn(Ok(SubmitOutcome::Cancelled))
+            .expect("the pending steer should start a replacement turn");
+        assert_eq!(submitted, steering);
+        view.start_turn(submitted);
+
+        let rendered = view
+            .take_pending_history_lines(88)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered
+                .matches("Model interrupted to submit steering input")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Turn interrupted"), "{rendered}");
+    }
+
+    #[test]
+    fn committed_steer_falls_back_to_the_plain_interruption_notice() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("initial prompt");
+        let (handle, _control) = crate::agent::TurnControl::channel();
+        let id = handle
+            .steer(crate::input::UserInput::text("already committed"))
+            .unwrap();
+        view.add_pending_steer(id, prompt("already committed"));
+        view.set_interrupting(InterruptIntent::SubmitSteering);
+        view.handle_agent_event(AgentEvent::SteeringCommitted(id));
+
+        assert_eq!(
+            view.finish_turn(Ok(SubmitOutcome::Cancelled)),
+            None
+        );
+
+        let rendered = view
+            .take_pending_history_lines(88)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered.matches("Turn interrupted").count(), 1, "{rendered}");
+        assert!(
+            !rendered.contains("Model interrupted to submit steering input"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn interrupted_pending_input_is_restored_before_the_existing_draft() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         let (handle, _control) = crate::agent::TurnControl::channel();
@@ -5257,6 +5370,33 @@ mod tests {
         );
         assert_eq!(view.pending_input.steer_count(), 0);
         assert_eq!(view.pending_input.follow_up_count(), 0);
+    }
+
+    #[test]
+    fn only_a_steering_interrupt_consumes_pending_steers() {
+        fn interrupted_view(intent: InterruptIntent) -> (View, Option<UserPrompt>) {
+            let mut view = View::new(Path::new("/tmp/bettercodex"));
+            view.start_turn("initial prompt");
+            let (handle, _control) = crate::agent::TurnControl::channel();
+            let id = handle
+                .steer(crate::input::UserInput::text("pending steer"))
+                .unwrap();
+            view.add_pending_steer(id, prompt("pending steer"));
+            view.queue_follow_up(prompt("queued follow-up"));
+            view.set_interrupting(intent);
+            let steering = view.finish_turn(Ok(SubmitOutcome::Cancelled));
+            (view, steering)
+        }
+
+        let (stopped, steering) = interrupted_view(InterruptIntent::StopTurn);
+        assert!(steering.is_none());
+        assert_eq!(stopped.pending_input.steer_count(), 1);
+        assert_eq!(stopped.pending_input.follow_up_count(), 1);
+
+        let (steered, steering) = interrupted_view(InterruptIntent::SubmitSteering);
+        assert_eq!(steering.unwrap().as_str(), "pending steer");
+        assert_eq!(steered.pending_input.steer_count(), 0);
+        assert_eq!(steered.pending_input.follow_up_count(), 1);
     }
 
     #[test]
