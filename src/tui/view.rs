@@ -1766,8 +1766,8 @@ impl View {
             .max(1)
             .saturating_add(2);
         let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
-        let status_height = u16::from(self.busy);
-        let status_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(status_height);
+        let activity_height = u16::from(self.has_activity_surface(width));
+        let activity_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(activity_height);
         let bottom_spacing: u16 = 1;
         let popup_height = self.completion_popup_height(width);
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
@@ -1787,8 +1787,8 @@ impl View {
         };
         let transcript_chrome_height = bottom_spacing
             .saturating_add(pending_height)
-            .saturating_add(status_height)
-            .saturating_add(status_composer_spacing)
+            .saturating_add(activity_height)
+            .saturating_add(activity_composer_spacing)
             .saturating_add(composer_height)
             .saturating_add(trailing_height);
         (transcript_chrome_height, overlay_height)
@@ -1826,7 +1826,8 @@ impl View {
         let trailing_height =
             requested_trailing_height.min(area.height.saturating_sub(minimum_composer_height));
         let height_above_trailing = area.height.saturating_sub(trailing_height);
-        let status_reserve = if self.busy {
+        let has_activity_surface = self.has_activity_surface(area.width);
+        let activity_reserve = if has_activity_surface {
             STATUS_LINE_HEIGHT
                 .saturating_add(ACTIVITY_COMPOSER_GAP)
                 .min(height_above_trailing.saturating_sub(minimum_composer_height))
@@ -1837,11 +1838,11 @@ impl View {
         let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
         let pending_height = requested_pending_height.min(
             height_above_trailing
-                .saturating_sub(status_reserve)
+                .saturating_sub(activity_reserve)
                 .saturating_sub(minimum_composer_height),
         );
         let composer_height_limit = height_above_trailing
-            .saturating_sub(status_reserve)
+            .saturating_sub(activity_reserve)
             .saturating_sub(pending_height);
         let editor_height_limit = composer_height_limit.saturating_sub(2).max(1);
         let editor_layout = self
@@ -1864,24 +1865,24 @@ impl View {
         } else {
             Rect::default()
         };
-        let status_height = u16::from(self.busy && composer_y > area.y);
-        let status_composer_spacing = if status_height > 0 {
+        let activity_height = u16::from(has_activity_surface && composer_y > area.y);
+        let activity_composer_spacing = if activity_height > 0 {
             ACTIVITY_COMPOSER_GAP.min(
                 composer_y
                     .saturating_sub(area.y)
-                    .saturating_sub(status_height),
+                    .saturating_sub(activity_height),
             )
         } else {
             0
         };
-        let status_area = Rect::new(
+        let activity_area = Rect::new(
             area.x,
-            composer_y.saturating_sub(status_height + status_composer_spacing),
+            composer_y.saturating_sub(activity_height + activity_composer_spacing),
             area.width,
-            status_height,
+            activity_height,
         );
-        let pending_bottom = if status_height > 0 {
-            status_area.y
+        let pending_bottom = if activity_height > 0 {
+            activity_area.y
         } else {
             composer_area.y
         };
@@ -1893,8 +1894,8 @@ impl View {
         );
         let content_bottom = if pending_height > 0 {
             pending_area.y
-        } else if status_height > 0 {
-            status_area.y
+        } else if activity_height > 0 {
+            activity_area.y
         } else {
             composer_area.y
         };
@@ -1919,13 +1920,16 @@ impl View {
                 pending_area,
             );
         }
-        if status_height > 0 {
+        if activity_height > 0 {
+            let line = if self.busy {
+                self.working_line()
+            } else {
+                self.standalone_background_process_line(area.width)
+                    .expect("an idle activity surface requires background processes")
+            };
             frame.render_widget(
-                Paragraph::new(truncate_line(
-                    self.working_line(),
-                    usize::from(status_area.width),
-                )),
-                status_area,
+                Paragraph::new(truncate_line(line, usize::from(activity_area.width))),
+                activity_area,
             );
         }
         self.render_composer(frame, composer_area, footer_area, editor_layout);
@@ -2258,7 +2262,37 @@ impl View {
             spans.push(Span::from(" · ").dim());
             spans.push(Span::from(format!("{queued_follow_ups} queued")).dim());
         }
+        if let Some(summary) = self.background_process_summary() {
+            spans.push(Span::from(" · ").dim());
+            spans.push(Span::from(summary).dim());
+        }
         Line::from(spans)
+    }
+
+    fn has_activity_surface(&self, width: u16) -> bool {
+        self.busy || (width >= 4 && !self.background_processes.is_empty())
+    }
+
+    fn background_process_summary(&self) -> Option<String> {
+        let count = self.background_processes.len();
+        if count == 0 {
+            return None;
+        }
+        let plural = if count == 1 { "" } else { "s" };
+        Some(format!(
+            "{count} background terminal{plural} running · /ps to view · /stop to close"
+        ))
+    }
+
+    fn standalone_background_process_line(&self, width: u16) -> Option<Line<'static>> {
+        if width < 4 {
+            return None;
+        }
+        let summary = self.background_process_summary()?;
+        Some(Line::from(vec![
+            Span::from("  ").dim(),
+            Span::from(summary).dim(),
+        ]))
     }
 
     fn status_line(&self, width: u16) -> Line<'static> {
@@ -2300,15 +2334,6 @@ impl View {
             format_context_usage(self.context_tokens),
             Style::default().fg(MUTED),
         ));
-        if !self.background_processes.is_empty() {
-            let count = self.background_processes.len();
-            let plural = if count == 1 { "" } else { "s" };
-            spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
-            spans.push(Span::styled(
-                format!("{count} background terminal{plural} · /ps · /stop"),
-                Style::default().fg(MUTED),
-            ));
-        }
         truncate_line(Line::from(spans), usize::from(width))
     }
 
@@ -4250,6 +4275,15 @@ mod tests {
         })
     }
 
+    fn test_background_process(session_id: i32) -> BackgroundProcess {
+        BackgroundProcess {
+            session_id,
+            command: "sleep 30".to_string(),
+            cwd: PathBuf::from("/tmp/bettercodex"),
+            running_for: Duration::from_secs(2),
+        }
+    }
+
     #[test]
     fn context_usage_matches_the_preserved_contract() {
         assert_eq!(format_context_usage(None), "? of 258K");
@@ -4467,6 +4501,80 @@ mod tests {
             ("•", "›", "g"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn busy_background_terminal_summary_is_inline_with_the_activity_row() {
+        const WIDTH: u16 = 120;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        let _ = view.take_pending_history_lines(WIDTH);
+        let height_without_processes = view.desired_height(WIDTH, 24);
+        view.set_background_processes(vec![test_background_process(1)]);
+        let height = view.desired_height(WIDTH, 24);
+        assert_eq!(height, height_without_processes);
+
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let activity = rows
+            .iter()
+            .find(|row| row.contains("Working ("))
+            .expect("rendered activity row");
+        assert!(
+            activity.contains(" · 1 background terminal running · /ps to view · /stop to close"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("background terminal").count(), 1);
+        let footer = rows
+            .iter()
+            .find(|row| row.contains(MODEL))
+            .expect("rendered model footer");
+        assert!(!footer.contains("background terminal"), "{rendered}");
+    }
+
+    #[test]
+    fn idle_background_terminal_summary_uses_a_separate_activity_row() {
+        const WIDTH: u16 = 120;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        let height_without_processes = view.desired_height(WIDTH, 24);
+        view.set_background_processes(vec![test_background_process(1), test_background_process(2)]);
+        let height = view.desired_height(WIDTH, 24);
+        assert_eq!(height, height_without_processes + 2);
+
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let activity_y = rows
+            .iter()
+            .position(|row| {
+                row.contains("  2 background terminals running · /ps to view · /stop to close")
+            })
+            .expect("rendered background-terminal activity row") as u16;
+        let composer_background = view.user_message_style.bg.unwrap();
+        let composer_y = (0..height)
+            .find(|&y| buffer[(0, y)].bg == composer_background)
+            .expect("rendered composer");
+        assert_eq!(
+            composer_y.saturating_sub(activity_y.saturating_add(1)),
+            ACTIVITY_COMPOSER_GAP,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Working ("), "{rendered}");
+        let footer = rows
+            .iter()
+            .find(|row| row.contains(MODEL))
+            .expect("rendered model footer");
+        assert!(!footer.contains("background terminal"), "{rendered}");
     }
 
     #[test]
