@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -27,6 +29,10 @@ TIKTOKEN_VERSION = "0.11.0"
 LOW_SPACE_BYTES = 15 * 1024**3
 TEMP_CANDIDATE_AGE_SECONDS = 6 * 60 * 60
 MAX_REPORTED_TEMP_CANDIDATES = 20
+CANONICAL_BRANCH = "refs/heads/main"
+CANONICAL_REMOTE_BRANCH = "refs/remotes/origin/main"
+INSTALL_LOCK_FILE = ".bettercodex-install.lock"
+MAX_INSTALL_ATTEMPTS = 3
 
 
 def git(*arguments: str, cwd: Path = REPOSITORY, check: bool = True) -> str:
@@ -39,6 +45,33 @@ def git(*arguments: str, cwd: Path = REPOSITORY, check: bool = True) -> str:
         stderr=subprocess.PIPE,
     )
     return result.stdout.strip()
+
+
+def resolved_git_commit(reference: str, cwd: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{reference}^{{commit}}"],
+        cwd=cwd,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def is_ancestor(ancestor: str, descendant: str, cwd: Path) -> bool:
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=cwd,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
 
 
 def repository_root() -> Path:
@@ -140,6 +173,109 @@ def has_broad_origin_fetch() -> bool:
     )
     return any(
         "refs/heads/*:refs/remotes/origin/*" in line for line in result.stdout.splitlines()
+    )
+
+
+def canonical_main_commit(repository: Path) -> str:
+    commit = resolved_git_commit(CANONICAL_BRANCH, repository)
+    if commit is None:
+        raise RuntimeError("cannot install bettercodex because the local main branch is missing")
+    remote_commit = resolved_git_commit(CANONICAL_REMOTE_BRANCH, repository)
+    if remote_commit is not None and not is_ancestor(remote_commit, commit, repository):
+        raise RuntimeError(
+            "local main does not contain origin/main; update main before installing bettercodex"
+        )
+    return commit
+
+
+def validate_install_caller(worktree: Path, main_commit: str) -> None:
+    status = git("status", "--porcelain=v1", "--untracked-files=all", cwd=worktree)
+    if status:
+        raise RuntimeError(
+            "the invoking worktree is dirty; commit its work before installing canonical main"
+        )
+    head = git("rev-parse", "HEAD", cwd=worktree)
+    if not is_ancestor(head, main_commit, worktree):
+        raise RuntimeError(
+            "the invoking worktree's HEAD is not integrated into local main; merge it before installing"
+        )
+
+
+@contextlib.contextmanager
+def install_lock(install_root: Path):
+    install_root.mkdir(parents=True, exist_ok=True)
+    lock_path = install_root / INSTALL_LOCK_FILE
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def committed_source_snapshot(repository: Path, commit: str):
+    with tempfile.TemporaryDirectory(prefix=f"bettercodex-install-{commit[:12]}-") as temporary:
+        root = Path(temporary)
+        archive = root / "source.tar"
+        source = root / "source"
+        source.mkdir()
+        subprocess.run(
+            ["git", "archive", "--format=tar", "--output", os.fspath(archive), commit],
+            cwd=repository,
+            check=True,
+        )
+        subprocess.run(
+            ["tar", "-xf", os.fspath(archive), "-C", os.fspath(source)],
+            check=True,
+        )
+        yield source
+
+
+def command_install(arguments: argparse.Namespace) -> int:
+    worktree = repository_root()
+    primary = main_worktree_root()
+    install_root = arguments.root.expanduser().resolve()
+    target = primary / "target" / "canonical-install"
+    target.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment["CARGO_TARGET_DIR"] = os.fspath(target)
+
+    with install_lock(install_root):
+        for attempt in range(1, MAX_INSTALL_ATTEMPTS + 1):
+            commit = canonical_main_commit(primary)
+            validate_install_caller(worktree, commit)
+            print(f"Installing committed main {commit[:12]} into {install_root}")
+            with committed_source_snapshot(primary, commit) as source:
+                subprocess.run(
+                    [
+                        "cargo",
+                        "install",
+                        "--locked",
+                        "--path",
+                        os.fspath(source),
+                        "--force",
+                        "--root",
+                        os.fspath(install_root),
+                    ],
+                    cwd=source,
+                    env=environment,
+                    check=True,
+                )
+
+            latest = canonical_main_commit(primary)
+            if latest == commit:
+                binary = install_root / "bin" / "bcodex"
+                subprocess.run([binary, "--version"], check=True)
+                print(f"Installed canonical bettercodex {commit[:12]} at {binary}")
+                return 0
+            print(
+                f"main advanced from {commit[:12]} to {latest[:12]} during installation; retrying",
+                file=sys.stderr,
+            )
+
+    raise RuntimeError(
+        f"main changed during all {MAX_INSTALL_ATTEMPTS} installation attempts; retry once it settles"
     )
 
 
@@ -461,6 +597,17 @@ def parser() -> argparse.ArgumentParser:
     cargo = commands.add_parser("cargo", help="run Cargo with a safe per-worktree target")
     cargo.add_argument("cargo_arguments", nargs=argparse.REMAINDER)
     cargo.set_defaults(function=command_cargo)
+
+    install = commands.add_parser(
+        "install", help="install a serialized snapshot of committed local main"
+    )
+    install.add_argument(
+        "--root",
+        type=Path,
+        default=Path.home() / ".local",
+        help="Cargo installation root (default: ~/.local)",
+    )
+    install.set_defaults(function=command_install)
 
     preflight = commands.add_parser(
         "preflight", help="show disk, stale target/temp, and Git fetch-refspec risks"
