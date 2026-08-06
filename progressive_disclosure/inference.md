@@ -22,9 +22,9 @@ public OpenAI documentation for wire contracts, the Codex source linked from
 what bettercodex actually does. Recheck live sources before porting behavior
 that may have changed.
 
-`docs/5-5-prompt-guidance.md` is a local copy of public GPT-5.6 guidance. Read
-it only when model capabilities or prompt design are part of the task; verify
-time-sensitive claims against the live OpenAI documentation.
+`docs/5.6-prompting.md` links to the public GPT-5.6 guidance. Read it only when
+model capabilities or prompt design are part of the task, and use the linked
+live OpenAI documentation as the authoritative source.
 
 Changes to turns, Responses transport, history, compaction, saved sessions, or
 tools need a test that drives the changed behavior and inspects the resulting
