@@ -71,6 +71,7 @@ task-specific context; do not preload the whole folder:
 - [`progressive_disclosure/product-direction.md`](progressive_disclosure/product-direction.md): before changing product scope, fixed model/runtime choices, supported platforms, or major dependencies.
 - [`progressive_disclosure/development.md`](progressive_disclosure/development.md): before changing Rust, build scripts, tests, performance, or installation behavior.
 - [`progressive_disclosure/inference.md`](progressive_disclosure/inference.md): before changing requests, Responses items, history, reasoning, compaction, caching, streaming, recovery, tools, or saved sessions.
+- [`docs/instruction-hierarchy.md`](docs/instruction-hierarchy.md): before changing message roles, trust boundaries, repository/skill/tool context authority, prompt-injection defenses, or related evaluations.
 - [`progressive_disclosure/terminal-ui.md`](progressive_disclosure/terminal-ui.md): before changing `src/tui/`, terminal lifecycle, rendering, composer behavior, or shortcuts.
 - [`progressive_disclosure/model-facing-context.md`](progressive_disclosure/model-facing-context.md): before changing `AGENTS.md`, `prompts/*.md`, tool descriptions, or model-visible errors.
 
