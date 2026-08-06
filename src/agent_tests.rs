@@ -846,8 +846,10 @@ async fn backend_usage_is_not_overridden_by_a_larger_full_history_estimate() {
     };
     assert_eq!(response.text, "measured context accepted");
     let request: Value = serde_json::from_slice(&request.expect("sampling request")).unwrap();
+    let rendered_request_tokens = crate::api::estimated_harness_instruction_tokens()
+        .saturating_add(estimated_tokens(request["input"].as_array().unwrap()));
     assert!(
-        estimated_tokens(request["input"].as_array().unwrap()) > EFFECTIVE_CONTEXT_WINDOW,
+        rendered_request_tokens > EFFECTIVE_CONTEXT_WINDOW,
         "the fixture must cover the heuristic false positive"
     );
 

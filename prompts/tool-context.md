@@ -18,7 +18,7 @@ renderer but deliberately uses shorter descriptions for its fixed surface.
 Every normal Responses request has two stable model-context channels:
 
 1. The top-level `instructions` field contains `prompts/system.md`, with
-   surrounding whitespace removed. Its `<harness_contract>` label identifies
+   surrounding whitespace removed. Its `<system_instructions>` label identifies
    the bettercodex-owned behavioral contract. The Responses API's
    [instruction-following contract](https://developers.openai.com/api/docs/guides/text#message-roles-and-instruction-following)
    applies this as developer-level instruction.
@@ -94,15 +94,15 @@ tokens, and 45.0% of bytes/4 tokens.
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable harness input: `instructions` plus `additional_tools` | 14,818 | 3,648 | 3,705 |
+| Complete stable harness input: `instructions` plus `additional_tools` | 21,901 | 5,086 | 5,476 |
 | Complete `additional_tools` developer item | 11,238 | 2,939 | 2,810 |
 | Top-level `exec` specification | 10,354 | 2,741 | 2,589 |
 | `exec` description only | 9,727 | 2,371 | 2,432 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
 | Top-level `wait` specification | 826 | 186 | 207 |
 | `wait` description only | 247 | 62 | 62 |
-| Top-level `instructions` request field | 3,569 | 706 | 893 |
-| `prompts/system.md` text only | 3,493 | 669 | 874 |
+| Top-level `instructions` request field | 10,652 | 2,144 | 2,663 |
+| `prompts/system.md` text only | 10,514 | 2,037 | 2,629 |
 <!-- bcodex-tool-context:stable:end -->
 
 The `exec` description contains the Code Mode runtime instructions and every

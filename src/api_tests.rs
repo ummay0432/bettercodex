@@ -286,8 +286,13 @@ fn request_uses_instructions_and_one_stable_tool_prefix() {
 
     assert_eq!(first["model"], MODEL);
     assert_eq!(first["instructions"], harness_instructions());
-    assert!(harness_instructions().starts_with("<harness_contract>"));
-    assert!(harness_instructions().ends_with("</harness_contract>"));
+    assert!(
+        harness_instructions().starts_with(
+            "<system_instructions>\nYou are Sol, the coding agent inside bettercodex."
+        )
+    );
+    assert!(harness_instructions().contains("# Engineering ownership"));
+    assert!(harness_instructions().ends_with("</system_instructions>"));
     assert!(
         first.get("max_output_tokens").is_none(),
         "ChatGPT Responses Lite rejects the public max_output_tokens field"
