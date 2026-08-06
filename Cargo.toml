@@ -26,25 +26,33 @@ codex-utils-fuzzy-match = { git = "https://github.com/openai/codex.git", rev = "
 codex-utils-image = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-utils-output-truncation = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-utils-rustls-provider = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-utils-string = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 crossterm = { version = "0.29.0", features = ["bracketed-paste", "event-stream"] }
 deno_core_icudata = "0.77.0"
+dirs = "6"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 libc = "0.2"
 portable-pty = "0.9.0"
 pulldown-cmark = { version = "0.10", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color", "unstable-rendered-line-info"] }
+regex-lite = "0.1.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 schemars = "0.8.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 supports-color = "3.0.2"
+syntect = "5"
+textwrap = "0.16.2"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-default-onig"] }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", default-features = false, features = ["deflate", "handshake"] }
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
+url = "2"
+urlencoding = "2.1"
 uuid = { version = "1", features = ["v4", "v5"] }
 v8 = "=150.4.0"
 zstd = "0.13"
@@ -57,4 +65,6 @@ strip = true
 all = "deny"
 
 [dev-dependencies]
+itertools = "0.14"
+pretty_assertions = "1"
 vt100 = "0.16.2"
