@@ -8,16 +8,50 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 use serde_json::json;
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
-const MAX_TOTAL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UserPrompt {
     text: String,
     skill_mentions: Vec<SkillMention>,
+    image_attachments: Vec<PromptImageAttachment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptImageAttachment {
+    image: PromptImage,
+    range: Range<usize>,
+}
+
+impl PromptImageAttachment {
+    pub(crate) fn new(image: PromptImage, range: Range<usize>) -> Self {
+        Self { image, range }
+    }
+
+    pub(crate) fn image(&self) -> &PromptImage {
+        &self.image
+    }
+
+    pub(crate) fn range(&self) -> &Range<usize> {
+        &self.range
+    }
+
+    pub(crate) fn range_mut(&mut self) -> &mut Range<usize> {
+        &mut self.range
+    }
+
+    fn shifted(mut self, offset: usize) -> Self {
+        self.range = self.range.start.saturating_add(offset)..self.range.end.saturating_add(offset);
+        self
+    }
 }
 
 impl UserPrompt {
@@ -25,23 +59,28 @@ impl UserPrompt {
         Self {
             text: text.into(),
             skill_mentions: Vec::new(),
+            image_attachments: Vec::new(),
         }
     }
 
-    pub(crate) fn with_skill_mentions(
+    pub(crate) fn with_attachments(
         text: impl Into<String>,
         mut skill_mentions: Vec<SkillMention>,
+        mut image_attachments: Vec<PromptImageAttachment>,
     ) -> Self {
         skill_mentions.sort_by_key(|mention| mention.range().start);
+        image_attachments.sort_by_key(|attachment| attachment.range.start);
         Self {
             text: text.into(),
             skill_mentions,
+            image_attachments,
         }
     }
 
     pub(crate) fn joined(prompts: Vec<Self>) -> Self {
         let mut text = String::new();
         let mut skill_mentions = Vec::new();
+        let mut image_attachments = Vec::new();
         for prompt in prompts {
             if !text.is_empty() {
                 text.push_str("\n\n");
@@ -54,10 +93,17 @@ impl UserPrompt {
                     .into_iter()
                     .map(|mention| mention.shifted(offset)),
             );
+            image_attachments.extend(
+                prompt
+                    .image_attachments
+                    .into_iter()
+                    .map(|attachment| attachment.shifted(offset)),
+            );
         }
         Self {
             text,
             skill_mentions,
+            image_attachments,
         }
     }
 
@@ -69,12 +115,42 @@ impl UserPrompt {
         &self.skill_mentions
     }
 
-    pub(crate) fn into_parts(self) -> (String, Vec<SkillSelection>) {
+    pub(crate) fn image_attachments(&self) -> &[PromptImageAttachment] {
+        &self.image_attachments
+    }
+
+    pub(crate) fn image_count(&self) -> usize {
+        self.image_attachments.len()
+    }
+
+    pub(crate) fn text_without_image_placeholders(&self) -> String {
+        if self.image_attachments.is_empty() {
+            return self.text.clone();
+        }
+        let mut text = String::with_capacity(self.text.len());
+        let mut cursor = 0;
+        for attachment in &self.image_attachments {
+            if attachment.range.start < cursor || attachment.range.end > self.text.len() {
+                continue;
+            }
+            text.push_str(&self.text[cursor..attachment.range.start]);
+            cursor = attachment.range.end;
+        }
+        text.push_str(&self.text[cursor..]);
+        text.trim().to_string()
+    }
+
+    pub(crate) fn into_parts(self) -> (String, Vec<SkillSelection>, Vec<PromptImage>) {
+        let text = self.text_without_image_placeholders();
         (
-            self.text,
+            text,
             self.skill_mentions
                 .into_iter()
                 .map(|mention| mention.selection().clone())
+                .collect(),
+            self.image_attachments
+                .into_iter()
+                .map(|attachment| attachment.image)
                 .collect(),
         )
     }
@@ -118,6 +194,69 @@ impl fmt::Display for ImageDetail {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptImage {
+    bytes: Arc<[u8]>,
+    mime: &'static str,
+    detail: ImageDetail,
+}
+
+impl PromptImage {
+    pub(crate) fn from_path(path: &Path, detail: ImageDetail) -> Result<Self> {
+        let mut file =
+            File::open(path).with_context(|| format!("failed to read image {}", path.display()))?;
+        let declared_len = file
+            .metadata()
+            .with_context(|| format!("failed to inspect image {}", path.display()))?
+            .len();
+        if declared_len > MAX_TOTAL_IMAGE_BYTES as u64 {
+            return Err(image_size_error());
+        }
+        let mut bytes = Vec::with_capacity(declared_len.try_into().unwrap_or(0));
+        file.by_ref()
+            .take(MAX_TOTAL_IMAGE_BYTES.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read image {}", path.display()))?;
+        if bytes.len() > MAX_TOTAL_IMAGE_BYTES {
+            return Err(image_size_error());
+        }
+        Self::from_bytes(path, bytes, detail)
+    }
+
+    pub(crate) fn from_bytes(path: &Path, bytes: Vec<u8>, detail: ImageDetail) -> Result<Self> {
+        let mime = image_mime(path, &bytes)?;
+        Ok(Self {
+            bytes: Arc::from(bytes),
+            mime,
+            detail,
+        })
+    }
+
+    pub(crate) fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn into_value(self) -> Value {
+        let image_url = format!(
+            "data:{};base64,{}",
+            self.mime,
+            STANDARD.encode(self.bytes.as_ref())
+        );
+        json!({
+            "type": "input_image",
+            "image_url": image_url,
+            "detail": self.detail.as_str(),
+        })
+    }
+}
+
+fn image_size_error() -> anyhow::Error {
+    anyhow!(
+        "attached images exceed bettercodex's {} MiB input limit",
+        MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
+    )
+}
+
 impl FromStr for ImageDetail {
     type Err = anyhow::Error;
 
@@ -151,10 +290,10 @@ impl UserInput {
     }
 
     pub(crate) fn prompt(prompt: UserPrompt) -> Self {
-        let (text, selected_skills) = prompt.into_parts();
+        let (text, selected_skills, images) = prompt.into_parts();
         Self {
             text,
-            images: Vec::new(),
+            images: images.into_iter().map(PromptImage::into_value).collect(),
             selected_skills,
         }
     }
@@ -167,24 +306,12 @@ impl UserInput {
         let mut total = 0_usize;
         let mut images = Vec::with_capacity(paths.len());
         for path in paths {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("failed to read image {}", path.display()))?;
+            let image = PromptImage::from_path(path, detail)?;
             total = total
-                .checked_add(bytes.len())
+                .checked_add(image.byte_len())
                 .filter(|total| *total <= MAX_TOTAL_IMAGE_BYTES)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "attached images exceed bettercodex's {} MiB input limit",
-                        MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
-                    )
-                })?;
-            let mime = image_mime(path, &bytes)?;
-            let image_url = format!("data:{mime};base64,{}", STANDARD.encode(bytes));
-            images.push(json!({
-                "type": "input_image",
-                "image_url": image_url,
-                "detail": detail.as_str(),
-            }));
+                .ok_or_else(image_size_error)?;
+            images.push(image.into_value());
         }
         let input = Self {
             text: text.into(),
@@ -265,19 +392,21 @@ mod tests {
 
     #[test]
     fn joined_prompts_shift_exact_skill_mentions_with_their_text() {
-        let first = UserPrompt::with_skill_mentions(
+        let first = UserPrompt::with_attachments(
             "use $demo",
             vec![SkillMention::new(
                 SkillSelection::new("demo", "/first/SKILL.md"),
                 4..9,
             )],
+            Vec::new(),
         );
-        let second = UserPrompt::with_skill_mentions(
+        let second = UserPrompt::with_attachments(
             "$demo again",
             vec![SkillMention::new(
                 SkillSelection::new("demo", "/second/SKILL.md"),
                 0..5,
             )],
+            Vec::new(),
         );
 
         let joined = UserPrompt::joined(vec![first, second]);
@@ -330,5 +459,34 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("not a supported"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn interactive_image_prompts_strip_ui_labels_and_share_the_cli_wire_shape() {
+        let image = PromptImage::from_bytes(
+            Path::new("clipboard.png"),
+            b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            ImageDetail::Original,
+        )
+        .unwrap();
+        let prompt = UserPrompt::with_attachments(
+            "[Image 1] inspect this",
+            Vec::new(),
+            vec![PromptImageAttachment::new(image, 0..9)],
+        );
+        assert_eq!(prompt.text_without_image_placeholders(), "inspect this");
+
+        let (message, prompt_text, skills) = UserInput::prompt(prompt).into_message_and_skills();
+        assert_eq!(prompt_text, "inspect this");
+        assert!(skills.is_empty());
+        assert_eq!(message["content"][0]["text"], "inspect this");
+        assert_eq!(message["content"][1]["type"], "input_image");
+        assert_eq!(message["content"][1]["detail"], "original");
+        assert!(
+            message["content"][1]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
     }
 }

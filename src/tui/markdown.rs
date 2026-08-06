@@ -1,36 +1,103 @@
-mod table;
-
-use self::table::Table;
-use pulldown_cmark::CodeBlockKind;
-use pulldown_cmark::Event;
-use pulldown_cmark::HeadingLevel;
-use pulldown_cmark::Options;
-use pulldown_cmark::Parser;
-use pulldown_cmark::Tag;
-use pulldown_cmark::TagEnd;
-use ratatui::style::Color;
-use ratatui::style::Modifier;
-use ratatui::style::Style;
-use ratatui::style::Stylize;
+//! Markdown-to-ratatui rendering entry points.
+//!
+//! Ported from Codex CLI revision `1669c2403f793d0230065397dfc25f52b844244e`. It keeps source
+//! text separate from rendered lines and hyperlink metadata, and conservatively unwraps Markdown
+//! fences only when they contain a real table.
+//!
+//! ## Why fence unwrapping exists
+//!
+//! LLM agents frequently wrap tables in `` ```markdown `` fences, treating
+//! them as code.  Without unwrapping, `pulldown-cmark` parses those lines
+//! as a fenced code block and renders them as monospace code rather than a
+//! structured table.  The unwrapper is intentionally conservative: it
+//! buffers the entire fence body before deciding, only unwraps fences whose
+//! info string is `md` or `markdown` AND whose body contains a
+//! header+delimiter pair, and degrades gracefully on unclosed fences.
+#[cfg(test)]
 use ratatui::text::Line;
-use ratatui::text::Span;
+use std::borrow::Cow;
+use std::ops::Range;
+use std::path::Path;
 
-pub(super) fn render(source: &str, width: u16) -> Vec<Line<'static>> {
-    let source = sanitize(source);
-    let parser = Parser::new_ext(
-        &source,
-        Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TABLES
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_FOOTNOTES,
-    );
-    let mut writer = MarkdownWriter::new(usize::from(width.max(1)));
-    for event in parser {
-        writer.event(event);
-    }
-    writer.finish()
+use super::markdown_render;
+use super::table_detect;
+use super::terminal_hyperlinks::HyperlinkLine;
+
+/// Render markdown source to styled ratatui lines and append them to `lines`.
+///
+/// Callers that already know the session working directory should pass it here so streamed and
+/// non-streamed rendering show the same relative path text even if the process cwd differs.
+#[cfg(test)]
+pub(super) fn append_markdown(
+    markdown_source: &str,
+    width: Option<usize>,
+    cwd: Option<&Path>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let rendered =
+        markdown_render::render_markdown_text_with_width_and_cwd(markdown_source, width, cwd);
+    super::render::line_utils::push_owned_lines(&rendered.lines, lines);
 }
 
+/// Render an agent message to styled ratatui lines.
+///
+/// Before rendering, the source is passed through [`unwrap_markdown_fences`] so that tables
+/// wrapped in `` ```md `` fences are rendered as native tables rather than code blocks.
+/// Non-markdown fences (e.g. `rust`, `sh`) are left
+/// intact.
+#[cfg(test)]
+pub(super) fn append_markdown_agent(
+    markdown_source: &str,
+    width: Option<usize>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let normalized = unwrap_markdown_fences(markdown_source);
+    let rendered = markdown_render::render_markdown_text_with_width_and_cwd(
+        &normalized,
+        width,
+        /*cwd*/ None,
+    );
+    super::render::line_utils::push_owned_lines(&rendered.lines, lines);
+}
+
+pub(super) fn render_markdown_agent_with_links_and_cwd(
+    markdown_source: &str,
+    width: Option<usize>,
+    cwd: Option<&Path>,
+) -> Vec<HyperlinkLine> {
+    let normalized = unwrap_markdown_fences(markdown_source);
+    markdown_render::render_markdown_lines_with_width_and_cwd(&normalized, width, cwd)
+}
+
+/// Render an agent message and collect the block metadata needed for incremental rendering.
+///
+/// Block offsets are mapped back to `markdown_source` after Markdown table fences are unwrapped.
+/// If a normalized boundary cannot be expressed as a raw-source suffix, it is discarded so the
+/// transformed block remains mutable.
+pub(super) fn render_streaming_markdown_agent_with_links_and_cwd(
+    markdown_source: &str,
+    width: Option<usize>,
+    cwd: Option<&Path>,
+) -> markdown_render::StreamingMarkdownRender {
+    let normalized = unwrap_markdown_fences(markdown_source);
+    let mut rendered = markdown_render::render_streaming_markdown_lines_with_width_and_cwd(
+        &normalized,
+        width,
+        cwd,
+    );
+    if normalized != markdown_source {
+        // Fence unwrapping removes opening/closing lines. A normalized tail that is still a raw
+        // suffix necessarily begins after those removed lines, so its boundary can safely be
+        // mapped back to the raw source; otherwise leave the transformed block mutable.
+        rendered.last_top_level_block_start = rendered
+            .last_top_level_block_start
+            .and_then(|boundary| markdown_source.strip_suffix(&normalized[boundary..]))
+            .map(str::len);
+    }
+    rendered
+}
+
+/// Remove control sequences before model output reaches Ratatui or a terminal escape writer.
 pub(super) fn sanitize(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
     let mut characters = text.chars().peekable();
@@ -56,394 +123,432 @@ pub(super) fn sanitize(text: &str) -> String {
     sanitized
 }
 
-struct MarkdownWriter {
-    lines: Vec<Line<'static>>,
-    current: Vec<Span<'static>>,
-    styles: Vec<Style>,
-    lists: Vec<ListState>,
-    quote_depth: usize,
-    code_block: bool,
-    table: Option<Table>,
-    width: usize,
-}
-
-struct ListState {
-    next: Option<u64>,
-}
-
-impl MarkdownWriter {
-    fn new(width: usize) -> Self {
-        Self {
-            lines: Vec::new(),
-            current: Vec::new(),
-            styles: Vec::new(),
-            lists: Vec::new(),
-            quote_depth: 0,
-            code_block: false,
-            table: None,
-            width,
-        }
+/// Strip `` ```md ``/`` ```markdown `` fences that contain tables, emitting their content as bare
+/// markdown so `pulldown-cmark` parses the tables natively.
+///
+/// Fences whose info string is not `md` or `markdown` are passed through unchanged.  Markdown
+/// fences that do *not* contain a table (detected by checking for a header row + delimiter row)
+/// are also passed through so that non-table markdown inside a fence still renders as a code
+/// block.
+///
+/// The fence unwrapping is intentionally conservative: it buffers the entire fence body before
+/// deciding, and an unclosed fence at end-of-input is re-emitted with its opening line so partial
+/// streams degrade to code display.
+fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
+    // Zero-copy fast path: most messages contain no fences at all.
+    if !markdown_source.contains("```") && !markdown_source.contains("~~~") {
+        return Cow::Borrowed(markdown_source);
     }
 
-    fn event(&mut self, event: Event<'_>) {
-        match event {
-            Event::Start(tag) => self.start(tag),
-            Event::End(tag) => self.end(tag),
-            Event::Text(text) => self.push_text(&text),
-            Event::Code(text) => {
-                self.push_span(text.into_string(), Style::default().fg(Color::Cyan));
-            }
-            Event::Html(text) | Event::InlineHtml(text) => {
-                self.push_span(text.into_string(), Style::default().dim());
-            }
-            Event::SoftBreak => self.push_text(" "),
-            Event::HardBreak => self.hard_break(),
-            Event::Rule => {
-                self.flush_nonempty();
-                self.lines.push(Line::from(Span::from("────────").dim()));
-            }
-            Event::TaskListMarker(checked) => {
-                self.push_span(
-                    if checked { "[x] " } else { "[ ] " },
-                    Style::default().dim(),
-                );
-            }
-            Event::FootnoteReference(reference) => {
-                self.push_span(format!("[{reference}]"), Style::default().fg(Color::Cyan));
-            }
-        }
+    #[derive(Clone, Copy)]
+    struct Fence {
+        marker: u8,
+        len: usize,
+        is_blockquoted: bool,
     }
 
-    fn start(&mut self, tag: Tag<'_>) {
-        match tag {
-            Tag::Paragraph => {}
-            Tag::Heading { level, .. } => self.styles.push(heading_style(level)),
-            Tag::BlockQuote => self.quote_depth += 1,
-            Tag::CodeBlock(kind) => {
-                self.flush_nonempty();
-                self.code_block = true;
-                if let CodeBlockKind::Fenced(language) = kind
-                    && !language.is_empty()
-                {
-                    self.push_span(language.into_string(), Style::default().dim());
-                    self.flush_line();
+    // Strip a trailing newline and up to 3 leading spaces, returning the
+    // trimmed slice.  Returns `None` when the line has 4+ leading spaces
+    // (which makes it an indented code line per CommonMark).
+    fn strip_line_indent(line: &str) -> Option<&str> {
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let mut byte_idx = 0usize;
+        let mut column = 0usize;
+        for b in without_newline.as_bytes() {
+            match b {
+                b' ' => {
+                    byte_idx += 1;
+                    column += 1;
                 }
-            }
-            Tag::List(first) => self.lists.push(ListState { next: first }),
-            Tag::Item => {
-                self.flush_nonempty();
-                let indent = "  ".repeat(self.lists.len().saturating_sub(1));
-                self.push_span(indent, Style::default());
-                let marker = match self.lists.last_mut() {
-                    Some(ListState { next: Some(next) }) => {
-                        let marker = format!("{next}. ");
-                        *next += 1;
-                        marker
-                    }
-                    _ => "- ".to_string(),
-                };
-                self.push_span(marker, Style::default().dim());
-            }
-            Tag::Emphasis => self.styles.push(Style::default().italic()),
-            Tag::Strong => self.styles.push(Style::default().bold()),
-            Tag::Strikethrough => self.styles.push(Style::default().crossed_out()),
-            Tag::Link { .. } => self
-                .styles
-                .push(Style::default().fg(Color::Cyan).underlined()),
-            Tag::Image { dest_url, .. } => {
-                self.push_span("[image: ", Style::default().dim());
-                self.push_span(dest_url.into_string(), Style::default().fg(Color::Cyan));
-                self.push_span("]", Style::default().dim());
-            }
-            Tag::FootnoteDefinition(name) => {
-                self.flush_nonempty();
-                self.push_span(format!("[{name}] "), Style::default().fg(Color::Cyan));
-            }
-            Tag::Table(alignments) => {
-                self.flush_nonempty();
-                self.table = Some(Table::new(alignments));
-            }
-            Tag::TableHead => {
-                if let Some(table) = self.table.as_mut() {
-                    table.start_header();
+                b'\t' => {
+                    byte_idx += 1;
+                    column += 4;
                 }
+                _ => break,
             }
-            Tag::TableRow => {
-                if let Some(table) = self.table.as_mut() {
-                    table.start_row();
-                }
+            if column >= 4 {
+                return None;
             }
-            Tag::TableCell => {
-                if let Some(table) = self.table.as_mut() {
-                    table.start_cell();
-                }
-            }
-            _ => {}
         }
+        Some(&without_newline[byte_idx..])
     }
 
-    fn end(&mut self, tag: TagEnd) {
-        match tag {
-            TagEnd::Paragraph if self.table.is_none() => {
-                self.flush_line();
-                if self.lists.is_empty() {
-                    self.blank_line();
-                }
-            }
-            TagEnd::Paragraph => {}
-            TagEnd::Heading(_) => {
-                self.styles.pop();
-                self.flush_line();
-                self.blank_line();
-            }
-            TagEnd::BlockQuote => {
-                self.flush_nonempty();
-                self.quote_depth = self.quote_depth.saturating_sub(1);
-            }
-            TagEnd::CodeBlock => {
-                self.flush_nonempty();
-                self.code_block = false;
-                self.blank_line();
-            }
-            TagEnd::List(_) => {
-                self.flush_nonempty();
-                self.lists.pop();
-                if self.lists.is_empty() {
-                    self.blank_line();
-                }
-            }
-            TagEnd::Item => self.flush_nonempty(),
-            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
-                self.styles.pop();
-            }
-            TagEnd::FootnoteDefinition => {
-                self.flush_nonempty();
-                self.blank_line();
-            }
-            TagEnd::TableHead => {
-                if let Some(table) = self.table.as_mut() {
-                    table.finish_header();
-                }
-            }
-            TagEnd::TableRow => {
-                if let Some(table) = self.table.as_mut() {
-                    table.finish_row();
-                }
-            }
-            TagEnd::TableCell => {
-                if let Some(table) = self.table.as_mut() {
-                    table.finish_cell();
-                }
-            }
-            TagEnd::Table => self.finish_table(),
-            TagEnd::Image => {}
-            _ => {}
-        }
+    // Parse an opening fence line, returning the fence metadata and whether
+    // the fence info string indicates markdown content.
+    fn parse_open_fence(line: &str) -> Option<(Fence, bool)> {
+        let trimmed = strip_line_indent(line)?;
+        let is_blockquoted = trimmed.trim_start().starts_with('>');
+        let fence_scan_text = table_detect::strip_blockquote_prefix(trimmed);
+        let (marker, len) = table_detect::parse_fence_marker(fence_scan_text)?;
+        let is_markdown = table_detect::is_markdown_fence_info(fence_scan_text, len);
+        Some((
+            Fence {
+                marker: marker as u8,
+                len,
+                is_blockquoted,
+            },
+            is_markdown,
+        ))
     }
 
-    fn push_text(&mut self, text: &str) {
-        for part in text.split_inclusive('\n') {
-            let (content, newline) = part
-                .strip_suffix('\n')
-                .map_or((part, false), |content| (content, true));
-            if !content.is_empty() {
-                let style = if self.code_block {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    self.styles
-                        .iter()
-                        .copied()
-                        .fold(Style::default(), Style::patch)
-                };
-                self.push_span(content.to_string(), style);
-            }
-            if newline {
-                self.hard_break();
-            }
-        }
-    }
-
-    fn push_span(&mut self, content: impl Into<String>, style: Style) {
-        let span = Span::styled(content.into(), style);
-        if let Some(table) = self.table.as_mut()
-            && table.is_in_cell()
-        {
-            table.push_span(span);
-            return;
-        }
-        if self.current.is_empty() && self.quote_depth > 0 {
-            self.current.push(Span::styled(
-                "│ ".repeat(self.quote_depth),
-                Style::default().fg(Color::Green),
-            ));
-        }
-        self.current.push(span);
-    }
-
-    fn hard_break(&mut self) {
-        if let Some(table) = self.table.as_mut()
-            && table.is_in_cell()
-        {
-            table.hard_break();
-        } else {
-            self.flush_line();
-        }
-    }
-
-    fn finish_table(&mut self) {
-        let Some(table) = self.table.take() else {
-            return;
+    fn is_close_fence(line: &str, fence: Fence) -> bool {
+        let Some(trimmed) = strip_line_indent(line) else {
+            return false;
         };
-        let quote_width = self.quote_depth.saturating_mul(2);
-        let table_width = self.width.saturating_sub(quote_width).max(1);
-        let mut rendered = table.render(table_width);
-        if self.quote_depth > 0 {
-            let prefix = "│ ".repeat(self.quote_depth);
-            for line in &mut rendered {
-                line.spans.insert(
-                    0,
-                    Span::styled(prefix.clone(), Style::default().fg(Color::Green)),
-                );
+        let fence_scan_text = if fence.is_blockquoted {
+            if !trimmed.trim_start().starts_with('>') {
+                return false;
+            }
+            table_detect::strip_blockquote_prefix(trimmed)
+        } else {
+            trimmed
+        };
+        if let Some((marker, len)) = table_detect::parse_fence_marker(fence_scan_text) {
+            marker as u8 == fence.marker
+                && len >= fence.len
+                && fence_scan_text[len..].trim().is_empty()
+        } else {
+            false
+        }
+    }
+
+    fn markdown_fence_contains_table(content: &str, is_blockquoted_fence: bool) -> bool {
+        let mut previous_line: Option<&str> = None;
+        for line in content.lines() {
+            let text = if is_blockquoted_fence {
+                table_detect::strip_blockquote_prefix(line)
+            } else {
+                line
+            };
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                previous_line = None;
+                continue;
+            }
+
+            if let Some(previous) = previous_line
+                && table_detect::is_table_header_line(previous)
+                && !table_detect::is_table_delimiter_line(previous)
+                && table_detect::is_table_delimiter_line(trimmed)
+            {
+                return true;
+            }
+
+            previous_line = Some(trimmed);
+        }
+        false
+    }
+
+    fn content_from_ranges(source: &str, ranges: &[Range<usize>]) -> String {
+        let total_len: usize = ranges.iter().map(ExactSizeIterator::len).sum();
+        let mut content = String::with_capacity(total_len);
+        for range in ranges {
+            content.push_str(&source[range.start..range.end]);
+        }
+        content
+    }
+
+    struct MarkdownCandidateData {
+        fence: Fence,
+        opening_range: Range<usize>,
+        content_ranges: Vec<Range<usize>>,
+    }
+
+    // Box the large variant to keep ActiveFence small (~pointer-sized).
+    enum ActiveFence {
+        Passthrough(Fence),
+        MarkdownCandidate(Box<MarkdownCandidateData>),
+    }
+
+    let mut out = String::with_capacity(markdown_source.len());
+    let mut active_fence: Option<ActiveFence> = None;
+    let mut source_offset = 0usize;
+
+    let mut push_source_range = |range: Range<usize>| {
+        if !range.is_empty() {
+            out.push_str(&markdown_source[range]);
+        }
+    };
+
+    for line in markdown_source.split_inclusive('\n') {
+        let line_start = source_offset;
+        source_offset += line.len();
+        let line_range = line_start..source_offset;
+
+        if let Some(active) = active_fence.take() {
+            match active {
+                ActiveFence::Passthrough(fence) => {
+                    push_source_range(line_range);
+                    if !is_close_fence(line, fence) {
+                        active_fence = Some(ActiveFence::Passthrough(fence));
+                    }
+                }
+                ActiveFence::MarkdownCandidate(mut data) => {
+                    if is_close_fence(line, data.fence) {
+                        if markdown_fence_contains_table(
+                            &content_from_ranges(markdown_source, &data.content_ranges),
+                            data.fence.is_blockquoted,
+                        ) {
+                            for range in data.content_ranges {
+                                push_source_range(range);
+                            }
+                        } else {
+                            push_source_range(data.opening_range);
+                            for range in data.content_ranges {
+                                push_source_range(range);
+                            }
+                            push_source_range(line_range);
+                        }
+                    } else {
+                        data.content_ranges.push(line_range);
+                        active_fence = Some(ActiveFence::MarkdownCandidate(data));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some((fence, is_markdown)) = parse_open_fence(line) {
+            if is_markdown {
+                active_fence = Some(ActiveFence::MarkdownCandidate(Box::new(
+                    MarkdownCandidateData {
+                        fence,
+                        opening_range: line_range,
+                        content_ranges: Vec::new(),
+                    },
+                )));
+            } else {
+                push_source_range(line_range);
+                active_fence = Some(ActiveFence::Passthrough(fence));
+            }
+            continue;
+        }
+
+        push_source_range(line_range);
+    }
+
+    if let Some(active) = active_fence {
+        match active {
+            ActiveFence::Passthrough(_) => {}
+            ActiveFence::MarkdownCandidate(data) => {
+                push_source_range(data.opening_range);
+                for range in data.content_ranges {
+                    push_source_range(range);
+                }
             }
         }
-        self.lines.append(&mut rendered);
-        self.blank_line();
     }
 
-    fn flush_nonempty(&mut self) {
-        if !self.current.is_empty() {
-            self.flush_line();
-        }
-    }
-
-    fn flush_line(&mut self) {
-        self.lines
-            .push(Line::from(std::mem::take(&mut self.current)));
-    }
-
-    fn blank_line(&mut self) {
-        if self.lines.last().is_some_and(|line| !line.spans.is_empty()) {
-            self.lines.push(Line::default());
-        }
-    }
-
-    fn finish(mut self) -> Vec<Line<'static>> {
-        if self.table.is_some() {
-            self.finish_table();
-        }
-        self.flush_nonempty();
-        while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
-            self.lines.pop();
-        }
-        self.lines
-    }
-}
-
-fn heading_style(level: HeadingLevel) -> Style {
-    match level {
-        HeadingLevel::H1 => Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        HeadingLevel::H2 => Style::default().bold(),
-        HeadingLevel::H3 => Style::default().bold().italic(),
-        HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => Style::default().italic(),
-    }
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unicode_width::UnicodeWidthStr;
+    use pretty_assertions::assert_eq;
+    use ratatui::text::Line;
 
-    fn plain(lines: &[Line<'static>]) -> Vec<String> {
+    fn lines_to_strings(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
-            .map(|line| {
-                line.spans
+            .map(|l| {
+                l.spans
                     .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
             })
             .collect()
     }
 
-    fn display_width(line: &Line<'_>) -> usize {
-        line.spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum()
-    }
-
     #[test]
-    fn markdown_keeps_lists_and_code_as_separate_lines() {
-        let lines = render("**Done**\n\n- one\n- two\n\n```rs\nlet x = 1;\n```", 80);
-        let plain = plain(&lines);
-        assert!(plain.iter().any(|line| line == "- one"));
-        assert!(plain.iter().any(|line| line == "let x = 1;"));
-    }
-
-    #[test]
-    fn sanitizer_removes_terminal_control_sequences() {
+    fn citations_render_as_plain_text() {
+        let src = "Before 【F:/x.rs†L1】\nAfter 【F:/x.rs†L3】\n";
+        let mut out = Vec::new();
+        append_markdown(src, /*width*/ None, /*cwd*/ None, &mut out);
+        let rendered = lines_to_strings(&out);
         assert_eq!(
-            sanitize("ok\u{1b}[31mred\u{1b}[0m\u{1b}]0;secret\u{7}done"),
-            "okreddone"
+            rendered,
+            vec![
+                "Before 【F:/x.rs†L1】".to_string(),
+                "After 【F:/x.rs†L3】".to_string()
+            ]
         );
     }
 
     #[test]
-    fn tables_render_as_aligned_row_separated_grids() {
-        let lines = render(
-            "| Left | Center | Right |\n| :--- | :---: | ---: |\n| **bold** | [docs](https://example.com) | `42` |",
-            60,
-        );
-        let text = plain(&lines);
-        assert!(text[0].starts_with(" Left"), "{text:?}");
-        assert!(text[0].contains("Center"), "{text:?}");
-        assert!(text[0].contains("Right "), "{text:?}");
-        assert!(text[1].contains('━'), "{text:?}");
-        assert!(text[2].contains("bold"), "{text:?}");
-        assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(lines[2].spans.iter().any(|span| {
-            span.content.contains("bold") && span.style.add_modifier.contains(Modifier::BOLD)
-        }));
+    fn indented_code_blocks_preserve_leading_whitespace() {
+        // Basic sanity: indented code with surrounding blank lines should produce the indented line.
+        let src = "Before\n\n    code 1\n\nAfter\n";
+        let mut out = Vec::new();
+        append_markdown(src, /*width*/ None, /*cwd*/ None, &mut out);
+        let lines = lines_to_strings(&out);
+        assert_eq!(lines, vec!["Before", "", "    code 1", "", "After"]);
     }
 
     #[test]
-    fn timeline_table_stays_structured_and_within_the_terminal_width() {
-        let source = "| Time | Component | Value observed | Result |\n\
-                      | ---: | --- | --- | --- |\n\
-                      | -10 ms | API handling R1 | Reads `legacy` once | R1 retains and uses `legacy` throughout its lifetime |\n\
-                      | +20 ms | Producer creating J1 | Cached value is still `legacy` | J1 envelope receives `mode=legacy` |\n\
-                      | +120 ms | Audit consuming J1 event | Envelope: `legacy`; live configuration: `strict` | Records `(legacy, strict)` |";
-        let lines = render(source, 100);
-        let text = plain(&lines);
-        assert!(text[0].contains("Time") && text[0].contains("Result"));
-        assert!(text.iter().any(|line| line.contains('━')));
-        assert!(text.iter().any(|line| line.contains('─')));
-        assert!(!text.iter().any(|line| line.contains(" │ ")));
-        assert!(lines.iter().all(|line| display_width(line) <= 100));
+    fn append_markdown_preserves_full_text_line() {
+        let src = "Hi! How can I help with codex-rs today? Want me to explore the repo, run tests, or work on a specific change?\n";
+        let mut out = Vec::new();
+        append_markdown(src, /*width*/ None, /*cwd*/ None, &mut out);
+        assert_eq!(
+            out.len(),
+            1,
+            "expected a single rendered line for plain text"
+        );
+        let rendered: String = out
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.clone())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(
+            rendered,
+            "Hi! How can I help with codex-rs today? Want me to explore the repo, run tests, or work on a specific change?"
+        );
     }
 
     #[test]
-    fn table_widths_follow_terminal_cell_geometry() {
-        let lines = render(
-            "| Key | Notes |\n| --- | --- |\n| ｶﾞﾊﾟtail | First 漢字 row with an escaped \\| pipe. |\n| short | Final 😀 row. |",
-            23,
+    fn append_markdown_matches_tui_markdown_for_ordered_item() {
+        let mut out = Vec::new();
+        append_markdown(
+            "1. Tight item\n",
+            /*width*/ None,
+            /*cwd*/ None,
+            &mut out,
         );
-        let text = plain(&lines).join("\n");
-        assert!(text.contains("ｶﾞﾊﾟ") && text.contains("漢字"), "{text}");
-        assert!(lines.iter().all(|line| display_width(line) <= 23));
+        let lines = lines_to_strings(&out);
+        assert_eq!(lines, vec!["1. Tight item".to_string()]);
     }
 
     #[test]
-    fn narrow_tables_fall_back_to_key_value_records() {
-        let lines = render(
-            "| Key | Content | Extra | More |\n| --- | --- | --- | --- |\n| item | linked value | bold | code |",
-            16,
+    fn append_markdown_keeps_ordered_list_line_unsplit_in_context() {
+        let src = "Loose vs. tight list items:\n1. Tight item\n";
+        let mut out = Vec::new();
+        append_markdown(src, /*width*/ None, /*cwd*/ None, &mut out);
+
+        let lines = lines_to_strings(&out);
+
+        // Expect to find the ordered list line rendered as a single line,
+        // not split into a marker-only line followed by the text.
+        assert!(
+            lines.iter().any(|s| s == "1. Tight item"),
+            "expected '1. Tight item' rendered as a single line; got: {lines:?}"
         );
-        let text = plain(&lines);
-        assert!(text.iter().any(|line| line.trim() == "Key"));
-        assert!(text.iter().any(|line| line.trim() == "item"));
-        assert!(text.iter().any(|line| line.trim() == "Content"));
-        assert!(!text.iter().any(|line| line.contains('━')));
-        assert!(lines.iter().all(|line| display_width(line) <= 16));
+        assert!(
+            !lines
+                .windows(2)
+                .any(|w| w[0].trim_end() == "1." && w[1] == "Tight item"),
+            "did not expect a split into ['1.', 'Tight item']; got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn append_markdown_agent_unwraps_markdown_fences_for_table_rendering() {
+        let src = "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n";
+        let mut out = Vec::new();
+        append_markdown_agent(src, /*width*/ None, &mut out);
+        let rendered = lines_to_strings(&out);
+        assert!(rendered.iter().any(|line| line.contains('━')));
+        assert!(rendered.iter().any(|line| line.contains(" 1      2")));
+    }
+
+    #[test]
+    fn append_markdown_agent_unwraps_markdown_fences_for_no_outer_table_rendering() {
+        let src = "```md\nCol A | Col B | Col C\n--- | --- | ---\nx | y | z\n10 | 20 | 30\n```\n";
+        let mut out = Vec::new();
+        append_markdown_agent(src, /*width*/ None, &mut out);
+        let rendered = lines_to_strings(&out);
+        assert!(rendered.iter().any(|line| line.contains('━')));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains(" Col A    Col B    Col C"))
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.trim() == "Col A | Col B | Col C")
+        );
+    }
+
+    #[test]
+    fn append_markdown_agent_unwraps_markdown_fences_for_two_column_no_outer_table() {
+        let src = "```md\nA | B\n--- | ---\nleft | right\n```\n";
+        let mut out = Vec::new();
+        append_markdown_agent(src, /*width*/ None, &mut out);
+        let rendered = lines_to_strings(&out);
+        assert!(rendered.iter().any(|line| line.contains('━')));
+        assert!(rendered.iter().any(|line| line.contains(" left    right")));
+        assert!(!rendered.iter().any(|line| line.trim() == "A | B"));
+    }
+
+    #[test]
+    fn append_markdown_agent_unwraps_markdown_fences_for_single_column_table() {
+        let src = "```md\n| Only |\n|---|\n| value |\n```\n";
+        let mut out = Vec::new();
+        append_markdown_agent(src, /*width*/ None, &mut out);
+        let rendered = lines_to_strings(&out);
+        assert!(rendered.iter().any(|line| line.contains('━')));
+        assert!(!rendered.iter().any(|line| line.trim() == "| Only |"));
+    }
+
+    #[test]
+    fn append_markdown_agent_keeps_non_markdown_fences_as_code() {
+        let src = "```rust\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n";
+        let mut out = Vec::new();
+        append_markdown_agent(src, /*width*/ None, &mut out);
+        let rendered = lines_to_strings(&out);
+        assert_eq!(
+            rendered,
+            vec![
+                "| A | B |".to_string(),
+                "|---|---|".to_string(),
+                "| 1 | 2 |".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_markdown_agent_unwraps_blockquoted_markdown_fence_table() {
+        let src = "> ```markdown\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n> ```\n";
+        let rendered = unwrap_markdown_fences(src);
+        assert!(
+            !rendered.contains("```"),
+            "expected markdown fence markers to be removed: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn append_markdown_agent_keeps_non_blockquoted_markdown_fence_with_blockquote_table_example() {
+        let src = "```markdown\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n```\n";
+        let normalized = unwrap_markdown_fences(src);
+        assert_eq!(normalized, src);
+    }
+
+    #[test]
+    fn append_markdown_agent_keeps_markdown_fence_when_content_is_not_table() {
+        let src = "```markdown\n**bold**\n```\n";
+        let mut out = Vec::new();
+        append_markdown_agent(src, /*width*/ None, &mut out);
+        let rendered = lines_to_strings(&out);
+        assert_eq!(rendered, vec!["**bold**".to_string()]);
+    }
+
+    #[test]
+    fn unwrap_markdown_fences_repro_keeps_fence_without_header_delimiter_pair() {
+        let src = "```markdown\n| A | B |\nnot a delimiter row\n| --- | --- |\n# Heading\n```\n";
+        let normalized = unwrap_markdown_fences(src);
+        assert_eq!(normalized, src);
+    }
+
+    #[test]
+    fn append_markdown_agent_keeps_markdown_fence_with_blank_line_between_header_and_delimiter() {
+        let src = "```markdown\n| A | B |\n\n|---|---|\n| 1 | 2 |\n```\n";
+        let rendered = unwrap_markdown_fences(src);
+        assert_eq!(rendered, src);
     }
 }
+
+#[cfg(test)]
+#[path = "markdown_parity_tests.rs"]
+mod parity_tests;

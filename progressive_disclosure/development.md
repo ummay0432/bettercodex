@@ -46,18 +46,34 @@ error:
 ./scripts/dev.py cargo clippy --all-targets -- -D warnings
 ```
 
+Changes to `scripts/dev.py` must also pass its dependency-free unit tests:
+
+```sh
+python3 -m unittest -v scripts.dev_tests
+```
+
 Cargo can wait on a shared build lock. Let it finish; do not kill a Cargo or
 Rust process by PID to make the lock disappear.
 
-After those commands pass, install the current worktree:
+Feature worktrees must smoke-test their isolated release binary before
+integration. Build it with `./scripts/dev.py cargo build --release`; the helper
+prints the target directory containing `release/bcodex`.
+
+After committing and integrating the work into local `main`, install the
+canonical binary:
 
 ```sh
-cargo install --locked --path . --force --root "$HOME/.local"
+./scripts/dev.py install
 ```
 
-Then run the relevant smoke test against `$HOME/.local/bin/bcodex`. Testing only
-`target/debug/bcodex` or `target/release/bcodex` does not finish a bettercodex
-code change.
+Then run the relevant final smoke test against `$HOME/.local/bin/bcodex`.
+
+Never run `cargo install` directly from a worktree. The global binary is for
+committed local `main`; installing a feature worktree can silently replace it
+with a branch that predates already-integrated fixes. The install helper rejects
+dirty or unmerged callers, serializes concurrent installs, archives committed
+`main` so unrelated shared-worktree edits cannot leak into the build, and
+retries if `main` advances while Cargo is running.
 
 ## Cargo worktrees and disk space
 
