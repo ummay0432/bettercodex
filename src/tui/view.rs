@@ -768,12 +768,13 @@ impl View {
             AgentEvent::ModelMessageCompleted(message) => {
                 self.complete_assistant_message(message);
             }
+            // Reasoning summaries only drive the transient activity heading. They are not a
+            // transcript boundary, so the active exploration cell must remain open across model
+            // samples for later read/list/search calls to join it, matching Codex's ExecCell.
             AgentEvent::ReasoningSummarySectionStarted => {
-                self.seal_exploration();
                 self.reasoning_status.reset();
             }
             AgentEvent::ReasoningSummaryDelta(delta) => {
-                self.seal_exploration();
                 self.reasoning_status.push_delta(&delta);
             }
             AgentEvent::ModelResponseCompleted => {
@@ -5478,13 +5479,16 @@ mod tests {
     }
 
     #[test]
-    fn sequential_read_commands_stay_in_one_codex_explored_cell() {
+    fn reasoning_between_read_commands_stays_in_one_codex_explored_cell() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        for (call_id, command) in [
+        for (index, (call_id, command)) in [
             ("cell:one", "cat src/main.rs"),
             ("cell:two", "cat src/api.rs"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             view.handle_agent_event(AgentEvent::ToolStarted {
                 call_id: call_id.to_string(),
                 name: "exec_command".to_string(),
@@ -5496,6 +5500,14 @@ mod tests {
                 duration: Duration::from_millis(10),
             });
             assert!(view.take_pending_history_lines(80).is_empty());
+            if index == 0 {
+                view.handle_agent_event(AgentEvent::ModelResponseCompleted);
+                view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
+                view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
+                    "**Inspecting more code**".to_string(),
+                ));
+                assert!(view.take_pending_history_lines(80).is_empty());
+            }
         }
         view.handle_agent_event(AgentEvent::ModelMessageDelta("done".to_string()));
         let rendered = view
