@@ -22,7 +22,6 @@ use codex_client::TransportError;
 use codex_client::run_with_retry;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::models::WebSearchAction;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::formatted_truncate_text;
@@ -242,6 +241,15 @@ enum SportsFunction {
     Standings,
 }
 
+impl SportsFunction {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Schedule => "schedule",
+            Self::Standings => "standings",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum SportsLeague {
@@ -254,6 +262,22 @@ enum SportsLeague {
     Ncaamb,
     Ncaawb,
     Ipl,
+}
+
+impl SportsLeague {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Nba => "NBA",
+            Self::Wnba => "WNBA",
+            Self::Nfl => "NFL",
+            Self::Nhl => "NHL",
+            Self::Mlb => "MLB",
+            Self::Epl => "EPL",
+            Self::Ncaamb => "NCAAMB",
+            Self::Ncaawb => "NCAAWB",
+            Self::Ipl => "IPL",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -277,6 +301,22 @@ struct SearchResponse {
     output: String,
     #[serde(default, rename = "results")]
     _results: Option<Vec<Value>>,
+}
+
+/// One concise row in the TUI's grouped web-activity tree.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WebActivity {
+    pub(crate) verb: &'static str,
+    pub(crate) detail: String,
+}
+
+impl WebActivity {
+    fn new(verb: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            verb,
+            detail: detail.into(),
+        }
+    }
 }
 
 impl WebSearchClient {
@@ -379,10 +419,129 @@ pub(crate) fn input_schema() -> &'static Value {
     &INPUT_SCHEMA
 }
 
-pub(crate) fn action_for_display(input: Option<&Value>) -> WebSearchAction {
-    parse_commands(input.cloned())
-        .map(|commands| command_action(&commands))
-        .unwrap_or(WebSearchAction::Other)
+pub(crate) fn activities_for_display(input: Option<Value>) -> Vec<WebActivity> {
+    let Ok(commands) = parse_commands(input) else {
+        return vec![WebActivity::new("Browse", String::new())];
+    };
+    let SearchCommands {
+        search_query,
+        image_query,
+        open,
+        click,
+        find,
+        screenshot,
+        finance,
+        weather,
+        sports,
+        time,
+        response_length: _,
+    } = commands;
+    let mut activities = Vec::new();
+
+    if let Some(queries) = search_query {
+        activities.extend(
+            queries
+                .into_iter()
+                .map(|query| WebActivity::new("Search", query.q)),
+        );
+    }
+    if let Some(queries) = image_query {
+        activities.extend(
+            queries
+                .into_iter()
+                .map(|query| WebActivity::new("Image search", query.q)),
+        );
+    }
+    if let Some(operations) = open {
+        activities.extend(operations.into_iter().map(|operation| {
+            let detail = match operation.lineno {
+                Some(line) => format!("{} at line {line}", operation.ref_id),
+                None => operation.ref_id,
+            };
+            WebActivity::new("Open", detail)
+        }));
+    }
+    if let Some(operations) = click {
+        activities.extend(operations.into_iter().map(|operation| {
+            WebActivity::new(
+                "Open",
+                format!("link {} in {}", operation.id, operation.ref_id),
+            )
+        }));
+    }
+    if let Some(operations) = find {
+        activities.extend(operations.into_iter().map(|operation| {
+            WebActivity::new(
+                "Find",
+                format!("'{}' in {}", operation.pattern, operation.ref_id),
+            )
+        }));
+    }
+    if let Some(operations) = screenshot {
+        activities.extend(operations.into_iter().map(|operation| {
+            WebActivity::new(
+                "Screenshot",
+                format!("page index {} of {}", operation.pageno, operation.ref_id),
+            )
+        }));
+    }
+    if let Some(operations) = finance {
+        activities.extend(operations.into_iter().map(|operation| {
+            let ticker = operation.ticker;
+            let detail = match operation.market.filter(|market| !market.is_empty()) {
+                Some(market) => format!("{ticker} ({market})"),
+                None => ticker,
+            };
+            WebActivity::new("Finance", detail)
+        }));
+    }
+    if let Some(operations) = weather {
+        activities.extend(operations.into_iter().map(|operation| {
+            let mut detail = operation.location;
+            if let Some(start) = operation.start {
+                detail.push_str(&format!(" from {start}"));
+            }
+            if let Some(duration) = operation.duration {
+                let plural = if duration == 1 { "" } else { "s" };
+                detail.push_str(&format!(" for {duration} day{plural}"));
+            }
+            WebActivity::new("Weather", detail)
+        }));
+    }
+    if let Some(operations) = sports {
+        activities.extend(operations.into_iter().map(|operation| {
+            let mut detail = format!(
+                "{} {}",
+                operation.league.display_name(),
+                operation.r#fn.display_name()
+            );
+            if let Some(team) = operation.team {
+                detail.push_str(&format!(" for {team}"));
+            }
+            if let Some(opponent) = operation.opponent {
+                detail.push_str(&format!(" vs {opponent}"));
+            }
+            match (operation.date_from, operation.date_to) {
+                (Some(from), Some(to)) => detail.push_str(&format!(" from {from} to {to}")),
+                (Some(from), None) => detail.push_str(&format!(" from {from}")),
+                (None, Some(to)) => detail.push_str(&format!(" through {to}")),
+                (None, None) => {}
+            }
+            WebActivity::new("Sports", detail)
+        }));
+    }
+    if let Some(operations) = time {
+        activities.extend(
+            operations
+                .into_iter()
+                .map(|operation| WebActivity::new("Time", operation.utc_offset)),
+        );
+    }
+
+    if activities.is_empty() {
+        activities.push(WebActivity::new("Browse", String::new()));
+    }
+    activities
 }
 
 fn commands_schema() -> Value {
@@ -423,54 +582,6 @@ fn parse_commands(input: Option<Value>) -> Result<SearchCommands> {
         Some(_) => Err(anyhow!(
             "tool `web.run` expects a JSON object for arguments"
         )),
-    }
-}
-
-fn command_action(commands: &SearchCommands) -> WebSearchAction {
-    commands
-        .search_query
-        .as_deref()
-        .and_then(query_action)
-        .or_else(|| commands.image_query.as_deref().and_then(query_action))
-        .or_else(|| {
-            commands
-                .open
-                .as_deref()
-                .and_then(|operations| operations.first())
-                .and_then(|operation| {
-                    reqwest::Url::parse(&operation.ref_id).is_ok().then(|| {
-                        WebSearchAction::OpenPage {
-                            url: Some(operation.ref_id.clone()),
-                        }
-                    })
-                })
-        })
-        .or_else(|| {
-            commands
-                .find
-                .as_deref()
-                .and_then(|operations| operations.first())
-                .map(|operation| WebSearchAction::FindInPage {
-                    url: reqwest::Url::parse(&operation.ref_id)
-                        .is_ok()
-                        .then(|| operation.ref_id.clone()),
-                    pattern: Some(operation.pattern.clone()),
-                })
-        })
-        .unwrap_or(WebSearchAction::Other)
-}
-
-fn query_action(queries: &[SearchQuery]) -> Option<WebSearchAction> {
-    match queries {
-        [] => None,
-        [query] => Some(WebSearchAction::Search {
-            query: Some(query.q.clone()),
-            queries: None,
-        }),
-        queries => Some(WebSearchAction::Search {
-            query: None,
-            queries: Some(queries.iter().map(|query| query.q.clone()).collect()),
-        }),
     }
 }
 

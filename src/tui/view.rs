@@ -288,7 +288,7 @@ enum ToolDisplay {
     Papercut,
     Plan(PlanDisplay),
     ViewImage(String),
-    WebSearch(codex_protocol::models::WebSearchAction),
+    WebSearch(Vec<crate::web_search::WebActivity>),
     Other,
 }
 
@@ -2530,9 +2530,7 @@ impl ToolEntry {
                     .map(|path| display_tool_path(Path::new(path), cwd))
                     .unwrap_or_else(|| "image".to_string()),
             ),
-            "web.run" => {
-                ToolDisplay::WebSearch(crate::web_search::action_for_display(input.as_ref()))
-            }
+            "web.run" => ToolDisplay::WebSearch(crate::web_search::activities_for_display(input)),
             _ => ToolDisplay::Other,
         };
         Self {
@@ -2545,12 +2543,16 @@ impl ToolEntry {
     }
 
     fn is_exploration(&self) -> bool {
-        matches!(
-            &self.display,
-            ToolDisplay::Command { parsed, .. }
-                if !parsed.is_empty()
-                    && parsed.iter().all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
-        )
+        match &self.display {
+            ToolDisplay::Command { parsed, .. } => {
+                !parsed.is_empty()
+                    && parsed
+                        .iter()
+                        .all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
+            }
+            ToolDisplay::WebSearch(_) => true,
+            _ => false,
+        }
     }
 
     fn activity_label(&self) -> String {
@@ -2586,7 +2588,7 @@ impl ToolEntry {
             ToolDisplay::Papercut => papercut_lines(self, width),
             ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
             ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
-            ToolDisplay::WebSearch(action) => web_search_lines(self, action, width),
+            ToolDisplay::WebSearch(_) => exploration_lines(std::slice::from_ref(self), width),
             ToolDisplay::Other => generic_tool_lines(self, width),
         }
     }
@@ -3622,6 +3624,7 @@ fn interaction_lines(
 
 fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
     let active = tools.iter().any(|tool| tool.outcome.is_none());
+    let failed = tools.iter().any(|tool| tool.succeeded() == Some(false));
     let started = tools
         .iter()
         .find(|tool| tool.outcome.is_none())
@@ -3629,6 +3632,8 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
         if active {
             activity_marker(started)
+        } else if failed {
+            "•".red().bold()
         } else {
             "•".dim()
         },
@@ -3639,9 +3644,11 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             "Explored".bold()
         },
     ])];
-    let mut details: Vec<(&str, Vec<Span<'static>>)> = Vec::new();
+    let detail_style = Style::default().fg(Color::Cyan);
+    let mut details: Vec<(&str, Style, Vec<Span<'static>>)> = Vec::new();
     let mut read_names = Vec::<String>::new();
-    let flush_reads = |details: &mut Vec<(&str, Vec<Span<'static>>)>, names: &mut Vec<String>| {
+    let flush_reads = |details: &mut Vec<(&str, Style, Vec<Span<'static>>)>,
+                       names: &mut Vec<String>| {
         if names.is_empty() {
             return;
         }
@@ -3652,46 +3659,71 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             }
             spans.push(name.into());
         }
-        details.push(("Read", spans));
+        details.push(("Read", detail_style, spans));
     };
     for tool in tools {
-        let ToolDisplay::Command { parsed, .. } = &tool.display else {
-            continue;
-        };
-        for parsed in parsed {
-            match parsed {
-                ParsedCommand::Read { name, .. } => {
-                    if !read_names.contains(name) {
-                        read_names.push(name.clone());
+        match &tool.display {
+            ToolDisplay::Command { parsed, .. } => {
+                for parsed in parsed {
+                    match parsed {
+                        ParsedCommand::Read { name, .. } => {
+                            if !read_names.contains(name) {
+                                read_names.push(name.clone());
+                            }
+                        }
+                        ParsedCommand::ListFiles { cmd, path } => {
+                            flush_reads(&mut details, &mut read_names);
+                            details.push((
+                                "List",
+                                detail_style,
+                                vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
+                            ));
+                        }
+                        ParsedCommand::Search { cmd, query, path } => {
+                            flush_reads(&mut details, &mut read_names);
+                            let spans = match (query, path) {
+                                (Some(query), Some(path)) => {
+                                    vec![query.clone().into(), " in ".dim(), path.clone().into()]
+                                }
+                                (Some(query), None) => vec![query.clone().into()],
+                                _ => vec![cmd.clone().into()],
+                            };
+                            details.push(("Search", detail_style, spans));
+                        }
+                        ParsedCommand::Unknown { .. } => {}
                     }
                 }
-                ParsedCommand::ListFiles { cmd, path } => {
-                    flush_reads(&mut details, &mut read_names);
+            }
+            ToolDisplay::WebSearch(activities) => {
+                flush_reads(&mut details, &mut read_names);
+                for activity in activities {
+                    let spans = if activity.detail.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![Span::from(activity.detail.clone())]
+                    };
+                    details.push((activity.verb, detail_style, spans));
+                }
+                if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
                     details.push((
-                        "List",
-                        vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
+                        "Error",
+                        Style::default().fg(Color::Red),
+                        vec![Span::from(first_display_line(error)).red()],
                     ));
                 }
-                ParsedCommand::Search { cmd, query, path } => {
-                    flush_reads(&mut details, &mut read_names);
-                    let spans = match (query, path) {
-                        (Some(query), Some(path)) => {
-                            vec![query.clone().into(), " in ".dim(), path.clone().into()]
-                        }
-                        (Some(query), None) => vec![query.clone().into()],
-                        _ => vec![cmd.clone().into()],
-                    };
-                    details.push(("Search", spans));
-                }
-                ParsedCommand::Unknown { .. } => {}
             }
+            _ => {}
         }
     }
     flush_reads(&mut details, &mut read_names);
     let detail_width = width.saturating_sub(4).max(1);
     let mut wrapped_details = Vec::new();
-    for (title, spans) in details {
-        let title = format!("{title} ");
+    for (title, title_style, spans) in details {
+        let title = if spans.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title} ")
+        };
         let title_width = UnicodeWidthStr::width(title.as_str()) as u16;
         let wrapped = wrap_styled_line(
             &Line::from(spans),
@@ -3699,7 +3731,7 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
         );
         for (index, mut row) in wrapped.into_iter().enumerate() {
             let mut spans = vec![if index == 0 {
-                Span::from(title.clone()).cyan()
+                Span::styled(title.clone(), title_style)
             } else {
                 Span::from(" ".repeat(usize::from(title_width)))
             }];
@@ -3734,84 +3766,6 @@ fn view_image_lines(outcome: Option<&ToolOutcome>, path: &str, width: u16) -> Ve
             ),
         ],
         Some(Err(error)) => failed_tool_lines("Failed to view image", error, width),
-    }
-}
-
-fn web_search_lines(
-    tool: &ToolEntry,
-    action: &codex_protocol::models::WebSearchAction,
-    width: u16,
-) -> Vec<Line<'static>> {
-    if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
-        return failed_tool_lines("Failed to search the web", error, width);
-    }
-
-    let completed = tool.outcome.is_some();
-    let detail = if completed {
-        web_search_action_detail(action)
-    } else {
-        String::new()
-    };
-    let mut content = vec![
-        Span::from(if completed {
-            "Searched the web"
-        } else {
-            "Searching the web"
-        })
-        .bold(),
-    ];
-    if !detail.is_empty() {
-        content.push(" for ".into());
-        content.push(Span::from(detail));
-    }
-    let wrapped = wrap_styled_line(&Line::from(content), width.saturating_sub(2).max(1));
-    let bullet = if completed {
-        "•".dim()
-    } else {
-        activity_marker(Some(tool.started_at))
-    };
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            let mut spans = if index == 0 {
-                vec![bullet.clone(), " ".into()]
-            } else {
-                vec!["  ".into()]
-            };
-            spans.append(&mut line.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-
-fn web_search_action_detail(action: &codex_protocol::models::WebSearchAction) -> String {
-    use codex_protocol::models::WebSearchAction;
-
-    match action {
-        WebSearchAction::Search { query, queries } => query
-            .clone()
-            .filter(|query| !query.is_empty())
-            .unwrap_or_else(|| {
-                let first = queries
-                    .as_ref()
-                    .and_then(|queries| queries.first())
-                    .cloned()
-                    .unwrap_or_default();
-                if queries.as_ref().is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
-                    format!("{first} ...")
-                } else {
-                    first
-                }
-            }),
-        WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
-        WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
-            (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
-            (Some(pattern), None) => format!("'{pattern}'"),
-            (None, Some(url)) => url.clone(),
-            (None, None) => String::new(),
-        },
-        WebSearchAction::Other => String::new(),
     }
 }
 
@@ -5754,11 +5708,11 @@ mod tests {
     }
 
     #[test]
-    fn web_search_uses_codex_activity_cell_and_hides_the_tool_payload() {
+    fn repeated_web_activity_streams_as_one_exploration_tree() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:web".to_string(),
+            call_id: "cell:search".to_string(),
             name: "web.run".to_string(),
             input: Some(json!({
                 "search_query": [{"q": "OpenAI Codex GitHub official repository"}],
@@ -5767,22 +5721,73 @@ mod tests {
 
         assert_eq!(
             view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
-            ["• Searching the web"]
+            [
+                "• Exploring",
+                "  └ Search OpenAI Codex GitHub official repository",
+            ]
         );
 
         view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:web".to_string(),
+            call_id: "cell:search".to_string(),
             output: Ok(json!(
                 "opaque search result that must remain model-facing only"
             )),
             duration: Duration::from_millis(50),
         });
+        assert!(view.take_pending_history_lines(80).is_empty());
+
+        view.handle_agent_event(AgentEvent::ModelResponseCompleted);
+        view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
+        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
+            "**Following the sources**".to_string(),
+        ));
+        let follow_up_calls = [
+            (
+                "cell:open",
+                json!({"open": [{"ref_id": "turn0search0", "lineno": 24}]}),
+            ),
+            (
+                "cell:find",
+                json!({"find": [{"ref_id": "turn0fetch0", "pattern": "Responses"}]}),
+            ),
+        ];
+        for (call_id, input) in &follow_up_calls {
+            view.handle_agent_event(AgentEvent::ToolStarted {
+                call_id: (*call_id).to_string(),
+                name: "web.run".to_string(),
+                input: Some(input.clone()),
+            });
+        }
+        assert_eq!(
+            view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
+            [
+                "• Exploring",
+                "  └ Search OpenAI Codex GitHub official repository",
+                "    Open turn0search0 at line 24",
+                "    Find 'Responses' in turn0fetch0",
+            ]
+        );
+        for (call_id, _) in follow_up_calls {
+            view.handle_agent_event(AgentEvent::ToolCompleted {
+                call_id: call_id.to_string(),
+                output: Ok(json!("another opaque result")),
+                duration: Duration::from_millis(50),
+            });
+        }
+
+        assert!(view.take_pending_history_lines(80).is_empty());
+        view.handle_agent_event(AgentEvent::ModelMessageDelta("done".to_string()));
         assert_eq!(
             view.take_pending_history_lines(80)
                 .iter()
                 .map(plain)
                 .collect::<Vec<_>>(),
-            ["• Searched the web for OpenAI Codex GitHub official repository"]
+            [
+                "• Explored",
+                "  └ Search OpenAI Codex GitHub official repository",
+                "    Open turn0search0 at line 24",
+                "    Find 'Responses' in turn0fetch0",
+            ]
         );
     }
 

@@ -121,32 +121,25 @@ fn command_parser_preserves_search_and_fetch_operations() {
 }
 
 #[test]
-fn display_actions_match_codex_web_search_activity() {
+fn display_activities_preserve_each_search_and_fetch_row() {
     assert_eq!(
-        action_for_display(Some(&json!({
+        activities_for_display(Some(json!({
             "search_query": [{"q": "first"}, {"q": "second"}],
-        }))),
-        WebSearchAction::Search {
-            query: None,
-            queries: Some(vec!["first".to_string(), "second".to_string()]),
-        }
-    );
-    assert_eq!(
-        action_for_display(Some(&json!({
-            "open": [{"ref_id": "https://openai.com/research"}],
-        }))),
-        WebSearchAction::OpenPage {
-            url: Some("https://openai.com/research".to_string()),
-        }
-    );
-    assert_eq!(
-        action_for_display(Some(&json!({
+            "open": [{"ref_id": "turn0search0", "lineno": 12}],
+            "click": [{"ref_id": "turn0fetch0", "id": 3}],
             "find": [{"ref_id": "turn0fetch0", "pattern": "Responses"}],
         }))),
-        WebSearchAction::FindInPage {
-            url: None,
-            pattern: Some("Responses".to_string()),
-        }
+        vec![
+            WebActivity::new("Search", "first"),
+            WebActivity::new("Search", "second"),
+            WebActivity::new("Open", "turn0search0 at line 12"),
+            WebActivity::new("Open", "link 3 in turn0fetch0"),
+            WebActivity::new("Find", "'Responses' in turn0fetch0"),
+        ]
+    );
+    assert_eq!(
+        activities_for_display(Some(json!([]))),
+        vec![WebActivity::new("Browse", "")]
     );
 }
 
