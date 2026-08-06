@@ -67,3 +67,22 @@ fn private_auth_replacement_is_atomic_across_concurrent_writers() {
     assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn oversized_auth_file_is_rejected_before_loading() {
+    let directory = std::env::temp_dir().join(format!(
+        "bettercodex-auth-limit-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("auth.json");
+    let file = File::create(&path).unwrap();
+    file.set_len(u64::try_from(MAX_AUTH_FILE_BYTES).unwrap() + 1)
+        .unwrap();
+
+    let error = read_auth_document(&path).unwrap_err();
+
+    assert!(error.to_string().contains("exceed the 1 MiB limit"));
+    std::fs::remove_dir_all(directory).unwrap();
+}

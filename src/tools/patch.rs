@@ -63,7 +63,18 @@ pub(super) fn apply(root: &Path, input: &str, cancellation: &CancellationToken) 
                         write_file(&source, &content, cancellation)?;
                         modified.push(path);
                     } else {
+                        let permissions = std::fs::metadata(&source)
+                            .with_context(|| {
+                                format!("Failed to inspect file to move {}", source.display())
+                            })?
+                            .permissions();
                         write_file(&destination, &content, cancellation)?;
+                        std::fs::set_permissions(&destination, permissions).with_context(|| {
+                            format!(
+                                "Failed to preserve permissions on moved file {}",
+                                destination.display()
+                            )
+                        })?;
                         // Once the destination is committed, finish the move even if cancellation
                         // arrives so an interrupted operation does not leave both paths behind.
                         std::fs::remove_file(&source).with_context(|| {

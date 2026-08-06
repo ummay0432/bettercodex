@@ -889,6 +889,28 @@ await tools.apply_patch(patch);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_timeout_cancels_the_pending_callback() {
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
+            .execute(
+                "call-clear-timeout",
+                r#"
+let fired = false;
+const cancelled = setTimeout(() => { fired = true; }, 0);
+clearTimeout(cancelled);
+await new Promise(resolve => setTimeout(resolve, 20));
+text(String(fired));
+"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.preview.contains("false"), "{}", result.preview);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn yielded_cells_resume_with_wait() {
         let runtime = runtime(PathBuf::from("."));
         let yielded = runtime

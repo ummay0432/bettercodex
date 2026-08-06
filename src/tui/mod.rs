@@ -773,22 +773,17 @@ fn should_notify_turn_completion(terminal_focused: bool, elapsed: Duration) -> b
     !terminal_focused && elapsed >= LONG_TASK_NOTIFICATION_THRESHOLD
 }
 
-fn prompt_history_for_session(persistent: &[String], resumed: Vec<String>) -> Vec<String> {
+fn prompt_history_for_session(mut persistent: Vec<String>, resumed: Vec<String>) -> Vec<String> {
     let resumed_set = resumed.iter().map(String::as_str).collect::<HashSet<_>>();
-    let mut history = persistent
-        .iter()
-        .filter(|prompt| !resumed_set.contains(prompt.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
+    persistent.retain(|prompt| !resumed_set.contains(prompt.as_str()));
     drop(resumed_set);
-    history.extend(resumed);
-    history
+    persistent.extend(resumed);
+    persistent
 }
 
 fn prompt_history_for_agent(agent: &Agent) -> Result<(PromptHistory, Vec<String>)> {
-    let prompt_history = PromptHistory::open(agent.session_id())?;
-    let composer_history =
-        prompt_history_for_session(prompt_history.entries(), agent.prompt_history());
+    let (prompt_history, persistent) = PromptHistory::open_with_entries(agent.session_id())?;
+    let composer_history = prompt_history_for_session(persistent, agent.prompt_history());
     Ok((prompt_history, composer_history))
 }
 

@@ -5,6 +5,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use serde::Deserialize;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::BufRead;
@@ -21,26 +22,42 @@ use std::time::UNIX_EPOCH;
 
 const HISTORY_FILENAME: &str = "history.jsonl";
 
-#[derive(Debug, Deserialize, Serialize)]
-struct HistoryEntry {
-    session_id: String,
-    ts: u64,
+#[derive(Debug, Deserialize)]
+struct HistoryEntry<'a> {
+    #[serde(borrow, rename = "session_id")]
+    _session_id: Cow<'a, str>,
+    #[serde(rename = "ts")]
+    _ts: u64,
     text: String,
+}
+
+#[derive(Serialize)]
+struct NewHistoryEntry<'a> {
+    session_id: &'a str,
+    ts: u64,
+    text: &'a str,
 }
 
 pub(crate) struct PromptHistory {
     file: File,
     session_id: String,
-    entries: Vec<String>,
 }
 
 impl PromptHistory {
     pub(crate) fn open(session_id: &str) -> Result<Self> {
-        let codex_home = std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-            .ok_or_else(|| anyhow!("cannot locate prompt history: HOME is not set"))?;
-        Self::open_in(&codex_home.join(HISTORY_FILENAME), session_id)
+        let path = history_path()?;
+        Self::open_in(&path, session_id)
+    }
+
+    pub(crate) fn open_with_entries(session_id: &str) -> Result<(Self, Vec<String>)> {
+        let path = history_path()?;
+        Self::open_with_entries_in(&path, session_id)
+    }
+
+    fn open_with_entries_in(path: &Path, session_id: &str) -> Result<(Self, Vec<String>)> {
+        let history = Self::open_in(path, session_id)?;
+        let entries = history.read_entries(path)?;
+        Ok((history, entries))
     }
 
     fn open_in(path: &Path, session_id: &str) -> Result<Self> {
@@ -61,49 +78,44 @@ impl PromptHistory {
             .with_context(|| format!("failed to open prompt history {}", path.display()))?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("failed to protect prompt history {}", path.display()))?;
-
-        let entries = {
-            let _lock = FileLock::shared(&file)
-                .with_context(|| format!("failed to lock prompt history {}", path.display()))?;
-            let reader =
-                BufReader::new(file.try_clone().with_context(|| {
-                    format!("failed to read prompt history {}", path.display())
-                })?);
-            let mut entries = Vec::new();
-            for line in reader.split(b'\n') {
-                let line = line
-                    .with_context(|| format!("failed to read prompt history {}", path.display()))?;
-                if let Ok(entry) = serde_json::from_slice::<HistoryEntry>(&line)
-                    && !entry.text.is_empty()
-                {
-                    entries.push(entry.text);
-                }
-            }
-            entries
-        };
-
         Ok(Self {
             file,
             session_id: session_id.to_string(),
-            entries,
         })
     }
 
-    pub(crate) fn entries(&self) -> &[String] {
-        &self.entries
+    fn read_entries(&self, path: &Path) -> Result<Vec<String>> {
+        let _lock = FileLock::shared(&self.file)
+            .with_context(|| format!("failed to lock prompt history {}", path.display()))?;
+        let reader = BufReader::new(
+            self.file
+                .try_clone()
+                .with_context(|| format!("failed to read prompt history {}", path.display()))?,
+        );
+        let mut entries = Vec::new();
+        for line in reader.split(b'\n') {
+            let line =
+                line.with_context(|| format!("failed to read prompt history {}", path.display()))?;
+            if let Ok(entry) = serde_json::from_slice::<HistoryEntry<'_>>(&line)
+                && !entry.text.is_empty()
+            {
+                entries.push(entry.text);
+            }
+        }
+        Ok(entries)
     }
 
     pub(crate) fn append(&mut self, text: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
-        let entry = HistoryEntry {
-            session_id: self.session_id.clone(),
+        let entry = NewHistoryEntry {
+            session_id: &self.session_id,
             ts: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|error| anyhow!("system clock is before the Unix epoch: {error}"))?
                 .as_secs(),
-            text: text.to_string(),
+            text,
         };
         let mut encoded = serde_json::to_vec(&entry).context("failed to encode prompt history")?;
         encoded.push(b'\n');
@@ -112,10 +124,16 @@ impl PromptHistory {
         let mut file = &self.file;
         file.write_all(&encoded)
             .context("failed to append prompt history")?;
-        file.flush().context("failed to flush prompt history")?;
-        self.entries.push(text.to_string());
-        Ok(())
+        file.flush().context("failed to flush prompt history")
     }
+}
+
+fn history_path() -> Result<PathBuf> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .ok_or_else(|| anyhow!("cannot locate prompt history: HOME is not set"))?;
+    Ok(codex_home.join(HISTORY_FILENAME))
 }
 
 struct FileLock {

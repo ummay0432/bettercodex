@@ -14,7 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-const MAX_TOTAL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UserPrompt {

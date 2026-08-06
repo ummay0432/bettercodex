@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -26,6 +27,7 @@ const ACCOUNT_ID_ENV: &str = "CHATGPT_ACCOUNT_ID";
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 const MAX_REFRESH_ERROR_BODY_BYTES: usize = 16_000;
 
 pub(crate) struct Auth {
@@ -107,11 +109,7 @@ impl Auth {
         }
 
         let path = auth_file_path()?;
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read ChatGPT credentials at {}", path.display()))?;
-        let document: Value = serde_json::from_str(&contents).with_context(|| {
-            format!("failed to parse ChatGPT credentials at {}", path.display())
-        })?;
+        let document = read_auth_document(&path)?;
         let tokens = document
             .get("tokens")
             .and_then(Value::as_object)
@@ -241,6 +239,32 @@ impl Auth {
             account_id,
         })
     }
+}
+
+fn read_auth_document(path: &Path) -> Result<Value> {
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to read ChatGPT credentials at {}", path.display()))?;
+    if file.metadata()?.len() > u64::try_from(MAX_AUTH_FILE_BYTES).unwrap_or(u64::MAX) {
+        return Err(anyhow!(
+            "ChatGPT credentials at {} exceed the {} MiB limit",
+            path.display(),
+            MAX_AUTH_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(u64::try_from(MAX_AUTH_FILE_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read ChatGPT credentials at {}", path.display()))?;
+    if bytes.len() > MAX_AUTH_FILE_BYTES {
+        return Err(anyhow!(
+            "ChatGPT credentials at {} exceed the {} MiB limit",
+            path.display(),
+            MAX_AUTH_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse ChatGPT credentials at {}", path.display()))
 }
 
 impl SharedAuth {

@@ -33,6 +33,8 @@ use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -258,16 +260,35 @@ fn view_image(cwd: &Path, input: Value) -> Result<Value> {
             ));
         }
     };
-    let requested = PathBuf::from(&arguments.path);
-    let path = cwd.join(requested);
-    let metadata = path
-        .metadata()
+    let path = cwd.join(PathBuf::from(&arguments.path));
+    let file = File::open(&path)
         .with_context(|| format!("unable to locate image at `{}`", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("unable to inspect image at `{}`", path.display()))?;
     if !metadata.is_file() {
         return Err(anyhow!("image path `{}` is not a file", path.display()));
     }
-    let bytes = std::fs::read(&path)
+    let limit = crate::input::MAX_TOTAL_IMAGE_BYTES;
+    if metadata.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
+        return Err(anyhow!(
+            "image at `{}` exceeds the {} MiB view_image limit",
+            path.display(),
+            limit / (1024 * 1024)
+        ));
+    }
+    let capacity = usize::try_from(metadata.len()).unwrap_or(limit).min(limit);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
         .with_context(|| format!("unable to read image at `{}`", path.display()))?;
+    if bytes.len() > limit {
+        return Err(anyhow!(
+            "image at `{}` exceeds the {} MiB view_image limit",
+            path.display(),
+            limit / (1024 * 1024)
+        ));
+    }
     Ok(json!({
         "image_url": data_url_from_bytes("application/octet-stream", &bytes),
         "detail": detail,

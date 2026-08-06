@@ -32,16 +32,15 @@ fn codex_history_is_loaded_appended_and_kept_private() {
     .join("\n");
     std::fs::write(&path, format!("{existing}\n")).unwrap();
 
-    let mut history = PromptHistory::open_in(&path, "bettercodex-session").unwrap();
-    assert_eq!(history.entries(), ["older prompt", "newer prompt"]);
+    let (mut history, entries) =
+        PromptHistory::open_with_entries_in(&path, "bettercodex-session").unwrap();
+    assert_eq!(entries, ["older prompt", "newer prompt"]);
     history.append("latest prompt").unwrap();
     drop(history);
 
-    let history = PromptHistory::open_in(&path, "resumed-session").unwrap();
-    assert_eq!(
-        history.entries(),
-        ["older prompt", "newer prompt", "latest prompt"]
-    );
+    let (_history, entries) =
+        PromptHistory::open_with_entries_in(&path, "resumed-session").unwrap();
+    assert_eq!(entries, ["older prompt", "newer prompt", "latest prompt"]);
     let last = std::fs::read_to_string(&path)
         .unwrap()
         .lines()

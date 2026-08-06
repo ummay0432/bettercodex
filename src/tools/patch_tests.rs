@@ -68,6 +68,30 @@ fn applies_add_update_delete_and_move() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn moving_a_file_preserves_its_executable_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDir::new();
+    let source = root.path().join("script.sh");
+    std::fs::write(&source, "#!/bin/sh\necho before\n").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    apply_patch(
+        root.path(),
+        "*** Begin Patch\n*** Update File: script.sh\n*** Move to: bin/script.sh\n@@\n-echo before\n+echo after\n*** End Patch\n",
+    )
+    .unwrap();
+
+    let destination = root.path().join("bin/script.sh");
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
 #[test]
 fn uses_anchors_and_end_of_file() {
     let root = TempDir::new();

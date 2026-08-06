@@ -85,6 +85,25 @@ fn direct_tool_errors_are_bounded_before_history_insertion() {
     assert!(result.preview.len() < 50_000);
 }
 
+#[test]
+fn view_image_rejects_oversized_files_before_loading_them() {
+    let cwd = std::env::temp_dir().join(format!(
+        "bettercodex-view-image-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let path = cwd.join("oversized.png");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(u64::try_from(crate::input::MAX_TOTAL_IMAGE_BYTES).unwrap() + 1)
+        .unwrap();
+
+    let error = super::view_image(&cwd, json!({"path": "oversized.png"})).unwrap_err();
+
+    assert!(error.to_string().contains("50 MiB view_image limit"));
+    std::fs::remove_dir_all(cwd).unwrap();
+}
+
 #[tokio::test]
 async fn web_search_runs_through_exec_and_posts_the_codex_alpha_contract() {
     let (base_url, requests, server) = spawn_search_server();

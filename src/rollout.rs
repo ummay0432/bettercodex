@@ -9,9 +9,11 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::BufRead;
 use std::io::BufReader;
 use std::io::BufWriter;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -164,12 +166,6 @@ type RolloutRecord = RolloutRecordData;
 type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value]>;
 
 #[derive(Debug, Deserialize)]
-struct PreviewHistoryRecord {
-    #[serde(default)]
-    items: Vec<PreviewItem>,
-}
-
-#[derive(Debug, Deserialize)]
 struct PreviewItem {
     #[serde(rename = "type", default)]
     kind: String,
@@ -185,6 +181,22 @@ struct PreviewContent {
     kind: String,
     #[serde(default)]
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+// Deserialize previews directly from the journal reader. Fields absent from these lightweight
+// records—including base64 images, reasoning, and tool payloads—are scanned but never allocated.
+enum PreviewRolloutRecord {
+    Session {
+        metadata: SessionMetadata,
+    },
+    HistoryAppend {
+        #[serde(default)]
+        items: Vec<PreviewItem>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -382,7 +394,15 @@ impl Rollout {
 fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut file = lock_rollout(open_private_append(&path, false)?, &path)?;
     let original_length = file.metadata()?.len();
-    let mut reader = BufReader::new(&*file);
+    let original_terminated = if original_length == 0 {
+        true
+    } else {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last_byte = [0_u8; 1];
+        file.read_exact(&mut last_byte)?;
+        file.seek(SeekFrom::Start(0))?;
+        last_byte[0] == b'\n'
+    };
     let mut metadata = None;
     let mut history = Vec::new();
     let mut transcript = Vec::new();
@@ -391,42 +411,32 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut server_reasoning_included = false;
     let mut compaction_count = 0_u64;
     let mut unfinished_turn = None;
-    let mut line_number = 0_usize;
     let mut valid_length = 0_u64;
-    let mut valid_record_needs_newline = false;
+    let mut partial_tail = false;
+    let mut records =
+        serde_json::Deserializer::from_reader(BufReader::new(&*file)).into_iter::<RolloutRecord>();
 
-    loop {
-        let mut line = Vec::new();
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        if bytes_read == 0 {
-            break;
-        }
-        line_number += 1;
-        let terminated = line.last() == Some(&b'\n');
-        if terminated {
-            line.pop();
-        }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if line.is_empty() {
-            valid_length = valid_length.saturating_add(bytes_read as u64);
-            valid_record_needs_newline = !terminated;
-            continue;
-        }
-        let record = match serde_json::from_slice::<RolloutRecord>(&line) {
-            Ok(record) => record,
-            Err(_) if !terminated => break,
+    while let Some(record) = records.next() {
+        let record = match record {
+            Ok(record) => {
+                valid_length = u64::try_from(records.byte_offset())
+                    .context("saved session offset exceeds the supported file size")?;
+                record
+            }
+            Err(error) if error.is_io() => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+            Err(_) if !original_terminated => {
+                partial_tail = true;
+                break;
+            }
             Err(error) => {
+                let line = error.line();
                 return Err(error).with_context(|| {
-                    format!("invalid session record at {}:{line_number}", path.display())
+                    format!("invalid session record at {}:{}", path.display(), line)
                 });
             }
         };
-        valid_length = valid_length.saturating_add(bytes_read as u64);
-        valid_record_needs_newline = !terminated;
         match record {
             RolloutRecord::Session {
                 metadata: session_metadata,
@@ -483,7 +493,12 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         }
     }
 
-    drop(reader);
+    drop(records);
+    let (valid_length, valid_record_needs_newline) = if partial_tail {
+        (valid_length, valid_length > 0)
+    } else {
+        (original_length, original_length > 0 && !original_terminated)
+    };
     repair_rollout_tail(
         &mut file,
         &path,
@@ -649,13 +664,21 @@ fn read_session_summary(
 ) -> Result<Option<SessionSummary>> {
     let file = File::open(path)
         .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-    let mut lines = BufReader::new(file).split(b'\n');
-    let Some(header) = lines.next() else {
+    let mut records = serde_json::Deserializer::from_reader(BufReader::new(file))
+        .into_iter::<PreviewRolloutRecord>();
+    let Some(header) = records.next() else {
         return Ok(None);
     };
-    let header = header?;
-    let Ok(RolloutRecord::Session { metadata }) = serde_json::from_slice(&header) else {
-        return Ok(None);
+    let metadata = match header {
+        Ok(PreviewRolloutRecord::Session { metadata }) => metadata,
+        Ok(PreviewRolloutRecord::HistoryAppend { .. } | PreviewRolloutRecord::Other) => {
+            return Ok(None);
+        }
+        Err(error) if error.is_io() => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect saved session {}", path.display()));
+        }
+        Err(_) => return Ok(None),
     };
     if metadata.version != ROLLOUT_VERSION
         || metadata.model != MODEL
@@ -673,20 +696,21 @@ fn read_session_summary(
     }
 
     let mut preview = None;
-    for line in lines {
-        let line =
-            line.with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-        // bettercodex writes the externally tagged record type first. Avoid decoding initial
-        // context, reasoning, and tool payloads while looking for the first real user message.
-        if !line.starts_with(br#"{"type":"history_append""#) {
-            continue;
-        }
-        let Ok(record) = serde_json::from_slice::<PreviewHistoryRecord>(&line) else {
-            continue;
-        };
-        if let Some(found) = preview_from_items(&record.items) {
-            preview = Some(found);
-            break;
+    for record in records {
+        match record {
+            Ok(PreviewRolloutRecord::HistoryAppend { items }) => {
+                if let Some(found) = preview_from_items(&items) {
+                    preview = Some(found);
+                    break;
+                }
+            }
+            Ok(PreviewRolloutRecord::Session { .. } | PreviewRolloutRecord::Other) => {}
+            Err(error) if error.is_io() => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect saved session {}", path.display())
+                });
+            }
+            Err(_) => break,
         }
     }
 
@@ -792,13 +816,21 @@ fn repair_rollout_tail(
 fn read_metadata(path: &Path) -> Result<Option<SessionMetadata>> {
     let file = File::open(path)
         .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-    let mut lines = BufReader::new(file).split(b'\n');
-    let Some(line) = lines.next() else {
+    let mut records = serde_json::Deserializer::from_reader(BufReader::new(file))
+        .into_iter::<PreviewRolloutRecord>();
+    let Some(record) = records.next() else {
         return Ok(None);
     };
-    let line = line?;
-    let Ok(RolloutRecord::Session { metadata }) = serde_json::from_slice(&line) else {
-        return Ok(None);
+    let metadata = match record {
+        Ok(PreviewRolloutRecord::Session { metadata }) => metadata,
+        Ok(PreviewRolloutRecord::HistoryAppend { .. } | PreviewRolloutRecord::Other) => {
+            return Ok(None);
+        }
+        Err(error) if error.is_io() => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect saved session {}", path.display()));
+        }
+        Err(_) => return Ok(None),
     };
     Ok(Some(metadata))
 }
@@ -832,7 +864,10 @@ fn installation_id(root: &Path) -> Result<String> {
     let linked = std::fs::hard_link(&temporary, &path);
     let _ = std::fs::remove_file(&temporary);
     match linked {
-        Ok(()) => Ok(value),
+        Ok(()) => {
+            File::open(root)?.sync_all()?;
+            Ok(value)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let existing = std::fs::read_to_string(&path)?;
             Uuid::parse_str(existing.trim())

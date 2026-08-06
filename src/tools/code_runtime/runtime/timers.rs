@@ -1,5 +1,5 @@
-use std::thread;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 use super::RuntimeCommand;
 use super::RuntimeState;
@@ -7,6 +7,13 @@ use super::value::value_to_error_text;
 
 pub(super) struct ScheduledTimeout {
     callback: v8::Global<v8::Function>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for ScheduledTimeout {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 pub(super) fn schedule_timeout(
@@ -33,13 +40,13 @@ pub(super) fn schedule_timeout(
     let timeout_id = state.next_timeout_id;
     state.next_timeout_id = state.next_timeout_id.saturating_add(1);
     let runtime_command_tx = state.runtime_command_tx.clone();
-    state
-        .pending_timeouts
-        .insert(timeout_id, ScheduledTimeout { callback });
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(delay_ms));
+    let task = state.timer_runtime.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         let _ = runtime_command_tx.send(RuntimeCommand::TimeoutFired { id: timeout_id });
     });
+    state
+        .pending_timeouts
+        .insert(timeout_id, ScheduledTimeout { callback, task });
 
     Ok(timeout_id)
 }

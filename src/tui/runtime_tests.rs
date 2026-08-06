@@ -31,7 +31,7 @@ fn resumed_prompts_precede_global_duplicates_during_recall() {
     let resumed = vec!["resumed older".to_string(), "resumed newer".to_string()];
 
     assert_eq!(
-        prompt_history_for_session(&persistent, resumed),
+        prompt_history_for_session(persistent, resumed),
         [
             "global older",
             "global newer",
