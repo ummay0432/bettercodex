@@ -5267,10 +5267,7 @@ mod tests {
         view.start_turn("initial prompt");
         view.set_interrupting(InterruptIntent::StopTurn);
 
-        assert_eq!(
-            view.finish_turn(Ok(SubmitOutcome::Cancelled)),
-            None
-        );
+        assert_eq!(view.finish_turn(Ok(SubmitOutcome::Cancelled)), None);
 
         let rendered = view
             .take_pending_history_lines(88)
@@ -5278,7 +5275,11 @@ mod tests {
             .map(plain)
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(rendered.matches("Turn interrupted").count(), 1, "{rendered}");
+        assert_eq!(
+            rendered.matches("Turn interrupted").count(),
+            1,
+            "{rendered}"
+        );
         assert!(
             !rendered.contains("Model interrupted to submit steering input"),
             "{rendered}"
@@ -5333,10 +5334,7 @@ mod tests {
         view.set_interrupting(InterruptIntent::SubmitSteering);
         view.handle_agent_event(AgentEvent::SteeringCommitted(id));
 
-        assert_eq!(
-            view.finish_turn(Ok(SubmitOutcome::Cancelled)),
-            None
-        );
+        assert_eq!(view.finish_turn(Ok(SubmitOutcome::Cancelled)), None);
 
         let rendered = view
             .take_pending_history_lines(88)
@@ -5344,7 +5342,11 @@ mod tests {
             .map(plain)
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(rendered.matches("Turn interrupted").count(), 1, "{rendered}");
+        assert_eq!(
+            rendered.matches("Turn interrupted").count(),
+            1,
+            "{rendered}"
+        );
         assert!(
             !rendered.contains("Model interrupted to submit steering input"),
             "{rendered}"
