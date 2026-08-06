@@ -71,8 +71,22 @@ pub(super) struct TerminalSession {
 impl TerminalSession {
     pub(super) fn enter() -> Result<Self> {
         install_panic_hook();
-        initialize_input_modes()?;
+        enable_raw_mode().context("failed to enable terminal raw mode")?;
         let mut output = stdout();
+        if let Err(error) = execute!(
+            output,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            ),
+            EnableBracketedPaste,
+            EnableFocusChange,
+            SetCursorStyle::SteadyBar,
+        ) {
+            let _ = restore();
+            return Err(error).context("failed to initialize terminal input modes");
+        }
+
         let probe = startup_probe(STARTUP_PROBE_TIMEOUT).unwrap_or_default();
         let screen_size = crossterm::terminal::size()
             .map(|(width, height)| Size::new(width, height))
@@ -214,30 +228,6 @@ where
             .draw(draw)
             .context("failed to draw inline terminal UI")?;
         Ok(())
-    }
-
-    pub(super) fn leave_ui(&mut self) -> Result<()> {
-        self.finish();
-        restore().context("failed to restore terminal modes")
-    }
-
-    pub(super) fn resume_ui(&mut self) -> Result<()> {
-        initialize_input_modes()?;
-        self.refresh_screen_size()?;
-        self.clear_screen()?;
-        self.terminal.swap_buffers();
-        Ok(())
-    }
-
-    pub(super) fn suspend_process(&mut self) -> Result<()> {
-        self.leave_ui()?;
-        let signal_result = unsafe { libc::kill(0, libc::SIGTSTP) };
-        if signal_result == -1 {
-            let signal_error = io::Error::last_os_error();
-            self.resume_ui()?;
-            return Err(signal_error).context("failed to suspend bettercodex");
-        }
-        self.resume_ui()
     }
 
     fn prepare_viewport(&mut self, height: u16) -> Result<()> {
@@ -398,24 +388,6 @@ fn restore() -> io::Result<()> {
         PopKeyboardEnhancementFlags,
     );
     raw_result.and(mode_result)
-}
-
-fn initialize_input_modes() -> Result<()> {
-    enable_raw_mode().context("failed to enable terminal raw mode")?;
-    if let Err(error) = execute!(
-        stdout(),
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-        ),
-        EnableBracketedPaste,
-        EnableFocusChange,
-        SetCursorStyle::SteadyBar,
-    ) {
-        let _ = restore();
-        return Err(error).context("failed to initialize terminal input modes");
-    }
-    Ok(())
 }
 
 fn install_panic_hook() {

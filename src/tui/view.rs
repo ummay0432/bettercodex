@@ -172,7 +172,6 @@ pub(super) enum Action {
     ShowContext,
     ShowDiff,
     StopBackgroundProcesses,
-    Suspend,
     UpdateSkill {
         path: PathBuf,
         update: SkillUpdate,
@@ -539,10 +538,6 @@ impl View {
 
     pub(super) fn action_required(&self) -> bool {
         self.action_required
-    }
-
-    pub(super) fn request_full_reflow(&mut self) {
-        self.resize_reflow_requested = true;
     }
 
     pub(super) fn start_turn(&mut self, prompt: impl Into<UserPrompt>) {
@@ -1064,10 +1059,6 @@ impl View {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-
-        if control && key.code == KeyCode::Char('z') {
-            return Action::Suspend;
-        }
 
         if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
             return match picker.handle_key(key) {
@@ -1858,7 +1849,7 @@ impl View {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
         };
         let overlay_height = match self.overlay.as_ref() {
-            Some(Overlay::Shortcuts) => 22,
+            Some(Overlay::Shortcuts) => 21,
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills),
@@ -2153,7 +2144,7 @@ impl View {
     }
 
     fn render_shortcuts(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered(area, 72, 20);
+        let popup = centered(area, 72, 19);
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .title(" Keyboard shortcuts ")
@@ -2179,7 +2170,6 @@ impl View {
             shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
             shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
             shortcut_line("Ctrl+C", "clear draft, interrupt work, or exit when idle"),
-            shortcut_line("Ctrl+Z", "suspend bettercodex on Unix"),
             Line::from(""),
             Line::from("Press any key to close").dim(),
         ];
@@ -5571,7 +5561,6 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("Ctrl+Z"), "{rendered}");
         assert!(rendered.contains("Press any key to close"), "{rendered}");
     }
 
@@ -5595,9 +5584,14 @@ mod tests {
     }
 
     #[test]
-    fn unwanted_ctrl_g_l_and_t_shortcuts_remain_unbound() {
+    fn unwanted_ctrl_g_l_t_and_z_shortcuts_remain_unbound() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
-        for (character, raw_control) in [('g', '\u{7}'), ('l', '\u{c}'), ('t', '\u{14}')] {
+        for (character, raw_control) in [
+            ('g', '\u{7}'),
+            ('l', '\u{c}'),
+            ('t', '\u{14}'),
+            ('z', '\u{1a}'),
+        ] {
             assert_eq!(
                 view.handle_terminal_event(Event::Key(KeyEvent::new(
                     KeyCode::Char(character),
