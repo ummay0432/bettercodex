@@ -56,21 +56,37 @@ def main_worktree_root() -> Path:
     return Path(first).resolve()
 
 
+def worktree_identifier(worktree: Path | None = None) -> str:
+    worktree = (worktree or repository_root()).resolve()
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", worktree.name).strip("-") or "worktree"
+    digest = hashlib.sha256(os.fsencode(worktree)).hexdigest()[:12]
+    return f"{slug}-{digest}"
+
+
 def worktree_target(worktree: Path | None = None) -> Path:
     worktree = (worktree or repository_root()).resolve()
     main = main_worktree_root()
     if worktree == main:
         return main / "target"
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", worktree.name).strip("-") or "worktree"
-    digest = hashlib.sha256(os.fsencode(worktree)).hexdigest()[:12]
-    return main / "target" / "worktrees" / f"{slug}-{digest}"
+    return main / "target" / "worktrees" / worktree_identifier(worktree)
+
+
+def worktree_temp(worktree: Path | None = None) -> Path:
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache / "bettercodex" / "tmp" / worktree_identifier(worktree)
 
 
 def cargo_environment() -> tuple[dict[str, str], Path]:
     target = worktree_target()
     target.mkdir(parents=True, exist_ok=True)
+    temporary = worktree_temp()
+    temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary.chmod(0o700)
     environment = os.environ.copy()
     environment["CARGO_TARGET_DIR"] = os.fspath(target)
+    # Test fixtures can be hundreds of MiB. Keep them in a per-worktree cache directory instead
+    # of consuming a small system tmpfs or colliding with concurrent bettercodex sessions.
+    environment["TMPDIR"] = os.fspath(temporary)
     return environment, target
 
 
@@ -150,6 +166,7 @@ def command_preflight(_: argparse.Namespace) -> int:
     usage = shutil.disk_usage(target)
     print(f"Worktree:    {root}")
     print(f"Cargo target: {target}")
+    print(f"Test temp:    {worktree_temp(root)}")
     print(f"Filesystem:   {human_bytes(usage.free)} free of {human_bytes(usage.total)}")
     if usage.free < LOW_SPACE_BYTES:
         print(
@@ -205,6 +222,7 @@ def command_cargo(arguments: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     print(f"CARGO_TARGET_DIR={target}", file=sys.stderr)
+    print(f"TMPDIR={environment['TMPDIR']}", file=sys.stderr)
     os.execvpe("cargo", ["cargo", *arguments.cargo_arguments], environment)
     raise AssertionError("exec returned")
 
