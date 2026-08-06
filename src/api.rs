@@ -29,6 +29,7 @@ use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt;
 use std::ops::Range;
 use std::sync::LazyLock;
@@ -1377,12 +1378,16 @@ impl CollectedResponse {
                 "model sent conflicting output items at index {index}"
             )));
         }
-        if let Some(previous) = self.pending_items.insert(index, item.clone())
-            && previous != item
-        {
-            return Err(ApiError::fatal(format!(
-                "model sent conflicting pending output items at index {index}"
-            )));
+        match self.pending_items.entry(index) {
+            Entry::Vacant(entry) => {
+                entry.insert(item);
+            }
+            Entry::Occupied(entry) if entry.get() == &item => {}
+            Entry::Occupied(_) => {
+                return Err(ApiError::fatal(format!(
+                    "model sent conflicting pending output items at index {index}"
+                )));
+            }
         }
         let appended_start = self.items.len();
         while let Some(item) = self.pending_items.remove(&self.items.len()) {
@@ -1433,12 +1438,29 @@ fn process_event(
 }
 
 fn process_event_value(
-    event: Value,
+    mut event: Value,
     collected: &mut CollectedResponse,
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
 ) -> ApiResult<()> {
     validate_event_server_model(&event)?;
+    // Completed items can contain multi-megabyte encrypted reasoning. Move the item out of the
+    // event so the collector only pays for the one copy simultaneously owned by conversation
+    // history.
+    if event.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
+        let index = event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap_or_else(|| collected.items.len() + collected.pending_items.len());
+        let item = event
+            .get_mut("item")
+            .map(Value::take)
+            .ok_or_else(|| ApiError::fatal("output_item.done omitted its item"))?;
+        let appended = collected.push_item(index, item, completed_items)?;
+        emit_completed_message_events(&collected.items[appended], events);
+        return Ok(());
+    }
     match event.get("type").and_then(Value::as_str) {
         Some("response.output_item.added") => {
             if let Some(item) = event.get("item") {
@@ -1471,26 +1493,15 @@ fn process_event_value(
                 let _ = events.send(AgentEvent::ReasoningSummarySectionStarted);
             }
         }
-        Some("response.output_item.done") => {
-            let item = event
-                .get("item")
-                .cloned()
-                .ok_or_else(|| ApiError::fatal("output_item.done omitted its item"))?;
-            let index = event
-                .get("output_index")
-                .and_then(Value::as_u64)
-                .and_then(|index| usize::try_from(index).ok())
-                .unwrap_or_else(|| collected.items.len() + collected.pending_items.len());
-            let appended = collected.push_item(index, item, completed_items)?;
-            emit_completed_message_events(&collected.items[appended], events);
-        }
         Some("response.completed") => {
             let response = event
-                .get("response")
+                .get_mut("response")
+                .map(Value::take)
                 .ok_or_else(|| ApiError::fatal("response.completed omitted its response"))?;
-            validate_completed_response(response)?;
-            if let Some(output) = response.get("output").and_then(Value::as_array) {
-                for (index, item) in output.iter().cloned().enumerate() {
+            validate_completed_response(&response)?;
+            let mut response = response;
+            if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
+                for (index, item) in std::mem::take(output).into_iter().enumerate() {
                     let appended = collected.push_item(index, item, completed_items)?;
                     emit_completed_message_events(&collected.items[appended], events);
                 }

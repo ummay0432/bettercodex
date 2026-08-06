@@ -208,6 +208,75 @@ fn completed_items_are_emitted_once_in_api_order() {
 }
 
 #[test]
+fn completed_item_retains_its_stream_allocation_in_the_collector() {
+    let (completed_items, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::default();
+    let event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "reasoning",
+            "id": "rs_move",
+            "encrypted_content": "cipher payload",
+        },
+    });
+    let stream_allocation = event["item"]["encrypted_content"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+
+    process_event_value(event, &mut collected, &completed_items, None).unwrap();
+
+    assert_eq!(
+        collected.items[0]["encrypted_content"]
+            .as_str()
+            .unwrap()
+            .as_ptr(),
+        stream_allocation,
+        "stream payloads must move into the response collector instead of being deep-cloned"
+    );
+    assert_eq!(received.try_recv().unwrap(), collected.items[0]);
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_completed_output_handoff() {
+    const ITEMS: usize = 64;
+    const PAYLOAD_BYTES: usize = 1024 * 1024;
+
+    let events = (0..ITEMS)
+        .map(|index| {
+            json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": {
+                    "type": "reasoning",
+                    "id": format!("rs_{index}"),
+                    "encrypted_content": "x".repeat(PAYLOAD_BYTES),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let (completed_items, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::default();
+
+    let started = std::time::Instant::now();
+    for event in events {
+        process_event_value(event, &mut collected, &completed_items, None).unwrap();
+    }
+    let elapsed = started.elapsed();
+    for _ in 0..ITEMS {
+        std::hint::black_box(received.try_recv().unwrap());
+    }
+
+    eprintln!(
+        "{ITEMS} completed {} MiB output items handed to history in {elapsed:?}",
+        PAYLOAD_BYTES / (1024 * 1024)
+    );
+    assert_eq!(collected.items.len(), ITEMS);
+}
+
+#[test]
 fn extracts_text_and_forwards_streaming_events() {
     assert_eq!(
         terminal_answer(&[assistant_item("done")]).as_deref(),

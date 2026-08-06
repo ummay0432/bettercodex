@@ -447,14 +447,16 @@ impl Agent {
                         control.cancellation.clone(),
                     )
                     .await;
-                self.conversation.extend(tool_call.output_items(&output))?;
+                self.conversation
+                    .extend(tool_call.into_output_items(output))?;
                 self.emit_context(events);
                 if control.cancellation.is_cancelled() {
                     for pending in tool_calls {
                         let output = ToolResult::text(
                             "tool error: skipped after user interruption".to_string(),
                         );
-                        self.conversation.extend(pending.output_items(&output))?;
+                        self.conversation
+                            .extend(pending.into_output_items(output))?;
                     }
                     return Ok(SubmitOutcome::Cancelled);
                 }

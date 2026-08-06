@@ -230,7 +230,6 @@ pub(super) fn store_callback(
         }
     };
     if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-        state.stored_values.insert(key.clone(), serialized.clone());
         state.stored_value_writes.insert(key, serialized);
     }
 }
@@ -249,7 +248,12 @@ pub(super) fn load_callback(
     };
     let value = scope
         .get_slot::<RuntimeState>()
-        .and_then(|state| state.stored_values.get(&key))
+        .and_then(|state| {
+            state
+                .stored_value_writes
+                .get(&key)
+                .or_else(|| state.stored_values.get(&key))
+        })
         .cloned();
     let Some(value) = value else {
         retval.set(v8::undefined(scope).into());
