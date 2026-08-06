@@ -1,13 +1,17 @@
+mod clipboard;
 mod context_window;
 mod editor;
 mod file_search;
+mod git_diff;
 mod markdown;
+mod notifications;
 mod pending_input;
 mod reasoning_status;
 mod resume_picker;
 mod skill_popup;
 mod skills_view;
 mod terminal;
+mod terminal_title;
 mod tool_catalogue;
 mod view;
 
@@ -24,16 +28,25 @@ use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionSummary;
 use crate::rollout::SessionTranscriptItem;
+use crate::tools::ProcessManager;
 use anyhow::Context;
 use anyhow::Result;
+use clipboard::ClipboardLease;
+use crossterm::event::Event;
 use crossterm::event::EventStream;
 use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures::StreamExt;
+use notifications::Notifier;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::pending;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
+use terminal_title::TerminalTitle;
+use terminal_title::TerminalTitleState;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
@@ -49,6 +62,8 @@ type TurnTask = JoinHandle<TurnResult>;
 type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
 const FRAME_INTERVAL: Duration = Duration::from_millis(32);
+const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
+const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
 const MAX_READY_AGENT_EVENTS: usize = 4_096;
 
 enum TurnCompletion {
@@ -78,6 +93,7 @@ pub(crate) async fn run(agent: Agent, cwd: PathBuf) -> Result<()> {
 }
 
 struct Runtime {
+    clipboard_lease: Option<ClipboardLease>,
     cwd: PathBuf,
     agent: Option<Agent>,
     turn: Option<TurnTask>,
@@ -86,11 +102,22 @@ struct Runtime {
     submit_steers_after_interrupt: bool,
     exit_after_turn: bool,
     context_snapshot: ContextSnapshot,
+    diff_task: Option<JoinHandle<()>>,
+    diff_updates: UnboundedReceiver<std::result::Result<String, String>>,
+    diff_updates_tx: tokio::sync::mpsc::UnboundedSender<std::result::Result<String, String>>,
     file_search: FileSearchManager,
     file_search_updates: UnboundedReceiver<FileSearchUpdate>,
     prompt_history: Option<PromptHistory>,
+    processes: ProcessManager,
     session_scan: Option<SessionScanTask>,
     resume_task: Option<ResumeTask>,
+    notifier: Option<Notifier>,
+    operator_command_tasks: HashMap<String, JoinHandle<()>>,
+    operator_command_updates: UnboundedReceiver<OperatorCommandCompletion>,
+    operator_command_updates_tx: tokio::sync::mpsc::UnboundedSender<OperatorCommandCompletion>,
+    terminal_focused: bool,
+    terminal_title: TerminalTitle,
+    turn_started_at: Option<Instant>,
     view: View,
 }
 
@@ -99,6 +126,11 @@ struct ResumedSession {
     prompt_history: PromptHistory,
     composer_history: Vec<String>,
     transcript: Vec<SessionTranscriptItem>,
+}
+
+struct OperatorCommandCompletion {
+    call_id: String,
+    output: std::result::Result<Value, String>,
 }
 
 impl Runtime {
@@ -113,9 +145,13 @@ impl Runtime {
         let (prompt_history, composer_history) = prompt_history_for_agent(&agent)?;
         view.seed_prompt_history(composer_history);
         let context_snapshot = agent.context_snapshot();
+        let processes = agent.background_processes();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
+        let (operator_command_updates_tx, operator_command_updates) = unbounded_channel();
+        let (diff_updates_tx, diff_updates) = unbounded_channel();
         Ok(Self {
+            clipboard_lease: None,
             view,
             cwd,
             agent: Some(agent),
@@ -125,11 +161,22 @@ impl Runtime {
             submit_steers_after_interrupt: false,
             exit_after_turn: false,
             context_snapshot,
+            diff_task: None,
+            diff_updates,
+            diff_updates_tx,
             file_search,
             file_search_updates,
             prompt_history: Some(prompt_history),
+            processes,
             session_scan: None,
             resume_task: None,
+            notifier: Some(Notifier::detect()),
+            operator_command_tasks: HashMap::new(),
+            operator_command_updates,
+            operator_command_updates_tx,
+            terminal_focused: true,
+            terminal_title: TerminalTitle::new(),
+            turn_started_at: None,
         })
     }
 
@@ -138,9 +185,19 @@ impl Runtime {
         let mut ticks =
             tokio::time::interval_at(tokio::time::Instant::now() + FRAME_INTERVAL, FRAME_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut process_ticks = tokio::time::interval(PROCESS_STATUS_INTERVAL);
+        process_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut redraw = true;
 
         loop {
+            let title_state = if self.view.action_required() {
+                TerminalTitleState::ActionRequired
+            } else if self.has_foreground_activity() {
+                TerminalTitleState::Working
+            } else {
+                TerminalTitleState::Idle
+            };
+            self.terminal_title.refresh(title_state)?;
             if redraw {
                 let clear_requested = self.view.take_clear_request();
                 let mut resize_reflow_requested = self.view.take_resize_reflow_request();
@@ -162,7 +219,7 @@ impl Runtime {
                 terminal.draw(height, |frame| self.view.render_prepared(frame, prepared))?;
                 redraw = false;
             }
-            let animate = self.view.is_busy();
+            let animate = self.has_foreground_activity();
 
             tokio::select! {
                 terminal_event = input.next() => {
@@ -171,6 +228,11 @@ impl Runtime {
                         break;
                     };
                     let event = terminal_event.context("failed to read terminal input")?;
+                    match event {
+                        Event::FocusGained => self.terminal_focused = true,
+                        Event::FocusLost => self.terminal_focused = false,
+                        _ => {}
+                    }
                     let action = self.view.handle_terminal_event(event);
                     self.file_search
                         .on_query_changed(self.view.file_search_query());
@@ -227,6 +289,16 @@ impl Runtime {
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.turn_handle = None;
+                    let elapsed = self.turn_started_at.take().map(|started| started.elapsed());
+                    let notification = match &completion {
+                        TurnCompletion::Submission(Ok(SubmitOutcome::Completed(answer))) => {
+                            Some(answer.clone())
+                        }
+                        TurnCompletion::Compaction(Ok(CompactionOutcome::Completed)) => {
+                            Some("Context compacted".to_string())
+                        }
+                        _ => None,
+                    };
                     let completed = completion.completed();
                     match completion {
                         TurnCompletion::Submission(result) => self.view.finish_turn(result),
@@ -241,6 +313,13 @@ impl Runtime {
                         self.submit_steers_after_interrupt = false;
                         if let Some(prompt) = self.view.pop_next_queued_follow_up() {
                             self.start_turn(prompt);
+                        } else if let (Some(message), Some(elapsed)) = (notification, elapsed)
+                            && should_notify_turn_completion(
+                                self.terminal_focused,
+                                elapsed,
+                            )
+                        {
+                            self.post_notification(&message);
                         }
                     } else if self.submit_steers_after_interrupt {
                         self.submit_steers_after_interrupt = false;
@@ -257,6 +336,26 @@ impl Runtime {
                     } else {
                         self.view.restore_pending_input_to_composer();
                     }
+                }
+                completion = self.operator_command_updates.recv() => {
+                    if let Some(completion) = completion {
+                        self.operator_command_tasks.remove(&completion.call_id);
+                        self.view.finish_operator_command(
+                            &completion.call_id,
+                            completion.output,
+                        );
+                        redraw = true;
+                    }
+                }
+                result = self.diff_updates.recv() => {
+                    if let Some(result) = result {
+                        self.diff_task = None;
+                        self.view.add_git_diff_result(result);
+                        redraw = true;
+                    }
+                }
+                _ = process_ticks.tick() => {
+                    redraw |= self.refresh_background_processes();
                 }
                 _ = receive_frame_tick(animate, &mut ticks) => redraw = true,
             }
@@ -291,11 +390,42 @@ impl Runtime {
                 }
             }
             Action::Cancel => self.interrupt_turn(),
+            Action::Copy(text) => match clipboard::copy_to_clipboard(&text) {
+                Ok(lease) => {
+                    self.clipboard_lease = lease;
+                    self.view
+                        .add_notice("Copied latest final response as Markdown".to_string());
+                }
+                Err(error) => self
+                    .view
+                    .add_notice(format!("Could not copy final response: {error}")),
+            },
             Action::Compact => self.start_compaction(),
+            Action::Fork => {
+                if self.has_local_session_activity() {
+                    self.view.add_notice(
+                        "Wait for the local command or Git diff before forking".to_string(),
+                    );
+                } else {
+                    self.fork_session()?;
+                }
+            }
+            Action::ListBackgroundProcesses => {
+                let processes = self.processes.list_background_processes();
+                self.view.set_background_processes(processes.clone());
+                self.view.add_background_process_list(processes);
+            }
             Action::Clear => {
-                if self.turn.is_none() {
+                if self.has_local_session_activity() {
+                    self.view.add_notice(
+                        "Wait for the local command or Git diff before clearing".to_string(),
+                    );
+                } else if self.turn.is_none() {
                     let agent = Agent::new(&self.cwd)?;
                     let prompt_history = PromptHistory::open(agent.session_id())?;
+                    let processes = agent.background_processes();
+                    self.processes.stop_all_background_processes();
+                    self.processes = processes;
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.prompt_history = Some(prompt_history);
@@ -311,13 +441,44 @@ impl Runtime {
                     }
                 }
             }
-            Action::OpenResumePicker => self.open_resume_picker()?,
-            Action::ResumeSession(id) => self.start_resume(id)?,
+            Action::OpenResumePicker => {
+                if self.has_local_session_activity() {
+                    self.view.add_notice(
+                        "Wait for the local command or Git diff before resuming".to_string(),
+                    );
+                } else {
+                    self.open_resume_picker()?;
+                }
+            }
+            Action::ResumeSession(id) => {
+                if self.has_local_session_activity() {
+                    self.view.add_notice(
+                        "Wait for the local command or Git diff before resuming".to_string(),
+                    );
+                } else {
+                    self.start_resume(id)?;
+                }
+            }
+            Action::RunShellCommand {
+                command,
+                history_text,
+            } => {
+                self.persist_prompt(&history_text);
+                self.start_operator_command(command);
+            }
             Action::ShowContext => {
                 if let Some(agent) = &self.agent {
                     self.context_snapshot = agent.context_snapshot();
                 }
                 self.view.show_context(self.context_snapshot.clone());
+            }
+            Action::ShowDiff => self.start_git_diff(),
+            Action::StopBackgroundProcesses => {
+                let count = self.processes.stop_all_background_processes();
+                self.view.set_background_processes(Vec::new());
+                let plural = if count == 1 { "" } else { "s" };
+                self.view
+                    .add_notice(format!("Stopped {count} background terminal{plural}"));
             }
             Action::UpdateSkill { path, update } => {
                 let result = self
@@ -363,6 +524,28 @@ impl Runtime {
         }
     }
 
+    fn fork_session(&mut self) -> Result<()> {
+        let source = self
+            .agent
+            .as_ref()
+            .context("a session can only be forked while the agent is idle")?;
+        let agent = source.fork(self.view.session_transcript())?;
+        let prompt_history = PromptHistory::open(agent.session_id())?;
+        let session_id = agent.session_id().to_string();
+        self.processes.stop_all_background_processes();
+        self.processes = agent.background_processes();
+        self.context_snapshot = agent.context_snapshot();
+        self.view.set_context_tokens(agent.context_tokens());
+        self.view.set_skills(agent.skills().to_vec());
+        self.view.set_background_processes(Vec::new());
+        self.agent = Some(agent);
+        self.prompt_history = Some(prompt_history);
+        self.submit_steers_after_interrupt = false;
+        self.view
+            .add_notice(format!("Forked conversation into session {session_id}"));
+        Ok(())
+    }
+
     fn open_resume_picker(&mut self) -> Result<()> {
         let current_session = self.current_session_id()?;
         self.view.show_resume_picker(current_session);
@@ -397,6 +580,39 @@ impl Runtime {
         Ok(())
     }
 
+    fn start_operator_command(&mut self, command: String) {
+        let call_id = format!("operator:{}", Uuid::new_v4());
+        self.view.start_operator_command(call_id.clone(), &command);
+        let processes = self.processes.clone();
+        let updates = self.operator_command_updates_tx.clone();
+        let task_call_id = call_id.clone();
+        let task = tokio::spawn(async move {
+            let output = processes
+                .run_operator_command(command)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = updates.send(OperatorCommandCompletion {
+                call_id: task_call_id,
+                output,
+            });
+        });
+        self.operator_command_tasks.insert(call_id, task);
+    }
+
+    fn start_git_diff(&mut self) {
+        if self.diff_task.is_some() {
+            self.view
+                .add_notice("A Git diff is already being computed".to_string());
+            return;
+        }
+        let cwd = self.cwd.clone();
+        let updates = self.diff_updates_tx.clone();
+        self.diff_task = Some(tokio::spawn(async move {
+            let result = git_diff::get_git_diff(cwd).await;
+            let _ = updates.send(result);
+        }));
+    }
+
     fn current_session_id(&self) -> Result<Uuid> {
         let session_id = self
             .agent
@@ -418,10 +634,13 @@ impl Runtime {
         let context_tokens = agent.context_tokens();
         let skills = agent.skills().to_vec();
         let skill_warnings = agent.skill_warnings().to_vec();
+        let processes = agent.background_processes();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
 
         self.cwd = cwd.clone();
+        self.processes.stop_all_background_processes();
+        self.processes = processes;
         self.context_snapshot = context_snapshot;
         self.agent = Some(agent);
         self.submit_steers_after_interrupt = false;
@@ -444,6 +663,7 @@ impl Runtime {
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::channel();
         self.view.start_turn(prompt.clone());
+        self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
         self.turn = Some(tokio::spawn(async move {
@@ -462,6 +682,7 @@ impl Runtime {
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::non_steerable_channel();
         self.view.start_compaction();
+        self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
         self.turn = Some(tokio::spawn(async move {
@@ -499,6 +720,51 @@ impl Runtime {
         }
         self.view.handle_agent_event(event);
     }
+
+    fn refresh_background_processes(&mut self) -> bool {
+        self.view
+            .set_background_processes(self.processes.list_background_processes())
+    }
+
+    fn has_foreground_activity(&self) -> bool {
+        self.view.is_busy()
+            || !self.operator_command_tasks.is_empty()
+            || self.diff_task.is_some()
+            || self.resume_task.is_some()
+            || self.session_scan.is_some()
+    }
+
+    fn has_local_session_activity(&self) -> bool {
+        !self.operator_command_tasks.is_empty() || self.diff_task.is_some()
+    }
+
+    fn post_notification(&mut self, message: &str) {
+        let Some(notifier) = self.notifier.as_mut() else {
+            return;
+        };
+        if let Err(error) = notifier.notify_turn_complete(message) {
+            self.notifier = None;
+            self.view.add_notice(format!(
+                "Terminal notifications were disabled after an output error: {error}"
+            ));
+        }
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.processes.stop_all_background_processes();
+        for (_, task) in self.operator_command_tasks.drain() {
+            task.abort();
+        }
+        if let Some(task) = self.diff_task.take() {
+            task.abort();
+        }
+    }
+}
+
+fn should_notify_turn_completion(terminal_focused: bool, elapsed: Duration) -> bool {
+    !terminal_focused && elapsed >= LONG_TASK_NOTIFICATION_THRESHOLD
 }
 
 fn prompt_history_for_session(persistent: &[String], resumed: Vec<String>) -> Vec<String> {

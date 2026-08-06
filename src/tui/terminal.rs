@@ -3,7 +3,9 @@ use anyhow::Result;
 use crossterm::cursor::MoveTo;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
+use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
+use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyboardEnhancementFlags;
 use crossterm::event::PopKeyboardEnhancementFlags;
 use crossterm::event::PushKeyboardEnhancementFlags;
@@ -75,6 +77,7 @@ impl TerminalSession {
                     | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
             ),
             EnableBracketedPaste,
+            EnableFocusChange,
             SetCursorStyle::SteadyBar,
         ) {
             let _ = restore();
@@ -376,6 +379,7 @@ fn restore() -> io::Result<()> {
         stdout(),
         SetCursorStyle::DefaultUserShape,
         DisableBracketedPaste,
+        DisableFocusChange,
         PopKeyboardEnhancementFlags,
     );
     raw_result.and(mode_result)

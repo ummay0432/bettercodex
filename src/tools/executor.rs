@@ -64,9 +64,15 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
     ("CODEX_CI", "1"),
 ];
 
-pub(super) struct ProcessManager {
-    cwd: PathBuf,
-    store: Mutex<ProcessStore>,
+#[derive(Clone)]
+pub(crate) struct ProcessManager {
+    cwd: Arc<PathBuf>,
+    store: Arc<Mutex<ProcessStore>>,
+    _cleanup: Arc<ProcessCleanup>,
+}
+
+struct ProcessCleanup {
+    store: Arc<Mutex<ProcessStore>>,
 }
 
 #[derive(Default)]
@@ -77,7 +83,18 @@ struct ProcessStore {
 
 struct ProcessEntry {
     session: Arc<ProcessSession>,
+    command: String,
+    cwd: PathBuf,
+    started_at: Instant,
     last_used: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackgroundProcess {
+    pub(crate) session_id: i32,
+    pub(crate) command: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) running_for: Duration,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -87,11 +104,69 @@ enum ProcessStorage {
 }
 
 impl ProcessManager {
-    pub(super) fn new(cwd: PathBuf) -> Self {
+    pub(crate) fn new(cwd: PathBuf) -> Self {
+        let store = Arc::new(Mutex::new(ProcessStore::default()));
         Self {
-            cwd,
-            store: Mutex::new(ProcessStore::default()),
+            cwd: Arc::new(cwd),
+            _cleanup: Arc::new(ProcessCleanup {
+                store: Arc::clone(&store),
+            }),
+            store,
         }
+    }
+
+    pub(crate) fn list_background_processes(&self) -> Vec<BackgroundProcess> {
+        let now = Instant::now();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut processes = store
+            .sessions
+            .iter()
+            .filter(|(_, entry)| !entry.session.has_exited())
+            .map(|(session_id, entry)| BackgroundProcess {
+                session_id: *session_id,
+                command: entry.command.clone(),
+                cwd: entry.cwd.clone(),
+                running_for: now.saturating_duration_since(entry.started_at),
+            })
+            .collect::<Vec<_>>();
+        processes.sort_by_key(|process| process.session_id);
+        processes
+    }
+
+    pub(crate) fn stop_all_background_processes(&self) -> usize {
+        let entries = {
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.reserved_session_ids.clear();
+            store
+                .sessions
+                .drain()
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>()
+        };
+        let count = entries
+            .iter()
+            .filter(|entry| !entry.session.has_exited())
+            .count();
+        for entry in entries {
+            entry.session.kill();
+        }
+        count
+    }
+
+    pub(crate) async fn run_operator_command(&self, command: String) -> Result<Value> {
+        self.exec_command(
+            json!({
+                "cmd": command,
+            }),
+            CancellationToken::new(),
+        )
+        .await
     }
 
     pub(super) async fn exec_command(
@@ -121,7 +196,13 @@ impl ProcessManager {
         let storage = if session.has_exited() {
             ProcessStorage::Transient
         } else {
-            self.store_session(session_id, Arc::clone(&session), started)?;
+            self.store_session(
+                session_id,
+                Arc::clone(&session),
+                arguments.cmd.clone(),
+                workdir,
+                started,
+            )?;
             session_id_reservation.commit();
             ProcessStorage::Stored
         };
@@ -315,6 +396,8 @@ impl ProcessManager {
         &self,
         session_id: i32,
         session: Arc<ProcessSession>,
+        command: String,
+        cwd: PathBuf,
         started_at: Instant,
     ) -> Result<()> {
         let pruned_entry = {
@@ -327,6 +410,9 @@ impl ProcessManager {
                 session_id,
                 ProcessEntry {
                     session,
+                    command,
+                    cwd,
+                    started_at,
                     last_used: started_at,
                 },
             );
@@ -432,14 +518,16 @@ impl Drop for SessionIdReservation<'_> {
     }
 }
 
-impl Drop for ProcessManager {
+impl Drop for ProcessCleanup {
     fn drop(&mut self) {
-        let Ok(store) = self.store.get_mut() else {
-            return;
-        };
-        for entry in store.sessions.values() {
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in store.sessions.drain().map(|(_, entry)| entry) {
             entry.session.kill();
         }
+        store.reserved_session_ids.clear();
     }
 }
 
@@ -1020,6 +1108,9 @@ mod tests {
                     session_id,
                     ProcessEntry {
                         session: fake_session(session_id == 1_001),
+                        command: format!("command {session_id}"),
+                        cwd: PathBuf::from("/tmp"),
+                        started_at: now,
                         last_used: now
                             .checked_sub(Duration::from_secs(
                                 u64::try_from(MAX_PROCESSES - offset).unwrap(),
@@ -1033,7 +1124,13 @@ mod tests {
         }
 
         manager
-            .store_session(2_000, fake_session(false), now)
+            .store_session(
+                2_000,
+                fake_session(false),
+                "new command".to_string(),
+                PathBuf::from("/tmp"),
+                now,
+            )
             .unwrap();
 
         {
@@ -1120,6 +1217,48 @@ mod tests {
         );
         assert!(completed["original_token_count"].as_u64().is_some());
         assert!(completed.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn cloned_process_table_lists_and_stops_background_commands() {
+        let cwd = std::env::current_dir().unwrap();
+        let manager = ProcessManager::new(cwd.clone());
+        let control = manager.clone();
+        let started = manager
+            .exec_command(
+                json!({
+                    "cmd": "sleep 30",
+                    "shell": "/bin/sh",
+                    "login": false,
+                    "yield_time_ms": 250,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let session_id = started["session_id"].as_i64().unwrap() as i32;
+
+        let processes = control.list_background_processes();
+        let running_for = processes[0].running_for;
+        assert_eq!(
+            processes,
+            [BackgroundProcess {
+                session_id,
+                command: "sleep 30".to_string(),
+                cwd,
+                running_for,
+            }]
+        );
+        assert_eq!(control.stop_all_background_processes(), 1);
+        assert!(manager.list_background_processes().is_empty());
+        let error = manager
+            .write_stdin(json!({"session_id": session_id}), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Unknown process id {session_id}")
+        );
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@
 //! the only top-level tool execution path.
 
 use super::NestedTools;
+use super::ProcessManager;
 use super::ToolResult;
 use super::catalogue;
 use super::code_runtime;
@@ -62,6 +63,10 @@ impl ToolRuntime {
 
     pub(super) fn prepare_turn(&self, context: ToolTurnContext) {
         self.state.tools.prepare_turn(context);
+    }
+
+    pub(crate) fn background_processes(&self) -> ProcessManager {
+        self.state.tools.processes.clone()
     }
 
     pub(super) async fn execute(

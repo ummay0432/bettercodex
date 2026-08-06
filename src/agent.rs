@@ -18,6 +18,7 @@ use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionTranscriptItem;
 use crate::rollout::TurnOutcome;
+use crate::tools::ProcessManager;
 use crate::tools::ToolResult;
 use crate::tools::ToolRuntime;
 use anyhow::Context;
@@ -193,6 +194,25 @@ impl Agent {
         Self::from_loaded_rollout(loaded)
     }
 
+    pub(crate) fn fork(&self, transcript: Vec<SessionTranscriptItem>) -> Result<Self> {
+        let mut rollout = Rollout::create(&self.cwd)?;
+        let identity = rollout.identity().clone();
+        let compaction_count = self.api.compaction_count();
+        rollout.record_fork(self.session_id(), compaction_count)?;
+        rollout.snapshot_transcript(transcript)?;
+        let conversation = self.conversation.fork(rollout)?;
+        let auth = Auth::load()?;
+        let api = ApiClient::new(auth, &identity, compaction_count)?;
+        let tools = ToolRuntime::new(self.cwd.clone(), api.web_search_client());
+        Ok(Self {
+            cwd: self.cwd.clone(),
+            api,
+            conversation,
+            tools,
+            resumed_transcript: Vec::new(),
+        })
+    }
+
     fn from_loaded_rollout(mut loaded: LoadedRollout) -> Result<Self> {
         let cwd = canonical_directory(&loaded.metadata.cwd)?;
         let identity = loaded.metadata.identity.clone();
@@ -225,6 +245,10 @@ impl Agent {
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
         self.conversation.context_snapshot()
+    }
+
+    pub(crate) fn background_processes(&self) -> ProcessManager {
+        self.tools.background_processes()
     }
 
     pub(crate) fn prompt_history(&self) -> Vec<String> {

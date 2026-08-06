@@ -28,6 +28,7 @@ use crate::rollout::SessionTranscriptItem;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
 use crate::skills::SkillUpdate;
+use crate::tools::BackgroundProcess;
 use codex_ansi_escape::ansi_escape_line;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::parse_command::ParsedCommand;
@@ -84,6 +85,21 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "start a fresh session",
     },
     SlashCommand {
+        name: "copy",
+        aliases: &[],
+        description: "copy latest final response as raw Markdown",
+    },
+    SlashCommand {
+        name: "fork",
+        aliases: &[],
+        description: "branch this conversation into a new saved session",
+    },
+    SlashCommand {
+        name: "diff",
+        aliases: &[],
+        description: "show styled Git diff including untracked files",
+    },
+    SlashCommand {
         name: "context",
         aliases: &[],
         description: "visualize current context usage",
@@ -104,6 +120,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show keyboard shortcuts",
     },
     SlashCommand {
+        name: "ps",
+        aliases: &[],
+        description: "list background terminals",
+    },
+    SlashCommand {
         name: "skills",
         aliases: &[],
         description: "manage installed skills and invocation policy",
@@ -112,6 +133,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "tools",
         aliases: &[],
         description: "inspect the active tool catalogue",
+    },
+    SlashCommand {
+        name: "stop",
+        aliases: &[],
+        description: "stop all background terminals",
     },
     SlashCommand {
         name: "quit",
@@ -127,11 +153,23 @@ pub(super) enum Action {
     Queue(UserPrompt),
     Cancel,
     Compact,
+    Copy(String),
     Clear,
+    Fork,
+    ListBackgroundProcesses,
     OpenResumePicker,
     ResumeSession(Uuid),
+    RunShellCommand {
+        command: String,
+        history_text: String,
+    },
     ShowContext,
-    UpdateSkill { path: PathBuf, update: SkillUpdate },
+    ShowDiff,
+    StopBackgroundProcesses,
+    UpdateSkill {
+        path: PathBuf,
+        update: SkillUpdate,
+    },
     Quit,
 }
 
@@ -149,7 +187,9 @@ pub(super) struct View {
     skill_popup: SkillPopup,
     skills: Vec<Skill>,
     context_tokens: Option<u64>,
+    background_processes: Vec<BackgroundProcess>,
     busy: bool,
+    action_required: bool,
     interrupting: bool,
     working_since: Option<Instant>,
     turn_had_work: bool,
@@ -201,6 +241,8 @@ enum TranscriptEntry {
     },
     Notice(String),
     Error(String),
+    Diff(String),
+    Processes(Vec<BackgroundProcess>),
     FinalMessageSeparator {
         elapsed_seconds: Option<u64>,
     },
@@ -380,7 +422,9 @@ impl View {
             skill_popup: SkillPopup::default(),
             skills,
             context_tokens: None,
+            background_processes: Vec::new(),
             busy: false,
+            action_required: false,
             interrupting: false,
             working_since: None,
             turn_had_work: false,
@@ -447,11 +491,16 @@ impl View {
         self.busy
     }
 
+    pub(super) fn action_required(&self) -> bool {
+        self.action_required
+    }
+
     pub(super) fn start_turn(&mut self, prompt: impl Into<UserPrompt>) {
         let prompt = prompt.into();
         self.seal_exploration();
         self.entries.push(TranscriptEntry::User(prompt));
         self.busy = true;
+        self.action_required = false;
         self.interrupting = false;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
@@ -465,6 +514,7 @@ impl View {
         self.seal_exploration();
         self.context_tokens = None;
         self.busy = true;
+        self.action_required = false;
         self.interrupting = false;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
@@ -538,6 +588,7 @@ impl View {
         self.interrupting = false;
         self.reasoning_status.reset();
         self.status_detail = None;
+        self.action_required = result.is_err();
         match result {
             Ok(SubmitOutcome::Completed(answer)) => {
                 if !self.terminal_assistant_received_this_turn && !answer.trim().is_empty() {
@@ -571,6 +622,7 @@ impl View {
         self.interrupting = false;
         self.reasoning_status.reset();
         self.status_detail = None;
+        self.action_required = result.is_err();
         match result {
             Ok(CompactionOutcome::Completed) => {
                 self.entries
@@ -596,6 +648,70 @@ impl View {
 
     pub(super) fn set_context_tokens(&mut self, tokens: Option<u64>) {
         self.context_tokens = tokens;
+    }
+
+    pub(super) fn set_background_processes(&mut self, processes: Vec<BackgroundProcess>) -> bool {
+        if self.background_processes == processes {
+            return false;
+        }
+        self.background_processes = processes;
+        true
+    }
+
+    pub(super) fn add_background_process_list(&mut self, processes: Vec<BackgroundProcess>) {
+        self.entries.push(TranscriptEntry::Processes(processes));
+    }
+
+    pub(super) fn add_git_diff_result(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(diff) => self.entries.push(TranscriptEntry::Diff(diff)),
+            Err(error) => self
+                .entries
+                .push(TranscriptEntry::Error(markdown::sanitize(&format!(
+                    "Could not compute Git diff: {error}"
+                )))),
+        }
+    }
+
+    pub(super) fn start_operator_command(&mut self, call_id: String, command: &str) {
+        self.seal_exploration();
+        self.entries.push(TranscriptEntry::Tool(ToolEntry::new(
+            call_id,
+            "exec_command".to_string(),
+            Some(serde_json::json!({"cmd": command})),
+            &self.cwd,
+            &self.process_commands,
+        )));
+    }
+
+    pub(super) fn finish_operator_command(&mut self, call_id: &str, output: Result<Value, String>) {
+        if let Some(tool) = self.find_tool_mut(call_id) {
+            tool.outcome = Some(ToolOutcome { output });
+        }
+        self.remember_process_command(call_id);
+        self.repository = Repository::discover(&self.cwd);
+    }
+
+    pub(super) fn session_transcript(&self) -> Vec<SessionTranscriptItem> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::User(prompt) => Some(SessionTranscriptItem::User {
+                    text: prompt.as_str().to_string(),
+                    image_count: 0,
+                }),
+                TranscriptEntry::Assistant {
+                    text,
+                    phase,
+                    streaming: false,
+                    ..
+                } if !text.trim().is_empty() => Some(SessionTranscriptItem::Assistant {
+                    text: text.clone(),
+                    phase: phase.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(super) fn show_context(&mut self, snapshot: ContextSnapshot) {
@@ -714,6 +830,8 @@ impl View {
         self.clear_requested = true;
         self.resize_reflow_requested = false;
         self.context_tokens = None;
+        self.background_processes.clear();
+        self.action_required = false;
         self.reasoning_status.reset();
         self.pending_input.clear();
         self.overlay = None;
@@ -852,6 +970,15 @@ impl View {
     }
 
     pub(super) fn handle_terminal_event(&mut self, event: Event) -> Action {
+        if matches!(event, Event::Key(_) | Event::Paste(_)) {
+            self.action_required = false;
+        }
+        if let Event::Paste(text) = &event
+            && self.editor.history_search_active()
+        {
+            self.editor.history_search_insert(text);
+            return Action::None;
+        }
         let action = match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
@@ -876,7 +1003,7 @@ impl View {
             }
             _ => Action::None,
         };
-        if self.editor.is_browsing_history() {
+        if self.editor.is_browsing_history() || self.editor.history_search_active() {
             self.file_search.hide();
             self.skill_popup.hide();
         } else {
@@ -907,6 +1034,12 @@ impl View {
                 ResumePickerAction::Resume(id) => Action::ResumeSession(id),
             };
         }
+        if control && key.code == KeyCode::Char('o') {
+            return self.copy_latest_final_action();
+        }
+        if self.editor.history_search_active() {
+            return self.handle_history_search_key(key);
+        }
         if control && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
@@ -933,6 +1066,14 @@ impl View {
             if close {
                 self.overlay = None;
             }
+            return Action::None;
+        }
+        if (control && key.code == KeyCode::Char('r'))
+            || (key.modifiers.is_empty() && key.code == KeyCode::Char('\u{12}'))
+        {
+            self.file_search.hide();
+            self.skill_popup.hide();
+            self.editor.begin_history_search();
             return Action::None;
         }
         if key.code == KeyCode::Esc {
@@ -1115,6 +1256,37 @@ impl View {
         Action::None
     }
 
+    fn handle_history_search_key(&mut self, key: KeyEvent) -> Action {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char('o') if control => return self.copy_latest_final_action(),
+            KeyCode::Char('r') if control => self.editor.history_search_older(),
+            KeyCode::Char('\u{12}') if key.modifiers.is_empty() => {
+                self.editor.history_search_older();
+            }
+            KeyCode::Char('s') if control => self.editor.history_search_newer(),
+            KeyCode::Up => self.editor.history_search_older(),
+            KeyCode::Down => self.editor.history_search_newer(),
+            KeyCode::Esc => self.editor.cancel_history_search(),
+            KeyCode::Char('c') if control => self.editor.cancel_history_search(),
+            KeyCode::Char('\u{3}') if key.modifiers.is_empty() => {
+                self.editor.cancel_history_search();
+            }
+            KeyCode::Enter => self.editor.accept_history_search(),
+            KeyCode::Backspace => self.editor.history_search_backspace(),
+            KeyCode::Char('h') if control => self.editor.history_search_backspace(),
+            KeyCode::Char('u') if control => self.editor.history_search_clear(),
+            KeyCode::Char(character) if !control && !alt => {
+                let mut bytes = [0; 4];
+                self.editor
+                    .history_search_insert(character.encode_utf8(&mut bytes));
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     fn complete_slash_command(&mut self, command: &SlashCommand, selection: usize) {
         let query = self.editor.text().strip_prefix('/').unwrap_or_default();
         let name = command.completion_name(query);
@@ -1168,6 +1340,19 @@ impl View {
         let text = prompt.as_str().to_string();
         self.editor.remember(&text);
         let command = text.trim();
+        if let Some(shell_command) = command.strip_prefix('!') {
+            let shell_command = shell_command.trim();
+            if shell_command.is_empty() {
+                self.entries.push(TranscriptEntry::Notice(
+                    "Run an operator shell command with !command".to_string(),
+                ));
+                return Action::None;
+            }
+            return Action::RunShellCommand {
+                command: shell_command.to_string(),
+                history_text: command.to_string(),
+            };
+        }
         if let Some(arguments) = command.strip_prefix("/resume")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
@@ -1200,6 +1385,15 @@ impl View {
                 Action::None
             }
             "/compact" => Action::Compact,
+            "/copy" => self.copy_latest_final_action(),
+            "/diff" => Action::ShowDiff,
+            "/fork" if self.busy => {
+                self.entries.push(TranscriptEntry::Notice(
+                    "Interrupt the active turn before forking this session".to_string(),
+                ));
+                Action::None
+            }
+            "/fork" => Action::Fork,
             "/clear" if self.busy => {
                 self.entries.push(TranscriptEntry::Notice(
                     "Interrupt the active turn before starting a fresh session".to_string(),
@@ -1210,11 +1404,12 @@ impl View {
             "/context" => Action::ShowContext,
             "/help" => {
                 self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · Tab queue follow-up · Alt+Up edit queue · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · $ skills · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
+                    "Enter submit/steer · !command run shell · Ctrl+R search history · Ctrl+O copy latest answer · Tab queue follow-up · Alt+Up edit queue · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · $ skills · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
                         .to_string(),
                 ));
                 Action::None
             }
+            "/ps" => Action::ListBackgroundProcesses,
             "/skills" if self.busy => {
                 self.entries.push(TranscriptEntry::Error(
                     "'/skills' is disabled while a task is in progress.".to_string(),
@@ -1229,6 +1424,7 @@ impl View {
                 self.overlay = Some(Overlay::Tools(ToolCatalogueView::new()));
                 Action::None
             }
+            "/stop" => Action::StopBackgroundProcesses,
             _ => Action::Submit(prompt),
         }
     }
@@ -1248,6 +1444,30 @@ impl View {
         let text = prompt.as_str().to_string();
         self.editor.remember(&text);
         Action::Queue(prompt)
+    }
+
+    fn copy_latest_final_action(&mut self) -> Action {
+        let markdown = self.entries.iter().rev().find_map(|entry| match entry {
+            TranscriptEntry::Assistant {
+                phase: Some(MessagePhase::Commentary),
+                ..
+            } => None,
+            TranscriptEntry::Assistant {
+                text,
+                streaming: false,
+                ..
+            } if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        });
+        match markdown {
+            Some(markdown) => Action::Copy(markdown),
+            None => {
+                self.entries.push(TranscriptEntry::Notice(
+                    "No completed final response is available to copy".to_string(),
+                ));
+                Action::None
+            }
+        }
     }
 
     fn complete_assistant_message(&mut self, message: AssistantMessage) {
@@ -1291,6 +1511,8 @@ impl View {
                 | TranscriptEntry::Exploration { .. }
                 | TranscriptEntry::Notice(_)
                 | TranscriptEntry::Error(_)
+                | TranscriptEntry::Diff(_)
+                | TranscriptEntry::Processes(_)
                 | TranscriptEntry::FinalMessageSeparator { .. } => {}
             }
         }
@@ -1766,6 +1988,7 @@ impl View {
             lines,
             paste_ranges,
             skill_ranges,
+            history_search_ranges,
             cursor_row,
             cursor_column,
             ..
@@ -1794,6 +2017,10 @@ impl View {
                         .get(usize::from(index))
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
+                    history_search_ranges
+                        .get(usize::from(index))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
                 )),
                 Rect::new(text_x, y, text_width, 1),
             );
@@ -1815,7 +2042,19 @@ impl View {
             );
         }
 
-        if self.overlay.is_none() {
+        if self.overlay.is_none() && self.editor.history_search_active() && !footer_area.is_empty()
+        {
+            let prefix_width = UnicodeWidthStr::width("reverse-i-search: ");
+            let query_width = self
+                .editor
+                .history_search_query()
+                .map_or(0, UnicodeWidthStr::width);
+            let cursor_x = footer_area
+                .x
+                .saturating_add(u16::try_from(prefix_width + query_width).unwrap_or(u16::MAX))
+                .min(footer_area.right().saturating_sub(1));
+            frame.set_cursor_position(Position::new(cursor_x, footer_area.y));
+        } else if self.overlay.is_none() {
             let cursor_x = text_x
                 .saturating_add(cursor_column)
                 .min(area.right().saturating_sub(1));
@@ -1846,6 +2085,11 @@ impl View {
             shortcut_line("$", "mention an installed skill"),
             shortcut_line("Esc", "interrupt active turn"),
             shortcut_line("Up / Down", "restore prompt history"),
+            shortcut_line(
+                "Ctrl+R / Ctrl+S",
+                "search prompt history backward / forward",
+            ),
+            shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
             shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
             shortcut_line("Ctrl+C", "exit"),
             Line::from(""),
@@ -1956,7 +2200,7 @@ impl View {
     }
 
     fn slash_matches(&self) -> Vec<&'static SlashCommand> {
-        if self.editor.is_browsing_history() {
+        if self.editor.is_browsing_history() || self.editor.history_search_active() {
             return Vec::new();
         }
         let text = self.editor.text();
@@ -2018,6 +2262,24 @@ impl View {
     }
 
     fn status_line(&self, width: u16) -> Line<'static> {
+        if let (Some(query), Some(status)) = (
+            self.editor.history_search_query(),
+            self.editor.history_search_status(),
+        ) {
+            let mut spans = vec!["reverse-i-search: ".dim(), query.to_string().cyan()];
+            match status {
+                editor::HistorySearchStatus::Idle => {}
+                editor::HistorySearchStatus::Match => spans.extend([
+                    "  ".into(),
+                    "Enter".cyan().bold(),
+                    " accept · ".dim(),
+                    "Esc".cyan().bold(),
+                    " cancel".dim(),
+                ]),
+                editor::HistorySearchStatus::NoMatch => spans.push("  no match".red()),
+            }
+            return truncate_line(Line::from(spans), usize::from(width));
+        }
         let mut spans = vec![
             Span::from(MODEL),
             Span::styled(" max", Style::default().fg(MUTED)),
@@ -2038,6 +2300,15 @@ impl View {
             format_context_usage(self.context_tokens),
             Style::default().fg(MUTED),
         ));
+        if !self.background_processes.is_empty() {
+            let count = self.background_processes.len();
+            let plural = if count == 1 { "" } else { "s" };
+            spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
+            spans.push(Span::styled(
+                format!("{count} background terminal{plural} · /ps · /stop"),
+                Style::default().fg(MUTED),
+            ));
+        }
         truncate_line(Line::from(spans), usize::from(width))
     }
 
@@ -2058,6 +2329,9 @@ impl View {
 }
 
 fn is_local_command(command: &str) -> bool {
+    if command.starts_with('!') {
+        return true;
+    }
     if let Some(arguments) = command.strip_prefix("/resume")
         && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
     {
@@ -2068,11 +2342,16 @@ fn is_local_command(command: &str) -> bool {
         "/q" | "/quit"
             | "/exit"
             | "/compact"
+            | "/copy"
+            | "/diff"
             | "/clear"
+            | "/fork"
             | "/context"
             | "/help"
+            | "/ps"
             | "/skills"
             | "/tools"
+            | "/stop"
     )
 }
 
@@ -2082,6 +2361,8 @@ impl TranscriptEntry {
             Self::User(_)
             | Self::Notice(_)
             | Self::Error(_)
+            | Self::Diff(_)
+            | Self::Processes(_)
             | Self::FinalMessageSeparator { .. } => true,
             Self::Assistant { streaming, .. } => !streaming,
             Self::Tool(tool) => tool.outcome.is_some(),
@@ -2181,6 +2462,8 @@ impl TranscriptEntry {
                 Span::styled("■ ", Style::default().fg(Color::Red)),
                 Span::styled(message.clone(), Style::default().fg(Color::Red)),
             ])],
+            Self::Diff(diff) => git_diff_lines(diff, width),
+            Self::Processes(processes) => background_process_lines(processes, width),
             Self::FinalMessageSeparator { elapsed_seconds } => {
                 final_message_separator_lines(*elapsed_seconds, width)
             }
@@ -3130,10 +3413,11 @@ fn styled_skill_mentions(
 }
 
 fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
-    let rendered = markdown::render(message);
+    let content_width = width.saturating_sub(2).max(1);
+    let rendered = markdown::render(message, content_width);
     let mut wrapped = Vec::new();
     for line in rendered {
-        wrapped.extend(wrap_styled_line(&line, width.saturating_sub(2).max(1)));
+        wrapped.extend(wrap_styled_line(&line, content_width));
     }
     prefix_styled_lines(wrapped, "• ", "  ")
 }
@@ -3153,6 +3437,61 @@ fn cached_assistant_lines<'a>(
         .as_ref()
         .expect("assistant rendering was cached")
         .lines
+}
+
+fn background_process_lines(processes: &[BackgroundProcess], width: u16) -> Vec<Line<'static>> {
+    if processes.is_empty() {
+        return vec![Line::from(vec![
+            "• ".dim(),
+            "No background terminals running".bold(),
+        ])];
+    }
+    let count = processes.len();
+    let plural = if count == 1 { "" } else { "s" };
+    let mut lines = vec![Line::from(vec![
+        "• ".dim(),
+        format!("{count} background terminal{plural} running").bold(),
+    ])];
+    for process in processes {
+        let prefix = format!(
+            "  {} · {} · ",
+            process.session_id,
+            format_elapsed(process.running_for.as_secs())
+        );
+        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+        let command_width = width
+            .saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
+            .max(1);
+        let command = markdown::sanitize(&process.command);
+        let mut command_lines = editor::wrap_text(&command, command_width);
+        if command_lines.is_empty() {
+            command_lines.push(String::new());
+        }
+        for (index, command) in command_lines.into_iter().enumerate() {
+            lines.push(if index == 0 {
+                Line::from(vec![prefix.clone().dim(), command.into()])
+            } else {
+                Line::from(vec![" ".repeat(prefix_width).into(), command.into()])
+            });
+        }
+    }
+    lines
+}
+
+fn git_diff_lines(diff: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec!["• ".dim(), "Git diff".bold()])];
+    for source in diff.lines() {
+        let line = ansi_escape_line(source);
+        for mut wrapped in wrap_styled_line(&line, width.saturating_sub(2).max(1)) {
+            let mut spans = vec!["  ".into()];
+            spans.append(&mut wrapped.spans);
+            lines.push(Line::from(spans));
+        }
+    }
+    if lines.len() == 1 {
+        lines.push(Line::from("  (no changes)").dim());
+    }
+    lines
 }
 
 fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Vec<Line<'static>> {
@@ -3811,10 +4150,12 @@ fn editor_line(
     text: &str,
     paste_ranges: &[std::ops::Range<usize>],
     skill_ranges: &[std::ops::Range<usize>],
+    history_search_ranges: &[std::ops::Range<usize>],
 ) -> Line<'static> {
     let mut highlights = paste_ranges
         .iter()
         .chain(skill_ranges)
+        .chain(history_search_ranges)
         .cloned()
         .collect::<Vec<_>>();
     highlights.sort_by_key(|range| range.start);
@@ -4216,6 +4557,35 @@ mod tests {
             )
         );
         assert!((0..WIDTH).all(|x| buffer[(x, separator_y)].modifier.contains(Modifier::DIM)));
+    }
+
+    #[test]
+    fn completed_assistant_table_renders_as_a_width_aware_grid() {
+        const WIDTH: u16 = 80;
+        let answer = "| Time | Component | Value observed | Result |\n\
+                      | ---: | --- | --- | --- |\n\
+                      | -10 ms | API handling R1 | Reads `legacy` once | R1 stays in `legacy` mode |\n\
+                      | +20 ms | Producer creating J1 | Cache is still `legacy` | J1 receives `mode=legacy` |";
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("render a table");
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(answer.to_string()));
+        view.handle_agent_event(completed_message(answer));
+        view.finish_turn(Ok(SubmitOutcome::Completed(answer.to_string())));
+
+        let height = view.desired_height(WIDTH, 30);
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+
+        assert!(
+            rendered.contains("Time") && rendered.contains("Result"),
+            "{rendered}"
+        );
+        assert!(rendered.contains('━'), "{rendered}");
+        assert!(rendered.contains('─'), "{rendered}");
+        assert!(!rendered.contains("Time │ Component"), "{rendered}");
     }
 
     #[test]

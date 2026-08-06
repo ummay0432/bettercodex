@@ -436,6 +436,10 @@ impl ApiClient {
         &self.turn_id
     }
 
+    pub(crate) fn compaction_count(&self) -> u64 {
+        self.window
+    }
+
     pub(crate) fn web_search_client(&self) -> WebSearchClient {
         WebSearchClient::new(
             self.client.clone(),

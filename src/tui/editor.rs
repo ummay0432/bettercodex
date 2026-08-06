@@ -1,6 +1,7 @@
 use crate::input::UserPrompt;
 use crate::skills::SkillMention;
 use crate::skills::SkillSelection;
+use std::collections::HashSet;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -19,13 +20,41 @@ pub(super) struct Editor {
     saved_draft: String,
     pending_pastes: Vec<PendingPaste>,
     skill_mentions: Vec<SkillMention>,
+    history_search: Option<HistorySearchSession>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PendingPaste {
     placeholder: String,
     content: String,
     range: Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HistorySearchStatus {
+    Idle,
+    Match,
+    NoMatch,
+}
+
+#[derive(Debug)]
+struct HistorySearchSession {
+    original: EditorSnapshot,
+    query: String,
+    matches: Vec<usize>,
+    selected: Option<usize>,
+    status: HistorySearchStatus,
+}
+
+#[derive(Clone, Debug)]
+struct EditorSnapshot {
+    text: String,
+    cursor: usize,
+    preferred_column: Option<usize>,
+    history_index: Option<usize>,
+    saved_draft: String,
+    pending_pastes: Vec<PendingPaste>,
+    skill_mentions: Vec<SkillMention>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,6 +64,8 @@ pub(super) struct EditorLayout {
     pub(super) paste_ranges: Vec<Vec<Range<usize>>>,
     /// Byte ranges within each visible line that represent selected skill mentions.
     pub(super) skill_ranges: Vec<Vec<Range<usize>>>,
+    /// Byte ranges within each visible line matching the active Ctrl+R query.
+    pub(super) history_search_ranges: Vec<Vec<Range<usize>>>,
     pub(super) cursor_row: u16,
     pub(super) cursor_column: u16,
     pub(super) total_lines: u16,
@@ -53,7 +84,113 @@ impl Editor {
         self.text.is_empty()
     }
 
+    pub(super) fn history_search_active(&self) -> bool {
+        self.history_search.is_some()
+    }
+
+    pub(super) fn history_search_query(&self) -> Option<&str> {
+        self.history_search
+            .as_ref()
+            .map(|search| search.query.as_str())
+    }
+
+    pub(super) fn history_search_status(&self) -> Option<HistorySearchStatus> {
+        self.history_search.as_ref().map(|search| search.status)
+    }
+
+    pub(super) fn begin_history_search(&mut self) {
+        if self.history_search.is_some() {
+            self.history_search_older();
+            return;
+        }
+        self.history_search = Some(HistorySearchSession {
+            original: self.snapshot(),
+            query: String::new(),
+            matches: Vec::new(),
+            selected: None,
+            status: HistorySearchStatus::Idle,
+        });
+        self.history_index = None;
+        self.saved_draft.clear();
+    }
+
+    pub(super) fn history_search_insert(&mut self, value: &str) {
+        let Some(search) = self.history_search.as_mut() else {
+            return;
+        };
+        for character in value.chars() {
+            if character.is_control() {
+                continue;
+            }
+            search.query.push(character);
+        }
+        self.restart_history_search();
+    }
+
+    pub(super) fn history_search_backspace(&mut self) {
+        if let Some(search) = self.history_search.as_mut() {
+            search.query.pop();
+        }
+        self.restart_history_search();
+    }
+
+    pub(super) fn history_search_clear(&mut self) {
+        if let Some(search) = self.history_search.as_mut() {
+            search.query.clear();
+        }
+        self.restart_history_search();
+    }
+
+    pub(super) fn history_search_older(&mut self) {
+        let Some(search) = self.history_search.as_mut() else {
+            return;
+        };
+        if search.query.is_empty() || search.matches.is_empty() {
+            return;
+        }
+        let selected = search
+            .selected
+            .map_or(0, |selected| (selected + 1).min(search.matches.len() - 1));
+        search.selected = Some(selected);
+        search.status = HistorySearchStatus::Match;
+        self.preview_history_search_match();
+    }
+
+    pub(super) fn history_search_newer(&mut self) {
+        let Some(search) = self.history_search.as_mut() else {
+            return;
+        };
+        if search.query.is_empty() || search.matches.is_empty() {
+            return;
+        }
+        let selected = search.selected.unwrap_or_default().saturating_sub(1);
+        search.selected = Some(selected);
+        search.status = HistorySearchStatus::Match;
+        self.preview_history_search_match();
+    }
+
+    pub(super) fn accept_history_search(&mut self) {
+        if self
+            .history_search
+            .as_ref()
+            .is_some_and(|search| search.status == HistorySearchStatus::Match)
+        {
+            self.history_search = None;
+            self.history_index = None;
+            self.saved_draft.clear();
+            self.cursor = self.text.len();
+            self.preferred_column = None;
+        }
+    }
+
+    pub(super) fn cancel_history_search(&mut self) {
+        if let Some(search) = self.history_search.take() {
+            self.restore_snapshot(search.original);
+        }
+    }
+
     pub(super) fn set_text(&mut self, text: impl Into<String>) {
+        self.history_search = None;
         self.text = text.into();
         self.cursor = self.text.len();
         self.preferred_column = None;
@@ -353,10 +490,25 @@ impl Editor {
                 highlights
             })
             .collect();
+        let search_ranges = self.history_search_match_ranges();
+        let history_search_ranges = visible_ranges
+            .iter()
+            .map(|line| {
+                search_ranges
+                    .iter()
+                    .filter_map(|range| {
+                        let start = range.start.max(line.start);
+                        let end = range.end.min(line.end);
+                        (start < end).then_some(start - line.start..end - line.start)
+                    })
+                    .collect()
+            })
+            .collect();
         EditorLayout {
             lines,
             paste_ranges,
             skill_ranges,
+            history_search_ranges,
             cursor_row: (cursor_line - first) as u16,
             cursor_column: display_width(&self.text[ranges[cursor_line].start..self.cursor]) as u16,
             total_lines: ranges.len().try_into().unwrap_or(u16::MAX),
@@ -490,8 +642,99 @@ impl Editor {
     }
 
     fn leave_history(&mut self) {
+        self.history_search = None;
         self.history_index = None;
         self.saved_draft.clear();
+    }
+
+    fn restart_history_search(&mut self) {
+        let Some((query, original)) = self
+            .history_search
+            .as_ref()
+            .map(|search| (search.query.clone(), search.original.clone()))
+        else {
+            return;
+        };
+        self.restore_snapshot(original);
+        if query.is_empty() {
+            if let Some(search) = self.history_search.as_mut() {
+                search.matches.clear();
+                search.selected = None;
+                search.status = HistorySearchStatus::Idle;
+            }
+            return;
+        }
+
+        let folded_query = query.to_lowercase();
+        let mut unique = HashSet::new();
+        let matches = self
+            .history
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, entry)| entry.to_lowercase().contains(&folded_query))
+            .filter(|(_, entry)| unique.insert(entry.as_str()))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let Some(search) = self.history_search.as_mut() {
+            search.matches = matches;
+            search.selected = (!search.matches.is_empty()).then_some(0);
+            search.status = if search.matches.is_empty() {
+                HistorySearchStatus::NoMatch
+            } else {
+                HistorySearchStatus::Match
+            };
+        }
+        self.preview_history_search_match();
+    }
+
+    fn preview_history_search_match(&mut self) {
+        let Some(history_index) = self.history_search.as_ref().and_then(|search| {
+            search
+                .selected
+                .and_then(|selected| search.matches.get(selected))
+                .copied()
+        }) else {
+            return;
+        };
+        self.text = self.history[history_index].clone();
+        self.cursor = self.text.len();
+        self.preferred_column = None;
+        self.pending_pastes.clear();
+        self.skill_mentions.clear();
+    }
+
+    fn snapshot(&self) -> EditorSnapshot {
+        EditorSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            preferred_column: self.preferred_column,
+            history_index: self.history_index,
+            saved_draft: self.saved_draft.clone(),
+            pending_pastes: self.pending_pastes.clone(),
+            skill_mentions: self.skill_mentions.clone(),
+        }
+    }
+
+    fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
+        self.text = snapshot.text;
+        self.cursor = snapshot.cursor;
+        self.preferred_column = snapshot.preferred_column;
+        self.history_index = snapshot.history_index;
+        self.saved_draft = snapshot.saved_draft;
+        self.pending_pastes = snapshot.pending_pastes;
+        self.skill_mentions = snapshot.skill_mentions;
+    }
+
+    fn history_search_match_ranges(&self) -> Vec<Range<usize>> {
+        let Some(search) = self
+            .history_search
+            .as_ref()
+            .filter(|search| search.status == HistorySearchStatus::Match)
+        else {
+            return Vec::new();
+        };
+        case_insensitive_match_ranges(&self.text, &search.query)
     }
 
     fn atomic_ranges(&self) -> impl Iterator<Item = &Range<usize>> {
@@ -539,6 +782,48 @@ impl Editor {
         self.saved_draft.clear();
         (text, mentions)
     }
+}
+
+fn case_insensitive_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+    let folded_query = query.to_lowercase();
+    if folded_query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut folded = String::new();
+    let mut folded_spans = Vec::new();
+    for (original_start, character) in text.char_indices() {
+        let original_range = original_start..original_start + character.len_utf8();
+        for lowercase in character.to_lowercase() {
+            let folded_start = folded.len();
+            folded.push(lowercase);
+            folded_spans.push((folded_start..folded.len(), original_range.clone()));
+        }
+    }
+
+    let mut ranges = Vec::new();
+    let mut search_from = 0;
+    while search_from <= folded.len()
+        && let Some(relative_start) = folded[search_from..].find(&folded_query)
+    {
+        let folded_start = search_from + relative_start;
+        let folded_end = folded_start + folded_query.len();
+        if let Some((_, first_original)) = folded_spans.iter().find(|(folded_range, _)| {
+            folded_range.end > folded_start && folded_range.start < folded_end
+        }) {
+            let original_end = folded_spans
+                .iter()
+                .rev()
+                .find(|(folded_range, _)| {
+                    folded_range.end > folded_start && folded_range.start < folded_end
+                })
+                .map(|(_, original_range)| original_range.end)
+                .unwrap_or(first_original.end);
+            ranges.push(first_original.start..original_end);
+        }
+        search_from = folded_end;
+    }
+    ranges
 }
 
 fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
@@ -949,5 +1234,83 @@ mod tests {
 
         editor.insert_paste(paste);
         assert_eq!(editor.text(), format!("{base}{second}"));
+    }
+
+    #[test]
+    fn incremental_history_search_navigates_unique_matches_and_restores_the_exact_draft() {
+        let mut editor = Editor::default();
+        editor.seed_history([
+            "git status".to_string(),
+            "cargo test".to_string(),
+            "git log".to_string(),
+            "git log".to_string(),
+        ]);
+        let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        editor.insert_paste(paste);
+        editor.insert(" $demo");
+        let mention_start = editor.text().len() - "$demo".len();
+        editor.bind_skill(
+            mention_start..editor.text().len(),
+            SkillSelection::new("demo", "/tmp/demo/SKILL.md"),
+        );
+        editor.move_left();
+        let draft_text = editor.text().to_string();
+        let draft_cursor = editor.cursor();
+
+        editor.begin_history_search();
+        assert_eq!(editor.text(), draft_text);
+        editor.history_search_insert("GIT");
+        assert_eq!(editor.text(), "git log");
+        editor.history_search_older();
+        assert_eq!(editor.text(), "git status");
+        editor.history_search_newer();
+        assert_eq!(editor.text(), "git log");
+        assert_eq!(
+            editor.history_search_status(),
+            Some(HistorySearchStatus::Match)
+        );
+
+        editor.cancel_history_search();
+        assert_eq!(editor.text(), draft_text);
+        assert_eq!(editor.cursor(), draft_cursor);
+        assert_eq!(editor.pending_pastes.len(), 1);
+        assert_eq!(
+            editor.skill_ranges(),
+            [Range {
+                start: mention_start,
+                end: mention_start + 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn history_search_accepts_a_match_but_keeps_a_miss_open() {
+        let mut editor = Editor::default();
+        editor.seed_history(["cargo test".to_string(), "git status".to_string()]);
+        editor.set_text("draft");
+        editor.begin_history_search();
+        editor.history_search_insert("cargo");
+        editor.accept_history_search();
+        assert!(!editor.history_search_active());
+        assert_eq!(editor.text(), "cargo test");
+        assert_eq!(editor.cursor(), editor.text().len());
+
+        editor.set_text("another draft");
+        editor.begin_history_search();
+        editor.history_search_insert("missing");
+        assert_eq!(editor.text(), "another draft");
+        assert_eq!(
+            editor.history_search_status(),
+            Some(HistorySearchStatus::NoMatch)
+        );
+        editor.accept_history_search();
+        assert!(editor.history_search_active());
+        editor.cancel_history_search();
+        assert_eq!(editor.text(), "another draft");
+    }
+
+    #[test]
+    fn history_search_highlights_unicode_case_insensitively() {
+        assert_eq!(case_insensitive_match_ranges("aİ i", "i"), [1..3, 4..5]);
     }
 }

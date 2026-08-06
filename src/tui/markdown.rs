@@ -1,3 +1,6 @@
+mod table;
+
+use self::table::Table;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::Event;
 use pulldown_cmark::HeadingLevel;
@@ -12,7 +15,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
-pub(super) fn render(source: &str) -> Vec<Line<'static>> {
+pub(super) fn render(source: &str, width: u16) -> Vec<Line<'static>> {
     let source = sanitize(source);
     let parser = Parser::new_ext(
         &source,
@@ -21,7 +24,7 @@ pub(super) fn render(source: &str) -> Vec<Line<'static>> {
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_FOOTNOTES,
     );
-    let mut writer = MarkdownWriter::default();
+    let mut writer = MarkdownWriter::new(usize::from(width.max(1)));
     for event in parser {
         writer.event(event);
     }
@@ -53,7 +56,6 @@ pub(super) fn sanitize(text: &str) -> String {
     sanitized
 }
 
-#[derive(Default)]
 struct MarkdownWriter {
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
@@ -61,8 +63,8 @@ struct MarkdownWriter {
     lists: Vec<ListState>,
     quote_depth: usize,
     code_block: bool,
-    in_table: bool,
-    table_cell: usize,
+    table: Option<Table>,
+    width: usize,
 }
 
 struct ListState {
@@ -70,19 +72,32 @@ struct ListState {
 }
 
 impl MarkdownWriter {
+    fn new(width: usize) -> Self {
+        Self {
+            lines: Vec::new(),
+            current: Vec::new(),
+            styles: Vec::new(),
+            lists: Vec::new(),
+            quote_depth: 0,
+            code_block: false,
+            table: None,
+            width,
+        }
+    }
+
     fn event(&mut self, event: Event<'_>) {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.push_text(&text),
             Event::Code(text) => {
-                self.push_span(text.into_string(), Style::default().fg(Color::Cyan))
+                self.push_span(text.into_string(), Style::default().fg(Color::Cyan));
             }
             Event::Html(text) | Event::InlineHtml(text) => {
-                self.push_span(text.into_string(), Style::default().dim())
+                self.push_span(text.into_string(), Style::default().dim());
             }
             Event::SoftBreak => self.push_text(" "),
-            Event::HardBreak => self.flush_line(),
+            Event::HardBreak => self.hard_break(),
             Event::Rule => {
                 self.flush_nonempty();
                 self.lines.push(Line::from(Span::from("────────").dim()));
@@ -144,16 +159,24 @@ impl MarkdownWriter {
                 self.flush_nonempty();
                 self.push_span(format!("[{name}] "), Style::default().fg(Color::Cyan));
             }
-            Tag::Table(_) => {
+            Tag::Table(alignments) => {
                 self.flush_nonempty();
-                self.in_table = true;
+                self.table = Some(Table::new(alignments));
             }
-            Tag::TableHead | Tag::TableRow => self.table_cell = 0,
-            Tag::TableCell => {
-                if self.table_cell > 0 {
-                    self.push_span(" │ ", Style::default().dim());
+            Tag::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.start_header();
                 }
-                self.table_cell += 1;
+            }
+            Tag::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.start_row();
+                }
+            }
+            Tag::TableCell => {
+                if let Some(table) = self.table.as_mut() {
+                    table.start_cell();
+                }
             }
             _ => {}
         }
@@ -161,12 +184,13 @@ impl MarkdownWriter {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph => {
+            TagEnd::Paragraph if self.table.is_none() => {
                 self.flush_line();
-                if self.lists.is_empty() && !self.in_table {
+                if self.lists.is_empty() {
                     self.blank_line();
                 }
             }
+            TagEnd::Paragraph => {}
             TagEnd::Heading(_) => {
                 self.styles.pop();
                 self.flush_line();
@@ -196,13 +220,23 @@ impl MarkdownWriter {
                 self.flush_nonempty();
                 self.blank_line();
             }
-            TagEnd::TableHead | TagEnd::TableRow => self.flush_nonempty(),
-            TagEnd::Table => {
-                self.flush_nonempty();
-                self.in_table = false;
-                self.blank_line();
+            TagEnd::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_header();
+                }
             }
-            TagEnd::TableCell | TagEnd::Image => {}
+            TagEnd::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_row();
+                }
+            }
+            TagEnd::TableCell => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_cell();
+                }
+            }
+            TagEnd::Table => self.finish_table(),
+            TagEnd::Image => {}
             _ => {}
         }
     }
@@ -224,19 +258,56 @@ impl MarkdownWriter {
                 self.push_span(content.to_string(), style);
             }
             if newline {
-                self.flush_line();
+                self.hard_break();
             }
         }
     }
 
     fn push_span(&mut self, content: impl Into<String>, style: Style) {
+        let span = Span::styled(content.into(), style);
+        if let Some(table) = self.table.as_mut()
+            && table.is_in_cell()
+        {
+            table.push_span(span);
+            return;
+        }
         if self.current.is_empty() && self.quote_depth > 0 {
             self.current.push(Span::styled(
                 "│ ".repeat(self.quote_depth),
                 Style::default().fg(Color::Green),
             ));
         }
-        self.current.push(Span::styled(content.into(), style));
+        self.current.push(span);
+    }
+
+    fn hard_break(&mut self) {
+        if let Some(table) = self.table.as_mut()
+            && table.is_in_cell()
+        {
+            table.hard_break();
+        } else {
+            self.flush_line();
+        }
+    }
+
+    fn finish_table(&mut self) {
+        let Some(table) = self.table.take() else {
+            return;
+        };
+        let quote_width = self.quote_depth.saturating_mul(2);
+        let table_width = self.width.saturating_sub(quote_width).max(1);
+        let mut rendered = table.render(table_width);
+        if self.quote_depth > 0 {
+            let prefix = "│ ".repeat(self.quote_depth);
+            for line in &mut rendered {
+                line.spans.insert(
+                    0,
+                    Span::styled(prefix.clone(), Style::default().fg(Color::Green)),
+                );
+            }
+        }
+        self.lines.append(&mut rendered);
+        self.blank_line();
     }
 
     fn flush_nonempty(&mut self) {
@@ -257,6 +328,9 @@ impl MarkdownWriter {
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
+        if self.table.is_some() {
+            self.finish_table();
+        }
         self.flush_nonempty();
         while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
             self.lines.pop();
@@ -277,19 +351,31 @@ fn heading_style(level: HeadingLevel) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
-    #[test]
-    fn markdown_keeps_lists_and_code_as_separate_lines() {
-        let lines = render("**Done**\n\n- one\n- two\n\n```rs\nlet x = 1;\n```");
-        let plain = lines
+    fn plain(lines: &[Line<'static>]) -> Vec<String> {
+        lines
             .iter()
             .map(|line| {
                 line.spans
                     .iter()
                     .map(|span| span.content.as_ref())
-                    .collect::<String>()
+                    .collect()
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn display_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
+
+    #[test]
+    fn markdown_keeps_lists_and_code_as_separate_lines() {
+        let lines = render("**Done**\n\n- one\n- two\n\n```rs\nlet x = 1;\n```", 80);
+        let plain = plain(&lines);
         assert!(plain.iter().any(|line| line == "- one"));
         assert!(plain.iter().any(|line| line == "let x = 1;"));
     }
@@ -303,18 +389,61 @@ mod tests {
     }
 
     #[test]
-    fn table_cells_have_visible_separators() {
-        let lines = render("| name | state |\n| --- | --- |\n| tui | ready |");
-        let plain = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert!(plain.iter().any(|line| line == "name │ state"));
-        assert!(plain.iter().any(|line| line == "tui │ ready"));
+    fn tables_render_as_aligned_row_separated_grids() {
+        let lines = render(
+            "| Left | Center | Right |\n| :--- | :---: | ---: |\n| **bold** | [docs](https://example.com) | `42` |",
+            60,
+        );
+        let text = plain(&lines);
+        assert!(text[0].starts_with(" Left"), "{text:?}");
+        assert!(text[0].contains("Center"), "{text:?}");
+        assert!(text[0].contains("Right "), "{text:?}");
+        assert!(text[1].contains('━'), "{text:?}");
+        assert!(text[2].contains("bold"), "{text:?}");
+        assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(lines[2].spans.iter().any(|span| {
+            span.content.contains("bold") && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn timeline_table_stays_structured_and_within_the_terminal_width() {
+        let source = "| Time | Component | Value observed | Result |\n\
+                      | ---: | --- | --- | --- |\n\
+                      | -10 ms | API handling R1 | Reads `legacy` once | R1 retains and uses `legacy` throughout its lifetime |\n\
+                      | +20 ms | Producer creating J1 | Cached value is still `legacy` | J1 envelope receives `mode=legacy` |\n\
+                      | +120 ms | Audit consuming J1 event | Envelope: `legacy`; live configuration: `strict` | Records `(legacy, strict)` |";
+        let lines = render(source, 100);
+        let text = plain(&lines);
+        assert!(text[0].contains("Time") && text[0].contains("Result"));
+        assert!(text.iter().any(|line| line.contains('━')));
+        assert!(text.iter().any(|line| line.contains('─')));
+        assert!(!text.iter().any(|line| line.contains(" │ ")));
+        assert!(lines.iter().all(|line| display_width(line) <= 100));
+    }
+
+    #[test]
+    fn table_widths_follow_terminal_cell_geometry() {
+        let lines = render(
+            "| Key | Notes |\n| --- | --- |\n| ｶﾞﾊﾟtail | First 漢字 row with an escaped \\| pipe. |\n| short | Final 😀 row. |",
+            23,
+        );
+        let text = plain(&lines).join("\n");
+        assert!(text.contains("ｶﾞﾊﾟ") && text.contains("漢字"), "{text}");
+        assert!(lines.iter().all(|line| display_width(line) <= 23));
+    }
+
+    #[test]
+    fn narrow_tables_fall_back_to_key_value_records() {
+        let lines = render(
+            "| Key | Content | Extra | More |\n| --- | --- | --- | --- |\n| item | linked value | bold | code |",
+            16,
+        );
+        let text = plain(&lines);
+        assert!(text.iter().any(|line| line.trim() == "Key"));
+        assert!(text.iter().any(|line| line.trim() == "item"));
+        assert!(text.iter().any(|line| line.trim() == "Content"));
+        assert!(!text.iter().any(|line| line.contains('━')));
+        assert!(lines.iter().all(|line| display_width(line) <= 16));
     }
 }

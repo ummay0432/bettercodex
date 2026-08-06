@@ -13,6 +13,8 @@ pub(crate) use catalogue::CatalogueMetrics;
 pub(crate) use catalogue::CatalogueRoute;
 pub(crate) use catalogue::CatalogueTool;
 pub(crate) use exec_runtime::ToolRuntime;
+pub(crate) use executor::BackgroundProcess;
+pub(crate) use executor::ProcessManager;
 pub(crate) use executor::command_argv_for_display;
 
 use self::code_runtime::CodeModeNestedToolCall as NestedToolCall;
@@ -146,7 +148,7 @@ impl ToolResult {
 
 struct NestedTools {
     cwd: PathBuf,
-    processes: executor::ProcessManager,
+    processes: ProcessManager,
     web_search: WebSearchClient,
     turn: Mutex<ToolTurnContext>,
 }
@@ -154,7 +156,7 @@ struct NestedTools {
 impl NestedTools {
     fn with_web_search(cwd: PathBuf, web_search: WebSearchClient) -> Self {
         Self {
-            processes: executor::ProcessManager::new(cwd.clone()),
+            processes: ProcessManager::new(cwd.clone()),
             cwd,
             web_search,
             turn: Mutex::new(ToolTurnContext::default()),

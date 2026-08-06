@@ -16,6 +16,38 @@ fn temporary_repository(name: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
+fn fork_copies_history_usage_and_world_state_into_an_independent_rollout() {
+    let (root, cwd) = temporary_repository("fork");
+    let source_rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let mut source = Conversation::new(&cwd, source_rollout).unwrap();
+    source
+        .extend([json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "inspect"}],
+        })])
+        .unwrap();
+    let usage = TokenUsage {
+        input_tokens: 40,
+        output_tokens: 5,
+        total_tokens: 45,
+        ..TokenUsage::default()
+    };
+    source.record_usage(Some(usage), true).unwrap();
+    let source_id = source.session_id().to_string();
+
+    let fork_rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let fork = source.fork(fork_rollout).unwrap();
+    assert_ne!(fork.session_id(), source_id);
+    assert_eq!(fork.items(), source.items());
+    assert_eq!(fork.context_snapshot(), source.context_snapshot());
+
+    drop(fork);
+    drop(source);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn normalization_inserts_stable_outputs_and_removes_orphans() {
     let mut history = vec![
         json!({

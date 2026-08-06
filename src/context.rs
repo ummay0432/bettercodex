@@ -206,6 +206,23 @@ impl Conversation {
         Ok(conversation)
     }
 
+    pub(crate) fn fork(&self, mut rollout: Rollout) -> Result<Self> {
+        rollout.replace_history(&self.history, HistoryReplacement::Initial)?;
+        if let (Some(usage), Some(history_estimate)) = (&self.usage, self.usage_history_estimate) {
+            rollout.record_usage(usage, history_estimate, self.server_reasoning_included)?;
+        }
+        Ok(Self {
+            history: self.history.clone(),
+            history_lineage: Uuid::new_v4(),
+            context_metrics: self.context_metrics.clone(),
+            usage: self.usage.clone(),
+            usage_history_estimate: self.usage_history_estimate,
+            server_reasoning_included: self.server_reasoning_included,
+            rollout,
+            world_state: self.world_state.clone(),
+        })
+    }
+
     pub(crate) fn session_id(&self) -> &str {
         &self.rollout.identity().session_id
     }

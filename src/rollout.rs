@@ -65,7 +65,8 @@ pub(crate) struct SessionSummary {
     pub(crate) preview: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SessionTranscriptItem {
     User {
         text: String,
@@ -124,6 +125,13 @@ impl Drop for LockedRolloutFile {
 enum RolloutRecordData<Items = Vec<Value>> {
     Session {
         metadata: SessionMetadata,
+    },
+    ForkedFrom {
+        session_id: String,
+        compaction_count: u64,
+    },
+    TranscriptSnapshot {
+        items: Vec<SessionTranscriptItem>,
     },
     HistoryAppend {
         items: Items,
@@ -265,6 +273,21 @@ impl Rollout {
         }
         let record = BorrowedRolloutRecord::HistoryAppend { items };
         self.write_record(&record)
+    }
+
+    pub(crate) fn record_fork(
+        &mut self,
+        source_session_id: &str,
+        compaction_count: u64,
+    ) -> Result<()> {
+        self.write_record(&RolloutRecord::ForkedFrom {
+            session_id: source_session_id.to_string(),
+            compaction_count,
+        })
+    }
+
+    pub(crate) fn snapshot_transcript(&mut self, items: Vec<SessionTranscriptItem>) -> Result<()> {
+        self.write_record(&RolloutRecord::TranscriptSnapshot { items })
     }
 
     pub(crate) fn replace_history(
@@ -415,6 +438,11 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                     ));
                 }
             }
+            RolloutRecord::ForkedFrom {
+                session_id: _,
+                compaction_count: source_compaction_count,
+            } => compaction_count = source_compaction_count,
+            RolloutRecord::TranscriptSnapshot { items } => transcript = items,
             RolloutRecord::HistoryAppend { items } => {
                 append_transcript_items(&mut transcript, &items);
                 history.extend(items);

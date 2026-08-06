@@ -30,6 +30,50 @@ fn legacy_history_replacements_default_missing_response_usage() {
 }
 
 #[test]
+fn fork_records_restore_the_transcript_and_compaction_window() {
+    let root = temporary_directory("rollout-fork");
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.clone();
+    let transcript = vec![
+        SessionTranscriptItem::User {
+            text: "investigate".to_string(),
+            image_count: 0,
+        },
+        SessionTranscriptItem::Assistant {
+            text: "Still working".to_string(),
+            phase: Some(MessagePhase::Commentary),
+        },
+        SessionTranscriptItem::Assistant {
+            text: "# Finished".to_string(),
+            phase: Some(MessagePhase::FinalAnswer),
+        },
+    ];
+    rollout.record_fork("source-session", 4).unwrap();
+    rollout.snapshot_transcript(transcript.clone()).unwrap();
+    rollout
+        .replace_history(
+            &[json!({"type": "message", "role": "user"})],
+            HistoryReplacement::Initial,
+        )
+        .unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(
+        &root,
+        ResumeSelector::Id(Uuid::parse_str(&session_id).unwrap()),
+        &cwd,
+    )
+    .unwrap();
+    assert_eq!(loaded.compaction_count, 4);
+    assert_eq!(loaded.transcript, transcript);
+
+    drop(loaded);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn failed_streamed_record_is_rolled_back_before_later_appends() {
     struct PartialRecord;
 
