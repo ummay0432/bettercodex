@@ -572,8 +572,13 @@ impl ApiClient {
                     .await
                 {
                     Ok(response) => {
-                        self.websocket_baseline =
-                            Some(WebSocketBaseline::new(request, &response, input_identity)?);
+                        // Compaction consumes the previous turn baseline but immediately replaces
+                        // conversation lineage. Retaining its full request here would deep-clone a
+                        // near-window history only to discard it after output validation.
+                        if matches!(request_kind, RequestKind::Turn) {
+                            self.websocket_baseline =
+                                Some(WebSocketBaseline::new(request, &response, input_identity)?);
+                        }
                         return Ok(response);
                     }
                     Err(error)
@@ -890,9 +895,16 @@ impl ApiClient {
             });
         }
         let trigger = compaction::compaction_trigger();
-        let rendered_tokens = estimated_tokens(&compose_input(history.to_vec()));
-        let prefix_tokens = rendered_tokens
-            .saturating_sub(estimated_tokens(history))
+        let [tools_item] = stable_input_prefix_items();
+        let tool_prefix_tokens = if history
+            .iter()
+            .any(|item| is_additional_tools_item(item, tools_item))
+        {
+            0
+        } else {
+            estimated_tokens(std::slice::from_ref(tools_item))
+        };
+        let prefix_tokens = tool_prefix_tokens
             .saturating_add(estimated_harness_instruction_tokens())
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
         let mut prompt_history = history.to_vec();
@@ -903,13 +915,16 @@ impl ApiClient {
         if rewritten_outputs > 0 {
             input_identity = RequestInputIdentity::Exact;
         }
-        let mut request_history = prompt_history.clone();
-        request_history.push(trigger);
+        // Retained context is at most 64k tokens. Build that small result now so ownership of the
+        // full prompt can move directly into one retryable request instead of keeping two complete
+        // history clones alive throughout compaction.
+        let mut items = compaction::retained_compacted_history(&prompt_history);
+        prompt_history.push(trigger);
         let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
         let request_kind = RequestKind::Compaction(compaction);
         let mut retries = 0_usize;
+        let mut request = self.build_request(prompt_history, request_kind);
         let response = loop {
-            let mut request = self.build_request(request_history.clone(), request_kind);
             match self
                 .respond_request_with_events(
                     &mut request,
@@ -938,7 +953,7 @@ impl ApiClient {
         };
         let compaction_output =
             compaction::opaque_compaction_item(&response.items).map_err(ApiError::fatal)?;
-        let items = compaction::build_compacted_history(&prompt_history, compaction_output);
+        items.push(compaction_output);
         self.window = self.window.saturating_add(1);
         self.websocket_baseline = None;
         Ok(CompactionResult {

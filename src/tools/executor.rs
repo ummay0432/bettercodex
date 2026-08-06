@@ -719,7 +719,8 @@ impl ProcessSession {
             .state
             .lock()
             .map_err(|_| anyhow!("process output lock was poisoned"))?;
-        let mut output = state.output.take();
+        let output_closed = state.readers == 0;
+        let mut output = state.output.take(output_closed);
         if !state.errors.is_empty() {
             if !output.text.is_empty() && !output.text.ends_with('\n') {
                 output.text.push('\n');
@@ -791,9 +792,9 @@ impl PendingOutput {
         self.tail.extend(bytes);
     }
 
-    fn take(&mut self) -> PendingOutputSnapshot {
+    fn take(&mut self, output_closed: bool) -> PendingOutputSnapshot {
         let omitted_bytes = self.omitted;
-        let total_bytes = self
+        let buffered_bytes = self
             .head
             .len()
             .saturating_add(self.tail.len())
@@ -808,6 +809,15 @@ impl PendingOutput {
         }
         bytes.extend(std::mem::take(&mut self.tail));
         self.omitted = 0;
+
+        // A process can write one UTF-8 scalar across separate reads or tool polls. Keep an
+        // incomplete suffix until another byte arrives instead of replacing both halves with the
+        // Unicode replacement character. Once every output reader closes, truly incomplete bytes
+        // are final and retain the existing lossy-decoding behavior.
+        if !output_closed && let Some(carry_start) = trailing_incomplete_utf8_start(&bytes) {
+            self.head = bytes.split_off(carry_start);
+        }
+        let total_bytes = buffered_bytes.saturating_sub(self.head.len());
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
             Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
@@ -818,6 +828,23 @@ impl PendingOutput {
             omitted_bytes,
         }
     }
+}
+
+fn trailing_incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(_) => return None,
+            Err(error) => {
+                let invalid_start = offset.saturating_add(error.valid_up_to());
+                let Some(invalid_length) = error.error_len() else {
+                    return Some(invalid_start);
+                };
+                offset = invalid_start.saturating_add(invalid_length);
+            }
+        }
+    }
+    None
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -1050,7 +1077,7 @@ mod tests {
         let mut output = PendingOutput::default();
         let bytes = vec![b'x'; RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + 17];
         output.append(&bytes);
-        let snapshot = output.take();
+        let snapshot = output.take(true);
         let rendered = snapshot.text;
         assert_eq!(snapshot.total_bytes, bytes.len());
         assert_eq!(snapshot.omitted_bytes, 17);
@@ -1071,7 +1098,7 @@ mod tests {
             output.append(chunk);
         }
 
-        let snapshot = output.take();
+        let snapshot = output.take(true);
 
         let expected = format!(
             "{}\n... {omitted_bytes} bytes omitted ...\n{}",
@@ -1093,7 +1120,33 @@ mod tests {
         let mut output = PendingOutput::default();
         output.append(b"before\x80after");
 
-        assert_eq!(output.take().text, "before\u{fffd}after");
+        assert_eq!(output.take(true).text, "before\u{fffd}after");
+    }
+
+    #[test]
+    fn retained_output_preserves_utf8_split_across_snapshots() {
+        let mut output = PendingOutput::default();
+        let scalar = "🦀".as_bytes();
+        output.append(&scalar[..2]);
+
+        assert_eq!(
+            output.take(false),
+            PendingOutputSnapshot {
+                text: String::new(),
+                total_bytes: 0,
+                omitted_bytes: 0,
+            }
+        );
+
+        output.append(&scalar[2..]);
+        assert_eq!(
+            output.take(true),
+            PendingOutputSnapshot {
+                text: "🦀".to_string(),
+                total_bytes: scalar.len(),
+                omitted_bytes: 0,
+            }
+        );
     }
 
     #[tokio::test]

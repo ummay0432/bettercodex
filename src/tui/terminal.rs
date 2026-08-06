@@ -70,50 +70,54 @@ impl TerminalSession {
         install_panic_hook();
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         let mut output = stdout();
-        if let Err(error) = execute!(
-            output,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            ),
-            EnableBracketedPaste,
-            EnableFocusChange,
-            SetCursorStyle::SteadyBar,
-        ) {
+        let result = (|| -> Result<Self> {
+            execute!(
+                output,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                ),
+                EnableBracketedPaste,
+                EnableFocusChange,
+                SetCursorStyle::SteadyBar,
+            )
+            .context("failed to initialize terminal input modes")?;
+
+            let probe = startup_probe(STARTUP_PROBE_TIMEOUT).unwrap_or_default();
+            let screen_size = crossterm::terminal::size()
+                .map(|(width, height)| Size::new(width, height))
+                .context("failed to read terminal size")?;
+            output
+                .write_all(CLEAR_VISIBLE_TERMINAL)
+                .context("failed to clear the terminal before startup")?;
+            output
+                .flush()
+                .context("failed to flush the startup clear")?;
+
+            let viewport_area = Rect::new(0, 0, screen_size.width, 1);
+            let terminal = Terminal::with_options(
+                CrosstermBackend::new(output),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(viewport_area),
+                },
+            )
+            .context("failed to create inline terminal renderer")?;
+
+            Ok(Self {
+                terminal: AppTerminal {
+                    terminal,
+                    viewport_area,
+                    screen_size,
+                    viewport_top: 0,
+                },
+                default_foreground: probe.foreground,
+                default_background: probe.background,
+            })
+        })();
+        if result.is_err() {
             let _ = restore();
-            return Err(error).context("failed to initialize terminal input modes");
         }
-
-        let probe = startup_probe(STARTUP_PROBE_TIMEOUT).unwrap_or_default();
-        let screen_size = crossterm::terminal::size()
-            .map(|(width, height)| Size::new(width, height))
-            .context("failed to read terminal size")?;
-        output
-            .write_all(CLEAR_VISIBLE_TERMINAL)
-            .context("failed to clear the terminal before startup")?;
-        output
-            .flush()
-            .context("failed to flush the startup clear")?;
-
-        let viewport_area = Rect::new(0, 0, screen_size.width, 1);
-        let terminal = Terminal::with_options(
-            CrosstermBackend::new(output),
-            TerminalOptions {
-                viewport: Viewport::Fixed(viewport_area),
-            },
-        )
-        .context("failed to create inline terminal renderer")?;
-
-        Ok(Self {
-            terminal: AppTerminal {
-                terminal,
-                viewport_area,
-                screen_size,
-                viewport_top: 0,
-            },
-            default_foreground: probe.foreground,
-            default_background: probe.background,
-        })
+        result
     }
 
     pub(super) fn terminal_mut(&mut self) -> &mut AppTerminal {

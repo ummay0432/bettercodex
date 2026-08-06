@@ -8,6 +8,8 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 use serde_json::json;
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -167,17 +169,8 @@ impl UserInput {
         let mut total = 0_usize;
         let mut images = Vec::with_capacity(paths.len());
         for path in paths {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("failed to read image {}", path.display()))?;
-            total = total
-                .checked_add(bytes.len())
-                .filter(|total| *total <= MAX_TOTAL_IMAGE_BYTES)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "attached images exceed bettercodex's {} MiB input limit",
-                        MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
-                    )
-                })?;
+            let bytes = read_image(path, MAX_TOTAL_IMAGE_BYTES.saturating_sub(total))?;
+            total = total.saturating_add(bytes.len());
             let mime = image_mime(path, &bytes)?;
             let image_url = format!("data:{mime};base64,{}", STANDARD.encode(bytes));
             images.push(json!({
@@ -217,6 +210,39 @@ impl UserInput {
             self.selected_skills,
         )
     }
+}
+
+fn read_image(path: &Path, remaining: usize) -> Result<Vec<u8>> {
+    let file =
+        File::open(path).with_context(|| format!("failed to read image {}", path.display()))?;
+    let reported_length = file
+        .metadata()
+        .with_context(|| format!("failed to inspect image {}", path.display()))?
+        .len();
+    if reported_length > u64::try_from(remaining).unwrap_or(u64::MAX) {
+        return Err(image_limit_error());
+    }
+
+    // The metadata check avoids allocating for an already-oversized file. The bounded read also
+    // covers files that grow between metadata collection and the final byte read.
+    let capacity = usize::try_from(reported_length)
+        .unwrap_or(remaining)
+        .min(remaining);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(u64::try_from(remaining.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read image {}", path.display()))?;
+    if bytes.len() > remaining {
+        return Err(image_limit_error());
+    }
+    Ok(bytes)
+}
+
+fn image_limit_error() -> anyhow::Error {
+    anyhow!(
+        "attached images exceed bettercodex's {} MiB input limit",
+        MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
+    )
 }
 
 pub(crate) fn image_mime(path: &Path, bytes: &[u8]) -> Result<&'static str> {
@@ -329,6 +355,25 @@ mod tests {
         let error = UserInput::from_paths("inspect", std::slice::from_ref(&path), ImageDetail::Low)
             .unwrap_err();
         assert!(error.to_string().contains("not a supported"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_image_is_rejected_before_it_is_loaded() {
+        let path = std::env::temp_dir().join(format!(
+            "bettercodex-oversized-image-{}-{}.png",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let file = File::create(&path).unwrap();
+        file.set_len(u64::try_from(MAX_TOTAL_IMAGE_BYTES).unwrap() + 1)
+            .unwrap();
+
+        let error =
+            UserInput::from_paths("inspect", std::slice::from_ref(&path), ImageDetail::High)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("50 MiB input limit"));
         std::fs::remove_file(path).unwrap();
     }
 }

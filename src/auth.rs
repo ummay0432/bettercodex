@@ -7,6 +7,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
 #[cfg(unix)]
@@ -18,12 +19,14 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const ACCESS_TOKEN_ENV: &str = "CODEX_ACCESS_TOKEN";
 const ACCOUNT_ID_ENV: &str = "CHATGPT_ACCOUNT_ID";
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+const MAX_REFRESH_ERROR_BODY_BYTES: usize = 16_000;
 
 pub(crate) struct Auth {
     access_token: String,
@@ -339,39 +342,55 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("credential path has no parent: {}", path.display()))?;
-    let temp = parent.join(format!(".auth.json.tmp-{}", std::process::id()));
+    let temp = parent.join(format!(
+        ".auth.json.tmp-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
     let bytes = serde_json::to_vec_pretty(document)?;
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&temp).with_context(|| {
-        format!(
-            "failed to open temporary credential file {}",
-            temp.display()
-        )
-    })?;
-    file.write_all(&bytes)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    std::fs::rename(&temp, path).with_context(|| {
-        format!(
-            "failed to replace credential file {} with {}",
-            path.display(),
-            temp.display()
-        )
-    })?;
-    Ok(())
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp).with_context(|| {
+            format!(
+                "failed to open temporary credential file {}",
+                temp.display()
+            )
+        })?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path).with_context(|| {
+            format!(
+                "failed to replace credential file {} with {}",
+                path.display(),
+                temp.display()
+            )
+        })?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
-async fn bounded_error_body(response: reqwest::Response) -> String {
-    response
-        .text()
-        .await
-        .unwrap_or_else(|_| "unreadable response".to_string())
-        .chars()
-        .take(2_000)
-        .collect()
+async fn bounded_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::with_capacity(MAX_REFRESH_ERROR_BODY_BYTES);
+    while body.len() < MAX_REFRESH_ERROR_BODY_BYTES {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) if body.is_empty() => return "unreadable response".to_string(),
+            Err(_) => break,
+        };
+        let remaining = MAX_REFRESH_ERROR_BODY_BYTES.saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&body).chars().take(4_000).collect()
 }
 
 #[cfg(test)]

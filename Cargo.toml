@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-arboard = { version = "3", features = ["wayland-data-control"] }
 base64 = "0.22.1"
 bytes = "1"
 codex-ansi-escape = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
@@ -48,6 +47,9 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "v5"] }
 v8 = "=150.4.0"
 zstd = "0.13"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [profile.release]
 lto = "thin"

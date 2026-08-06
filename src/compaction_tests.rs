@@ -17,8 +17,6 @@ fn remote_v2_retains_only_recent_user_and_non_completion_agent_messages() {
         "recipient": "root",
         "content": [{"type": "input_text", "text": "child completion"}],
     });
-    let compaction =
-        json!({"type": "compaction_summary", "id": "cmp_new", "encrypted_content": "opaque"});
     let history = vec![
         message("developer", "system prompt"),
         message(
@@ -56,10 +54,7 @@ fn remote_v2_retains_only_recent_user_and_non_completion_agent_messages() {
         json!({"type": "compaction", "id": "cmp_old", "encrypted_content": "old"}),
     ];
 
-    assert_eq!(
-        build_compacted_history(&history, compaction.clone()),
-        vec![user, delegated, compaction]
-    );
+    assert_eq!(retained_compacted_history(&history), vec![user, delegated]);
 }
 
 #[test]

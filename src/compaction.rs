@@ -79,19 +79,14 @@ pub(crate) fn opaque_compaction_item(items: &[Value]) -> Result<Value, String> {
     Ok(compaction.expect("the count proves a compaction item exists"))
 }
 
-pub(crate) fn build_compacted_history(
-    prompt_history: &[Value],
-    compaction_output: Value,
-) -> Vec<Value> {
+pub(crate) fn retained_compacted_history(prompt_history: &[Value]) -> Vec<Value> {
     let retained = prompt_history
         .iter()
         .filter(|item| is_retained_for_remote_compaction_v2(item))
         .filter(|item| should_keep_compacted_history_item(item))
         .cloned()
         .collect::<Vec<_>>();
-    let mut retained = truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
-    retained.push(compaction_output);
-    retained
+    truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET)
 }
 
 pub(crate) fn trim_tool_outputs_to_fit(history: &mut [Value], max_tokens: u64) -> usize {

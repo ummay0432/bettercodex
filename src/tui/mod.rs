@@ -284,8 +284,7 @@ impl Runtime {
                 completion = receive_turn_completion(&mut self.turn) => {
                     let (agent, completion) = completion.context("agent task stopped unexpectedly")?;
                     self.turn = None;
-                    self.drain_agent_events();
-                    self.turn_events = None;
+                    self.drain_completed_turn_events();
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.turn_handle = None;
@@ -714,6 +713,13 @@ impl Runtime {
         }
     }
 
+    fn drain_completed_turn_events(&mut self) {
+        let Some(mut events) = self.turn_events.take() else {
+            return;
+        };
+        drain_completed_agent_events(&mut events, |event| self.apply_agent_event(event));
+    }
+
     fn apply_agent_event(&mut self, event: AgentEvent) {
         if let AgentEvent::ContextUpdated(snapshot) = &event {
             self.context_snapshot = snapshot.clone();
@@ -806,6 +812,18 @@ fn drain_ready_agent_events(
     // Return to `select!` so input, cancellation, and the frame clock cannot be
     // starved by an unusually large ready backlog.
     ReceiverState::Open
+}
+
+fn drain_completed_agent_events(
+    receiver: &mut UnboundedReceiver<AgentEvent>,
+    mut apply: impl FnMut(AgentEvent),
+) {
+    // Once the turn task has joined, every response event it emitted is already queued. The
+    // normal fairness cap no longer protects input responsiveness and would discard the tail when
+    // the receiver is dropped immediately after this drain.
+    while let Ok(event) = receiver.try_recv() {
+        apply(event);
+    }
 }
 
 async fn receive_frame_tick(animate: bool, ticks: &mut Interval) {
