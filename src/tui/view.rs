@@ -4189,14 +4189,15 @@ fn editor_line(
 }
 
 fn format_context_usage(tokens: Option<u64>) -> String {
+    let context_window_k = EFFECTIVE_CONTEXT_WINDOW / 1_000;
     let Some(tokens) = tokens else {
-        return "? of 353K".to_string();
+        return format!("? of {context_window_k}K");
     };
     let percent = (tokens as f64 / EFFECTIVE_CONTEXT_WINDOW as f64 * 100.0).clamp(0.0, 100.0);
     if percent > 0.0 && percent < 1.0 {
-        format!("{percent:.1}% of 353K")
+        format!("{percent:.1}% of {context_window_k}K")
     } else {
-        format!("{percent:.0}% of 353K")
+        format!("{percent:.0}% of {context_window_k}K")
     }
 }
 
@@ -4297,10 +4298,10 @@ mod tests {
 
     #[test]
     fn context_usage_matches_the_preserved_contract() {
-        assert_eq!(format_context_usage(None), "? of 353K");
-        assert_eq!(format_context_usage(Some(1_000)), "0.3% of 353K");
-        assert_eq!(format_context_usage(Some(70_680)), "20% of 353K");
-        assert_eq!(format_context_usage(Some(u64::MAX)), "100% of 353K");
+        assert_eq!(format_context_usage(None), "? of 258K");
+        assert_eq!(format_context_usage(Some(1_000)), "0.4% of 258K");
+        assert_eq!(format_context_usage(Some(51_680)), "20% of 258K");
+        assert_eq!(format_context_usage(Some(u64::MAX)), "100% of 258K");
     }
 
     #[test]
@@ -4310,10 +4311,10 @@ mod tests {
             name: "pi".to_string(),
             branch: Some("main".to_string()),
         };
-        view.context_tokens = Some(70_680);
+        view.context_tokens = Some(51_680);
         assert_eq!(
             plain(&view.status_line(80)),
-            "gpt-5.6-sol max │ pi / main │ 20% of 353K"
+            "gpt-5.6-sol max │ pi / main │ 20% of 258K"
         );
     }
 
@@ -5439,13 +5440,13 @@ mod tests {
         assert!(view.overlay.is_none());
 
         view.show_context(ContextSnapshot {
-            used_tokens: 70_680,
+            used_tokens: 51_680,
             context_window: EFFECTIVE_CONTEXT_WINDOW,
             compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: true,
             sections: vec![ContextSection {
                 kind: ContextKind::UserMessages,
-                tokens: 70_680,
+                tokens: 51_680,
                 items: 4,
             }],
         });
@@ -5457,24 +5458,24 @@ mod tests {
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(rendered.contains("Context"), "{rendered}");
-        assert!(rendered.contains("70.7K / 353.4K tokens"), "{rendered}");
+        assert!(rendered.contains("51.7K / 258.4K tokens"), "{rendered}");
         assert!(rendered.contains("User messages"), "{rendered}");
         assert!(rendered.contains("Auto-compact reserve"), "{rendered}");
 
         view.handle_agent_event(AgentEvent::ContextUpdated(ContextSnapshot {
-            used_tokens: 106_020,
+            used_tokens: 77_520,
             context_window: EFFECTIVE_CONTEXT_WINDOW,
             compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: true,
             sections: vec![ContextSection {
                 kind: ContextKind::AssistantMessages,
-                tokens: 106_020,
+                tokens: 77_520,
                 items: 6,
             }],
         }));
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("106K / 353.4K tokens"), "{rendered}");
+        assert!(rendered.contains("77.5K / 258.4K tokens"), "{rendered}");
         assert!(rendered.contains("Assistant messages"), "{rendered}");
 
         assert_eq!(

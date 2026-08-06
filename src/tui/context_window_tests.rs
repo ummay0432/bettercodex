@@ -7,44 +7,44 @@ use ratatui::backend::TestBackend;
 
 fn snapshot(measured: bool) -> ContextSnapshot {
     ContextSnapshot {
-        used_tokens: 70_680,
+        used_tokens: 51_680,
         context_window: EFFECTIVE_CONTEXT_WINDOW,
         compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
         measured,
         sections: vec![
             ContextSection {
                 kind: ContextKind::SystemPrompt,
-                tokens: 3_534,
+                tokens: 2_584,
                 items: 1,
             },
             ContextSection {
                 kind: ContextKind::ToolCatalogue,
-                tokens: 7_068,
+                tokens: 5_168,
                 items: 1,
             },
             ContextSection {
                 kind: ContextKind::RepositoryInstructions,
-                tokens: 3_534,
+                tokens: 2_584,
                 items: 1,
             },
             ContextSection {
                 kind: ContextKind::UserMessages,
-                tokens: 10_602,
+                tokens: 7_752,
                 items: 3,
             },
             ContextSection {
                 kind: ContextKind::AssistantMessages,
-                tokens: 14_136,
+                tokens: 10_336,
                 items: 2,
             },
             ContextSection {
                 kind: ContextKind::ToolActivity,
-                tokens: 10_602,
+                tokens: 7_752,
                 items: 4,
             },
             ContextSection {
                 kind: ContextKind::Reasoning,
-                tokens: 21_204,
+                tokens: 15_504,
                 items: 2,
             },
         ],
@@ -108,11 +108,11 @@ fn renders_capacity_grid_categories_and_compaction_headroom() {
     assert_eq!(buffer[(PREFERRED_WIDTH - 1, 0)].symbol(), "┐");
     assert_eq!(buffer[(PREFERRED_WIDTH, 0)].symbol(), " ");
     assert!(rendered.contains("Context"), "{rendered}");
-    assert!(rendered.contains("70.7K / 353.4K tokens"), "{rendered}");
+    assert!(rendered.contains("51.7K / 258.4K tokens"), "{rendered}");
     assert!(rendered.contains("20.0% used"), "{rendered}");
-    assert!(rendered.contains("Auto-compact at 334.8K"), "{rendered}");
+    assert!(rendered.contains("Auto-compact at 244.8K"), "{rendered}");
     assert!(
-        !rendered.contains("Auto-compact at 334.8K  ·"),
+        !rendered.contains("Auto-compact at 244.8K  ·"),
         "{rendered}"
     );
     assert!(rendered.contains("System prompt"), "{rendered}");

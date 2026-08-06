@@ -27,9 +27,9 @@ const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 const MAX_CONTEXT_NOTICE_TEXT_TOKENS: usize = 9_900;
 const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
 const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;
-// Codex derives these independently from the resolved raw model context: 95% is the
-// usable hard window, while automatic compaction starts at 90% of the raw window.
-pub(crate) const RAW_CONTEXT_WINDOW: u64 = 372_000;
+// Match Codex's gpt-5.6-sol model metadata. Codex derives these independently from
+// the raw window: 95% is usable, while automatic compaction starts at 90%.
+pub(crate) const RAW_CONTEXT_WINDOW: u64 = 272_000;
 pub(crate) const EFFECTIVE_CONTEXT_WINDOW: u64 = RAW_CONTEXT_WINDOW * 95 / 100;
 pub(crate) const AUTO_COMPACT_TOKEN_LIMIT: u64 = RAW_CONTEXT_WINDOW * 90 / 100;
 static STABLE_HARNESS_TOKEN_ESTIMATES: LazyLock<[u64; 2]> = LazyLock::new(|| {

@@ -323,7 +323,7 @@ mod tests {
         ));
         assert_eq!(
             tool_catalogue_stats(),
-            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (7): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, web__run\n\nExec description: 9727 bytes\nComplete additional_tools item: 11238 bytes\nEstimated context cost: 2810 tokens (bytes/4)\nEffective-window share: 0.80%"
+            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (7): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, web__run\n\nExec description: 9727 bytes\nComplete additional_tools item: 11238 bytes\nEstimated context cost: 2810 tokens (bytes/4)\nEffective-window share: 1.09%"
         );
     }
 

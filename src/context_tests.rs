@@ -1232,10 +1232,10 @@ fn resume_replaces_stale_world_state_without_losing_the_usage_baseline() {
 }
 
 #[test]
-fn compaction_boundary_matches_codex_ninety_percent_auto_compact_limit() {
-    assert_eq!(RAW_CONTEXT_WINDOW, 372_000);
-    assert_eq!(EFFECTIVE_CONTEXT_WINDOW, 353_400);
-    assert_eq!(AUTO_COMPACT_TOKEN_LIMIT, 334_800);
+fn context_boundaries_match_codex_sol_model_metadata() {
+    assert_eq!(RAW_CONTEXT_WINDOW, 272_000);
+    assert_eq!(EFFECTIVE_CONTEXT_WINDOW, 258_400);
+    assert_eq!(AUTO_COMPACT_TOKEN_LIMIT, 244_800);
     let (root, cwd) = temporary_repository("threshold");
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();

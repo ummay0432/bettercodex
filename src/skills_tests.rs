@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::skill_settings;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -116,7 +117,11 @@ fn metadata_controls_popup_labels_and_implicit_catalog_visibility_without_blocki
     let skill = &catalog.skills()[0];
     assert_eq!(skill.display_name(), "Private Workflow");
     assert_eq!(skill.display_description(), "Explicit only");
-    assert!(catalog.catalogue_message(353_400).is_none());
+    assert!(
+        catalog
+            .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
+            .is_none()
+    );
 
     let selected = SkillSelection::new("private-workflow", skill.path());
     let injection = catalog.explicit_injections("use $private-workflow", &[selected]);
@@ -144,7 +149,7 @@ fn implicit_catalog_discloses_metadata_without_eagerly_injecting_the_skill_body(
         scope: SkillScope::Repository,
     }]);
 
-    let instructions = catalog.catalogue_message(353_400).unwrap();
+    let instructions = catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap();
     let metadata = text_of(&instructions);
     assert_eq!(instructions["role"], "user");
     assert!(metadata.starts_with("<available_skills>"));
@@ -184,7 +189,7 @@ fn skill_metadata_and_bodies_cannot_close_their_context_fields() {
         scope: SkillScope::Repository,
     }]);
 
-    let catalogue = catalog.catalogue_message(353_400).unwrap();
+    let catalogue = catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap();
     let catalogue = text_of(&catalogue);
     assert_eq!(catalogue.matches("</available_skills>").count(), 1);
     assert!(catalogue.contains("&lt;/available_skills&gt;"));
@@ -217,7 +222,7 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     assert!(papercut.is_enabled());
     assert!(papercut.allows_implicit_invocation());
 
-    let instructions = catalog.catalogue_message(353_400).unwrap();
+    let instructions = catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap();
     let instructions = text_of(&instructions);
     assert!(instructions.contains("papercut"));
     assert!(instructions.contains("dead-end tool call"));
@@ -244,7 +249,11 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     )
     .unwrap();
     let explicit_only = SkillCatalog::load_with_home(&cwd, Some(&home));
-    assert!(explicit_only.catalogue_message(353_400).is_none());
+    assert!(
+        explicit_only
+            .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
+            .is_none()
+    );
     assert_eq!(
         explicit_only
             .explicit_injections("use $papercut", &[papercut_selection])
@@ -279,7 +288,11 @@ fn saved_settings_independently_control_availability_and_implicit_injection() {
     let mut disabled = SkillCatalog::load_from_roots(&roots);
     disabled.apply_settings(&settings_path);
     assert!(!disabled.skills()[0].is_enabled());
-    assert!(disabled.catalogue_message(353_400).is_none());
+    assert!(
+        disabled
+            .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
+            .is_none()
+    );
     let selected = SkillSelection::new("review", &path);
     let blocked = disabled.explicit_injections("use $review", std::slice::from_ref(&selected));
     assert!(blocked.items.is_empty());
@@ -296,7 +309,11 @@ fn saved_settings_independently_control_availability_and_implicit_injection() {
     explicit_only.apply_settings(&settings_path);
     assert!(explicit_only.skills()[0].is_enabled());
     assert!(!explicit_only.skills()[0].allows_implicit_invocation());
-    assert!(explicit_only.catalogue_message(353_400).is_none());
+    assert!(
+        explicit_only
+            .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
+            .is_none()
+    );
     let injection = explicit_only.explicit_injections("use $review", &[selected]);
     assert_eq!(injection.items.len(), 1);
     assert!(text_of(&injection.items[0]).contains("REVIEW BODY"));
@@ -427,7 +444,7 @@ fn injected_skill_bodies_and_catalog_metadata_are_bounded() {
             .any(|warning| warning.contains("truncated"))
     );
 
-    let catalog_message = catalog.catalogue_message(353_400).unwrap();
+    let catalog_message = catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap();
     assert!(text_of(&catalog_message).len() < MAX_SKILLS_CONTEXT_BYTES);
 
     fs::remove_dir_all(root).unwrap();
