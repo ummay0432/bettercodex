@@ -99,6 +99,127 @@ fn recent_input_keeps_two_operator_turns_and_drops_images_and_world_state() {
 }
 
 #[test]
+fn recent_input_excludes_assistant_text_outside_the_selected_user_turns() {
+    let history = vec![
+        message("assistant", "before the only user"),
+        message("user", "current user"),
+        message("assistant", "after the current user"),
+    ];
+
+    assert_eq!(
+        serde_json::to_value(recent_input(&history)).unwrap(),
+        json!([message("user", "current user")])
+    );
+}
+
+#[test]
+fn recent_input_borrows_multimodal_payloads_before_discarding_them() {
+    let history_message = json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "inspect the image"},
+            {"type": "input_image", "image_url": "data:image/png;base64,payload"},
+        ],
+    });
+    let source = history_message["content"][1]["image_url"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+
+    let projected = HistoryMessage::deserialize(&history_message).unwrap();
+    let HistoryContent::InputImage { image_url, .. } = &projected.content[1] else {
+        panic!("expected the input image")
+    };
+
+    assert_eq!(image_url.as_ptr(), source);
+    let mut assistant_tokens = ASSISTANT_CONTEXT_TOKEN_LIMIT;
+    assert_eq!(
+        serde_json::to_value(projected.into_search_item(&mut assistant_tokens)).unwrap(),
+        message("user", "inspect the image")
+    );
+}
+
+#[test]
+fn recent_input_preserves_bounded_assistant_message_metadata() {
+    let assistant_text = "x".repeat(ASSISTANT_CONTEXT_TOKEN_LIMIT * 4 + 100);
+    let expected_text = truncate_text(
+        &assistant_text,
+        TruncationPolicy::Tokens(ASSISTANT_CONTEXT_TOKEN_LIMIT),
+    );
+    let history = vec![
+        message("user", "previous user"),
+        json!({
+            "id": "msg_previous",
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"},
+            "content": [
+                {"type": "output_text", "text": assistant_text},
+                {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "low"},
+            ],
+        }),
+        message("user", "current user"),
+    ];
+
+    assert_eq!(
+        serde_json::to_value(recent_input(&history)).unwrap(),
+        json!([
+            message("user", "previous user"),
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"},
+                "content": [
+                    {"type": "output_text", "text": expected_text},
+                    {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "low"},
+                ],
+            },
+            message("user", "current user"),
+        ])
+    );
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_recent_input_with_discarded_large_payloads() {
+    const RUNS: usize = 50;
+    const IMAGE_BYTES: usize = 16 * 1024 * 1024;
+    const TRAILING_ASSISTANT_BYTES: usize = 4 * 1024 * 1024;
+
+    let history = vec![
+        message("user", "previous user"),
+        message("assistant", "previous assistant"),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "current user"},
+                {
+                    "type": "input_image",
+                    "image_url": format!("data:image/png;base64,{}", "x".repeat(IMAGE_BYTES)),
+                },
+            ],
+        }),
+        message("assistant", &"x".repeat(TRAILING_ASSISTANT_BYTES)),
+    ];
+
+    let started = std::time::Instant::now();
+    for _ in 0..RUNS {
+        std::hint::black_box(recent_input(&history));
+    }
+    let elapsed = started.elapsed();
+
+    eprintln!(
+        "{RUNS} web-search context projections with a {} MiB image and {} MiB trailing assistant message: {elapsed:?}",
+        IMAGE_BYTES / (1024 * 1024),
+        TRAILING_ASSISTANT_BYTES / (1024 * 1024),
+    );
+}
+
+#[test]
 fn command_parser_preserves_search_and_fetch_operations() {
     let commands = parse_commands(Some(json!({
         "search_query": [{"q": "Codex", "domains": ["openai.com"]}],
@@ -121,32 +242,25 @@ fn command_parser_preserves_search_and_fetch_operations() {
 }
 
 #[test]
-fn display_actions_match_codex_web_search_activity() {
+fn display_activities_preserve_each_search_and_fetch_row() {
     assert_eq!(
-        action_for_display(Some(&json!({
+        activities_for_display(Some(json!({
             "search_query": [{"q": "first"}, {"q": "second"}],
-        }))),
-        WebSearchAction::Search {
-            query: None,
-            queries: Some(vec!["first".to_string(), "second".to_string()]),
-        }
-    );
-    assert_eq!(
-        action_for_display(Some(&json!({
-            "open": [{"ref_id": "https://openai.com/research"}],
-        }))),
-        WebSearchAction::OpenPage {
-            url: Some("https://openai.com/research".to_string()),
-        }
-    );
-    assert_eq!(
-        action_for_display(Some(&json!({
+            "open": [{"ref_id": "turn0search0", "lineno": 12}],
+            "click": [{"ref_id": "turn0fetch0", "id": 3}],
             "find": [{"ref_id": "turn0fetch0", "pattern": "Responses"}],
         }))),
-        WebSearchAction::FindInPage {
-            url: None,
-            pattern: Some("Responses".to_string()),
-        }
+        vec![
+            WebActivity::new("Search", "first"),
+            WebActivity::new("Search", "second"),
+            WebActivity::new("Open", "turn0search0 at line 12"),
+            WebActivity::new("Open", "link 3 in turn0fetch0"),
+            WebActivity::new("Find", "'Responses' in turn0fetch0"),
+        ]
+    );
+    assert_eq!(
+        activities_for_display(Some(json!([]))),
+        vec![WebActivity::new("Browse", "")]
     );
 }
 

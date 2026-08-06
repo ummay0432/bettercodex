@@ -173,6 +173,12 @@ pub(super) enum Action {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InterruptIntent {
+    StopTurn,
+    SubmitSteering,
+}
+
 pub(super) struct View {
     cwd: PathBuf,
     repository: Repository,
@@ -190,7 +196,7 @@ pub(super) struct View {
     background_processes: Vec<BackgroundProcess>,
     busy: bool,
     action_required: bool,
-    interrupting: bool,
+    interrupting: Option<InterruptIntent>,
     working_since: Option<Instant>,
     turn_had_work: bool,
     reasoning_status: ReasoningStatus,
@@ -288,7 +294,7 @@ enum ToolDisplay {
     Papercut,
     Plan(PlanDisplay),
     ViewImage(String),
-    WebSearch(codex_protocol::models::WebSearchAction),
+    WebSearch(Vec<crate::web_search::WebActivity>),
     Other,
 }
 
@@ -425,7 +431,7 @@ impl View {
             background_processes: Vec::new(),
             busy: false,
             action_required: false,
-            interrupting: false,
+            interrupting: None,
             working_since: None,
             turn_had_work: false,
             reasoning_status: ReasoningStatus::default(),
@@ -501,7 +507,7 @@ impl View {
         self.entries.push(TranscriptEntry::User(prompt));
         self.busy = true;
         self.action_required = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
@@ -515,7 +521,7 @@ impl View {
         self.context_tokens = None;
         self.busy = true;
         self.action_required = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
@@ -548,10 +554,6 @@ impl View {
         self.pending_input.has_steers()
     }
 
-    pub(super) fn take_pending_steers(&mut self) -> Vec<UserPrompt> {
-        self.pending_input.take_steers()
-    }
-
     pub(super) fn restore_pending_input_to_composer(&mut self) {
         let prompts = self.pending_input.take_all();
         self.restore_prompts_to_composer(prompts);
@@ -575,7 +577,10 @@ impl View {
         self.slash_selection = 0;
     }
 
-    pub(super) fn finish_turn(&mut self, result: anyhow::Result<SubmitOutcome>) {
+    pub(super) fn finish_turn(
+        &mut self,
+        result: anyhow::Result<SubmitOutcome>,
+    ) -> Option<UserPrompt> {
         self.close_streaming_entries();
         self.seal_exploration();
         self.finish_incomplete_tools();
@@ -585,7 +590,7 @@ impl View {
             .map(|started| started.elapsed().as_secs());
         let turn_had_work = std::mem::take(&mut self.turn_had_work);
         self.busy = false;
-        self.interrupting = false;
+        let interrupt_intent = self.interrupting.take();
         self.reasoning_status.reset();
         self.status_detail = None;
         self.action_required = result.is_err();
@@ -604,22 +609,39 @@ impl View {
                     self.entries
                         .push(TranscriptEntry::FinalMessageSeparator { elapsed_seconds });
                 }
+                None
             }
-            Ok(SubmitOutcome::Cancelled) => self
-                .entries
-                .push(TranscriptEntry::Notice("Turn interrupted".to_string())),
-            Err(error) => self
-                .entries
-                .push(TranscriptEntry::Error(markdown::sanitize(&format!(
-                    "{error:#}"
-                )))),
+            Ok(SubmitOutcome::Cancelled) => {
+                let steers = if interrupt_intent == Some(InterruptIntent::SubmitSteering) {
+                    self.pending_input.take_steers()
+                } else {
+                    Vec::new()
+                };
+                if steers.is_empty() {
+                    self.entries
+                        .push(TranscriptEntry::Notice("Turn interrupted".to_string()));
+                    None
+                } else {
+                    self.entries.push(TranscriptEntry::Notice(
+                        "Model interrupted to submit steering input".to_string(),
+                    ));
+                    Some(UserPrompt::joined(steers))
+                }
+            }
+            Err(error) => {
+                self.entries
+                    .push(TranscriptEntry::Error(markdown::sanitize(&format!(
+                        "{error:#}"
+                    ))));
+                None
+            }
         }
     }
 
     pub(super) fn finish_compaction(&mut self, result: anyhow::Result<CompactionOutcome>) {
         self.working_since = None;
         self.busy = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.reasoning_status.reset();
         self.status_detail = None;
         self.action_required = result.is_err();
@@ -639,9 +661,9 @@ impl View {
         }
     }
 
-    pub(super) fn set_interrupting(&mut self) {
+    pub(super) fn set_interrupting(&mut self, intent: InterruptIntent) {
         if self.busy {
-            self.interrupting = true;
+            self.interrupting = Some(intent);
             self.status_detail = None;
         }
     }
@@ -1766,8 +1788,8 @@ impl View {
             .max(1)
             .saturating_add(2);
         let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
-        let status_height = u16::from(self.busy);
-        let status_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(status_height);
+        let activity_height = u16::from(self.has_activity_surface(width));
+        let activity_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(activity_height);
         let bottom_spacing: u16 = 1;
         let popup_height = self.completion_popup_height(width);
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
@@ -1787,8 +1809,8 @@ impl View {
         };
         let transcript_chrome_height = bottom_spacing
             .saturating_add(pending_height)
-            .saturating_add(status_height)
-            .saturating_add(status_composer_spacing)
+            .saturating_add(activity_height)
+            .saturating_add(activity_composer_spacing)
             .saturating_add(composer_height)
             .saturating_add(trailing_height);
         (transcript_chrome_height, overlay_height)
@@ -1826,7 +1848,8 @@ impl View {
         let trailing_height =
             requested_trailing_height.min(area.height.saturating_sub(minimum_composer_height));
         let height_above_trailing = area.height.saturating_sub(trailing_height);
-        let status_reserve = if self.busy {
+        let has_activity_surface = self.has_activity_surface(area.width);
+        let activity_reserve = if has_activity_surface {
             STATUS_LINE_HEIGHT
                 .saturating_add(ACTIVITY_COMPOSER_GAP)
                 .min(height_above_trailing.saturating_sub(minimum_composer_height))
@@ -1837,11 +1860,11 @@ impl View {
         let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
         let pending_height = requested_pending_height.min(
             height_above_trailing
-                .saturating_sub(status_reserve)
+                .saturating_sub(activity_reserve)
                 .saturating_sub(minimum_composer_height),
         );
         let composer_height_limit = height_above_trailing
-            .saturating_sub(status_reserve)
+            .saturating_sub(activity_reserve)
             .saturating_sub(pending_height);
         let editor_height_limit = composer_height_limit.saturating_sub(2).max(1);
         let editor_layout = self
@@ -1864,24 +1887,24 @@ impl View {
         } else {
             Rect::default()
         };
-        let status_height = u16::from(self.busy && composer_y > area.y);
-        let status_composer_spacing = if status_height > 0 {
+        let activity_height = u16::from(has_activity_surface && composer_y > area.y);
+        let activity_composer_spacing = if activity_height > 0 {
             ACTIVITY_COMPOSER_GAP.min(
                 composer_y
                     .saturating_sub(area.y)
-                    .saturating_sub(status_height),
+                    .saturating_sub(activity_height),
             )
         } else {
             0
         };
-        let status_area = Rect::new(
+        let activity_area = Rect::new(
             area.x,
-            composer_y.saturating_sub(status_height + status_composer_spacing),
+            composer_y.saturating_sub(activity_height + activity_composer_spacing),
             area.width,
-            status_height,
+            activity_height,
         );
-        let pending_bottom = if status_height > 0 {
-            status_area.y
+        let pending_bottom = if activity_height > 0 {
+            activity_area.y
         } else {
             composer_area.y
         };
@@ -1893,8 +1916,8 @@ impl View {
         );
         let content_bottom = if pending_height > 0 {
             pending_area.y
-        } else if status_height > 0 {
-            status_area.y
+        } else if activity_height > 0 {
+            activity_area.y
         } else {
             composer_area.y
         };
@@ -1919,13 +1942,16 @@ impl View {
                 pending_area,
             );
         }
-        if status_height > 0 {
+        if activity_height > 0 {
+            let line = if self.busy {
+                self.working_line()
+            } else {
+                self.standalone_background_process_line(area.width)
+                    .expect("an idle activity surface requires background processes")
+            };
             frame.render_widget(
-                Paragraph::new(truncate_line(
-                    self.working_line(),
-                    usize::from(status_area.width),
-                )),
-                status_area,
+                Paragraph::new(truncate_line(line, usize::from(activity_area.width))),
+                activity_area,
             );
         }
         self.render_composer(frame, composer_area, footer_area, editor_layout);
@@ -2224,7 +2250,7 @@ impl View {
             .working_since
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        let heading = if self.interrupting {
+        let heading = if self.interrupting.is_some() {
             "Interrupting"
         } else if self.status_detail.as_deref() == Some("Compacting conversation") {
             "Compacting"
@@ -2258,7 +2284,37 @@ impl View {
             spans.push(Span::from(" · ").dim());
             spans.push(Span::from(format!("{queued_follow_ups} queued")).dim());
         }
+        if let Some(summary) = self.background_process_summary() {
+            spans.push(Span::from(" · ").dim());
+            spans.push(Span::from(summary).dim());
+        }
         Line::from(spans)
+    }
+
+    fn has_activity_surface(&self, width: u16) -> bool {
+        self.busy || (width >= 4 && !self.background_processes.is_empty())
+    }
+
+    fn background_process_summary(&self) -> Option<String> {
+        let count = self.background_processes.len();
+        if count == 0 {
+            return None;
+        }
+        let plural = if count == 1 { "" } else { "s" };
+        Some(format!(
+            "{count} background terminal{plural} running · /ps to view · /stop to close"
+        ))
+    }
+
+    fn standalone_background_process_line(&self, width: u16) -> Option<Line<'static>> {
+        if width < 4 {
+            return None;
+        }
+        let summary = self.background_process_summary()?;
+        Some(Line::from(vec![
+            Span::from("  ").dim(),
+            Span::from(summary).dim(),
+        ]))
     }
 
     fn status_line(&self, width: u16) -> Line<'static> {
@@ -2300,15 +2356,6 @@ impl View {
             format_context_usage(self.context_tokens),
             Style::default().fg(MUTED),
         ));
-        if !self.background_processes.is_empty() {
-            let count = self.background_processes.len();
-            let plural = if count == 1 { "" } else { "s" };
-            spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
-            spans.push(Span::styled(
-                format!("{count} background terminal{plural} · /ps · /stop"),
-                Style::default().fg(MUTED),
-            ));
-        }
         truncate_line(Line::from(spans), usize::from(width))
     }
 
@@ -2530,9 +2577,7 @@ impl ToolEntry {
                     .map(|path| display_tool_path(Path::new(path), cwd))
                     .unwrap_or_else(|| "image".to_string()),
             ),
-            "web.run" => {
-                ToolDisplay::WebSearch(crate::web_search::action_for_display(input.as_ref()))
-            }
+            "web.run" => ToolDisplay::WebSearch(crate::web_search::activities_for_display(input)),
             _ => ToolDisplay::Other,
         };
         Self {
@@ -2545,12 +2590,16 @@ impl ToolEntry {
     }
 
     fn is_exploration(&self) -> bool {
-        matches!(
-            &self.display,
-            ToolDisplay::Command { parsed, .. }
-                if !parsed.is_empty()
-                    && parsed.iter().all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
-        )
+        match &self.display {
+            ToolDisplay::Command { parsed, .. } => {
+                !parsed.is_empty()
+                    && parsed
+                        .iter()
+                        .all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
+            }
+            ToolDisplay::WebSearch(_) => true,
+            _ => false,
+        }
     }
 
     fn activity_label(&self) -> String {
@@ -2586,7 +2635,7 @@ impl ToolEntry {
             ToolDisplay::Papercut => papercut_lines(self, width),
             ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
             ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
-            ToolDisplay::WebSearch(action) => web_search_lines(self, action, width),
+            ToolDisplay::WebSearch(_) => exploration_lines(std::slice::from_ref(self), width),
             ToolDisplay::Other => generic_tool_lines(self, width),
         }
     }
@@ -3622,6 +3671,7 @@ fn interaction_lines(
 
 fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
     let active = tools.iter().any(|tool| tool.outcome.is_none());
+    let failed = tools.iter().any(|tool| tool.succeeded() == Some(false));
     let started = tools
         .iter()
         .find(|tool| tool.outcome.is_none())
@@ -3629,6 +3679,8 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
         if active {
             activity_marker(started)
+        } else if failed {
+            "•".red().bold()
         } else {
             "•".dim()
         },
@@ -3639,9 +3691,11 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             "Explored".bold()
         },
     ])];
-    let mut details: Vec<(&str, Vec<Span<'static>>)> = Vec::new();
+    let detail_style = Style::default().fg(Color::Cyan);
+    let mut details: Vec<(&str, Style, Vec<Span<'static>>)> = Vec::new();
     let mut read_names = Vec::<String>::new();
-    let flush_reads = |details: &mut Vec<(&str, Vec<Span<'static>>)>, names: &mut Vec<String>| {
+    let flush_reads = |details: &mut Vec<(&str, Style, Vec<Span<'static>>)>,
+                       names: &mut Vec<String>| {
         if names.is_empty() {
             return;
         }
@@ -3652,46 +3706,71 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             }
             spans.push(name.into());
         }
-        details.push(("Read", spans));
+        details.push(("Read", detail_style, spans));
     };
     for tool in tools {
-        let ToolDisplay::Command { parsed, .. } = &tool.display else {
-            continue;
-        };
-        for parsed in parsed {
-            match parsed {
-                ParsedCommand::Read { name, .. } => {
-                    if !read_names.contains(name) {
-                        read_names.push(name.clone());
+        match &tool.display {
+            ToolDisplay::Command { parsed, .. } => {
+                for parsed in parsed {
+                    match parsed {
+                        ParsedCommand::Read { name, .. } => {
+                            if !read_names.contains(name) {
+                                read_names.push(name.clone());
+                            }
+                        }
+                        ParsedCommand::ListFiles { cmd, path } => {
+                            flush_reads(&mut details, &mut read_names);
+                            details.push((
+                                "List",
+                                detail_style,
+                                vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
+                            ));
+                        }
+                        ParsedCommand::Search { cmd, query, path } => {
+                            flush_reads(&mut details, &mut read_names);
+                            let spans = match (query, path) {
+                                (Some(query), Some(path)) => {
+                                    vec![query.clone().into(), " in ".dim(), path.clone().into()]
+                                }
+                                (Some(query), None) => vec![query.clone().into()],
+                                _ => vec![cmd.clone().into()],
+                            };
+                            details.push(("Search", detail_style, spans));
+                        }
+                        ParsedCommand::Unknown { .. } => {}
                     }
                 }
-                ParsedCommand::ListFiles { cmd, path } => {
-                    flush_reads(&mut details, &mut read_names);
+            }
+            ToolDisplay::WebSearch(activities) => {
+                flush_reads(&mut details, &mut read_names);
+                for activity in activities {
+                    let spans = if activity.detail.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![Span::from(activity.detail.clone())]
+                    };
+                    details.push((activity.verb, detail_style, spans));
+                }
+                if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
                     details.push((
-                        "List",
-                        vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
+                        "Error",
+                        Style::default().fg(Color::Red),
+                        vec![Span::from(first_display_line(error)).red()],
                     ));
                 }
-                ParsedCommand::Search { cmd, query, path } => {
-                    flush_reads(&mut details, &mut read_names);
-                    let spans = match (query, path) {
-                        (Some(query), Some(path)) => {
-                            vec![query.clone().into(), " in ".dim(), path.clone().into()]
-                        }
-                        (Some(query), None) => vec![query.clone().into()],
-                        _ => vec![cmd.clone().into()],
-                    };
-                    details.push(("Search", spans));
-                }
-                ParsedCommand::Unknown { .. } => {}
             }
+            _ => {}
         }
     }
     flush_reads(&mut details, &mut read_names);
     let detail_width = width.saturating_sub(4).max(1);
     let mut wrapped_details = Vec::new();
-    for (title, spans) in details {
-        let title = format!("{title} ");
+    for (title, title_style, spans) in details {
+        let title = if spans.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title} ")
+        };
         let title_width = UnicodeWidthStr::width(title.as_str()) as u16;
         let wrapped = wrap_styled_line(
             &Line::from(spans),
@@ -3699,7 +3778,7 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
         );
         for (index, mut row) in wrapped.into_iter().enumerate() {
             let mut spans = vec![if index == 0 {
-                Span::from(title.clone()).cyan()
+                Span::styled(title.clone(), title_style)
             } else {
                 Span::from(" ".repeat(usize::from(title_width)))
             }];
@@ -3734,84 +3813,6 @@ fn view_image_lines(outcome: Option<&ToolOutcome>, path: &str, width: u16) -> Ve
             ),
         ],
         Some(Err(error)) => failed_tool_lines("Failed to view image", error, width),
-    }
-}
-
-fn web_search_lines(
-    tool: &ToolEntry,
-    action: &codex_protocol::models::WebSearchAction,
-    width: u16,
-) -> Vec<Line<'static>> {
-    if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
-        return failed_tool_lines("Failed to search the web", error, width);
-    }
-
-    let completed = tool.outcome.is_some();
-    let detail = if completed {
-        web_search_action_detail(action)
-    } else {
-        String::new()
-    };
-    let mut content = vec![
-        Span::from(if completed {
-            "Searched the web"
-        } else {
-            "Searching the web"
-        })
-        .bold(),
-    ];
-    if !detail.is_empty() {
-        content.push(" for ".into());
-        content.push(Span::from(detail));
-    }
-    let wrapped = wrap_styled_line(&Line::from(content), width.saturating_sub(2).max(1));
-    let bullet = if completed {
-        "•".dim()
-    } else {
-        activity_marker(Some(tool.started_at))
-    };
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            let mut spans = if index == 0 {
-                vec![bullet.clone(), " ".into()]
-            } else {
-                vec!["  ".into()]
-            };
-            spans.append(&mut line.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-
-fn web_search_action_detail(action: &codex_protocol::models::WebSearchAction) -> String {
-    use codex_protocol::models::WebSearchAction;
-
-    match action {
-        WebSearchAction::Search { query, queries } => query
-            .clone()
-            .filter(|query| !query.is_empty())
-            .unwrap_or_else(|| {
-                let first = queries
-                    .as_ref()
-                    .and_then(|queries| queries.first())
-                    .cloned()
-                    .unwrap_or_default();
-                if queries.as_ref().is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
-                    format!("{first} ...")
-                } else {
-                    first
-                }
-            }),
-        WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
-        WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
-            (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
-            (Some(pattern), None) => format!("'{pattern}'"),
-            (None, Some(url)) => url.clone(),
-            (None, None) => String::new(),
-        },
-        WebSearchAction::Other => String::new(),
     }
 }
 
@@ -4189,14 +4190,15 @@ fn editor_line(
 }
 
 fn format_context_usage(tokens: Option<u64>) -> String {
+    let context_window_k = EFFECTIVE_CONTEXT_WINDOW / 1_000;
     let Some(tokens) = tokens else {
-        return "? of 353K".to_string();
+        return format!("? of {context_window_k}K");
     };
     let percent = (tokens as f64 / EFFECTIVE_CONTEXT_WINDOW as f64 * 100.0).clamp(0.0, 100.0);
     if percent > 0.0 && percent < 1.0 {
-        format!("{percent:.1}% of 353K")
+        format!("{percent:.1}% of {context_window_k}K")
     } else {
-        format!("{percent:.0}% of 353K")
+        format!("{percent:.0}% of {context_window_k}K")
     }
 }
 
@@ -4295,12 +4297,21 @@ mod tests {
         })
     }
 
+    fn test_background_process(session_id: i32) -> BackgroundProcess {
+        BackgroundProcess {
+            session_id,
+            command: "sleep 30".to_string(),
+            cwd: PathBuf::from("/tmp/bettercodex"),
+            running_for: Duration::from_secs(2),
+        }
+    }
+
     #[test]
     fn context_usage_matches_the_preserved_contract() {
-        assert_eq!(format_context_usage(None), "? of 353K");
-        assert_eq!(format_context_usage(Some(1_000)), "0.3% of 353K");
-        assert_eq!(format_context_usage(Some(70_680)), "20% of 353K");
-        assert_eq!(format_context_usage(Some(u64::MAX)), "100% of 353K");
+        assert_eq!(format_context_usage(None), "? of 258K");
+        assert_eq!(format_context_usage(Some(1_000)), "0.4% of 258K");
+        assert_eq!(format_context_usage(Some(51_680)), "20% of 258K");
+        assert_eq!(format_context_usage(Some(u64::MAX)), "100% of 258K");
     }
 
     #[test]
@@ -4310,10 +4321,10 @@ mod tests {
             name: "pi".to_string(),
             branch: Some("main".to_string()),
         };
-        view.context_tokens = Some(70_680);
+        view.context_tokens = Some(51_680);
         assert_eq!(
             plain(&view.status_line(80)),
-            "gpt-5.6-sol max │ pi / main │ 20% of 353K"
+            "gpt-5.6-sol max │ pi / main │ 20% of 258K"
         );
     }
 
@@ -4515,6 +4526,80 @@ mod tests {
     }
 
     #[test]
+    fn busy_background_terminal_summary_is_inline_with_the_activity_row() {
+        const WIDTH: u16 = 120;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        let _ = view.take_pending_history_lines(WIDTH);
+        let height_without_processes = view.desired_height(WIDTH, 24);
+        view.set_background_processes(vec![test_background_process(1)]);
+        let height = view.desired_height(WIDTH, 24);
+        assert_eq!(height, height_without_processes);
+
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let activity = rows
+            .iter()
+            .find(|row| row.contains("Working ("))
+            .expect("rendered activity row");
+        assert!(
+            activity.contains(" · 1 background terminal running · /ps to view · /stop to close"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("background terminal").count(), 1);
+        let footer = rows
+            .iter()
+            .find(|row| row.contains(MODEL))
+            .expect("rendered model footer");
+        assert!(!footer.contains("background terminal"), "{rendered}");
+    }
+
+    #[test]
+    fn idle_background_terminal_summary_uses_a_separate_activity_row() {
+        const WIDTH: u16 = 120;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        let height_without_processes = view.desired_height(WIDTH, 24);
+        view.set_background_processes(vec![test_background_process(1), test_background_process(2)]);
+        let height = view.desired_height(WIDTH, 24);
+        assert_eq!(height, height_without_processes + 2);
+
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let activity_y = rows
+            .iter()
+            .position(|row| {
+                row.contains("  2 background terminals running · /ps to view · /stop to close")
+            })
+            .expect("rendered background-terminal activity row") as u16;
+        let composer_background = view.user_message_style.bg.unwrap();
+        let composer_y = (0..height)
+            .find(|&y| buffer[(0, y)].bg == composer_background)
+            .expect("rendered composer");
+        assert_eq!(
+            composer_y.saturating_sub(activity_y.saturating_add(1)),
+            ACTIVITY_COMPOSER_GAP,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Working ("), "{rendered}");
+        let footer = rows
+            .iter()
+            .find(|row| row.contains(MODEL))
+            .expect("rendered model footer");
+        assert!(!footer.contains("background terminal"), "{rendered}");
+    }
+
+    #[test]
     fn completed_work_turn_renders_the_codex_worked_for_separator() {
         const WIDTH: u16 = 80;
 
@@ -4534,7 +4619,7 @@ mod tests {
         view.handle_agent_event(AgentEvent::ModelMessageDelta("Done.".to_string()));
         view.handle_agent_event(completed_message("Done."));
         view.working_since = Some(Instant::now() - Duration::from_secs(125));
-        view.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
+        let _ = view.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
 
         let height = view.desired_height(WIDTH, 30);
         let backend = TestBackend::new(WIDTH, height);
@@ -4571,7 +4656,7 @@ mod tests {
         view.start_turn("render a table");
         view.handle_agent_event(AgentEvent::ModelMessageDelta(answer.to_string()));
         view.handle_agent_event(completed_message(answer));
-        view.finish_turn(Ok(SubmitOutcome::Completed(answer.to_string())));
+        let _ = view.finish_turn(Ok(SubmitOutcome::Completed(answer.to_string())));
 
         let height = view.desired_height(WIDTH, 30);
         let backend = TestBackend::new(WIDTH, height);
@@ -4599,7 +4684,7 @@ mod tests {
         }));
 
         assert!(!view.terminal_assistant_received_this_turn);
-        view.finish_turn(Ok(SubmitOutcome::Completed("Finished.".to_string())));
+        let _ = view.finish_turn(Ok(SubmitOutcome::Completed("Finished.".to_string())));
 
         let assistant_phases = view
             .entries
@@ -4645,7 +4730,7 @@ mod tests {
         conversational.welcome_pending = false;
         conversational.start_turn("test");
         conversational.working_since = Some(Instant::now() - Duration::from_secs(125));
-        conversational.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
+        let _ = conversational.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
         assert!(
             conversational
                 .take_pending_history_lines(80)
@@ -4690,7 +4775,7 @@ mod tests {
         assert!(second_section.contains("• Running validation ("));
         assert!(!second_section.contains("Inspecting the request"));
 
-        view.set_interrupting();
+        view.set_interrupting(InterruptIntent::StopTurn);
         assert!(render(&mut view).contains("• Interrupting ("));
     }
 
@@ -5176,6 +5261,99 @@ mod tests {
     }
 
     #[test]
+    fn plain_interruption_renders_one_plain_notice() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("initial prompt");
+        view.set_interrupting(InterruptIntent::StopTurn);
+
+        assert_eq!(view.finish_turn(Ok(SubmitOutcome::Cancelled)), None);
+
+        let rendered = view
+            .take_pending_history_lines(88)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered.matches("Turn interrupted").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Model interrupted to submit steering input"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn steering_interruption_replaces_the_plain_notice() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("initial prompt");
+        let steering = prompt("change direction");
+        let (handle, _control) = crate::agent::TurnControl::channel();
+        let id = handle
+            .steer(crate::input::UserInput::text(steering.as_str()))
+            .unwrap();
+        view.add_pending_steer(id, steering.clone());
+        view.set_interrupting(InterruptIntent::SubmitSteering);
+
+        let submitted = view
+            .finish_turn(Ok(SubmitOutcome::Cancelled))
+            .expect("the pending steer should start a replacement turn");
+        assert_eq!(submitted, steering);
+        view.start_turn(submitted);
+
+        let rendered = view
+            .take_pending_history_lines(88)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered
+                .matches("Model interrupted to submit steering input")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Turn interrupted"), "{rendered}");
+    }
+
+    #[test]
+    fn committed_steer_falls_back_to_the_plain_interruption_notice() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("initial prompt");
+        let (handle, _control) = crate::agent::TurnControl::channel();
+        let id = handle
+            .steer(crate::input::UserInput::text("already committed"))
+            .unwrap();
+        view.add_pending_steer(id, prompt("already committed"));
+        view.set_interrupting(InterruptIntent::SubmitSteering);
+        view.handle_agent_event(AgentEvent::SteeringCommitted(id));
+
+        assert_eq!(view.finish_turn(Ok(SubmitOutcome::Cancelled)), None);
+
+        let rendered = view
+            .take_pending_history_lines(88)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered.matches("Turn interrupted").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Model interrupted to submit steering input"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn interrupted_pending_input_is_restored_before_the_existing_draft() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         let (handle, _control) = crate::agent::TurnControl::channel();
@@ -5194,6 +5372,33 @@ mod tests {
         );
         assert_eq!(view.pending_input.steer_count(), 0);
         assert_eq!(view.pending_input.follow_up_count(), 0);
+    }
+
+    #[test]
+    fn only_a_steering_interrupt_consumes_pending_steers() {
+        fn interrupted_view(intent: InterruptIntent) -> (View, Option<UserPrompt>) {
+            let mut view = View::new(Path::new("/tmp/bettercodex"));
+            view.start_turn("initial prompt");
+            let (handle, _control) = crate::agent::TurnControl::channel();
+            let id = handle
+                .steer(crate::input::UserInput::text("pending steer"))
+                .unwrap();
+            view.add_pending_steer(id, prompt("pending steer"));
+            view.queue_follow_up(prompt("queued follow-up"));
+            view.set_interrupting(intent);
+            let steering = view.finish_turn(Ok(SubmitOutcome::Cancelled));
+            (view, steering)
+        }
+
+        let (stopped, steering) = interrupted_view(InterruptIntent::StopTurn);
+        assert!(steering.is_none());
+        assert_eq!(stopped.pending_input.steer_count(), 1);
+        assert_eq!(stopped.pending_input.follow_up_count(), 1);
+
+        let (steered, steering) = interrupted_view(InterruptIntent::SubmitSteering);
+        assert_eq!(steering.unwrap().as_str(), "pending steer");
+        assert_eq!(steered.pending_input.steer_count(), 0);
+        assert_eq!(steered.pending_input.follow_up_count(), 1);
     }
 
     #[test]
@@ -5439,13 +5644,13 @@ mod tests {
         assert!(view.overlay.is_none());
 
         view.show_context(ContextSnapshot {
-            used_tokens: 70_680,
+            used_tokens: 51_680,
             context_window: EFFECTIVE_CONTEXT_WINDOW,
             compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: true,
             sections: vec![ContextSection {
                 kind: ContextKind::UserMessages,
-                tokens: 70_680,
+                tokens: 51_680,
                 items: 4,
             }],
         });
@@ -5457,24 +5662,24 @@ mod tests {
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(rendered.contains("Context"), "{rendered}");
-        assert!(rendered.contains("70.7K / 353.4K tokens"), "{rendered}");
+        assert!(rendered.contains("51.7K / 258.4K tokens"), "{rendered}");
         assert!(rendered.contains("User messages"), "{rendered}");
         assert!(rendered.contains("Auto-compact reserve"), "{rendered}");
 
         view.handle_agent_event(AgentEvent::ContextUpdated(ContextSnapshot {
-            used_tokens: 106_020,
+            used_tokens: 77_520,
             context_window: EFFECTIVE_CONTEXT_WINDOW,
             compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
             measured: true,
             sections: vec![ContextSection {
                 kind: ContextKind::AssistantMessages,
-                tokens: 106_020,
+                tokens: 77_520,
                 items: 6,
             }],
         }));
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("106K / 353.4K tokens"), "{rendered}");
+        assert!(rendered.contains("77.5K / 258.4K tokens"), "{rendered}");
         assert!(rendered.contains("Assistant messages"), "{rendered}");
 
         assert_eq!(
@@ -5753,11 +5958,11 @@ mod tests {
     }
 
     #[test]
-    fn web_search_uses_codex_activity_cell_and_hides_the_tool_payload() {
+    fn repeated_web_activity_streams_as_one_exploration_tree() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:web".to_string(),
+            call_id: "cell:search".to_string(),
             name: "web.run".to_string(),
             input: Some(json!({
                 "search_query": [{"q": "OpenAI Codex GitHub official repository"}],
@@ -5766,22 +5971,73 @@ mod tests {
 
         assert_eq!(
             view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
-            ["• Searching the web"]
+            [
+                "• Exploring",
+                "  └ Search OpenAI Codex GitHub official repository",
+            ]
         );
 
         view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:web".to_string(),
+            call_id: "cell:search".to_string(),
             output: Ok(json!(
                 "opaque search result that must remain model-facing only"
             )),
             duration: Duration::from_millis(50),
         });
+        assert!(view.take_pending_history_lines(80).is_empty());
+
+        view.handle_agent_event(AgentEvent::ModelResponseCompleted);
+        view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
+        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
+            "**Following the sources**".to_string(),
+        ));
+        let follow_up_calls = [
+            (
+                "cell:open",
+                json!({"open": [{"ref_id": "turn0search0", "lineno": 24}]}),
+            ),
+            (
+                "cell:find",
+                json!({"find": [{"ref_id": "turn0fetch0", "pattern": "Responses"}]}),
+            ),
+        ];
+        for (call_id, input) in &follow_up_calls {
+            view.handle_agent_event(AgentEvent::ToolStarted {
+                call_id: (*call_id).to_string(),
+                name: "web.run".to_string(),
+                input: Some(input.clone()),
+            });
+        }
+        assert_eq!(
+            view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
+            [
+                "• Exploring",
+                "  └ Search OpenAI Codex GitHub official repository",
+                "    Open turn0search0 at line 24",
+                "    Find 'Responses' in turn0fetch0",
+            ]
+        );
+        for (call_id, _) in follow_up_calls {
+            view.handle_agent_event(AgentEvent::ToolCompleted {
+                call_id: call_id.to_string(),
+                output: Ok(json!("another opaque result")),
+                duration: Duration::from_millis(50),
+            });
+        }
+
+        assert!(view.take_pending_history_lines(80).is_empty());
+        view.handle_agent_event(AgentEvent::ModelMessageDelta("done".to_string()));
         assert_eq!(
             view.take_pending_history_lines(80)
                 .iter()
                 .map(plain)
                 .collect::<Vec<_>>(),
-            ["• Searched the web for OpenAI Codex GitHub official repository"]
+            [
+                "• Explored",
+                "  └ Search OpenAI Codex GitHub official repository",
+                "    Open turn0search0 at line 24",
+                "    Find 'Responses' in turn0fetch0",
+            ]
         );
     }
 

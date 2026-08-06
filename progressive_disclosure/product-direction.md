@@ -23,14 +23,13 @@ framework, Node workspace, and Bazel build.
 
 - model: `gpt-5.6-sol`;
 - reasoning effort: `max`;
-- raw context window: 372,000 tokens;
-- effective context window: 95%, or 353,400 tokens;
+- raw context window: 272,000 tokens;
+- effective context window: 95%, or 258,400 tokens;
 - maximum output tokens: 128,000; and
-- automatic compaction: 90% of the raw window, or 334,800 tokens (approximately
+- automatic compaction: 90% of the raw window, or 244,800 tokens (approximately
   95% of the effective window).
 
-The 372,000-token window is a bettercodex choice. It is not the public API limit
-or the value in Codex's model catalog.
+The context limits intentionally match Codex's `gpt-5.6-sol` model catalog.
 
 The runtime is one Cargo package and one `bcodex` binary. It contains the
 inference loop and terminal UI for one operator. Commands and patches run with

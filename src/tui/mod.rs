@@ -55,6 +55,7 @@ use tokio::time::Interval;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 use view::Action;
+use view::InterruptIntent;
 use view::View;
 
 type TurnResult = (Agent, TurnCompletion);
@@ -99,7 +100,6 @@ struct Runtime {
     turn: Option<TurnTask>,
     turn_events: Option<UnboundedReceiver<AgentEvent>>,
     turn_handle: Option<TurnHandle>,
-    submit_steers_after_interrupt: bool,
     exit_after_turn: bool,
     context_snapshot: ContextSnapshot,
     diff_task: Option<JoinHandle<()>>,
@@ -158,7 +158,6 @@ impl Runtime {
             turn: None,
             turn_events: None,
             turn_handle: None,
-            submit_steers_after_interrupt: false,
             exit_after_turn: false,
             context_snapshot,
             diff_task: None,
@@ -224,7 +223,7 @@ impl Runtime {
             tokio::select! {
                 terminal_event = input.next() => {
                     let Some(terminal_event) = terminal_event else {
-                        self.cancel_turn();
+                        self.cancel_turn(InterruptIntent::StopTurn);
                         break;
                     };
                     let event = terminal_event.context("failed to read terminal input")?;
@@ -300,17 +299,19 @@ impl Runtime {
                         _ => None,
                     };
                     let completed = completion.completed();
-                    match completion {
+                    let steering_after_interrupt = match completion {
                         TurnCompletion::Submission(result) => self.view.finish_turn(result),
-                        TurnCompletion::Compaction(result) => self.view.finish_compaction(result),
-                    }
+                        TurnCompletion::Compaction(result) => {
+                            self.view.finish_compaction(result);
+                            None
+                        }
+                    };
                     redraw = true;
 
                     if self.exit_after_turn {
                         break;
                     }
                     if completed {
-                        self.submit_steers_after_interrupt = false;
                         if let Some(prompt) = self.view.pop_next_queued_follow_up() {
                             self.start_turn(prompt);
                         } else if let (Some(message), Some(elapsed)) = (notification, elapsed)
@@ -321,18 +322,8 @@ impl Runtime {
                         {
                             self.post_notification(&message);
                         }
-                    } else if self.submit_steers_after_interrupt {
-                        self.submit_steers_after_interrupt = false;
-                        let steers = self.view.take_pending_steers();
-                        if steers.is_empty() {
-                            self.view.restore_pending_input_to_composer();
-                        } else {
-                            self.view.add_notice(
-                                "Model interrupted to submit steering input".to_string(),
-                            );
-                            let prompt = UserPrompt::joined(steers);
-                            self.start_turn(prompt);
-                        }
+                    } else if let Some(prompt) = steering_after_interrupt {
+                        self.start_turn(prompt);
                     } else {
                         self.view.restore_pending_input_to_composer();
                     }
@@ -429,7 +420,6 @@ impl Runtime {
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.prompt_history = Some(prompt_history);
-                    self.submit_steers_after_interrupt = false;
                     self.view.clear();
                     let agent = self
                         .agent
@@ -504,7 +494,7 @@ impl Runtime {
             Action::Quit => {
                 if self.turn.is_some() {
                     self.exit_after_turn = true;
-                    self.cancel_turn();
+                    self.cancel_turn(InterruptIntent::StopTurn);
                 } else {
                     return Ok(true);
                 }
@@ -540,7 +530,6 @@ impl Runtime {
         self.view.set_background_processes(Vec::new());
         self.agent = Some(agent);
         self.prompt_history = Some(prompt_history);
-        self.submit_steers_after_interrupt = false;
         self.view
             .add_notice(format!("Forked conversation into session {session_id}"));
         Ok(())
@@ -643,7 +632,6 @@ impl Runtime {
         self.processes = processes;
         self.context_snapshot = context_snapshot;
         self.agent = Some(agent);
-        self.submit_steers_after_interrupt = false;
         self.exit_after_turn = false;
         self.file_search = file_search;
         self.file_search_updates = file_search_updates;
@@ -691,16 +679,20 @@ impl Runtime {
         }));
     }
 
-    fn cancel_turn(&mut self) {
+    fn cancel_turn(&mut self, intent: InterruptIntent) {
         if let Some(turn) = &self.turn_handle {
             turn.cancel();
-            self.view.set_interrupting();
+            self.view.set_interrupting(intent);
         }
     }
 
     fn interrupt_turn(&mut self) {
-        self.submit_steers_after_interrupt = self.view.has_pending_steers();
-        self.cancel_turn();
+        let intent = if self.view.has_pending_steers() {
+            InterruptIntent::SubmitSteering
+        } else {
+            InterruptIntent::StopTurn
+        };
+        self.cancel_turn(intent);
     }
 
     fn drain_agent_events(&mut self) {

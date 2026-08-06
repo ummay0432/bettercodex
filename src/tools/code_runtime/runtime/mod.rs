@@ -7,6 +7,7 @@ mod value;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -69,7 +70,7 @@ pub(crate) enum RuntimeEvent {
 }
 
 pub(crate) fn spawn_runtime(
-    stored_values: HashMap<String, JsonValue>,
+    stored_values: Arc<HashMap<String, JsonValue>>,
     request: ExecuteRequest,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     pending_mode: PendingRuntimeMode,
@@ -138,14 +139,14 @@ struct RuntimeConfig {
     tool_call_id: String,
     enabled_tools: Vec<EnabledToolMetadata>,
     source: String,
-    stored_values: HashMap<String, JsonValue>,
+    stored_values: Arc<HashMap<String, JsonValue>>,
 }
 
 pub(super) struct RuntimeState {
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
-    stored_values: HashMap<String, JsonValue>,
+    stored_values: Arc<HashMap<String, JsonValue>>,
     stored_value_writes: HashMap<String, JsonValue>,
     enabled_tools: Vec<EnabledToolMetadata>,
     next_tool_call_id: u64,

@@ -5,6 +5,7 @@ mod executor;
 mod image_preparation;
 mod papercuts;
 mod patch;
+mod process_session;
 
 const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
     code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
@@ -30,6 +31,7 @@ use codex_utils_image::data_url_from_bytes;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text;
 use serde::Deserialize;
+use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use std::path::Path;
@@ -84,20 +86,22 @@ impl ToolCall {
             .unwrap_or_else(|error| ToolResult::text(format!("{error:#}")))
     }
 
-    pub(crate) fn output_items(&self, output: &ToolResult) -> Vec<Value> {
-        let mut items = output.preceding_items.clone();
-        items.push(match self {
-            Self::Function { call_id, .. } => json!({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": output.body,
-            }),
-            Self::Custom { call_id, .. } => json!({
-                "type": "custom_tool_call_output",
-                "call_id": call_id,
-                "output": output.body,
-            }),
-        });
+    pub(crate) fn into_output_items(self, output: ToolResult) -> Vec<Value> {
+        let ToolResult {
+            body,
+            preceding_items,
+            ..
+        } = output;
+        let mut items = preceding_items;
+        let (item_type, call_id) = match self {
+            Self::Function { call_id, .. } => ("function_call_output", call_id),
+            Self::Custom { call_id, .. } => ("custom_tool_call_output", call_id),
+        };
+        let mut item = Map::new();
+        item.insert("type".to_string(), Value::String(item_type.to_string()));
+        item.insert("call_id".to_string(), Value::String(call_id));
+        item.insert("output".to_string(), body);
+        items.push(Value::Object(item));
         items
     }
 
@@ -127,7 +131,9 @@ impl ToolCall {
 
 pub(crate) struct ToolResult {
     body: Value,
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Runtime tests inspect this human-readable projection. Production moves the structured body
+    // directly into history and should not duplicate every text result merely for a dead preview.
+    #[cfg(test)]
     pub(crate) preview: String,
     preceding_items: Vec<Value>,
 }
@@ -138,9 +144,12 @@ impl ToolResult {
             &text,
             TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
         );
+        #[cfg(test)]
+        let preview = text.clone();
         Self {
-            body: Value::String(text.clone()),
-            preview: text,
+            body: Value::String(text),
+            #[cfg(test)]
+            preview,
             preceding_items: Vec::new(),
         }
     }

@@ -758,6 +758,7 @@ fn cached_context_metrics_follow_every_history_mutation() {
                 "encrypted_content": "opaque metrics",
             })],
             InitialContextInjection::AfterCompaction,
+            &ActiveTurnContext::default(),
             None,
         )
         .unwrap();
@@ -800,6 +801,7 @@ fn sampling_history_cursor_tracks_appends_and_rejects_rewrites() {
                 "encrypted_content": "opaque",
             })],
             InitialContextInjection::AfterCompaction,
+            &ActiveTurnContext::default(),
             None,
         )
         .unwrap();
@@ -940,6 +942,7 @@ fn compaction_replaces_history_canonically_then_reinjects_world_state() {
         .replace_compacted(
             canonical.clone(),
             InitialContextInjection::AfterCompaction,
+            &ActiveTurnContext::default(),
             Some(compaction_usage.clone()),
         )
         .unwrap();
@@ -985,16 +988,24 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     let world_state = conversation.world_state.items();
     let current_user = UserInput::text("current turn").into_message_and_skills().0;
+    let active_skill = message(
+        "user",
+        "<skill_context>\n<instructions>exact active workflow</instructions>\n</skill_context>"
+            .to_string(),
+    );
     let summary = json!({
         "type": "compaction_summary",
         "id": "cmp_mid",
         "encrypted_content": "opaque",
     });
+    let mut active_turn_context = ActiveTurnContext::default();
+    active_turn_context.record_input(vec![active_skill.clone()]);
 
     conversation
         .replace_compacted(
             vec![current_user.clone(), summary.clone()],
             InitialContextInjection::BeforeLastUserMessage,
+            &active_turn_context,
             None,
         )
         .unwrap();
@@ -1004,14 +1015,181 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
         .iter()
         .position(|item| item == &current_user)
         .unwrap();
+    let skill_index = conversation
+        .items()
+        .iter()
+        .position(|item| item == &active_skill)
+        .unwrap();
+    assert!(skill_index < user_index);
     for item in world_state {
         let world_index = conversation
             .items()
             .iter()
             .position(|candidate| candidate == &item)
             .unwrap();
-        assert!(world_index < user_index);
+        assert!(world_index < skill_index);
     }
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mid_turn_context_blocks_stay_attached_to_their_operator_inputs() {
+    let (root, cwd) = temporary_repository("mid-turn-context-blocks");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let world_state = conversation.world_state.items();
+    let first_user = UserInput::text("initial task").into_message_and_skills().0;
+    let steering_user = UserInput::text("later steering")
+        .into_message_and_skills()
+        .0;
+    let first_skill = message(
+        "user",
+        "<skill_context>\n<name>first</name>\n</skill_context>".to_string(),
+    );
+    let steering_skill = message(
+        "user",
+        "<skill_context>\n<name>steering</name>\n</skill_context>".to_string(),
+    );
+    let delegated = json!({
+        "type": "agent_message",
+        "author": "worker",
+        "recipient": "root",
+        "content": [{"type": "input_text", "text": "delegated result"}],
+    });
+    let summary = json!({
+        "type": "compaction",
+        "id": "cmp_context_blocks",
+        "encrypted_content": "opaque",
+    });
+    let mut active_turn_context = ActiveTurnContext::default();
+    active_turn_context.record_input(vec![first_skill.clone()]);
+    active_turn_context.record_input(vec![steering_skill.clone()]);
+
+    conversation
+        .replace_compacted(
+            vec![
+                first_user.clone(),
+                steering_user.clone(),
+                delegated.clone(),
+                summary.clone(),
+            ],
+            InitialContextInjection::BeforeLastUserMessage,
+            &active_turn_context,
+            None,
+        )
+        .unwrap();
+
+    let index_of = |expected: &Value| {
+        conversation
+            .items()
+            .iter()
+            .position(|item| item == expected)
+            .unwrap()
+    };
+    let first_skill_index = index_of(&first_skill);
+    let first_user_index = index_of(&first_user);
+    let steering_skill_index = index_of(&steering_skill);
+    let steering_user_index = index_of(&steering_user);
+    let delegated_index = index_of(&delegated);
+    assert!(first_skill_index < first_user_index);
+    assert!(first_user_index < steering_skill_index);
+    assert!(steering_skill_index < steering_user_index);
+    assert!(steering_user_index < delegated_index);
+    assert!(
+        world_state
+            .iter()
+            .all(|world_item| index_of(world_item) < first_skill_index)
+    );
+    assert_eq!(conversation.items().last(), Some(&summary));
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn oversized_compaction_replacement_is_rejected_transactionally() {
+    let (root, cwd) = temporary_repository("oversized-compaction-replacement");
+    let rollout_root = root.join("state");
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let before = conversation.items().to_vec();
+    let oversized = json!({
+        "type": "compaction",
+        "id": "cmp_oversized",
+        "encrypted_content": "x".repeat(
+            usize::try_from(AUTO_COMPACT_TOKEN_LIMIT.saturating_mul(6)).unwrap()
+        ),
+    });
+
+    let error = conversation
+        .replace_compacted(
+            vec![oversized],
+            InitialContextInjection::AfterCompaction,
+            &ActiveTurnContext::default(),
+            None,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("did not restore headroom"));
+    assert_eq!(conversation.items(), before);
+    drop(conversation);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.compaction_count, 0);
+    assert_eq!(loaded.history, before);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn image_heavy_compaction_keeps_every_image_that_fits_before_the_next_cadence() {
+    let (root, cwd) = temporary_repository("image-heavy-compaction");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let mut content = vec![json!({"type": "input_text", "text": "inspect these images"})];
+    content.extend((0..150).map(|_| {
+        json!({
+            "type": "input_image",
+            "image_url": "data:image/png;base64,AAAA",
+            "detail": "low",
+        })
+    }));
+    let user = json!({
+        "type": "message",
+        "role": "user",
+        "content": content,
+    });
+    let summary = json!({
+        "type": "compaction",
+        "id": "cmp_many_images",
+        "encrypted_content": "opaque",
+    });
+    assert!(
+        estimated_tokens(&[user.clone(), summary.clone()]) >= AUTO_COMPACT_TOKEN_LIMIT,
+        "fixture must exceed the next automatic-compaction cadence"
+    );
+
+    conversation
+        .replace_compacted(
+            vec![user, summary.clone()],
+            InitialContextInjection::BeforeLastUserMessage,
+            &ActiveTurnContext::default(),
+            None,
+        )
+        .unwrap();
+
+    let retained_images = conversation
+        .items()
+        .iter()
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter(|content_item| content_item["type"] == "input_image")
+        .count();
+    assert!(retained_images > 0);
+    assert!(retained_images < 150);
+    assert!(conversation.projected_tokens(&[]) < AUTO_COMPACT_TOKEN_LIMIT);
+    assert_eq!(conversation.items().last(), Some(&summary));
 
     drop(conversation);
     std::fs::remove_dir_all(root).unwrap();
@@ -1040,6 +1218,7 @@ fn mid_turn_context_is_inserted_before_the_last_retained_agent_message() {
         .replace_compacted(
             vec![current_user, agent_message.clone(), summary.clone()],
             InitialContextInjection::BeforeLastUserMessage,
+            &ActiveTurnContext::default(),
             None,
         )
         .unwrap();
@@ -1056,6 +1235,61 @@ fn mid_turn_context_is_inserted_before_the_last_retained_agent_message() {
             .position(|item| item == &world_item)
             .is_some_and(|index| index < agent_index)
     }));
+    assert_eq!(conversation.items().last(), Some(&summary));
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn active_context_precedes_agent_message_when_remote_retention_drops_every_operator_input() {
+    let (root, cwd) = temporary_repository("mid-turn-agent-without-user");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let world_state = conversation.world_state.items();
+    let active_skill = message(
+        "user",
+        "<skill_context>\n<instructions>keep this workflow active</instructions>\n</skill_context>"
+            .to_string(),
+    );
+    let agent_message = json!({
+        "type": "agent_message",
+        "author": "worker",
+        "recipient": "root",
+        "content": [{"type": "input_text", "text": "latest delegated context"}],
+    });
+    let summary = json!({
+        "type": "compaction",
+        "id": "cmp_agent_without_user",
+        "encrypted_content": "opaque",
+    });
+    let mut active_turn_context = ActiveTurnContext::default();
+    active_turn_context.record_input(vec![active_skill.clone()]);
+
+    conversation
+        .replace_compacted(
+            vec![agent_message.clone(), summary.clone()],
+            InitialContextInjection::BeforeLastUserMessage,
+            &active_turn_context,
+            None,
+        )
+        .unwrap();
+
+    let index_of = |expected: &Value| {
+        conversation
+            .items()
+            .iter()
+            .position(|item| item == expected)
+            .unwrap()
+    };
+    let skill_index = index_of(&active_skill);
+    let agent_index = index_of(&agent_message);
+    assert!(skill_index < agent_index);
+    assert!(
+        world_state
+            .iter()
+            .all(|world_item| index_of(world_item) < skill_index)
+    );
     assert_eq!(conversation.items().last(), Some(&summary));
 
     drop(conversation);
@@ -1085,6 +1319,7 @@ fn retained_world_state_keeps_remote_v2_history_order_unchanged() {
         .replace_compacted(
             canonical.clone(),
             InitialContextInjection::BeforeLastUserMessage,
+            &ActiveTurnContext::default(),
             None,
         )
         .unwrap();
@@ -1232,10 +1467,10 @@ fn resume_replaces_stale_world_state_without_losing_the_usage_baseline() {
 }
 
 #[test]
-fn compaction_boundary_matches_codex_ninety_percent_auto_compact_limit() {
-    assert_eq!(RAW_CONTEXT_WINDOW, 372_000);
-    assert_eq!(EFFECTIVE_CONTEXT_WINDOW, 353_400);
-    assert_eq!(AUTO_COMPACT_TOKEN_LIMIT, 334_800);
+fn context_boundaries_match_codex_sol_model_metadata() {
+    assert_eq!(RAW_CONTEXT_WINDOW, 272_000);
+    assert_eq!(EFFECTIVE_CONTEXT_WINDOW, 258_400);
+    assert_eq!(AUTO_COMPACT_TOKEN_LIMIT, 244_800);
     let (root, cwd) = temporary_repository("threshold");
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();

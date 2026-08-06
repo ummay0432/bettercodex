@@ -11,6 +11,10 @@ fn message(role: &str, text: &str) -> Value {
 #[test]
 fn remote_v2_retains_only_recent_user_and_non_completion_agent_messages() {
     let user = message("user", "real user request");
+    let reserved_prefix_user = message(
+        "user",
+        "<skill_context> is the literal syntax I need you to investigate",
+    );
     let delegated = json!({
         "type": "agent_message",
         "author": "worker",
@@ -23,13 +27,14 @@ fn remote_v2_retains_only_recent_user_and_non_completion_agent_messages() {
         message("developer", "system prompt"),
         message(
             "user",
-            "# Repository onboarding from AGENTS.md for /repo\n\nstale instructions",
+            "# Repository onboarding from AGENTS.md for /repo\n\nstale instructions\n# End repository onboarding",
         ),
         message("user", "<turn_aborted>\ninterrupted\n</turn_aborted>"),
         message(
             "user",
             "<response_interrupted>\nretry\n</response_interrupted>",
         ),
+        reserved_prefix_user.clone(),
         user.clone(),
         json!({
             "type": "message",
@@ -58,7 +63,7 @@ fn remote_v2_retains_only_recent_user_and_non_completion_agent_messages() {
 
     assert_eq!(
         build_compacted_history(&history, compaction.clone()),
-        vec![user, delegated, compaction]
+        vec![reserved_prefix_user, user, delegated, compaction]
     );
 }
 
@@ -75,6 +80,36 @@ fn retained_history_budget_keeps_the_newest_messages() {
         truncate_retained_messages(retained, 3),
         vec![message("user", "midd…1 tokens truncated…1234"), newest,]
     );
+}
+
+#[test]
+fn multimodal_inputs_match_upstream_text_only_retention_budgeting() {
+    let images = (0..40).map(|_| {
+        json!({
+            "type": "input_image",
+            "image_url": "data:image/png;base64,AAAA",
+            "detail": "low",
+        })
+    });
+    let mut content = vec![json!({"type": "input_text", "text": "inspect every image"})];
+    content.extend(images);
+    let original = json!({
+        "type": "message",
+        "role": "user",
+        "content": content,
+    });
+    let budget = 10_000;
+
+    let retained = truncate_retained_messages(vec![original], budget);
+    assert_eq!(retained.len(), 1);
+    let retained_images = retained[0]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "input_image")
+        .count();
+    assert_eq!(retained_images, 40);
+    assert!(message_text_token_count(&retained[0]) <= budget);
 }
 
 #[test]
@@ -126,4 +161,16 @@ fn compaction_output_validation_ignores_other_output_items_but_requires_one_summ
         .unwrap_err()
         .contains("got 2")
     );
+    for malformed in [
+        json!({"type": "compaction"}),
+        json!({"type": "compaction", "encrypted_content": ""}),
+        json!({"type": "compaction", "encrypted_content": "  \n"}),
+        json!({"type": "compaction", "encrypted_content": null}),
+    ] {
+        assert!(
+            opaque_compaction_item(&[malformed])
+                .unwrap_err()
+                .contains("non-empty encrypted_content")
+        );
+    }
 }

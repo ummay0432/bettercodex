@@ -21,8 +21,10 @@ use codex_client::RetryPolicy;
 use codex_client::TransportError;
 use codex_client::run_with_retry;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageDetail;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::models::WebSearchAction;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::formatted_truncate_text;
@@ -84,6 +86,42 @@ struct SearchRequest {
 #[serde(untagged)]
 enum SearchInput {
     Items(Vec<ResponseItem>),
+}
+
+/// Borrowed projection of a history message used to build standalone-search context.
+///
+/// Deserializing from `&Value` validates the same wire fields as `ResponseItem` without deep-
+/// cloning payloads such as input images that the search endpoint never receives.
+#[derive(Deserialize)]
+struct HistoryMessage<'a> {
+    #[serde(default, rename = "id")]
+    _id: Option<&'a str>,
+    role: &'a str,
+    #[serde(borrow)]
+    content: Vec<HistoryContent<'a>>,
+    #[serde(default)]
+    phase: Option<MessagePhase>,
+    #[serde(default)]
+    internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum HistoryContent<'a> {
+    InputText {
+        text: &'a str,
+    },
+    InputImage {
+        image_url: &'a str,
+        #[serde(default)]
+        detail: Option<ImageDetail>,
+    },
+    InputAudio {
+        audio_url: &'a str,
+    },
+    OutputText {
+        text: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, JsonSchema)]
@@ -242,6 +280,15 @@ enum SportsFunction {
     Standings,
 }
 
+impl SportsFunction {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Schedule => "schedule",
+            Self::Standings => "standings",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum SportsLeague {
@@ -254,6 +301,22 @@ enum SportsLeague {
     Ncaamb,
     Ncaawb,
     Ipl,
+}
+
+impl SportsLeague {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Nba => "NBA",
+            Self::Wnba => "WNBA",
+            Self::Nfl => "NFL",
+            Self::Nhl => "NHL",
+            Self::Mlb => "MLB",
+            Self::Epl => "EPL",
+            Self::Ncaamb => "NCAAMB",
+            Self::Ncaawb => "NCAAWB",
+            Self::Ipl => "IPL",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -277,6 +340,22 @@ struct SearchResponse {
     output: String,
     #[serde(default, rename = "results")]
     _results: Option<Vec<Value>>,
+}
+
+/// One concise row in the TUI's grouped web-activity tree.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WebActivity {
+    pub(crate) verb: &'static str,
+    pub(crate) detail: String,
+}
+
+impl WebActivity {
+    fn new(verb: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            verb,
+            detail: detail.into(),
+        }
+    }
 }
 
 impl WebSearchClient {
@@ -379,10 +458,129 @@ pub(crate) fn input_schema() -> &'static Value {
     &INPUT_SCHEMA
 }
 
-pub(crate) fn action_for_display(input: Option<&Value>) -> WebSearchAction {
-    parse_commands(input.cloned())
-        .map(|commands| command_action(&commands))
-        .unwrap_or(WebSearchAction::Other)
+pub(crate) fn activities_for_display(input: Option<Value>) -> Vec<WebActivity> {
+    let Ok(commands) = parse_commands(input) else {
+        return vec![WebActivity::new("Browse", String::new())];
+    };
+    let SearchCommands {
+        search_query,
+        image_query,
+        open,
+        click,
+        find,
+        screenshot,
+        finance,
+        weather,
+        sports,
+        time,
+        response_length: _,
+    } = commands;
+    let mut activities = Vec::new();
+
+    if let Some(queries) = search_query {
+        activities.extend(
+            queries
+                .into_iter()
+                .map(|query| WebActivity::new("Search", query.q)),
+        );
+    }
+    if let Some(queries) = image_query {
+        activities.extend(
+            queries
+                .into_iter()
+                .map(|query| WebActivity::new("Image search", query.q)),
+        );
+    }
+    if let Some(operations) = open {
+        activities.extend(operations.into_iter().map(|operation| {
+            let detail = match operation.lineno {
+                Some(line) => format!("{} at line {line}", operation.ref_id),
+                None => operation.ref_id,
+            };
+            WebActivity::new("Open", detail)
+        }));
+    }
+    if let Some(operations) = click {
+        activities.extend(operations.into_iter().map(|operation| {
+            WebActivity::new(
+                "Open",
+                format!("link {} in {}", operation.id, operation.ref_id),
+            )
+        }));
+    }
+    if let Some(operations) = find {
+        activities.extend(operations.into_iter().map(|operation| {
+            WebActivity::new(
+                "Find",
+                format!("'{}' in {}", operation.pattern, operation.ref_id),
+            )
+        }));
+    }
+    if let Some(operations) = screenshot {
+        activities.extend(operations.into_iter().map(|operation| {
+            WebActivity::new(
+                "Screenshot",
+                format!("page index {} of {}", operation.pageno, operation.ref_id),
+            )
+        }));
+    }
+    if let Some(operations) = finance {
+        activities.extend(operations.into_iter().map(|operation| {
+            let ticker = operation.ticker;
+            let detail = match operation.market.filter(|market| !market.is_empty()) {
+                Some(market) => format!("{ticker} ({market})"),
+                None => ticker,
+            };
+            WebActivity::new("Finance", detail)
+        }));
+    }
+    if let Some(operations) = weather {
+        activities.extend(operations.into_iter().map(|operation| {
+            let mut detail = operation.location;
+            if let Some(start) = operation.start {
+                detail.push_str(&format!(" from {start}"));
+            }
+            if let Some(duration) = operation.duration {
+                let plural = if duration == 1 { "" } else { "s" };
+                detail.push_str(&format!(" for {duration} day{plural}"));
+            }
+            WebActivity::new("Weather", detail)
+        }));
+    }
+    if let Some(operations) = sports {
+        activities.extend(operations.into_iter().map(|operation| {
+            let mut detail = format!(
+                "{} {}",
+                operation.league.display_name(),
+                operation.r#fn.display_name()
+            );
+            if let Some(team) = operation.team {
+                detail.push_str(&format!(" for {team}"));
+            }
+            if let Some(opponent) = operation.opponent {
+                detail.push_str(&format!(" vs {opponent}"));
+            }
+            match (operation.date_from, operation.date_to) {
+                (Some(from), Some(to)) => detail.push_str(&format!(" from {from} to {to}")),
+                (Some(from), None) => detail.push_str(&format!(" from {from}")),
+                (None, Some(to)) => detail.push_str(&format!(" through {to}")),
+                (None, None) => {}
+            }
+            WebActivity::new("Sports", detail)
+        }));
+    }
+    if let Some(operations) = time {
+        activities.extend(
+            operations
+                .into_iter()
+                .map(|operation| WebActivity::new("Time", operation.utc_offset)),
+        );
+    }
+
+    if activities.is_empty() {
+        activities.push(WebActivity::new("Browse", String::new()));
+    }
+    activities
 }
 
 fn commands_schema() -> Value {
@@ -426,54 +624,6 @@ fn parse_commands(input: Option<Value>) -> Result<SearchCommands> {
     }
 }
 
-fn command_action(commands: &SearchCommands) -> WebSearchAction {
-    commands
-        .search_query
-        .as_deref()
-        .and_then(query_action)
-        .or_else(|| commands.image_query.as_deref().and_then(query_action))
-        .or_else(|| {
-            commands
-                .open
-                .as_deref()
-                .and_then(|operations| operations.first())
-                .and_then(|operation| {
-                    reqwest::Url::parse(&operation.ref_id).is_ok().then(|| {
-                        WebSearchAction::OpenPage {
-                            url: Some(operation.ref_id.clone()),
-                        }
-                    })
-                })
-        })
-        .or_else(|| {
-            commands
-                .find
-                .as_deref()
-                .and_then(|operations| operations.first())
-                .map(|operation| WebSearchAction::FindInPage {
-                    url: reqwest::Url::parse(&operation.ref_id)
-                        .is_ok()
-                        .then(|| operation.ref_id.clone()),
-                    pattern: Some(operation.pattern.clone()),
-                })
-        })
-        .unwrap_or(WebSearchAction::Other)
-}
-
-fn query_action(queries: &[SearchQuery]) -> Option<WebSearchAction> {
-    match queries {
-        [] => None,
-        [query] => Some(WebSearchAction::Search {
-            query: Some(query.q.clone()),
-            queries: None,
-        }),
-        queries => Some(WebSearchAction::Search {
-            query: None,
-            queries: Some(queries.iter().map(|query| query.q.clone()).collect()),
-        }),
-    }
-}
-
 fn search_headers(turn_metadata: &str, auth: &crate::auth::AuthSnapshot) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert("authorization", auth.authorization.clone());
@@ -511,10 +661,28 @@ fn recent_input(history: &[Value]) -> Option<SearchInput> {
     let mut messages = Vec::new();
     let mut user_messages = 0;
     for value in history.iter().rev() {
-        let Some(message) = visible_message(value) else {
+        let Some(role) = value
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| *kind == "message")
+            .and_then(|_| value.get("role"))
+            .and_then(Value::as_str)
+            .filter(|role| matches!(*role, "assistant" | "user"))
+        else {
             continue;
         };
-        if message.is_user_message() {
+        // Search context ends at the newest operator input. Avoid even walking the assistant
+        // response that triggered the current tool call, because it is discarded by contract.
+        if role == "assistant" && user_messages == 0 {
+            continue;
+        }
+        let Ok(message) = HistoryMessage::deserialize(value) else {
+            continue;
+        };
+        if role == "user" {
+            if !message.is_operator_message() {
+                continue;
+            }
             user_messages += 1;
             messages.push(message);
             if user_messages == 2 {
@@ -524,112 +692,99 @@ fn recent_input(history: &[Value]) -> Option<SearchInput> {
             messages.push(message);
         }
     }
+    // With only one operator message, reverse traversal can encounter assistant messages that
+    // predate it. They are outside the selected turn just as trailing assistant output is.
+    if user_messages == 1 {
+        messages.truncate(1);
+    }
     messages.reverse();
-    retain_recent_user_turns(&mut messages, 2);
-    truncate_assistant_text(&mut messages, ASSISTANT_CONTEXT_TOKEN_LIMIT);
+    let mut assistant_tokens = ASSISTANT_CONTEXT_TOKEN_LIMIT;
+    let messages = messages
+        .into_iter()
+        .filter_map(|message| message.into_search_item(&mut assistant_tokens))
+        .collect::<Vec<_>>();
     (!messages.is_empty()).then_some(SearchInput::Items(messages))
 }
 
-fn visible_message(value: &Value) -> Option<ResponseItem> {
-    if value.get("type").and_then(Value::as_str) != Some("message")
-        || !matches!(
-            value.get("role").and_then(Value::as_str),
-            Some("assistant" | "user")
-        )
-    {
-        return None;
-    }
-    let item = serde_json::from_value::<ResponseItem>(value.clone()).ok()?;
-    match item {
-        ResponseItem::Message { ref role, .. } if role == "assistant" => {
-            let mut message = item;
-            message.set_id(None);
-            Some(message)
-        }
-        ResponseItem::Message {
-            role,
-            content,
-            phase,
-            internal_chat_message_metadata_passthrough,
-            ..
-        } if role == "user" && is_operator_message(&content) => {
-            let content = content
-                .into_iter()
-                .filter(|item| matches!(item, ContentItem::InputText { .. }))
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then_some(ResponseItem::Message {
-                id: None,
-                role,
-                content,
-                phase,
-                internal_chat_message_metadata_passthrough,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn is_operator_message(content: &[ContentItem]) -> bool {
-    let text = content
-        .iter()
-        .filter_map(|item| match item {
-            ContentItem::InputText { text } => Some(text.as_str()),
+impl HistoryMessage<'_> {
+    fn is_operator_message(&self) -> bool {
+        let mut text = self.content.iter().filter_map(|item| match item {
+            HistoryContent::InputText { text } => Some(*text),
             _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    !crate::context::is_contextual_user_text(&text)
-}
-
-fn retain_recent_user_turns(items: &mut Vec<ResponseItem>, user_message_count: usize) {
-    if user_message_count == 0 {
-        items.clear();
-        return;
-    }
-    let Some(latest_user) = items.iter().rposition(ResponseItem::is_user_message) else {
-        items.clear();
-        return;
-    };
-    items.truncate(latest_user + 1);
-    let earliest_user = items
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, item)| item.is_user_message())
-        .take(user_message_count)
-        .last()
-        .map(|(index, _)| index)
-        .unwrap_or(latest_user);
-    items.drain(..earliest_user);
-}
-
-fn truncate_assistant_text(items: &mut Vec<ResponseItem>, max_tokens: usize) {
-    let mut remaining = max_tokens;
-    items.retain_mut(|item| {
-        let ResponseItem::Message { role, content, .. } = item else {
-            return true;
-        };
-        if role != "assistant" {
-            return true;
-        }
-        content.retain_mut(|item| {
-            let ContentItem::OutputText { text } = item else {
-                return true;
-            };
-            if remaining == 0 {
-                return false;
-            }
-            let tokens = approx_token_count(text);
-            if tokens <= remaining {
-                remaining = remaining.saturating_sub(tokens);
-            } else {
-                *text = truncate_text(text, TruncationPolicy::Tokens(remaining));
-                remaining = 0;
-            }
-            true
         });
-        !content.is_empty()
-    });
+        let Some(first) = text.next() else {
+            return false;
+        };
+        let Some(second) = text.next() else {
+            return !crate::context::is_contextual_user_text(first);
+        };
+        let mut joined =
+            String::with_capacity(first.len().saturating_add(second.len()).saturating_add(1));
+        joined.push_str(first);
+        joined.push('\n');
+        joined.push_str(second);
+        for part in text {
+            joined.push('\n');
+            joined.push_str(part);
+        }
+        !crate::context::is_contextual_user_text(&joined)
+    }
+
+    fn into_search_item(self, assistant_tokens: &mut usize) -> Option<ResponseItem> {
+        let is_user = self.role == "user";
+        let content = self
+            .content
+            .into_iter()
+            .filter_map(|item| {
+                if is_user {
+                    return match item {
+                        HistoryContent::InputText { text } => Some(ContentItem::InputText {
+                            text: text.to_string(),
+                        }),
+                        HistoryContent::InputImage { .. }
+                        | HistoryContent::InputAudio { .. }
+                        | HistoryContent::OutputText { .. } => None,
+                    };
+                }
+                match item {
+                    HistoryContent::InputText { text } => Some(ContentItem::InputText {
+                        text: text.to_string(),
+                    }),
+                    HistoryContent::InputImage { image_url, detail } => {
+                        Some(ContentItem::InputImage {
+                            image_url: image_url.to_string(),
+                            detail,
+                        })
+                    }
+                    HistoryContent::InputAudio { audio_url } => Some(ContentItem::InputAudio {
+                        audio_url: audio_url.to_string(),
+                    }),
+                    HistoryContent::OutputText { .. } if *assistant_tokens == 0 => None,
+                    HistoryContent::OutputText { text } => {
+                        let tokens = approx_token_count(text);
+                        let text = if tokens <= *assistant_tokens {
+                            *assistant_tokens = assistant_tokens.saturating_sub(tokens);
+                            text.to_string()
+                        } else {
+                            let text =
+                                truncate_text(text, TruncationPolicy::Tokens(*assistant_tokens));
+                            *assistant_tokens = 0;
+                            text
+                        };
+                        Some(ContentItem::OutputText { text })
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        (!content.is_empty()).then_some(ResponseItem::Message {
+            id: None,
+            role: self.role.to_string(),
+            content,
+            phase: self.phase,
+            internal_chat_message_metadata_passthrough: self
+                .internal_chat_message_metadata_passthrough,
+        })
+    }
 }
 
 #[cfg(test)]

@@ -208,6 +208,147 @@ fn completed_items_are_emitted_once_in_api_order() {
 }
 
 #[test]
+fn completed_item_retains_its_stream_allocation_in_the_collector() {
+    let (completed_items, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::default();
+    let event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "reasoning",
+            "id": "rs_move",
+            "encrypted_content": "cipher payload",
+        },
+    });
+    let stream_allocation = event["item"]["encrypted_content"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+
+    process_event_value(event, &mut collected, &completed_items, None).unwrap();
+
+    assert_eq!(
+        collected.items[0]["encrypted_content"]
+            .as_str()
+            .unwrap()
+            .as_ptr(),
+        stream_allocation,
+        "stream payloads must move into the response collector instead of being deep-cloned"
+    );
+    assert_eq!(received.try_recv().unwrap(), collected.items[0]);
+}
+
+#[test]
+fn streaming_delta_payloads_move_from_decoding_into_tui_events() {
+    for (event_type, reasoning) in [
+        ("response.output_text.delta", false),
+        ("response.reasoning_summary_text.delta", true),
+    ] {
+        let payload = format!("{event_type}-payload");
+        let event = json!({"type": event_type, "delta": payload});
+        let decoded_allocation = event["delta"].as_str().unwrap().as_ptr();
+        let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+
+        process_event_value(
+            event,
+            &mut CollectedResponse::default(),
+            &completed_items,
+            Some(&events),
+        )
+        .unwrap();
+
+        let received = received.try_recv().unwrap();
+        let received_text = match &received {
+            AgentEvent::ModelMessageDelta(text) | AgentEvent::ReasoningSummaryDelta(text) => text,
+            event => panic!("expected a streaming delta event, got {event:?}"),
+        };
+        assert_eq!(received_text, &payload);
+        assert_eq!(
+            received_text.as_ptr(),
+            decoded_allocation,
+            "decoded delta payloads must move into TUI events instead of being copied"
+        );
+        assert_eq!(
+            matches!(received, AgentEvent::ReasoningSummaryDelta(_)),
+            reasoning
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_completed_output_handoff() {
+    const ITEMS: usize = 64;
+    const PAYLOAD_BYTES: usize = 1024 * 1024;
+
+    let events = (0..ITEMS)
+        .map(|index| {
+            json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": {
+                    "type": "reasoning",
+                    "id": format!("rs_{index}"),
+                    "encrypted_content": "x".repeat(PAYLOAD_BYTES),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let (completed_items, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::default();
+
+    let started = std::time::Instant::now();
+    for event in events {
+        process_event_value(event, &mut collected, &completed_items, None).unwrap();
+    }
+    let elapsed = started.elapsed();
+    for _ in 0..ITEMS {
+        std::hint::black_box(received.try_recv().unwrap());
+    }
+
+    eprintln!(
+        "{ITEMS} completed {} MiB output items handed to history in {elapsed:?}",
+        PAYLOAD_BYTES / (1024 * 1024)
+    );
+    assert_eq!(collected.items.len(), ITEMS);
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_websocket_event_handoff() {
+    const EVENTS: usize = 100_000;
+    const DELTA_BYTES: usize = 512;
+
+    let wire = json!({
+        "type": "response.output_text.delta",
+        "delta": "x".repeat(DELTA_BYTES),
+    })
+    .to_string();
+    let frame = tungstenite::Utf8Bytes::from(wire);
+    let frames = std::iter::repeat_n(frame, EVENTS).collect::<Vec<_>>();
+    let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::default();
+
+    let started = std::time::Instant::now();
+    for frame in frames {
+        let event = serde_json::from_str::<Value>(frame.as_str()).unwrap();
+        process_event_value(event, &mut collected, &completed_items, Some(&events)).unwrap();
+    }
+    drop(events);
+    let received = std::iter::from_fn(|| received.try_recv().ok())
+        .map(std::hint::black_box)
+        .count();
+    let elapsed = started.elapsed();
+
+    eprintln!(
+        "{EVENTS} WebSocket events with {DELTA_BYTES}-byte deltas decoded and handed to the TUI without intermediate payload copies in {elapsed:?}"
+    );
+    assert_eq!(received, EVENTS);
+}
+
+#[test]
 fn extracts_text_and_forwards_streaming_events() {
     assert_eq!(
         terminal_answer(&[assistant_item("done")]).as_deref(),
@@ -996,6 +1137,8 @@ async fn remote_compaction_v2_uses_the_responses_stream_and_builds_bounded_histo
         .unwrap();
     assert_eq!(compacted.items, vec![user_message("old"), compaction]);
     assert_eq!(compacted.usage.unwrap().total_tokens, 50);
+    assert_eq!(client.window, 0, "transport success is not installation");
+    client.commit_compaction();
     assert_eq!(client.window, 1);
     let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(request.path, "/responses");

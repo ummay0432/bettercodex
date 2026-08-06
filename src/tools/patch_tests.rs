@@ -103,18 +103,75 @@ fn patches_paths_outside_the_working_directory_with_user_permissions() {
 }
 
 #[test]
-fn preserves_codex_partial_application_on_later_failure() {
+fn validates_every_operation_before_mutating_files() {
     let root = TempDir::new();
+    let updated = root.path().join("updated.txt");
+    let deleted = root.path().join("deleted.txt");
+    std::fs::write(&updated, "before\n").unwrap();
+    std::fs::write(&deleted, "keep\n").unwrap();
     let error = apply_patch(
         root.path(),
-        "*** Begin Patch\n*** Add File: staged.txt\n+not yet\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch\n",
+        concat!(
+            "*** Begin Patch\n",
+            "*** Add File: staged.txt\n",
+            "+not yet\n",
+            "*** Update File: updated.txt\n",
+            "@@\n",
+            "-before\n",
+            "+after\n",
+            "*** Delete File: deleted.txt\n",
+            "*** Update File: missing.txt\n",
+            "@@\n",
+            "-old\n",
+            "+new\n",
+            "*** End Patch\n",
+        ),
     )
     .unwrap_err();
 
     assert!(error.to_string().contains("Failed to read file to update"));
+    assert!(!root.path().join("staged.txt").exists());
+    assert_eq!(std::fs::read_to_string(updated).unwrap(), "before\n");
+    assert_eq!(std::fs::read_to_string(deleted).unwrap(), "keep\n");
+}
+
+#[test]
+fn preparation_preserves_sequential_operations_on_the_same_paths() {
+    let root = TempDir::new();
+    let path = root.path().join("file.txt");
+    std::fs::write(&path, "original\n").unwrap();
+
+    apply_patch(
+        root.path(),
+        concat!(
+            "*** Begin Patch\n",
+            "*** Add File: added.txt\n",
+            "+one\n",
+            "*** Update File: added.txt\n",
+            "@@\n",
+            "-one\n",
+            "+two\n",
+            "*** Delete File: file.txt\n",
+            "*** Add File: file.txt\n",
+            "+replacement\n",
+            "*** Update File: file.txt\n",
+            "*** Move to: moved.txt\n",
+            "@@\n",
+            "-replacement\n",
+            "+final\n",
+            "*** End Patch\n",
+        ),
+    )
+    .unwrap();
+
     assert_eq!(
-        std::fs::read_to_string(root.path().join("staged.txt")).unwrap(),
-        "not yet\n",
+        std::fs::read_to_string(root.path().join("added.txt")).unwrap(),
+        "two\n"
+    );
+    assert!(!path.exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("moved.txt")).unwrap(),
+        "final\n"
     );
 }
 
