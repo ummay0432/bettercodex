@@ -42,7 +42,10 @@ pub(crate) struct SessionRuntime<D: SessionRuntimeDelegate> {
 }
 
 struct Inner<D: SessionRuntimeDelegate> {
-    stored_values: Mutex<HashMap<String, JsonValue>>,
+    // Each cell observes the store as it existed at admission. Immutable shared snapshots make
+    // that handoff constant-time even when stored values are large; commits copy only when an
+    // older snapshot is still live in a concurrent cell.
+    stored_values: Mutex<Arc<HashMap<String, JsonValue>>>,
     cells: Mutex<HashMap<CellId, CellHandle>>,
     cell_tasks: TaskTracker,
     shutdown_token: CancellationToken,
@@ -62,7 +65,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                stored_values: Mutex::new(HashMap::new()),
+                stored_values: Mutex::new(Arc::new(HashMap::new())),
                 cells: Mutex::new(HashMap::new()),
                 cell_tasks: TaskTracker::new(),
                 shutdown_token: CancellationToken::new(),
@@ -160,7 +163,10 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         request: CreateCellRequest,
         initial_observe_mode: ObserveMode,
     ) -> Result<RuntimeEventFuture, Error> {
-        let stored_values = self.inner.stored_values.lock().await.clone();
+        let stored_values = {
+            let stored_values = self.inner.stored_values.lock().await;
+            Arc::clone(&*stored_values)
+        };
         let host = Arc::new(RuntimeCellHost {
             cell_id: cell_id.clone(),
             inner: Arc::clone(&self.inner),
@@ -287,7 +293,9 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             stored_values = self.inner.stored_values.lock() => stored_values,
         };
         cell_state.commit_completion(event, pending_initial_yield_items, || {
-            stored_values.extend(stored_value_writes);
+            if !stored_value_writes.is_empty() {
+                Arc::make_mut(&mut stored_values).extend(stored_value_writes);
+            }
         })
     }
 

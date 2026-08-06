@@ -214,6 +214,7 @@ impl ToolRuntime {
                 "output": notification.text,
             }));
         }
+        #[cfg(test)]
         let preview = items
             .iter()
             .filter_map(|item| match item {
@@ -230,6 +231,7 @@ impl ToolRuntime {
         }
         Ok(ToolResult {
             body,
+            #[cfg(test)]
             preview,
             preceding_items: output_items,
         })
@@ -981,6 +983,129 @@ text("after");
             .await
             .unwrap();
         assert!(loaded.preview.contains("42"), "{}", loaded.preview);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stored_writes_are_visible_within_the_same_cell() {
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
+            .execute(
+                "call-store-load",
+                r#"store("answer", {value: 42}); text(load("answer").value);"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.preview.contains("42"), "{}", result.preview);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_cells_keep_their_starting_store_snapshot() {
+        let runtime = runtime(PathBuf::from("."));
+        runtime
+            .execute(
+                "call-seed",
+                r#"store("answer", {value: 1});"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let reader = runtime.execute(
+            "call-snapshot-reader",
+            r#"await new Promise(resolve => setTimeout(resolve, 200)); text(load("answer").value);"#,
+            None,
+            CancellationToken::new(),
+        );
+        let writer = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            runtime
+                .execute(
+                    "call-concurrent-writer",
+                    r#"store("answer", {value: 2});"#,
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        };
+        let (reader, ()) = tokio::join!(reader, writer);
+        let reader = reader.unwrap();
+
+        assert!(reader.preview.contains("1"), "{}", reader.preview);
+        let latest = runtime
+            .execute(
+                "call-latest-reader",
+                r#"text(load("answer").value);"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(latest.preview.contains("2"), "{}", latest.preview);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual performance measurement"]
+    async fn benchmark_large_stored_value_handoff() {
+        const SAMPLES: usize = 30;
+        const PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+        // Initialize V8 before either timing loop so this measures per-cell handoff.
+        let baseline = runtime(PathBuf::from("."));
+        baseline
+            .execute(
+                "warmup",
+                r#"text("ready");"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let baseline_started = Instant::now();
+        for sample in 0..SAMPLES {
+            baseline
+                .execute(
+                    &format!("baseline-{sample}"),
+                    r#"text("ready");"#,
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let with_store = runtime(PathBuf::from("."));
+        with_store
+            .execute(
+                "store-large-payload",
+                &format!(r#"store("payload", "x".repeat({PAYLOAD_BYTES}));"#),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let stored_started = Instant::now();
+        for sample in 0..SAMPLES {
+            with_store
+                .execute(
+                    &format!("stored-{sample}"),
+                    r#"text("ready");"#,
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let stored_elapsed = stored_started.elapsed();
+
+        eprintln!(
+            "{SAMPLES} exec cells with a {PAYLOAD_BYTES}-byte stored value: baseline {baseline_elapsed:?}, stored {stored_elapsed:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
