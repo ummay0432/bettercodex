@@ -136,10 +136,89 @@ fn validates_every_operation_before_mutating_files() {
 }
 
 #[test]
+fn validates_parent_path_conflicts_before_mutating_files() {
+    let root = TempDir::new();
+    let updated = root.path().join("updated.txt");
+    std::fs::write(&updated, "before\n").unwrap();
+
+    let error = apply_patch(
+        root.path(),
+        concat!(
+            "*** Begin Patch\n",
+            "*** Update File: updated.txt\n",
+            "@@\n",
+            "-before\n",
+            "+after\n",
+            "*** Add File: parent\n",
+            "+file\n",
+            "*** Add File: parent/child.txt\n",
+            "+child\n",
+            "*** End Patch\n",
+        ),
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Failed to create parent directories"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read_to_string(updated).unwrap(), "before\n");
+    assert!(!root.path().join("parent").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_symlink_directory_hides_its_old_children_during_preparation() {
+    let root = TempDir::new();
+    let real = root.path().join("real");
+    let link = root.path().join("link");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("old.txt"), "old\n").unwrap();
+    std::os::unix::fs::symlink("real", &link).unwrap();
+
+    let error = apply_patch(
+        root.path(),
+        concat!(
+            "*** Begin Patch\n",
+            "*** Update File: link/old.txt\n",
+            "@@\n",
+            "-old\n",
+            "+first change\n",
+            "*** Delete File: link\n",
+            "*** Add File: link/new.txt\n",
+            "+new\n",
+            "*** Update File: link/old.txt\n",
+            "@@\n",
+            "-first change\n",
+            "+changed\n",
+            "*** End Patch\n",
+        ),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("Failed to read file to update"));
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_to_string(real.join("old.txt")).unwrap(),
+        "old\n"
+    );
+    assert!(!real.join("new.txt").exists());
+}
+
+#[test]
 fn preparation_preserves_sequential_operations_on_the_same_paths() {
     let root = TempDir::new();
     let path = root.path().join("file.txt");
+    let replaced_by_directory = root.path().join("parent");
     std::fs::write(&path, "original\n").unwrap();
+    std::fs::write(&replaced_by_directory, "old parent\n").unwrap();
 
     apply_patch(
         root.path(),
@@ -159,6 +238,9 @@ fn preparation_preserves_sequential_operations_on_the_same_paths() {
             "@@\n",
             "-replacement\n",
             "+final\n",
+            "*** Delete File: parent\n",
+            "*** Add File: parent/child.txt\n",
+            "+child\n",
             "*** End Patch\n",
         ),
     )
@@ -172,6 +254,10 @@ fn preparation_preserves_sequential_operations_on_the_same_paths() {
     assert_eq!(
         std::fs::read_to_string(root.path().join("moved.txt")).unwrap(),
         "final\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(replaced_by_directory.join("child.txt")).unwrap(),
+        "child\n"
     );
 }
 

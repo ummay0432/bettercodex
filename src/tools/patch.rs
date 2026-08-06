@@ -62,7 +62,7 @@ impl PreparedPatch {
                 Operation::Add { path, content } => {
                     let target = resolve(root, &path)?;
                     let content = Arc::<str>::from(content);
-                    files.write(target.clone(), Arc::clone(&content));
+                    files.write(target.clone(), Arc::clone(&content))?;
                     mutations.push(Mutation::Write {
                         path: target,
                         content,
@@ -93,14 +93,14 @@ impl PreparedPatch {
                     if let Some(destination_path) = move_to {
                         let destination = resolve(root, &destination_path)?;
                         if destination == source {
-                            files.write(source.clone(), Arc::clone(&content));
+                            files.write(source.clone(), Arc::clone(&content))?;
                             mutations.push(Mutation::Write {
                                 path: source,
                                 content,
                             });
                             modified.push(path);
                         } else {
-                            files.write(destination.clone(), Arc::clone(&content));
+                            files.write(destination.clone(), Arc::clone(&content))?;
                             files.delete(&source)?;
                             mutations.push(Mutation::Write {
                                 path: destination,
@@ -113,7 +113,7 @@ impl PreparedPatch {
                             modified.push(destination_path);
                         }
                     } else {
-                        files.write(source.clone(), Arc::clone(&content));
+                        files.write(source.clone(), Arc::clone(&content))?;
                         mutations.push(Mutation::Write {
                             path: source,
                             content,
@@ -194,7 +194,13 @@ impl VirtualFiles {
                 VirtualFile::Text(content) => Ok(Arc::clone(content)),
                 VirtualFile::Missing => Err(missing_file_error())
                     .with_context(|| format!("Failed to read file to update {}", path.display())),
+                VirtualFile::Directory => Err(directory_error())
+                    .with_context(|| format!("Failed to read file to update {}", path.display())),
             };
+        }
+        if let Some(error) = self.virtual_parent_error(path) {
+            return Err(error)
+                .with_context(|| format!("Failed to read file to update {}", path.display()));
         }
 
         let content = Arc::<str>::from(
@@ -206,8 +212,81 @@ impl VirtualFiles {
         Ok(content)
     }
 
-    fn write(&mut self, path: PathBuf, content: Arc<str>) {
+    fn write(&mut self, path: PathBuf, content: Arc<str>) -> Result<()> {
+        let has_virtual_parent = self.prepare_parent_directories(&path)?;
+        let is_directory = match self.files.get(&path) {
+            Some(VirtualFile::Directory) => true,
+            Some(VirtualFile::Text(_) | VirtualFile::Missing) => false,
+            None if has_virtual_parent => false,
+            None => match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.is_dir(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to write file {}", path.display()));
+                }
+            },
+        };
+        if is_directory {
+            return Err(directory_error())
+                .with_context(|| format!("Failed to write file {}", path.display()));
+        }
         self.files.insert(path, VirtualFile::Text(content));
+        Ok(())
+    }
+
+    fn prepare_parent_directories(&mut self, target: &Path) -> Result<bool> {
+        let Some(parent) = target.parent() else {
+            return Ok(false);
+        };
+        let mut missing = Vec::new();
+        let mut has_virtual_parent = false;
+        for parent in parent.ancestors() {
+            match self.files.get(parent) {
+                Some(VirtualFile::Directory) => {
+                    has_virtual_parent = true;
+                    break;
+                }
+                Some(VirtualFile::Missing) => {
+                    has_virtual_parent = true;
+                    missing.push(parent.to_path_buf());
+                    continue;
+                }
+                Some(VirtualFile::Text(_)) => {
+                    return Err(not_directory_error()).with_context(|| parent_error(target));
+                }
+                None => {}
+            }
+
+            match std::fs::metadata(parent) {
+                Ok(metadata) if metadata.is_dir() => break,
+                Ok(_) => {
+                    return Err(not_directory_error()).with_context(|| parent_error(target));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(parent) {
+                        Ok(_) => {
+                            return Err(not_directory_error())
+                                .with_context(|| parent_error(target));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            has_virtual_parent = true;
+                            missing.push(parent.to_path_buf());
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| parent_error(target));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| parent_error(target));
+                }
+            }
+        }
+        for path in missing {
+            self.files.insert(path, VirtualFile::Directory);
+        }
+        Ok(has_virtual_parent)
     }
 
     fn delete(&mut self, path: &Path) -> Result<()> {
@@ -217,27 +296,63 @@ impl VirtualFiles {
                 return Err(missing_file_error())
                     .with_context(|| format!("Failed to delete file {}", path.display()));
             }
+            Some(VirtualFile::Directory) => {
+                return Err(directory_error())
+                    .with_context(|| format!("Failed to delete file {}", path.display()));
+            }
             None => {
+                if let Some(error) = self.virtual_parent_error(path) {
+                    return Err(error)
+                        .with_context(|| format!("Failed to delete file {}", path.display()));
+                }
                 let metadata = std::fs::symlink_metadata(path)
                     .with_context(|| format!("Failed to delete file {}", path.display()))?;
                 if metadata.file_type().is_dir() {
-                    return Err(std::io::Error::from_raw_os_error(libc::EISDIR))
+                    return Err(directory_error())
                         .with_context(|| format!("Failed to delete file {}", path.display()));
                 }
             }
         }
+        self.files
+            .retain(|candidate, _| !candidate.starts_with(path));
         self.files.insert(path.to_path_buf(), VirtualFile::Missing);
         Ok(())
+    }
+
+    fn virtual_parent_error(&self, path: &Path) -> Option<std::io::Error> {
+        path.parent()?
+            .ancestors()
+            .find_map(|parent| self.files.get(parent))
+            .map(|parent| match parent {
+                VirtualFile::Text(_) => not_directory_error(),
+                VirtualFile::Missing | VirtualFile::Directory => missing_file_error(),
+            })
     }
 }
 
 enum VirtualFile {
     Text(Arc<str>),
     Missing,
+    Directory,
 }
 
 fn missing_file_error() -> std::io::Error {
     std::io::Error::from_raw_os_error(libc::ENOENT)
+}
+
+fn directory_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::EISDIR)
+}
+
+fn not_directory_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::ENOTDIR)
+}
+
+fn parent_error(target: &Path) -> String {
+    format!(
+        "Failed to create parent directories for {}",
+        target.display()
+    )
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
