@@ -93,6 +93,19 @@ It reports median/min/max elapsed time and maximum child RSS. The RSS figure
 includes the small Python fork floor, so compare runs made with the same helper
 and host rather than treating it as an exact allocator measurement.
 
+## Managed terminal sessions
+
+Interactive agent invocations outside tmux automatically create and attach to
+the first free `c1`, `c2`, … session. The pane is dedicated to the bettercodex
+process lifecycle: disconnecting a client leaves it running, while exiting
+bettercodex destroys the session and releases its name. Interactive use requires
+tmux on both Linux and macOS.
+
+On macOS, every agent invocation re-executes once through
+`/usr/bin/caffeinate -i -s`. The wrapper is process-scoped and exits with
+bettercodex; diagnostics such as `--help` and `--version` do not acquire a sleep
+assertion.
+
 ## Tool-context audit
 
 The audit command builds the current worktree, asks `bcodex` to render the real

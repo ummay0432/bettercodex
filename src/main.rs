@@ -6,6 +6,7 @@ mod compaction;
 mod context;
 mod events;
 mod input;
+mod managed_session;
 mod prompt_history;
 mod repository;
 mod rollout;
@@ -33,16 +34,16 @@ use uuid::Uuid;
 
 const MODEL: &str = "gpt-5.6-sol";
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    if let Err(error) = run() {
         eprintln!("error: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let command = Command::parse(std::env::args().skip(1))?;
+fn run() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let command = Command::parse(arguments.iter().cloned())?;
     match command {
         Command::Help => {
             print_help();
@@ -72,9 +73,24 @@ async fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::Run(options) => run_agent(options, None).await,
-        Command::Resume { selector, options } => run_agent(options, Some(selector)).await,
+        Command::Run(options) => run_agent_command(&arguments, options, None),
+        Command::Resume { selector, options } => {
+            run_agent_command(&arguments, options, Some(selector))
+        }
     }
+}
+
+fn run_agent_command(
+    arguments: &[String],
+    options: RunOptions,
+    resume: Option<ResumeSelector>,
+) -> Result<()> {
+    let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    managed_session::enter(arguments, interactive_terminal)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_agent(options, resume))
 }
 
 async fn run_agent(options: RunOptions, resume: Option<ResumeSelector>) -> Result<()> {
@@ -237,7 +253,7 @@ impl Command {
 
 fn print_help() {
     println!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Interactive runs automatically occupy the first free c1, c2, … tmux session, and macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     );
 }
