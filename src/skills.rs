@@ -33,24 +33,6 @@ const APPROXIMATE_BYTES_PER_TOKEN: u64 = 4;
 const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
 const MAX_SKILLS_CONTEXT_BYTES: usize = 39_000;
 
-const SKILLS_USAGE: &str = r#"- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.
-- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
-- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.
-- How to use a skill (progressive disclosure):
-  1) After deciding to use a skill, open the listed path and read its `SKILL.md` completely before taking task actions. If a read is truncated or paginated, continue until EOF.
-  2) When `SKILL.md` references relative paths (for example `scripts/foo.py`), resolve them relative to the directory containing that `SKILL.md` first, and only consider other paths if needed.
-  3) If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the files required for the task. Read only the relevant files, not the whole folder.
-  4) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.
-  5) If `assets/` or templates exist, reuse them instead of recreating them.
-- Coordination and sequencing:
-  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.
-  - Announce which skill(s) you're using and why in one short line. If you skip an obvious skill, say why.
-- Context hygiene:
-  - Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file.
-  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.
-  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.
-- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue."#;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SkillScope {
     System,
@@ -319,7 +301,7 @@ impl SkillCatalog {
         &self.warnings
     }
 
-    pub(crate) fn instructions_message(&self, context_window: u64) -> Option<Value> {
+    pub(crate) fn catalogue_message(&self, context_window: u64) -> Option<Value> {
         let visible = self
             .skills
             .iter()
@@ -353,14 +335,13 @@ impl SkillCatalog {
             }
         }
         let body = format!(
-            "<skills>\n\n## Skills\nA skill is a set of local instructions stored in a `SKILL.md` file. The list below contains the skills available in this session. Each entry includes its name, description, and file path.\n### Available skills\n{}\n### How to use skills\n{}\n\n</skills>",
+            "<available_skills>\n{}\n</available_skills>",
             lines.join("\n"),
-            SKILLS_USAGE,
         );
-        debug_assert!(body.len() <= MAX_SKILLS_CONTEXT_BYTES + 8_000);
+        debug_assert!(body.len() <= MAX_SKILLS_CONTEXT_BYTES + 64);
         Some(json!({
             "type": "message",
-            "role": "developer",
+            "role": "user",
             "content": [{"type": "input_text", "text": body}],
         }))
     }
@@ -449,7 +430,8 @@ impl SkillCatalog {
                     }
                     let name = escape_xml(&skill.name);
                     let prompt = format!(
-                        "<skill>\n<name>{name}</name>\n<path>{path}</path>\n{contents}{}\n</skill>",
+                        "<skill_context>\n<name>{name}</name>\n<path>{path}</path>\n<instructions><![CDATA[\n{}\n]]></instructions>{}\n</skill_context>",
+                        escape_cdata(&contents),
                         truncation_notice.as_deref().unwrap_or_default(),
                     );
                     items.push(json!({
@@ -917,11 +899,15 @@ fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize
     let full_descriptions = skills
         .iter()
         .map(|skill| {
-            skill
-                .description
-                .chars()
-                .take(MAX_DESCRIPTION_CHARS)
-                .collect::<Vec<_>>()
+            escape_xml(
+                &skill
+                    .description
+                    .chars()
+                    .take(MAX_DESCRIPTION_CHARS)
+                    .collect::<String>(),
+            )
+            .chars()
+            .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     let full = skills
@@ -969,8 +955,11 @@ fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize
 }
 
 fn catalog_line(skill: &Skill, description: &str) -> String {
-    let path = truncate_bytes(&skill.path.to_string_lossy().replace('\\', "/"), 1_024);
-    let name = truncate_bytes(&skill.name, 256);
+    let path = truncate_bytes(
+        &escape_xml(&skill.path.to_string_lossy().replace('\\', "/")),
+        1_024,
+    );
+    let name = truncate_bytes(&escape_xml(&skill.name), 256);
     if description.is_empty() {
         format!("- {name}: (file: {path})")
     } else {
@@ -1021,6 +1010,10 @@ fn escape_xml(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn escape_cdata(value: &str) -> String {
+    value.replace("]]>", "]]]]><![CDATA[>")
 }
 
 struct Mentions<'a> {

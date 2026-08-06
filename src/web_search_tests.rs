@@ -62,7 +62,11 @@ fn recent_input_keeps_two_operator_turns_and_drops_images_and_world_state() {
         ),
         message(
             "user",
-            "# Repository onboarding from AGENTS.md for /repo\nignored\n# End repository onboarding",
+            "<repository_context>\nignored\n</repository_context>",
+        ),
+        message(
+            "user",
+            "<available_skills>\n- demo: ignored\n</available_skills>",
         ),
         message("user", "old user"),
         message("assistant", "old assistant"),

@@ -64,6 +64,7 @@ async fn run() -> Result<()> {
             println!(
                 "{}",
                 serde_json::json!({
+                    "instructions": api::harness_instructions(),
                     "stable_prefix": api::stable_request_prefix(),
                     "world_state": context::initial_context_items(&cwd)?,
                 })

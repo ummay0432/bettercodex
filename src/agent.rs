@@ -627,8 +627,8 @@ impl Agent {
             emit(events, AgentEvent::Warning(warning));
         }
         let mut projected = Vec::with_capacity(injections.items.len().saturating_add(1));
-        projected.push(user_message);
         projected.extend(injections.items);
+        projected.push(user_message);
         let incoming_tokens = estimated_tokens(&projected);
         if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
             return Err(anyhow!(

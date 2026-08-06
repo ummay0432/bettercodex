@@ -57,19 +57,12 @@ const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
-static CONTEXT_PREFIX_ITEMS: LazyLock<[Value; 2]> = LazyLock::new(|| {
-    [
-        json!({
-            "type": "additional_tools",
-            "role": "developer",
-            "tools": tools::specifications(),
-        }),
-        json!({
-            "type": "message",
-            "role": "developer",
-            "content": [{"type": "input_text", "text": SYSTEM_PROMPT.trim()}],
-        }),
-    ]
+static STABLE_INPUT_PREFIX_ITEMS: LazyLock<[Value; 1]> = LazyLock::new(|| {
+    [json!({
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": tools::specifications(),
+    })]
 });
 
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -80,7 +73,6 @@ enum ApiErrorKind {
     Retryable,
     StreamIdle,
     Unauthorized,
-    CacheUnsupported,
     PreviousResponseNotFound,
     WebSocketUnavailable,
 }
@@ -166,7 +158,6 @@ pub(crate) struct ApiClient {
     turn_started_at_unix_ms: u64,
     turn_state: Option<String>,
     window: u64,
-    explicit_cache: bool,
     prefer_websocket: bool,
     websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
@@ -294,16 +285,6 @@ impl Drop for WebSocketRequestGuard<'_> {
 
 struct SamplingInputRestoration {
     inserted_tools: bool,
-    system_prompt: SamplingSystemPrompt,
-}
-
-enum SamplingSystemPrompt {
-    Inserted,
-    Existing,
-    Marked {
-        index: usize,
-        previous_breakpoint: Option<Value>,
-    },
 }
 
 impl WebSocketBaseline {
@@ -356,39 +337,8 @@ impl SamplingRequest {
 
 impl SamplingInputRestoration {
     fn restore(self, mut input: Vec<Value>) -> ApiResult<Vec<Value>> {
-        match self.system_prompt {
-            SamplingSystemPrompt::Inserted => {
-                if !input.get(1).is_some_and(is_system_prompt_item) {
-                    return Err(ApiError::fatal(
-                        "sampling request lost its inserted system prompt",
-                    ));
-                }
-                input.remove(1);
-            }
-            SamplingSystemPrompt::Existing => {}
-            SamplingSystemPrompt::Marked {
-                index,
-                previous_breakpoint,
-            } => {
-                let content = input
-                    .get_mut(index)
-                    .and_then(|item| item.pointer_mut("/content/0"))
-                    .and_then(Value::as_object_mut)
-                    .ok_or_else(|| {
-                        ApiError::fatal("sampling request lost its marked system prompt")
-                    })?;
-                match previous_breakpoint {
-                    Some(breakpoint) => {
-                        content.insert("prompt_cache_breakpoint".to_string(), breakpoint);
-                    }
-                    None => {
-                        content.remove("prompt_cache_breakpoint");
-                    }
-                }
-            }
-        }
         if self.inserted_tools {
-            let expected = &context_prefix_items()[0];
+            let expected = &stable_input_prefix_items()[0];
             if !input
                 .first()
                 .is_some_and(|item| is_additional_tools_item(item, expected))
@@ -459,7 +409,6 @@ impl ApiClient {
             turn_started_at_unix_ms: unix_timestamp_millis(),
             turn_state: None,
             window: compaction_count,
-            explicit_cache: true,
             prefer_websocket: true,
             websocket_prewarm_attempted: false,
             websocket: None,
@@ -579,12 +528,6 @@ impl ApiClient {
                     refreshed_websocket_auth = true;
                     self.abandon_response();
                 }
-                Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
-                    if self.explicit_cache {
-                        self.disable_explicit_cache();
-                        disable_explicit_cache_for_request(request)?;
-                    }
-                }
                 Err(error) if error.kind == ApiErrorKind::WebSocketUnavailable => {
                     self.fall_back_to_http();
                 }
@@ -638,14 +581,6 @@ impl ApiClient {
                         retried_full_websocket_request = true;
                         continue;
                     }
-                    Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
-                        if self.explicit_cache {
-                            self.disable_explicit_cache();
-                            disable_explicit_cache_for_request(request)?;
-                            continue;
-                        }
-                        return Err(error);
-                    }
                     Err(error) if error.kind == ApiErrorKind::WebSocketUnavailable => {
                         self.fall_back_to_http();
                     }
@@ -661,20 +596,9 @@ impl ApiClient {
                 }
             }
 
-            match self
+            return self
                 .respond_http(request, completed_items, events, request_kind)
-                .await
-            {
-                Err(error) if error.kind == ApiErrorKind::CacheUnsupported => {
-                    if self.explicit_cache {
-                        self.disable_explicit_cache();
-                        disable_explicit_cache_for_request(request)?;
-                    } else {
-                        return Err(error);
-                    }
-                }
-                result => return result,
-            }
+                .await;
         }
     }
 
@@ -951,10 +875,10 @@ impl ApiClient {
             });
         }
         let trigger = compaction::compaction_trigger();
-        let rendered_tokens =
-            estimated_tokens(&compose_input(history.to_vec(), self.explicit_cache));
+        let rendered_tokens = estimated_tokens(&compose_input(history.to_vec()));
         let prefix_tokens = rendered_tokens
             .saturating_sub(estimated_tokens(history))
+            .saturating_add(estimated_harness_instruction_tokens())
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
         let mut prompt_history = history.to_vec();
         let rewritten_outputs = compaction::trim_tool_outputs_to_fit(
@@ -1009,7 +933,7 @@ impl ApiClient {
     }
 
     fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> Value {
-        let input = compose_input(history, self.explicit_cache);
+        let input = compose_input(history);
         self.build_request_from_input(input, request_kind)
     }
 
@@ -1018,7 +942,7 @@ impl ApiClient {
         history: Vec<Value>,
         cursor: HistoryCursor,
     ) -> SamplingRequest {
-        let (input, input_restoration) = compose_sampling_input(history, self.explicit_cache);
+        let (input, input_restoration) = compose_sampling_input(history);
         SamplingRequest {
             request: self.build_request_from_input(input, RequestKind::Turn),
             cursor,
@@ -1029,7 +953,7 @@ impl ApiClient {
     fn build_request_from_input(&self, input: Vec<Value>, request_kind: RequestKind) -> Value {
         let mut request = json!({
             "model": MODEL,
-            "instructions": "",
+            "instructions": harness_instructions(),
             "tool_choice": "auto",
             "parallel_tool_calls": false,
             "reasoning": {"effort": "max", "summary": "auto", "context": "all_turns"},
@@ -1041,15 +965,7 @@ impl ApiClient {
             "client_metadata": self.client_metadata(request_kind),
         });
         request["input"] = Value::Array(input);
-        if self.explicit_cache {
-            request["prompt_cache_options"] = json!({"mode": "explicit", "ttl": "30m"});
-        }
         request
-    }
-
-    fn disable_explicit_cache(&mut self) {
-        self.explicit_cache = false;
-        self.abandon_response();
     }
 
     fn client_metadata(&self, request_kind: RequestKind) -> Map<String, Value> {
@@ -1243,9 +1159,6 @@ impl ApiClient {
             }
             let body = bounded_error_body(response).await;
             let message = format!("Responses request failed with {status}: {body}");
-            if explicit_cache_unsupported(&body) {
-                return Err(ApiError::new(ApiErrorKind::CacheUnsupported, message));
-            }
             if status == StatusCode::TOO_MANY_REQUESTS || transport_retryable {
                 return Err(ApiError::retryable_after(message, retry_after));
             }
@@ -1298,15 +1211,12 @@ impl RequestKind {
     }
 }
 
-fn compose_input(history: Vec<Value>, explicit_cache: bool) -> Vec<Value> {
-    compose_sampling_input(history, explicit_cache).0
+fn compose_input(history: Vec<Value>) -> Vec<Value> {
+    compose_sampling_input(history).0
 }
 
-fn compose_sampling_input(
-    mut history: Vec<Value>,
-    explicit_cache: bool,
-) -> (Vec<Value>, SamplingInputRestoration) {
-    let [tools_item, system_item] = request_context_prefix(explicit_cache);
+fn compose_sampling_input(mut history: Vec<Value>) -> (Vec<Value>, SamplingInputRestoration) {
+    let [tools_item] = stable_request_prefix();
     let inserted_tools = if history
         .iter()
         .any(|item| is_additional_tools_item(item, &tools_item))
@@ -1316,36 +1226,7 @@ fn compose_sampling_input(
         history.insert(0, tools_item);
         true
     };
-
-    let system_prompt = match history.iter().position(is_system_prompt_item) {
-        Some(index) if explicit_cache => {
-            let previous_breakpoint = history[index]
-                .pointer_mut("/content/0")
-                .and_then(Value::as_object_mut)
-                .and_then(|content| {
-                    content.insert(
-                        "prompt_cache_breakpoint".to_string(),
-                        json!({"mode": "explicit"}),
-                    )
-                });
-            SamplingSystemPrompt::Marked {
-                index,
-                previous_breakpoint,
-            }
-        }
-        Some(_) => SamplingSystemPrompt::Existing,
-        None => {
-            history.insert(1, system_item);
-            SamplingSystemPrompt::Inserted
-        }
-    };
-    (
-        history,
-        SamplingInputRestoration {
-            inserted_tools,
-            system_prompt,
-        },
-    )
+    (history, SamplingInputRestoration { inserted_tools })
 }
 
 fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
@@ -1354,60 +1235,20 @@ fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
         .all(|field| item.get(field) == expected.get(field))
 }
 
-pub(crate) fn context_prefix_items() -> &'static [Value; 2] {
-    &CONTEXT_PREFIX_ITEMS
+pub(crate) fn stable_input_prefix_items() -> &'static [Value; 1] {
+    &STABLE_INPUT_PREFIX_ITEMS
 }
 
-pub(crate) fn stable_request_prefix() -> [Value; 2] {
-    request_context_prefix(true)
+pub(crate) fn stable_request_prefix() -> [Value; 1] {
+    (*stable_input_prefix_items()).clone()
 }
 
-fn request_context_prefix(explicit_cache: bool) -> [Value; 2] {
-    let [tools_item, mut system_item] = (*context_prefix_items()).clone();
-    if explicit_cache {
-        mark_cache_breakpoint(&mut system_item);
-    }
-    [tools_item, system_item]
+pub(crate) fn harness_instructions() -> &'static str {
+    SYSTEM_PROMPT.trim()
 }
 
-fn is_system_prompt_item(item: &Value) -> bool {
-    item.get("type").and_then(Value::as_str) == Some("message")
-        && item.get("role").and_then(Value::as_str) == Some("developer")
-        && item
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .is_some_and(|text| text == SYSTEM_PROMPT.trim())
-}
-
-fn mark_cache_breakpoint(item: &mut Value) {
-    if let Some(content) = item.pointer_mut("/content/0")
-        && let Some(content) = content.as_object_mut()
-    {
-        content.insert(
-            "prompt_cache_breakpoint".to_string(),
-            json!({"mode": "explicit"}),
-        );
-    }
-}
-
-fn disable_explicit_cache_for_request(request: &mut Value) -> ApiResult<()> {
-    let object = request
-        .as_object_mut()
-        .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
-    object.remove("prompt_cache_options");
-    let input = object
-        .get_mut("input")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
-    for item in input.iter_mut().filter(|item| is_system_prompt_item(item)) {
-        if let Some(content) = item
-            .pointer_mut("/content/0")
-            .and_then(Value::as_object_mut)
-        {
-            content.remove("prompt_cache_breakpoint");
-        }
-    }
-    Ok(())
+pub(crate) fn estimated_harness_instruction_tokens() -> u64 {
+    estimated_tokens(&[json!({"instructions": harness_instructions()})])
 }
 
 fn is_reusable_request_property(name: &str) -> bool {
@@ -1676,9 +1517,6 @@ fn error_event(event: &Value) -> ApiError {
             ApiError::new(ApiErrorKind::PreviousResponseNotFound, message)
         }
         "websocket_connection_limit_reached" => ApiError::retryable(message),
-        _ if explicit_cache_unsupported(message) => {
-            ApiError::new(ApiErrorKind::CacheUnsupported, message)
-        }
         _ => {
             let status = event
                 .get("status")
@@ -1694,28 +1532,24 @@ fn error_event(event: &Value) -> ApiError {
 }
 
 fn classify_stream_error(code: &str, message: &str) -> ApiError {
-    if explicit_cache_unsupported(message) {
-        ApiError::new(ApiErrorKind::CacheUnsupported, message)
-    } else {
-        match code {
-            "previous_response_not_found" => {
-                ApiError::new(ApiErrorKind::PreviousResponseNotFound, message)
-            }
-            "context_length_exceeded"
-            | "insufficient_quota"
-            | "usage_not_included"
-            | "cyber_policy"
-            | "invalid_prompt"
-            | "bio_policy" => ApiError::fatal(message),
-            // Codex treats other response.failed errors as retryable, including
-            // server_is_overloaded, slow_down, and future transient codes.
-            _ => ApiError::retryable_after(
-                message,
-                (code == "rate_limit_exceeded")
-                    .then(|| parse_rate_limit_delay(message))
-                    .flatten(),
-            ),
+    match code {
+        "previous_response_not_found" => {
+            ApiError::new(ApiErrorKind::PreviousResponseNotFound, message)
         }
+        "context_length_exceeded"
+        | "insufficient_quota"
+        | "usage_not_included"
+        | "cyber_policy"
+        | "invalid_prompt"
+        | "bio_policy" => ApiError::fatal(message),
+        // Codex treats other response.failed errors as retryable, including
+        // server_is_overloaded, slow_down, and future transient codes.
+        _ => ApiError::retryable_after(
+            message,
+            (code == "rate_limit_exceeded")
+                .then(|| parse_rate_limit_delay(message))
+                .flatten(),
+        ),
     }
 }
 
@@ -1905,14 +1739,6 @@ fn parse_rate_limit_delay(message: &str) -> Option<Duration> {
     } else {
         None
     }
-}
-
-fn explicit_cache_unsupported(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    (message.contains("prompt_cache_options") || message.contains("prompt_cache_breakpoint"))
-        && (message.contains("unknown")
-            || message.contains("unsupported")
-            || message.contains("invalid"))
 }
 
 fn unix_timestamp_millis() -> u64 {

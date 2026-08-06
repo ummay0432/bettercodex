@@ -365,15 +365,18 @@ def render_audit() -> tuple[str, str, str]:
         stdout=subprocess.PIPE,
     )
     audit = json.loads(result.stdout)
+    instructions = audit["instructions"]
     stable = audit["stable_prefix"]
-    additional_tools, system_item = stable
+    [additional_tools] = stable
     exec_specification, wait_specification = additional_tools["tools"]
     exec_description = exec_specification["description"]
-    system_text = system_item["content"][0]["text"]
     stable_rows = [
         (
-            "Complete stable prefix: `additional_tools` plus cached system-prompt item",
-            metrics(compact_json(stable), encoding),
+            "Complete stable harness input: `instructions` plus `additional_tools`",
+            metrics(
+                compact_json({"instructions": instructions, "input": stable}),
+                encoding,
+            ),
         ),
         ("Complete `additional_tools` developer item", metrics(compact_json(additional_tools), encoding)),
         ("Top-level `exec` specification", metrics(compact_json(exec_specification), encoding)),
@@ -381,8 +384,11 @@ def render_audit() -> tuple[str, str, str]:
         ("`exec` Lark grammar only", metrics(exec_specification["format"]["definition"], encoding)),
         ("Top-level `wait` specification", metrics(compact_json(wait_specification), encoding)),
         ("`wait` description only", metrics(wait_specification["description"], encoding)),
-        ("Cached system-prompt message item", metrics(compact_json(system_item), encoding)),
-        ("`prompts/system.md` text only", metrics(system_text, encoding)),
+        (
+            "Top-level `instructions` request field",
+            metrics(compact_json({"instructions": instructions}), encoding),
+        ),
+        ("`prompts/system.md` text only", metrics(instructions, encoding)),
     ]
 
     dynamic_rows = []
@@ -390,10 +396,10 @@ def render_audit() -> tuple[str, str, str]:
         text = item["content"][0]["text"]
         if text.startswith("<environment_context>"):
             label = "Current `<environment_context>` developer item"
-        elif text.startswith("# Repository onboarding"):
-            label = "Current repository-onboarding user item"
-        elif text.startswith("<skills>"):
-            label = "Current `<skills>` developer item"
+        elif text.startswith("<repository_context>"):
+            label = "Current `<repository_context>` user item"
+        elif text.startswith("<available_skills>"):
+            label = "Current `<available_skills>` user item"
         else:
             raise RuntimeError("tool-context audit returned an unknown world-state item")
         dynamic_rows.append((label, metrics(compact_json(item), encoding)))

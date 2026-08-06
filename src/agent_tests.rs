@@ -343,6 +343,7 @@ async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() 
     let cwd = repository.join("service");
     std::fs::create_dir_all(repository.join(".git")).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(repository.join("AGENTS.md"), "Keep service code coherent.").unwrap();
     let repository_skill = repository.join(".bcodex/skills/demo/SKILL.md");
     let service_skill = cwd.join(".bcodex/skills/demo/SKILL.md");
     for (path, body) in [
@@ -396,6 +397,7 @@ async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() 
     assert_eq!(agent.prompt_history(), ["use $demo now"]);
 
     let request: Value = serde_json::from_slice(&server.join().unwrap()).unwrap();
+    assert_eq!(request["instructions"], crate::api::harness_instructions());
     let input = request["input"].as_array().unwrap();
     fn text(item: &Value) -> &str {
         item.pointer("/content/0/text")
@@ -404,7 +406,7 @@ async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() 
     }
     let catalog = input
         .iter()
-        .find(|item| item["role"] == "developer" && text(item).starts_with("<skills>"))
+        .find(|item| item["role"] == "user" && text(item).starts_with("<available_skills>"))
         .expect("model-visible skills catalogue");
     assert_eq!(text(catalog).matches("- demo:").count(), 2);
     let user_index = input
@@ -413,9 +415,28 @@ async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() 
         .expect("ordinary user prompt");
     let injection_index = input
         .iter()
-        .position(|item| item["role"] == "user" && text(item).starts_with("<skill>"))
+        .position(|item| item["role"] == "user" && text(item).starts_with("<skill_context>"))
         .expect("selected skill injection");
-    assert!(user_index < injection_index);
+    let environment_index = input
+        .iter()
+        .position(|item| text(item).starts_with("<environment_context>"))
+        .expect("environment context");
+    let repository_index = input
+        .iter()
+        .position(|item| text(item).starts_with("<repository_context>"))
+        .expect("repository context");
+    let catalogue_index = input
+        .iter()
+        .position(|item| text(item).starts_with("<available_skills>"))
+        .expect("skills catalogue index");
+    assert_eq!(input[0]["type"], "additional_tools");
+    assert_eq!(input[environment_index]["role"], "developer");
+    assert_eq!(input[repository_index]["role"], "user");
+    assert!(environment_index < repository_index);
+    assert!(repository_index < catalogue_index);
+    assert!(catalogue_index < injection_index);
+    assert!(injection_index < user_index);
+    assert_eq!(user_index, input.len() - 1);
     assert!(text(&input[injection_index]).contains("SERVICE SKILL BODY"));
     assert!(!text(&input[injection_index]).contains("REPOSITORY SKILL BODY"));
 
@@ -767,7 +788,8 @@ async fn backend_usage_is_not_overridden_by_a_larger_full_history_estimate() {
     });
     let (root, mut agent) = test_agent(&format!("http://{address}"));
 
-    let prefix_tokens = estimated_tokens(crate::api::context_prefix_items());
+    let prefix_tokens = estimated_tokens(crate::api::stable_input_prefix_items())
+        .saturating_add(crate::api::estimated_harness_instruction_tokens());
     let baseline_text_tokens = EFFECTIVE_CONTEXT_WINDOW
         .saturating_sub(prefix_tokens)
         .saturating_sub(2_000);
@@ -985,7 +1007,7 @@ fn conversation_text(request: &[u8]) -> Vec<(String, String)> {
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 })?;
-            (!text.starts_with("# Repository onboarding")).then(|| (role.to_string(), text))
+            (!crate::context::is_contextual_user_text(&text)).then(|| (role.to_string(), text))
         })
         .collect()
 }

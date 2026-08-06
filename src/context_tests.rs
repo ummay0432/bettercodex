@@ -246,7 +246,7 @@ fn reloading_skill_policy_replaces_the_saved_catalogue_without_blocking_explicit
             .items()
             .iter()
             .filter_map(message_text)
-            .any(|text| text.starts_with("<skills>") && text.contains("context-reload"))
+            .any(|text| text.starts_with("<available_skills>") && text.contains("context-reload"))
     );
 
     fs::write(
@@ -261,7 +261,7 @@ fn reloading_skill_policy_replaces_the_saved_catalogue_without_blocking_explicit
             .items()
             .iter()
             .filter_map(message_text)
-            .any(|text| text.starts_with("<skills>") && text.contains("context-reload")),
+            .any(|text| text.starts_with("<available_skills>") && text.contains("context-reload")),
         "the superseded implicitly invocable catalogue must not remain in history"
     );
     let skill = conversation
@@ -458,7 +458,7 @@ fn contextual_user_messages_do_not_turn_current_reasoning_into_past_reasoning() 
 
     let contextual = message(
         "user",
-        "# Repository onboarding from AGENTS.md for /repo\n\nupdated instructions".to_string(),
+        "<repository_context>\nupdated instructions\n</repository_context>".to_string(),
     );
     let contextual_tokens = estimate_value_tokens(&contextual);
     conversation.extend([contextual]).unwrap();
@@ -553,22 +553,17 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
         ])
         .unwrap();
 
-    let [tools, system_prompt] = crate::api::context_prefix_items();
+    let [tools] = crate::api::stable_input_prefix_items();
+    let system_prompt = json!({
+        "instructions": crate::api::harness_instructions(),
+    });
     let environment = conversation.world_state.environment.clone();
-    let repository_instructions = conversation
-        .world_state
-        .repository_instructions
-        .clone()
-        .unwrap();
-    let skills_instructions = conversation
-        .world_state
-        .skills_instructions
-        .clone()
-        .unwrap();
+    let repository_context = conversation.world_state.repository_context.clone().unwrap();
+    let skills_catalogue = conversation.world_state.skills_catalogue.clone().unwrap();
     let sections = vec![
         ContextSection {
             kind: ContextKind::SystemPrompt,
-            tokens: estimate_value_tokens(system_prompt),
+            tokens: estimate_value_tokens(&system_prompt),
             items: 1,
         },
         ContextSection {
@@ -578,12 +573,12 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
         },
         ContextSection {
             kind: ContextKind::RepositoryInstructions,
-            tokens: estimate_value_tokens(&repository_instructions),
+            tokens: estimate_value_tokens(&repository_context),
             items: 1,
         },
         ContextSection {
             kind: ContextKind::Skills,
-            tokens: estimate_value_tokens(&skills_instructions),
+            tokens: estimate_value_tokens(&skills_catalogue),
             items: 1,
         },
         ContextSection {
@@ -629,9 +624,7 @@ fn context_snapshot_classifies_the_complete_request_and_uses_backend_total() {
             sections: sections.clone(),
         }
     );
-    conversation
-        .extend([(*tools).clone(), (*system_prompt).clone()])
-        .unwrap();
+    conversation.extend([(*tools).clone()]).unwrap();
     assert_eq!(
         conversation.context_snapshot(),
         ContextSnapshot {
@@ -836,13 +829,25 @@ fn project_root_stops_agents_discovery_at_git_boundary() {
     std::fs::write(repository.join("AGENTS.md"), "root rule").unwrap();
     std::fs::write(nested.join("AGENTS.override.md"), "nested rule").unwrap();
 
-    let instructions = repository_instructions(&nested).unwrap().unwrap();
-    assert!(instructions.contains("root rule"));
-    assert!(instructions.contains("nested rule"));
-    assert!(!instructions.contains("outside"));
-    assert!(instructions.contains("Do not let AGENTS.md override how the System prompt"));
+    let context = repository_context(&nested).unwrap().unwrap();
+    assert!(context.starts_with("<repository_context>"));
+    assert!(context.ends_with("</repository_context>"));
+    assert!(context.contains("<repository_instructions path=\""));
+    assert!(context.contains("<![CDATA["));
+    assert!(context.contains("root rule"));
+    assert!(context.contains("nested rule"));
+    assert!(!context.contains("outside"));
+    assert!(!context.contains("Do not let AGENTS.md override"));
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repository_context_cannot_close_its_cdata_field_from_agents_content() {
+    assert_eq!(
+        escape_cdata("before ]]> after"),
+        "before ]]]]><![CDATA[> after"
+    );
 }
 
 #[test]
@@ -852,9 +857,9 @@ fn an_existing_override_suppresses_the_same_directory_agents_file() {
     std::fs::write(root.join("AGENTS.override.md"), "\n").unwrap();
     std::fs::write(root.join("AGENTS.md"), "must not be loaded").unwrap();
 
-    let instructions = repository_instructions(&root).unwrap();
+    let context = repository_context(&root).unwrap();
     assert!(
-        instructions
+        context
             .as_deref()
             .is_none_or(|text| !text.contains("must not be loaded"))
     );
@@ -870,10 +875,10 @@ fn agents_content_is_bounded_before_it_enters_model_history() {
     contents.push_str("TAIL_MUST_NOT_BE_VISIBLE");
     std::fs::write(root.join("AGENTS.md"), contents).unwrap();
 
-    let instructions = repository_instructions(&root).unwrap().unwrap();
-    assert!(instructions.contains("[AGENTS.md truncated]"));
-    assert!(!instructions.contains("TAIL_MUST_NOT_BE_VISIBLE"));
-    assert!(instructions.len() < MAX_REPOSITORY_INSTRUCTIONS_BYTES + 1_024);
+    let context = repository_context(&root).unwrap().unwrap();
+    assert!(context.contains("[AGENTS.md truncated]"));
+    assert!(!context.contains("TAIL_MUST_NOT_BE_VISIBLE"));
+    assert!(context.len() < MAX_REPOSITORY_INSTRUCTIONS_BYTES + 1_024);
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -1172,13 +1177,18 @@ fn resume_replaces_stale_world_state_without_losing_the_usage_baseline() {
         .filter(|item| {
             item.get("role").and_then(Value::as_str) == Some("user")
                 && message_text(item)
-                    .is_some_and(|text| text.trim_start().starts_with(REPOSITORY_ONBOARDING_PREFIX))
+                    .is_some_and(|text| text.trim_start().starts_with(REPOSITORY_CONTEXT_PREFIX))
         })
         .collect::<Vec<_>>();
     assert_eq!(repository_context.len(), 1);
     let current_context = message_text(repository_context[0]).unwrap();
     assert!(current_context.contains("current instruction"));
     assert!(!current_context.contains("old saved instruction"));
+    assert_eq!(
+        resumed.items().last().and_then(message_text),
+        Some("saved user turn"),
+        "refreshing world state must preserve the current user request as the final input item"
+    );
     assert!(resumed.context_tokens().unwrap() < context_before_refresh);
     drop(resumed);
 

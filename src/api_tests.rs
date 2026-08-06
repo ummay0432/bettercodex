@@ -265,7 +265,7 @@ fn output_item_completion_closes_the_visible_stream() {
 }
 
 #[test]
-fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
+fn request_uses_instructions_and_one_stable_tool_prefix() {
     assert!(
         !SYSTEM_PROMPT.to_ascii_lowercase().contains("papercut"),
         "papercut policy belongs to the toggleable system skill"
@@ -285,6 +285,9 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
     let second_input = second["input"].as_array().unwrap();
 
     assert_eq!(first["model"], MODEL);
+    assert_eq!(first["instructions"], harness_instructions());
+    assert!(harness_instructions().starts_with("<harness_contract>"));
+    assert!(harness_instructions().ends_with("</harness_contract>"));
     assert!(
         first.get("max_output_tokens").is_none(),
         "ChatGPT Responses Lite rejects the public max_output_tokens field"
@@ -293,13 +296,9 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
         first["reasoning"],
         json!({"effort": "max", "summary": "auto", "context": "all_turns"})
     );
-    assert_eq!(
-        first["prompt_cache_options"],
-        json!({"mode": "explicit", "ttl": "30m"})
-    );
+    assert!(first.get("prompt_cache_options").is_none());
     assert_eq!(first["prompt_cache_key"], "session-test");
     assert_eq!(first_input[0]["type"], "additional_tools");
-    assert_eq!(first_input[1]["role"], "developer");
     assert_eq!(
         first_input.last().unwrap()["content"][0]["text"]
             .as_str()
@@ -308,33 +307,25 @@ fn request_has_one_stable_prefix_and_explicit_cache_breakpoint() {
         first_text_allocation,
         "request assembly must consume the sampling snapshot without cloning its payloads"
     );
+    assert_eq!(&first_input[..1], &second_input[..1]);
+    assert_eq!(&first_input[..1], stable_request_prefix());
     assert_eq!(
-        first_input[1]["content"][0]["prompt_cache_breakpoint"],
-        json!({"mode": "explicit"})
-    );
-    assert_eq!(&first_input[..2], &second_input[..2]);
-    assert_eq!(&first_input[..2], stable_request_prefix());
-    assert_eq!(
-        serde_json::to_string(&first_input[..2]).unwrap().len(),
-        13_937,
+        serde_json::to_string(&first_input[..1]).unwrap().len(),
+        11_240,
         "run ./scripts/dev.py tool-context --update"
     );
+    assert!(first_input.iter().all(|item| {
+        item.pointer("/content/0/text").and_then(Value::as_str) != Some(harness_instructions())
+    }));
 
     let mut retained_prefix = first_input.to_vec();
     retained_prefix[0]["id"] = json!("at_compacted");
     retained_prefix[0]["status"] = json!("completed");
-    let recomposed = compose_input(retained_prefix, true);
+    let recomposed = compose_input(retained_prefix);
     assert_eq!(
         recomposed
             .iter()
             .filter(|item| item["type"] == "additional_tools")
-            .count(),
-        1
-    );
-    assert_eq!(
-        recomposed
-            .iter()
-            .filter(|item| is_system_prompt_item(item))
             .count(),
         1
     );
@@ -403,7 +394,7 @@ fn benchmark_long_context_sampling_handoff() {
     let mut transferred = history;
     let transfer_started = std::time::Instant::now();
     for _ in 0..SAMPLES {
-        let (input, restoration) = compose_sampling_input(transferred, true);
+        let (input, restoration) = compose_sampling_input(transferred);
         transferred = restoration.restore(input).unwrap();
         std::hint::black_box(&transferred);
     }
@@ -795,78 +786,6 @@ async fn transport_model_header_cannot_silently_route_to_another_model() {
 }
 
 #[tokio::test]
-async fn unsupported_explicit_cache_retries_without_cache_fields() {
-    let item = assistant_item("fallback");
-    let (base_url, requests, server) = spawn_http_server(vec![
-        HttpReply::status(
-            400,
-            "application/json",
-            r#"{"error":{"message":"Unknown parameter: prompt_cache_options"}}"#,
-        ),
-        HttpReply::ok("text/event-stream", completed_sse("resp_fallback", &item)),
-    ]);
-    let mut client = test_client(base_url);
-    client.prefer_websocket = false;
-    let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let response = client
-        .respond(vec![user_message("hello")], &completed_items)
-        .await
-        .unwrap();
-    assert_eq!(response.text, "fallback");
-    assert!(!client.explicit_cache);
-
-    let first: Value =
-        serde_json::from_slice(&requests.recv_timeout(Duration::from_secs(2)).unwrap().body)
-            .unwrap();
-    let second: Value =
-        serde_json::from_slice(&requests.recv_timeout(Duration::from_secs(2)).unwrap().body)
-            .unwrap();
-    assert!(first.get("prompt_cache_options").is_some());
-    assert!(
-        first["input"][1]["content"][0]
-            .get("prompt_cache_breakpoint")
-            .is_some()
-    );
-    assert!(second.get("prompt_cache_options").is_none());
-    assert!(
-        second["input"][1]["content"][0]
-            .get("prompt_cache_breakpoint")
-            .is_none()
-    );
-    server.join().unwrap();
-}
-
-#[tokio::test]
-async fn repeated_cache_parameter_error_stops_after_the_single_fallback() {
-    let error_body = r#"{"error":{"message":"Unsupported prompt_cache_options"}}"#;
-    let (base_url, requests, server) = spawn_http_server(vec![
-        HttpReply::status(400, "application/json", error_body),
-        HttpReply::status(400, "application/json", error_body),
-    ]);
-    let mut client = test_client(base_url);
-    client.prefer_websocket = false;
-    let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let error = match client
-        .respond(vec![user_message("hello")], &completed_items)
-        .await
-    {
-        Ok(_) => panic!("the repeated parameter error should be returned"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("Unsupported prompt_cache_options")
-    );
-    requests.recv_timeout(Duration::from_secs(2)).unwrap();
-    requests.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(requests.try_recv().is_err());
-    server.join().unwrap();
-}
-
-#[tokio::test]
 async fn http_transport_uses_the_pinned_four_retry_request_policy() {
     let item = assistant_item("recovered");
     let retry = || HttpReply::status(503, "text/plain", "busy").with_header("retry-after", "0");
@@ -1048,8 +967,9 @@ async fn remote_compaction_request_is_bounded_by_the_effective_context_window() 
     });
     let fixed_history = vec![user_message("keep"), call, empty_output.clone()];
     let trigger = compaction::compaction_trigger();
-    let prefix_tokens = estimated_tokens(&compose_input(fixed_history.clone(), true))
+    let prefix_tokens = estimated_tokens(&compose_input(fixed_history.clone()))
         .saturating_sub(estimated_tokens(&fixed_history))
+        .saturating_add(estimated_harness_instruction_tokens())
         .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
     let target_request_tokens =
         EFFECTIVE_CONTEXT_WINDOW + (RAW_CONTEXT_WINDOW - EFFECTIVE_CONTEXT_WINDOW) / 2;
@@ -1241,7 +1161,8 @@ async fn websocket_prewarm_and_continuations_match_the_responses_contract() {
     assert!(warmup_request.get("stream").is_none());
     assert!(warmup_request.get("background").is_none());
     assert!(warmup_request.get("previous_response_id").is_none());
-    assert_eq!(warmup_request["input"].as_array().unwrap().len(), 2);
+    assert_eq!(warmup_request["instructions"], harness_instructions());
+    assert_eq!(warmup_request["input"].as_array().unwrap().len(), 1);
     assert_eq!(
         warmup_request["client_metadata"][WS_RESPONSES_LITE_CLIENT_METADATA],
         "true"

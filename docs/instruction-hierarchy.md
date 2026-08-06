@@ -63,18 +63,17 @@ repository, web page, command result, or skill safe.
 
 Source is authoritative; recheck it before changing or relying on this map.
 
-- `src/api.rs` gives the `additional_tools` catalogue and
-  `prompts/system.md` developer authority. The catalogue is a developer item;
-  when the prompt is supplied through the top-level string `instructions`
-  field, the Responses API defines that string as equivalent to developer-role
-  text. Despite its local name, `prompts/system.md` is the harness's
-  developer-level contract.
-- `src/context.rs` sends repository onboarding from `AGENTS.md` as a user
-  message and currently sends environment context as a developer message.
-- `src/skills.rs` currently sends the available-skills catalogue and framework
-  policy as a developer message, while selected full `SKILL.md` bodies are user
-  messages. Because catalogue metadata can come from repository and user files,
-  this boundary requires adversarial coverage before it is changed or trusted.
+- `src/api.rs` sends `prompts/system.md` through the top-level `instructions`
+  field and sends the typed `additional_tools` catalogue as a developer item.
+  The Responses API gives both developer authority. Despite its local name,
+  `prompts/system.md` is the harness's developer-level contract, not OpenAI's
+  root or system layer.
+- `src/context.rs` sends labeled `<repository_context>` from `AGENTS.md` as a
+  user message and labeled `<environment_context>` as a developer message.
+- `src/skills.rs` sends only bounded skill metadata in a user
+  `<available_skills>` message. Harness-owned skill framework policy lives in
+  `prompts/system.md`; selected full `SKILL.md` bodies are separate user
+  `<skill_context>` messages immediately before the current user request.
 - Tool calls and results remain native Responses call and call-output items.
 
 These are implementation facts, not proof that every boundary is optimal.

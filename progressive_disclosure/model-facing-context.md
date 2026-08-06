@@ -8,13 +8,15 @@ model-visible errors.
 Do not alter Codex-derived agent-facing context in `prompts/*.md`, tool
 descriptions, or model-visible errors without explicit user permission.
 
-`prompts/system.md` is the active system prompt. Edit it only when the user
+`prompts/system.md` is the active harness contract. `src/api.rs` sends it
+through the Responses API's top-level `instructions` field at developer
+authority; it is not OpenAI's root or system layer. Edit it only when the user
 explicitly asks to edit the system prompt.
 
 `prompts/tool-catalogue.md` contains the exact generated tool text.
-`prompts/tool-context.md` records the complete tool-related request prefix and
-its context cost; update its generated regions through
-`./scripts/dev.py tool-context --update`.
+`prompts/tool-context.md` records the complete stable harness context, dynamic
+world-state messages, and their context cost; update its generated regions
+through `./scripts/dev.py tool-context --update`.
 
 ## Writing and placement
 
