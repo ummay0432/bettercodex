@@ -3,31 +3,9 @@
 Read this before changing what bettercodex is, what it supports, or which
 upstream Codex behavior belongs here.
 
-bettercodex is my personal Codex CLI fork. I have been an avid Codex user since
-forever, but Codex has grown into a product made for everyone. It is now full of
-compromises, bloat, and trash I do not need. bettercodex strips it back to the
-core and turns it into a harness bespoke to how I work.
-
-I am a CEO. My projects are fully AI-vibecoded, and many of them have run for
-years and passed through thousands of agent sessions. Not long ago, LLMs were
-stupid—very stupid. We still made the projects work, but those models left a lot
-of garbage behind: duplicated paths, shallow fixes, needless abstractions, dead
-code, and implementations that are probably far from the best design for the
-product today.
-
-Generic coding-agent instructions make this worse. They chain the model down:
-do the least amount possible, ignore problems outside the exact task, prefer the
-smallest patch, and stop as soon as a local test passes. Across years of agent
-sessions, each tiny patch stacks on the old garbage and compounds into technical
-debt and scope creep.
-
-bettercodex is meant to give the agent the freedom to stretch its legs, live up
-to its full potential, and give the work its all. I make the product decisions;
-the agent owns the engineering. The agent should not be afraid to refactor,
-delete, consolidate, or clean up clear garbage simply because the request named
-another file. It should be a perfectionist about the code it leaves behind.
-That does not mean inventing unrelated features. It means not preserving bad
-engineering just to keep a diff small.
+[`AGENTS.md`](../AGENTS.md) defines why bettercodex exists, its success criteria,
+and the engineering ownership expected in every session. This file defines
+which Codex behavior belongs here and the fixed product boundaries.
 
 ## Relationship to Codex
 
