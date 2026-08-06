@@ -105,6 +105,12 @@ fn assistant_item(text: &str) -> Value {
     })
 }
 
+fn assistant_item_with_phase(text: &str, phase: &str) -> Value {
+    let mut item = assistant_item(text);
+    item["phase"] = json!(phase);
+    item
+}
+
 fn completed_sse(response_id: &str, item: &Value) -> String {
     completed_sse_with_items(response_id, std::slice::from_ref(item))
 }
@@ -203,7 +209,22 @@ fn completed_items_are_emitted_once_in_api_order() {
 
 #[test]
 fn extracts_text_and_forwards_streaming_events() {
-    assert_eq!(text_from_items(&[assistant_item("done")]), "done");
+    assert_eq!(
+        terminal_answer(&[assistant_item("done")]).as_deref(),
+        Some("done")
+    );
+    assert_eq!(
+        terminal_answer(&[
+            assistant_item_with_phase("working", "commentary"),
+            assistant_item_with_phase("done", "final_answer"),
+        ])
+        .as_deref(),
+        Some("done")
+    );
+    assert_eq!(
+        terminal_answer(&[assistant_item_with_phase("future", "unknown")]),
+        None
+    );
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut collected = CollectedResponse::default();
@@ -231,7 +252,7 @@ fn extracts_text_and_forwards_streaming_events() {
 
     assert_eq!(
         received.try_recv().unwrap(),
-        AgentEvent::ModelTextDelta("hello".to_string())
+        AgentEvent::ModelMessageDelta("hello".to_string())
     );
     assert_eq!(
         received.try_recv().unwrap(),
@@ -244,16 +265,28 @@ fn extracts_text_and_forwards_streaming_events() {
 }
 
 #[test]
-fn output_item_completion_closes_the_visible_stream() {
+fn assistant_item_events_preserve_phase_and_authoritative_text() {
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut collected = CollectedResponse::default();
 
+    let item = assistant_item_with_phase("still working", "commentary");
+    process_event_value(
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": item,
+        }),
+        &mut collected,
+        &completed_items,
+        Some(&events),
+    )
+    .unwrap();
     process_event_value(
         json!({
             "type": "response.output_item.done",
             "output_index": 0,
-            "item": assistant_item("done"),
+            "item": item,
         }),
         &mut collected,
         &completed_items,
@@ -261,7 +294,62 @@ fn output_item_completion_closes_the_visible_stream() {
     )
     .unwrap();
 
-    assert_eq!(received.try_recv().unwrap(), AgentEvent::ModelItemCompleted);
+    let message = AssistantMessage {
+        text: "still working".to_string(),
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    };
+    assert_eq!(
+        received.try_recv().unwrap(),
+        AgentEvent::ModelMessageStarted(message.clone())
+    );
+    assert_eq!(
+        received.try_recv().unwrap(),
+        AgentEvent::ModelMessageCompleted(message)
+    );
+}
+
+#[test]
+fn response_completion_preserves_end_turn_and_recovers_missing_item_events() {
+    let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
+    let (completed_items, mut received_items) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::default();
+    let item = assistant_item_with_phase("continuing", "commentary");
+    let mut completed = completed_event("resp_continue", &item);
+    completed["response"]["end_turn"] = json!(false);
+
+    process_event_value(completed, &mut collected, &completed_items, Some(&events)).unwrap();
+
+    assert_eq!(received_items.try_recv().unwrap(), item);
+    assert_eq!(
+        received_events.try_recv().unwrap(),
+        AgentEvent::ModelMessageCompleted(AssistantMessage {
+            text: "continuing".to_string(),
+            phase: Some(codex_protocol::models::MessagePhase::Commentary),
+        })
+    );
+    let response = collected.finish().unwrap();
+    assert_eq!(response.end_turn, Some(false));
+    assert_eq!(response.final_answer, None);
+    assert!(response.has_assistant_text());
+}
+
+#[test]
+fn unsupported_assistant_message_phases_are_rejected_at_the_stream_boundary() {
+    let (completed_items, _received_items) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::default();
+    let error = process_event_value(
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": assistant_item_with_phase("future", "unknown"),
+        }),
+        &mut collected,
+        &completed_items,
+        None,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("unsupported phase"));
 }
 
 #[test]
@@ -655,7 +743,7 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
         .respond(vec![user_message("hello")], &completed_items)
         .await
         .unwrap();
-    assert_eq!(response.text, "http");
+    assert_eq!(response.final_answer.as_deref(), Some("http"));
     assert!(response.server_reasoning_included);
     assert_eq!(response.usage.unwrap().cached_input_tokens, 30);
     assert_eq!(completed_rx.try_recv().unwrap(), item);
@@ -731,7 +819,7 @@ async fn http_transport_collects_large_sse_events_from_small_http_chunks() {
         .unwrap();
 
     assert_eq!(response.items.as_slice(), std::slice::from_ref(&item));
-    assert_eq!(response.text, text);
+    assert_eq!(response.final_answer.as_deref(), Some(text.as_str()));
     assert_eq!(completed_rx.try_recv().unwrap(), item);
     assert!(completed_rx.try_recv().is_err());
     assert_eq!(
@@ -809,7 +897,7 @@ async fn http_transport_uses_the_pinned_four_retry_request_policy() {
         .respond(vec![user_message("retry")], &completed_items)
         .await
         .unwrap();
-    assert_eq!(response.text, "recovered");
+    assert_eq!(response.final_answer.as_deref(), Some("recovered"));
     for _ in 0..5 {
         requests.recv_timeout(Duration::from_secs(2)).unwrap();
     }
@@ -874,7 +962,7 @@ async fn websocket_upgrade_failure_falls_back_to_http() {
         .respond(vec![user_message("hello")], &completed_items)
         .await
         .unwrap();
-    assert_eq!(response.text, "https fallback");
+    assert_eq!(response.final_answer.as_deref(), Some("https fallback"));
     assert!(!client.prefer_websocket);
     assert_eq!(
         requests.recv_timeout(Duration::from_secs(2)).unwrap().path,
@@ -1153,7 +1241,7 @@ async fn websocket_prewarm_and_continuations_match_the_responses_contract() {
     history.extend(first.items);
     history.push(user_message("two"));
     let second = client.respond(history, &completed_items).await.unwrap();
-    assert_eq!(second.text, "second");
+    assert_eq!(second.final_answer.as_deref(), Some("second"));
 
     let warmup_request = requests_rx.recv().await.unwrap();
     let first_request = requests_rx.recv().await.unwrap();
@@ -1289,7 +1377,7 @@ async fn websocket_pings_do_not_hide_inactivity_and_recovery_goes_directly_to_ht
     .expect("response recovery timed out")
     .unwrap();
 
-    assert_eq!(response.text, "https recovery");
+    assert_eq!(response.final_answer.as_deref(), Some("https recovery"));
     assert!(!client.prefer_websocket);
     let warnings = std::iter::from_fn(|| event_rx.try_recv().ok())
         .filter_map(|event| match event {

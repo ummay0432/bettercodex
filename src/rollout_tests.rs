@@ -281,11 +281,13 @@ fn resume_reconstructs_the_visible_transcript_across_compaction() {
         "type": "message",
         "role": "assistant",
         "content": [{"type": "output_text", "text": "First answer"}],
+        "phase": "commentary",
     });
     let final_answer = json!({
         "type": "message",
         "role": "assistant",
         "content": [{"type": "output_text", "text": "After compaction"}],
+        "phase": "final_answer",
     });
     rollout
         .append_history(&[contextual, user.clone(), first_answer.clone()])
@@ -309,9 +311,11 @@ fn resume_reconstructs_the_visible_transcript_across_compaction() {
             },
             SessionTranscriptItem::Assistant {
                 text: "First answer".to_string(),
+                phase: Some(MessagePhase::Commentary),
             },
             SessionTranscriptItem::Assistant {
                 text: "After compaction".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
             },
         ]
     );

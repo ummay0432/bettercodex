@@ -3,12 +3,21 @@ use super::ReceiverState;
 use super::drain_ready_agent_events;
 use super::prompt_history_for_session;
 use super::view::View;
+use crate::assistant_message::AssistantMessage;
 use crate::events::AgentEvent;
+use codex_protocol::models::MessagePhase;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::Path;
 use std::time::Instant;
 use tokio::sync::mpsc::unbounded_channel;
+
+fn completed_message(text: impl Into<String>) -> AgentEvent {
+    AgentEvent::ModelMessageCompleted(AssistantMessage {
+        text: text.into(),
+        phase: Some(MessagePhase::FinalAnswer),
+    })
+}
 
 #[test]
 fn resumed_prompts_precede_global_duplicates_during_recall() {
@@ -43,7 +52,7 @@ fn ready_stream_events_are_drained_before_the_terminal_frame() {
     let (events, mut ready) = unbounded_channel();
     for index in 0..DELTAS {
         events
-            .send(AgentEvent::ModelTextDelta(format!(
+            .send(AgentEvent::ModelMessageDelta(format!(
                 "streamed line {index}\n"
             )))
             .unwrap();
@@ -77,7 +86,7 @@ fn ready_event_drain_yields_to_the_event_loop_at_its_bound() {
     let (events, mut ready) = unbounded_channel();
     for _ in 0..=MAX_READY_AGENT_EVENTS {
         events
-            .send(AgentEvent::ModelItemCompleted)
+            .send(completed_message(String::new()))
             .expect("receiver remains open");
     }
     drop(events);
@@ -104,14 +113,14 @@ fn prepared_streaming_layout_tracks_new_deltas_and_finalizes_to_history() {
     let mut view = View::new(Path::new("/tmp/bettercodex"));
     view.start_turn("render a cached response");
     let _ = view.take_pending_history_lines(WIDTH);
-    view.handle_agent_event(AgentEvent::ModelTextDelta("**alpha**".to_string()));
+    view.handle_agent_event(AgentEvent::ModelMessageDelta("**alpha**".to_string()));
     assert!(render_view(&mut view, WIDTH, SCREEN_HEIGHT).contains("alpha"));
 
-    view.handle_agent_event(AgentEvent::ModelTextDelta(" omega".to_string()));
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(" omega".to_string()));
     let updated = render_view(&mut view, WIDTH, SCREEN_HEIGHT);
     assert!(updated.contains("alpha omega"), "{updated}");
 
-    view.handle_agent_event(AgentEvent::ModelItemCompleted);
+    view.handle_agent_event(completed_message("**alpha** omega"));
     let finalized = view
         .take_pending_history_lines(WIDTH)
         .iter()
@@ -134,11 +143,10 @@ fn oversized_stream_moves_old_rows_to_history_before_completion() {
     let mut view = View::new(Path::new("/tmp/bettercodex"));
     view.start_turn("stream beyond the viewport");
     let _ = view.take_pending_history_lines(WIDTH);
-    view.handle_agent_event(AgentEvent::ModelTextDelta(
-        (0..40)
-            .map(|index| format!("- stream row {index}\n"))
-            .collect(),
-    ));
+    let first = (0..40)
+        .map(|index| format!("- stream row {index}\n"))
+        .collect::<String>();
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(first.clone()));
 
     let mut prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
     let mut emitted = prepared.take_history_lines();
@@ -152,11 +160,10 @@ fn oversized_stream_moves_old_rows_to_history_before_completion() {
     assert!(!rendered.contains("stream row 0"), "{rendered}");
     assert!(rendered.contains("stream row 39"), "{rendered}");
 
-    view.handle_agent_event(AgentEvent::ModelTextDelta(
-        (40..45)
-            .map(|index| format!("- stream row {index}\n"))
-            .collect(),
-    ));
+    let second = (40..45)
+        .map(|index| format!("- stream row {index}\n"))
+        .collect::<String>();
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(second.clone()));
     let mut prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
     let next = prepared.take_history_lines();
     assert!(
@@ -166,7 +173,7 @@ fn oversized_stream_moves_old_rows_to_history_before_completion() {
     emitted.extend(next);
     assert!(render_prepared_view(&mut view, WIDTH, prepared).contains("stream row 44"));
 
-    view.handle_agent_event(AgentEvent::ModelItemCompleted);
+    view.handle_agent_event(completed_message(format!("{first}{second}")));
     assert!(!view.streamed_history_needs_reflow(WIDTH));
     emitted.extend(view.take_pending_history_lines(WIDTH));
     for index in 0..45 {
@@ -196,7 +203,7 @@ fn completed_stream_requests_replay_if_markdown_rewrites_emitted_rows() {
             .map(|index| format!("- filler row {index}\n"))
             .collect::<String>(),
     );
-    view.handle_agent_event(AgentEvent::ModelTextDelta(initial));
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(initial.clone()));
     let mut prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
     let emitted = prepared.take_history_lines();
     assert!(
@@ -206,10 +213,12 @@ fn completed_stream_requests_replay_if_markdown_rewrites_emitted_rows() {
         "{emitted:?}"
     );
 
-    view.handle_agent_event(AgentEvent::ModelTextDelta(
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(
         "\n[target]: https://example.com\n".to_string(),
     ));
-    view.handle_agent_event(AgentEvent::ModelItemCompleted);
+    view.handle_agent_event(completed_message(format!(
+        "{initial}\n[target]: https://example.com\n"
+    )));
     assert!(view.streamed_history_needs_reflow(WIDTH));
 
     let replay = view
@@ -227,7 +236,7 @@ fn prepared_layout_reflows_if_the_terminal_resizes_before_draw() {
     let mut view = View::new(Path::new("/tmp/bettercodex"));
     view.start_turn("render across a resize");
     let _ = view.take_pending_history_lines(80);
-    view.handle_agent_event(AgentEvent::ModelTextDelta(
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(
         "a response wide enough to reflow at the narrower width resize-marker".to_string(),
     ));
     let prepared = view.prepare(80, 24);
@@ -259,7 +268,7 @@ fn benchmark_streaming_markdown_event_burst() {
     let (events, mut ready) = unbounded_channel();
     for index in 0..DELTAS {
         events
-            .send(AgentEvent::ModelTextDelta(format!(
+            .send(AgentEvent::ModelMessageDelta(format!(
                 "token {index} with **markdown** and `code`\n"
             )))
             .unwrap();

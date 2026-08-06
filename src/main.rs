@@ -1,5 +1,6 @@
 mod agent;
 mod api;
+mod assistant_message;
 mod auth;
 mod compaction;
 mod context;

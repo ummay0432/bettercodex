@@ -18,6 +18,7 @@ use super::tool_catalogue::ToolCatalogueView;
 use crate::MODEL;
 use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
+use crate::assistant_message::AssistantMessage;
 use crate::context::ContextSnapshot;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
@@ -28,6 +29,7 @@ use crate::skills::Skill;
 use crate::skills::SkillSelection;
 use crate::skills::SkillUpdate;
 use codex_ansi_escape::ansi_escape_line;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::parse_command::parse_command;
 use crossterm::event::Event;
@@ -154,7 +156,8 @@ pub(super) struct View {
     reasoning_status: ReasoningStatus,
     status_detail: Option<String>,
     pending_input: PendingInput,
-    assistant_received_this_turn: bool,
+    terminal_assistant_received_this_turn: bool,
+    active_message_phase: Option<MessagePhase>,
     composer_text_width: u16,
     overlay: Option<Overlay>,
     slash_selection: usize,
@@ -186,6 +189,7 @@ enum TranscriptEntry {
     User(UserPrompt),
     Assistant {
         text: String,
+        phase: Option<MessagePhase>,
         streaming: bool,
         rendered: Option<RenderedAssistant>,
         history: StreamedAssistantHistory,
@@ -383,7 +387,8 @@ impl View {
             reasoning_status: ReasoningStatus::default(),
             status_detail: None,
             pending_input: PendingInput::default(),
-            assistant_received_this_turn: false,
+            terminal_assistant_received_this_turn: false,
+            active_message_phase: None,
             composer_text_width: 1,
             overlay: None,
             slash_selection: 0,
@@ -452,7 +457,8 @@ impl View {
         self.turn_had_work = false;
         self.reasoning_status.reset();
         self.status_detail = None;
-        self.assistant_received_this_turn = false;
+        self.terminal_assistant_received_this_turn = false;
+        self.active_message_phase = None;
     }
 
     pub(super) fn start_compaction(&mut self) {
@@ -464,7 +470,8 @@ impl View {
         self.turn_had_work = false;
         self.reasoning_status.reset();
         self.status_detail = Some("Compacting conversation".to_string());
-        self.assistant_received_this_turn = false;
+        self.terminal_assistant_received_this_turn = false;
+        self.active_message_phase = None;
     }
 
     pub(super) fn add_user_message(&mut self, prompt: &UserPrompt) {
@@ -533,9 +540,10 @@ impl View {
         self.status_detail = None;
         match result {
             Ok(SubmitOutcome::Completed(answer)) => {
-                if !self.assistant_received_this_turn && !answer.trim().is_empty() {
+                if !self.terminal_assistant_received_this_turn && !answer.trim().is_empty() {
                     self.entries.push(TranscriptEntry::Assistant {
                         text: answer,
+                        phase: Some(MessagePhase::FinalAnswer),
                         streaming: false,
                         rendered: None,
                         history: StreamedAssistantHistory::default(),
@@ -663,8 +671,9 @@ impl View {
                     }
                     TranscriptEntry::User(UserPrompt::text(text))
                 }
-                SessionTranscriptItem::Assistant { text } => TranscriptEntry::Assistant {
+                SessionTranscriptItem::Assistant { text, phase } => TranscriptEntry::Assistant {
                     text,
+                    phase,
                     streaming: false,
                     rendered: None,
                     history: StreamedAssistantHistory::default(),
@@ -713,13 +722,29 @@ impl View {
         self.slash_selection = 0;
         self.dismissed_slash = None;
         self.process_commands.clear();
+        self.terminal_assistant_received_this_turn = false;
+        self.active_message_phase = None;
     }
 
     pub(super) fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::ModelTextDelta(delta) => {
+            AgentEvent::ModelMessageStarted(message) => {
                 self.seal_exploration();
-                self.assistant_received_this_turn = true;
+                self.close_streaming_entries();
+                self.active_message_phase = message.phase;
+                if !message.text.is_empty() {
+                    self.entries.push(TranscriptEntry::Assistant {
+                        text: message.text,
+                        phase: self.active_message_phase.clone(),
+                        streaming: true,
+                        rendered: None,
+                        history: StreamedAssistantHistory::default(),
+                    });
+                }
+                self.status_detail = None;
+            }
+            AgentEvent::ModelMessageDelta(delta) => {
+                self.seal_exploration();
                 match self.entries.last_mut() {
                     Some(TranscriptEntry::Assistant {
                         text,
@@ -732,12 +757,16 @@ impl View {
                     }
                     _ => self.entries.push(TranscriptEntry::Assistant {
                         text: delta,
+                        phase: self.active_message_phase.clone(),
                         streaming: true,
                         rendered: None,
                         history: StreamedAssistantHistory::default(),
                     }),
                 }
                 self.status_detail = None;
+            }
+            AgentEvent::ModelMessageCompleted(message) => {
+                self.complete_assistant_message(message);
             }
             AgentEvent::ReasoningSummarySectionStarted => {
                 self.seal_exploration();
@@ -747,7 +776,7 @@ impl View {
                 self.seal_exploration();
                 self.reasoning_status.push_delta(&delta);
             }
-            AgentEvent::ModelItemCompleted | AgentEvent::ModelResponseCompleted => {
+            AgentEvent::ModelResponseCompleted => {
                 self.close_streaming_entries();
             }
             AgentEvent::ToolStarted {
@@ -1220,6 +1249,38 @@ impl View {
         Action::Queue(prompt)
     }
 
+    fn complete_assistant_message(&mut self, message: AssistantMessage) {
+        self.seal_exploration();
+        self.terminal_assistant_received_this_turn |=
+            message.is_terminal() && !message.text.trim().is_empty();
+        match self.entries.last_mut() {
+            Some(TranscriptEntry::Assistant {
+                text,
+                phase,
+                streaming,
+                rendered,
+                ..
+            }) if *streaming => {
+                *text = message.text;
+                *phase = message.phase;
+                *streaming = false;
+                *rendered = None;
+            }
+            _ if !message.text.trim().is_empty() => {
+                self.entries.push(TranscriptEntry::Assistant {
+                    text: message.text,
+                    phase: message.phase,
+                    streaming: false,
+                    rendered: None,
+                    history: StreamedAssistantHistory::default(),
+                });
+            }
+            _ => {}
+        }
+        self.active_message_phase = None;
+        self.status_detail = None;
+    }
+
     fn close_streaming_entries(&mut self) {
         for entry in self.entries.iter_mut().rev() {
             match entry {
@@ -1232,6 +1293,7 @@ impl View {
                 | TranscriptEntry::FinalMessageSeparator { .. } => {}
             }
         }
+        self.active_message_phase = None;
     }
 
     fn seal_exploration(&mut self) {
@@ -1382,6 +1444,7 @@ impl View {
             streaming: true,
             rendered,
             history,
+            ..
         }) = self.entries.get_mut(self.committed_entries)
         else {
             return Vec::new();
@@ -2038,6 +2101,7 @@ impl TranscriptEntry {
                 streaming,
                 rendered,
                 history,
+                ..
             } if history.started && history.width == Some(width) => {
                 let rendered_lines = cached_assistant_lines(text, rendered, width);
                 let start = history.lines.len().min(rendered_lines.len());
@@ -2057,6 +2121,7 @@ impl TranscriptEntry {
             streaming,
             rendered,
             history,
+            ..
         } = self
         else {
             return false;
@@ -3881,6 +3946,13 @@ mod tests {
         UserPrompt::text(text)
     }
 
+    fn completed_message(text: impl Into<String>) -> AgentEvent {
+        AgentEvent::ModelMessageCompleted(AssistantMessage {
+            text: text.into(),
+            phase: Some(MessagePhase::FinalAnswer),
+        })
+    }
+
     #[test]
     fn context_usage_matches_the_preserved_contract() {
         assert_eq!(format_context_usage(None), "? of 353K");
@@ -4117,8 +4189,8 @@ mod tests {
             output: Ok(json!({"exit_code": 0, "output": ""})),
             duration: Duration::from_millis(10),
         });
-        view.handle_agent_event(AgentEvent::ModelTextDelta("Done.".to_string()));
-        view.handle_agent_event(AgentEvent::ModelItemCompleted);
+        view.handle_agent_event(AgentEvent::ModelMessageDelta("Done.".to_string()));
+        view.handle_agent_event(completed_message("Done."));
         view.working_since = Some(Instant::now() - Duration::from_secs(125));
         view.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
 
@@ -4143,6 +4215,44 @@ mod tests {
             )
         );
         assert!((0..WIDTH).all(|x| buffer[(x, separator_y)].modifier.contains(Modifier::DIM)));
+    }
+
+    #[test]
+    fn commentary_completion_does_not_claim_the_turns_final_answer() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test phases");
+        view.handle_agent_event(AgentEvent::ModelMessageCompleted(AssistantMessage {
+            text: "Still working.".to_string(),
+            phase: Some(MessagePhase::Commentary),
+        }));
+
+        assert!(!view.terminal_assistant_received_this_turn);
+        view.finish_turn(Ok(SubmitOutcome::Completed("Finished.".to_string())));
+
+        let assistant_phases = view
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Assistant { phase, .. } => Some(phase.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assistant_phases,
+            [
+                Some(MessagePhase::Commentary),
+                Some(MessagePhase::FinalAnswer),
+            ]
+        );
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Still working."), "{rendered}");
+        assert!(rendered.contains("Finished."), "{rendered}");
     }
 
     #[test]
@@ -4527,6 +4637,7 @@ mod tests {
                 },
                 SessionTranscriptItem::Assistant {
                     text: "Saved **answer**".to_string(),
+                    phase: Some(MessagePhase::FinalAnswer),
                 },
             ],
             ["resumed prompt".to_string()],
@@ -5156,8 +5267,8 @@ mod tests {
         );
         view.start_turn("a user message that wraps at the narrower width");
         let _ = view.take_pending_history_lines(80);
-        view.handle_agent_event(AgentEvent::ModelTextDelta("assistant reply".to_string()));
-        view.handle_agent_event(AgentEvent::ModelItemCompleted);
+        view.handle_agent_event(AgentEvent::ModelMessageDelta("assistant reply".to_string()));
+        view.handle_agent_event(completed_message("assistant reply"));
         let _ = view.take_pending_history_lines(80);
 
         assert_eq!(
@@ -5386,7 +5497,7 @@ mod tests {
             });
             assert!(view.take_pending_history_lines(80).is_empty());
         }
-        view.handle_agent_event(AgentEvent::ModelTextDelta("done".to_string()));
+        view.handle_agent_event(AgentEvent::ModelMessageDelta("done".to_string()));
         let rendered = view
             .take_pending_history_lines(80)
             .iter()

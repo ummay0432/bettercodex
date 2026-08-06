@@ -31,7 +31,18 @@ fn remote_v2_retains_only_recent_user_and_non_completion_agent_messages() {
             "<response_interrupted>\nretry\n</response_interrupted>",
         ),
         user.clone(),
-        message("assistant", "assistant output is summarized"),
+        json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "interim output is summarized"}],
+            "phase": "commentary",
+        }),
+        json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "final output is summarized"}],
+            "phase": "final_answer",
+        }),
         delegated.clone(),
         json!({
             "type": "agent_message",

@@ -821,7 +821,7 @@ mod tests {
             })
             .unwrap();
 
-        view.handle_agent_event(AgentEvent::ModelTextDelta(
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(
             (0..40)
                 .map(|index| format!("- stream row {index}\n"))
                 .collect(),

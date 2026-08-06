@@ -1,3 +1,4 @@
+use crate::assistant_message::AssistantMessage;
 use crate::context::ContextSnapshot;
 use serde_json::Value;
 use std::time::Duration;
@@ -7,10 +8,11 @@ pub(crate) struct SteerId(pub(crate) u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentEvent {
-    ModelTextDelta(String),
+    ModelMessageStarted(AssistantMessage),
+    ModelMessageDelta(String),
     ReasoningSummarySectionStarted,
     ReasoningSummaryDelta(String),
-    ModelItemCompleted,
+    ModelMessageCompleted(AssistantMessage),
     ModelResponseCompleted,
     ToolStarted {
         call_id: String,

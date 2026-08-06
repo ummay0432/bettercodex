@@ -1,4 +1,7 @@
 use crate::MODEL;
+use crate::assistant_message::AssistantMessage;
+use crate::assistant_message::has_assistant_text;
+use crate::assistant_message::terminal_answer;
 use crate::auth::Auth;
 use crate::auth::AuthSnapshot;
 use crate::auth::SharedAuth;
@@ -27,6 +30,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Range;
 use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -362,10 +366,17 @@ enum WebSocketRequestMode {
 pub(crate) struct ModelResponse {
     pub(crate) items: Vec<Value>,
     pub(crate) tool_calls: Vec<ToolCall>,
-    pub(crate) text: String,
+    pub(crate) final_answer: Option<String>,
+    pub(crate) end_turn: Option<bool>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) server_reasoning_included: bool,
     response_id: String,
+}
+
+impl ModelResponse {
+    pub(crate) fn has_assistant_text(&self) -> bool {
+        has_assistant_text(&self.items)
+    }
 }
 
 #[derive(Debug)]
@@ -695,7 +706,7 @@ impl ApiClient {
                 break;
             }
         }
-        let mut response = collected.finish(events)?;
+        let mut response = collected.finish()?;
         response.server_reasoning_included = self.websocket_reasoning_included;
         Ok(response)
     }
@@ -1318,18 +1329,17 @@ async fn collect_http_stream(
             "model stream closed before response.completed",
         ));
     }
-    collected.finish(events)
+    collected.finish()
 }
 
 #[derive(Default)]
 struct CollectedResponse {
     items: Vec<Value>,
     pending_items: BTreeMap<usize, Value>,
-    text: String,
     usage: Option<TokenUsage>,
+    end_turn: Option<bool>,
     response_id: Option<String>,
     completed: bool,
-    streamed_text: bool,
 }
 
 impl CollectedResponse {
@@ -1338,10 +1348,11 @@ impl CollectedResponse {
         index: usize,
         item: Value,
         completed_items: &UnboundedSender<Value>,
-    ) -> ApiResult<()> {
+    ) -> ApiResult<Range<usize>> {
+        validate_assistant_message_phase(&item)?;
         if index < self.items.len() {
             if self.items[index] == item {
-                return Ok(());
+                return Ok(index..index);
             }
             return Err(ApiError::fatal(format!(
                 "model sent conflicting output items at index {index}"
@@ -1354,14 +1365,15 @@ impl CollectedResponse {
                 "model sent conflicting pending output items at index {index}"
             )));
         }
+        let appended_start = self.items.len();
         while let Some(item) = self.pending_items.remove(&self.items.len()) {
             let _ = completed_items.send(item.clone());
             self.items.push(item);
         }
-        Ok(())
+        Ok(appended_start..self.items.len())
     }
 
-    fn finish(self, events: Option<&UnboundedSender<AgentEvent>>) -> ApiResult<ModelResponse> {
+    fn finish(self) -> ApiResult<ModelResponse> {
         if !self.pending_items.is_empty() {
             return Err(ApiError::fatal(
                 "model response completed with a gap in output item indexes",
@@ -1372,21 +1384,12 @@ impl CollectedResponse {
             .iter()
             .filter_map(ToolCall::from_response_item)
             .collect();
-        let text = if self.text.is_empty() {
-            text_from_items(&self.items)
-        } else {
-            self.text
-        };
-        if !self.streamed_text
-            && !text.is_empty()
-            && let Some(events) = events
-        {
-            let _ = events.send(AgentEvent::ModelTextDelta(text.clone()));
-        }
+        let final_answer = terminal_answer(&self.items);
         Ok(ModelResponse {
             items: self.items,
             tool_calls,
-            text,
+            final_answer,
+            end_turn: self.end_turn,
             usage: self.usage,
             server_reasoning_included: false,
             response_id: self
@@ -1418,13 +1421,23 @@ fn process_event_value(
 ) -> ApiResult<()> {
     validate_event_server_model(&event)?;
     match event.get("type").and_then(Value::as_str) {
+        Some("response.output_item.added") => {
+            if let Some(item) = event.get("item") {
+                validate_assistant_message_phase(item)?;
+            }
+            if let Some(message) = event
+                .get("item")
+                .and_then(AssistantMessage::from_response_item)
+                && let Some(events) = events
+            {
+                let _ = events.send(AgentEvent::ModelMessageStarted(message));
+            }
+        }
         Some("response.output_text.delta") => {
-            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                collected.text.push_str(delta);
-                collected.streamed_text = true;
-                if let Some(events) = events {
-                    let _ = events.send(AgentEvent::ModelTextDelta(delta.to_string()));
-                }
+            if let Some(delta) = event.get("delta").and_then(Value::as_str)
+                && let Some(events) = events
+            {
+                let _ = events.send(AgentEvent::ModelMessageDelta(delta.to_string()));
             }
         }
         Some("response.reasoning_summary_text.delta") => {
@@ -1449,10 +1462,8 @@ fn process_event_value(
                 .and_then(Value::as_u64)
                 .and_then(|index| usize::try_from(index).ok())
                 .unwrap_or_else(|| collected.items.len() + collected.pending_items.len());
-            collected.push_item(index, item, completed_items)?;
-            if let Some(events) = events {
-                let _ = events.send(AgentEvent::ModelItemCompleted);
-            }
+            let appended = collected.push_item(index, item, completed_items)?;
+            emit_completed_message_events(&collected.items[appended], events);
         }
         Some("response.completed") => {
             let response = event
@@ -1461,10 +1472,12 @@ fn process_event_value(
             validate_completed_response(response)?;
             if let Some(output) = response.get("output").and_then(Value::as_array) {
                 for (index, item) in output.iter().cloned().enumerate() {
-                    collected.push_item(index, item, completed_items)?;
+                    let appended = collected.push_item(index, item, completed_items)?;
+                    emit_completed_message_events(&collected.items[appended], events);
                 }
             }
             collected.usage = response.get("usage").and_then(parse_usage);
+            collected.end_turn = response.get("end_turn").and_then(Value::as_bool);
             collected.response_id = response
                 .get("id")
                 .and_then(Value::as_str)
@@ -1501,6 +1514,35 @@ fn process_event_value(
         _ => {}
     }
     Ok(())
+}
+
+fn emit_completed_message_events(items: &[Value], events: Option<&UnboundedSender<AgentEvent>>) {
+    let Some(events) = events else {
+        return;
+    };
+    for message in items
+        .iter()
+        .filter_map(AssistantMessage::from_response_item)
+    {
+        let _ = events.send(AgentEvent::ModelMessageCompleted(message));
+    }
+}
+
+fn validate_assistant_message_phase(item: &Value) -> ApiResult<()> {
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return Ok(());
+    }
+    match item.get("phase") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(phase)) if matches!(phase.as_str(), "commentary" | "final_answer") => {
+            Ok(())
+        }
+        _ => Err(ApiError::fatal(
+            "model sent an assistant message with an unsupported phase",
+        )),
+    }
 }
 
 fn error_event(event: &Value) -> ApiError {
@@ -1660,20 +1702,6 @@ fn parse_usage(usage: &Value) -> Option<TokenUsage> {
                     )
             }),
     })
-}
-
-fn text_from_items(items: &[Value]) -> String {
-    items
-        .iter()
-        .filter(|item| {
-            item.get("type").and_then(Value::as_str) == Some("message")
-                && item.get("role").and_then(Value::as_str) == Some("assistant")
-        })
-        .filter_map(|item| item.get("content").and_then(Value::as_array))
-        .flatten()
-        .filter_map(|content| content.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn websocket_url(base_url: &str, path: &str) -> ApiResult<String> {

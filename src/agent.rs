@@ -358,7 +358,6 @@ impl Agent {
             return Ok(SubmitOutcome::Cancelled);
         }
 
-        let mut transcript = Vec::new();
         let mut pending_steering = VecDeque::new();
         // Sample the fresh turn input first. After a mid-turn compact, sample the
         // compacted tool continuation once before inserting queued steering.
@@ -386,16 +385,16 @@ impl Agent {
                 SamplingOutcome::Response(response) => response,
                 SamplingOutcome::Cancelled => return Ok(SubmitOutcome::Cancelled),
             };
-            if !response.text.trim().is_empty() {
-                transcript.push(response.text.trim().to_string());
-            }
+            let model_needs_follow_up = response.end_turn == Some(false);
+            let has_assistant_text = response.has_assistant_text();
+            let final_answer = response.final_answer;
             self.conversation
                 .record_usage(response.usage, response.server_reasoning_included)?;
             self.emit_context(events);
             emit(events, AgentEvent::ModelResponseCompleted);
 
             let mut tool_calls = response.tool_calls.into_iter();
-            if tool_calls.len() == 0 {
+            if tool_calls.len() == 0 && !model_needs_follow_up {
                 control.drain_steering(&mut pending_steering);
                 if !pending_steering.is_empty() {
                     continue;
@@ -403,10 +402,15 @@ impl Agent {
                 if !control.close_if_idle(&mut pending_steering) {
                     continue;
                 }
-                if transcript.is_empty() {
-                    return Err(anyhow!("model returned no text or tool call"));
+                if let Some(final_answer) = final_answer {
+                    return Ok(SubmitOutcome::Completed(final_answer.trim().to_string()));
                 }
-                return Ok(SubmitOutcome::Completed(transcript.join("\n")));
+                if has_assistant_text {
+                    // Explicit commentary remains visible in the transcript but is
+                    // not promoted into the terminal answer for line/one-shot mode.
+                    return Ok(SubmitOutcome::Completed(String::new()));
+                }
+                return Err(anyhow!("model returned no text or tool call"));
             }
 
             while let Some(tool_call) = tool_calls.next() {

@@ -59,7 +59,7 @@ async fn steering_waits_for_the_response_boundary_and_enters_the_next_request() 
     let (agent, outcome) = task.await.expect("agent task");
     assert_eq!(
         outcome.unwrap(),
-        SubmitOutcome::Completed("first answer\nsecond answer".to_string())
+        SubmitOutcome::Completed("second answer".to_string())
     );
     assert_eq!(
         agent.prompt_history(),
@@ -98,6 +98,83 @@ async fn steering_waits_for_the_response_boundary_and_enters_the_next_request() 
     assert!(response_boundary < committed, "{events:#?}");
 
     fixture.server.join().expect("server thread");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commentary_with_end_turn_false_continues_until_a_final_answer() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requests_tx, mut requests_rx) = unbounded_channel();
+    let server = thread::spawn(move || {
+        let commentary = json!({
+            "id": "msg_commentary",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Still working."}],
+            "phase": "commentary",
+        });
+        let final_answer = json!({
+            "id": "msg_final",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Finished."}],
+            "phase": "final_answer",
+        });
+        for (index, item) in [commentary, final_answer].into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests_tx.send(read_request(&mut stream)).unwrap();
+            write_sse_items_response_with_end_turn(
+                &mut stream,
+                &format!("resp_{index}"),
+                &[item],
+                (index == 0).then_some(false),
+            );
+        }
+    });
+    let (root, mut agent) = test_agent(&format!("http://{address}"));
+
+    let answer = timeout(Duration::from_secs(5), agent.submit("finish the task"))
+        .await
+        .expect("turn timed out")
+        .unwrap();
+    let first_request = requests_rx.recv().await.unwrap();
+    let second_request = requests_rx.recv().await.unwrap();
+
+    assert_eq!(answer, "Finished.");
+    assert_eq!(
+        conversation_text(&first_request),
+        [("user".to_string(), "finish the task".to_string())]
+    );
+    assert_eq!(
+        conversation_text(&second_request),
+        [
+            ("user".to_string(), "finish the task".to_string()),
+            ("assistant".to_string(), "Still working.".to_string()),
+        ]
+    );
+    let second_request: Value = serde_json::from_slice(&second_request).unwrap();
+    assert!(
+        second_request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item.get("role").and_then(Value::as_str) == Some("assistant")
+                    && item.get("phase").and_then(Value::as_str) == Some("commentary")
+            })
+    );
+    let phases = agent
+        .conversation
+        .items()
+        .iter()
+        .filter(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|item| item.get("phase").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(phases, ["commentary", "final_answer"]);
+
+    server.join().unwrap();
+    drop(agent);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -260,7 +337,7 @@ async fn steering_compacts_before_an_instruction_boundary_restores_omitted_reaso
     let (agent, outcome) = task.await.expect("agent task");
     assert_eq!(
         outcome.unwrap(),
-        SubmitOutcome::Completed("first answer\nsecond answer".to_string())
+        SubmitOutcome::Completed("second answer".to_string())
     );
     assert_eq!(
         conversation_text(&first_request),
@@ -844,7 +921,10 @@ async fn backend_usage_is_not_overridden_by_a_larger_full_history_estimate() {
         SamplingOutcome::Response(response) => response,
         SamplingOutcome::Cancelled => panic!("sampling was cancelled"),
     };
-    assert_eq!(response.text, "measured context accepted");
+    assert_eq!(
+        response.final_answer.as_deref(),
+        Some("measured context accepted")
+    );
     let request: Value = serde_json::from_slice(&request.expect("sampling request")).unwrap();
     let rendered_request_tokens = crate::api::estimated_harness_instruction_tokens()
         .saturating_add(estimated_tokens(request["input"].as_array().unwrap()));
@@ -1115,11 +1195,40 @@ fn write_sse_items_response(stream: &mut TcpStream, response_id: &str, items: &[
     );
 }
 
+fn write_sse_items_response_with_end_turn(
+    stream: &mut TcpStream,
+    response_id: &str,
+    items: &[Value],
+    end_turn: Option<bool>,
+) {
+    write_sse_items_response_with_usage_and_end_turn(
+        stream,
+        response_id,
+        items,
+        json!({
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+        }),
+        end_turn,
+    );
+}
+
 fn write_sse_items_response_with_usage(
     stream: &mut TcpStream,
     response_id: &str,
     items: &[Value],
     usage: Value,
+) {
+    write_sse_items_response_with_usage_and_end_turn(stream, response_id, items, usage, None);
+}
+
+fn write_sse_items_response_with_usage_and_end_turn(
+    stream: &mut TcpStream,
+    response_id: &str,
+    items: &[Value],
+    usage: Value,
+    end_turn: Option<bool>,
 ) {
     let item_events = items
         .iter()
@@ -1135,7 +1244,7 @@ fn write_sse_items_response_with_usage(
             )
         })
         .collect::<String>();
-    let completed = json!({
+    let mut completed = json!({
         "type": "response.completed",
         "response": {
             "id": response_id,
@@ -1145,6 +1254,9 @@ fn write_sse_items_response_with_usage(
             "usage": usage,
         },
     });
+    if let Some(end_turn) = end_turn {
+        completed["response"]["end_turn"] = json!(end_turn);
+    }
     let body = format!("{item_events}data: {completed}\n\n");
     write!(
         stream,

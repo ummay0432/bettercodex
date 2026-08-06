@@ -3,6 +3,7 @@ use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_protocol::models::MessagePhase;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -66,8 +67,14 @@ pub(crate) struct SessionSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SessionTranscriptItem {
-    User { text: String, image_count: usize },
-    Assistant { text: String },
+    User {
+        text: String,
+        image_count: usize,
+    },
+    Assistant {
+        text: String,
+        phase: Option<MessagePhase>,
+    },
 }
 
 pub(crate) struct LoadedRollout {
@@ -528,7 +535,10 @@ fn append_transcript_items(transcript: &mut Vec<SessionTranscriptItem>, items: &
                 transcript.push(SessionTranscriptItem::User { text, image_count });
             }
             "assistant" if !text.trim().is_empty() => {
-                transcript.push(SessionTranscriptItem::Assistant { text });
+                let phase = item
+                    .get("phase")
+                    .and_then(|phase| serde_json::from_value(phase.clone()).ok());
+                transcript.push(SessionTranscriptItem::Assistant { text, phase });
             }
             "assistant" => {}
             _ => unreachable!("message roles were filtered above"),
