@@ -1,2 +1,3 @@
 # Papercuts
 - `./scripts/dev.py tool-context --update` rewrites informational dynamic world-state metrics using the feature worktree's longer path, creating spurious diffs in the mandated isolated-worktree workflow. Normalize the audited cwd or preserve the dynamic region unless explicitly refreshing that snapshot.
+- The full test suite intermittently fails `spawned_pty_processes_receive_a_capable_terminal_type` because the PTY emits `xterm-256color\r\n` while the assertion expects no line ending, despite passing in an immediately prior run. Normalize PTY line endings or trim CR/LF in that assertion.
