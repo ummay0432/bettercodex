@@ -192,7 +192,7 @@ bettercodex repository on the audit date:
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Current `<environment_context>` developer item | 286 | 89 | 72 |
-| Current `<repository_context>` user item | 5,447 | 1,304 | 1,362 |
+| Current `<repository_context>` user item | 5,845 | 1,381 | 1,462 |
 | Current `<available_skills>` user item | 646 | 155 | 162 |
 <!-- bcodex-tool-context:dynamic:end -->
 
