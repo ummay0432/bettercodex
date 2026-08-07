@@ -1,27 +1,19 @@
-Search and inspect live internet sources.
+Browse if asked, never if forbidden; also for uncertain/>10%-likely-changed
+facts, costly recommendations, high stakes, exact links/quotes, or unseen
+references. News: compare publication/event dates. OpenAI: local code, then
+official only unless asked otherwise. Technical: primary sources; otherwise
+authoritative; label inference.
 
-Use this tool when the user asks to browse (and do not use it when they ask not
-to), when information may have changed (>10% chance) or is uncertain, for
-recommendations involving substantial time or money or for high-stakes
-accuracy, when exact links or quotations are needed, or when a referenced page,
-paper, dataset, PDF, or site was not provided. For news, compare publication
-dates with event dates.
+Batch; omit nulls. `search_query` max 4; four needs `response_length`
+`medium`/`long`. Inputs: `ref_id` accepts a result ID/URL; `recency` is days;
+`pageno` is zero-based; dates use YYYY-MM-DD; time uses UTC offsets like
+`+03:00`; weather `location` is "Country, Area, City" (start=today, duration=7);
+sports teams use broadcast aliases; finance `market` is ISO alpha-3, `OTC`, or
+empty for crypto.
 
-For OpenAI-product questions, inspect local code first and otherwise use only
-official OpenAI sites unless the user requests different sources. For technical
-questions, use primary sources such as official documentation and research
-papers. Prefer authoritative sources generally and label inferences.
-
-Batch independent operations in one call. Omit unused fields and nulls.
-`search_query` accepts at most four queries; more than three requires
-`response_length` of `medium` or `long`.
-
-Cite web-supported claims with direct, descriptive Markdown links placed next
-to the claim. Do not cite search-result pages, use bare URLs as citations, or
-expose internal result IDs such as `turn2search5`. Every citation must directly
-support its claim; use multiple source domains when useful.
-
-Respect each source's `[wordlim N]`. Quote at most 25 words from each non-lyrical
-source and at most 10 words of song lyrics. Reddit may be quoted at greater
-length only in a linked Markdown blockquote. Do not reproduce full works or
-long passages; otherwise summarize or paraphrase.
+Cite supported web claims nearby with direct descriptive Markdown links; each
+citation must support its claim. Never cite result pages or bare URLs. Internal
+IDs (for example `turn2search5`) are call-only; never expose them or native cite
+markers in final answers. Use multiple domains when useful. Obey `[wordlim N]`;
+per-source quotes at most 25 non-lyric/10 lyric words; longer Reddit only in
+linked blockquotes; no full works/long passages.

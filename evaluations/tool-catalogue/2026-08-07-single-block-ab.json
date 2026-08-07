@@ -1,0 +1,2166 @@
+{
+  "protocol": {
+    "script_sha256": "877df344eb43ea94fa80df1a279c65e98714b1c237edb9e5702abc2833f568de",
+    "seed": 20260805,
+    "repetitions": 2,
+    "cases": [
+      "read_compute",
+      "patch_and_test",
+      "interactive_session",
+      "local_image",
+      "planned_mutation",
+      "papercut_logging",
+      "web_primary_citation",
+      "local_no_web",
+      "implicit_freshness_web",
+      "parallel_commands",
+      "yield_and_wait",
+      "persistent_helpers"
+    ],
+    "acceptance": {
+      "minimum_catalogue_token_reduction_percent": 35,
+      "candidate_total_passes_must_not_be_lower": true,
+      "candidate_case_passes_must_not_be_lower": true,
+      "tie_break": "If either arm differs by one pass in a case, run one additional matched repetition for that case and retain every result."
+    }
+  },
+  "summary": {
+    "baseline": {
+      "passed": 24,
+      "total": 24,
+      "input_tokens": 509831,
+      "output_tokens": 13686,
+      "reasoning_output_tokens": 6095,
+      "duration_seconds": 468.13
+    },
+    "candidate": {
+      "passed": 24,
+      "total": 24,
+      "input_tokens": 352612,
+      "output_tokens": 12901,
+      "reasoning_output_tokens": 6014,
+      "duration_seconds": 420.131
+    }
+  },
+  "results": [
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "yield_and_wait",
+      "category": "orchestration",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "used_exec_pragma": true,
+        "used_wait": true,
+        "reported_result": true
+      },
+      "duration_seconds": 19.608,
+      "top_level_tools": [
+        "exec",
+        "wait"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "// @exec:{\"yield_time_ms\":250,\"max_output_tokens\":1000}\nconst result = await tools.exec_command({cmd:\"./slow.sh\", yield_time_ms:30000, max_output_tokens:1000});\ntext(result);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 11345,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 512,
+        "reasoning_output_tokens": 363,
+        "total_tokens": 11857
+      },
+      "request_input_tokens": [
+        3454,
+        3885,
+        4006
+      ],
+      "stdout": "Token: `WAIT-READY-83`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "yield_and_wait",
+      "category": "orchestration",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "used_exec_pragma": true,
+        "used_wait": true,
+        "reported_result": true
+      },
+      "duration_seconds": 15.088,
+      "top_level_tools": [
+        "exec",
+        "wait"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "// @exec: {\"yield_time_ms\": 250, \"max_output_tokens\": 1000}\nconst result = await tools.exec_command({\n  cmd: \"./slow.sh\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 30000,\n  max_output_tokens: 1000\n});\ntext(result.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 15072,
+        "cached_input_tokens": 3840,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 514,
+        "reasoning_output_tokens": 341,
+        "total_tokens": 15586
+      },
+      "request_input_tokens": [
+        4688,
+        5151,
+        5233
+      ],
+      "stdout": "Token: `WAIT-READY-83`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "yield_and_wait",
+      "category": "orchestration",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "used_exec_pragma": true,
+        "used_wait": true,
+        "reported_result": true
+      },
+      "duration_seconds": 16.407,
+      "top_level_tools": [
+        "exec",
+        "wait"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "// @exec:{\"yield_time_ms\":250,\"max_output_tokens\":1000}\nconst result = await tools.exec_command({cmd:\"./slow.sh\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:10000,max_output_tokens:1000});\ntext(result);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 11311,
+        "cached_input_tokens": 5632,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 476,
+        "reasoning_output_tokens": 301,
+        "total_tokens": 11787
+      },
+      "request_input_tokens": [
+        3454,
+        3868,
+        3989
+      ],
+      "stdout": "Token: `WAIT-READY-83`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "yield_and_wait",
+      "category": "orchestration",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "used_exec_pragma": true,
+        "used_wait": true,
+        "reported_result": true
+      },
+      "duration_seconds": 14.847,
+      "top_level_tools": [
+        "exec",
+        "wait"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "// @exec: {\"yield_time_ms\": 250, \"max_output_tokens\": 1000}\nconst result = await tools.exec_command({\n  cmd: \"./slow.sh\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 30000,\n  max_output_tokens: 1000\n});\ntext(result.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 15008,
+        "cached_input_tokens": 12544,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 488,
+        "reasoning_output_tokens": 303,
+        "total_tokens": 15496
+      },
+      "request_input_tokens": [
+        4688,
+        5120,
+        5200
+      ],
+      "stdout": "Token: `WAIT-READY-83`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "implicit_freshness_web",
+      "category": "routing",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_web": true,
+        "cited_rust_source": true,
+        "reported_version_like_value": true,
+        "hid_internal_refs": true
+      },
+      "duration_seconds": 14.549,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "web__run"
+      ],
+      "exec_inputs": [
+        "const r = await tools.web__run({search_query:[\n  {q:\"site:blog.rust-lang.org 1.97.0 Rust release\"},\n  {q:\"site:doc.rust-lang.org stable releases Rust 1.97.0\"}\n],response_length:\"short\"}); text(r)\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 10790,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 475,
+        "reasoning_output_tokens": 322,
+        "total_tokens": 11265
+      },
+      "request_input_tokens": [
+        3443,
+        7347
+      ],
+      "stdout": "The current stable Rust release is [**Rust 1.97.1**](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/), released July 16, 2026.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "implicit_freshness_web",
+      "category": "routing",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_web": true,
+        "cited_rust_source": true,
+        "reported_version_like_value": true,
+        "hid_internal_refs": true
+      },
+      "duration_seconds": 20.371,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "web__run",
+        "web__run"
+      ],
+      "exec_inputs": [
+        "const r = await tools.web__run({search_query:[\n  {q:\"site:blog.rust-lang.org 2026 \\\"Announcing Rust\\\" stable\"},\n  {q:\"site:static.rust-lang.org/dist channel-rust-stable.toml\"},\n  {q:\"site:doc.rust-lang.org stable Rust release version\"}\n],response_length:\"long\"}); text(r)\n",
+        "const r = await tools.web__run({open:[\n  {ref_id:\"https://blog.rust-lang.org/releases/latest\"},\n  {ref_id:\"https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/\"}\n],response_length:\"medium\"}); text(r)\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 31796,
+        "cached_input_tokens": 15872,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 554,
+        "reasoning_output_tokens": 302,
+        "total_tokens": 32350
+      },
+      "request_input_tokens": [
+        4677,
+        12896,
+        14223
+      ],
+      "stdout": "The current stable Rust release is **Rust 1.97.1**, published July 16, 2026 ([official Rust release announcement](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/)).\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "local_image",
+      "category": "image",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_view_image": true,
+        "identified_upper_right": true,
+        "identified_center": true
+      },
+      "duration_seconds": 6.786,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "view_image"
+      ],
+      "exec_inputs": [
+        "const r = await tools.view_image({path:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture/quadrants.png\", detail:\"original\"}); image(r.image_url);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9475,
+        "cached_input_tokens": 7680,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 179,
+        "reasoning_output_tokens": 78,
+        "total_tokens": 9654
+      },
+      "request_input_tokens": [
+        4682,
+        4793
+      ],
+      "stdout": "Upper-right quadrant: **green**. Center square: **black**.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "local_image",
+      "category": "image",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_view_image": true,
+        "identified_upper_right": true,
+        "identified_center": true
+      },
+      "duration_seconds": 6.918,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "view_image"
+      ],
+      "exec_inputs": [
+        "const r = await tools.view_image({path:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture/quadrants.png\", detail:\"original\"}); image(r.image_url);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7006,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 148,
+        "reasoning_output_tokens": 49,
+        "total_tokens": 7154
+      },
+      "request_input_tokens": [
+        3448,
+        3558
+      ],
+      "stdout": "Upper-right quadrant: **green**  \nCenter square: **black**\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "patch_and_test",
+      "category": "mutation",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_apply_patch": true,
+        "used_exec_command": true,
+        "tests_pass": true,
+        "kept_test": true
+      },
+      "duration_seconds": 43.431,
+      "top_level_tools": [
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "apply_patch",
+        "exec_command",
+        "log_papercut",
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"pwd && rg --files -g '!*__pycache__*' && git status --short && sed -n '1,240p' calculator.py && sed -n '1,260p' test_calculator.py\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(r.output); if(r.session_id) text(`SESSION_ID=${r.session_id}`);\n",
+        "const patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/calculator.py\\n@@\\n-    return sum(index * value for index, value in enumerate(values))\\n+    return sum(index * value for index, value in enumerate(values, start=1))\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst r = await tools.exec_command({cmd:\"python -m unittest -v && git diff --check && git diff -- calculator.py\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(r.output); if(r.session_id) text(`SESSION_ID=${r.session_id}`);\n",
+        "const note = await tools.log_papercut({message:\"The documented/default `python` command is unavailable in this fixture environment, so test invocations fail before collection. Use `python3` in repository setup or document the required interpreter command.\"});\ntext(`Recorded papercut in ${note.path}`);\nconst r = await tools.exec_command({cmd:\"python3 -m unittest -v && git diff --check && git diff -- calculator.py && git status --short\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000});\ntext(r.output);\nif(r.session_id) text(`SESSION_ID=${r.session_id}`);\n",
+        "const r = await tools.exec_command({cmd:\"rm -rf -- __pycache__ && git status --short && git diff --check && git diff --name-only\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(r.output); if(r.session_id) text(`SESSION_ID=${r.session_id}`);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 21767,
+        "cached_input_tokens": 10496,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1824,
+        "reasoning_output_tokens": 1033,
+        "total_tokens": 23591
+      },
+      "request_input_tokens": [
+        3450,
+        3764,
+        4038,
+        5017,
+        5498
+      ],
+      "stdout": "Fixed `calculator.py` to use one-based positional weighting via `enumerate(values, start=1)`.\n\nValidation:\n- `python3 -m unittest -v` \u2014 **2 tests passed**\n- Test file unchanged\n- Recorded the missing `python` command setup issue in `PAPERCUTS.md`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "patch_and_test",
+      "category": "mutation",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_apply_patch": true,
+        "used_exec_command": true,
+        "tests_pass": true,
+        "kept_test": true
+      },
+      "duration_seconds": 49.667,
+      "top_level_tools": [
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "exec_command",
+        "exec_command",
+        "apply_patch",
+        "exec_command",
+        "log_papercut",
+        "exec_command",
+        "exec_command",
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await Promise.all([\n  tools.exec_command({cmd:\"sed -n '1,240p' calculator.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:10000,max_output_tokens:10000}),\n  tools.exec_command({cmd:\"rg --files -g '*test*' -g '!test_file_to_never_edit' && git status --short\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:10000,max_output_tokens:10000})\n]); r.forEach((x,i)=>text(`--- result ${i+1} ---\\n${x.output}`));",
+        "const r = await tools.exec_command({cmd:\"sed -n '1,240p' test_calculator.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:10000,max_output_tokens:10000}); text(r.output);",
+        "const patch = \"*** Begin Patch\\n*** Update File: calculator.py\\n@@\\n-    return sum(index * value for index, value in enumerate(values))\\n+    return sum(index * value for index, value in enumerate(values, start=1))\\n*** End Patch\";\ntext(await tools.apply_patch(patch));",
+        "const r = await tools.exec_command({cmd:\"python -m unittest\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:30000,max_output_tokens:10000}); text(r.output);",
+        "const r = await tools.log_papercut({message:\"The repository's test instructions are not documented and the environment has no `python` executable alias, so `python -m unittest` fails. Document `python3 -m unittest` as the test command (or provide a consistent runner).\"}); text(JSON.stringify(r));",
+        "const r = await tools.exec_command({cmd:\"python3 -m unittest\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:30000,max_output_tokens:10000}); text(r.output);",
+        "const r = await Promise.all([\n  tools.exec_command({cmd:\"git diff --check\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:10000,max_output_tokens:10000}),\n  tools.exec_command({cmd:\"git status --short && git diff -- calculator.py test_calculator.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:10000,max_output_tokens:10000})\n]); r.forEach((x,i)=>text(`--- result ${i+1} ---\\n${x.output}`));",
+        "const r = await tools.exec_command({cmd:\"rm -rf __pycache__ && git status --short && git diff --check && git diff --name-only -- test_calculator.py\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":10000}); text(r.output);"
+      ],
+      "usage_totals": {
+        "input_tokens": 50643,
+        "cached_input_tokens": 41728,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1766,
+        "reasoning_output_tokens": 789,
+        "total_tokens": 52409
+      },
+      "request_input_tokens": [
+        4684,
+        4951,
+        5155,
+        5317,
+        5417,
+        5911,
+        6015,
+        6415,
+        6778
+      ],
+      "stdout": "Fixed `weighted_total` to use one-based positions via `enumerate(values, start=1)`.\n\nValidation:\n- `python3 -m unittest` \u2014 **2 tests passed**\n- Test file unchanged\n- Recorded missing `python` alias in `PAPERCUTS.md`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "persistent_helpers",
+      "category": "runtime_helpers",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_two_exec_cells": true,
+        "used_store": true,
+        "used_load": true,
+        "used_notify": true,
+        "reported_value": true
+      },
+      "duration_seconds": 9.938,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [],
+      "exec_inputs": [
+        "store(\"answer\", \"STATE-619\");\nnotify(\"saved\");",
+        "const answer = load(\"answer\");\ntext(answer);"
+      ],
+      "usage_totals": {
+        "input_tokens": 10843,
+        "cached_input_tokens": 5632,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 227,
+        "reasoning_output_tokens": 173,
+        "total_tokens": 11070
+      },
+      "request_input_tokens": [
+        3460,
+        3645,
+        3738
+      ],
+      "stdout": "STATE-619\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "persistent_helpers",
+      "category": "runtime_helpers",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_two_exec_cells": true,
+        "used_store": true,
+        "used_load": true,
+        "used_notify": true,
+        "reported_value": true
+      },
+      "duration_seconds": 9.743,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [],
+      "exec_inputs": [
+        "store(\"answer\", \"STATE-619\");\nnotify(\"saved\");\n",
+        "const answer = load(\"answer\");\ntext(answer);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 14456,
+        "cached_input_tokens": 7680,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 180,
+        "reasoning_output_tokens": 96,
+        "total_tokens": 14636
+      },
+      "request_input_tokens": [
+        4694,
+        4852,
+        4910
+      ],
+      "stdout": "STATE-619\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "local_no_web",
+      "category": "routing",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "did_not_use_web": true,
+        "used_local_command": true,
+        "reported_codeword": true
+      },
+      "duration_seconds": 6.769,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"sed -n '1,160p' policy.txt\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":2000}); text(r.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7106,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 204,
+        "reasoning_output_tokens": 106,
+        "total_tokens": 7310
+      },
+      "request_input_tokens": [
+        3439,
+        3667
+      ],
+      "stdout": "maple-731\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "local_no_web",
+      "category": "routing",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "did_not_use_web": true,
+        "used_local_command": true,
+        "reported_codeword": true
+      },
+      "duration_seconds": 10.437,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"rg -n \\\".\\\" policy.txt\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":2000}); text(r.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9619,
+        "cached_input_tokens": 7680,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 247,
+        "reasoning_output_tokens": 168,
+        "total_tokens": 9866
+      },
+      "request_input_tokens": [
+        4673,
+        4946
+      ],
+      "stdout": "maple-731\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "patch_and_test",
+      "category": "mutation",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_apply_patch": true,
+        "used_exec_command": true,
+        "tests_pass": true,
+        "kept_test": true
+      },
+      "duration_seconds": 70.027,
+      "top_level_tools": [
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "exec_command",
+        "exec_command",
+        "apply_patch",
+        "exec_command",
+        "exec_command",
+        "log_papercut",
+        "exec_command",
+        "exec_command",
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await Promise.all([\n  tools.exec_command({cmd:\"sed -n '1,240p' calculator.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:10000,max_output_tokens:20000}),\n  tools.exec_command({cmd:\"rg --files -g '*test*' -g '!PAPERCUTS.md' && git status --short\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",yield_time_ms:10000,max_output_tokens:20000})\n]); r.forEach((x,i)=>{text(`---${i}---\\n${x.output}`)});\n",
+        "const r = await tools.exec_command({cmd:\"sed -n '1,240p' test_calculator.py\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(r.output);\n",
+        "const patch = \"*** Begin Patch\\n*** Update File: calculator.py\\n@@\\n-    return sum(index * value for index, value in enumerate(values))\\n+    return sum(index * value for index, value in enumerate(values, start=1))\\n*** End Patch\";\ntext(await tools.apply_patch(patch));\n",
+        "const r = await Promise.all([\n  tools.exec_command({cmd:\"python -m unittest\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":30000,\"max_output_tokens\":20000}),\n  tools.exec_command({cmd:\"git diff -- calculator.py && git status --short\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000})\n]); r.forEach((x,i)=>{text(`---${i}---\\n${x.output}\\nexit=${x.exit_code}`)});\n",
+        "const r = await tools.log_papercut({message:\"The repository\u2019s tests are Python-based, but the environment has no `python` executable; use `python3 -m unittest` (or document the required interpreter command) to avoid a dead-end test invocation.\"}); text(JSON.stringify(r));\n",
+        "const r = await tools.exec_command({cmd:\"python3 -m unittest\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":30000,\"max_output_tokens\":20000}); text(`${r.output}\\nexit=${r.exit_code}`);\n",
+        "const r = await tools.exec_command({cmd:\"git status --short\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(r.output);\n",
+        "const r = await tools.exec_command({cmd:\"rm -r -- __pycache__\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(`${r.output}\\nexit=${r.exit_code}`);\n",
+        "const r = await tools.exec_command({cmd:\"git status --short\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(r.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 59590,
+        "cached_input_tokens": 37888,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 2172,
+        "reasoning_output_tokens": 1113,
+        "total_tokens": 61762
+      },
+      "request_input_tokens": [
+        4684,
+        4945,
+        5141,
+        5300,
+        5657,
+        6247,
+        6420,
+        6782,
+        7148,
+        7266
+      ],
+      "stdout": "Fixed `calculator.py` to use one-based weighting via `enumerate(values, start=1)`.\n\nValidation:\n- `python3 -m unittest`\n- **2 tests passed**\n- Test file unchanged\n\nAlso logged the missing `python` executable in `PAPERCUTS.md`.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "patch_and_test",
+      "category": "mutation",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_apply_patch": true,
+        "used_exec_command": true,
+        "tests_pass": true,
+        "kept_test": true
+      },
+      "duration_seconds": 44.19,
+      "top_level_tools": [
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "exec_command",
+        "exec_command",
+        "apply_patch",
+        "exec_command",
+        "exec_command",
+        "exec_command",
+        "log_papercut",
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await Promise.all([\n  tools.exec_command({cmd:\"sed -n '1,240p' calculator.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"}),\n  tools.exec_command({cmd:\"rg --files -g '*test*' -g '!calculator.py' && git status --short\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"})\n]); r.forEach((x)=>text(x));\n",
+        "const r = await tools.exec_command({cmd:\"sed -n '1,240p' test_calculator.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"}); text(r);\n",
+        "const patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/calculator.py\\n@@\\n-    return sum(index * value for index, value in enumerate(values))\\n+    return sum(index * value for index, value in enumerate(values, start=1))\\n*** End Patch\";\nawait tools.apply_patch(patch);\ntext(\"Patch applied.\");\n",
+        "const r = await Promise.all([\n  tools.exec_command({cmd:\"python -m unittest\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"}),\n  tools.exec_command({cmd:\"git diff --check && git diff -- calculator.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"})\n]); r.forEach((x)=>text(x));\n",
+        "const r = await tools.exec_command({cmd:\"sed -n '1,240p' /tmp/bettercodex-tool-eval-shg_5v1w/state-candidate/bcodex/skills/.system/papercut/SKILL.md\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"}); text(r);\n",
+        "const r = await tools.log_papercut({message:\"Running the repository\u2019s Python tests with `python -m unittest` failed because no `python` executable is installed. Document `python3 -m unittest` as the test command or provide a `python` alias in the environment.\"}); text(r);\n",
+        "const r = await Promise.all([\n  tools.exec_command({cmd:\"python3 -m unittest\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"}),\n  tools.exec_command({cmd:\"git diff --check && git status --short\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"})\n]); r.forEach((x)=>text(x));\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 36720,
+        "cached_input_tokens": 26880,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1671,
+        "reasoning_output_tokens": 837,
+        "total_tokens": 38391
+      },
+      "request_input_tokens": [
+        3450,
+        3731,
+        3957,
+        4136,
+        4494,
+        5467,
+        5602,
+        5883
+      ],
+      "stdout": "Fixed `calculator.py` to use one-based positions via `enumerate(values, start=1)`.\n\nValidation:\n- `python3 -m unittest` \u2014 **2 tests passed**\n- Test file unchanged\n- Recorded missing `python` alias in `PAPERCUTS.md` as setup friction.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "local_image",
+      "category": "image",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_view_image": true,
+        "identified_upper_right": true,
+        "identified_center": true
+      },
+      "duration_seconds": 7.2,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "view_image"
+      ],
+      "exec_inputs": [
+        "const r = await tools.view_image({path:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture/quadrants.png\", detail:\"original\"}); image(r);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7005,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 203,
+        "reasoning_output_tokens": 104,
+        "total_tokens": 7208
+      },
+      "request_input_tokens": [
+        3448,
+        3557
+      ],
+      "stdout": "Upper-right quadrant: **green**. Center square: **black**.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "local_image",
+      "category": "image",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_view_image": true,
+        "identified_upper_right": true,
+        "identified_center": true
+      },
+      "duration_seconds": 8.108,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "view_image"
+      ],
+      "exec_inputs": [
+        "const r = await tools.view_image({path:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture/quadrants.png\", detail:\"original\"}); image(r.image_url);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9475,
+        "cached_input_tokens": 7680,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 151,
+        "reasoning_output_tokens": 51,
+        "total_tokens": 9626
+      },
+      "request_input_tokens": [
+        4682,
+        4793
+      ],
+      "stdout": "Upper-right quadrant: **green**  \nCenter square: **black**\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "read_compute",
+      "category": "local_read",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "reported_sum": true,
+        "reported_digest": true
+      },
+      "duration_seconds": 17.905,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({\n  cmd: \"pwd && rg --files -g 'numbers.txt' -g 'label.txt' -g 'AGENTS.md' && sed -n '1,240p' numbers.txt && sed -n '1,120p' label.txt && sha256sum label.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 20000\n});\ntext(r.output);\n",
+        "const r = await tools.exec_command({\n  cmd: \"awk '{for (i = 1; i <= NF; i++) total += $i} END {print total}' numbers.txt && openssl dgst -sha256 label.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 2000\n});\ntext(r.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 14842,
+        "cached_input_tokens": 3840,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 419,
+        "reasoning_output_tokens": 95,
+        "total_tokens": 15261
+      },
+      "request_input_tokens": [
+        4680,
+        4943,
+        5219
+      ],
+      "stdout": "- Sum: **140**\n- SHA-256 of `label.txt`: `a1df0da2ff76219c2038d3c31f6132885c4e3c6b79096e12a610bb2ac30153e1`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "read_compute",
+      "category": "local_read",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "reported_sum": true,
+        "reported_digest": true
+      },
+      "duration_seconds": 9.961,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"pwd && printf '%s\\\\n' '--- numbers.txt ---' && sed -n '1,200p' numbers.txt && printf '%s\\\\n' '--- label.txt ---' && sed -n '1,200p' label.txt && printf '%s\\\\n' '--- computed ---' && awk '{for (i=1;i<=NF;i++) if ($i ~ /^[-+]?[0-9]+([.][0-9]+)?$/) sum += $i} END {printf \\\"sum=%s\\\\n\\\", sum}' numbers.txt && sha256sum label.txt\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(r.output);"
+      ],
+      "usage_totals": {
+        "input_tokens": 7217,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 314,
+        "reasoning_output_tokens": 39,
+        "total_tokens": 7531
+      },
+      "request_input_tokens": [
+        3446,
+        3771
+      ],
+      "stdout": "- Sum: **140**\n- `label.txt` SHA-256: `a1df0da2ff76219c2038d3c31f6132885c4e3c6b79096e12a610bb2ac30153e1`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "web_primary_citation",
+      "category": "web",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_web": true,
+        "cited_official_source": true,
+        "answered_topic": true,
+        "hid_internal_refs": true
+      },
+      "duration_seconds": 20.838,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "web__run",
+        "web__run"
+      ],
+      "exec_inputs": [
+        "const r = await tools.web__run({search_query:[\n  {q:\"site:openai.com GPT-5.6 leaner prompts tool descriptions\"},\n  {q:\"site:developers.openai.com GPT-5.6 prompting guide lean prompts tool descriptions\"},\n  {q:\"site:platform.openai.com/docs GPT-5.6 leaner prompts tools\"}\n],response_length:\"long\"}); text(r)\n",
+        "const r = await tools.web__run({open:[{ref_id:\"turn0search0\"}],response_length:\"long\"}); text(r)\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 37202,
+        "cached_input_tokens": 13824,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 612,
+        "reasoning_output_tokens": 385,
+        "total_tokens": 37814
+      },
+      "request_input_tokens": [
+        3457,
+        11683,
+        22062
+      ],
+      "stdout": "OpenAI recommends removing repeated instructions and examples, exposing only task-relevant tools, and keeping tool descriptions concise and precise, with changes validated on representative evals ([GPT\u20115.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model#favor-leaner-prompts)).\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "web_primary_citation",
+      "category": "web",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_web": true,
+        "cited_official_source": true,
+        "answered_topic": true,
+        "hid_internal_refs": true
+      },
+      "duration_seconds": 18.195,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "web__run",
+        "web__run"
+      ],
+      "exec_inputs": [
+        "const r = await tools.web__run({search_query:[\n  {q:\"site:platform.openai.com/docs GPT-5.6 leaner prompts tool descriptions\"},\n  {q:\"site:developers.openai.com GPT-5.6 prompting guide lean prompts tool descriptions\"},\n  {q:\"site:openai.com GPT-5.6 model guidance tools descriptions\"}\n],response_length:\"long\"}); text(r)\n",
+        "const r = await tools.web__run({open:[{ref_id:\"turn0search0\"}],response_length:\"medium\"}); text(r)\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 37757,
+        "cached_input_tokens": 19712,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 602,
+        "reasoning_output_tokens": 374,
+        "total_tokens": 38359
+      },
+      "request_input_tokens": [
+        4691,
+        12917,
+        20149
+      ],
+      "stdout": "OpenAI recommends stating instructions once, removing repetition, exposing only task-relevant tools, and keeping tool descriptions concise and precise, while validating changes with representative evaluations ([official GPT\u20115.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model#favor-leaner-prompts)).\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "persistent_helpers",
+      "category": "runtime_helpers",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_two_exec_cells": true,
+        "used_store": true,
+        "used_load": true,
+        "used_notify": true,
+        "reported_value": true
+      },
+      "duration_seconds": 9.401,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [],
+      "exec_inputs": [
+        "await store(\"answer\", \"STATE-619\");\nnotify(\"saved\");",
+        "const answer = await load(\"answer\");\ntext(answer);"
+      ],
+      "usage_totals": {
+        "input_tokens": 10814,
+        "cached_input_tokens": 5632,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 194,
+        "reasoning_output_tokens": 116,
+        "total_tokens": 11008
+      },
+      "request_input_tokens": [
+        3460,
+        3649,
+        3705
+      ],
+      "stdout": "STATE-619\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "persistent_helpers",
+      "category": "runtime_helpers",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_two_exec_cells": true,
+        "used_store": true,
+        "used_load": true,
+        "used_notify": true,
+        "reported_value": true
+      },
+      "duration_seconds": 9.257,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [],
+      "exec_inputs": [
+        "store(\"answer\", \"STATE-619\");\nnotify(\"saved\");\n",
+        "const answer = load(\"answer\");\ntext(answer);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 14454,
+        "cached_input_tokens": 11520,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 158,
+        "reasoning_output_tokens": 88,
+        "total_tokens": 14612
+      },
+      "request_input_tokens": [
+        4694,
+        4857,
+        4903
+      ],
+      "stdout": "STATE-619\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "web_primary_citation",
+      "category": "web",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_web": true,
+        "cited_official_source": true,
+        "answered_topic": true,
+        "hid_internal_refs": true
+      },
+      "duration_seconds": 21.401,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "web__run",
+        "web__run"
+      ],
+      "exec_inputs": [
+        "const r = await tools.web__run({search_query:[\n  {q:\"site:openai.com GPT-5.6 leaner prompts tool descriptions\"},\n  {q:\"site:platform.openai.com/docs GPT-5.6 prompting tool descriptions lean\"},\n  {q:\"site:cookbook.openai.com GPT-5.6 prompting guide tool descriptions\"}\n],response_length:\"long\"}); text(r)\n",
+        "const r = await tools.web__run({open:[{ref_id:\"turn0search0\"}],response_length:\"medium\"}); text(r)\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 33744,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 668,
+        "reasoning_output_tokens": 441,
+        "total_tokens": 34412
+      },
+      "request_input_tokens": [
+        3457,
+        11529,
+        18758
+      ],
+      "stdout": "OpenAI recommends removing repeated instructions and examples, exposing only relevant tools, and keeping tool descriptions concise and precise while documenting return fields, types, and error behavior ([official GPT\u20115.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model#favor-leaner-prompts)).\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "web_primary_citation",
+      "category": "web",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_web": true,
+        "cited_official_source": true,
+        "answered_topic": true,
+        "hid_internal_refs": true
+      },
+      "duration_seconds": 23.702,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "web__run",
+        "web__run"
+      ],
+      "exec_inputs": [
+        "const r = await tools.web__run({search_query:[\n  {q:\"site:platform.openai.com/docs GPT-5.6 leaner prompts tool descriptions\"},\n  {q:\"site:developers.openai.com GPT-5.6 prompting guide lean prompts tool descriptions\"},\n  {q:\"site:openai.com GPT-5.6 prompting guide tools descriptions\"}\n],response_length:\"long\"}); text(r)\n",
+        "const r = await tools.web__run({open:[{ref_id:\"turn0search0\"}],response_length:\"long\"}); text(r)\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 40792,
+        "cached_input_tokens": 19712,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 617,
+        "reasoning_output_tokens": 375,
+        "total_tokens": 41409
+      },
+      "request_input_tokens": [
+        4691,
+        12903,
+        23198
+      ],
+      "stdout": "OpenAI recommends removing repeated instructions and examples, exposing only task-relevant tools, and keeping tool descriptions concise, precise, and explicit about return fields, types, and errors, while validating changes with representative evals ([official GPT\u20115.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model#favor-leaner-prompts)).\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "implicit_freshness_web",
+      "category": "routing",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_web": true,
+        "cited_rust_source": true,
+        "reported_version_like_value": true,
+        "hid_internal_refs": true
+      },
+      "duration_seconds": 18.066,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "web__run",
+        "web__run"
+      ],
+      "exec_inputs": [
+        "const r = await tools.web__run({search_query:[\n  {q:\"site:blog.rust-lang.org stable Rust release latest\"},\n  {q:\"site:static.rust-lang.org dist channel-rust-stable.toml Rust stable\"}\n],response_length:\"short\"}); text(r)\n",
+        "const r = await tools.web__run({open:[\n  {ref_id:\"turn0search3\"},\n  {ref_id:\"turn0search9\"}\n],response_length:\"medium\"}); text(r)\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 23853,
+        "cached_input_tokens": 12544,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 494,
+        "reasoning_output_tokens": 295,
+        "total_tokens": 24347
+      },
+      "request_input_tokens": [
+        3443,
+        7150,
+        13260
+      ],
+      "stdout": "The current stable Rust release is **1.97.1**, per the [official Rust release announcement](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/).\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "implicit_freshness_web",
+      "category": "routing",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_web": true,
+        "cited_rust_source": true,
+        "reported_version_like_value": true,
+        "hid_internal_refs": true
+      },
+      "duration_seconds": 21.892,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "web__run",
+        "web__run"
+      ],
+      "exec_inputs": [
+        "const r = await tools.web__run({search_query:[\n  {q:\"site:blog.rust-lang.org 2026 Rust stable release August 2026\"},\n  {q:\"site:doc.rust-lang.org stable releases current Rust version\"},\n  {q:\"site:static.rust-lang.org/dist channel-rust-stable.toml\"}\n],response_length:\"long\"}); text(r)\n",
+        "const r = await tools.web__run({open:[\n  {ref_id:\"https://blog.rust-lang.org/releases/latest\"},\n  {ref_id:\"https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/\"},\n  {ref_id:\"https://static.rust-lang.org/dist/channel-rust-stable.toml\"}\n],response_length:\"long\"}); text(r)\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 31661,
+        "cached_input_tokens": 15872,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 491,
+        "reasoning_output_tokens": 224,
+        "total_tokens": 32152
+      },
+      "request_input_tokens": [
+        4677,
+        12785,
+        14199
+      ],
+      "stdout": "The current stable Rust release is **Rust 1.97.1**, according to the [official Rust release announcement](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/).\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "read_compute",
+      "category": "local_read",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "reported_sum": true,
+        "reported_digest": true
+      },
+      "duration_seconds": 8.617,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({\n  cmd: \"sed -n '1,200p' numbers.txt && sha256sum label.txt && git status --short\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 20000\n});\ntext(r.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9554,
+        "cached_input_tokens": 7680,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 257,
+        "reasoning_output_tokens": 71,
+        "total_tokens": 9811
+      },
+      "request_input_tokens": [
+        4680,
+        4874
+      ],
+      "stdout": "- Sum: **140**\n- SHA-256 (`label.txt`): `a1df0da2ff76219c2038d3c31f6132885c4e3c6b79096e12a610bb2ac30153e1`\n\nNo files modified.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "read_compute",
+      "category": "local_read",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "reported_sum": true,
+        "reported_digest": true
+      },
+      "duration_seconds": 11.487,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"pwd && rg --files -g 'numbers.txt' -g 'label.txt' && sed -n '1,240p' numbers.txt && sha256sum label.txt && git status --short\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":20000}); text(r.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7121,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 328,
+        "reasoning_output_tokens": 127,
+        "total_tokens": 7449
+      },
+      "request_input_tokens": [
+        3446,
+        3675
+      ],
+      "stdout": "- **Sum:** 140\n- **SHA-256 of `label.txt`:** `a1df0da2ff76219c2038d3c31f6132885c4e3c6b79096e12a610bb2ac30153e1`\n\nNo files were modified.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "local_no_web",
+      "category": "routing",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "did_not_use_web": true,
+        "used_local_command": true,
+        "reported_codeword": true
+      },
+      "duration_seconds": 13.112,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"sed -n '1,200p' policy.txt\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":2000});\ntext(r.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9614,
+        "cached_input_tokens": 7680,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 244,
+        "reasoning_output_tokens": 146,
+        "total_tokens": 9858
+      },
+      "request_input_tokens": [
+        4673,
+        4941
+      ],
+      "stdout": "maple-731\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "local_no_web",
+      "category": "routing",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "did_not_use_web": true,
+        "used_local_command": true,
+        "reported_codeword": true
+      },
+      "duration_seconds": 8.988,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"sed -n '1,200p' policy.txt\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"yield_time_ms\":10000,\"max_output_tokens\":2000}); text(r.output);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7153,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 251,
+        "reasoning_output_tokens": 153,
+        "total_tokens": 7404
+      },
+      "request_input_tokens": [
+        3439,
+        3714
+      ],
+      "stdout": "maple-731\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "interactive_session",
+      "category": "session",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "used_write_stdin": true,
+        "reported_result": true,
+        "did_not_report_tty_failure": true
+      },
+      "duration_seconds": 10.511,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "write_stdin"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"./challenge.py\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"tty\":true,\"yield_time_ms\":1000,\"max_output_tokens\":2000});\ntext(JSON.stringify(r));\n",
+        "const r = await tools.write_stdin({session_id:25082,chars:\"cobalt-otter\\n\",yield_time_ms:1000,max_output_tokens:2000});\ntext(JSON.stringify(r));\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 14523,
+        "cached_input_tokens": 11520,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 193,
+        "reasoning_output_tokens": 31,
+        "total_tokens": 14716
+      },
+      "request_input_tokens": [
+        4683,
+        4839,
+        5001
+      ],
+      "stdout": "9edbfd6dbc8c7dca\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "interactive_session",
+      "category": "session",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "used_write_stdin": true,
+        "reported_result": true,
+        "did_not_report_tty_failure": true
+      },
+      "duration_seconds": 10.33,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "write_stdin"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"./challenge.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",tty:true,yield_time_ms:1000,max_output_tokens:2000}); text(JSON.stringify(r))\n",
+        "const r = await tools.write_stdin({session_id:14354,chars:\"cobalt-otter\\n\",yield_time_ms:1000,max_output_tokens:2000}); text(JSON.stringify(r))\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 10800,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 176,
+        "reasoning_output_tokens": 16,
+        "total_tokens": 10976
+      },
+      "request_input_tokens": [
+        3449,
+        3602,
+        3749
+      ],
+      "stdout": "9edbfd6dbc8c7dca\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "parallel_commands",
+      "category": "orchestration",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_two_commands": true,
+        "used_promise_all": true,
+        "reported_left": true,
+        "reported_right": true
+      },
+      "duration_seconds": 9.639,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const results = await Promise.all([\n  tools.exec_command({ cmd: \"./left.sh\", workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\" }),\n  tools.exec_command({ cmd: \"./right.sh\", workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\" })\n]);\ntext(JSON.stringify(results));\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9578,
+        "cached_input_tokens": 3840,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 142,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 9720
+      },
+      "request_input_tokens": [
+        4681,
+        4897
+      ],
+      "stdout": "- Left token: `LEFT-17`\n- Right token: `RIGHT-29`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "parallel_commands",
+      "category": "orchestration",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_two_commands": true,
+        "used_promise_all": true,
+        "reported_left": true,
+        "reported_right": true
+      },
+      "duration_seconds": 9.713,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const results = await Promise.all([\n  tools.exec_command({ cmd: \"./left.sh\", workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\" }),\n  tools.exec_command({ cmd: \"./right.sh\", workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\" })\n]);\ntext(JSON.stringify(results));\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7115,
+        "cached_input_tokens": 5632,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 143,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 7258
+      },
+      "request_input_tokens": [
+        3447,
+        3668
+      ],
+      "stdout": "- Left token: `LEFT-17`\n- Right token: `RIGHT-29`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "parallel_commands",
+      "category": "orchestration",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_two_commands": true,
+        "used_promise_all": true,
+        "reported_left": true,
+        "reported_right": true
+      },
+      "duration_seconds": 8.424,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const results = await Promise.all([\n  tools.exec_command({ cmd: \"./left.sh\", workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\" }),\n  tools.exec_command({ cmd: \"./right.sh\", workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\" })\n]);\ntext(JSON.stringify(results));\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9578,
+        "cached_input_tokens": 3840,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 142,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 9720
+      },
+      "request_input_tokens": [
+        4681,
+        4897
+      ],
+      "stdout": "- Left token: `LEFT-17`\n- Right token: `RIGHT-29`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "parallel_commands",
+      "category": "orchestration",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_two_commands": true,
+        "used_promise_all": true,
+        "reported_left": true,
+        "reported_right": true
+      },
+      "duration_seconds": 8.033,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "exec_command"
+      ],
+      "exec_inputs": [
+        "const [left, right] = await Promise.all([\n  tools.exec_command({cmd: \"./left.sh\", workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"}),\n  tools.exec_command({cmd: \"./right.sh\", workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\"})\n]);\ntext(JSON.stringify({\n  left: {output: left.output, exit_code: left.exit_code},\n  right: {output: right.output, exit_code: right.exit_code}\n}));\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7101,
+        "cached_input_tokens": 5632,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 177,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 7278
+      },
+      "request_input_tokens": [
+        3447,
+        3654
+      ],
+      "stdout": "- Left token: `LEFT-17`\n- Right token: `RIGHT-29`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "interactive_session",
+      "category": "session",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "used_write_stdin": true,
+        "reported_result": true,
+        "did_not_report_tty_failure": true
+      },
+      "duration_seconds": 8.89,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "write_stdin"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"./challenge.py\",\"workdir\":\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\"tty\":true,\"yield_time_ms\":1000,\"max_output_tokens\":2000}); text(JSON.stringify(r))\n",
+        "const r = await tools.write_stdin({session_id:23755,chars:\"cobalt-otter\\n\",yield_time_ms:1000,max_output_tokens:2000}); text(JSON.stringify(r))\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 14505,
+        "cached_input_tokens": 11520,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 178,
+        "reasoning_output_tokens": 14,
+        "total_tokens": 14683
+      },
+      "request_input_tokens": [
+        4683,
+        4838,
+        4984
+      ],
+      "stdout": "9edbfd6dbc8c7dca\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "interactive_session",
+      "category": "session",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_exec_command": true,
+        "used_write_stdin": true,
+        "reported_result": true,
+        "did_not_report_tty_failure": true
+      },
+      "duration_seconds": 10.398,
+      "top_level_tools": [
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "exec_command",
+        "write_stdin"
+      ],
+      "exec_inputs": [
+        "const r = await tools.exec_command({cmd:\"./challenge.py\",workdir:\"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",tty:true,yield_time_ms:1000,max_output_tokens:2000}); text(JSON.stringify(r))\n",
+        "const r = await tools.write_stdin({session_id:25563,chars:\"cobalt-otter\\n\",yield_time_ms:1000,max_output_tokens:2000}); text(JSON.stringify(r))\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 10793,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 173,
+        "reasoning_output_tokens": 14,
+        "total_tokens": 10966
+      },
+      "request_input_tokens": [
+        3449,
+        3600,
+        3744
+      ],
+      "stdout": "9edbfd6dbc8c7dca\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "papercut_logging",
+      "category": "papercut",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_log_papercut": true,
+        "created_expected_file": true,
+        "recorded_exact_message_once": true
+      },
+      "duration_seconds": 10.688,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "log_papercut"
+      ],
+      "exec_inputs": [
+        "const result = await tools.log_papercut({message: \"Repeated setup checks hide the required compiler version; document it beside bootstrap.\"});\ntext(JSON.stringify(result));\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9626,
+        "cached_input_tokens": 7680,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 241,
+        "reasoning_output_tokens": 146,
+        "total_tokens": 9867
+      },
+      "request_input_tokens": [
+        4695,
+        4931
+      ],
+      "stdout": "Returned path: `PAPERCUTS.md`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "papercut_logging",
+      "category": "papercut",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_log_papercut": true,
+        "created_expected_file": true,
+        "recorded_exact_message_once": true
+      },
+      "duration_seconds": 11.727,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "log_papercut"
+      ],
+      "exec_inputs": [
+        "const result = await tools.log_papercut({message:\"Repeated setup checks hide the required compiler version; document it beside bootstrap.\"});\ntext(result);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7172,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 251,
+        "reasoning_output_tokens": 152,
+        "total_tokens": 7423
+      },
+      "request_input_tokens": [
+        3461,
+        3711
+      ],
+      "stdout": "Recorded successfully. Returned path: `PAPERCUTS.md`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "papercut_logging",
+      "category": "papercut",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_log_papercut": true,
+        "created_expected_file": true,
+        "recorded_exact_message_once": true
+      },
+      "duration_seconds": 12.884,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "log_papercut"
+      ],
+      "exec_inputs": [
+        "const result = await tools.log_papercut({message: \"Repeated setup checks hide the required compiler version; document it beside bootstrap.\"});\ntext(result);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 9766,
+        "cached_input_tokens": 7680,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 378,
+        "reasoning_output_tokens": 283,
+        "total_tokens": 10144
+      },
+      "request_input_tokens": [
+        4695,
+        5071
+      ],
+      "stdout": "Recorded successfully. Returned path: `PAPERCUTS.md`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "papercut_logging",
+      "category": "papercut",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_log_papercut": true,
+        "created_expected_file": true,
+        "recorded_exact_message_once": true
+      },
+      "duration_seconds": 11.622,
+      "top_level_tools": [
+        "exec"
+      ],
+      "nested_tools": [
+        "log_papercut"
+      ],
+      "exec_inputs": [
+        "const result = await tools.log_papercut({message: \"Repeated setup checks hide the required compiler version; document it beside bootstrap.\"});\ntext(result);\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 7300,
+        "cached_input_tokens": 2816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 360,
+        "reasoning_output_tokens": 264,
+        "total_tokens": 7660
+      },
+      "request_input_tokens": [
+        3461,
+        3839
+      ],
+      "stdout": "Returned path: `PAPERCUTS.md`\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "planned_mutation",
+      "category": "planning",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_update_plan": true,
+        "alpha_updated": true,
+        "beta_updated": true,
+        "gamma_updated": true
+      },
+      "duration_seconds": 37.918,
+      "top_level_tools": [
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "update_plan",
+        "exec_command",
+        "apply_patch",
+        "exec_command",
+        "update_plan",
+        "apply_patch",
+        "exec_command",
+        "update_plan",
+        "apply_patch",
+        "exec_command",
+        "update_plan"
+      ],
+      "exec_inputs": [
+        "const plan = await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"in_progress\" },\n    { step: \"reverse beta.txt\", status: \"pending\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"pending\" }\n  ]\n});\nconst inspected = await tools.exec_command({\n  cmd: \"git status --short && rg --files -g 'alpha.txt' -g 'beta.txt' -g 'gamma.txt' && sed -n '1,120p' alpha.txt && sed -n '1,120p' beta.txt && sed -n '1,120p' gamma.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 2000\n});\ntext(inspected.output);\n",
+        "const patch = \"*** Begin Patch\\n*** Update File: alpha.txt\\n@@\\n-alpha\\n+ALPHA\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst check = await tools.exec_command({\n  cmd: \"test \\\"$(cat alpha.txt)\\\" = 'ALPHA' && printf '%s\\\\n' 'alpha.txt validated: ALPHA'\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(check.output);\nawait tools.update_plan({\n  explanation: \"alpha.txt is uppercase and validated.\",\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"in_progress\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"pending\" }\n  ]\n});\n",
+        "const patch = \"*** Begin Patch\\n*** Update File: beta.txt\\n@@\\n-stressed\\n+desserts\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst check = await tools.exec_command({\n  cmd: \"test \\\"$(cat beta.txt)\\\" = 'desserts' && printf '%s\\\\n' 'beta.txt validated: desserts'\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(check.output);\nawait tools.update_plan({\n  explanation: \"beta.txt is reversed and validated.\",\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"completed\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"in_progress\" }\n  ]\n});\n",
+        "const patch = \"*** Begin Patch\\n*** Update File: gamma.txt\\n@@\\n-8 13 21\\n+42\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst validation = await tools.exec_command({\n  cmd: \"diff -u <(printf 'ALPHA\\\\n') alpha.txt && diff -u <(printf 'desserts\\\\n') beta.txt && diff -u <(printf '42\\\\n') gamma.txt && git diff --check && printf '%s\\\\n' 'all exact-content checks passed' && git diff -- alpha.txt beta.txt gamma.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 3000\n});\ntext(validation.output);\nawait tools.update_plan({\n  explanation: \"gamma.txt now contains 42; exact-content validation passed for all three files, along with git diff --check.\",\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"completed\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"completed\" }\n  ]\n});\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 27547,
+        "cached_input_tokens": 13568,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1648,
+        "reasoning_output_tokens": 557,
+        "total_tokens": 29195
+      },
+      "request_input_tokens": [
+        4689,
+        5113,
+        5451,
+        5751,
+        6543
+      ],
+      "stdout": "Completed all three planned phases:\n\n- `alpha.txt` \u2192 `ALPHA`\n- `beta.txt` \u2192 `desserts`\n- `gamma.txt` \u2192 `42`\n\nExact-content validation and `git diff --check` both passed.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "planned_mutation",
+      "category": "planning",
+      "repetition": 1,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_update_plan": true,
+        "alpha_updated": true,
+        "beta_updated": true,
+        "gamma_updated": true
+      },
+      "duration_seconds": 43.031,
+      "top_level_tools": [
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "update_plan",
+        "exec_command",
+        "apply_patch",
+        "exec_command",
+        "update_plan",
+        "apply_patch",
+        "exec_command",
+        "update_plan",
+        "apply_patch",
+        "exec_command",
+        "exec_command",
+        "update_plan"
+      ],
+      "exec_inputs": [
+        "const plan = [\n  { step: \"uppercase alpha.txt\", status: \"in_progress\" },\n  { step: \"reverse beta.txt\", status: \"pending\" },\n  { step: \"replace gamma.txt with the sum of its numbers\", status: \"pending\" },\n];\nawait tools.update_plan({ plan });\nconst r = await tools.exec_command({\n  cmd: \"pwd && rg --files -g 'alpha.txt' -g 'beta.txt' -g 'gamma.txt' && sed -n '1,120p' alpha.txt && sed -n '1,120p' beta.txt && sed -n '1,120p' gamma.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 3000\n});\ntext(r.output);",
+        "const patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/alpha.txt\\n@@\\n-alpha\\n+ALPHA\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst r = await tools.exec_command({\n  cmd: \"test \\\"$(<alpha.txt)\\\" = ALPHA && sed -n '1p' alpha.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(r.output);",
+        "await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"in_progress\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"pending\" },\n  ],\n});\nconst patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/beta.txt\\n@@\\n-stressed\\n+desserts\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst r = await tools.exec_command({\n  cmd: \"test \\\"$(<beta.txt)\\\" = \\\"$(rev <<<'stressed')\\\" && sed -n '1p' beta.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(r.output);",
+        "await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"completed\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"in_progress\" },\n  ],\n});\nconst patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/gamma.txt\\n@@\\n-8 13 21\\n+42\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst r = await tools.exec_command({\n  cmd: \"test \\\"$(<gamma.txt)\\\" = 42 && printf 'gamma: ' && sed -n '1p' gamma.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(r.output);",
+        "const r = await tools.exec_command({\n  cmd: \"set -eu\\n[ \\\"$(<alpha.txt)\\\" = \\\"$(printf alpha | tr '[:lower:]' '[:upper:]')\\\" ]\\n[ \\\"$(<beta.txt)\\\" = \\\"$(printf stressed | rev)\\\" ]\\n[ \\\"$(<gamma.txt)\\\" = \\\"$(printf '8 13 21\\\\n' | awk '{ for (i = 1; i <= NF; i++) sum += $i } END { print sum }')\\\" ]\\ngit diff --check\\nprintf 'alpha.txt=%s\\\\nbeta.txt=%s\\\\ngamma.txt=%s\\\\n' \\\"$(<alpha.txt)\\\" \\\"$(<beta.txt)\\\" \\\"$(<gamma.txt)\\\"\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 2000\n});\nif (r.exit_code !== 0) {\n  text(r.output);\n  throw new Error(`validation failed with exit code ${r.exit_code}`);\n}\nawait tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"completed\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"completed\" },\n  ],\n});\ntext(r.output);"
+      ],
+      "usage_totals": {
+        "input_tokens": 25660,
+        "cached_input_tokens": 9472,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1726,
+        "reasoning_output_tokens": 479,
+        "total_tokens": 27386
+      },
+      "request_input_tokens": [
+        3455,
+        3797,
+        4060,
+        4343,
+        4733,
+        5272
+      ],
+      "stdout": "Completed and validated all three phases:\n\n- `alpha.txt`: `ALPHA`\n- `beta.txt`: `desserts`\n- `gamma.txt`: `42`\n\nAll exact-content checks and `git diff --check` passed.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "candidate",
+      "binary_sha256": "a9b84fa443f2a7c1515556111d0d87e2824dd69c93a3bd4866fac2fde0189e40",
+      "case": "planned_mutation",
+      "category": "planning",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_update_plan": true,
+        "alpha_updated": true,
+        "beta_updated": true,
+        "gamma_updated": true
+      },
+      "duration_seconds": 46.125,
+      "top_level_tools": [
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "update_plan",
+        "exec_command",
+        "apply_patch",
+        "exec_command",
+        "update_plan",
+        "apply_patch",
+        "exec_command",
+        "update_plan",
+        "apply_patch",
+        "exec_command",
+        "update_plan"
+      ],
+      "exec_inputs": [
+        "const plan = [\n  { step: \"uppercase alpha.txt\", status: \"in_progress\" },\n  { step: \"reverse beta.txt\", status: \"pending\" },\n  { step: \"replace gamma.txt with the sum of its numbers\", status: \"pending\" },\n];\nawait tools.update_plan({ plan });\nconst r = await tools.exec_command({\n  cmd: \"pwd && rg --files -g 'alpha.txt' -g 'beta.txt' -g 'gamma.txt' && sed -n '1,120p' alpha.txt && sed -n '1,120p' beta.txt && sed -n '1,120p' gamma.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 5000\n});\ntext(r.output);\n",
+        "const patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/alpha.txt\\n@@\\n-alpha\\n+ALPHA\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst r = await tools.exec_command({\n  cmd: \"test \\\"$(cat alpha.txt)\\\" = ALPHA && printf '%s\\\\n' 'alpha.txt validated: ALPHA'\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(r.output);\n",
+        "await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"in_progress\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"pending\" },\n  ],\n});\nconst patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/beta.txt\\n@@\\n-stressed\\n+desserts\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst r = await tools.exec_command({\n  cmd: \"test \\\"$(cat beta.txt)\\\" = desserts && printf '%s\\\\n' 'beta.txt validated: desserts'\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(r.output);\n",
+        "await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"completed\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"in_progress\" },\n  ],\n});\nconst patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/gamma.txt\\n@@\\n-8 13 21\\n+42\\n*** End Patch\";\nawait tools.apply_patch(patch);\nconst r = await tools.exec_command({\n  cmd: \"test \\\"$(cat gamma.txt)\\\" = 42 && test \\\"$(cat alpha.txt)\\\" = ALPHA && test \\\"$(cat beta.txt)\\\" = desserts && printf '%s\\\\n' 'alpha.txt=ALPHA' 'beta.txt=desserts' 'gamma.txt=42' && git diff --check && git diff -- alpha.txt beta.txt gamma.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 3000\n});\ntext(r.output);\n",
+        "await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"completed\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"completed\" },\n  ],\n});\ntext(\"All three plan phases are complete.\");\n"
+      ],
+      "usage_totals": {
+        "input_tokens": 25674,
+        "cached_input_tokens": 13312,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1294,
+        "reasoning_output_tokens": 245,
+        "total_tokens": 26968
+      },
+      "request_input_tokens": [
+        3455,
+        3805,
+        4073,
+        4372,
+        4919,
+        5050
+      ],
+      "stdout": "Completed and validated all three phases:\n\n- `alpha.txt` \u2192 `ALPHA`\n- `beta.txt` \u2192 `desserts`\n- `gamma.txt` \u2192 `42`\n\n`git diff --check` also passed.\n",
+      "stderr": ""
+    },
+    {
+      "arm": "baseline",
+      "binary_sha256": "76384e55f5f5a0ee99bcd37f2c6716b8b3462eac70f4e9406b5d441f81ddaa15",
+      "case": "planned_mutation",
+      "category": "planning",
+      "repetition": 2,
+      "passed": true,
+      "checks": {
+        "completed": true,
+        "used_update_plan": true,
+        "alpha_updated": true,
+        "beta_updated": true,
+        "gamma_updated": true
+      },
+      "duration_seconds": 51.422,
+      "top_level_tools": [
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "nested_tools": [
+        "update_plan",
+        "exec_command",
+        "apply_patch",
+        "exec_command",
+        "update_plan",
+        "apply_patch",
+        "exec_command",
+        "update_plan",
+        "apply_patch",
+        "exec_command",
+        "exec_command",
+        "update_plan"
+      ],
+      "exec_inputs": [
+        "const plan = await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"in_progress\" },\n    { step: \"reverse beta.txt\", status: \"pending\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"pending\" }\n  ]\n});\nconst inspect = await tools.exec_command({\n  cmd: \"git status --short && rg --files && for task_file in alpha.txt beta.txt gamma.txt; do echo \\\"$task_file\\\"; od -An -tx1c \\\"$task_file\\\"; done\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 5000\n});\ntext(inspect.output);",
+        "const patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/alpha.txt\\n@@\\n-alpha\\n+ALPHA\\n*** End Patch\";\nconst applied = await tools.apply_patch(patch);\nconst checked = await tools.exec_command({\n  cmd: \"test \\\"$(cat alpha.txt)\\\" = 'ALPHA' && printf 'alpha.txt validated: ' && cat alpha.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(JSON.stringify(applied) + \"\\n\" + checked.output);",
+        "const plan = await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"in_progress\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"pending\" }\n  ]\n});\nconst patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/beta.txt\\n@@\\n-stressed\\n+desserts\\n*** End Patch\";\nconst applied = await tools.apply_patch(patch);\nconst checked = await tools.exec_command({\n  cmd: \"test \\\"$(cat beta.txt)\\\" = \\\"$(head -n 1 beta.txt | rev | rev)\\\" && test \\\"$(cat beta.txt)\\\" = 'desserts' && printf 'beta.txt validated: ' && cat beta.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(JSON.stringify(applied) + \"\\n\" + checked.output);",
+        "const plan = await tools.update_plan({\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"completed\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"in_progress\" }\n  ]\n});\nconst patch = \"*** Begin Patch\\n*** Update File: /tmp/bettercodex-tool-eval-shg_5v1w/fixture/gamma.txt\\n@@\\n-8 13 21\\n+42\\n*** End Patch\";\nconst applied = await tools.apply_patch(patch);\nconst checked = await tools.exec_command({\n  cmd: \"test \\\"$((8 + 13 + 21))\\\" = \\\"$(cat gamma.txt)\\\" && printf 'gamma.txt validated: ' && cat gamma.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 1000\n});\ntext(JSON.stringify(applied) + \"\\n\" + checked.output);",
+        "const validation = await tools.exec_command({\n  cmd: \"cmp -s alpha.txt <(printf 'ALPHA\\\\n') && cmp -s beta.txt <(printf 'desserts\\\\n') && cmp -s gamma.txt <(printf '42\\\\n') && git diff --check && printf 'All exact-byte validations passed.\\\\n' && git diff -- alpha.txt beta.txt gamma.txt\",\n  workdir: \"/tmp/bettercodex-tool-eval-shg_5v1w/fixture\",\n  yield_time_ms: 10000,\n  max_output_tokens: 3000\n});\ntext(validation.output);\nif (validation.exit_code !== 0) {\n  throw new Error(`Validation failed with exit code ${validation.exit_code}`);\n}\n",
+        "const result = await tools.update_plan({\n  explanation: \"All three transformations and exact-byte validations passed.\",\n  plan: [\n    { step: \"uppercase alpha.txt\", status: \"completed\" },\n    { step: \"reverse beta.txt\", status: \"completed\" },\n    { step: \"replace gamma.txt with the sum of its numbers\", status: \"completed\" }\n  ]\n});\ntext(\"Plan completed.\");"
+      ],
+      "usage_totals": {
+        "input_tokens": 40900,
+        "cached_input_tokens": 24320,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1725,
+        "reasoning_output_tokens": 450,
+        "total_tokens": 42625
+      },
+      "request_input_tokens": [
+        4689,
+        5189,
+        5507,
+        5809,
+        6184,
+        6701,
+        6821
+      ],
+      "stdout": "Completed all three phases:\n\n- `alpha.txt` \u2192 `ALPHA`\n- `beta.txt` \u2192 `desserts`\n- `gamma.txt` \u2192 `42`\n\nExact-byte validation and `git diff --check` passed.\n",
+      "stderr": ""
+    }
+  ]
+}

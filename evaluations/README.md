@@ -8,9 +8,8 @@ graders, calibrated fixtures, repeated matched runs, and complete records.
 ## Audit result
 
 The public OpenAI Codex repository has extensive deterministic tests but no
-public end-to-end model-evaluation corpus or release runner to port. The two
-older bettercodex records in this directory therefore remain historical
-observations:
+public end-to-end model-evaluation corpus or release runner to port. The
+bettercodex records in this directory therefore remain focused observations:
 
 - `tool-catalogue/` compares two bettercodex catalogue variants on prompts that
   often name the expected tool. It is a useful focused diagnostic, but it does
