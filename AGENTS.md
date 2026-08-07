@@ -23,6 +23,8 @@ work exposes poor engineering, refactor, delete, consolidate, or clean it up
 instead of compounding it. Do not invent unrelated features, but do not preserve
 bad engineering just to keep a diff small.
 
+Do not use emojis, except for Codex's established checkmark status marker.
+
 ## Start here
 
 This file is the universal context layer. Before working, open only the matching
