@@ -1,3 +1,5 @@
 # Papercuts
 - `./scripts/dev.py tool-context --update` rewrites informational dynamic world-state metrics using the feature worktree's longer path, creating spurious diffs in the mandated isolated-worktree workflow. Normalize the audited cwd or preserve the dynamic region unless explicitly refreshing that snapshot.
 - The full test suite intermittently fails `spawned_pty_processes_receive_a_capable_terminal_type` because the PTY emits `xterm-256color\r\n` while the assertion expects no line ending, despite passing in an immediately prior run. Normalize PTY line endings or trim CR/LF in that assertion.
+- While auditing the active model prompt, `prompts/system-initial.md` looked like an active bootstrap prompt but is tracked, unused, and has no explanation of its archival purpose, causing a detour through history and call sites. Rename or move it to a clearly historical location, or add a short provenance/purpose header.
+- GitHub Actions workflow validation has no checked-in actionlint path, so sessions must fetch an external binary and can hit changing release asset names. Pin actionlint or expose it through scripts/dev.py for reproducible local workflow checks.

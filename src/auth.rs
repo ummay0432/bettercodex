@@ -109,8 +109,12 @@ impl Auth {
     }
 
     fn load_from_file(path: PathBuf) -> Result<Self> {
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read ChatGPT credentials at {}", path.display()))?;
+        let contents = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "failed to read ChatGPT credentials at {}; run `bcodex login`",
+                path.display()
+            )
+        })?;
         let document: Value = serde_json::from_str(&contents).with_context(|| {
             format!("failed to parse ChatGPT credentials at {}", path.display())
         })?;
@@ -157,7 +161,9 @@ impl Auth {
             return Ok(());
         }
         let refresh_token = self.refresh_token.clone().ok_or_else(|| {
-            anyhow!("the ChatGPT access token cannot be refreshed; run `codex login` and try again")
+            anyhow!(
+                "the ChatGPT access token cannot be refreshed; run `bcodex login` and try again"
+            )
         })?;
         let response = client
             .post(self.refresh_url.as_ref())
@@ -173,7 +179,7 @@ impl Auth {
         if status != StatusCode::OK {
             let body = bounded_error_body(response).await;
             return Err(anyhow!(
-                "ChatGPT credential refresh failed with {status}: {body}; run `codex login`"
+                "ChatGPT credential refresh failed with {status}: {body}; run `bcodex login`"
             ));
         }
         let refreshed: RefreshResponse = response
@@ -208,13 +214,13 @@ impl Auth {
         };
         let expected_account_id = self.account_id.as_deref().ok_or_else(|| {
             anyhow!(
-                "cannot safely refresh ChatGPT credentials without an account ID; run `codex login`"
+                "cannot safely refresh ChatGPT credentials without an account ID; run `bcodex login`"
             )
         })?;
         let mut reloaded = Self::load_from_file(path)?;
         if reloaded.account_id.as_deref() != Some(expected_account_id) {
             return Err(anyhow!(
-                "stored ChatGPT credentials changed accounts; restart bettercodex or run `codex login`"
+                "stored ChatGPT credentials changed accounts; restart bettercodex or run `bcodex login`"
             ));
         }
         let changed = self.storage.as_ref().map(|storage| &storage.document)
@@ -296,12 +302,15 @@ impl SharedAuth {
     }
 }
 
-fn auth_file_path() -> Result<PathBuf> {
-    let codex_home = std::env::var_os("CODEX_HOME")
+pub(crate) fn codex_home() -> Result<PathBuf> {
+    std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .ok_or_else(|| anyhow!("cannot locate Codex credentials: HOME is not set"))?;
-    Ok(codex_home.join("auth.json"))
+        .ok_or_else(|| anyhow!("cannot locate Codex credentials: HOME is not set"))
+}
+
+pub(crate) fn auth_file_path() -> Result<PathBuf> {
+    Ok(codex_home()?.join("auth.json"))
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<&str> {
