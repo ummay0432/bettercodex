@@ -94,15 +94,15 @@ tokens, and 45.0% of bytes/4 tokens.
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable harness input: `instructions` plus `additional_tools` | 20,639 | 4,809 | 5,160 |
+| Complete stable harness input: `instructions` plus `additional_tools` | 14,421 | 3,613 | 3,606 |
 | Complete `additional_tools` developer item | 11,370 | 2,964 | 2,843 |
 | Top-level `exec` specification | 10,486 | 2,766 | 2,622 |
 | `exec` description only | 9,859 | 2,396 | 2,465 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
 | Top-level `wait` specification | 826 | 186 | 207 |
 | `wait` description only | 247 | 62 | 62 |
-| Top-level `instructions` request field | 9,258 | 1,842 | 2,315 |
-| `prompts/system.md` text only | 9,145 | 1,759 | 2,287 |
+| Top-level `instructions` request field | 3,040 | 646 | 760 |
+| `prompts/system.md` text only | 2,986 | 615 | 747 |
 <!-- bcodex-tool-context:stable:end -->
 
 The `exec` description contains the Code Mode runtime instructions and every
@@ -191,8 +191,8 @@ bettercodex repository on the audit date:
 <!-- bcodex-tool-context:dynamic:start -->
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Current `<environment_context>` developer item | 286 | 89 | 72 |
-| Current `<repository_context>` user item | 5,845 | 1,381 | 1,462 |
+| Current `<environment_context>` developer item | 276 | 85 | 69 |
+| Current `<repository_context>` user item | 5,835 | 1,377 | 1,459 |
 | Current `<available_skills>` user item | 646 | 155 | 162 |
 <!-- bcodex-tool-context:dynamic:end -->
 
