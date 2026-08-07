@@ -240,7 +240,10 @@ fn session_listing_drives_resume_and_uses_the_first_real_user_message() {
         "role": "user",
         "content": [{
             "type": "input_text",
-            "text": "# Repository onboarding from AGENTS.md for /tmp\nignored",
+            "text": format!(
+                "# Repository onboarding from AGENTS.md for /tmp\n{}\n# End repository onboarding",
+                "x".repeat(JOURNAL_BUFFER_BYTES * 2),
+            ),
         }],
     });
     let interruption = json!({
@@ -319,6 +322,24 @@ fn session_listing_drives_resume_and_uses_the_first_real_user_message() {
     );
     drop(loaded);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn preview_scan_skips_large_irrelevant_records_across_buffer_boundaries() {
+    let mut input = Vec::new();
+    input.extend_from_slice(b"short\n");
+    input.extend(std::iter::repeat_n(b'x', JOURNAL_BUFFER_BYTES * 4));
+    input.push(b'\n');
+    let expected = b"{\"type\":\"history_append\",\"items\":[]}\r\n";
+    input.extend_from_slice(expected);
+
+    let mut reader = BufReader::with_capacity(7, input.as_slice());
+    let mut record = Vec::new();
+    let found = read_next_history_append_record(&mut reader, &mut record).unwrap();
+    assert!(found);
+    assert_eq!(record, expected);
+    assert!(record.capacity() < JOURNAL_BUFFER_BYTES);
+    assert!(!read_next_history_append_record(&mut reader, &mut record).unwrap());
 }
 
 #[test]

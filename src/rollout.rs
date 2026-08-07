@@ -7,6 +7,7 @@ use codex_protocol::models::MessagePhase;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::BufRead;
@@ -32,6 +33,7 @@ const SESSIONS_DIRECTORY: &str = "sessions";
 const INSTALLATION_ID_FILE: &str = "installation_id";
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 160;
+const HISTORY_APPEND_PREFIX: &[u8] = br#"{"type":"history_append""#;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionIdentity {
@@ -164,28 +166,30 @@ type RolloutRecord = RolloutRecordData;
 // them into a short-lived record.
 type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value]>;
 
+// Listing only needs message shape and preview text. Borrow unescaped fields directly from the
+// matched journal record so inspecting a session does not copy its message payloads again.
 #[derive(Debug, Deserialize)]
-struct PreviewHistoryRecord {
-    #[serde(default)]
-    items: Vec<PreviewItem>,
+struct PreviewHistoryRecord<'a> {
+    #[serde(default, borrow)]
+    items: Vec<PreviewItem<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PreviewItem {
-    #[serde(rename = "type", default)]
-    kind: String,
-    #[serde(default)]
-    role: String,
-    #[serde(default)]
-    content: Vec<PreviewContent>,
+struct PreviewItem<'a> {
+    #[serde(rename = "type", default, borrow)]
+    kind: Cow<'a, str>,
+    #[serde(default, borrow)]
+    role: Cow<'a, str>,
+    #[serde(default, borrow)]
+    content: Vec<PreviewContent<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PreviewContent {
-    #[serde(rename = "type", default)]
-    kind: String,
-    #[serde(default)]
-    text: String,
+struct PreviewContent<'a> {
+    #[serde(rename = "type", default, borrow)]
+    kind: Cow<'a, str>,
+    #[serde(default, borrow)]
+    text: Cow<'a, str>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -650,12 +654,16 @@ fn read_session_summary(
 ) -> Result<Option<SessionSummary>> {
     let file = File::open(path)
         .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-    let mut lines = BufReader::new(file).split(b'\n');
-    let Some(header) = lines.next() else {
+    let mut reader = BufReader::new(file);
+    let mut record = Vec::new();
+    if reader
+        .read_until(b'\n', &mut record)
+        .with_context(|| format!("failed to inspect saved session {}", path.display()))?
+        == 0
+    {
         return Ok(None);
-    };
-    let header = header?;
-    let Ok(RolloutRecord::Session { metadata }) = serde_json::from_slice(&header) else {
+    }
+    let Ok(RolloutRecord::Session { metadata }) = serde_json::from_slice(&record) else {
         return Ok(None);
     };
     if metadata.version != ROLLOUT_VERSION
@@ -674,18 +682,13 @@ fn read_session_summary(
     }
 
     let mut preview = None;
-    for line in lines {
-        let line =
-            line.with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-        // bettercodex writes the externally tagged record type first. Avoid decoding initial
-        // context, reasoning, and tool payloads while looking for the first real user message.
-        if !line.starts_with(br#"{"type":"history_append""#) {
-            continue;
-        }
-        let Ok(record) = serde_json::from_slice::<PreviewHistoryRecord>(&line) else {
+    while read_next_history_append_record(&mut reader, &mut record)
+        .with_context(|| format!("failed to inspect saved session {}", path.display()))?
+    {
+        let Ok(history_append) = serde_json::from_slice::<PreviewHistoryRecord<'_>>(&record) else {
             continue;
         };
-        if let Some(found) = preview_from_items(&record.items) {
+        if let Some(found) = preview_from_items(&history_append.items) {
             preview = Some(found);
             break;
         }
@@ -704,18 +707,72 @@ fn read_session_summary(
     }))
 }
 
-fn preview_from_items(items: &[PreviewItem]) -> Option<String> {
+/// Reads the next history-append record without materializing records that cannot match.
+///
+/// Rollout serialization puts the externally tagged record type first. Most session records can
+/// therefore be rejected after a few bytes; `skip_until` advances over the rest through the
+/// `BufRead` buffer instead of allocating and copying a potentially multi-megabyte JSON value.
+fn read_next_history_append_record(
+    reader: &mut impl BufRead,
+    record: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    record.clear();
+    'records: loop {
+        let mut matched = 0;
+        while matched < HISTORY_APPEND_PREFIX.len() {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(false);
+            }
+            let compared = available.len().min(HISTORY_APPEND_PREFIX.len() - matched);
+            let expected = &HISTORY_APPEND_PREFIX[matched..matched + compared];
+            if available[..compared] != *expected {
+                let mismatch = available[..compared]
+                    .iter()
+                    .zip(expected)
+                    .position(|(actual, expected)| actual != expected)
+                    .expect("unequal byte slices contain a mismatch");
+                let mismatch_byte = available[mismatch];
+                reader.consume(mismatch + 1);
+                if mismatch_byte != b'\n' {
+                    reader.skip_until(b'\n')?;
+                }
+                continue 'records;
+            }
+            reader.consume(compared);
+            matched += compared;
+        }
+
+        record.extend_from_slice(HISTORY_APPEND_PREFIX);
+        reader.read_until(b'\n', record)?;
+        return Ok(true);
+    }
+}
+
+fn preview_from_items(items: &[PreviewItem<'_>]) -> Option<String> {
     for item in items {
         if item.kind != "message" || item.role != "user" {
             continue;
         }
-        let text = item
+        let mut texts = item
             .content
             .iter()
             .filter(|content| content.kind == "input_text")
-            .map(|content| content.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|content| content.text.as_ref());
+        let first = texts.next().unwrap_or_default();
+        let text = if let Some(second) = texts.next() {
+            let mut joined = String::with_capacity(first.len() + second.len() + 1);
+            joined.push_str(first);
+            joined.push('\n');
+            joined.push_str(second);
+            for text in texts {
+                joined.push('\n');
+                joined.push_str(text);
+            }
+            Cow::Owned(joined)
+        } else {
+            Cow::Borrowed(first)
+        };
         if crate::context::is_contextual_user_text(&text) {
             continue;
         }
