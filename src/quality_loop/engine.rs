@@ -1054,6 +1054,7 @@ fn restore_iteration_snapshot(
     run.update(|state| state.phase = RunPhase::Iteration)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn block_integrity(
     worktree: &super::Worktree,
     run: &mut LoopRun,

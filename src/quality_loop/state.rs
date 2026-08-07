@@ -330,12 +330,13 @@ fn recover_run(worktree: &Worktree, root: &Path, directory_id: &str) -> Result<(
     }
     verify_runtime_state(&state)
         .with_context(|| format!("cannot recover incomplete quality-loop run `{directory_id}`"))?;
-    if state.phase == RunPhase::Iteration && state.active_iteration.is_none() {
-        if state.prepared_iteration.is_none() {
-            return Err(anyhow!(
-                "incomplete loop run `{directory_id}` has no active iteration marker"
-            ));
-        }
+    if state.phase == RunPhase::Iteration
+        && state.active_iteration.is_none()
+        && state.prepared_iteration.is_none()
+    {
+        return Err(anyhow!(
+            "incomplete loop run `{directory_id}` has no active iteration marker"
+        ));
     }
     if let Some(prepared) = state.prepared_iteration.clone() {
         return recover_prepared_iteration(worktree, root, directory_id, &mut state, prepared);
