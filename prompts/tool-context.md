@@ -94,15 +94,15 @@ tokens, and 45.0% of bytes/4 tokens.
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable harness input: `instructions` plus `additional_tools` | 14,595 | 3,651 | 3,649 |
+| Complete stable harness input: `instructions` plus `additional_tools` | 20,116 | 4,733 | 5,029 |
 | Complete `additional_tools` developer item | 11,370 | 2,964 | 2,843 |
 | Top-level `exec` specification | 10,486 | 2,766 | 2,622 |
 | `exec` description only | 9,859 | 2,396 | 2,465 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
 | Top-level `wait` specification | 826 | 186 | 207 |
 | `wait` description only | 247 | 62 | 62 |
-| Top-level `instructions` request field | 3,214 | 684 | 804 |
-| `prompts/system.md` text only | 3,158 | 651 | 790 |
+| Top-level `instructions` request field | 8,735 | 1,766 | 2,184 |
+| `prompts/system.md` text only | 8,642 | 1,699 | 2,161 |
 <!-- bcodex-tool-context:stable:end -->
 
 The `exec` description contains the Code Mode runtime instructions and every
