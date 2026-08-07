@@ -239,7 +239,15 @@ impl ProcessSession {
             .state
             .lock()
             .map_err(|_| anyhow!("process output lock was poisoned"))?;
-        let mut output = state.output.take();
+        // A running process may be polled between the bytes of one UTF-8 scalar. Keep that short
+        // suffix for the next snapshot; once the process has exited this is the last response the
+        // manager will expose, so flush any incomplete bytes lossily instead of dropping them.
+        let boundary = if state.exit_code.is_some() || state.readers == 0 {
+            SnapshotBoundary::Final
+        } else {
+            SnapshotBoundary::Intermediate
+        };
+        let mut output = state.output.take(boundary);
         if !state.errors.is_empty() {
             if !output.text.is_empty() && !output.text.ends_with('\n') {
                 output.text.push('\n');
@@ -285,6 +293,12 @@ struct PendingOutput {
     omitted: usize,
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotBoundary {
+    Intermediate,
+    Final,
+}
+
 impl PendingOutput {
     fn append(&mut self, mut bytes: &[u8]) {
         let head_space = RETAINED_HEAD_BYTES.saturating_sub(self.head.len());
@@ -315,13 +329,9 @@ impl PendingOutput {
         self.tail.extend(bytes);
     }
 
-    fn take(&mut self) -> PendingOutputSnapshot {
+    fn take(&mut self, boundary: SnapshotBoundary) -> PendingOutputSnapshot {
         let omitted_bytes = self.omitted;
-        let total_bytes = self
-            .head
-            .len()
-            .saturating_add(self.tail.len())
-            .saturating_add(omitted_bytes);
+        let retained_bytes = self.head.len().saturating_add(self.tail.len());
         let mut bytes = std::mem::take(&mut self.head);
         if omitted_bytes > 0 {
             let marker = format!("\n... {omitted_bytes} bytes omitted ...\n");
@@ -332,6 +342,18 @@ impl PendingOutput {
         }
         bytes.extend(std::mem::take(&mut self.tail));
         self.omitted = 0;
+
+        let pending = match boundary {
+            SnapshotBoundary::Intermediate => {
+                let length = incomplete_utf8_suffix_length(&bytes);
+                bytes.split_off(bytes.len().saturating_sub(length))
+            }
+            SnapshotBoundary::Final => Vec::new(),
+        };
+        let total_bytes = retained_bytes
+            .saturating_add(omitted_bytes)
+            .saturating_sub(pending.len());
+        self.head = pending;
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
             Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
@@ -342,6 +364,19 @@ impl PendingOutput {
             omitted_bytes,
         }
     }
+}
+
+fn incomplete_utf8_suffix_length(bytes: &[u8]) -> usize {
+    // A UTF-8 scalar is at most four bytes, so no valid incomplete suffix can exceed three. Check
+    // each possible suffix independently: an earlier invalid byte must not hide a later valid
+    // prefix that can be completed by the process's next write.
+    (1..=bytes.len().min(3))
+        .rev()
+        .find(|length| {
+            std::str::from_utf8(&bytes[bytes.len() - length..])
+                .is_err_and(|error| error.valid_up_to() == 0 && error.error_len().is_none())
+        })
+        .unwrap_or(0)
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]

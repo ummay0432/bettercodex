@@ -743,6 +743,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn polling_preserves_utf8_split_between_tool_results() {
+        let cwd = std::env::current_dir().unwrap();
+        let manager = ProcessManager::new(cwd);
+        let started = manager
+            .exec_command(
+                json!({
+                    "cmd": "printf 'ready:\\360\\237'; sleep 1; printf '\\230\\200'",
+                    "shell": "/bin/sh",
+                    "login": false,
+                    "yield_time_ms": 250,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(started["output"], "ready:");
+        let session_id = started["session_id"].as_i64().unwrap() as i32;
+        let completed = manager
+            .write_stdin(
+                json!({
+                    "session_id": session_id,
+                    "yield_time_ms": 5_000,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(completed["output"], "😀");
+        assert_eq!(completed["exit_code"], 0);
+    }
+
+    #[tokio::test]
     async fn cloned_process_table_lists_and_stops_background_commands() {
         let cwd = std::env::current_dir().unwrap();
         let manager = ProcessManager::new(cwd.clone());

@@ -18,7 +18,7 @@ fn retained_output_keeps_head_and_tail() {
     let mut output = PendingOutput::default();
     let bytes = vec![b'x'; RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + 17];
     output.append(&bytes);
-    let snapshot = output.take();
+    let snapshot = output.take(SnapshotBoundary::Final);
     let rendered = snapshot.text;
     assert_eq!(snapshot.total_bytes, bytes.len());
     assert_eq!(snapshot.omitted_bytes, 17);
@@ -39,7 +39,7 @@ fn retained_output_ring_preserves_order_across_many_reads() {
         output.append(chunk);
     }
 
-    let snapshot = output.take();
+    let snapshot = output.take(SnapshotBoundary::Final);
 
     let expected = format!(
         "{}\n... {omitted_bytes} bytes omitted ...\n{}",
@@ -61,7 +61,38 @@ fn retained_output_replaces_invalid_utf8() {
     let mut output = PendingOutput::default();
     output.append(b"before\x80after");
 
-    assert_eq!(output.take().text, "before\u{fffd}after");
+    assert_eq!(
+        output.take(SnapshotBoundary::Intermediate).text,
+        "before\u{fffd}after"
+    );
+}
+
+#[test]
+fn process_snapshots_join_utf8_split_across_poll_boundaries() {
+    let session = ProcessSession::new(None, Box::new(NoopKiller), 1, ProcessMode::Piped, None);
+    let emoji = "😀".as_bytes();
+    session.append(&[0x80]);
+    session.append(&emoji[..2]);
+
+    let first = session.snapshot().unwrap();
+    assert_eq!(first.output, "\u{fffd}");
+    assert_eq!(first.total_bytes, 1);
+
+    session.append(&emoji[2..]);
+    let second = session.snapshot().unwrap();
+    assert_eq!(second.output, "😀");
+    assert_eq!(second.total_bytes, emoji.len());
+}
+
+#[test]
+fn final_snapshot_exposes_an_incomplete_utf8_suffix_lossily() {
+    let session = ProcessSession::new(None, Box::new(NoopKiller), 1, ProcessMode::Piped, None);
+    session.append(&[0xf0, 0x9f]);
+    session.reader_finished(None);
+
+    let snapshot = session.snapshot().unwrap();
+    assert_eq!(snapshot.output, "\u{fffd}");
+    assert_eq!(snapshot.total_bytes, 2);
 }
 
 #[tokio::test]
