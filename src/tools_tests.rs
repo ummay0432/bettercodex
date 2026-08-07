@@ -1,6 +1,7 @@
 use super::ToolCall;
 use super::ToolResult;
 use super::ToolRuntime;
+use super::view_image;
 use crate::auth::Auth;
 use crate::auth::SharedAuth;
 use crate::events::AgentEvent;
@@ -45,6 +46,28 @@ fn parses_exec_and_wait_calls() {
             arguments: "{\"cell_id\":\"cell-1\"}".to_string(),
         })
     );
+}
+
+#[test]
+fn view_image_rejects_oversized_files_before_reading_them() {
+    let root = std::env::temp_dir().join(format!(
+        "bettercodex-view-image-limit-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4(),
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("oversized.png");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(crate::input::MAX_TOTAL_IMAGE_BYTES as u64 + 1)
+        .unwrap();
+
+    let error = view_image(&root, json!({"path": "oversized.png"})).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "attached images exceed bettercodex's 50 MiB input limit"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

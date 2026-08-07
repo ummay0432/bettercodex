@@ -24,6 +24,8 @@ const ACCOUNT_ID_ENV: &str = "CHATGPT_ACCOUNT_ID";
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+const MAX_REFRESH_ERROR_BODY_BYTES: usize = 8_000;
+const MAX_REFRESH_ERROR_BODY_CHARS: usize = 2_000;
 
 pub(crate) struct Auth {
     access_token: String,
@@ -103,7 +105,10 @@ impl Auth {
             });
         }
 
-        let path = auth_file_path()?;
+        Self::load_from_file(auth_file_path()?)
+    }
+
+    fn load_from_file(path: PathBuf) -> Result<Self> {
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read ChatGPT credentials at {}", path.display()))?;
         let document: Value = serde_json::from_str(&contents).with_context(|| {
@@ -148,6 +153,9 @@ impl Auth {
     }
 
     async fn refresh(&mut self, client: &reqwest::Client) -> Result<()> {
+        if self.reload_from_storage_if_changed()? {
+            return Ok(());
+        }
         let refresh_token = self.refresh_token.clone().ok_or_else(|| {
             anyhow!("the ChatGPT access token cannot be refreshed; run `codex login` and try again")
         })?;
@@ -192,6 +200,28 @@ impl Auth {
         self.refresh_token = refresh_token;
         self.persist(refreshed.id_token.as_deref())?;
         Ok(())
+    }
+
+    fn reload_from_storage_if_changed(&mut self) -> Result<bool> {
+        let Some(path) = self.storage.as_ref().map(|storage| storage.path.clone()) else {
+            return Ok(false);
+        };
+        let expected_account_id = self.account_id.as_deref().ok_or_else(|| {
+            anyhow!(
+                "cannot safely refresh ChatGPT credentials without an account ID; run `codex login`"
+            )
+        })?;
+        let mut reloaded = Self::load_from_file(path)?;
+        if reloaded.account_id.as_deref() != Some(expected_account_id) {
+            return Err(anyhow!(
+                "stored ChatGPT credentials changed accounts; restart bettercodex or run `codex login`"
+            ));
+        }
+        let changed = self.storage.as_ref().map(|storage| &storage.document)
+            != reloaded.storage.as_ref().map(|storage| &storage.document);
+        reloaded.refresh_url = self.refresh_url.clone();
+        *self = reloaded;
+        Ok(changed)
     }
 
     fn persist(&mut self, id_token: Option<&str>) -> Result<()> {
@@ -364,13 +394,21 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn bounded_error_body(response: reqwest::Response) -> String {
-    response
-        .text()
-        .await
-        .unwrap_or_else(|_| "unreadable response".to_string())
+async fn bounded_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::with_capacity(MAX_REFRESH_ERROR_BODY_BYTES);
+    while body.len() < MAX_REFRESH_ERROR_BODY_BYTES {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) if body.is_empty() => return "unreadable response".to_string(),
+            Err(_) => break,
+        };
+        let remaining = MAX_REFRESH_ERROR_BODY_BYTES.saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&body)
         .chars()
-        .take(2_000)
+        .take(MAX_REFRESH_ERROR_BODY_CHARS)
         .collect()
 }
 

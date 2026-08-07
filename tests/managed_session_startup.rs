@@ -53,6 +53,16 @@ impl Fixture {
         .unwrap();
     }
 
+    fn write_auth(&self) {
+        let codex_home = self.root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("auth.json"),
+            r#"{"tokens":{"access_token":"test-access-token"}}"#,
+        )
+        .unwrap();
+    }
+
     fn command(&self) -> CommandBuilder {
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_bcodex"));
         command.cwd(&self.root);
@@ -110,6 +120,47 @@ fn disabled_startup_bypasses_tmux_before_agent_initialization() {
         !fixture.tmux_log.exists(),
         "tmux was invoked while disabled: {}",
         fs::read_to_string(&fixture.tmux_log).unwrap_or_default()
+    );
+    assert!(
+        !fixture.root.join("codex-home/bettercodex").exists(),
+        "failed authentication left an empty saved session"
+    );
+}
+
+#[test]
+fn invalid_one_shot_input_is_rejected_before_session_creation() {
+    let fixture = Fixture::new();
+    fixture.set_tmux(false);
+    let mut command = fixture.command();
+    command.arg("--image");
+    command.arg(fixture.root.join("missing.png"));
+
+    let output = run_in_pty(command);
+
+    assert!(output.contains("failed to read image"), "{output:?}");
+    assert!(
+        !fixture.root.join("codex-home/bettercodex").exists(),
+        "invalid input left an empty saved session"
+    );
+}
+
+#[test]
+fn invalid_repository_context_is_rejected_before_session_creation() {
+    let fixture = Fixture::new();
+    fixture.set_tmux(false);
+    fixture.write_auth();
+    let instructions = fixture.root.join("AGENTS.md");
+    fs::write(&instructions, "unreadable").unwrap();
+    let mut permissions = fs::metadata(&instructions).unwrap().permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&instructions, permissions).unwrap();
+
+    let output = run_in_pty(fixture.command());
+
+    assert!(output.contains("failed to read instructions"), "{output:?}");
+    assert!(
+        !fixture.root.join("codex-home/bettercodex").exists(),
+        "invalid repository context left an empty saved session"
     );
 }
 

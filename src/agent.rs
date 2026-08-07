@@ -174,10 +174,9 @@ pub(crate) struct Agent {
 impl Agent {
     pub(crate) fn new(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = canonical_directory(cwd.as_ref())?;
-        let rollout = Rollout::create(&cwd)?;
-        let identity = rollout.identity().clone();
-        let conversation = Conversation::new(&cwd, rollout)?;
         let auth = Auth::load()?;
+        let conversation = Conversation::create(&cwd)?;
+        let identity = conversation.identity().clone();
         let api = ApiClient::new(auth, &identity, 0)?;
         let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
         Ok(Self {
@@ -196,13 +195,13 @@ impl Agent {
     }
 
     pub(crate) fn fork(&self, transcript: Vec<SessionTranscriptItem>) -> Result<Self> {
+        let auth = Auth::load()?;
         let mut rollout = Rollout::create(&self.cwd)?;
         let identity = rollout.identity().clone();
         let compaction_count = self.api.compaction_count();
         rollout.record_fork(self.session_id(), compaction_count)?;
         rollout.snapshot_transcript(transcript)?;
         let conversation = self.conversation.fork(rollout)?;
-        let auth = Auth::load()?;
         let api = ApiClient::new(auth, &identity, compaction_count)?;
         let tools = ToolRuntime::new(self.cwd.clone(), api.web_search_client());
         Ok(Self {
