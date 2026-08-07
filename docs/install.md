@@ -19,8 +19,9 @@ when necessary.
 
 ## Friend setup
 
-1. The maintainer sends a read-only GitHub repository invitation. Accept it
-   while signed in to the GitHub account that should retain access.
+1. The maintainer sends a GitHub repository invitation to a specific account.
+   Accept the email invitation while signed in to that account, or open the
+   [pending invitation page](https://github.com/ummay0432/bettercodex/invitations).
 2. Install the [GitHub CLI](https://github.com/cli/cli#installation), then sign
    in:
 
@@ -71,8 +72,16 @@ gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/
 
 The private repository and its private release assets are the invite gate.
 Each friend authenticates as themselves, so the install command contains no
-shared token to leak. Give friends the read role; they do not need write
-access.
+shared token to leak. GitHub does not provide a reusable link that lets an
+arbitrary visitor join a private repository: the maintainer must first invite
+each GitHub account, after which the repository's `/invitations` URL lets that
+account accept.
+
+This repository is currently owned by a personal GitHub account. GitHub gives
+collaborators on private personal repositories write access and does not offer
+a read-only collaborator role. If friends should only read source and download
+releases, transfer the repository to a GitHub organization and grant them its
+Read role before inviting them.
 
 Removing a collaborator blocks future source and release downloads. It cannot
 erase binaries or source that the collaborator already downloaded, so this is
@@ -86,15 +95,25 @@ GitHub Actions must be enabled for this private repository. Private-repository
 runner minutes count against the repository owner's GitHub plan, and macOS
 jobs consume more billed minutes than Linux jobs.
 
-Invite a friend with read-only access by replacing `FRIEND` with their GitHub
-username:
+Invite a friend to the current personal repository by replacing `FRIEND` with
+their GitHub username:
 
 ```sh
-gh api --method PUT repos/ummay0432/bettercodex/collaborators/FRIEND -f permission=pull
+gh api --method PUT repos/ummay0432/bettercodex/collaborators/FRIEND
 ```
 
-GitHub emails the invitation. The friend must accept it before the installer
-can read the repository or its releases.
+GitHub emails the targeted invitation. The friend can also accept it at:
+
+```text
+https://github.com/ummay0432/bettercodex/invitations
+```
+
+The URL only works for an account with a pending invitation. Because this is a
+personal repository, accepting grants write access. See GitHub's
+[personal-repository permission levels](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/repository-access-and-collaboration/permission-levels-for-a-personal-account-repository)
+and [organization repository roles](https://docs.github.com/en/organizations/managing-user-access-to-your-organizations-repositories/managing-repository-roles/repository-roles-for-an-organization)
+before choosing between the current trusted-collaborator setup and an
+organization-owned read-only setup.
 
 ## Publishing a release
 
