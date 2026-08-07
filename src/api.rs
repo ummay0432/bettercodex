@@ -1313,6 +1313,7 @@ async fn collect_http_stream(
 ) -> ApiResult<ModelResponse> {
     let mut decoder = SseDecoder::default();
     let mut collected = CollectedResponse::default();
+    let mut decoded = Vec::new();
     let mut event_deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
         let chunk = tokio::time::timeout_at(event_deadline, response.chunk())
@@ -1322,16 +1323,17 @@ async fn collect_http_stream(
                 ApiError::retryable(format!("failed to read model response: {error}"))
             })?;
         let Some(chunk) = chunk else {
-            for data in decoder.finish()? {
+            decoder.finish(&mut decoded)?;
+            for data in decoded.drain(..) {
                 process_event(&data, &mut collected, completed_items, events)?;
             }
             break;
         };
-        let decoded = decoder.push(&chunk)?;
+        decoder.push(&chunk, &mut decoded)?;
         if !decoded.is_empty() {
             event_deadline = tokio::time::Instant::now() + idle_timeout;
         }
-        for data in decoded {
+        for data in decoded.drain(..) {
             process_event(&data, &mut collected, completed_items, events)?;
         }
         if collected.completed {

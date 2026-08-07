@@ -357,6 +357,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "libc",
+ "memchr",
  "portable-pty",
  "pretty_assertions",
  "pulldown-cmark",

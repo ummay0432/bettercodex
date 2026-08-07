@@ -364,13 +364,14 @@ fn benchmark_http_sse_event_handoff() {
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
     let mut collected = CollectedResponse::default();
     let mut decoder = SseDecoder::default();
+    let mut decoded = Vec::new();
 
     let started = std::time::Instant::now();
     for _ in 0..EVENTS {
-        for data in decoder
-            .push(std::hint::black_box(frame.as_bytes()))
-            .unwrap()
-        {
+        decoder
+            .push(std::hint::black_box(frame.as_bytes()), &mut decoded)
+            .unwrap();
+        for data in decoded.drain(..) {
             process_event(&data, &mut collected, &completed_items, Some(&events)).unwrap();
         }
     }

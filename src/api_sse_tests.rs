@@ -1,16 +1,30 @@
 use super::*;
 
+fn push_events(decoder: &mut SseDecoder, chunk: &[u8]) -> ApiResult<Vec<String>> {
+    let mut events = Vec::new();
+    decoder.push(chunk, &mut events)?;
+    Ok(events)
+}
+
+fn finish_events(decoder: &mut SseDecoder) -> ApiResult<Vec<String>> {
+    let mut events = Vec::new();
+    decoder.finish(&mut events)?;
+    Ok(events)
+}
+
 #[test]
 fn handles_split_crlf_and_multiline_frames() {
     let mut decoder = SseDecoder::default();
     assert_eq!(
-        decoder.push(b"event: ignored\r\nda").unwrap(),
+        push_events(&mut decoder, b"event: ignored\r\nda").unwrap(),
         Vec::<String>::new()
     );
     assert_eq!(
-        decoder
-            .push(b"ta: {\"type\":\r\ndata: \"response.created\"}\r\n\r\n")
-            .unwrap(),
+        push_events(
+            &mut decoder,
+            b"ta: {\"type\":\r\ndata: \"response.created\"}\r\n\r\n",
+        )
+        .unwrap(),
         vec!["{\"type\":\n\"response.created\"}".to_string()]
     );
 }
@@ -19,11 +33,15 @@ fn handles_split_crlf_and_multiline_frames() {
 fn preserves_empty_data_lines_and_unterminated_events() {
     let mut decoder = SseDecoder::default();
     assert_eq!(
-        decoder.push(b"data:\ndata: second\n\n").unwrap(),
+        push_events(&mut decoder, b"data:\ndata: second\n\n").unwrap(),
         ["\nsecond"]
     );
-    assert!(decoder.push(b"data: trailing\r").unwrap().is_empty());
-    assert_eq!(decoder.finish().unwrap(), ["trailing"]);
+    assert!(
+        push_events(&mut decoder, b"data: trailing\r")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(finish_events(&mut decoder).unwrap(), ["trailing"]);
 }
 
 #[test]
@@ -36,7 +54,7 @@ fn reassembles_a_large_line_from_small_chunks() {
     let mut decoded = Vec::new();
 
     for chunk in frame.as_bytes().chunks(CHUNK_BYTES) {
-        decoded.extend(decoder.push(chunk).unwrap());
+        decoded.extend(push_events(&mut decoder, chunk).unwrap());
     }
 
     assert_eq!(decoded, [event]);
@@ -49,7 +67,7 @@ fn bounds_each_event_instead_of_the_transport_chunk() {
     assert!(chunk.len() > MAX_STREAM_EVENT_BYTES);
 
     let mut decoder = SseDecoder::default();
-    let events = decoder.push(chunk.as_bytes()).unwrap();
+    let events = push_events(&mut decoder, chunk.as_bytes()).unwrap();
     assert_eq!(events.len(), chunk.len() / event.len());
 }
 
@@ -58,7 +76,7 @@ fn rejects_an_oversized_non_data_line() {
     let line = format!("event: {}\n\n", "x".repeat(MAX_STREAM_EVENT_BYTES));
     let mut decoder = SseDecoder::default();
 
-    let error = decoder.push(line.as_bytes()).unwrap_err();
+    let error = push_events(&mut decoder, line.as_bytes()).unwrap_err();
     assert!(error.to_string().contains("oversized SSE event"));
 }
 
@@ -67,8 +85,8 @@ fn rejects_an_oversized_fragmented_line() {
     let line = vec![b'x'; MAX_STREAM_EVENT_BYTES];
     let mut decoder = SseDecoder::default();
 
-    assert!(decoder.push(&line).unwrap().is_empty());
-    let error = decoder.push(b"x").unwrap_err();
+    assert!(push_events(&mut decoder, &line).unwrap().is_empty());
+    let error = push_events(&mut decoder, b"x").unwrap_err();
     assert!(error.to_string().contains("oversized SSE event"));
 }
 
@@ -77,9 +95,25 @@ fn rejects_oversized_multiline_data() {
     let line = format!("data: {}\n", "x".repeat(MAX_STREAM_EVENT_BYTES / 2));
     let mut decoder = SseDecoder::default();
 
-    assert!(decoder.push(line.as_bytes()).unwrap().is_empty());
-    let error = decoder.push(line.as_bytes()).unwrap_err();
+    assert!(
+        push_events(&mut decoder, line.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    let error = push_events(&mut decoder, line.as_bytes()).unwrap_err();
     assert!(error.to_string().contains("oversized SSE event"));
+}
+
+#[test]
+fn rejects_invalid_utf8_after_reassembling_a_line() {
+    let mut decoder = SseDecoder::default();
+    let mut events = Vec::new();
+
+    decoder.push(b"data: \xf0\x9f", &mut events).unwrap();
+    let error = decoder.push(b"\xff\n\n", &mut events).unwrap_err();
+
+    assert!(events.is_empty());
+    assert!(error.to_string().contains("SSE stream was not UTF-8"));
 }
 
 #[test]
@@ -89,9 +123,9 @@ fn handles_every_chunk_boundary_without_buffering_complete_lines() {
 
     for split in 0..=stream.len() {
         let mut decoder = SseDecoder::default();
-        let mut events = decoder.push(&stream.as_bytes()[..split]).unwrap();
-        events.extend(decoder.push(&stream.as_bytes()[split..]).unwrap());
-        events.extend(decoder.finish().unwrap());
+        let mut events = push_events(&mut decoder, &stream.as_bytes()[..split]).unwrap();
+        events.extend(push_events(&mut decoder, &stream.as_bytes()[split..]).unwrap());
+        events.extend(finish_events(&mut decoder).unwrap());
         assert_eq!(events, expected, "failed at byte split {split}");
     }
 
@@ -99,14 +133,17 @@ fn handles_every_chunk_boundary_without_buffering_complete_lines() {
         let mut decoder = SseDecoder::default();
         let mut events = Vec::new();
         for chunk in stream.as_bytes().chunks(chunk_bytes) {
-            events.extend(decoder.push(chunk).unwrap());
+            events.extend(push_events(&mut decoder, chunk).unwrap());
         }
-        events.extend(decoder.finish().unwrap());
+        events.extend(finish_events(&mut decoder).unwrap());
         assert_eq!(events, expected, "failed with {chunk_bytes}-byte chunks");
     }
 
     let mut decoder = SseDecoder::default();
-    assert_eq!(decoder.push(stream.as_bytes()).unwrap(), expected);
+    assert_eq!(
+        push_events(&mut decoder, stream.as_bytes()).unwrap(),
+        expected
+    );
     assert_eq!(
         decoder.partial_line.capacity(),
         0,
@@ -134,12 +171,14 @@ fn benchmark_sse_decoder_workloads() {
         EVENTS_PER_WORKLOAD,
         || {
             let mut decoder = SseDecoder::default();
+            let mut events = Vec::new();
             for _ in 0..EVENTS_PER_WORKLOAD {
-                let events = decoder
-                    .push(std::hint::black_box(frame.as_bytes()))
+                decoder
+                    .push(std::hint::black_box(frame.as_bytes()), &mut events)
                     .unwrap();
                 assert_eq!(events.len(), 1);
-                std::hint::black_box(events);
+                std::hint::black_box(&events);
+                events.clear();
             }
         },
     );
@@ -149,12 +188,14 @@ fn benchmark_sse_decoder_workloads() {
         EVENTS_PER_WORKLOAD,
         || {
             let mut decoder = SseDecoder::default();
+            let mut events = Vec::new();
             for _ in 0..EVENTS_PER_WORKLOAD / EVENTS_PER_BATCH {
-                let events = decoder
-                    .push(std::hint::black_box(batch.as_bytes()))
+                decoder
+                    .push(std::hint::black_box(batch.as_bytes()), &mut events)
                     .unwrap();
                 assert_eq!(events.len(), EVENTS_PER_BATCH);
-                std::hint::black_box(events);
+                std::hint::black_box(&events);
+                events.clear();
             }
         },
     );
@@ -164,12 +205,16 @@ fn benchmark_sse_decoder_workloads() {
         EVENTS_PER_WORKLOAD,
         || {
             let mut decoder = SseDecoder::default();
+            let mut events = Vec::new();
             for _ in 0..EVENTS_PER_WORKLOAD {
                 let mut decoded = 0;
                 for fragment in frame.as_bytes().chunks(FRAGMENT_BYTES) {
-                    let events = decoder.push(std::hint::black_box(fragment)).unwrap();
+                    decoder
+                        .push(std::hint::black_box(fragment), &mut events)
+                        .unwrap();
                     decoded += events.len();
-                    std::hint::black_box(events);
+                    std::hint::black_box(&events);
+                    events.clear();
                 }
                 assert_eq!(decoded, 1);
             }

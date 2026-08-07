@@ -6,8 +6,8 @@ controls the process's output descriptor directly. It is not the whole test
 suite. Most tests sit beside the Rust modules they exercise so they can inspect
 private behavior and exact wire values.
 
-As audited on 2026-08-07, the repository has 618 Rust unit tests, three PTY
-integration tests, and one process-level CLI test. Seven of the unit-test
+As audited on 2026-08-07, the repository has 622 Rust unit tests, three PTY
+integration tests, and one process-level CLI test. Nine of the unit-test
 entries are ignored performance benchmarks. Before this audit, CI ran Clippy
 but did not run the test suite or check formatting; the validation workflow now
 runs all of them.

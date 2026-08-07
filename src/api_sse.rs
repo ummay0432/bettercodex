@@ -1,45 +1,48 @@
 use super::ApiError;
 use super::ApiResult;
 use super::MAX_STREAM_EVENT_BYTES;
-use bytes::Buf;
-use bytes::BytesMut;
+use memchr::memchr;
+use memchr::memchr_iter;
 
 #[derive(Default)]
 pub(super) struct SseDecoder {
-    partial_line: BytesMut,
+    partial_line: Vec<u8>,
     pending_event: PendingSseEvent,
 }
 
 impl SseDecoder {
-    pub(super) fn push(&mut self, chunk: &[u8]) -> ApiResult<Vec<String>> {
-        let buffered_prefix = self.partial_line.len();
-        self.partial_line.extend_from_slice(chunk);
-
+    pub(super) fn push(&mut self, chunk: &[u8], events: &mut Vec<String>) -> ApiResult<()> {
         let Self {
             partial_line,
             pending_event,
         } = self;
-        let mut events = Vec::new();
-        let mut line_start = 0;
-        for (chunk_offset, byte) in chunk.iter().enumerate() {
-            if *byte != b'\n' {
-                continue;
+
+        let chunk = if partial_line.is_empty() {
+            chunk
+        } else if let Some(newline) = memchr(b'\n', chunk) {
+            append_fragment(partial_line, &chunk[..newline])?;
+            if let Some(event) = pending_event.process_line(partial_line)? {
+                events.push(event);
             }
-            let newline = buffered_prefix + chunk_offset;
-            if let Some(event) = pending_event.process_line(&partial_line[line_start..newline])? {
+            partial_line.clear();
+            &chunk[newline + 1..]
+        } else {
+            append_fragment(partial_line, chunk)?;
+            return Ok(());
+        };
+
+        let mut line_start = 0;
+        for newline in memchr_iter(b'\n', chunk) {
+            if let Some(event) = pending_event.process_line(&chunk[line_start..newline])? {
                 events.push(event);
             }
             line_start = newline + 1;
         }
-        partial_line.advance(line_start);
-        if partial_line.len() > MAX_STREAM_EVENT_BYTES {
-            return Err(ApiError::fatal("model sent an oversized SSE event"));
-        }
-        Ok(events)
+        append_fragment(partial_line, &chunk[line_start..])?;
+        Ok(())
     }
 
-    pub(super) fn finish(&mut self) -> ApiResult<Vec<String>> {
-        let mut events = Vec::new();
+    pub(super) fn finish(&mut self, events: &mut Vec<String>) -> ApiResult<()> {
         if !self.partial_line.is_empty() {
             let line = std::mem::take(&mut self.partial_line);
             if let Some(event) = self.pending_event.process_line(&line)? {
@@ -49,8 +52,16 @@ impl SseDecoder {
         if let Some(event) = self.pending_event.take() {
             events.push(event);
         }
-        Ok(events)
+        Ok(())
     }
+}
+
+fn append_fragment(partial_line: &mut Vec<u8>, fragment: &[u8]) -> ApiResult<()> {
+    if partial_line.len().saturating_add(fragment.len()) > MAX_STREAM_EVENT_BYTES {
+        return Err(ApiError::fatal("model sent an oversized SSE event"));
+    }
+    partial_line.extend_from_slice(fragment);
+    Ok(())
 }
 
 #[derive(Default)]
