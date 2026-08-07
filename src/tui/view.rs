@@ -1,3 +1,6 @@
+use super::bottom_pane::selection_popup_common::measure_text_height;
+use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
+use super::bottom_pane::selection_popup_common::render_menu_surface;
 use super::clipboard_paste;
 use super::context_window::ContextAction;
 use super::context_window::ContextWindowView;
@@ -58,7 +61,6 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
 use ratatui::widgets::Block;
-use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
@@ -536,6 +538,9 @@ impl View {
     pub(super) fn set_skills(&mut self, skills: Vec<Skill>) {
         self.skills = skills;
         self.skill_popup.hide();
+        if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
+            skills.clear_error();
+        }
     }
 
     pub(super) fn skill_update_failed(&mut self, error: impl Into<String>) {
@@ -1952,11 +1957,11 @@ impl View {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
         };
         let overlay_height = match self.overlay.as_ref() {
-            Some(Overlay::Shortcuts) => 21,
+            Some(Overlay::Shortcuts) => shortcuts_height(width),
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
-            Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills),
-            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(),
+            Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills, width),
+            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(width, self.tmux_mode),
             Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
             None => 0,
         };
@@ -2113,11 +2118,17 @@ impl View {
         }
         match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
-            Some(Overlay::Context(context)) => context.render(frame, area),
+            Some(Overlay::Context(context)) => context.render(frame, area, self.user_message_style),
             Some(Overlay::Resume(picker)) => picker.render(frame, area),
-            Some(Overlay::Skills(skills)) => skills.render(frame, area, &self.skills),
-            Some(Overlay::Tmux(tmux)) => tmux.render(frame, area, self.tmux_mode),
-            Some(Overlay::Tools(catalogue)) => catalogue.render(frame, area),
+            Some(Overlay::Skills(skills)) => {
+                skills.render(frame, area, &self.skills, self.user_message_style)
+            }
+            Some(Overlay::Tmux(tmux)) => {
+                tmux.render(frame, area, self.tmux_mode, self.user_message_style)
+            }
+            Some(Overlay::Tools(catalogue)) => {
+                catalogue.render(frame, area, self.user_message_style)
+            }
             None => {}
         }
     }
@@ -2253,36 +2264,34 @@ impl View {
     }
 
     fn render_shortcuts(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered(area, 72, 19);
-        frame.render_widget(Clear, popup);
-        let block = Block::default()
-            .title(" Keyboard shortcuts ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(RULE));
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        let lines = vec![
-            shortcut_line("Enter", "submit prompt"),
-            shortcut_line("Enter while working", "steer after current model step"),
-            shortcut_line("Tab while working", "queue a follow-up turn"),
-            shortcut_line("Alt+Up / Shift+Left", "edit last queued follow-up"),
-            shortcut_line("Option+Left / Right", "jump by word"),
-            shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
-            shortcut_line("@", "find and insert a file path"),
-            shortcut_line("$", "mention an installed skill"),
-            shortcut_line("Esc", "interrupt active turn"),
-            shortcut_line("Up / Down", "restore prompt history"),
-            shortcut_line(
-                "Ctrl+R / Ctrl+S",
-                "search prompt history backward / forward",
-            ),
-            shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
-            shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
-            shortcut_line("Ctrl+C", "clear draft, interrupt work, or exit when idle"),
-            Line::from(""),
-            Line::from("Press any key to close").dim(),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
+        if area.is_empty() {
+            return;
+        }
+        frame.render_widget(Clear, area);
+        let footer_height = 1.min(area.height);
+        let content_area = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(footer_height),
+        );
+        let footer_area = Rect::new(area.x, content_area.bottom(), area.width, footer_height);
+        let inner = render_menu_surface(content_area, frame.buffer_mut(), self.user_message_style);
+        if !inner.is_empty() {
+            frame.render_widget(
+                Paragraph::new(shortcut_reference_lines()).wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
+        if !footer_area.is_empty() {
+            let hint_area = Rect::new(
+                footer_area.x.saturating_add(2),
+                footer_area.y,
+                footer_area.width.saturating_sub(2),
+                footer_area.height,
+            );
+            frame.render_widget(Paragraph::new("Press any key to go back").dim(), hint_area);
+        }
     }
 
     fn render_completion_popup(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -4357,22 +4366,41 @@ fn format_elapsed(seconds: u64) -> String {
     }
 }
 
+fn shortcut_reference_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from("Keyboard shortcuts").bold(),
+        Line::default(),
+        shortcut_line("Enter", "submit prompt"),
+        shortcut_line("Enter while working", "steer after current model step"),
+        shortcut_line("Tab while working", "queue a follow-up turn"),
+        shortcut_line("Alt+Up / Shift+Left", "edit last queued follow-up"),
+        shortcut_line("Option+Left / Right", "jump by word"),
+        shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
+        shortcut_line("@", "find and insert a file path"),
+        shortcut_line("$", "mention an installed skill"),
+        shortcut_line("Esc", "interrupt active turn"),
+        shortcut_line("Up / Down", "restore prompt history"),
+        shortcut_line(
+            "Ctrl+R / Ctrl+S",
+            "search prompt history backward / forward",
+        ),
+        shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
+        shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
+        shortcut_line("Ctrl+C", "clear draft, interrupt work, or exit when idle"),
+    ]
+}
+
+fn shortcuts_height(width: u16) -> u16 {
+    measure_text_height(&shortcut_reference_lines(), width.saturating_sub(4))
+        .saturating_add(menu_surface_padding_height())
+        .saturating_add(1)
+}
+
 fn shortcut_line(key: &'static str, description: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::from(format!("{key:<22}")),
         Span::from(description).dim(),
     ])
-}
-
-fn centered(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
-    let width = preferred_width.min(area.width.saturating_sub(2)).max(1);
-    let height = preferred_height.min(area.height.saturating_sub(2)).max(1);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
@@ -5799,9 +5827,9 @@ mod tests {
             }],
         });
         assert!(matches!(view.overlay.as_ref(), Some(Overlay::Context(_))));
-        assert_eq!(view.desired_height(92, 30), 16);
+        assert_eq!(view.desired_height(92, 30), 17);
 
-        let backend = TestBackend::new(92, 16);
+        let backend = TestBackend::new(92, 17);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
@@ -5853,8 +5881,14 @@ mod tests {
         let backend = TestBackend::new(80, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let surface_background = view.user_message_style.bg.unwrap();
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        assert_eq!(buffer[(0, 0)].bg, surface_background);
+        assert_eq!(buffer[(79, 0)].bg, surface_background);
+        assert_eq!(buffer[(0, height - 1)].bg, Color::Reset);
         let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("Press any key to close"), "{rendered}");
+        assert!(rendered.contains("Press any key to go back"), "{rendered}");
     }
 
     #[test]
@@ -5956,7 +5990,7 @@ mod tests {
         assert!(view.entries.is_empty());
         assert!(matches!(view.overlay.as_ref(), Some(Overlay::Skills(_))));
         let manager_height = match view.overlay.as_ref() {
-            Some(Overlay::Skills(skills)) => skills.preferred_height(&view.skills),
+            Some(Overlay::Skills(skills)) => skills.preferred_height(&view.skills, 88),
             _ => panic!("expected skills overlay"),
         };
         assert_eq!(view.desired_height(88, 30), manager_height);
@@ -5967,7 +6001,7 @@ mod tests {
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(rendered.contains("No skills installed."), "{rendered}");
         assert!(rendered.contains("BCODEX_HOME"), "{rendered}");
-        assert!(rendered.contains("i implicit"), "{rendered}");
+        assert!(rendered.contains("i to toggle implicit"), "{rendered}");
         assert!(!rendered.contains(MODEL), "{rendered}");
 
         assert_eq!(
@@ -6007,7 +6041,7 @@ mod tests {
         assert!(matches!(view.overlay.as_ref(), Some(Overlay::Tmux(_))));
 
         let manager_height = match view.overlay.as_ref() {
-            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(),
+            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(88, view.tmux_mode),
             _ => panic!("expected tmux overlay"),
         };
         let backend = TestBackend::new(88, manager_height);
@@ -6015,7 +6049,7 @@ mod tests {
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(
-            rendered.contains("[x] Automatic tmux sessions (on)"),
+            rendered.contains("› [x] Automatic tmux sessions"),
             "{rendered}"
         );
         assert!(rendered.contains("next launch"), "{rendered}");
@@ -6032,7 +6066,7 @@ mod tests {
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(
-            rendered.contains("[ ] Automatic tmux sessions (off)"),
+            rendered.contains("› [ ] Automatic tmux sessions"),
             "{rendered}"
         );
 
@@ -6188,7 +6222,11 @@ mod tests {
             rendered.contains("9 tools · ~2.8K prompt tokens"),
             "{rendered}"
         );
-        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "┌");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            view.user_message_style.bg.unwrap()
+        );
         assert!(!rendered.contains("available"), "{rendered}");
         assert!(!rendered.contains("Code Mode"), "{rendered}");
         assert!(!rendered.contains("function"), "{rendered}");

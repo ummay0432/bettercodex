@@ -1,3 +1,4 @@
+mod bottom_pane;
 mod clipboard;
 mod clipboard_paste;
 mod context_window;

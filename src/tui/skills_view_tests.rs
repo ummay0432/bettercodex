@@ -80,13 +80,20 @@ fn rendered_view_shows_both_controls_and_the_explicit_only_state() {
     let view = SkillsView::new();
     let rendered = render(&view, &skills, 100);
 
-    assert!(rendered.contains("Skills"), "{rendered}");
-    assert!(rendered.contains("[x] enabled"), "{rendered}");
-    assert!(rendered.contains("[x] implicit"), "{rendered}");
-    assert!(rendered.contains("[ ] implicit"), "{rendered}");
-    assert!(rendered.contains("Alpha Skill"), "{rendered}");
-    assert!(rendered.contains("Beta Skill"), "{rendered}");
-    assert!(rendered.contains("i implicit"), "{rendered}");
+    assert_eq!(
+        rendered,
+        [
+            "",
+            "  Enable/Disable Skills",
+            "  Enable skills or restrict them to explicit $ mentions. Changes are saved automatically.",
+            "",
+            "› [x] enabled  [x] implicit  Alpha Skill  Handle alpha work",
+            "  [x] enabled  [ ] implicit  Beta Skill   Handle beta work",
+            "",
+            "  Press space or enter to toggle enabled; i to toggle implicit; esc to close",
+        ]
+        .join("\n")
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -102,13 +109,13 @@ fn empty_view_explains_where_to_install_the_first_skill() {
 }
 
 fn render(view: &SkillsView, skills: &[Skill], width: u16) -> String {
-    let height = view.preferred_height(skills);
+    let height = view.preferred_height(skills, width);
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
             let area = frame.area();
-            view.render(frame, area, skills);
+            view.render(frame, area, skills, Style::default());
         })
         .unwrap();
     render_buffer(terminal.backend().buffer())
@@ -121,6 +128,8 @@ fn render_buffer(buffer: &ratatui::buffer::Buffer) -> String {
             (area.x..area.right())
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
+                .trim_end()
+                .to_string()
         })
         .collect::<Vec<_>>()
         .join("\n")

@@ -1,32 +1,35 @@
+// Ported from OpenAI Codex rust-v0.147.0 (be6e8eac),
+// codex-rs/tui/src/bottom_pane/experimental_features_view.rs.
+
+use super::bottom_pane::scroll_state::ScrollState;
+use super::bottom_pane::selection_popup_common::GenericDisplayRow;
+use super::bottom_pane::selection_popup_common::measure_rows_height;
+use super::bottom_pane::selection_popup_common::measure_text_height;
+use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
+use super::bottom_pane::selection_popup_common::render_menu_surface;
+use super::bottom_pane::selection_popup_common::render_rows;
 use super::markdown;
 use crate::operator_settings::TmuxMode;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use ratatui::Frame;
-use ratatui::layout::Alignment;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
-use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
-use ratatui::text::Span;
-use ratatui::widgets::Block;
-use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
 
-const MUTED: Color = Color::Indexed(245);
-const RULE: Color = Color::Indexed(8);
-const PREFERRED_WIDTH: u16 = 88;
-const PANEL_HEIGHT: u16 = 7;
+const FOOTER_HEIGHT: u16 = 1;
 
 pub(super) struct TmuxView {
+    state: ScrollState,
     error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TmuxViewAction {
     None,
     Close,
@@ -35,11 +38,24 @@ pub(super) enum TmuxViewAction {
 
 impl TmuxView {
     pub(super) fn new() -> Self {
-        Self { error: None }
+        let mut state = ScrollState::new();
+        state.clamp_selection(1);
+        Self { state, error: None }
     }
 
-    pub(super) const fn preferred_height(&self) -> u16 {
-        PANEL_HEIGHT
+    pub(super) fn preferred_height(&self, width: u16, mode: TmuxMode) -> u16 {
+        let header = self.header_lines();
+        let rows = self.rows(mode);
+        let row_width = width.saturating_sub(2);
+        measure_text_height(&header, width.saturating_sub(4))
+            .saturating_add(measure_rows_height(
+                &rows,
+                &self.state,
+                row_width.saturating_add(1),
+            ))
+            .saturating_add(menu_surface_padding_height())
+            .saturating_add(1)
+            .saturating_add(FOOTER_HEIGHT)
     }
 
     pub(super) fn set_error(&mut self, error: impl Into<String>) {
@@ -51,13 +67,15 @@ impl TmuxView {
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent, mode: TmuxMode) -> TmuxViewAction {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => TmuxViewAction::Close,
-            KeyCode::Enter | KeyCode::Char(' ')
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => TmuxViewAction::Close,
+            KeyEvent {
+                code: KeyCode::Enter | KeyCode::Char(' '),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
                 self.error = None;
                 TmuxViewAction::SetMode(mode.toggled())
             }
@@ -65,79 +83,87 @@ impl TmuxView {
         }
     }
 
-    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, mode: TmuxMode) {
+    pub(super) fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        mode: TmuxMode,
+        surface_style: Style,
+    ) {
         if area.is_empty() {
             return;
         }
         frame.render_widget(Clear, area);
-        let panel = Rect::new(
-            area.x,
-            area.y,
-            PREFERRED_WIDTH.min(area.width),
-            self.preferred_height().min(area.height),
-        );
-        let block = Block::default()
-            .title(" Tmux ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(RULE));
-        let inner = block.inner(panel);
-        frame.render_widget(block, panel);
-        if inner.is_empty() {
-            return;
-        }
+        let footer_height = FOOTER_HEIGHT.min(area.height);
+        let content_height = area.height.saturating_sub(footer_height);
+        let content_area = Rect::new(area.x, area.y, area.width, content_height);
+        let footer_area = Rect::new(area.x, content_area.bottom(), area.width, footer_height);
+        let inner = render_menu_surface(content_area, frame.buffer_mut(), surface_style);
+        if !inner.is_empty() {
+            let header = self.header_lines();
+            let header_height = measure_text_height(&header, inner.width).min(inner.height);
+            let header_area = Rect::new(inner.x, inner.y, inner.width, header_height);
+            frame.render_widget(
+                Paragraph::new(header).wrap(Wrap { trim: false }),
+                header_area,
+            );
 
-        let status_area = Rect::new(inner.x, inner.y, inner.width, 1);
-        let footer_height = u16::from(inner.height > 2);
-        let setting_y = status_area.bottom().saturating_add(1).min(inner.bottom());
-        let setting_area = Rect::new(
-            inner.x,
-            setting_y,
-            inner.width,
-            inner
-                .bottom()
-                .saturating_sub(setting_y)
-                .saturating_sub(footer_height),
-        );
-        let footer_area = Rect::new(
-            inner.x,
-            inner.bottom().saturating_sub(footer_height),
-            inner.width,
-            footer_height,
-        );
-
-        let status = self.error.as_ref().map_or_else(
-            || Line::from("Changes save automatically and apply on the next launch.").dim(),
-            |error| Line::from(markdown::sanitize(error)).red(),
-        );
-        frame.render_widget(Paragraph::new(status), status_area);
-
-        if !setting_area.is_empty() {
-            let enabled = if mode.is_on() { "x" } else { " " };
-            let selected = Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled("› ", selected),
-                    Span::styled(
-                        format!("[{enabled}] Automatic tmux sessions ({})", mode.label()),
-                        selected,
-                    ),
-                ]),
-                Line::from("    Start interactive launches in detachable c1, c2, … sessions.")
-                    .style(selected),
-            ];
-            frame.render_widget(Paragraph::new(lines), setting_area);
+            let rows = self.rows(mode);
+            let row_width = content_area.width.saturating_sub(2).max(1);
+            let requested_rows =
+                measure_rows_height(&rows, &self.state, row_width.saturating_add(1));
+            let list_y = header_area.bottom().saturating_add(1).min(inner.bottom());
+            let list_area = Rect::new(
+                inner.x.saturating_sub(2),
+                list_y,
+                row_width,
+                requested_rows.min(inner.bottom().saturating_sub(list_y)),
+            );
+            render_rows(
+                list_area,
+                frame.buffer_mut(),
+                &rows,
+                &self.state,
+                "  No tmux settings available",
+            );
         }
 
         if !footer_area.is_empty() {
+            let hint_area = Rect::new(
+                footer_area.x.saturating_add(2),
+                footer_area.y,
+                footer_area.width.saturating_sub(2),
+                footer_area.height,
+            );
             frame.render_widget(
-                Paragraph::new("space/enter toggle · esc close")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(MUTED)),
-                footer_area,
+                Paragraph::new("Press space or enter to toggle; esc to close").dim(),
+                hint_area,
             );
         }
+    }
+
+    fn header_lines(&self) -> Vec<Line<'static>> {
+        vec![
+            Line::from("Tmux").bold(),
+            self.error.as_ref().map_or_else(
+                || {
+                    Line::from("Changes are saved automatically and apply on the next launch.")
+                        .dim()
+                },
+                |error| Line::from(markdown::sanitize(error)).red(),
+            ),
+        ]
+    }
+
+    fn rows(&self, mode: TmuxMode) -> Vec<GenericDisplayRow> {
+        let marker = if mode.is_on() { 'x' } else { ' ' };
+        vec![GenericDisplayRow {
+            name: format!("› [{marker}] Automatic tmux sessions"),
+            description: Some(
+                "Start interactive launches in detachable c1, c2, … sessions.".to_string(),
+            ),
+            ..Default::default()
+        }]
     }
 }
 
