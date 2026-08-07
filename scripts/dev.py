@@ -373,6 +373,46 @@ def committed_source_snapshot(repository: Path, commit: str):
         yield source
 
 
+def install_source_snapshot(
+    source: Path,
+    target: Path,
+    install_root: Path,
+    environment: dict[str, str],
+) -> None:
+    # Archived snapshots keep the same package name and version across commits. Cargo can otherwise
+    # consider the root release artifact fresh and install a binary from the preceding snapshot.
+    # Invalidate only bettercodex itself so the expensive dependency cache remains reusable.
+    subprocess.run(
+        [
+            "cargo",
+            "clean",
+            "--release",
+            "--package",
+            "bettercodex",
+            "--target-dir",
+            os.fspath(target),
+        ],
+        cwd=source,
+        env=environment,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "cargo",
+            "install",
+            "--locked",
+            "--path",
+            os.fspath(source),
+            "--force",
+            "--root",
+            os.fspath(install_root),
+        ],
+        cwd=source,
+        env=environment,
+        check=True,
+    )
+
+
 def command_install(arguments: argparse.Namespace) -> int:
     worktree = repository_root()
     primary = main_worktree_root()
@@ -389,21 +429,7 @@ def command_install(arguments: argparse.Namespace) -> int:
             validate_install_caller(worktree, commit)
             print(f"Installing committed main {commit[:12]} into {install_root}")
             with committed_source_snapshot(primary, commit) as source:
-                subprocess.run(
-                    [
-                        "cargo",
-                        "install",
-                        "--locked",
-                        "--path",
-                        os.fspath(source),
-                        "--force",
-                        "--root",
-                        os.fspath(install_root),
-                    ],
-                    cwd=source,
-                    env=environment,
-                    check=True,
-                )
+                install_source_snapshot(source, target, install_root, environment)
 
             latest = canonical_main_commit(primary)
             if latest == commit:

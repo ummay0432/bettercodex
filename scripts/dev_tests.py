@@ -90,6 +90,50 @@ class CanonicalInstallTests(unittest.TestCase):
             self.assertEqual((source / "tracked.txt").read_text(), "first\n")
             self.assertFalse((source / "untracked.txt").exists())
 
+    def test_install_cleans_the_root_package_before_reusing_the_target(self) -> None:
+        source = Path("/source")
+        target = Path("/target")
+        install_root = Path("/install")
+        environment = {"CARGO_TARGET_DIR": str(target)}
+
+        with mock.patch.object(dev.subprocess, "run") as run:
+            dev.install_source_snapshot(source, target, install_root, environment)
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    [
+                        "cargo",
+                        "clean",
+                        "--release",
+                        "--package",
+                        "bettercodex",
+                        "--target-dir",
+                        str(target),
+                    ],
+                    cwd=source,
+                    env=environment,
+                    check=True,
+                ),
+                mock.call(
+                    [
+                        "cargo",
+                        "install",
+                        "--locked",
+                        "--path",
+                        str(source),
+                        "--force",
+                        "--root",
+                        str(install_root),
+                    ],
+                    cwd=source,
+                    env=environment,
+                    check=True,
+                ),
+            ],
+        )
+
 
 class SandboxedV8Tests(unittest.TestCase):
     def test_pinned_artifact_version_matches_cargo_lock(self) -> None:
