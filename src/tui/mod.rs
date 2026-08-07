@@ -22,7 +22,6 @@ mod table_detect;
 mod terminal;
 mod terminal_hyperlinks;
 mod terminal_title;
-mod tmux_view;
 mod tool_catalogue;
 mod view;
 mod width;
@@ -36,8 +35,6 @@ use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
 use crate::input::UserPrompt;
-use crate::operator_settings;
-use crate::operator_settings::TmuxMode;
 use crate::prompt_history::PromptHistory;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
@@ -97,13 +94,17 @@ impl TurnCompletion {
     }
 }
 
-pub(crate) async fn run(agent: Agent, cwd: PathBuf, tmux_mode: TmuxMode) -> Result<()> {
-    let mut runtime = Runtime::new(agent, cwd, tmux_mode)?;
+pub(crate) async fn run(
+    agent: Agent,
+    cwd: PathBuf,
+    worker_handoff: Option<crate::managed_session::WorkerHandoff>,
+) -> Result<()> {
+    let mut runtime = Runtime::new(agent, cwd, worker_handoff)?;
     let mut session = terminal::TerminalSession::enter()?;
     runtime
         .view
         .set_terminal_colors(session.default_foreground(), session.default_background());
-    let result = runtime.event_loop(session.terminal_mut()).await;
+    let result = runtime.event_loop(&mut session).await;
     drop(session);
     result
 }
@@ -133,6 +134,7 @@ struct Runtime {
     terminal_focused: bool,
     terminal_title: TerminalTitle,
     turn_started_at: Option<Instant>,
+    worker_handoff: Option<crate::managed_session::WorkerHandoff>,
     view: View,
 }
 
@@ -149,8 +151,12 @@ struct OperatorCommandCompletion {
 }
 
 impl Runtime {
-    fn new(mut agent: Agent, cwd: PathBuf, tmux_mode: TmuxMode) -> Result<Self> {
-        let mut view = View::with_tmux_mode(&cwd, tmux_mode);
+    fn new(
+        mut agent: Agent,
+        cwd: PathBuf,
+        worker_handoff: Option<crate::managed_session::WorkerHandoff>,
+    ) -> Result<Self> {
+        let mut view = View::new(&cwd);
         view.replay_transcript(agent.take_resumed_transcript());
         view.set_skills(agent.skills().to_vec());
         for warning in agent.skill_warnings() {
@@ -191,10 +197,11 @@ impl Runtime {
             terminal_focused: true,
             terminal_title: TerminalTitle::new(),
             turn_started_at: None,
+            worker_handoff,
         })
     }
 
-    async fn event_loop(&mut self, terminal: &mut terminal::AppTerminal) -> Result<()> {
+    async fn event_loop(&mut self, session: &mut terminal::TerminalSession) -> Result<()> {
         let mut input = EventStream::new();
         let mut ticks =
             tokio::time::interval_at(tokio::time::Instant::now() + FRAME_INTERVAL, FRAME_INTERVAL);
@@ -213,6 +220,7 @@ impl Runtime {
             };
             self.terminal_title.refresh(title_state)?;
             if redraw {
+                let terminal = session.terminal_mut();
                 let clear_requested = self.view.take_clear_request();
                 let mut resize_reflow_requested = self.view.take_resize_reflow_request();
                 let width = terminal.width()?;
@@ -251,6 +259,10 @@ impl Runtime {
                     self.file_search
                         .on_query_changed(self.view.file_search_query());
                     redraw = true;
+                    if matches!(action, Action::EnterTmux) {
+                        self.enter_tmux(session).await;
+                        continue;
+                    }
                     if self.handle_action(action)? {
                         break;
                     }
@@ -369,6 +381,73 @@ impl Runtime {
         Ok(())
     }
 
+    async fn enter_tmux(&mut self, session: &mut terminal::TerminalSession) {
+        if crate::managed_session::is_tmux_active() {
+            self.view
+                .add_notice("This session is already running in tmux".to_string());
+            return;
+        }
+        if self.worker_handoff.is_none() {
+            self.view.tmux_handoff_failed(
+                "Could not move this session into tmux: the interactive supervisor is unavailable",
+            );
+            return;
+        }
+        let size = {
+            let terminal = session.terminal_mut();
+            terminal.width().and_then(|width| {
+                terminal
+                    .height()
+                    .map(|height| (width.max(1), height.max(1)))
+            })
+        };
+        let size = match size {
+            Ok(size) => size,
+            Err(error) => {
+                self.view.tmux_handoff_failed(format!(
+                    "Could not move this session into tmux: failed to read terminal size: {error:#}"
+                ));
+                return;
+            }
+        };
+        let cwd = self.cwd.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::managed_session::prepare_tmux_session(&cwd, size)
+        })
+        .await;
+        let prepared = match prepared {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                self.view.tmux_handoff_failed(format!(
+                    "Could not move this session into tmux: {error:#}"
+                ));
+                return;
+            }
+            Err(error) => {
+                self.view.tmux_handoff_failed(format!(
+                    "Could not move this session into tmux: relay setup task failed: {error}"
+                ));
+                return;
+            }
+        };
+
+        let worker_handoff = self
+            .worker_handoff
+            .as_mut()
+            .expect("the interactive supervisor was checked before tmux setup");
+        match session.migrate_to_tmux(prepared, worker_handoff) {
+            Ok(session_name) => {
+                self.worker_handoff = None;
+                self.notifier = Some(Notifier::detect());
+                self.view.tmux_handoff_succeeded(&session_name);
+            }
+            Err(error) => self
+                .view
+                .tmux_handoff_failed(format!("Could not move this session into tmux: {error:#}")),
+        }
+        self.view.request_terminal_reflow();
+    }
+
     fn handle_action(&mut self, action: Action) -> Result<bool> {
         match action {
             Action::None => {}
@@ -485,12 +564,7 @@ impl Runtime {
                 self.view
                     .add_notice(format!("Stopped {count} background terminal{plural}"));
             }
-            Action::SetTmuxMode(mode) => match operator_settings::save_tmux_mode(mode) {
-                Ok(()) => self.view.tmux_update_succeeded(mode),
-                Err(error) => self
-                    .view
-                    .tmux_update_failed(format!("Could not update tmux setting: {error:#}")),
-            },
+            Action::EnterTmux => unreachable!("tmux handoffs are handled by the event loop"),
             Action::UpdateSkill { path, update } => {
                 let result = self
                     .agent

@@ -16,7 +16,7 @@ pub(super) fn copy_to_clipboard(text: &str) -> Result<Option<ClipboardLease>, St
         CopyEnvironment {
             ssh: std::env::var_os("SSH_TTY").is_some()
                 || std::env::var_os("SSH_CONNECTION").is_some(),
-            tmux: std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some(),
+            tmux: crate::managed_session::is_tmux_active(),
             wsl: is_wsl(),
         },
         tmux_copy,
@@ -126,7 +126,7 @@ fn tmux_copy(text: &str) -> Result<(), String> {
 }
 
 fn osc52_copy(text: &str) -> Result<(), String> {
-    let sequence = osc52_sequence(text, std::env::var_os("TMUX").is_some())?;
+    let sequence = osc52_sequence(text, crate::managed_session::is_tmux_active())?;
     match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
         Ok(mut tty) => write_and_flush(&mut tty, sequence.as_bytes()),
         Err(_) => write_and_flush(&mut std::io::stdout().lock(), sequence.as_bytes()),

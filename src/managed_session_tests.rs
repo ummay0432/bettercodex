@@ -1,5 +1,8 @@
 use super::*;
 use std::ffi::OsStr;
+use std::fs::File;
+use std::os::fd::IntoRawFd;
+use std::os::unix::fs::MetadataExt;
 
 #[test]
 fn canonical_c_names_reserve_slots() {
@@ -18,19 +21,7 @@ fn first_gap_is_reused() {
 }
 
 #[test]
-fn automatic_tmux_requires_an_enabled_outside_interactive_launch() {
-    assert!(should_launch_in_tmux(true, None, TmuxMode::On));
-    assert!(!should_launch_in_tmux(true, None, TmuxMode::Off));
-    assert!(!should_launch_in_tmux(false, None, TmuxMode::On));
-    assert!(!should_launch_in_tmux(
-        true,
-        Some(OsStr::new("/tmp/tmux,1,0")),
-        TmuxMode::On
-    ));
-}
-
-#[test]
-fn tmux_is_not_started_for_an_unsuitable_terminal() {
+fn tmux_requires_a_capable_terminal_only_when_requested() {
     assert!(ensure_attachable_terminal(None).is_err());
     assert!(ensure_attachable_terminal(Some(OsStr::new(""))).is_err());
     assert!(ensure_attachable_terminal(Some(OsStr::new("dumb"))).is_err());
@@ -38,21 +29,13 @@ fn tmux_is_not_started_for_an_unsuitable_terminal() {
 }
 
 #[test]
-fn tmux_creation_is_detached_sized_and_self_cleaning() {
+fn tmux_creation_runs_only_the_private_relay_in_a_durable_c_session() {
     let arguments = tmux_create_arguments(
         "c2",
         Path::new("/opt/bcodex"),
         Path::new("/work tree;"),
-        &[
-            "resume".to_string(),
-            "session id".to_string(),
-            "do it;".to_string(),
-            "keep \\;".to_string(),
-        ],
-        Some((151, 47)),
-        &[OsString::from(
-            "BCODEX_MANAGED_ENVIRONMENT=/tmp/environment;",
-        )],
+        "2f746d702f736f636b6574",
+        (151, 47),
     );
     assert_eq!(
         arguments,
@@ -72,14 +55,10 @@ fn tmux_creation_is_detached_sized_and_self_cleaning() {
             "151",
             "-y",
             "47",
-            "-e",
-            "BCODEX_MANAGED_ENVIRONMENT=/tmp/environment\\;",
             "--",
             "/opt/bcodex",
-            "resume",
-            "session id",
-            "do it\\;",
-            "keep \\\\;",
+            "--internal-tmux-relay",
+            "2f746d702f736f636b6574",
             ";",
             "set-option",
             "-t",
@@ -104,57 +83,146 @@ fn tmux_creation_is_detached_sized_and_self_cleaning() {
 }
 
 #[test]
-fn managed_environment_round_trips_non_utf8_values_without_reserved_variables() {
-    let environment = vec![
-        (OsString::from("Z_VALUE"), OsString::from("last")),
-        (
-            OsString::from("A_VALUE"),
-            OsString::from_vec(vec![b'v', b'=', 0xff]),
-        ),
-    ];
+fn relay_paths_round_trip_non_utf8_bytes_and_are_narrowly_validated() {
+    let path = PathBuf::from(OsString::from_vec(
+        b"/tmp/.bettercodex-tmux-relay-test/socket"
+            .iter()
+            .copied()
+            .chain([0xff])
+            .collect(),
+    ));
+    assert_eq!(decode_path(&encode_path(&path)).unwrap(), path);
 
-    let encoded = encode_environment(environment).unwrap();
+    assert!(validate_relay_path(Path::new("relative/socket")).is_err());
+    assert!(validate_relay_path(Path::new("/tmp/unrelated/socket")).is_err());
+    assert!(
+        validate_relay_path(Path::new(
+            "/tmp/.bettercodex-tmux-relay-test/not-the-socket"
+        ))
+        .is_err()
+    );
+    assert!(validate_relay_path(Path::new("/tmp/.bettercodex-tmux-relay-test/socket")).is_ok());
+}
+
+#[test]
+fn relay_descriptor_handoff_transfers_one_owned_file_descriptor() {
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    let source = File::open("/dev/null").unwrap();
+    let source_metadata = source.metadata().unwrap();
+
+    send_fd(&sender, source.as_raw_fd()).unwrap();
+    let received = receive_fd(&receiver).unwrap();
+    let received_metadata = File::from(received).metadata().unwrap();
 
     assert_eq!(
-        decode_environment(&encoded).unwrap(),
-        vec![
-            (
-                OsString::from("A_VALUE"),
-                OsString::from_vec(vec![b'v', b'=', 0xff]),
-            ),
-            (OsString::from("Z_VALUE"), OsString::from("last")),
-        ]
+        (received_metadata.dev(), received_metadata.ino()),
+        (source_metadata.dev(), source_metadata.ino())
     );
 }
 
 #[test]
-fn managed_environment_rejects_truncation_duplicates_and_tmux_variables() {
-    assert!(decode_environment(b"NAME=value").is_err());
-    assert!(decode_environment(b"=value\0").is_err());
-    assert!(decode_environment(b"NAME=one\0NAME=two\0").is_err());
-    assert!(decode_environment(b"TMUX=spoofed\0").is_err());
-    assert!(decode_environment(b"BCODEX_MANAGED_ENVIRONMENT=again\0").is_err());
+fn pseudoterminal_starts_at_the_requested_size() {
+    let pty = open_pty((151, 47)).unwrap();
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: the slave descriptor is open and size is writable.
+    assert_ne!(
+        unsafe { libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCGWINSZ as _, &raw mut size,) },
+        -1
+    );
+    assert_eq!((size.ws_col, size.ws_row), (151, 47));
 }
 
 #[test]
-fn environment_snapshot_is_private_and_self_cleaning() {
-    let snapshot = EnvironmentSnapshot::capture().unwrap();
-    let path = snapshot.path.clone();
-    let metadata = std::fs::metadata(&path).unwrap();
-    assert!(metadata.is_file());
-    assert_eq!(metadata.mode() & 0o077, 0);
+fn worker_requests_the_exact_tmux_id_and_commits_only_after_supervisor_ack() {
+    let (mut supervisor, worker) = UnixStream::pair().unwrap();
+    let (relay, relay_peer) = UnixStream::pair().unwrap();
+    let prepared = PreparedTmuxSession {
+        session_id: "$17".to_string(),
+        session_name: "c17".to_string(),
+        relay,
+        committed: true,
+    };
+    let transfer = std::thread::spawn(move || {
+        let mut handoff = WorkerHandoff {
+            control: Some(worker),
+        };
+        handoff.transfer(&prepared).unwrap();
+        handoff.control.is_none()
+    });
+
+    let received_relay = receive_fd(&supervisor).unwrap();
+    assert_eq!(read_control_line(&supervisor).unwrap(), "$17");
+    supervisor.write_all(&[HANDOFF_COMMITTED_TAG]).unwrap();
+
+    assert!(transfer.join().unwrap());
+    drop(received_relay);
+    drop(relay_peer);
+    assert!(validate_session_id("c17").is_err());
+}
+
+#[test]
+fn rejected_handoff_preserves_the_supervisor_channel_and_valid_utf8_detail() {
+    let (mut supervisor, worker) = UnixStream::pair().unwrap();
+    let (relay, _relay_peer) = UnixStream::pair().unwrap();
+    let prepared = PreparedTmuxSession {
+        session_id: "$18".to_string(),
+        session_name: "c18".to_string(),
+        relay,
+        committed: true,
+    };
+    let transfer = std::thread::spawn(move || {
+        let mut handoff = WorkerHandoff {
+            control: Some(worker),
+        };
+        let error = handoff.transfer(&prepared).unwrap_err();
+        (format!("{error:#}"), handoff.control.is_some())
+    });
+
+    drop(receive_fd(&supervisor).unwrap());
+    assert_eq!(read_control_line(&supervisor).unwrap(), "$18");
+    reject_handoff(&mut supervisor, &anyhow!("é".repeat(300))).unwrap();
+
+    let (detail, channel_preserved) = transfer.join().unwrap();
+    assert!(channel_preserved);
+    assert!(!detail.is_empty());
+    assert!(detail.chars().all(|character| character == 'é'));
+    assert!(detail.len() <= MAX_CONTROL_MESSAGE_BYTES);
+}
+
+#[test]
+fn supervisor_passes_the_existing_pty_master_to_the_tmux_relay() {
+    let pty = open_pty((80, 24)).unwrap();
+    let (supervisor_relay, mut tmux_relay) = UnixStream::pair().unwrap();
+    let relay_fd = unsafe { OwnedFd::from_raw_fd(supervisor_relay.into_raw_fd()) };
+    let relay = std::thread::spawn(move || {
+        let master = receive_fd(&tmux_relay).unwrap();
+        tmux_relay.write_all(&[RELAY_READY_TAG]).unwrap();
+        write_all_fd(master.as_raw_fd(), b"still-live\n").unwrap();
+    });
+
+    complete_relay_handoff(relay_fd, pty.master.as_raw_fd()).unwrap();
+    let mut slave = File::from(pty.slave);
+    let mut message = [0_u8; 11];
+    slave.read_exact(&mut message).unwrap();
+
+    relay.join().unwrap();
+    assert_eq!(&message, b"still-live\n");
+}
+
+#[test]
+fn relay_command_is_private_and_strictly_parsed() {
+    assert!(run_relay_command(&[]).is_none());
+    assert!(run_relay_command(&["--help".to_string()]).is_none());
     assert!(
-        snapshot
-            .tmux_variable()
-            .as_bytes()
-            .starts_with(b"BCODEX_MANAGED_ENVIRONMENT=")
+        run_relay_command(&[RELAY_COMMAND.to_string()])
+            .unwrap()
+            .is_err()
     );
-
-    drop(snapshot);
-
-    assert!(!path.exists());
-    assert!(validate_environment_path(Path::new("relative-environment")).is_err());
-    assert!(validate_environment_path(Path::new("/tmp/not-bettercodex")).is_err());
 }
 
 #[test]

@@ -1,5 +1,7 @@
 use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
+use crate::managed_session::PreparedTmuxSession;
+use crate::managed_session::WorkerHandoff;
 use anyhow::Context;
 use anyhow::Result;
 use crossterm::cursor::MoveTo;
@@ -71,21 +73,8 @@ pub(super) struct TerminalSession {
 impl TerminalSession {
     pub(super) fn enter() -> Result<Self> {
         install_panic_hook();
-        enable_raw_mode().context("failed to enable terminal raw mode")?;
+        initialize_terminal_modes()?;
         let mut output = stdout();
-        if let Err(error) = execute!(
-            output,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            ),
-            EnableBracketedPaste,
-            EnableFocusChange,
-            SetCursorStyle::SteadyBar,
-        ) {
-            let _ = restore();
-            return Err(error).context("failed to initialize terminal input modes");
-        }
 
         let probe = startup_probe(STARTUP_PROBE_TIMEOUT).unwrap_or_default();
         let screen_size = crossterm::terminal::size()
@@ -129,6 +118,15 @@ impl TerminalSession {
 
     pub(super) fn default_foreground(&self) -> Option<(u8, u8, u8)> {
         self.default_foreground
+    }
+
+    pub(super) fn migrate_to_tmux(
+        &mut self,
+        prepared: PreparedTmuxSession,
+        supervisor: &mut WorkerHandoff,
+    ) -> Result<String> {
+        supervisor.transfer(&prepared)?;
+        Ok(prepared.commit())
     }
 }
 
@@ -376,6 +374,24 @@ impl Drop for TerminalSession {
         self.terminal.finish();
         let _ = restore();
     }
+}
+
+fn initialize_terminal_modes() -> Result<()> {
+    enable_raw_mode().context("failed to enable terminal raw mode")?;
+    if let Err(error) = execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        ),
+        EnableBracketedPaste,
+        EnableFocusChange,
+        SetCursorStyle::SteadyBar,
+    ) {
+        let _ = restore();
+        return Err(error).context("failed to initialize terminal input modes");
+    }
+    Ok(())
 }
 
 fn restore() -> io::Result<()> {

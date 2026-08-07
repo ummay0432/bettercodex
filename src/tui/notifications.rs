@@ -21,7 +21,7 @@ impl Notifier {
     pub(super) fn detect() -> Self {
         let backend = if terminal_supports_osc9() {
             Backend::Osc9 {
-                tmux: std::env::var_os("TMUX").is_some(),
+                tmux: crate::managed_session::is_tmux_active(),
             }
         } else {
             Backend::Bel

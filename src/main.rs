@@ -7,7 +7,6 @@ mod context;
 mod events;
 mod input;
 mod managed_session;
-mod operator_settings;
 mod paths;
 mod prompt_history;
 mod repository;
@@ -40,7 +39,7 @@ use uuid::Uuid;
 const MODEL: &str = "gpt-5.6-sol";
 
 fn main() {
-    if let Err(error) = managed_session::restore_environment().and_then(|()| run()) {
+    if let Err(error) = run() {
         if is_broken_pipe(&error) {
             return;
         }
@@ -75,6 +74,9 @@ fn write_stderr_line(arguments: fmt::Arguments<'_>) -> io::Result<()> {
 
 fn run() -> Result<()> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(result) = managed_session::run_relay_command(&arguments) {
+        return result;
+    }
     let command = Command::parse(arguments.iter().cloned())?;
     match command {
         Command::Help => {
@@ -118,22 +120,19 @@ fn run_agent_command(
     resume: Option<ResumeSelector>,
 ) -> Result<()> {
     let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let tmux_mode = if interactive_terminal {
-        operator_settings::load_tmux_mode()?
-    } else {
-        operator_settings::TmuxMode::default()
-    };
-    managed_session::enter(arguments, interactive_terminal, tmux_mode)?;
+    let interactive_tui =
+        interactive_terminal && options.prompt.is_empty() && options.images.is_empty();
+    let worker_handoff = managed_session::enter_agent_process(arguments, interactive_tui)?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_agent(options, resume, tmux_mode))
+        .block_on(run_agent(options, resume, worker_handoff))
 }
 
 async fn run_agent(
     options: RunOptions,
     resume: Option<ResumeSelector>,
-    tmux_mode: operator_settings::TmuxMode,
+    worker_handoff: Option<managed_session::WorkerHandoff>,
 ) -> Result<()> {
     let input = if !options.prompt.is_empty() || !options.images.is_empty() {
         Some(UserInput::from_paths(
@@ -157,7 +156,7 @@ async fn run_agent(
     }
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return tui::run(agent, cwd, tmux_mode).await;
+        return tui::run(agent, cwd, worker_handoff).await;
     }
 
     run_line_mode(&mut agent).await
@@ -303,7 +302,7 @@ impl Command {
 
 fn write_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Automatic tmux sessions are on by default and can be changed with /tmux; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     ))
 }

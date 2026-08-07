@@ -45,14 +45,6 @@ impl Fixture {
         }
     }
 
-    fn set_tmux(&self, enabled: bool) {
-        fs::write(
-            self.bettercodex_home.join("settings.json"),
-            format!("{{\"version\":1,\"tmux\":{enabled}}}\n"),
-        )
-        .unwrap();
-    }
-
     fn write_auth(&self) {
         let codex_home = self.root.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
@@ -77,26 +69,6 @@ impl Fixture {
         command.env_remove("TMUX_PANE");
         command
     }
-
-    fn environment_snapshot(&self) -> (PathBuf, PathBuf) {
-        let restored_codex_home = self.root.join("restored-codex-home");
-        let path = self.root.join(format!(
-            ".bettercodex-environment-integration-{}",
-            Uuid::new_v4()
-        ));
-        let environment = format!(
-            "BCODEX_HOME={}\0CODEX_HOME={}\0HOME={}\0PATH={}\0STARTUP_SECRET=restored-secret\0",
-            self.bettercodex_home.display(),
-            restored_codex_home.display(),
-            self.root.join("restored-home").display(),
-            prefixed_path(&self.fake_bin).to_string_lossy(),
-        );
-        fs::write(&path, environment.as_bytes()).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(&path, permissions).unwrap();
-        (path, restored_codex_home)
-    }
 }
 
 impl Drop for Fixture {
@@ -106,9 +78,13 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn disabled_startup_bypasses_tmux_before_agent_initialization() {
+fn interactive_startup_never_creates_tmux_before_the_command() {
     let fixture = Fixture::new();
-    fixture.set_tmux(false);
+    fs::write(
+        fixture.bettercodex_home.join("settings.json"),
+        "{\"version\":1,\"tmux\":true}\n",
+    )
+    .unwrap();
 
     let output = run_in_pty(fixture.command());
 
@@ -118,7 +94,7 @@ fn disabled_startup_bypasses_tmux_before_agent_initialization() {
     );
     assert!(
         !fixture.tmux_log.exists(),
-        "tmux was invoked while disabled: {}",
+        "tmux was invoked during ordinary startup: {}",
         fs::read_to_string(&fixture.tmux_log).unwrap_or_default()
     );
     assert!(
@@ -130,7 +106,6 @@ fn disabled_startup_bypasses_tmux_before_agent_initialization() {
 #[test]
 fn invalid_one_shot_input_is_rejected_before_session_creation() {
     let fixture = Fixture::new();
-    fixture.set_tmux(false);
     let mut command = fixture.command();
     command.arg("--image");
     command.arg(fixture.root.join("missing.png"));
@@ -147,7 +122,6 @@ fn invalid_one_shot_input_is_rejected_before_session_creation() {
 #[test]
 fn invalid_repository_context_is_rejected_before_session_creation() {
     let fixture = Fixture::new();
-    fixture.set_tmux(false);
     fixture.write_auth();
     let instructions = fixture.root.join("AGENTS.md");
     fs::write(&instructions, "unreadable").unwrap();
@@ -162,47 +136,6 @@ fn invalid_repository_context_is_rejected_before_session_creation() {
         !fixture.root.join("codex-home/bettercodex").exists(),
         "invalid repository context left an empty saved session"
     );
-}
-
-#[test]
-fn enabled_startup_still_enters_the_managed_tmux_path() {
-    let fixture = Fixture::new();
-    fixture.set_tmux(true);
-
-    let output = run_in_pty(fixture.command());
-
-    let invocations = fs::read_to_string(&fixture.tmux_log).unwrap();
-    assert!(invocations.contains("list-sessions -F"), "{invocations}");
-    assert!(invocations.contains("new-session -d"), "{invocations}");
-    assert!(
-        invocations.contains("BCODEX_MANAGED_ENVIRONMENT="),
-        "{invocations}"
-    );
-    assert!(!invocations.contains("startup-secret"), "{invocations}");
-    assert!(!invocations.contains("BCODEX_HOME="), "{invocations}");
-    assert!(
-        output.contains("tmux could not create session c1"),
-        "{output:?}"
-    );
-}
-
-#[test]
-fn managed_pane_restores_and_consumes_the_invoking_environment() {
-    let fixture = Fixture::new();
-    fixture.set_tmux(false);
-    let (snapshot, restored_codex_home) = fixture.environment_snapshot();
-    let mut command = fixture.command();
-    command.env("BCODEX_MANAGED_ENVIRONMENT", &snapshot);
-    command.env("CODEX_HOME", fixture.root.join("stale-codex-home"));
-
-    let output = run_in_pty(command);
-
-    assert!(
-        output.contains(&restored_codex_home.display().to_string()),
-        "{output:?}"
-    );
-    assert!(!snapshot.exists());
-    assert!(!fixture.tmux_log.exists());
 }
 
 fn run_in_pty(command: CommandBuilder) -> String {
