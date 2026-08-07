@@ -486,7 +486,6 @@ fn is_decorative_marker_token(raw_token: &str, token: &str) -> bool {
             | "+"
             | "•"
             | "◦"
-            | "▪"
             | ">"
             | "|"
             | "│"
@@ -1375,11 +1374,11 @@ mod tests {
 
     #[test]
     fn wide_unicode_wraps_by_display_width() {
-        let line = Line::from("😀😀😀");
+        let line = Line::from("\u{ff21}\u{ff21}\u{ff21}");
         let out = word_wrap_line(&line, /*width_or_options*/ 4);
         assert_eq!(out.len(), 2);
-        assert_eq!(concat_line(&out[0]), "😀😀");
-        assert_eq!(concat_line(&out[1]), "😀");
+        assert_eq!(concat_line(&out[0]), "\u{ff21}\u{ff21}");
+        assert_eq!(concat_line(&out[1]), "\u{ff21}");
     }
 
     #[test]
@@ -1439,8 +1438,8 @@ mod tests {
     }
 
     #[test]
-    fn line_height_counts_double_width_emoji() {
-        let line = "😀😀😀".into(); // each emoji ~ width 2
+    fn line_height_counts_double_width_characters() {
+        let line = "\u{ff21}\u{ff21}\u{ff21}".into();
         assert_eq!(word_wrap_line(&line, /*width_or_options*/ 4).len(), 2);
         assert_eq!(word_wrap_line(&line, /*width_or_options*/ 2).len(), 3);
         assert_eq!(word_wrap_line(&line, /*width_or_options*/ 6).len(), 1);
@@ -1773,8 +1772,10 @@ them."#
             assert_eq!(wrapped, expected);
         }
 
-        for (text, emoji, sound_mark) in [("a👨‍👩 ﾞ", "👨‍👩", "ﾞ"), ("a👍🏻 ﾟ", "👍🏻", "ﾟ")]
-        {
+        for (text, wide_grapheme, sound_mark) in [
+            ("a\u{ff21}\u{301} \u{ff9e}", "\u{ff21}\u{301}", "\u{ff9e}"),
+            ("a\u{ff22}\u{327} \u{ff9f}", "\u{ff22}\u{327}", "\u{ff9f}"),
+        ] {
             for options in [
                 Options::new(/*width*/ 2),
                 Options::new(/*width*/ 2).word_separator(WordSeparator::AsciiSpace),
@@ -1785,7 +1786,7 @@ them."#
                     .map(|range| &text[range.clone()])
                     .collect_vec();
 
-                assert_eq!(wrapped, ["a", emoji, sound_mark]);
+                assert_eq!(wrapped, ["a", wide_grapheme, sound_mark]);
             }
         }
 

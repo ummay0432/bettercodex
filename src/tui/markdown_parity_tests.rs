@@ -255,7 +255,7 @@ fn narrow_tables_fall_back_to_rich_key_value_records() {
 #[test]
 fn table_widths_and_wrapping_use_terminal_cell_geometry() {
     let lines = rendered(
-        "| Key | Notes |\n| --- | --- |\n| ｶﾞﾊﾟtail | First 漢字 row with an escaped \\| pipe. |\n| short | Final 😀 row. |",
+        "| Key | Notes |\n| --- | --- |\n| \u{ff76}\u{ff9e}\u{ff8a}\u{ff9f}tail | First \u{6f22}\u{5b57} row with an escaped \\| pipe. |\n| short | Final \u{ff21} row. |",
         Some(23),
     );
     assert!(lines.iter().any(|line| line.to_string().contains("ｶﾞﾊﾟ")));
@@ -380,7 +380,7 @@ fn wrapping_preserves_styles_indentation_and_hyperlink_ranges() {
 #[test]
 fn sanitizer_removes_terminal_controls_without_removing_unicode() {
     assert_eq!(
-        sanitize("ok 😀\u{1b}[31mred\u{1b}[0m\u{1b}]0;secret\u{7}done\u{0}"),
-        "ok 😀reddone"
+        sanitize("ok \u{ff21}\u{1b}[31mred\u{1b}[0m\u{1b}]0;secret\u{7}done\u{0}"),
+        "ok \u{ff21}reddone"
     );
 }

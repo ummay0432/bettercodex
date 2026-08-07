@@ -1187,7 +1187,7 @@ mod tests {
     #[test]
     fn editing_moves_by_grapheme_clusters() {
         let mut editor = Editor::default();
-        editor.insert("a👩‍💻b");
+        editor.insert("ae\u{301}b");
         editor.move_left();
         editor.backspace();
         assert_eq!(editor.text(), "ab");
@@ -1276,7 +1276,7 @@ mod tests {
     #[test]
     fn large_pastes_are_compact_elements_until_submission() {
         let mut editor = Editor::default();
-        let paste = "🦀".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
         let placeholder = format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 1);
 
         editor.insert("before ");

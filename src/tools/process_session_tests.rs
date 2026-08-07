@@ -70,24 +70,24 @@ fn retained_output_replaces_invalid_utf8() {
 #[test]
 fn process_snapshots_join_utf8_split_across_poll_boundaries() {
     let session = ProcessSession::new(None, Box::new(NoopKiller), 1, ProcessMode::Piped, None);
-    let emoji = "😀".as_bytes();
+    let character = "\u{10348}".as_bytes();
     session.append(&[0x80]);
-    session.append(&emoji[..2]);
+    session.append(&character[..2]);
 
     let first = session.snapshot().unwrap();
     assert_eq!(first.output, "\u{fffd}");
     assert_eq!(first.total_bytes, 1);
 
-    session.append(&emoji[2..]);
+    session.append(&character[2..]);
     let second = session.snapshot().unwrap();
-    assert_eq!(second.output, "😀");
-    assert_eq!(second.total_bytes, emoji.len());
+    assert_eq!(second.output, "\u{10348}");
+    assert_eq!(second.total_bytes, character.len());
 }
 
 #[test]
 fn final_snapshot_exposes_an_incomplete_utf8_suffix_lossily() {
     let session = ProcessSession::new(None, Box::new(NoopKiller), 1, ProcessMode::Piped, None);
-    session.append(&[0xf0, 0x9f]);
+    session.append(&[0xf0, 0x90]);
     session.reader_finished(None);
 
     let snapshot = session.snapshot().unwrap();

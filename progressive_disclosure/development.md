@@ -37,6 +37,12 @@ Run developer workflows through the checked-in helper:
 
 ## Finish a code change
 
+Every change must pass the repository text check:
+
+```sh
+./scripts/check-no-emoji.sh
+```
+
 Every Rust change must pass all three commands; treat every Clippy warning as an
 error:
 

@@ -749,7 +749,7 @@ mod tests {
         let started = manager
             .exec_command(
                 json!({
-                    "cmd": "printf 'ready:\\360\\237'; sleep 1; printf '\\230\\200'",
+                    "cmd": "printf 'ready:\\360\\220'; sleep 1; printf '\\215\\210'",
                     "shell": "/bin/sh",
                     "login": false,
                     "yield_time_ms": 250,
@@ -772,7 +772,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(completed["output"], "😀");
+        assert_eq!(completed["output"], "\u{10348}");
         assert_eq!(completed["exit_code"], 0);
     }
 
