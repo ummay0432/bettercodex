@@ -263,6 +263,13 @@ impl Runtime {
                         self.enter_tmux(session).await;
                         continue;
                     }
+                    if matches!(action, Action::Logout) {
+                        match crate::login::logout().await {
+                            Ok(_) => break,
+                            Err(error) => self.view.add_notice(format!("Logout failed: {error:#}")),
+                        }
+                        continue;
+                    }
                     if self.handle_action(action)? {
                         break;
                     }
@@ -565,6 +572,7 @@ impl Runtime {
                     .add_notice(format!("Stopped {count} background terminal{plural}"));
             }
             Action::EnterTmux => unreachable!("tmux handoffs are handled by the event loop"),
+            Action::Logout => unreachable!("logout is handled by the event loop"),
             Action::UpdateSkill { path, update } => {
                 let result = self
                     .agent

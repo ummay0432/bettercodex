@@ -6,6 +6,7 @@ mod compaction;
 mod context;
 mod events;
 mod input;
+mod login;
 mod managed_session;
 mod openai_docs;
 mod paths;
@@ -108,11 +109,62 @@ fn run() -> Result<()> {
             ))?;
             Ok(())
         }
+        Command::Login(command) => run_login_command(command),
+        Command::Logout => run_logout_command(),
+        Command::LogoutHelp => {
+            write_logout_help()?;
+            Ok(())
+        }
         Command::Run(options) => run_agent_command(&arguments, options, None),
         Command::Resume { selector, options } => {
             run_agent_command(&arguments, options, Some(selector))
         }
     }
+}
+
+fn run_login_command(command: LoginCommand) -> Result<()> {
+    let mode = match command {
+        LoginCommand::Browser => login::LoginMode::Browser,
+        LoginCommand::DeviceCode => login::LoginMode::DeviceCode,
+        LoginCommand::Status => {
+            return match login::status()? {
+                login::LoginStatus::ChatGpt => {
+                    write_stderr_line(format_args!("Logged in using ChatGPT"))?;
+                    Ok(())
+                }
+                login::LoginStatus::AccessToken => {
+                    write_stderr_line(format_args!("Logged in using access token"))?;
+                    Ok(())
+                }
+                login::LoginStatus::NotLoggedIn => Err(anyhow!("Not logged in")),
+            };
+        }
+        LoginCommand::Help => {
+            write_login_help()?;
+            return Ok(());
+        }
+    };
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(login::login(mode))?;
+    write_stderr_line(format_args!("Successfully logged in"))?;
+    Ok(())
+}
+
+fn run_logout_command() -> Result<()> {
+    let removed = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(login::logout())?;
+    let message = if removed {
+        "Successfully logged out"
+    } else {
+        "Not logged in"
+    };
+    write_stderr_line(format_args!("{message}"))?;
+    Ok(())
 }
 
 fn run_agent_command(
@@ -201,6 +253,17 @@ enum Command {
     ToolCatalogue,
     ToolCatalogueStats,
     ToolContextJson,
+    Login(LoginCommand),
+    Logout,
+    LogoutHelp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginCommand {
+    Browser,
+    DeviceCode,
+    Status,
+    Help,
 }
 
 #[derive(Default)]
@@ -241,6 +304,17 @@ impl Command {
             .is_some_and(|argument| argument == "--tool-context-json")
         {
             return Ok(Self::ToolContextJson);
+        }
+        if arguments.peek().is_some_and(|argument| argument == "login") {
+            arguments.next();
+            return parse_login_command(arguments);
+        }
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "logout")
+        {
+            arguments.next();
+            return parse_logout_command(arguments);
         }
 
         let resume = arguments
@@ -301,10 +375,44 @@ impl Command {
     }
 }
 
+fn parse_login_command(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(Command::Login(LoginCommand::Browser)),
+        [argument] if argument == "--device-auth" => Ok(Command::Login(LoginCommand::DeviceCode)),
+        [argument] if argument == "status" => Ok(Command::Login(LoginCommand::Status)),
+        [argument] if argument == "--help" || argument == "-h" => {
+            Ok(Command::Login(LoginCommand::Help))
+        }
+        [argument, ..] => Err(anyhow!("unknown login argument `{argument}`")),
+    }
+}
+
+fn parse_logout_command(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(Command::Logout),
+        [argument] if argument == "--help" || argument == "-h" => Ok(Command::LogoutHelp),
+        [argument, ..] => Err(anyhow!("unknown logout argument `{argument}`")),
+    }
+}
+
 fn write_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
+    ))
+}
+
+fn write_login_help() -> io::Result<()> {
+    write_stdout_line(format_args!(
+        "Sign in with ChatGPT\n\nUsage:\n  bcodex login [OPTIONS]\n  bcodex login status\n\nOptions:\n      --device-auth  Use device code authentication for remote or headless machines\n  -h, --help         Show this help"
+    ))
+}
+
+fn write_logout_help() -> io::Result<()> {
+    write_stdout_line(format_args!(
+        "Remove stored ChatGPT credentials\n\nUsage:\n  bcodex logout\n\nOptions:\n  -h, --help  Show this help"
     ))
 }
 
@@ -363,6 +471,37 @@ mod tests {
     #[test]
     fn rejects_unknown_options() {
         assert!(Command::parse(["--model".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_upstream_login_and_logout_commands() {
+        assert!(matches!(
+            Command::parse(["login".to_string()]).unwrap(),
+            Command::Login(LoginCommand::Browser)
+        ));
+        assert!(matches!(
+            Command::parse(["login".to_string(), "--device-auth".to_string()]).unwrap(),
+            Command::Login(LoginCommand::DeviceCode)
+        ));
+        assert!(matches!(
+            Command::parse(["login".to_string(), "status".to_string()]).unwrap(),
+            Command::Login(LoginCommand::Status)
+        ));
+        assert!(matches!(
+            Command::parse(["logout".to_string()]).unwrap(),
+            Command::Logout
+        ));
+        assert!(Command::parse(["login".to_string(), "unexpected".to_string()]).is_err());
+        assert!(Command::parse(["logout".to_string(), "unexpected".to_string()]).is_err());
+    }
+
+    #[test]
+    fn positional_separator_preserves_login_as_a_prompt() {
+        let command = Command::parse(["--".to_string(), "login".to_string()]).unwrap();
+        let Command::Run(options) = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.prompt, "login");
     }
 
     #[test]

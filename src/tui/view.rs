@@ -154,6 +154,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "stop all background terminals",
     },
     SlashCommand {
+        name: "logout",
+        aliases: &[],
+        description: "log out of bettercodex",
+    },
+    SlashCommand {
         name: "quit",
         aliases: &["exit"],
         description: "leave bettercodex",
@@ -180,6 +185,7 @@ pub(super) enum Action {
     ShowContext,
     ShowDiff,
     EnterTmux,
+    Logout,
     StopBackgroundProcesses,
     UpdateSkill {
         path: PathBuf,
@@ -1561,6 +1567,13 @@ impl View {
                 Action::None
             }
             "/stop" => Action::StopBackgroundProcesses,
+            "/logout" if self.busy => {
+                self.entries.push(TranscriptEntry::Notice(
+                    "Interrupt the active turn before logging out".to_string(),
+                ));
+                Action::None
+            }
+            "/logout" => Action::Logout,
             _ => Action::Submit(prompt),
         }
     }
@@ -6073,6 +6086,59 @@ mod tests {
         );
         assert!(view.editor.is_empty());
         assert!(view.entries.is_empty());
+    }
+
+    #[test]
+    fn logout_command_is_rendered_and_dispatches_without_model_input() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.editor.set_text("/logo");
+
+        let height = view.desired_height(88, 24);
+        let backend = TestBackend::new(88, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("/logout  log out of bettercodex"),
+            "{rendered}"
+        );
+
+        view.editor.set_text("/logout");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Logout
+        );
+        assert!(view.editor.is_empty());
+        assert!(view.entries.is_empty());
+    }
+
+    #[test]
+    fn logout_is_disabled_while_a_task_is_active() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.start_turn("working");
+        view.editor.set_text("/logout");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("Interrupt the active turn before logging out"),
+            "{rendered}"
+        );
     }
 
     #[test]

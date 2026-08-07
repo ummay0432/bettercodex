@@ -19,6 +19,8 @@ codex-ansi-escape = { git = "https://github.com/openai/codex.git", rev = "1669c2
 codex-client = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-code-mode-protocol = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-file-search = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-http-client = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
+codex-login = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-protocol = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-shell-command = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
 codex-utils-audio = { git = "https://github.com/openai/codex.git", rev = "1669c2403f793d0230065397dfc25f52b844244e" }
@@ -61,6 +63,10 @@ zstd = "0.13"
 [profile.release]
 lto = "thin"
 strip = true
+
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 
 [lints.clippy]
 all = "deny"
