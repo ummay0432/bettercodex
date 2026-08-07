@@ -554,7 +554,12 @@ fn request_uses_instructions_and_one_stable_tool_prefix() {
 
     assert_eq!(first["model"], MODEL);
     assert_eq!(first["instructions"], harness_instructions());
-    assert!(harness_instructions().starts_with("<system_instructions>\n# Working with the user"));
+    assert!(harness_instructions().starts_with(concat!(
+        "<system_instructions>\n",
+        "You are an exceptional coding agent. You and the user share one workspace, ",
+        "and your job is to collaborate with them until their goal is genuinely handled.\n\n",
+        "# Working with the user"
+    )));
     assert!(harness_instructions().contains("# Rules for getting work done"));
     assert!(harness_instructions().ends_with("</system_instructions>"));
     assert!(
