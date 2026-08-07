@@ -1,3 +1,4 @@
+use super::bottom_pane::selection_popup_common::MAX_POPUP_ROWS;
 use super::bottom_pane::selection_popup_common::measure_text_height;
 use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
 use super::bottom_pane::selection_popup_common::render_menu_surface;
@@ -555,8 +556,8 @@ impl View {
 
     pub(super) fn tmux_update_succeeded(&mut self, mode: TmuxMode) {
         self.tmux_mode = mode;
-        if let Some(Overlay::Tmux(tmux)) = self.overlay.as_mut() {
-            tmux.clear_error();
+        if matches!(self.overlay, Some(Overlay::Tmux(_))) {
+            self.overlay = None;
         } else {
             self.entries.push(TranscriptEntry::Notice(format!(
                 "Automatic tmux sessions are {}. This applies on the next launch.",
@@ -838,22 +839,15 @@ impl View {
         self.overlay = Some(Overlay::Context(ContextWindowView::new(snapshot)));
     }
 
-    pub(super) fn show_resume_picker(&mut self, current_session: Uuid) {
-        self.overlay = Some(Overlay::Resume(ResumePicker::loading(
-            &self.cwd,
-            current_session,
-        )));
+    pub(super) fn show_resume_picker(&mut self) {
+        self.overlay = Some(Overlay::Resume(ResumePicker::loading(&self.cwd)));
     }
 
-    pub(super) fn show_resume_progress(&mut self, current_session: Uuid, target: Uuid) {
+    pub(super) fn show_resume_progress(&mut self, target: Uuid) {
         if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
             picker.begin_resume(target);
         } else {
-            self.overlay = Some(Overlay::Resume(ResumePicker::resuming(
-                &self.cwd,
-                current_session,
-                target,
-            )));
+            self.overlay = Some(Overlay::Resume(ResumePicker::resuming(&self.cwd, target)));
         }
     }
 
@@ -1148,6 +1142,12 @@ impl View {
         if self.editor.history_search_active() {
             return self.handle_history_search_key(key);
         }
+        if let Some(Overlay::Tmux(tmux)) = self.overlay.as_mut() {
+            return match tmux.handle_key(key) {
+                TmuxViewAction::None => Action::None,
+                TmuxViewAction::Save(mode) => Action::SetTmuxMode(mode),
+            };
+        }
         if control && key.code == KeyCode::Char('c') {
             if self.overlay.is_some() {
                 self.overlay = None;
@@ -1173,16 +1173,6 @@ impl View {
                     Action::None
                 }
                 SkillsViewAction::Update { path, update } => Action::UpdateSkill { path, update },
-            };
-        }
-        if let Some(Overlay::Tmux(tmux)) = self.overlay.as_mut() {
-            return match tmux.handle_key(key, self.tmux_mode) {
-                TmuxViewAction::None => Action::None,
-                TmuxViewAction::Close => {
-                    self.overlay = None;
-                    Action::None
-                }
-                TmuxViewAction::SetMode(mode) => Action::SetTmuxMode(mode),
             };
         }
         if let Some(overlay) = self.overlay.as_ref() {
@@ -1306,26 +1296,37 @@ impl View {
 
         let slash_matches = self.slash_matches();
         if !slash_matches.is_empty() {
+            let plain = key.modifiers == KeyModifiers::NONE;
+            let control_only = key.modifiers == KeyModifiers::CONTROL;
+            let selected = self.slash_selection.min(slash_matches.len() - 1);
+            if (plain && key.code == KeyCode::Up)
+                || (control_only && key.code == KeyCode::Char('p'))
+            {
+                self.slash_selection = if selected == 0 {
+                    slash_matches.len() - 1
+                } else {
+                    selected - 1
+                };
+                return Action::None;
+            }
+            if (plain && key.code == KeyCode::Down)
+                || (control_only && key.code == KeyCode::Char('n'))
+            {
+                self.slash_selection = (selected + 1) % slash_matches.len();
+                return Action::None;
+            }
             match key.code {
                 KeyCode::Enter if !shift && !alt && !control => {
-                    let selection = self.slash_selection.min(slash_matches.len() - 1);
-                    self.complete_slash_command(slash_matches[selection], selection);
+                    self.complete_slash_command(slash_matches[selected], selected);
                     return self.submit_action();
                 }
                 KeyCode::Tab => {
-                    let selection = self.slash_selection.min(slash_matches.len() - 1);
-                    self.complete_slash_command(slash_matches[selection], selection);
-                    return Action::None;
-                }
-                KeyCode::Up => {
-                    self.slash_selection = self
-                        .slash_selection
-                        .min(slash_matches.len() - 1)
-                        .saturating_sub(1);
-                    return Action::None;
-                }
-                KeyCode::Down => {
-                    self.slash_selection = (self.slash_selection + 1).min(slash_matches.len() - 1);
+                    let command = slash_matches[selected];
+                    self.complete_slash_command(command, selected);
+                    if command.name == "skills" {
+                        return self.submit_action();
+                    }
+                    self.editor.insert(" ");
                     return Action::None;
                 }
                 _ => {}
@@ -1537,7 +1538,7 @@ impl View {
             }
             return match arguments.trim() {
                 "" => {
-                    self.overlay = Some(Overlay::Tmux(TmuxView::new()));
+                    self.overlay = Some(Overlay::Tmux(TmuxView::new(self.tmux_mode)));
                     Action::None
                 }
                 "on" => Action::SetTmuxMode(TmuxMode::On),
@@ -1961,7 +1962,7 @@ impl View {
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills, width),
-            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(width, self.tmux_mode),
+            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(width),
             Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
             None => 0,
         };
@@ -2123,9 +2124,7 @@ impl View {
             Some(Overlay::Skills(skills)) => {
                 skills.render(frame, area, &self.skills, self.user_message_style)
             }
-            Some(Overlay::Tmux(tmux)) => {
-                tmux.render(frame, area, self.tmux_mode, self.user_message_style)
-            }
+            Some(Overlay::Tmux(tmux)) => tmux.render(frame, area, self.user_message_style),
             Some(Overlay::Tools(catalogue)) => {
                 catalogue.render(frame, area, self.user_message_style)
             }
@@ -2334,6 +2333,11 @@ impl View {
             area.height,
         );
         let selected = self.slash_selection.min(matches.len() - 1);
+        let visible = MAX_POPUP_ROWS.min(matches.len());
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(matches.len().saturating_sub(visible));
         let query = self.editor.text().strip_prefix('/').unwrap_or_default();
         let name_width = matches
             .iter()
@@ -2343,6 +2347,8 @@ impl View {
         let lines = matches
             .iter()
             .enumerate()
+            .skip(start)
+            .take(visible)
             .map(|(index, command)| {
                 let mut spans = Vec::with_capacity(command.aliases.len().saturating_mul(4) + 5);
                 for (name_index, name) in command.names().enumerate() {
@@ -2368,9 +2374,7 @@ impl View {
                 spans.push(Span::from(command.description).dim());
                 let mut line = Line::from(spans);
                 if index == selected {
-                    let selected_style = Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD);
+                    let selected_style = palette::accent_style();
                     for span in &mut line.spans {
                         span.style = selected_style;
                     }
@@ -2382,7 +2386,7 @@ impl View {
     }
 
     fn slash_popup_height(&self, _width: u16) -> u16 {
-        u16::try_from(self.slash_matches().len()).unwrap_or(u16::MAX)
+        u16::try_from(MAX_POPUP_ROWS.min(self.slash_matches().len())).unwrap_or(u16::MAX)
     }
 
     fn completion_popup_height(&self, width: u16) -> u16 {
@@ -4999,7 +5003,10 @@ mod tests {
         assert!(command_y > composer_y, "{rendered}");
         assert_eq!(buffer[(2, composer_y as u16)].symbol(), "/");
         assert_eq!(buffer[(2, command_y as u16)].symbol(), "/");
-        assert_eq!(buffer[(9, command_y as u16)].fg, Color::Cyan);
+        assert_eq!(
+            buffer[(9, command_y as u16)].fg,
+            palette::accent_style().fg.unwrap_or(Color::Reset)
+        );
         assert!(
             buffer[(2, command_y as u16)]
                 .modifier
@@ -5030,7 +5037,7 @@ mod tests {
             )),
             Action::None
         );
-        assert_eq!(view.editor.text(), "/exit");
+        assert_eq!(view.editor.text(), "/exit ");
         assert_eq!(
             view.handle_terminal_event(Event::Key(KeyEvent::new(
                 KeyCode::Enter,
@@ -5038,6 +5045,73 @@ mod tests {
             ))),
             Action::Quit
         );
+    }
+
+    #[test]
+    fn slash_popup_caps_rows_wraps_navigation_and_supports_control_aliases() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.editor.set_text("/");
+
+        assert!(view.slash_matches().len() > MAX_POPUP_ROWS);
+        assert_eq!(view.slash_popup_height(80), MAX_POPUP_ROWS as u16);
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE,))),
+            Action::None
+        );
+        assert_eq!(view.slash_selection, view.slash_matches().len() - 1);
+
+        let height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("/quit, /exit"), "{rendered}");
+        assert!(
+            !rendered.contains("/clear  start a fresh session"),
+            "{rendered}"
+        );
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+            ))),
+            Action::None
+        );
+        assert_eq!(view.slash_selection, 0);
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL,
+            ))),
+            Action::None
+        );
+        assert_eq!(view.slash_selection, view.slash_matches().len() - 1);
+    }
+
+    #[test]
+    fn tab_completes_with_an_argument_separator_and_opens_skills_immediately() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/tmu");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "/tmux ");
+
+        view.editor.set_text("/sk");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert!(view.editor.is_empty());
+        assert!(matches!(view.overlay, Some(Overlay::Skills(_))));
     }
 
     #[test]
@@ -5252,7 +5326,7 @@ mod tests {
         let mut view = View::new(Path::new("/tmp/old-session"));
         view.welcome_pending = false;
         view.add_notice("old transcript");
-        view.show_resume_picker(Uuid::new_v4());
+        view.show_resume_picker();
 
         view.switch_session(
             Path::new("/tmp/resumed-session"),
@@ -5298,11 +5372,10 @@ mod tests {
 
     #[test]
     fn resume_overlay_renders_and_dispatches_the_selected_saved_session() {
-        let current = Uuid::new_v4();
         let target = Uuid::new_v4();
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        view.show_resume_picker(current);
+        view.show_resume_picker();
         view.set_resume_sessions(vec![crate::rollout::SessionSummary {
             id: target,
             cwd: PathBuf::from("/tmp/bettercodex"),
@@ -6041,7 +6114,7 @@ mod tests {
         assert!(matches!(view.overlay.as_ref(), Some(Overlay::Tmux(_))));
 
         let manager_height = match view.overlay.as_ref() {
-            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(88, view.tmux_mode),
+            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(88),
             _ => panic!("expected tmux overlay"),
         };
         let backend = TestBackend::new(88, manager_height);
@@ -6060,23 +6133,64 @@ mod tests {
                 KeyCode::Char(' '),
                 KeyModifiers::NONE,
             ))),
-            Action::SetTmuxMode(TmuxMode::Off)
+            Action::None
         );
-        view.tmux_update_succeeded(TmuxMode::Off);
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(
             rendered.contains("› [ ] Automatic tmux sessions"),
             "{rendered}"
         );
+        assert_eq!(view.tmux_mode, TmuxMode::On);
 
         assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
-            )),
-            Action::None
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::SetTmuxMode(TmuxMode::Off)
         );
+        assert!(matches!(view.overlay, Some(Overlay::Tmux(_))));
+
+        view.tmux_update_failed("Could not save <tmux>");
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(rendered.contains("Could not save <tmux>"), "{rendered}");
+        assert!(matches!(view.overlay, Some(Overlay::Tmux(_))));
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::SetTmuxMode(TmuxMode::Off)
+        );
+        view.tmux_update_succeeded(TmuxMode::Off);
         assert!(view.overlay.is_none());
+        assert_eq!(view.tmux_mode, TmuxMode::Off);
+    }
+
+    #[test]
+    fn tmux_escape_and_control_c_save_the_staged_value() {
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut view = View::with_tmux_mode(Path::new("/tmp/bettercodex"), TmuxMode::On);
+            view.overlay = Some(Overlay::Tmux(TmuxView::new(TmuxMode::On)));
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(key)),
+                Action::SetTmuxMode(TmuxMode::Off)
+            );
+            assert!(matches!(view.overlay, Some(Overlay::Tmux(_))));
+        }
     }
 
     #[test]

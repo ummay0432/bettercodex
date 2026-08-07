@@ -26,26 +26,30 @@ const FOOTER_HEIGHT: u16 = 1;
 
 pub(super) struct TmuxView {
     state: ScrollState,
+    mode: TmuxMode,
     error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TmuxViewAction {
     None,
-    Close,
-    SetMode(TmuxMode),
+    Save(TmuxMode),
 }
 
 impl TmuxView {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(mode: TmuxMode) -> Self {
         let mut state = ScrollState::new();
         state.clamp_selection(1);
-        Self { state, error: None }
+        Self {
+            state,
+            mode,
+            error: None,
+        }
     }
 
-    pub(super) fn preferred_height(&self, width: u16, mode: TmuxMode) -> u16 {
+    pub(super) fn preferred_height(&self, width: u16) -> u16 {
         let header = self.header_lines();
-        let rows = self.rows(mode);
+        let rows = self.rows();
         let row_width = width.saturating_sub(2);
         measure_text_height(&header, width.saturating_sub(4))
             .saturating_add(measure_rows_height(
@@ -62,34 +66,32 @@ impl TmuxView {
         self.error = Some(error.into());
     }
 
-    pub(super) fn clear_error(&mut self) {
-        self.error = None;
-    }
-
-    pub(super) fn handle_key(&mut self, key: KeyEvent, mode: TmuxMode) -> TmuxViewAction {
+    pub(super) fn handle_key(&mut self, key: KeyEvent) -> TmuxViewAction {
         match key {
             KeyEvent {
-                code: KeyCode::Esc, ..
-            } => TmuxViewAction::Close,
+                code: KeyCode::Esc | KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => TmuxViewAction::Save(self.mode),
             KeyEvent {
-                code: KeyCode::Enter | KeyCode::Char(' '),
+                code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
                 self.error = None;
-                TmuxViewAction::SetMode(mode.toggled())
+                self.mode = self.mode.toggled();
+                TmuxViewAction::None
             }
             _ => TmuxViewAction::None,
         }
     }
 
-    pub(super) fn render(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        mode: TmuxMode,
-        surface_style: Style,
-    ) {
+    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, surface_style: Style) {
         if area.is_empty() {
             return;
         }
@@ -108,7 +110,7 @@ impl TmuxView {
                 header_area,
             );
 
-            let rows = self.rows(mode);
+            let rows = self.rows();
             let row_width = content_area.width.saturating_sub(2).max(1);
             let requested_rows =
                 measure_rows_height(&rows, &self.state, row_width.saturating_add(1));
@@ -136,7 +138,7 @@ impl TmuxView {
                 footer_area.height,
             );
             frame.render_widget(
-                Paragraph::new("Press space or enter to toggle; esc to close").dim(),
+                Paragraph::new("Press space to toggle or enter to save for next launch").dim(),
                 hint_area,
             );
         }
@@ -147,16 +149,18 @@ impl TmuxView {
             Line::from("Tmux").bold(),
             self.error.as_ref().map_or_else(
                 || {
-                    Line::from("Changes are saved automatically and apply on the next launch.")
-                        .dim()
+                    Line::from(
+                        "Toggle automatic tmux sessions. Changes are saved to settings.json.",
+                    )
+                    .dim()
                 },
                 |error| Line::from(markdown::sanitize(error)).red(),
             ),
         ]
     }
 
-    fn rows(&self, mode: TmuxMode) -> Vec<GenericDisplayRow> {
-        let marker = if mode.is_on() { 'x' } else { ' ' };
+    fn rows(&self) -> Vec<GenericDisplayRow> {
+        let marker = if self.mode.is_on() { 'x' } else { ' ' };
         vec![GenericDisplayRow {
             name: format!("› [{marker}] Automatic tmux sessions"),
             description: Some(

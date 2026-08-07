@@ -5,51 +5,52 @@ use ratatui::style::Color;
 use ratatui::style::Modifier;
 
 #[test]
-fn space_and_enter_toggle_the_mode_and_escape_closes() {
-    let mut view = TmuxView::new();
+fn space_stages_the_mode_and_accept_keys_save_it() {
+    let mut view = TmuxView::new(TmuxMode::On);
     assert_eq!(
-        view.handle_key(
-            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-            TmuxMode::On
-        ),
-        TmuxViewAction::SetMode(TmuxMode::Off)
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        TmuxViewAction::None
     );
     assert_eq!(
-        view.handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            TmuxMode::Off
-        ),
-        TmuxViewAction::SetMode(TmuxMode::On)
+        view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        TmuxViewAction::Save(TmuxMode::Off)
     );
+
+    let mut escape = TmuxView::new(TmuxMode::On);
+    escape.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     assert_eq!(
-        view.handle_key(
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            TmuxMode::On
-        ),
-        TmuxViewAction::Close
+        escape.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        TmuxViewAction::Save(TmuxMode::Off)
+    );
+
+    let mut control_c = TmuxView::new(TmuxMode::Off);
+    assert_eq!(
+        control_c.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        TmuxViewAction::Save(TmuxMode::Off)
     );
 }
 
 #[test]
 fn rendered_toggle_shows_state_timing_and_controls() {
-    let view = TmuxView::new();
-    let enabled = render(&view, TmuxMode::On);
+    let mut view = TmuxView::new(TmuxMode::On);
+    let enabled = render(&view);
     assert_eq!(
         enabled,
         [
             "",
             "  Tmux",
-            "  Changes are saved automatically and apply on the next launch.",
+            "  Toggle automatic tmux sessions. Changes are saved to settings.json.",
             "",
             "› [x] Automatic tmux sessions  Start interactive launches in detachable c1,",
             "                               c2, … sessions.",
             "",
-            "  Press space or enter to toggle; esc to close",
+            "  Press space to toggle or enter to save for next launch",
         ]
         .join("\n")
     );
 
-    let disabled = render(&view, TmuxMode::Off);
+    view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    let disabled = render(&view);
     assert!(
         disabled.contains("› [ ] Automatic tmux sessions"),
         "{disabled}"
@@ -58,23 +59,26 @@ fn rendered_toggle_shows_state_timing_and_controls() {
 
 #[test]
 fn save_error_replaces_the_timing_hint() {
-    let mut view = TmuxView::new();
+    let mut view = TmuxView::new(TmuxMode::On);
     view.set_error("Could not save <tmux>");
-    let rendered = render(&view, TmuxMode::On);
+    let rendered = render(&view);
     assert!(rendered.contains("Could not save <tmux>"), "{rendered}");
-    assert!(!rendered.contains("next launch"), "{rendered}");
+    assert!(
+        !rendered.contains("Changes are saved to settings.json"),
+        "{rendered}"
+    );
 }
 
 #[test]
 fn rendered_menu_uses_the_codex_surface_and_active_row_styles() {
     const WIDTH: u16 = 80;
-    let view = TmuxView::new();
-    let height = view.preferred_height(WIDTH, TmuxMode::On);
+    let view = TmuxView::new(TmuxMode::On);
+    let height = view.preferred_height(WIDTH);
     let backend = TestBackend::new(WIDTH, height);
     let mut terminal = Terminal::new(backend).unwrap();
     let surface = Style::default().bg(Color::Rgb(55, 55, 55));
     terminal
-        .draw(|frame| view.render(frame, frame.area(), TmuxMode::On, surface))
+        .draw(|frame| view.render(frame, frame.area(), surface))
         .unwrap();
     let buffer = terminal.backend().buffer();
 
@@ -85,13 +89,13 @@ fn rendered_menu_uses_the_codex_surface_and_active_row_styles() {
     assert_ne!(buffer[(0, 4)].fg, Color::Reset);
 }
 
-fn render(view: &TmuxView, mode: TmuxMode) -> String {
+fn render(view: &TmuxView) -> String {
     const WIDTH: u16 = 80;
-    let height = view.preferred_height(WIDTH, mode);
+    let height = view.preferred_height(WIDTH);
     let backend = TestBackend::new(WIDTH, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| view.render(frame, frame.area(), mode, Style::default()))
+        .draw(|frame| view.render(frame, frame.area(), Style::default()))
         .unwrap();
     render_buffer(terminal.backend().buffer())
 }
