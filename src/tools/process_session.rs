@@ -23,6 +23,7 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 
 const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
+const PROCESS_READ_BUFFER_BYTES: usize = 64 * 1024;
 pub(super) const RETAINED_HEAD_BYTES: usize = 512 * 1024;
 pub(super) const RETAINED_TAIL_BYTES: usize = 512 * 1024;
 const UNIFIED_EXEC_ENV: [(&str, &str); 9] = [
@@ -481,11 +482,15 @@ fn spawn_reader(
     label: &'static str,
 ) {
     std::thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
+        // A larger read amortizes syscalls, retention-lock acquisitions, and wakeups on noisy
+        // commands. Pipe and PTY reads still return with available bytes, preserving interactive
+        // output latency.
+        let mut buffer = [0_u8; PROCESS_READ_BUFFER_BYTES];
         let error = loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break None,
                 Ok(read) => session.append(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => break Some(format!("failed to read {label}: {error}")),
             }
         };

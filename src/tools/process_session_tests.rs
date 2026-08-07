@@ -13,6 +13,26 @@ impl ChildKiller for NoopKiller {
     }
 }
 
+struct InterruptedThenData {
+    interrupted: bool,
+    emitted: bool,
+}
+
+impl Read for InterruptedThenData {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if !self.interrupted {
+            self.interrupted = true;
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        if self.emitted {
+            return Ok(0);
+        }
+        self.emitted = true;
+        buffer[..5].copy_from_slice(b"ready");
+        Ok(5)
+    }
+}
+
 #[test]
 fn retained_output_keeps_head_and_tail() {
     let mut output = PendingOutput::default();
@@ -53,6 +73,59 @@ fn retained_output_ring_preserves_order_across_many_reads() {
             total_bytes: input_bytes,
             omitted_bytes,
         }
+    );
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_retained_output_many_reads() {
+    const CHUNK_BYTES: usize = 8 * 1024;
+    const INPUT_BYTES: usize = 512 * 1024 * 1024;
+
+    let chunk = vec![b'x'; CHUNK_BYTES];
+    let mut output = PendingOutput::default();
+    let started = Instant::now();
+    for _ in 0..INPUT_BYTES / CHUNK_BYTES {
+        output.append(std::hint::black_box(&chunk));
+    }
+    let snapshot = output.take(SnapshotBoundary::Final);
+    std::hint::black_box(&snapshot);
+
+    assert_eq!(snapshot.total_bytes, INPUT_BYTES);
+    assert_eq!(
+        snapshot.omitted_bytes,
+        INPUT_BYTES - RETAINED_HEAD_BYTES - RETAINED_TAIL_BYTES
+    );
+    eprintln!(
+        "retained {INPUT_BYTES} process-output bytes across {} reads: {:?}",
+        INPUT_BYTES / CHUNK_BYTES,
+        started.elapsed()
+    );
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_repeated_retained_output_snapshots() {
+    const CHUNK_BYTES: usize = 8 * 1024;
+    const BYTES_PER_SNAPSHOT: usize = 2 * 1024 * 1024;
+    const SNAPSHOTS: usize = 256;
+
+    let chunk = vec![b'x'; CHUNK_BYTES];
+    let mut output = PendingOutput::default();
+    let started = Instant::now();
+    for _ in 0..SNAPSHOTS {
+        for _ in 0..BYTES_PER_SNAPSHOT / CHUNK_BYTES {
+            output.append(std::hint::black_box(&chunk));
+        }
+        let snapshot = output.take(SnapshotBoundary::Final);
+        assert_eq!(snapshot.total_bytes, BYTES_PER_SNAPSHOT);
+        std::hint::black_box(snapshot);
+    }
+
+    eprintln!(
+        "retained and snapshotted {} bytes across {SNAPSHOTS} polls: {:?}",
+        BYTES_PER_SNAPSHOT * SNAPSHOTS,
+        started.elapsed()
     );
 }
 
@@ -110,6 +183,32 @@ async fn exited_process_uses_codex_output_close_grace() {
 }
 
 #[tokio::test]
+async fn process_reader_retries_interrupted_reads() {
+    let session = ProcessSession::new(None, Box::new(NoopKiller), 1, ProcessMode::Piped, None);
+    spawn_reader(
+        Arc::clone(&session),
+        InterruptedThenData {
+            interrupted: false,
+            emitted: false,
+        },
+        "test output",
+    );
+
+    loop {
+        let notified = session.notify.notified();
+        if session.state.lock().unwrap().readers == 0 {
+            break;
+        }
+        timeout(Duration::from_secs(1), notified).await.unwrap();
+    }
+    session.exited(0, None);
+
+    let snapshot = session.snapshot().unwrap();
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert_eq!(snapshot.output, "ready");
+}
+
+#[tokio::test]
 async fn spawned_pty_processes_receive_a_capable_terminal_type() {
     let shell = DetectedShell {
         shell_type: ShellType::Sh,
@@ -129,4 +228,34 @@ async fn spawned_pty_processes_receive_a_capable_terminal_type() {
     let snapshot = session.snapshot().unwrap();
     assert_eq!(snapshot.exit_code, Some(0));
     assert_eq!(snapshot.output, "xterm-256color");
+}
+
+#[tokio::test]
+#[ignore = "manual performance measurement"]
+async fn benchmark_large_process_output_ingestion() {
+    const INPUT_BYTES: usize = 256 * 1024 * 1024;
+    let shell = DetectedShell {
+        shell_type: ShellType::Sh,
+        shell_path: PathBuf::from("/bin/sh"),
+    };
+    let started = Instant::now();
+    let session = ProcessSession::spawn(
+        &shell,
+        ShellStartup::NonLogin,
+        "dd if=/dev/zero bs=1048576 count=256 2>/dev/null",
+        Path::new("/"),
+        ProcessMode::Piped,
+    )
+    .unwrap();
+
+    session.wait(Duration::from_secs(30)).await;
+    let snapshot = session.snapshot().unwrap();
+    std::hint::black_box(&snapshot.output);
+
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert_eq!(snapshot.total_bytes, INPUT_BYTES);
+    eprintln!(
+        "ingested {INPUT_BYTES} bytes from a subprocess: {:?}",
+        started.elapsed()
+    );
 }
