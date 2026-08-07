@@ -54,7 +54,7 @@ unicode-width = "0.2"
 url = "2"
 urlencoding = "2.1"
 uuid = { version = "1", features = ["v4", "v5"] }
-v8 = "=150.4.0"
+v8 = { version = "=150.4.0", features = ["v8_enable_sandbox"] }
 zstd = "0.13"
 
 [profile.release]
@@ -67,4 +67,5 @@ all = "deny"
 [dev-dependencies]
 itertools = "0.14"
 pretty_assertions = "1"
+tokio = { version = "1", features = ["test-util"] }
 vt100 = "0.16.2"

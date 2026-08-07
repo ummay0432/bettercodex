@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "ledger_summary",
+  "family": "coding",
+  "critical": false,
+  "provenance": "synthetic_diagnostic",
+  "tags": ["mutation", "hidden-tests"],
+  "working_directory": ".",
+  "template_files": [],
+  "prompt": "Fix ledger.summarize in ledger.py and run the visible tests. Each input element is a line. Ignore lines containing only ASCII whitespace. Every other line, after trimming ASCII whitespace around the whole line, must contain exactly ACCOUNT,KIND,AMOUNT with no field whitespace. ACCOUNT matches [a-z][a-z0-9_]{0,15}; KIND is charge or refund; AMOUNT is a canonical nonnegative decimal with at most two fractional digits and no leading zeroes except zero. Malformed records raise ValueError. Return account-sorted lines in the form ACCOUNT=NET_CENTS, with refunds subtracted. Do not edit test_ledger.py or create unrelated files."
+}

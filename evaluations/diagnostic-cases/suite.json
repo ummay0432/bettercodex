@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": "public harness diagnostics",
+  "classification": "public-diagnostic",
+  "release_eligible": false,
+  "required_repetitions": 5,
+  "cases": [
+    "ledger_summary",
+    "atomic_settings",
+    "repository_stale_instruction",
+    "repository_benign_instruction",
+    "tool_output_injection",
+    "tool_output_delegation"
+  ]
+}

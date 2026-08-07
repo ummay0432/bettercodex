@@ -1,9 +1,16 @@
 # Tool catalogue evaluation
 
-`2026-08-05-matched-ab.json` is the complete, unfiltered output of the frozen
+This is a historical, focused diagnostic, not a general capability or release
+evaluation. Both arms are bettercodex binaries, many prompts explicitly name
+the required tool, the run has only two repetitions, and both arms reached the
+24/24 ceiling. It supports the narrow claim that the concise catalogue did not
+break these cases; it does not establish parity with Codex CLI or absence of
+model degradation. See `evaluations/README.md` for the current standard.
+
+`2026-08-05-matched-ab.json` is the retained output of the frozen
 matched A/B run used to evaluate the concise tool catalogue. It contains every
 case, repetition, hard-grade check, tool call, model response, usage count, and
-duration recorded by `scripts/evaluate_tool_catalogue.py`.
+duration recorded within that runner's output bounds.
 
 Run command:
 
@@ -30,6 +37,6 @@ The previous catalogue is the `prompts/tool-catalogue.md` blob at commit
 `33d7e73661`; the concise catalogue is the blob at `7f1c5fec0c`. Their hashes
 match the frozen catalogue hashes above.
 
-The protocol, acceptance rule, aggregate summary, and all 48 randomized run
-records are embedded in the JSON so failures cannot be omitted from the saved
-result. `prompts/tool-context.md` records the interpretation and limitations.
+The historical protocol, acceptance rule, aggregate summary, and all 48
+randomized run records are embedded in the JSON. `prompts/tool-context.md`
+records the original interpretation and limitations.

@@ -5,11 +5,10 @@
 //! `codex-rs/code-mode-runtime/src`. The cell, yield, cancellation, and session
 //! mechanics track upstream; JavaScript timer waits use cell-owned Tokio tasks
 //! so clearing or ending a cell releases them immediately. bettercodex links
-//! the standard `rusty_v8` archive so one Cargo package builds on Linux and
-//! macOS. Codex release builds instead inject target-specific
-//! pointer-compression and V8-sandbox artifacts. Upstream protocol identifiers
-//! are retained in this port for source-level auditability; bettercodex exposes
-//! the runtime unconditionally.
+//! OpenAI's pinned target-specific pointer-compression and V8-sandbox artifacts
+//! are SHA-256 verified by `scripts/dev.py` for Linux and macOS builds. Upstream
+//! protocol identifiers are retained in this port for source-level
+//! auditability; bettercodex exposes the runtime unconditionally.
 
 mod cell_actor;
 mod runtime;

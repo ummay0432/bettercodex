@@ -58,6 +58,13 @@ Changes to `scripts/dev.py` must also pass its dependency-free unit tests:
 python3 -m unittest -v scripts.dev_tests
 ```
 
+Changes to the matched live-evaluation runner must pass its offline protocol
+tests as well:
+
+```sh
+python3 -m unittest -v scripts.evaluate_harness_tests
+```
+
 Cargo can wait on a shared build lock. Let it finish; do not kill a Cargo or
 Rust process by PID to make the lock disappear.
 
@@ -89,6 +96,12 @@ executing a package artifact produced from another concurrently changing
 worktree, while keeping large build output on the primary worktree's filesystem
 instead of a space-constrained `/tmp` mount. The primary worktree continues to
 use its normal `target/` directory.
+
+The helper also downloads and SHA-256 verifies OpenAI's pinned, sandbox-enabled
+V8 archive and matching Rust bindings for the current Linux or macOS target.
+The crates.io release does not publish that feature combination, so direct
+Cargo builds need explicit `RUSTY_V8_ARCHIVE` and
+`RUSTY_V8_SRC_BINDING_PATH` overrides; use the helper for normal workflows.
 
 Do not point `CARGO_TARGET_DIR` at another active worktree. Use the helper for
 focused tests and for the complete validation sequence above.

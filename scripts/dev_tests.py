@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import dev
 
@@ -88,6 +89,100 @@ class CanonicalInstallTests(unittest.TestCase):
         with dev.committed_source_snapshot(self.repository.path, commit) as source:
             self.assertEqual((source / "tracked.txt").read_text(), "first\n")
             self.assertFalse((source / "untracked.txt").exists())
+
+
+class SandboxedV8Tests(unittest.TestCase):
+    def test_pinned_artifact_version_matches_cargo_lock(self) -> None:
+        self.assertEqual(dev.locked_package_version("v8"), dev.V8_VERSION)
+
+    def test_locked_package_version_rejects_ambiguous_versions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bettercodex-lock-test-") as temporary:
+            lockfile = Path(temporary) / "Cargo.lock"
+            lockfile.write_text(
+                '[[package]]\nname = "v8"\nversion = "1.0.0"\n\n'
+                '[[package]]\nname = "v8"\nversion = "2.0.0"\n'
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "exactly one v8 version"):
+                dev.locked_package_version("v8", lockfile)
+
+    def test_partial_artifact_override_is_rejected(self) -> None:
+        environment = {"RUSTY_V8_ARCHIVE": "/tmp/archive"}
+
+        with self.assertRaisesRegex(RuntimeError, "must be set together"):
+            dev.configure_v8_environment(environment, target="unused")
+
+    def test_complete_override_and_source_build_are_preserved(self) -> None:
+        overridden = {
+            "RUSTY_V8_ARCHIVE": "/tmp/archive",
+            "RUSTY_V8_SRC_BINDING_PATH": "/tmp/binding",
+        }
+        dev.configure_v8_environment(overridden, target="unused")
+        self.assertEqual(overridden["RUSTY_V8_ARCHIVE"], "/tmp/archive")
+
+        source_build = {"V8_FROM_SOURCE": "true"}
+        dev.configure_v8_environment(source_build, target="unused")
+        self.assertNotIn("RUSTY_V8_ARCHIVE", source_build)
+
+    def test_downloads_and_verifies_the_pinned_artifact_pair(self) -> None:
+        target = "test-target"
+        archive_name, binding_name = dev.v8_artifact_names(target)
+        with tempfile.TemporaryDirectory(prefix="bettercodex-v8-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            cache = root / "cache"
+            source.mkdir()
+            archive_bytes = b"sandboxed archive"
+            binding_bytes = b"matching bindings"
+            (source / archive_name).write_bytes(archive_bytes)
+            (source / binding_name).write_bytes(binding_bytes)
+            checksums = {
+                target: (
+                    dev.hashlib.sha256(archive_bytes).hexdigest(),
+                    dev.hashlib.sha256(binding_bytes).hexdigest(),
+                )
+            }
+            environment: dict[str, str] = {}
+
+            with (
+                mock.patch.object(dev, "V8_CHECKSUMS", checksums),
+                mock.patch.object(dev, "V8_RELEASE", source.as_uri()),
+            ):
+                dev.configure_v8_environment(
+                    environment,
+                    target=target,
+                    cache_root=cache,
+                )
+
+            archive = Path(environment["RUSTY_V8_ARCHIVE"])
+            binding = Path(environment["RUSTY_V8_SRC_BINDING_PATH"])
+            self.assertEqual(archive.read_bytes(), archive_bytes)
+            self.assertEqual(binding.read_bytes(), binding_bytes)
+
+    def test_rejects_an_artifact_with_the_wrong_checksum(self) -> None:
+        target = "test-target"
+        archive_name, binding_name = dev.v8_artifact_names(target)
+        with tempfile.TemporaryDirectory(prefix="bettercodex-v8-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            cache = root / "cache"
+            source.mkdir()
+            (source / archive_name).write_bytes(b"unexpected archive")
+            (source / binding_name).write_bytes(b"matching bindings")
+            checksums = {target: ("0" * 64, dev.hashlib.sha256(b"matching bindings").hexdigest())}
+
+            with (
+                mock.patch.object(dev, "V8_CHECKSUMS", checksums),
+                mock.patch.object(dev, "V8_RELEASE", source.as_uri()),
+                self.assertRaisesRegex(RuntimeError, "expected 000000"),
+            ):
+                dev.configure_v8_environment(
+                    {},
+                    target=target,
+                    cache_root=cache,
+                )
+
+            self.assertFalse((cache / archive_name).exists())
 
 
 if __name__ == "__main__":

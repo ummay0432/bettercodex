@@ -600,3 +600,7 @@ fn begin_termination(
     let _ = runtime_control_tx.send(RuntimeControlCommand::Terminate);
     let _ = runtime_terminate_handle.terminate_execution();
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

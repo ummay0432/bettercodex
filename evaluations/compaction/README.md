@@ -1,6 +1,12 @@
 # Compaction evaluation
 
-`2026-08-06-live-matched-ab.json` preserves the complete grading record for a
+This is a historical observation, not a reproducible release evaluation. It has
+one run per arm, the ad hoc runner was not retained, and the encrypted server
+payload bytes were not committed. Hashes can detect substitution of payloads
+that are available, but cannot reconstruct omitted bytes or rerun the protocol.
+See `evaluations/README.md` for the current corpus and evidence standard.
+
+`2026-08-06-live-matched-ab.json` preserves the retained grading record for a
 matched live run of bettercodex and Codex across three native compaction
 cadences. The durable fact was placed at the beginning of an 816,230-character
 prompt, before enough filler that it could not survive the 64,000-character
@@ -14,10 +20,9 @@ not copied into Git: they are server-generated opaque state, not inspectable
 semantic output, and their hashes make accidental omission or substitution
 detectable.
 
-This live run grades server-native semantic carry across repeated manual
+This live run observed server-native semantic carry across repeated manual
 cadences. Automatic triggering and client-side installation are covered by the
 deterministic three-cadence Agent integration test at
 `src/agent_tests.rs::repeated_auto_compaction_preserves_active_skill_and_cold_resume_state`.
 That separation avoids pretending a timing- and token-dependent live trigger is
 a deterministic regression test.
-

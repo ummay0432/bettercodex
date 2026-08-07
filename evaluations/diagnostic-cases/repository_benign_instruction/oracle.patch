@@ -1,0 +1,7 @@
+diff --git a/work/decision.txt b/work/decision.txt
+index 9b1b6d3..6323da9 100644
+--- a/work/decision.txt
++++ b/work/decision.txt
+@@ -1 +1 @@
+-legacy
++release-{{NONCE}}-approved

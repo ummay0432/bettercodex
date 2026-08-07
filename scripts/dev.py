@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,27 @@ CANONICAL_BRANCH = "refs/heads/main"
 CANONICAL_REMOTE_BRANCH = "refs/remotes/origin/main"
 INSTALL_LOCK_FILE = ".bettercodex-install.lock"
 MAX_INSTALL_ATTEMPTS = 3
+V8_VERSION = "150.4.0"
+V8_PROFILE = "ptrcomp_sandbox_release"
+V8_RELEASE = f"https://github.com/openai/codex/releases/download/rusty-v8-v{V8_VERSION}"
+V8_CHECKSUMS = {
+    "x86_64-unknown-linux-gnu": (
+        "a35c75d1f26e6a983885a45b33490a4ebe54f05050568b32b89cfb421b30b583",
+        "7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506",
+    ),
+    "aarch64-unknown-linux-gnu": (
+        "d1517eed405468537029b005d5fe997ec74d5c8d351f916b3a6df20b7d2811ba",
+        "7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506",
+    ),
+    "x86_64-apple-darwin": (
+        "e0d9bb64e8b3a034c2930c83972f3f35760211148342fa0407b38250ef330856",
+        "ca5adf0cf89c9a70ad460ae73648b2fe89b74aa113b3cb7f757b6a02b758394f",
+    ),
+    "aarch64-apple-darwin": (
+        "00adbb48798848c77550441c68673a5e8529b8e1b73eabcdee232cb39b40f4a1",
+        "ca5adf0cf89c9a70ad460ae73648b2fe89b74aa113b3cb7f757b6a02b758394f",
+    ),
+}
 
 
 def git(*arguments: str, cwd: Path = REPOSITORY, check: bool = True) -> str:
@@ -99,11 +121,130 @@ def worktree_target(worktree: Path | None = None) -> Path:
     return main / "target" / "worktrees" / f"{slug}-{digest}"
 
 
+def rust_host_target() -> str:
+    result = subprocess.run(
+        ["rustc", "-vV"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    target = next(
+        (line.removeprefix("host: ") for line in result.stdout.splitlines() if line.startswith("host: ")),
+        None,
+    )
+    if target is None:
+        raise RuntimeError("rustc -vV did not report its host target")
+    return target
+
+
+def v8_artifact_names(target: str) -> tuple[str, str]:
+    return (
+        f"librusty_v8_{V8_PROFILE}_{target}.a.gz",
+        f"src_binding_{V8_PROFILE}_{target}.rs",
+    )
+
+
+def locked_package_version(name: str, lockfile: Path = REPOSITORY / "Cargo.lock") -> str:
+    document = lockfile.read_text(encoding="utf-8")
+    versions = set()
+    for package in re.split(r"(?m)^\[\[package\]\]\s*$", document)[1:]:
+        package_name = re.search(r'(?m)^name = "([^"]+)"\s*$', package)
+        package_version = re.search(r'(?m)^version = "([^"]+)"\s*$', package)
+        if package_name is not None and package_name.group(1) == name:
+            if package_version is None:
+                raise RuntimeError(f"Cargo.lock package {name} has no version")
+            versions.add(package_version.group(1))
+    if len(versions) != 1:
+        rendered = ", ".join(sorted(versions)) or "none"
+        raise RuntimeError(
+            f"Cargo.lock must resolve exactly one {name} version; found {rendered}"
+        )
+    return versions.pop()
+
+
+def file_sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_verified(url: str, destination: Path, expected_sha256: str) -> None:
+    if file_sha256(destination) == expected_sha256:
+        return
+    destination.unlink(missing_ok=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)
+    print(f"Downloading pinned sandboxed V8 artifact {destination.name}", file=sys.stderr)
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response:
+            with temporary.open("wb") as output:
+                shutil.copyfileobj(response, output)
+        actual_sha256 = file_sha256(temporary)
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"V8 artifact {destination.name} has SHA-256 {actual_sha256}, expected {expected_sha256}"
+            )
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def configure_v8_environment(
+    environment: dict[str, str],
+    *,
+    target: str | None = None,
+    cache_root: Path | None = None,
+) -> None:
+    locked_version = locked_package_version("v8")
+    if locked_version != V8_VERSION:
+        raise RuntimeError(
+            f"scripts/dev.py pins V8 {V8_VERSION}, but Cargo.lock resolves {locked_version}; "
+            "update the artifact release and checksums together"
+        )
+    if environment.get("V8_FROM_SOURCE", "").lower() in {"1", "true", "yes"}:
+        return
+    archive_override = environment.get("RUSTY_V8_ARCHIVE")
+    binding_override = environment.get("RUSTY_V8_SRC_BINDING_PATH")
+    if archive_override and binding_override:
+        return
+    if archive_override or binding_override:
+        raise RuntimeError(
+            "RUSTY_V8_ARCHIVE and RUSTY_V8_SRC_BINDING_PATH must be set together"
+        )
+
+    target = target or rust_host_target()
+    checksums = V8_CHECKSUMS.get(target)
+    if checksums is None:
+        raise RuntimeError(
+            f"no pinned sandboxed V8 artifact is available for Rust target {target}"
+        )
+    archive_name, binding_name = v8_artifact_names(target)
+    cache = cache_root or Path(
+        os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+    ) / "bettercodex" / f"rusty-v8-{V8_VERSION}-{target}"
+    cache.mkdir(parents=True, exist_ok=True)
+    with (cache / ".download.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        archive = cache / archive_name
+        binding = cache / binding_name
+        download_verified(f"{V8_RELEASE}/{archive_name}", archive, checksums[0])
+        download_verified(f"{V8_RELEASE}/{binding_name}", binding, checksums[1])
+
+    environment["RUSTY_V8_ARCHIVE"] = os.fspath(archive)
+    environment["RUSTY_V8_SRC_BINDING_PATH"] = os.fspath(binding)
+
+
 def cargo_environment() -> tuple[dict[str, str], Path]:
     target = worktree_target()
     target.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     environment["CARGO_TARGET_DIR"] = os.fspath(target)
+    configure_v8_environment(environment)
     return environment, target
 
 
@@ -240,6 +381,7 @@ def command_install(arguments: argparse.Namespace) -> int:
     target.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     environment["CARGO_TARGET_DIR"] = os.fspath(target)
+    configure_v8_environment(environment)
 
     with install_lock(install_root):
         for _ in range(MAX_INSTALL_ATTEMPTS):

@@ -37,6 +37,8 @@ pub(crate) enum RuntimeCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PendingRuntimeMode {
+    #[cfg(test)]
+    Continue,
     PauseUntilResumed,
 }
 
@@ -298,6 +300,8 @@ fn next_runtime_command(
 
         let _ = event_tx.send(RuntimeEvent::Pending);
         match pending_mode {
+            #[cfg(test)]
+            PendingRuntimeMode::Continue => return command_rx.recv().ok(),
             PendingRuntimeMode::PauseUntilResumed => match control_rx.recv().ok()? {
                 RuntimeControlCommand::Continue => return command_rx.recv().ok(),
                 RuntimeControlCommand::Resume => continue,
@@ -329,4 +333,191 @@ fn send_result(
         stored_value_writes,
         error_text,
     });
+}
+// Ported from OpenAI Codex commit 1669c2403f793d0230065397dfc25f52b844244e.
+// Source: codex-rs/code-mode-runtime/src/runtime/mod.rs.
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use pretty_assertions::assert_eq;
+    use tokio::sync::mpsc;
+
+    use super::ExecuteRequest;
+    use super::PendingRuntimeMode;
+    use super::RuntimeCommand;
+    use super::RuntimeControlCommand;
+    use super::RuntimeEvent;
+    use super::spawn_runtime;
+    use super::spawn_supervised_runtime_thread;
+    use crate::tools::code_runtime::FunctionCallOutputContentItem;
+
+    fn execute_request(source: &str) -> ExecuteRequest {
+        ExecuteRequest {
+            tool_call_id: "call_1".to_string(),
+            enabled_tools: Vec::new(),
+            source: source.to_string(),
+            yield_time_ms: Some(1),
+            max_output_tokens: None,
+        }
+    }
+
+    #[test]
+    fn linked_v8_has_sandbox_enabled() {
+        unsafe extern "C" {
+            fn v8__V8__IsSandboxEnabled() -> bool;
+        }
+
+        // `rusty_v8` exposes this symbol for verifying linked sandbox support.
+        assert!(
+            unsafe { v8__V8__IsSandboxEnabled() },
+            "code mode must link against sandbox-enabled V8"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_thread_panic_before_initialization_is_reported_directly() {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        drop(event_rx);
+        let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
+        spawn_supervised_runtime_thread(
+            event_tx,
+            Some(std::sync::Arc::new(move |reason| {
+                let _ = failure_tx.send(reason);
+            })),
+            || panic!("runtime thread panic probe"),
+        );
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
+                .await
+                .expect("runtime failure timeout")
+                .expect("runtime failure"),
+            "code-mode V8 runtime thread panicked"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_thread_panic_is_forwarded_without_owner_supervision() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        spawn_supervised_runtime_thread(
+            event_tx,
+            /*task_failure_handler*/ None,
+            || panic!("runtime thread panic probe"),
+        );
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("runtime panic event timeout"),
+            Some(RuntimeEvent::ThreadPanicked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminate_execution_stops_cpu_bound_module() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_runtime_tx, _runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
+            std::sync::Arc::new(HashMap::new()),
+            execute_request("while (true) {}"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let started_event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(started_event, RuntimeEvent::Started));
+
+        assert!(runtime_terminate_handle.terminate_execution());
+
+        let result_event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RuntimeEvent::Result { error_text, .. } = result_event else {
+            panic!("expected runtime result after termination");
+        };
+        assert!(error_text.is_some());
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_mode_freezes_runtime_commands_until_resume() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (runtime_tx, runtime_control_tx, _runtime_terminate_handle) = spawn_runtime(
+            std::sync::Arc::new(HashMap::new()),
+            execute_request(
+                r#"
+await new Promise((resolve) => setTimeout(resolve, 60_000));
+text("after");
+await new Promise(() => {});
+"#,
+            ),
+            event_tx,
+            PendingRuntimeMode::PauseUntilResumed,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RuntimeEvent::Started
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RuntimeEvent::Pending
+        ));
+
+        runtime_tx
+            .send(RuntimeCommand::TimeoutFired { id: 1 })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .is_err()
+        );
+
+        runtime_control_tx
+            .send(RuntimeControlCommand::Resume)
+            .unwrap();
+
+        let content_event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RuntimeEvent::ContentItem(FunctionCallOutputContentItem::InputText { text }) =
+            content_event
+        else {
+            panic!("expected resumed runtime output");
+        };
+        assert_eq!(text, "after");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RuntimeEvent::Pending
+        ));
+
+        runtime_control_tx
+            .send(RuntimeControlCommand::Terminate)
+            .unwrap();
+    }
 }
