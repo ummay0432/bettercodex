@@ -27,6 +27,8 @@ use anyhow::anyhow;
 use input::ImageDetail;
 use input::UserInput;
 use rollout::ResumeSelector;
+use std::fmt;
+use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
@@ -39,9 +41,36 @@ const MODEL: &str = "gpt-5.6-sol";
 
 fn main() {
     if let Err(error) = managed_session::restore_environment().and_then(|()| run()) {
-        eprintln!("error: {error:#}");
+        if is_broken_pipe(&error) {
+            return;
+        }
+        let _ = write_stderr_line(format_args!("error: {error:#}"));
         std::process::exit(1);
     }
+}
+
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn write_stdout(arguments: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    output.write_fmt(arguments)?;
+    output.flush()
+}
+
+fn write_stdout_line(arguments: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    writeln!(output, "{arguments}")
+}
+
+fn write_stderr_line(arguments: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut output = io::stderr().lock();
+    writeln!(output, "{arguments}")
 }
 
 fn run() -> Result<()> {
@@ -49,31 +78,31 @@ fn run() -> Result<()> {
     let command = Command::parse(arguments.iter().cloned())?;
     match command {
         Command::Help => {
-            print_help();
+            write_help()?;
             Ok(())
         }
         Command::Version => {
-            println!("bcodex {}", env!("CARGO_PKG_VERSION"));
+            write_stdout_line(format_args!("bcodex {}", env!("CARGO_PKG_VERSION")))?;
             Ok(())
         }
         Command::ToolCatalogue => {
-            println!("{}", tools::catalogue_text());
+            write_stdout_line(format_args!("{}", tools::catalogue_text()))?;
             Ok(())
         }
         Command::ToolCatalogueStats => {
-            println!("{}", tool_catalogue_stats());
+            write_stdout_line(format_args!("{}", tool_catalogue_stats()))?;
             Ok(())
         }
         Command::ToolContextJson => {
             let cwd = std::env::current_dir()?.canonicalize()?;
-            println!(
+            write_stdout_line(format_args!(
                 "{}",
                 serde_json::json!({
                     "instructions": api::harness_instructions(),
                     "stable_prefix": api::stable_request_prefix(),
                     "world_state": context::initial_context_items(&cwd)?,
                 })
-            );
+            ))?;
             Ok(())
         }
         Command::Run(options) => run_agent_command(&arguments, options, None),
@@ -115,7 +144,7 @@ async fn run_agent(
     if !options.prompt.is_empty() || !options.images.is_empty() {
         let input = UserInput::from_paths(options.prompt, &options.images, options.image_detail)?;
         let answer = agent.submit_user_input(input).await?;
-        println!("{answer}");
+        write_stdout_line(format_args!("{answer}"))?;
         return Ok(());
     }
 
@@ -127,17 +156,18 @@ async fn run_agent(
 }
 
 async fn run_line_mode(agent: &mut Agent) -> Result<()> {
-    eprintln!(
+    write_stderr_line(format_args!(
         "bettercodex · {MODEL} · max · session {}",
         agent.session_id()
-    );
-    eprintln!("Commands run with your user permissions. Ctrl-D exits.\n");
+    ))?;
+    write_stderr_line(format_args!(
+        "Commands run with your user permissions. Ctrl-D exits.\n"
+    ))?;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
-        print!("> ");
-        std::io::stdout().flush()?;
+        write_stdout(format_args!("> "))?;
         let Some(line) = lines.next_line().await? else {
-            println!();
+            write_stdout_line(format_args!(""))?;
             break;
         };
         let prompt = line.trim();
@@ -145,8 +175,8 @@ async fn run_line_mode(agent: &mut Agent) -> Result<()> {
             continue;
         }
         match agent.submit(prompt).await {
-            Ok(answer) => println!("{answer}\n"),
-            Err(error) => eprintln!("error: {error:#}\n"),
+            Ok(answer) => write_stdout_line(format_args!("{answer}\n"))?,
+            Err(error) => write_stderr_line(format_args!("error: {error:#}\n"))?,
         }
     }
     Ok(())
@@ -263,11 +293,11 @@ impl Command {
     }
 }
 
-fn print_help() {
-    println!(
+fn write_help() -> io::Result<()> {
+    write_stdout_line(format_args!(
         "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Automatic tmux sessions are on by default and can be changed with /tmux; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
-    );
+    ))
 }
 
 fn tool_catalogue_stats() -> String {
