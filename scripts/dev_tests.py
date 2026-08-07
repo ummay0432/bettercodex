@@ -185,5 +185,23 @@ class SandboxedV8Tests(unittest.TestCase):
             self.assertFalse((cache / archive_name).exists())
 
 
+class ToolContextAuditTests(unittest.TestCase):
+    class CharacterEncoding:
+        @staticmethod
+        def encode(text: str) -> list[str]:
+            return list(text)
+
+    def test_exec_section_table_tracks_the_compact_catalogue_layout(self) -> None:
+        table = dev.exec_section_table(
+            "runtime\n\nTools:\n- x\n\nDefaults: default\n\n```ts\nT",
+            self.CharacterEncoding(),
+        )
+
+        self.assertIn("| Runtime and orchestration | 7 | 7 | 2 |", table)
+        self.assertIn("| Tool purposes and web policy | 10 | 10 | 3 |", table)
+        self.assertIn("| Defaults, limits, and process results | 17 | 17 | 5 |", table)
+        self.assertIn("| Schema-derived TypeScript | 7 | 7 | 2 |", table)
+
+
 if __name__ == "__main__":
     unittest.main()

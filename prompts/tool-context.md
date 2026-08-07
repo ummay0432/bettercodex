@@ -5,13 +5,14 @@ context window. It is documentation and is not itself sent to the model.
 
 The audit baseline is OpenAI Codex commit
 `1669c2403f793d0230065397dfc25f52b844244e`, which bettercodex pins for the
-shared Code Mode protocol and utility crates. The fixed Code Mode catalogue and
-specifications were rechecked against Codex commit
-`6d4d9442c7142c08ac5c5098dfd6e82d8cd9f65a` on 2026-08-04, and the upstream
-description renderer was rechecked at
-[`fa5d5ae047d1891a2f816c22d9ed926a0728ba47`](https://github.com/openai/codex/blob/fa5d5ae047d1891a2f816c22d9ed926a0728ba47/codex-rs/code-mode-protocol/src/description.rs)
-on 2026-08-05. bettercodex keeps its runtime protocol and schema-to-TypeScript
-renderer but deliberately uses shorter descriptions for its fixed surface.
+shared Code Mode protocol and utility crates. The fixed catalogue, wrapper
+specifications, and upstream description renderer were rechecked against Codex
+commit
+[`c5d94319715d2598a2e8b2b7d0e21a3b1e83aec6`](https://github.com/openai/codex/tree/c5d94319715d2598a2e8b2b7d0e21a3b1e83aec6)
+on 2026-08-07. bettercodex keeps the runtime protocol and Codex's
+schema-to-TypeScript conversion. Its fixed seven-tool surface uses one compact
+declaration block instead of Codex's dynamic per-tool headings, prose, wrapper,
+and fenced declaration.
 
 ## Request order
 
@@ -76,7 +77,7 @@ reproducible estimates:
   used by bettercodex for text history estimates.
 
 The JSON figures use compact serialization with sorted object keys. Counts are
-the audited 2026-08-06 snapshot. `./scripts/dev.py tool-context --check`
+the audited 2026-08-07 snapshot. `./scripts/dev.py tool-context --check`
 renders the actual request items and verifies the stable rows;
 `./scripts/dev.py tool-context --update` rewrites all three tables. The command
 uses pinned `tiktoken` 0.11.0 through `uv` when the module is not already
@@ -85,22 +86,25 @@ on the Responses API's default implicit prompt caching. It sends no explicit
 cache breakpoint or `prompt_cache_options`. Caching reduces repeated input
 billing; it does not remove cached input from the active context window.
 
-The previous catalogue snapshot was 20,440 bytes, 5,195 `o200k` tokens, and
-5,110 bytes/4 tokens. The current item retains the same two request tools, seven
-nested tools, input schemas, output schemas, JavaScript names, and runtime
-behavior while reducing those estimates by 45.0% of bytes, 43.4% of `o200k`
-tokens, and 45.0% of bytes/4 tokens.
+The immediately preceding item was 11,370 bytes, 2,964 `o200k` tokens, and 2,843
+bytes/4 tokens. The current item retains the same two request tools, seven nested
+tools, input fields, enums, JavaScript names, and runtime behavior while reducing
+those estimates by 55.4% of bytes, 53.5% of `o200k` tokens, and 55.4% of bytes/4
+tokens. It also replaces three vague `unknown` returns with their implemented
+shapes: empty objects for `apply_patch` and `update_plan`, and a string for
+`web__run`. Relative to the original 20,440-byte catalogue, the reduction is
+75.2%.
 
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable harness input: `instructions` plus `additional_tools` | 20,116 | 4,733 | 5,029 |
-| Complete `additional_tools` developer item | 11,370 | 2,964 | 2,843 |
-| Top-level `exec` specification | 10,486 | 2,766 | 2,622 |
-| `exec` description only | 9,859 | 2,396 | 2,465 |
-| `exec` Lark grammar only | 177 | 58 | 45 |
-| Top-level `wait` specification | 826 | 186 | 207 |
-| `wait` description only | 247 | 62 | 62 |
+| Complete stable harness input: `instructions` plus `additional_tools` | 13,819 | 3,148 | 3,455 |
+| Complete `additional_tools` developer item | 5,073 | 1,379 | 1,269 |
+| Top-level `exec` specification | 4,577 | 1,260 | 1,145 |
+| `exec` description only | 4,353 | 1,162 | 1,089 |
+| `exec` Lark grammar only | 31 | 12 | 8 |
+| Top-level `wait` specification | 438 | 107 | 110 |
+| `wait` description only | 151 | 40 | 38 |
 | Top-level `instructions` request field | 8,735 | 1,766 | 2,184 |
 | `prompts/system.md` text only | 8,642 | 1,699 | 2,161 |
 <!-- bcodex-tool-context:stable:end -->
@@ -111,24 +115,22 @@ nested tool declaration. This is the text-only breakdown:
 <!-- bcodex-tool-context:sections:start -->
 | Section inside `exec` | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Runtime rules and global helpers | 989 | 221 | 248 |
-| `apply_patch` | 336 | 76 | 84 |
-| `exec_command` | 1,403 | 329 | 351 |
-| `log_papercut` | 397 | 106 | 100 |
-| `update_plan` | 498 | 126 | 125 |
-| `view_image` | 654 | 153 | 164 |
-| `write_stdin` | 1,169 | 267 | 293 |
-| `web` namespace and `web__run` | 4,406 | 1,118 | 1,102 |
+| Runtime and orchestration | 566 | 145 | 142 |
+| Tool purposes and web policy | 1,800 | 445 | 450 |
+| Defaults, limits, and process results | 355 | 108 | 89 |
+| Schema-derived TypeScript | 1,626 | 464 | 407 |
 <!-- bcodex-tool-context:sections:end -->
 
 The full `exec` description is stored verbatim in
 [`tool-catalogue.md`](tool-catalogue.md). A snapshot test compares that file to
 the string produced by `src/tools/catalogue.rs`, and `bcodex --tool-catalogue`
 prints the same generated string. Tool declarations still use Codex's
-`render_code_mode_sample` and `render_json_schema_to_typescript`; only the fixed
-runtime preamble, web guidance, and `wait` description are concise
-bettercodex-owned text. The full-description row is authoritative; the section
-rows exclude the separator newline before each heading.
+`render_json_schema_to_typescript` after recursively omitting descriptive JSON
+Schema metadata. The fixed renderer removes insignificant TypeScript whitespace,
+shares the repeated process result type, and emits one declaration block. Schema
+property names, required/optional markers, arrays, enums, and return fields remain
+generated from the source schemas. The full-description row is authoritative;
+the section rows exclude their separator newlines.
 
 ## Description design and evaluation
 
@@ -137,11 +139,12 @@ says to remove repeated instructions and examples, keep tool descriptions
 concise and precise, and rerun the same representative evaluations after each
 change. The [function-calling guide](https://developers.openai.com/api/docs/guides/function-calling#token-usage)
 confirms that tool definitions consume context and recommends shortening
-descriptions while retaining clear purpose, parameters, formats, outputs, and
-measured examples. The compact catalogue follows that boundary: it removes
-generic MCP, audio, and image-generation guidance and ten redundant web-call
-examples, but retains the typed input/output declarations and every web routing,
-source, citation, and quotation constraint applicable to this product.
+descriptions while retaining clear purpose, parameters, formats, and outputs.
+The compact catalogue follows that boundary: each instruction appears once;
+input and output types remain complete; runtime defaults, process-state fields,
+web routing, source selection, citations, and quotation limits remain explicit.
+Only repeated headings, declaration wrappers, schema-comment prose, formatting
+whitespace, and behavior irrelevant to bettercodex's fixed surface are absent.
 
 Published evidence is directionally supportive but not treated as proof for
 Sol. [EASYTOOL](https://aclanthology.org/2025.naacl-long.44/) found that
@@ -156,7 +159,32 @@ rule requires at least a 35% catalogue reduction with no lower aggregate or
 per-case pass count; differing cases receive one additional matched repetition,
 with all outcomes retained.
 
-The frozen 2026-08-05 run evaluated 12 cases twice per arm in randomized order.
+The frozen runner was used unchanged for this single-block renderer. An early
+development run caught one candidate response exposing a native internal
+citation marker (23/24 versus 24/24 baseline). The web contract was corrected
+to make internal IDs and native markers explicitly call-only. Because that
+changed model-visible text, the result below is a fresh full matrix after the
+fix and the final input-format review, not a selective retry:
+
+| Recorded measure | Previous catalogue | Single-block catalogue | Change |
+| --- | ---: | ---: | ---: |
+| Hard-graded passes | 24/24 | 24/24 | tied |
+| Complete catalogue `o200k` estimate | 2,964 | 1,379 | -53.5% |
+| Aggregate backend input tokens | 509,831 | 352,612 | -30.8% |
+| Aggregate output tokens | 13,686 | 12,901 | -5.7% |
+| Aggregate reasoning-output tokens | 6,095 | 6,014 | -1.3% |
+| Aggregate wall time | 468.130 s | 420.131 s | -10.3% |
+
+Every case tied 2/2, so the extra-repetition rule did not trigger. Aggregate
+usage and timing differences are observations from this randomized low-sample
+run, not performance claims. The complete 48-run artifact is
+[`2026-08-07-single-block-ab.json`](../evaluations/tool-catalogue/2026-08-07-single-block-ab.json)
+(SHA-256
+`8b68a6fda4d62b15e650d779ef3bfed41218802c98703a6fcf7ee6e2320e1dc5`).
+
+The frozen 2026-08-05 run predates this single-block renderer and is retained as
+historical evidence for the preceding concise catalogue, not as validation of
+the current change. It evaluated 12 cases twice per arm in randomized order.
 Both catalogues passed every hard grade and every case was tied 2/2, so the
 predeclared extra-repetition rule did not trigger. The candidate met the
 catalogue-reduction threshold and the no-regression acceptance rules:
@@ -213,14 +241,14 @@ Only two tools are visible directly to Sol.
 [`tool-catalogue.md`](tool-catalogue.md). Its format is this exact Lark grammar:
 
 ```lark
-start: pragma_source | plain_source
-pragma_source: PRAGMA_LINE NEWLINE SOURCE
-plain_source: SOURCE
-
-PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
-NEWLINE: /\r?\n/
+start: SOURCE
 SOURCE: /[\s\S]+/
 ```
+
+This accepts the same nonempty source language as the previous grammar because
+its `plain_source: SOURCE` branch already matched every character sequence. The
+Rust `parse_exec_source` implementation remains responsible for recognizing and
+validating an optional first-line pragma.
 
 The description exposes seven nested tools through the JavaScript `tools`
 object: `apply_patch`, `exec_command`, `log_papercut`, `update_plan`,
@@ -235,7 +263,7 @@ quotation rules without Codex's broad-product examples and repetition.
 `wait` is a non-strict function tool. Its exact description is:
 
 ```text
-Resume a yielded `exec` cell. Use only the `cell_id` returned by `exec`; call `wait` again while the cell remains active. Each call returns only new output. `terminate: true` stops the cell. Waiting and output default to 10000 ms and 10000 tokens.
+Continue yielded `exec` by `cell_id`; returns only new output. Repeat while active; `terminate:true` stops. `yield_time_ms`/`max_tokens` default 10000.
 ```
 
 Its exact input schema is:
@@ -244,22 +272,10 @@ Its exact input schema is:
 {
   "type": "object",
   "properties": {
-    "cell_id": {
-      "type": "string",
-      "description": "Identifier of the running exec cell."
-    },
-    "yield_time_ms": {
-      "type": "number",
-      "description": "Wait before yielding more output. Defaults to 10000 ms."
-    },
-    "max_tokens": {
-      "type": "number",
-      "description": "Output token budget for this wait call. Defaults to 10000 tokens."
-    },
-    "terminate": {
-      "type": "boolean",
-      "description": "True stops the running exec cell; false or omitted waits for output."
-    }
+    "cell_id": {"type": "string"},
+    "yield_time_ms": {"type": "number"},
+    "max_tokens": {"type": "number"},
+    "terminate": {"type": "boolean"}
   },
   "required": ["cell_id"],
   "additionalProperties": false

@@ -605,28 +605,15 @@ def metric_table(rows: list[tuple[str, Metrics]]) -> str:
 
 
 def exec_section_table(description: str, encoding: Any) -> str:
-    headings = [
-        ("`apply_patch`", "### `apply_patch`"),
-        ("`exec_command`", "### `exec_command`"),
-        ("`log_papercut`", "### `log_papercut`"),
-        ("`update_plan`", "### `update_plan`"),
-        ("`view_image`", "### `view_image`"),
-        ("`write_stdin`", "### `write_stdin`"),
-        ("`web` namespace and `web__run`", "## web"),
+    runtime, remainder = description.split("\n\nTools:\n", maxsplit=1)
+    tools, remainder = remainder.split("\n\nDefaults: ", maxsplit=1)
+    defaults, declarations = remainder.split("\n\n```ts\n", maxsplit=1)
+    rows = [
+        ("Runtime and orchestration", metrics(runtime, encoding)),
+        ("Tool purposes and web policy", metrics(f"Tools:\n{tools}", encoding)),
+        ("Defaults, limits, and process results", metrics(f"Defaults: {defaults}", encoding)),
+        ("Schema-derived TypeScript", metrics(f"```ts\n{declarations}", encoding)),
     ]
-    starts = [description.index(heading) for _, heading in headings]
-    chunks = [description[: starts[0] - 1]]
-    for index, start in enumerate(starts):
-        end = starts[index + 1] if index + 1 < len(starts) else len(description)
-        chunk = description[start:end]
-        if index + 1 < len(starts) and chunk.endswith("\n\n"):
-            chunk = chunk[:-1]
-        chunks.append(chunk)
-    rows = [("Runtime rules and global helpers", metrics(chunks[0], encoding))]
-    rows.extend(
-        (label, metrics(chunk, encoding))
-        for (label, _), chunk in zip(headings, chunks[1:], strict=True)
-    )
     return metric_table(rows).replace("Injected component", "Section inside `exec`")
 
 

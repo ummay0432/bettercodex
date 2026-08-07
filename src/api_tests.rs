@@ -585,7 +585,7 @@ fn request_uses_instructions_and_one_stable_tool_prefix() {
     assert_eq!(&first_input[..1], stable_request_prefix());
     assert_eq!(
         serde_json::to_string(&first_input[..1]).unwrap().len(),
-        11_372,
+        5_075,
         "run ./scripts/dev.py tool-context --update"
     );
     assert!(first_input.iter().all(|item| {
@@ -609,9 +609,8 @@ fn request_uses_instructions_and_one_stable_tool_prefix() {
 fn request_bakes_in_the_fixed_exec_runtime() {
     let client = test_client("http://127.0.0.1:1".to_string());
     let request = client.build_request(vec![user_message("run tools")], RequestKind::Turn);
-    let request_tools = request["input"][0]["tools"]
-        .as_array()
-        .unwrap()
+    let request_tool_specs = request["input"][0]["tools"].as_array().unwrap();
+    let request_tools = request_tool_specs
         .iter()
         .map(|tool| {
             (
@@ -624,6 +623,18 @@ fn request_bakes_in_the_fixed_exec_runtime() {
     assert_eq!(
         request_tools,
         vec![("custom", "exec"), ("function", "wait")]
+    );
+    assert_eq!(
+        request_tool_specs[0]["description"],
+        tools::catalogue_text()
+    );
+    assert_eq!(
+        request_tool_specs[0]["format"]["definition"],
+        "start: SOURCE\nSOURCE: /[\\s\\S]+/"
+    );
+    assert_eq!(
+        request_tool_specs[1]["parameters"]["required"],
+        json!(["cell_id"])
     );
     assert_eq!(request["tool_choice"], "auto");
     assert_eq!(request["parallel_tool_calls"], false);

@@ -36,7 +36,7 @@ fn renders_on_the_shared_codex_command_surface() {
             "    ├─ ● write_stdin",
             "    └─ ● web__run",
             "",
-            "  9 tools · ~2.8K prompt tokens",
+            "  9 tools · ~1.3K prompt tokens",
             "",
             "  Press esc to go back",
         ]
