@@ -7,11 +7,14 @@ mod context;
 mod events;
 mod input;
 mod managed_session;
+mod operator_settings;
+mod paths;
 mod prompt_history;
 mod repository;
 mod rollout;
 mod skill_settings;
 mod skills;
+mod state_file;
 mod system_skills;
 mod tools;
 mod tui;
@@ -35,7 +38,7 @@ use uuid::Uuid;
 const MODEL: &str = "gpt-5.6-sol";
 
 fn main() {
-    if let Err(error) = run() {
+    if let Err(error) = managed_session::restore_environment().and_then(|()| run()) {
         eprintln!("error: {error:#}");
         std::process::exit(1);
     }
@@ -86,14 +89,23 @@ fn run_agent_command(
     resume: Option<ResumeSelector>,
 ) -> Result<()> {
     let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    managed_session::enter(arguments, interactive_terminal)?;
+    let tmux_mode = if interactive_terminal {
+        operator_settings::load_tmux_mode()?
+    } else {
+        operator_settings::TmuxMode::default()
+    };
+    managed_session::enter(arguments, interactive_terminal, tmux_mode)?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_agent(options, resume))
+        .block_on(run_agent(options, resume, tmux_mode))
 }
 
-async fn run_agent(options: RunOptions, resume: Option<ResumeSelector>) -> Result<()> {
+async fn run_agent(
+    options: RunOptions,
+    resume: Option<ResumeSelector>,
+    tmux_mode: operator_settings::TmuxMode,
+) -> Result<()> {
     let requested_cwd = std::env::current_dir()?;
     let mut agent = match resume {
         Some(selector) => Agent::resume(&requested_cwd, selector)?,
@@ -108,7 +120,7 @@ async fn run_agent(options: RunOptions, resume: Option<ResumeSelector>) -> Resul
     }
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return tui::run(agent, cwd).await;
+        return tui::run(agent, cwd, tmux_mode).await;
     }
 
     run_line_mode(&mut agent).await
@@ -253,7 +265,7 @@ impl Command {
 
 fn print_help() {
     println!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Interactive runs automatically occupy the first free c1, c2, … tmux session, and macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Automatic tmux sessions are on by default and can be changed with /tmux; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     );
 }

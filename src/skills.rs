@@ -1,3 +1,4 @@
+use crate::paths;
 use crate::repository;
 use crate::skill_settings;
 use crate::system_skills;
@@ -225,7 +226,7 @@ impl WarningCollector {
 
 impl SkillCatalog {
     pub(crate) fn load(cwd: &Path) -> Self {
-        let home = bettercodex_home();
+        let home = paths::bettercodex_home();
         Self::load_with_home(cwd, home.as_deref())
     }
 
@@ -479,14 +480,14 @@ impl SkillCatalog {
 }
 
 pub(crate) fn save_skill_update(path: &Path, update: SkillUpdate) -> Result<()> {
-    let home = bettercodex_home().ok_or_else(|| {
+    let home = paths::bettercodex_home().ok_or_else(|| {
         anyhow!("cannot save skill settings because neither BCODEX_HOME nor HOME is set")
     })?;
     skill_settings::save(&home.join(skill_settings::FILE_NAME), path, update)
 }
 
 fn settings_file_display() -> String {
-    bettercodex_home().map_or_else(
+    paths::bettercodex_home().map_or_else(
         || "${BCODEX_HOME:-$HOME/.bcodex}/skills.json".to_string(),
         |home| home.join(skill_settings::FILE_NAME).display().to_string(),
     )
@@ -529,12 +530,6 @@ fn discovery_roots_with_home(
         roots.push((system_skills::root(home), SkillScope::System));
     }
     roots
-}
-
-fn bettercodex_home() -> Option<PathBuf> {
-    std::env::var_os("BCODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bcodex")))
 }
 
 fn discover_skill_files(root: &Path, warnings: &mut WarningCollector) -> Vec<PathBuf> {

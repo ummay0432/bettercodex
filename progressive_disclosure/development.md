@@ -117,11 +117,16 @@ and host rather than treating it as an exact allocator measurement.
 
 ## Managed terminal sessions
 
-Interactive agent invocations outside tmux automatically create and attach to
-the first free `c1`, `c2`, … session. The pane is dedicated to the bettercodex
-process lifecycle: disconnecting a client leaves it running, while exiting
-bettercodex destroys the session and releases its name. Interactive use requires
-tmux on both Linux and macOS.
+Automatic tmux management is enabled by default and can be changed from the TUI
+with `/tmux` or directly with `/tmux on|off`. When enabled, interactive agent
+invocations outside tmux create and attach to the first free `c1`, `c2`, …
+session. The pane is dedicated to the bettercodex process lifecycle:
+disconnecting a client leaves it running, while exiting bettercodex destroys the
+session and releases its name. Toggling the setting affects the next launch and
+does not move or close the current session. When disabled, startup does not
+invoke tmux at all. Automatic management requires tmux on both Linux and macOS
+when enabled. The invoking environment crosses an existing tmux server through a
+private one-use file; never put its values back into tmux command-line arguments.
 
 On macOS, every agent invocation re-executes once through
 `/usr/bin/caffeinate -i -s`. The wrapper is process-scoped and exits with

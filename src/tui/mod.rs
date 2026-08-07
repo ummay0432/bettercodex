@@ -21,6 +21,7 @@ mod table_detect;
 mod terminal;
 mod terminal_hyperlinks;
 mod terminal_title;
+mod tmux_view;
 mod tool_catalogue;
 mod view;
 mod width;
@@ -34,6 +35,8 @@ use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
 use crate::input::UserPrompt;
+use crate::operator_settings;
+use crate::operator_settings::TmuxMode;
 use crate::prompt_history::PromptHistory;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
@@ -93,8 +96,8 @@ impl TurnCompletion {
     }
 }
 
-pub(crate) async fn run(agent: Agent, cwd: PathBuf) -> Result<()> {
-    let mut runtime = Runtime::new(agent, cwd)?;
+pub(crate) async fn run(agent: Agent, cwd: PathBuf, tmux_mode: TmuxMode) -> Result<()> {
+    let mut runtime = Runtime::new(agent, cwd, tmux_mode)?;
     let mut session = terminal::TerminalSession::enter()?;
     runtime
         .view
@@ -145,8 +148,8 @@ struct OperatorCommandCompletion {
 }
 
 impl Runtime {
-    fn new(mut agent: Agent, cwd: PathBuf) -> Result<Self> {
-        let mut view = View::new(&cwd);
+    fn new(mut agent: Agent, cwd: PathBuf, tmux_mode: TmuxMode) -> Result<Self> {
+        let mut view = View::with_tmux_mode(&cwd, tmux_mode);
         view.replay_transcript(agent.take_resumed_transcript());
         view.set_skills(agent.skills().to_vec());
         for warning in agent.skill_warnings() {
@@ -481,6 +484,12 @@ impl Runtime {
                 self.view
                     .add_notice(format!("Stopped {count} background terminal{plural}"));
             }
+            Action::SetTmuxMode(mode) => match operator_settings::save_tmux_mode(mode) {
+                Ok(()) => self.view.tmux_update_succeeded(mode),
+                Err(error) => self
+                    .view
+                    .tmux_update_failed(format!("Could not update tmux setting: {error:#}")),
+            },
             Action::UpdateSkill { path, update } => {
                 let result = self
                     .agent

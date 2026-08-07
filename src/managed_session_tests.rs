@@ -18,6 +18,18 @@ fn first_gap_is_reused() {
 }
 
 #[test]
+fn automatic_tmux_requires_an_enabled_outside_interactive_launch() {
+    assert!(should_launch_in_tmux(true, None, TmuxMode::On));
+    assert!(!should_launch_in_tmux(true, None, TmuxMode::Off));
+    assert!(!should_launch_in_tmux(false, None, TmuxMode::On));
+    assert!(!should_launch_in_tmux(
+        true,
+        Some(OsStr::new("/tmp/tmux,1,0")),
+        TmuxMode::On
+    ));
+}
+
+#[test]
 fn tmux_is_not_started_for_an_unsuitable_terminal() {
     assert!(ensure_attachable_terminal(None).is_err());
     assert!(ensure_attachable_terminal(Some(OsStr::new(""))).is_err());
@@ -38,7 +50,9 @@ fn tmux_creation_is_detached_sized_and_self_cleaning() {
             "keep \\;".to_string(),
         ],
         Some((151, 47)),
-        &[OsString::from("BCODEX_HOME=/state dir;")],
+        &[OsString::from(
+            "BCODEX_MANAGED_ENVIRONMENT=/tmp/environment;",
+        )],
     );
     assert_eq!(
         arguments,
@@ -59,7 +73,7 @@ fn tmux_creation_is_detached_sized_and_self_cleaning() {
             "-y",
             "47",
             "-e",
-            "BCODEX_HOME=/state dir\\;",
+            "BCODEX_MANAGED_ENVIRONMENT=/tmp/environment\\;",
             "--",
             "/opt/bcodex",
             "resume",
@@ -87,6 +101,60 @@ fn tmux_creation_is_detached_sized_and_self_cleaning() {
         ]
         .map(OsString::from)
     );
+}
+
+#[test]
+fn managed_environment_round_trips_non_utf8_values_without_reserved_variables() {
+    let environment = vec![
+        (OsString::from("Z_VALUE"), OsString::from("last")),
+        (
+            OsString::from("A_VALUE"),
+            OsString::from_vec(vec![b'v', b'=', 0xff]),
+        ),
+    ];
+
+    let encoded = encode_environment(environment).unwrap();
+
+    assert_eq!(
+        decode_environment(&encoded).unwrap(),
+        vec![
+            (
+                OsString::from("A_VALUE"),
+                OsString::from_vec(vec![b'v', b'=', 0xff]),
+            ),
+            (OsString::from("Z_VALUE"), OsString::from("last")),
+        ]
+    );
+}
+
+#[test]
+fn managed_environment_rejects_truncation_duplicates_and_tmux_variables() {
+    assert!(decode_environment(b"NAME=value").is_err());
+    assert!(decode_environment(b"=value\0").is_err());
+    assert!(decode_environment(b"NAME=one\0NAME=two\0").is_err());
+    assert!(decode_environment(b"TMUX=spoofed\0").is_err());
+    assert!(decode_environment(b"BCODEX_MANAGED_ENVIRONMENT=again\0").is_err());
+}
+
+#[test]
+fn environment_snapshot_is_private_and_self_cleaning() {
+    let snapshot = EnvironmentSnapshot::capture().unwrap();
+    let path = snapshot.path.clone();
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert!(metadata.is_file());
+    assert_eq!(metadata.mode() & 0o077, 0);
+    assert!(
+        snapshot
+            .tmux_variable()
+            .as_bytes()
+            .starts_with(b"BCODEX_MANAGED_ENVIRONMENT=")
+    );
+
+    drop(snapshot);
+
+    assert!(!path.exists());
+    assert!(validate_environment_path(Path::new("relative-environment")).is_err());
+    assert!(validate_environment_path(Path::new("/tmp/not-bettercodex")).is_err());
 }
 
 #[test]

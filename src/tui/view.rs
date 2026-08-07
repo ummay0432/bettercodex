@@ -19,6 +19,8 @@ use super::skills_view::SkillsView;
 use super::skills_view::SkillsViewAction;
 use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
+use super::tmux_view::TmuxView;
+use super::tmux_view::TmuxViewAction;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
 use crate::MODEL;
@@ -30,6 +32,7 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
+use crate::operator_settings::TmuxMode;
 use crate::rollout::SessionTranscriptItem;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
@@ -136,6 +139,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "manage installed skills and invocation policy",
     },
     SlashCommand {
+        name: "tmux",
+        aliases: &[],
+        description: "configure automatic tmux sessions",
+    },
+    SlashCommand {
         name: "tools",
         aliases: &[],
         description: "inspect the active tool catalogue",
@@ -171,6 +179,7 @@ pub(super) enum Action {
     },
     ShowContext,
     ShowDiff,
+    SetTmuxMode(TmuxMode),
     StopBackgroundProcesses,
     UpdateSkill {
         path: PathBuf,
@@ -198,6 +207,7 @@ pub(super) struct View {
     file_search: FileSearchPopup,
     skill_popup: SkillPopup,
     skills: Vec<Skill>,
+    tmux_mode: TmuxMode,
     context_tokens: Option<u64>,
     background_processes: Vec<BackgroundProcess>,
     busy: bool,
@@ -453,17 +463,28 @@ enum Overlay {
     Context(ContextWindowView),
     Resume(ResumePicker),
     Skills(SkillsView),
+    Tmux(TmuxView),
     Tools(ToolCatalogueView),
 }
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 impl View {
+    #[cfg(test)]
     pub(super) fn new(cwd: &Path) -> Self {
-        Self::with_skills(cwd, Vec::new())
+        Self::with_state(cwd, Vec::new(), TmuxMode::default())
     }
 
+    #[cfg(test)]
     pub(super) fn with_skills(cwd: &Path, skills: Vec<Skill>) -> Self {
+        Self::with_state(cwd, skills, TmuxMode::default())
+    }
+
+    pub(super) fn with_tmux_mode(cwd: &Path, tmux_mode: TmuxMode) -> Self {
+        Self::with_state(cwd, Vec::new(), tmux_mode)
+    }
+
+    fn with_state(cwd: &Path, skills: Vec<Skill>, tmux_mode: TmuxMode) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             repository: Repository::discover(cwd),
@@ -477,6 +498,7 @@ impl View {
             file_search: FileSearchPopup::default(),
             skill_popup: SkillPopup::default(),
             skills,
+            tmux_mode,
             context_tokens: None,
             background_processes: Vec::new(),
             busy: false,
@@ -520,6 +542,28 @@ impl View {
         let error = error.into();
         if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
             skills.set_error(error);
+        } else {
+            self.entries
+                .push(TranscriptEntry::Error(markdown::sanitize(&error)));
+        }
+    }
+
+    pub(super) fn tmux_update_succeeded(&mut self, mode: TmuxMode) {
+        self.tmux_mode = mode;
+        if let Some(Overlay::Tmux(tmux)) = self.overlay.as_mut() {
+            tmux.clear_error();
+        } else {
+            self.entries.push(TranscriptEntry::Notice(format!(
+                "Automatic tmux sessions are {}. This applies on the next launch.",
+                mode.label()
+            )));
+        }
+    }
+
+    pub(super) fn tmux_update_failed(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        if let Some(Overlay::Tmux(tmux)) = self.overlay.as_mut() {
+            tmux.set_error(error);
         } else {
             self.entries
                 .push(TranscriptEntry::Error(markdown::sanitize(&error)));
@@ -864,7 +908,8 @@ impl View {
         skills: Vec<Skill>,
     ) {
         let user_message_style = self.user_message_style;
-        *self = Self::with_skills(cwd, skills);
+        let tmux_mode = self.tmux_mode;
+        *self = Self::with_state(cwd, skills, tmux_mode);
         self.user_message_style = user_message_style;
         self.context_tokens = context_tokens;
         self.replay_transcript(transcript);
@@ -1125,12 +1170,23 @@ impl View {
                 SkillsViewAction::Update { path, update } => Action::UpdateSkill { path, update },
             };
         }
+        if let Some(Overlay::Tmux(tmux)) = self.overlay.as_mut() {
+            return match tmux.handle_key(key, self.tmux_mode) {
+                TmuxViewAction::None => Action::None,
+                TmuxViewAction::Close => {
+                    self.overlay = None;
+                    Action::None
+                }
+                TmuxViewAction::SetMode(mode) => Action::SetTmuxMode(mode),
+            };
+        }
         if let Some(overlay) = self.overlay.as_ref() {
             let close = match overlay {
                 Overlay::Shortcuts => true,
                 Overlay::Context(context) => context.handle_key(key.code) == ContextAction::Close,
                 Overlay::Resume(_) => unreachable!("resume picker keys are handled above"),
                 Overlay::Skills(_) => unreachable!("skills keys are handled above"),
+                Overlay::Tmux(_) => unreachable!("tmux keys are handled above"),
                 Overlay::Tools(catalogue) => {
                     catalogue.handle_key(key.code) == CatalogueAction::Close
                 }
@@ -1459,6 +1515,31 @@ impl View {
                 Err(_) => {
                     self.entries.push(TranscriptEntry::Error(
                         "`/resume` expects one bettercodex session UUID".to_string(),
+                    ));
+                    Action::None
+                }
+            };
+        }
+        if local_command
+            && let Some(arguments) = command.strip_prefix("/tmux")
+            && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
+        {
+            if self.busy {
+                self.entries.push(TranscriptEntry::Error(
+                    "'/tmux' is disabled while a task is in progress.".to_string(),
+                ));
+                return Action::None;
+            }
+            return match arguments.trim() {
+                "" => {
+                    self.overlay = Some(Overlay::Tmux(TmuxView::new()));
+                    Action::None
+                }
+                "on" => Action::SetTmuxMode(TmuxMode::On),
+                "off" => Action::SetTmuxMode(TmuxMode::Off),
+                _ => {
+                    self.entries.push(TranscriptEntry::Error(
+                        "`/tmux` expects `on`, `off`, or no argument".to_string(),
                     ));
                     Action::None
                 }
@@ -1875,6 +1956,7 @@ impl View {
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills),
+            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(),
             Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
             None => 0,
         };
@@ -2034,6 +2116,7 @@ impl View {
             Some(Overlay::Context(context)) => context.render(frame, area),
             Some(Overlay::Resume(picker)) => picker.render(frame, area),
             Some(Overlay::Skills(skills)) => skills.render(frame, area, &self.skills),
+            Some(Overlay::Tmux(tmux)) => tmux.render(frame, area, self.tmux_mode),
             Some(Overlay::Tools(catalogue)) => catalogue.render(frame, area),
             None => {}
         }
@@ -2461,6 +2544,11 @@ fn is_local_command(command: &str) -> bool {
         return true;
     }
     if let Some(arguments) = command.strip_prefix("/resume")
+        && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
+    {
+        return true;
+    }
+    if let Some(arguments) = command.strip_prefix("/tmux")
         && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
     {
         return true;
@@ -5889,6 +5977,151 @@ mod tests {
             Action::None
         );
         assert!(view.overlay.is_none());
+    }
+
+    #[test]
+    fn tmux_command_opens_a_rendered_persisted_toggle() {
+        let mut view = View::with_tmux_mode(Path::new("/tmp/bettercodex"), TmuxMode::On);
+        view.welcome_pending = false;
+        view.editor.set_text("/tmu");
+
+        let height = view.desired_height(88, 24);
+        let backend = TestBackend::new(88, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("/tmux  configure automatic tmux sessions"),
+            "{rendered}"
+        );
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(view.editor.is_empty());
+        assert!(view.entries.is_empty());
+        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Tmux(_))));
+
+        let manager_height = match view.overlay.as_ref() {
+            Some(Overlay::Tmux(tmux)) => tmux.preferred_height(),
+            _ => panic!("expected tmux overlay"),
+        };
+        let backend = TestBackend::new(88, manager_height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("[x] Automatic tmux sessions (on)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("next launch"), "{rendered}");
+        assert!(!rendered.contains(MODEL), "{rendered}");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+            ))),
+            Action::SetTmuxMode(TmuxMode::Off)
+        );
+        view.tmux_update_succeeded(TmuxMode::Off);
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("[ ] Automatic tmux sessions (off)"),
+            "{rendered}"
+        );
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert!(view.overlay.is_none());
+    }
+
+    #[test]
+    fn tmux_accepts_explicit_on_and_off_without_model_input() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+
+        view.editor.set_text("/tmux off");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::SetTmuxMode(TmuxMode::Off)
+        );
+        assert!(view.entries.is_empty());
+
+        view.tmux_update_succeeded(TmuxMode::Off);
+        let notice = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            notice.contains("Automatic tmux sessions are off"),
+            "{notice}"
+        );
+        assert!(notice.contains("next launch"), "{notice}");
+
+        view.editor.set_text("/tmux on");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::SetTmuxMode(TmuxMode::On)
+        );
+    }
+
+    #[test]
+    fn switching_sessions_preserves_the_loaded_tmux_mode() {
+        let mut view = View::with_tmux_mode(Path::new("/tmp/bettercodex"), TmuxMode::Off);
+
+        view.switch_session(
+            Path::new("/tmp/another-session"),
+            None,
+            std::iter::empty::<SessionTranscriptItem>(),
+            std::iter::empty::<String>(),
+            Vec::new(),
+        );
+
+        assert_eq!(view.tmux_mode, TmuxMode::Off);
+    }
+
+    #[test]
+    fn tmux_command_is_not_opened_while_a_task_is_active() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.start_turn("working");
+        view.editor.set_text("/tmux");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(view.overlay.is_none());
+        let rendered = view
+            .take_pending_history_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("'/tmux' is disabled while a task is in progress."),
+            "{rendered}"
+        );
     }
 
     #[test]
