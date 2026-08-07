@@ -28,6 +28,20 @@ struct EmbeddedFile {
 
 const EMBEDDED_FILES: &[EmbeddedFile] = &[
     EmbeddedFile {
+        relative_path: "manifest/SKILL.md",
+        contents: include_bytes!("../bundled-skills/manifest/SKILL.md"),
+    },
+    EmbeddedFile {
+        relative_path: "manifest/agents/openai.yaml",
+        contents: include_bytes!("../bundled-skills/manifest/agents/openai.yaml"),
+    },
+    EmbeddedFile {
+        relative_path: "manifest/references/exemplar-shopify-graphql-manifest.md",
+        contents: include_bytes!(
+            "../bundled-skills/manifest/references/exemplar-shopify-graphql-manifest.md"
+        ),
+    },
+    EmbeddedFile {
         relative_path: "papercut/SKILL.md",
         contents: include_bytes!("../bundled-skills/papercut/SKILL.md"),
     },
