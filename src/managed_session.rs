@@ -572,7 +572,7 @@ pub(crate) fn run_relay_command(arguments: &[String]) -> Option<Result<()>> {
 /// `tokio::task::spawn_blocking` from the TUI.
 pub(crate) fn prepare_tmux_session(cwd: &Path, size: (u16, u16)) -> Result<PreparedTmuxSession> {
     ensure_attachable_terminal(std::env::var_os("TERM").as_deref())?;
-    let executable = std::env::current_exe().context("failed to locate the bcodex executable")?;
+    let executable = relay_executable()?;
     let endpoint = RelayEndpoint::new()?;
     let endpoint_argument = encode_path(&endpoint.path);
     let mut occupied = occupied_slots()?;
@@ -612,6 +612,33 @@ pub(crate) fn prepare_tmux_session(cwd: &Path, size: (u16, u16)) -> Result<Prepa
         }
         return Err(tmux_failure(&format!("create session {name}"), &output));
     }
+}
+
+/// Resolve the exact process image that speaks this worker's relay protocol.
+///
+/// Linux appends ` (deleted)` to `current_exe()` after an install atomically replaces a running
+/// bcodex binary. That pathname cannot be executed, but the process image remains available through
+/// procfs for the worker's lifetime.
+#[cfg(target_os = "linux")]
+fn relay_executable() -> Result<PathBuf> {
+    let executable = linux_process_executable(std::process::id());
+    executable.metadata().with_context(|| {
+        format!(
+            "failed to access running bcodex image {}",
+            executable.display()
+        )
+    })?;
+    Ok(executable)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_executable(pid: u32) -> PathBuf {
+    Path::new("/proc").join(pid.to_string()).join("exe")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn relay_executable() -> Result<PathBuf> {
+    std::env::current_exe().context("failed to locate the bcodex executable")
 }
 
 fn ensure_attachable_terminal(term: Option<&OsStr>) -> Result<()> {

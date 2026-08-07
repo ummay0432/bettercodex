@@ -82,6 +82,20 @@ fn tmux_creation_runs_only_the_private_relay_in_a_durable_c_session() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn relay_reexecution_uses_the_live_linux_process_image() {
+    let executable = relay_executable().unwrap();
+    assert_eq!(executable, linux_process_executable(std::process::id()));
+
+    let relay_metadata = executable.metadata().unwrap();
+    let current_metadata = std::env::current_exe().unwrap().metadata().unwrap();
+    assert_eq!(
+        (relay_metadata.dev(), relay_metadata.ino()),
+        (current_metadata.dev(), current_metadata.ino())
+    );
+}
+
 #[test]
 fn relay_paths_round_trip_non_utf8_bytes_and_are_narrowly_validated() {
     let path = PathBuf::from(OsString::from_vec(
