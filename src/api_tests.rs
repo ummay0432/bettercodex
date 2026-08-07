@@ -585,7 +585,7 @@ fn request_uses_instructions_and_one_stable_tool_prefix() {
     assert_eq!(&first_input[..1], stable_request_prefix());
     assert_eq!(
         serde_json::to_string(&first_input[..1]).unwrap().len(),
-        5_075,
+        6_826,
         "run ./scripts/dev.py tool-context --update"
     );
     assert!(first_input.iter().all(|item| {
@@ -652,6 +652,11 @@ fn request_bakes_in_the_fixed_exec_runtime() {
             "apply_patch": {"name": "apply_patch", "namespace": null},
             "exec_command": {"name": "exec_command", "namespace": null},
             "log_papercut": {"name": "log_papercut", "namespace": null},
+            "openaiDeveloperDocs__fetch_openai_doc": {"name": "fetch_openai_doc", "namespace": "openaiDeveloperDocs"},
+            "openaiDeveloperDocs__get_openapi_spec": {"name": "get_openapi_spec", "namespace": "openaiDeveloperDocs"},
+            "openaiDeveloperDocs__list_api_endpoints": {"name": "list_api_endpoints", "namespace": "openaiDeveloperDocs"},
+            "openaiDeveloperDocs__list_openai_docs": {"name": "list_openai_docs", "namespace": "openaiDeveloperDocs"},
+            "openaiDeveloperDocs__search_openai_docs": {"name": "search_openai_docs", "namespace": "openaiDeveloperDocs"},
             "update_plan": {"name": "update_plan", "namespace": null},
             "view_image": {"name": "view_image", "namespace": null},
             "web__run": {"name": "run", "namespace": "web"},

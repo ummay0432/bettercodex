@@ -87,21 +87,20 @@ cache breakpoint or `prompt_cache_options`. Caching reduces repeated input
 billing; it does not remove cached input from the active context window.
 
 The immediately preceding item was 11,370 bytes, 2,964 `o200k` tokens, and 2,843
-bytes/4 tokens. The current item retains the same two request tools, seven nested
-tools, input fields, enums, JavaScript names, and runtime behavior while reducing
-those estimates by 55.4% of bytes, 53.5% of `o200k` tokens, and 55.4% of bytes/4
-tokens. It also replaces three vague `unknown` returns with their implemented
-shapes: empty objects for `apply_patch` and `update_plan`, and a string for
-`web__run`. Relative to the original 20,440-byte catalogue, the reduction is
-75.2%.
+bytes/4 tokens. The current item retains the same two request tools and seven
+existing nested tools, and adds five focused OpenAI Developer Docs tools with
+closed input schemas and string returns. It reduces the preceding estimates by
+40.0% of bytes, 39.2% of `o200k` tokens, and 40.0% of bytes/4 tokens. It also
+retains the implemented return shapes for the existing tools. Relative to the
+original 20,440-byte catalogue, the reduction is 66.6%.
 
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable harness input: `instructions` plus `additional_tools` | 13,819 | 3,148 | 3,455 |
-| Complete `additional_tools` developer item | 5,073 | 1,379 | 1,269 |
-| Top-level `exec` specification | 4,577 | 1,260 | 1,145 |
-| `exec` description only | 4,353 | 1,162 | 1,089 |
+| Complete stable harness input: `instructions` plus `additional_tools` | 15,570 | 3,570 | 3,893 |
+| Complete `additional_tools` developer item | 6,824 | 1,801 | 1,706 |
+| Top-level `exec` specification | 6,328 | 1,682 | 1,582 |
+| `exec` description only | 6,094 | 1,569 | 1,524 |
 | `exec` Lark grammar only | 31 | 12 | 8 |
 | Top-level `wait` specification | 438 | 107 | 110 |
 | `wait` description only | 151 | 40 | 38 |
@@ -116,9 +115,9 @@ nested tool declaration. This is the text-only breakdown:
 | Section inside `exec` | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Runtime and orchestration | 566 | 145 | 142 |
-| Tool purposes and web policy | 1,800 | 445 | 450 |
+| Tool purposes and web policy | 3,042 | 727 | 761 |
 | Defaults, limits, and process results | 355 | 108 | 89 |
-| Schema-derived TypeScript | 1,626 | 464 | 407 |
+| Schema-derived TypeScript | 2,125 | 589 | 532 |
 <!-- bcodex-tool-context:sections:end -->
 
 The full `exec` description is stored verbatim in
@@ -214,16 +213,16 @@ all outputs and tool calls, is
 `a7c5e790a4bdbc3a2ba5eb3cf33e8d802dfa5b6c9febbbb649858e8757d759cb`).
 
 The dynamic world-state items are not part of the tool specification, but they
-occupy the same context window. With the default embedded `papercut` skill
-implicitly invocable, they cost the following for the
+occupy the same context window. With the default embedded `openai-docs` and
+`papercut` skills implicitly invocable, they cost the following for the
 bettercodex repository on the audit date:
 
 <!-- bcodex-tool-context:dynamic:start -->
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Current `<environment_context>` developer item | 276 | 85 | 69 |
-| Current `<repository_context>` user item | 5,835 | 1,377 | 1,459 |
-| Current `<available_skills>` user item | 646 | 155 | 162 |
+| Current `<environment_context>` developer item | 288 | 89 | 72 |
+| Current `<repository_context>` user item | 5,847 | 1,381 | 1,462 |
+| Current `<available_skills>` user item | 1,151 | 282 | 288 |
 <!-- bcodex-tool-context:dynamic:end -->
 
 Those rows are snapshots, not constants. The environment fields change with the
@@ -252,13 +251,16 @@ its `plain_source: SOURCE` branch already matched every character sequence. The
 Rust `parse_exec_source` implementation remains responsible for recognizing and
 validating an optional first-line pragma.
 
-The description exposes seven nested tools through the JavaScript `tools`
+The description exposes twelve nested tools through the JavaScript `tools`
 object: `apply_patch`, `exec_command`, `log_papercut`, `update_plan`,
-`view_image`, `write_stdin`, and the namespaced `web__run` (`web.run`). The web
-tool uses Codex's exact command schema for search, open/fetch, click, find, PDF
-screenshots, finance, weather, sports, time, and image search. Its concise
-description preserves bettercodex's browsing, primary-source, citation, and
-quotation rules without Codex's broad-product examples and repetition.
+`view_image`, `write_stdin`, five namespaced `openaiDeveloperDocs__*` tools,
+and the namespaced `web__run` (`web.run`). The focused documentation tools call
+OpenAI's public Developer Docs service for official search, page fetches, and
+OpenAPI lookup. The web tool uses Codex's exact command schema for search,
+open/fetch, click, find, PDF screenshots, finance, weather, sports, time, and
+image search. Its concise description preserves bettercodex's browsing,
+primary-source, citation, and quotation rules without Codex's broad-product
+examples and repetition.
 
 ### `wait`
 
@@ -324,10 +326,11 @@ The skills-catalogue user message wraps bounded metadata lines in
 `<available_skills>` markers. Skill-use rules live once in the harness contract,
 not in every catalogue message. Only enabled skills whose
 `allow_implicit_invocation` policy is true appear in that catalogue.
-bettercodex's embedded `papercut` skill is materialized at the real
-`${BCODEX_HOME:-$HOME/.bcodex}/skills/.system/papercut/SKILL.md` path; the model
-reads its full body only after deciding to use it. Explicitly selected bodies
-use separate `<skill_context>` user messages:
+bettercodex materializes its embedded skills below the real
+`${BCODEX_HOME:-$HOME/.bcodex}/skills/.system/` path. `openai-docs` and
+`papercut` are implicitly invocable, while `manifest` remains explicit-only;
+the model reads a full body only after deciding to use it. Explicitly selected
+bodies use separate `<skill_context>` user messages:
 
 ```xml
 <skill_context>

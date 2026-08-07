@@ -42,6 +42,80 @@ const EMBEDDED_FILES: &[EmbeddedFile] = &[
         ),
     },
     EmbeddedFile {
+        relative_path: "openai-docs/LICENSE.txt",
+        contents: include_bytes!("../bundled-skills/openai-docs/LICENSE.txt"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/SKILL.md",
+        contents: include_bytes!("../bundled-skills/openai-docs/SKILL.md"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/agents/openai.yaml",
+        contents: include_bytes!("../bundled-skills/openai-docs/agents/openai.yaml"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/assets/openai-small.svg",
+        contents: include_bytes!("../bundled-skills/openai-docs/assets/openai-small.svg"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/assets/openai.png",
+        contents: include_bytes!("../bundled-skills/openai-docs/assets/openai.png"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/codex-self-knowledge.md",
+        contents: include_bytes!(
+            "../bundled-skills/openai-docs/references/codex-self-knowledge.md"
+        ),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/latest-model.md",
+        contents: include_bytes!("../bundled-skills/openai-docs/references/latest-model.md"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/mcp-diagnostics.md",
+        contents: include_bytes!("../bundled-skills/openai-docs/references/mcp-diagnostics.md"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/model-migration.md",
+        contents: include_bytes!("../bundled-skills/openai-docs/references/model-migration.md"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/model-selection.md",
+        contents: include_bytes!("../bundled-skills/openai-docs/references/model-selection.md"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/official-docs.md",
+        contents: include_bytes!("../bundled-skills/openai-docs/references/official-docs.md"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/prompting-guide.md",
+        contents: include_bytes!("../bundled-skills/openai-docs/references/prompting-guide.md"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/upgrade-guide.md",
+        contents: include_bytes!("../bundled-skills/openai-docs/references/upgrade-guide.md"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/references/upgrading-to-gpt-5p6-sol.md",
+        contents: include_bytes!(
+            "../bundled-skills/openai-docs/references/upgrading-to-gpt-5p6-sol.md"
+        ),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/scripts/fetch-codex-manual.mjs",
+        contents: include_bytes!("../bundled-skills/openai-docs/scripts/fetch-codex-manual.mjs"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/scripts/resolve-latest-model-info",
+        contents: include_bytes!("../bundled-skills/openai-docs/scripts/resolve-latest-model-info"),
+    },
+    EmbeddedFile {
+        relative_path: "openai-docs/scripts/resolve-latest-model-info.cjs",
+        contents: include_bytes!(
+            "../bundled-skills/openai-docs/scripts/resolve-latest-model-info.cjs"
+        ),
+    },
+    EmbeddedFile {
         relative_path: "papercut/SKILL.md",
         contents: include_bytes!("../bundled-skills/papercut/SKILL.md"),
     },

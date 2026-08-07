@@ -178,7 +178,11 @@ impl Agent {
         let conversation = Conversation::create(&cwd)?;
         let identity = conversation.identity().clone();
         let api = ApiClient::new(auth, &identity, 0)?;
-        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+        let tools = ToolRuntime::new(
+            cwd.clone(),
+            api.web_search_client(),
+            api.openai_docs_client(),
+        );
         Ok(Self {
             cwd,
             api,
@@ -203,7 +207,11 @@ impl Agent {
         rollout.snapshot_transcript(transcript)?;
         let conversation = self.conversation.fork(rollout)?;
         let api = ApiClient::new(auth, &identity, compaction_count)?;
-        let tools = ToolRuntime::new(self.cwd.clone(), api.web_search_client());
+        let tools = ToolRuntime::new(
+            self.cwd.clone(),
+            api.web_search_client(),
+            api.openai_docs_client(),
+        );
         Ok(Self {
             cwd: self.cwd.clone(),
             api,
@@ -221,7 +229,11 @@ impl Agent {
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
         let api = ApiClient::new(auth, &identity, compaction_count)?;
-        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+        let tools = ToolRuntime::new(
+            cwd.clone(),
+            api.web_search_client(),
+            api.openai_docs_client(),
+        );
         Ok(Self {
             cwd,
             api,

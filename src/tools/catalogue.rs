@@ -26,7 +26,7 @@ const TOOL_DEFAULTS: &str = "Defaults: command cwd=turn, shell=user, `login:true
 const WAIT_DESCRIPTION: &str = "Continue yielded `exec` by `cell_id`; returns only new output. Repeat while active; `terminate:true` stops. `yield_time_ms`/`max_tokens` default 10000.";
 
 static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
-    vec![
+    let mut tools = vec![
         freeform_tool(
             "apply_patch",
             "Validates the whole patch before editing. Pass the patch string directly; paths use turn cwd, not `exec_command.workdir`; absolute paths work.",
@@ -61,15 +61,26 @@ static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
             write_stdin_input_schema(),
             Some(unified_exec_output_schema()),
         ),
+    ];
+    tools.extend(crate::openai_docs::TOOLS.iter().copied().map(|tool| {
         namespaced_function_tool(
-            crate::web_search::JAVASCRIPT_NAME,
-            crate::web_search::NAMESPACE,
-            crate::web_search::TOOL_NAME,
-            crate::web_search::DESCRIPTION,
-            crate::web_search::input_schema().clone(),
+            tool.javascript_name(),
+            crate::openai_docs::NAMESPACE,
+            tool.name(),
+            tool.description(),
+            tool.input_schema(),
             Some(json!({"type": "string"})),
-        ),
-    ]
+        )
+    }));
+    tools.push(namespaced_function_tool(
+        crate::web_search::JAVASCRIPT_NAME,
+        crate::web_search::NAMESPACE,
+        crate::web_search::TOOL_NAME,
+        crate::web_search::DESCRIPTION,
+        crate::web_search::input_schema().clone(),
+        Some(json!({"type": "string"})),
+    ));
+    tools
 });
 
 // The in-process V8 runtime needs names, descriptions, and calling kinds for
@@ -599,7 +610,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogue_contains_the_fixed_tools_and_codex_web_namespace() {
+    fn catalogue_contains_the_fixed_tools_and_namespaces() {
         assert_eq!(
             core_tools()
                 .iter()
@@ -612,6 +623,11 @@ mod tests {
                 "update_plan",
                 "view_image",
                 "write_stdin",
+                "openaiDeveloperDocs__fetch_openai_doc",
+                "openaiDeveloperDocs__get_openapi_spec",
+                "openaiDeveloperDocs__list_api_endpoints",
+                "openaiDeveloperDocs__list_openai_docs",
+                "openaiDeveloperDocs__search_openai_docs",
                 "web__run",
             ]
         );
@@ -653,6 +669,11 @@ mod tests {
             "update_plan(args: {explanation?:string;plan:Array<",
             "view_image(args: {detail?:\"high\"|\"original\";path:string}",
             "write_stdin(args: {chars?:string;max_output_tokens?:number;session_id:number",
+            "openaiDeveloperDocs__fetch_openai_doc(args: {anchor?:string;url:string}): Promise<string>",
+            "openaiDeveloperDocs__get_openapi_spec(args: {codeExamplesOnly?:boolean;languages?:Array<string>;url:string}): Promise<string>",
+            "openaiDeveloperDocs__list_api_endpoints(args: {}): Promise<string>",
+            "openaiDeveloperDocs__list_openai_docs(args: {cursor?:string;limit?:number}): Promise<string>",
+            "openaiDeveloperDocs__search_openai_docs(args: {cursor?:string;limit?:number;query:string}): Promise<string>",
             "web__run(args: {click?:Array<",
             "): Promise<string>",
         ] {
@@ -866,10 +887,10 @@ mod tests {
     fn documented_tool_context_byte_counts_do_not_drift() {
         let tools = specifications();
         let update = "run ./scripts/dev.py tool-context --update";
-        assert_eq!(text().len(), 4_353, "{update}");
+        assert_eq!(text().len(), 6_094, "{update}");
         assert_eq!(
             serde_json::to_string(&tools[0]).unwrap().len(),
-            4_577,
+            6_328,
             "{update}"
         );
         assert_eq!(
@@ -884,15 +905,15 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_string(&item).unwrap().len(),
-            5_073,
+            6_824,
             "{update}"
         );
         assert_eq!(
             metrics(),
             CatalogueMetrics {
-                description_bytes: 4_353,
-                request_bytes: 5_073,
-                estimated_tokens: 1_269,
+                description_bytes: 6_094,
+                request_bytes: 6_824,
+                estimated_tokens: 1_706,
             }
         );
     }

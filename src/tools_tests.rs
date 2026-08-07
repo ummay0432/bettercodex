@@ -5,6 +5,7 @@ use super::view_image;
 use crate::auth::Auth;
 use crate::auth::SharedAuth;
 use crate::events::AgentEvent;
+use crate::openai_docs::OpenAiDocsClient;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use serde_json::json;
@@ -124,7 +125,11 @@ async fn web_search_runs_through_exec_and_posts_the_codex_alpha_contract() {
         base_url,
         "session-test".to_string(),
     );
-    let runtime = ToolRuntime::new(PathBuf::from("."), web_search);
+    let runtime = ToolRuntime::new(
+        PathBuf::from("."),
+        web_search,
+        OpenAiDocsClient::with_endpoint(reqwest::Client::new(), "http://127.0.0.1:1"),
+    );
     let call = ToolCall::Custom {
         call_id: "call-web".to_string(),
         name: "exec".to_string(),
@@ -241,6 +246,93 @@ text(result);
     server.join().unwrap();
 }
 
+#[tokio::test]
+async fn openai_docs_runs_through_exec_and_posts_the_focused_mcp_contract() {
+    let (endpoint, requests, server) = spawn_openai_docs_server();
+    let web_search = WebSearchClient::new(
+        reqwest::Client::new(),
+        SharedAuth::new(Auth::for_test("token-test")),
+        "http://127.0.0.1:1".to_string(),
+        "session-test".to_string(),
+    );
+    let runtime = ToolRuntime::new(
+        PathBuf::from("."),
+        web_search,
+        OpenAiDocsClient::with_endpoint(reqwest::Client::new(), endpoint),
+    );
+    let call = ToolCall::Custom {
+        call_id: "call-openai-docs".to_string(),
+        name: "exec".to_string(),
+        input: r#"
+const result = await tools.openaiDeveloperDocs__search_openai_docs({
+  query: "Responses streaming",
+  limit: 2,
+});
+text(result);
+"#
+        .to_string(),
+    };
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let output = call
+        .execute(
+            &runtime,
+            ToolTurnContext::default(),
+            Some(events_tx),
+            CancellationToken::new(),
+        )
+        .await;
+
+    let nested_call_id = match events_rx.recv().await.unwrap() {
+        AgentEvent::ToolStarted {
+            call_id,
+            name,
+            input,
+        } => {
+            assert_eq!(name, "openaiDeveloperDocs.search_openai_docs");
+            assert_eq!(
+                input,
+                Some(json!({"query": "Responses streaming", "limit": 2}))
+            );
+            call_id
+        }
+        event => panic!("expected OpenAI Docs start event, got {event:?}"),
+    };
+    assert!(matches!(
+        events_rx.recv().await.unwrap(),
+        AgentEvent::ToolCompleted {
+            call_id,
+            output: Ok(output),
+            ..
+        } if call_id == nested_call_id && output == json!("Official docs result")
+    ));
+    assert!(events_rx.try_recv().is_err());
+    assert!(
+        output.preview.contains("Official docs result"),
+        "{}",
+        output.preview
+    );
+
+    let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(request.path, "/mcp");
+    let headers = request.headers.to_ascii_lowercase();
+    assert!(headers.contains("accept: application/json, text/event-stream"));
+    assert!(headers.contains("mcp-protocol-version: 2025-03-26"));
+    assert!(!headers.contains("authorization:"));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "search_openai_docs",
+                "arguments": {"query": "Responses streaming", "limit": 2}
+            }
+        })
+    );
+    server.join().unwrap();
+}
+
 struct CapturedRequest {
     path: String,
     headers: String,
@@ -269,6 +361,33 @@ fn spawn_search_server() -> (
         stream.flush().unwrap();
     });
     (format!("http://{address}"), requests_rx, server)
+}
+
+fn spawn_openai_docs_server() -> (
+    String,
+    mpsc::Receiver<CapturedRequest>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requests_tx, requests_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        requests_tx.send(read_request(&mut stream)).unwrap();
+        let body = concat!(
+            "event: message\n",
+            "data: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Official docs result\"}]},\"jsonrpc\":\"2.0\",\"id\":1}\n\n"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+    (format!("http://{address}/mcp"), requests_rx, server)
 }
 
 fn read_request(stream: &mut TcpStream) -> CapturedRequest {

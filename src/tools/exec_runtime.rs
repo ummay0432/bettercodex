@@ -20,6 +20,7 @@ use super::code_runtime::ToolInvocationFuture;
 use super::code_runtime::WaitRequest;
 use super::image_preparation::prepare_tool_output_images;
 use crate::events::AgentEvent;
+use crate::openai_docs::OpenAiDocsClient;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Result;
@@ -50,9 +51,13 @@ pub(crate) struct ToolRuntime {
 }
 
 impl ToolRuntime {
-    pub(crate) fn new(cwd: PathBuf, web_search: WebSearchClient) -> Self {
+    pub(crate) fn new(
+        cwd: PathBuf,
+        web_search: WebSearchClient,
+        openai_docs: OpenAiDocsClient,
+    ) -> Self {
         let state = Arc::new(RuntimeState {
-            tools: NestedTools::with_web_search(cwd, web_search),
+            tools: NestedTools::new(cwd, web_search, openai_docs),
             notifications: Notifications::default(),
             ui_events: UiEvents::default(),
         });
@@ -502,6 +507,10 @@ mod tests {
                 "http://127.0.0.1:1".to_string(),
                 "test-session".to_string(),
             ),
+            crate::openai_docs::OpenAiDocsClient::with_endpoint(
+                reqwest::Client::new(),
+                "http://127.0.0.1:1",
+            ),
         )
     }
 
@@ -925,7 +934,7 @@ await tools.apply_patch(patch);
             .unwrap();
         assert!(
             result.preview.contains(
-                "apply_patch,exec_command,log_papercut,update_plan,view_image,write_stdin,web__run"
+                "apply_patch,exec_command,log_papercut,update_plan,view_image,write_stdin,openaiDeveloperDocs__fetch_openai_doc,openaiDeveloperDocs__get_openapi_spec,openaiDeveloperDocs__list_api_endpoints,openaiDeveloperDocs__list_openai_docs,openaiDeveloperDocs__search_openai_docs,web__run"
             ),
             "{}",
             result.preview

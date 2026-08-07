@@ -149,6 +149,11 @@ Tools:
 - `update_plan`: Replaces plan; allows one `in_progress` step.
 - `view_image`: Loads a local image.
 - `write_stdin`: Writes `chars` or, when omitted, polls an `exec_command` session; returns new output.
+- `openaiDeveloperDocs__fetch_openai_doc` (`openaiDeveloperDocs.fetch_openai_doc`): Fetch exact Markdown for an official OpenAI documentation URL; `anchor` can select one section. Search or list first when the URL is unknown. Returns the server's text payload.
+- `openaiDeveloperDocs__get_openapi_spec` (`openaiDeveloperDocs.get_openapi_spec`): Return the OpenAPI specification for one URL from `list_api_endpoints`; optionally filter code samples by language or return only examples. Returns the server's text payload.
+- `openaiDeveloperDocs__list_api_endpoints` (`openaiDeveloperDocs.list_api_endpoints`): List all OpenAI API endpoint URLs available in the current OpenAPI specification. Returns the server's text payload.
+- `openaiDeveloperDocs__list_openai_docs` (`openaiDeveloperDocs.list_openai_docs`): Browse official pages from `platform.openai.com`, `developers.openai.com`, and `learn.chatgpt.com`; use fetch on a result URL for exact Markdown. Returns the server's text payload.
+- `openaiDeveloperDocs__search_openai_docs` (`openaiDeveloperDocs.search_openai_docs`): Search official OpenAI, ChatGPT, and Codex documentation; then use fetch on the best result URL before quoting or relying on it. Returns the server's text payload.
 - `web__run` (`web.run`): Browse if asked, never if forbidden; also for uncertain/>10%-likely-changed facts, costly recommendations, high stakes, exact links/quotes, or unseen references. News: compare publication/event dates. OpenAI: local code, then official only unless asked otherwise. Technical: primary sources; otherwise authoritative; label inference. Batch; omit nulls. `search_query` max 4; four needs `response_length` `medium`/`long`. Inputs: `ref_id` accepts a result ID/URL; `recency` is days; `pageno` is zero-based; dates use YYYY-MM-DD; time uses UTC offsets like `+03:00`; weather `location` is "Country, Area, City" (start=today, duration=7); sports teams use broadcast aliases; finance `market` is ISO alpha-3, `OTC`, or empty for crypto. Cite supported web claims nearby with direct descriptive Markdown links; each citation must support its claim. Never cite result pages or bare URLs. Internal IDs (for example `turn2search5`) are call-only; never expose them or native cite markers in final answers. Use multiple domains when useful. Obey `[wordlim N]`; per-source quotes at most 25 non-lyric/10 lyric words; longer Reddit only in linked blockquotes; no full works/long passages.
 
 Defaults: command cwd=turn, shell=user, `login:true`, `tty:false`, yield=10s; stdin yield=.25s after writes/5s polling; output=10k tokens; image detail=`high`. Yields clamp to .25–30s (poll 5–300s). Process: `output`+`wall_time_seconds` always; `session_id`=running, `exit_code`=done, `original_token_count`=before truncation, `chunk_id`=output chunk.
@@ -162,6 +167,11 @@ declare const tools: {
   update_plan(args: {explanation?:string;plan:Array<{status:"pending"|"in_progress"|"completed";step:string}>}): Promise<{}>;
   view_image(args: {detail?:"high"|"original";path:string}): Promise<{detail:"high"|"original";image_url:string}>;
   write_stdin(args: {chars?:string;max_output_tokens?:number;session_id:number;yield_time_ms?:number}): Promise<ProcessResult>;
+  openaiDeveloperDocs__fetch_openai_doc(args: {anchor?:string;url:string}): Promise<string>;
+  openaiDeveloperDocs__get_openapi_spec(args: {codeExamplesOnly?:boolean;languages?:Array<string>;url:string}): Promise<string>;
+  openaiDeveloperDocs__list_api_endpoints(args: {}): Promise<string>;
+  openaiDeveloperDocs__list_openai_docs(args: {cursor?:string;limit?:number}): Promise<string>;
+  openaiDeveloperDocs__search_openai_docs(args: {cursor?:string;limit?:number;query:string}): Promise<string>;
   web__run(args: {click?:Array<{id:number;ref_id:string}>;finance?:Array<{market?:string;ticker:string;type:"equity"|"fund"|"crypto"|"index"}>;find?:Array<{pattern:string;ref_id:string}>;image_query?:Array<{domains?:Array<string>;q:string;recency?:number}>;open?:Array<{lineno?:number;ref_id:string}>;response_length?:"short"|"medium"|"long";screenshot?:Array<{pageno:number;ref_id:string}>;search_query?:Array<{domains?:Array<string>;q:string;recency?:number}>;sports?:Array<{date_from?:string;date_to?:string;fn:"schedule"|"standings";league:"nba"|"wnba"|"nfl"|"nhl"|"mlb"|"epl"|"ncaamb"|"ncaawb"|"ipl";locale?:string;num_games?:number;opponent?:string;team?:string;tool?:"sports"}>;time?:Array<{utc_offset:string}>;weather?:Array<{duration?:number;location:string;start?:string}>}): Promise<string>;
 };
 ```
@@ -296,6 +306,7 @@ Exact `content[0].text`:
 
 ````xml
 <available_skills>
+- openai-docs: Use for upstream OpenAI Codex models/pricing, scheduled tasks, skills, settings, setup, troubleshooting, customization, automations, and self-knowledge, and for OpenAI APIs/products and ChatGPT Work. Also use for model choice/migration, prompting, SDKs, Responses, Realtime, agents, evals, and Chat/Work/Codex comparisons. Do not use for bettercodex self-knowledge or generic app/software tasks that merely mention Codex. (file: /home/sysadmin/.bcodex/skills/.system/openai-docs/SKILL.md)
 - papercut: Proactively record small, non-blocking repository, tool, setup, or documentation friction so future coding-agent sessions can avoid it. Use immediately when a dead-end tool call, unclear setup, flaky command, stale cache, misleading error, or undocumented gotcha wastes time and could recur; call tools.log_papercut and continue. Do not use for the requested bug, expected failures, one-off agent mistakes, issues fixed during the same task, or secrets. (file: /home/sysadmin/.bcodex/skills/.system/papercut/SKILL.md)
 </available_skills>
 ````
