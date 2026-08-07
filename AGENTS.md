@@ -42,7 +42,6 @@ OpenAI documents the behavior you are working on, fetch the documentation
 before designing or changing it. Never rely on memory or make assumptions where
 an authoritative source exists. Apply the same rule to the official Rust sources below.
 
-- GPT-5.6 prompting: [model guidance and prompting best practices](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.6#prompting-best-practices).
 - CLI interaction: [interactive CLI](https://developers.openai.com/codex/cli/features#running-in-interactive-mode) and [slash commands](https://developers.openai.com/codex/cli/slash-commands).
 - Agent context: [AGENTS.md](https://developers.openai.com/codex/guides/agents-md) and [skills](https://developers.openai.com/codex/skills).
 - Authentication and permissions: [authentication](https://developers.openai.com/codex/auth) and [security, sandboxing, and approvals](https://developers.openai.com/codex/security).
