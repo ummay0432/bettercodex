@@ -6197,7 +6197,7 @@ mod tests {
         assert!(rendered.contains("Inside exec"), "{rendered}");
         assert!(rendered.contains("apply_patch"), "{rendered}");
         assert!(
-            rendered.contains("9 tools · ~1.3K prompt tokens"),
+            rendered.contains("14 tools · ~1.7K prompt tokens"),
             "{rendered}"
         );
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");

@@ -11,6 +11,7 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::HistoryCursor;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
+use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
 use crate::tools;
 use crate::tools::ToolCall;
@@ -459,6 +460,10 @@ impl ApiClient {
             self.base_url.clone(),
             self.session_id.clone(),
         )
+    }
+
+    pub(crate) fn openai_docs_client(&self) -> OpenAiDocsClient {
+        OpenAiDocsClient::new(self.client.clone())
     }
 
     pub(crate) fn tool_turn_context(&self, history: &[Value]) -> ToolTurnContext {

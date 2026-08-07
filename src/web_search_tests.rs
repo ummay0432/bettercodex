@@ -220,6 +220,47 @@ fn benchmark_recent_input_with_discarded_large_payloads() {
 }
 
 #[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_search_request_retry_preparation() {
+    const RUNS: usize = 100;
+    const USER_BYTES: usize = 1024 * 1024;
+
+    let history = vec![message("user", &"x".repeat(USER_BYTES))];
+    let context = ToolTurnContext::from_history(&history, "{}".to_string());
+    let commands = parse_commands(Some(json!({
+        "search_query": [{"q": "request encoding benchmark"}],
+    })))
+    .unwrap();
+    let url = "https://example.com/alpha/search".to_string();
+    let started = std::time::Instant::now();
+    for _ in 0..RUNS {
+        let context = context.clone();
+        let request = SearchRequest::new("benchmark-session", context.input.as_deref(), &commands);
+        let body = EncodedJsonBody::encode(&request).unwrap();
+        let request = Request {
+            method: reqwest::Method::POST,
+            url: url.clone(),
+            headers: HeaderMap::new(),
+            body: Some(RequestBody::EncodedJson(body)),
+            compression: RequestCompression::None,
+            timeout: None,
+        }
+        .into_prepared()
+        .unwrap();
+        for _ in 0..=REQUEST_MAX_RETRIES {
+            let prepared = request.clone().prepare_body_for_send().unwrap();
+            std::hint::black_box(prepared.body);
+        }
+    }
+    let elapsed = started.elapsed();
+
+    eprintln!(
+        "{RUNS} web-search requests with {REQUEST_MAX_RETRIES} retry slots and a {} MiB user message: {elapsed:?}",
+        USER_BYTES / (1024 * 1024),
+    );
+}
+
+#[test]
 fn command_parser_preserves_search_and_fetch_operations() {
     let commands = parse_commands(Some(json!({
         "search_query": [{"q": "Codex", "domains": ["openai.com"]}],
@@ -267,10 +308,56 @@ fn display_activities_preserve_each_search_and_fetch_row() {
 #[test]
 fn search_output_is_bounded_even_if_the_endpoint_exceeds_its_budget() {
     let output = "x".repeat(50_000);
-    let bounded = bounded_search_output(&output);
+    let bounded = bounded_search_output(output.clone());
 
     assert!(bounded.starts_with("Warning: truncated output"));
     assert!(bounded.len() < output.len());
+}
+
+#[test]
+fn search_output_within_budget_reuses_the_response_allocation() {
+    let output = "search result".to_string();
+    let allocation = output.as_ptr();
+
+    let bounded = bounded_search_output(output);
+
+    assert_eq!(bounded, "search result");
+    assert_eq!(bounded.as_ptr(), allocation);
+}
+
+#[test]
+fn search_response_ignores_unused_endpoint_fields() {
+    let response: SearchResponse = serde_json::from_value(json!({
+        "encrypted_output": {"future": "shape"},
+        "output": "model-visible result",
+        "results": "future shape",
+    }))
+    .unwrap();
+
+    assert_eq!(response.output, "model-visible result");
+}
+
+#[tokio::test]
+async fn already_cancelled_search_stops_before_transport() {
+    let web_search = WebSearchClient::new(
+        reqwest::Client::new(),
+        SharedAuth::new(Auth::for_test("token")),
+        "http://127.0.0.1:1".to_string(),
+        "session-test".to_string(),
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = web_search
+        .run(
+            Some(json!({"search_query": [{"q": "should not run"}]})),
+            &ToolTurnContext::default(),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "web search cancelled");
 }
 
 #[tokio::test]

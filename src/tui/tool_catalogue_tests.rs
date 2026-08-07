@@ -16,7 +16,10 @@ fn renders_on_the_shared_codex_command_surface() {
 
     assert_eq!(buffer[(0, 0)].bg, Color::Rgb(55, 55, 55));
     assert_eq!(buffer[(87, 0)].bg, Color::Rgb(55, 55, 55));
-    assert_eq!(buffer[(0, 18)].bg, Color::Reset);
+    assert_eq!(
+        buffer[(0, catalogue.preferred_height().saturating_sub(1))].bg,
+        Color::Reset
+    );
     assert_eq!(
         render_buffer(buffer),
         [
@@ -34,9 +37,14 @@ fn renders_on_the_shared_codex_command_surface() {
             "    ├─ ● update_plan",
             "    ├─ ● view_image",
             "    ├─ ● write_stdin",
+            "    ├─ ● openaiDeveloperDocs__fetch_openai_doc",
+            "    ├─ ● openaiDeveloperDocs__get_openapi_spec",
+            "    ├─ ● openaiDeveloperDocs__list_api_endpoints",
+            "    ├─ ● openaiDeveloperDocs__list_openai_docs",
+            "    ├─ ● openaiDeveloperDocs__search_openai_docs",
             "    └─ ● web__run",
             "",
-            "  9 tools · ~1.3K prompt tokens",
+            "  14 tools · ~1.7K prompt tokens",
             "",
             "  Press esc to go back",
         ]

@@ -7,6 +7,7 @@ mod context;
 mod events;
 mod input;
 mod managed_session;
+mod openai_docs;
 mod paths;
 mod prompt_history;
 mod repository;
@@ -388,7 +389,7 @@ mod tests {
         ));
         assert_eq!(
             tool_catalogue_stats(),
-            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (7): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, web__run\n\nExec description: 4353 bytes\nComplete additional_tools item: 5073 bytes\nEstimated context cost: 1269 tokens (bytes/4)\nEffective-window share: 0.49%"
+            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (12): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, openaiDeveloperDocs__fetch_openai_doc, openaiDeveloperDocs__get_openapi_spec, openaiDeveloperDocs__list_api_endpoints, openaiDeveloperDocs__list_openai_docs, openaiDeveloperDocs__search_openai_docs, web__run\n\nExec description: 6094 bytes\nComplete additional_tools item: 6824 bytes\nEstimated context cost: 1706 tokens (bytes/4)\nEffective-window share: 0.66%"
         );
     }
 

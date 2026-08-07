@@ -446,7 +446,11 @@ async fn selected_skill_path_drives_the_recorded_history_and_outgoing_request() 
     )
     .unwrap();
     assert!(api.fall_back_to_http());
-    let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+    let tools = ToolRuntime::new(
+        cwd.clone(),
+        api.web_search_client(),
+        api.openai_docs_client(),
+    );
     let mut agent = Agent {
         cwd,
         api,
@@ -719,7 +723,11 @@ async fn repeated_auto_compaction_preserves_active_skill_and_cold_resume_state()
     )
     .unwrap();
     assert!(api.fall_back_to_http());
-    let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+    let tools = ToolRuntime::new(
+        cwd.clone(),
+        api.web_search_client(),
+        api.openai_docs_client(),
+    );
     let mut resumed = Agent {
         cwd: cwd.clone(),
         api,
@@ -1294,7 +1302,11 @@ fn test_agent_with_transport(base_url: &str, transport: TestTransport) -> (PathB
         TestTransport::Http => assert!(api.fall_back_to_http()),
         TestTransport::WebSocket => {}
     }
-    let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+    let tools = ToolRuntime::new(
+        cwd.clone(),
+        api.web_search_client(),
+        api.openai_docs_client(),
+    );
     (
         root,
         Agent {

@@ -11,6 +11,7 @@ use crate::auth::SharedAuth;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::Request;
 use codex_client::RequestBody;
@@ -37,6 +38,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -64,25 +66,44 @@ pub(crate) struct WebSearchClient {
 
 #[derive(Clone, Default)]
 pub(crate) struct ToolTurnContext {
-    input: Option<SearchInput>,
+    input: Option<Arc<SearchInput>>,
     turn_metadata: String,
 }
 
 #[derive(Debug, Serialize)]
-struct SearchRequest {
-    id: String,
-    model: String,
+struct SearchRequest<'a> {
+    id: &'a str,
+    model: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<SearchInput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    commands: Option<SearchCommands>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    settings: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u64>,
+    input: Option<&'a SearchInput>,
+    commands: &'a SearchCommands,
+    settings: SearchSettings,
+    max_output_tokens: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug, Serialize)]
+struct SearchSettings {
+    allowed_callers: [&'static str; 1],
+    external_web_access: bool,
+}
+
+impl<'a> SearchRequest<'a> {
+    fn new(id: &'a str, input: Option<&'a SearchInput>, commands: &'a SearchCommands) -> Self {
+        Self {
+            id,
+            model: MODEL,
+            input,
+            commands,
+            settings: SearchSettings {
+                allowed_callers: ["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: u64::try_from(MAX_OUTPUT_TOKENS).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum SearchInput {
     Items(Vec<ResponseItem>),
@@ -335,11 +356,7 @@ enum SearchResponseLength {
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
-    #[serde(rename = "encrypted_output")]
-    _encrypted_output: Option<String>,
     output: String,
-    #[serde(default, rename = "results")]
-    _results: Option<Vec<Value>>,
 }
 
 /// One concise row in the TUI's grouped web-activity tree.
@@ -379,25 +396,19 @@ impl WebSearchClient {
         context: &ToolTurnContext,
         cancellation: CancellationToken,
     ) -> Result<Value> {
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("web search cancelled"));
+        }
         let commands = parse_commands(input)?;
-        let mut auth = self
-            .auth
-            .refreshed_snapshot(&self.client)
-            .await
-            .context("failed to refresh ChatGPT credentials for web search")?;
-        let request = SearchRequest {
-            id: self.session_id.clone(),
-            model: MODEL.to_string(),
-            input: context.input.clone(),
-            commands: Some(commands),
-            settings: Some(serde_json::json!({
-                "allowed_callers": ["direct"],
-                "external_web_access": true,
-            })),
-            max_output_tokens: Some(u64::try_from(MAX_OUTPUT_TOKENS).unwrap_or(u64::MAX)),
-        };
-        let body = serde_json::to_value(request)
+        let request = SearchRequest::new(&self.session_id, context.input.as_deref(), &commands);
+        let body = EncodedJsonBody::encode(&request)
             .context("failed to encode standalone web search request")?;
+        let mut auth = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(anyhow!("web search cancelled")),
+            auth = self.auth.refreshed_snapshot(&self.client) => auth,
+        }
+        .context("failed to refresh ChatGPT credentials for web search")?;
         let transport = ReqwestTransport::new(self.client.clone());
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), SEARCH_PATH);
         let mut refreshed_after_unauthorized = false;
@@ -406,11 +417,14 @@ impl WebSearchClient {
                 method: reqwest::Method::POST,
                 url: url.clone(),
                 headers: search_headers(&context.turn_metadata, &auth)?,
-                body: Some(RequestBody::Json(body.clone())),
+                body: Some(RequestBody::EncodedJson(body.clone())),
                 compression: RequestCompression::None,
                 timeout: None,
-            };
+            }
+            .into_prepared()
+            .map_err(|error| anyhow!("failed to prepare standalone web search request: {error}"))?;
             let result = tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => return Err(anyhow!("web search cancelled")),
                 response = run_with_retry(
                     search_retry_policy(),
@@ -423,6 +437,7 @@ impl WebSearchClient {
                     if status.as_u16() == 401 && !refreshed_after_unauthorized =>
                 {
                     auth = tokio::select! {
+                        biased;
                         _ = cancellation.cancelled() => return Err(anyhow!("web search cancelled")),
                         refreshed = self.auth.force_refreshed_snapshot(&self.client) => refreshed,
                     }
@@ -437,18 +452,23 @@ impl WebSearchClient {
         .map_err(|error| anyhow!("standalone web search request failed: {error}"))?;
         let response: SearchResponse = serde_json::from_slice(&response.body)
             .context("failed to decode standalone web search response")?;
-        Ok(Value::String(bounded_search_output(&response.output)))
+        Ok(Value::String(bounded_search_output(response.output)))
     }
 }
 
-fn bounded_search_output(output: &str) -> String {
-    formatted_truncate_text(output, TruncationPolicy::Tokens(MAX_OUTPUT_TOKENS))
+fn bounded_search_output(output: String) -> String {
+    let policy = TruncationPolicy::Tokens(MAX_OUTPUT_TOKENS);
+    if output.len() <= policy.byte_budget() {
+        output
+    } else {
+        formatted_truncate_text(&output, policy)
+    }
 }
 
 impl ToolTurnContext {
     pub(crate) fn from_history(history: &[Value], turn_metadata: String) -> Self {
         Self {
-            input: recent_input(history),
+            input: recent_input(history).map(Arc::new),
             turn_metadata,
         }
     }

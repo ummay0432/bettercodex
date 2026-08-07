@@ -1,0 +1,10 @@
+# Adapted by bettercodex to distinguish this harness from upstream OpenAI Codex.
+interface:
+  display_name: "OpenAI Docs"
+  short_description: "Official OpenAI and upstream Codex documentation"
+  icon_small: "./assets/openai-small.svg"
+  icon_large: "./assets/openai.png"
+  default_prompt: "Use OpenAI Docs for official documentation lookup, upstream Codex questions, model selection, migration, and prompt-upgrade work."
+
+policy:
+  allow_implicit_invocation: true

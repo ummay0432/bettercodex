@@ -212,7 +212,49 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
 
     assert!(catalog.warnings().is_empty());
-    assert_eq!(catalog.skills().len(), 1);
+    assert_eq!(
+        catalog.skills().iter().map(Skill::name).collect::<Vec<_>>(),
+        ["manifest", "openai-docs", "papercut"]
+    );
+    let manifest = catalog
+        .skills()
+        .iter()
+        .find(|skill| skill.name() == "manifest")
+        .unwrap();
+    assert_eq!(manifest.scope, SkillScope::System);
+    assert!(manifest.is_enabled());
+    assert!(!manifest.allows_implicit_invocation());
+    assert_eq!(manifest.display_name(), "Docs Manifest");
+    assert_eq!(
+        manifest.display_description(),
+        "Research official docs, write a MANIFEST.md routing map"
+    );
+    assert_eq!(
+        fs::read(
+            manifest
+                .path()
+                .parent()
+                .unwrap()
+                .join("references/exemplar-shopify-graphql-manifest.md")
+        )
+        .unwrap(),
+        include_bytes!(
+            "../bundled-skills/manifest/references/exemplar-shopify-graphql-manifest.md"
+        )
+    );
+    let openai_docs = catalog
+        .skills()
+        .iter()
+        .find(|skill| skill.name() == "openai-docs")
+        .unwrap();
+    assert_eq!(openai_docs.scope, SkillScope::System);
+    assert!(openai_docs.is_enabled());
+    assert!(openai_docs.allows_implicit_invocation());
+    assert_eq!(openai_docs.display_name(), "OpenAI Docs");
+    assert_eq!(
+        openai_docs.display_description(),
+        "Official OpenAI and upstream Codex documentation"
+    );
     let papercut = catalog
         .skills()
         .iter()
@@ -227,9 +269,30 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     assert!(instructions.contains("papercut"));
     assert!(instructions.contains("dead-end tool call"));
     assert!(instructions.contains(&papercut.path().display().to_string()));
+    assert!(instructions.contains("openai-docs"));
+    assert!(instructions.contains("OpenAI APIs/products"));
+    assert!(instructions.contains(&openai_docs.path().display().to_string()));
+    assert!(!instructions.contains("- manifest:"));
     assert!(
         !instructions.contains("Log each distinct papercut at most once per session"),
         "the papercut workflow body must stay out of the always-visible catalogue"
+    );
+    assert!(
+        !instructions.contains("First substantive action"),
+        "the OpenAI Docs workflow body must stay out of the always-visible catalogue"
+    );
+
+    let manifest_injection = catalog.explicit_injections("use $manifest", &[]);
+    assert!(manifest_injection.warnings.is_empty());
+    assert_eq!(manifest_injection.items.len(), 1);
+    assert!(text_of(&manifest_injection.items[0]).contains("Produce a MANIFEST.md"));
+
+    let openai_docs_injection = catalog.explicit_injections("use $openai-docs", &[]);
+    assert!(openai_docs_injection.warnings.is_empty());
+    assert_eq!(openai_docs_injection.items.len(), 1);
+    assert!(
+        text_of(&openai_docs_injection.items[0])
+            .contains("tools.openaiDeveloperDocs__search_openai_docs")
     );
 
     let papercut_selection = SkillSelection::new("papercut", papercut.path());
@@ -249,11 +312,12 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     )
     .unwrap();
     let explicit_only = SkillCatalog::load_with_home(&cwd, Some(&home));
-    assert!(
-        explicit_only
-            .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
-            .is_none()
-    );
+    let explicit_only_message = explicit_only
+        .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
+        .unwrap();
+    let explicit_only_catalogue = text_of(&explicit_only_message);
+    assert!(explicit_only_catalogue.contains("openai-docs"));
+    assert!(!explicit_only_catalogue.contains("papercut"));
     assert_eq!(
         explicit_only
             .explicit_injections("use $papercut", &[papercut_selection])
