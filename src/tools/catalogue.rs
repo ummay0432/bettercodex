@@ -1,6 +1,6 @@
 //! Fixed JavaScript tool catalogue ported from Codex's `code_mode_only` plan at
 //! `1669c2403f793d0230065397dfc25f52b844244e` and rechecked against upstream at
-//! `c5d94319715d2598a2e8b2b7d0e21a3b1e83aec6`. bettercodex exposes this one
+//! `3b366654f1de1b77587ffb026c8f35507f3fe4ef`. bettercodex exposes this one
 //! execution path unconditionally; it has no tool-mode selector.
 //!
 //! The schemas mirror `core/src/tools/handlers/{apply_patch_spec,plan_spec,
@@ -261,37 +261,20 @@ fn render_tool_signature(tool: &ToolDefinition, process_output_schema: &Value) -
 }
 
 fn render_compact_schema(schema: &Value) -> String {
-    let mut schema = schema.clone();
-    remove_schema_descriptions(&mut schema);
-    compact_typescript(&code_runtime::render_json_schema_to_typescript(&schema))
-}
-
-fn remove_schema_descriptions(schema: &mut Value) {
-    match schema {
-        Value::Array(values) => values.iter_mut().for_each(remove_schema_descriptions),
-        Value::Object(map) => {
-            map.remove("description");
-            map.values_mut().for_each(remove_schema_descriptions);
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
+    // Upstream renders schema annotations as line comments. Strip those from
+    // the rendered declaration so argument properties named `description`
+    // remain part of the schema.
+    compact_typescript(&code_runtime::render_json_schema_to_typescript(schema))
 }
 
 fn compact_typescript(source: &str) -> String {
-    let characters = source.chars().collect::<Vec<_>>();
-    let mut next_non_whitespace = vec![None; characters.len()];
-    let mut next = None;
-    for (index, character) in characters.iter().copied().enumerate().rev() {
-        next_non_whitespace[index] = next;
-        if !character.is_whitespace() {
-            next = Some(character);
-        }
-    }
     let mut output = String::with_capacity(source.len());
+    let mut characters = source.chars().peekable();
     let mut previous = None;
+    let mut pending_whitespace = false;
     let mut in_string = false;
     let mut escaped = false;
-    for (index, character) in characters.iter().copied().enumerate() {
+    while let Some(character) = characters.next() {
         if in_string {
             output.push(character);
             previous = Some(character);
@@ -304,23 +287,36 @@ fn compact_typescript(source: &str) -> String {
             }
             continue;
         }
-        if character == '"' {
-            in_string = true;
-            output.push(character);
-            previous = Some(character);
+
+        if character == '/' && characters.peek() == Some(&'/') {
+            characters.next();
+            for comment_character in characters.by_ref() {
+                if matches!(comment_character, '\n' | '\r') {
+                    break;
+                }
+            }
+            pending_whitespace = true;
             continue;
         }
-        if character == ';' && next_non_whitespace[index] == Some('}') {
+
+        if character.is_whitespace() {
+            pending_whitespace = true;
             continue;
         }
-        if character.is_whitespace()
-            && (previous.is_some_and(is_compact_typescript_punctuation)
-                || next_non_whitespace[index].is_some_and(is_compact_typescript_punctuation))
+
+        if pending_whitespace
+            && previous.is_some_and(|character| !is_compact_typescript_punctuation(character))
+            && !is_compact_typescript_punctuation(character)
         {
-            continue;
+            output.push(' ');
+        }
+        if character == '}' && previous == Some(';') {
+            output.pop();
         }
         output.push(character);
         previous = Some(character);
+        pending_whitespace = false;
+        in_string = character == '"';
     }
     output
 }
@@ -710,14 +706,48 @@ mod tests {
                 "properties": {
                     "label": {
                         "type": "string",
-                        "enum": ["two words", "x,y", "say \"hi\"", "c:\\tmp"],
+                        "enum": [
+                            "two words",
+                            "x,y",
+                            "say \"hi\"",
+                            "c:\\tmp",
+                            "https://example.com/a // b"
+                        ],
                         "description": "Removed from the declaration."
                     }
                 },
                 "required": ["label"],
                 "additionalProperties": false
             })),
-            r#"{label:"two words"|"x,y"|"say \"hi\""|"c:\\tmp"}"#
+            r#"{label:"two words"|"x,y"|"say \"hi\""|"c:\\tmp"|"https://example.com/a // b"}"#
+        );
+    }
+
+    #[test]
+    fn compact_schema_rendering_preserves_properties_named_description() {
+        assert_eq!(
+            render_compact_schema(&json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Documentation for a real argument."
+                    },
+                    "nested": {
+                        "type": "object",
+                        "properties": {
+                            "description": {
+                                "type": "number",
+                                "description": "Documentation for a nested argument."
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["description"],
+                "additionalProperties": false
+            })),
+            "{description:string;nested?:{description?:number}}"
         );
     }
 
