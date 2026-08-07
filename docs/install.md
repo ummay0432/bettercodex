@@ -34,14 +34,21 @@ when necessary.
    gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | sh
    ```
 
-4. Open a new terminal, enter a project directory, and run:
+4. Open a new terminal and sign in with your own ChatGPT account:
+
+   ```sh
+   bcodex login
+   ```
+
+5. Enter a project directory and run:
 
    ```sh
    bcodex
    ```
 
-5. Sign in with your own ChatGPT account when prompted. Authentication,
-   settings, and saved sessions stay under `$HOME/.bcodex` on that computer.
+The ChatGPT credential cache stays in `$CODEX_HOME/auth.json`, or
+`$HOME/.codex/auth.json` when `CODEX_HOME` is unset. bettercodex settings and
+saved sessions stay under `$HOME/.bcodex`. Both remain local to that computer.
 
 Run the same installer command whenever the maintainer publishes an update.
 The installer authenticates with `gh`, selects the native release asset,
@@ -70,7 +77,8 @@ access.
 Removing a collaborator blocks future source and release downloads. It cannot
 erase binaries or source that the collaborator already downloaded, so this is
 private distribution rather than digital-rights management. Friends should
-never share GitHub tokens, ChatGPT credentials, or `$HOME/.bcodex` contents.
+never share GitHub tokens, `$HOME/.codex/auth.json`, or `$HOME/.bcodex`
+contents.
 
 ## Maintainer setup
 

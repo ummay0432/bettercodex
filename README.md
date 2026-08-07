@@ -12,13 +12,14 @@ signing in with the [GitHub CLI](https://cli.github.com/), run:
 gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | sh
 ```
 
-Then open a new terminal and run:
+Then open a new terminal, sign in with your own ChatGPT account, and launch
+bettercodex from a project directory:
 
 ```sh
+bcodex login
 bcodex
 ```
 
 The same installer command updates an existing installation. See
 [`docs/install.md`](docs/install.md) for first-time GitHub setup, supported
 platforms, privacy boundaries, and release instructions.
-

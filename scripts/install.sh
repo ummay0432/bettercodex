@@ -272,15 +272,16 @@ configure_path
 step "Installed $installed_version at $BIN_PATH"
 case "$path_action" in
   added | updated)
-    step "Open a new terminal and run: bcodex"
-    step "For this terminal: export PATH=\"$BIN_DIR:\$PATH\""
+    step "Open a new terminal and run: bcodex login"
+    step "For this terminal: export PATH=\"$BIN_DIR:\$PATH\" && bcodex login"
     step "PATH was configured in $path_profile"
     ;;
   configured)
-    step "Open a new terminal and run: bcodex"
+    step "Open a new terminal and run: bcodex login"
     step "PATH is configured in $path_profile"
     ;;
   *)
-    step "Run: bcodex"
+    step "Run: bcodex login"
     ;;
 esac
+step "After signing in, run bcodex from a project directory"
