@@ -533,6 +533,28 @@ fn unsupported_assistant_message_phases_are_rejected_at_the_stream_boundary() {
 }
 
 #[test]
+fn system_prompt_uses_the_sol_adaptation_of_the_upstream_personality_block() {
+    fn personality_block(document: &str) -> &str {
+        const START: &str = "# Personality\n";
+        const END: &str = "\n# Working with the user\n";
+
+        let start = document.find(START).expect("personality heading");
+        let end = document[start..]
+            .find(END)
+            .map(|offset| start + offset)
+            .expect("working-with-user heading after personality block");
+        &document[start..end]
+    }
+
+    let expected = personality_block(include_str!(
+        "../docs/upstream-codex-gpt-5.6-sol-instructions.md"
+    ))
+    .replacen("As Codex,", "As Sol,", 1);
+
+    assert_eq!(personality_block(harness_instructions()), expected);
+}
+
+#[test]
 fn request_uses_instructions_and_one_stable_tool_prefix() {
     assert!(
         !SYSTEM_PROMPT.to_ascii_lowercase().contains("papercut"),
@@ -558,7 +580,7 @@ fn request_uses_instructions_and_one_stable_tool_prefix() {
         "<system_instructions>\n",
         "You are an exceptional coding agent. You and the user share one workspace, ",
         "and your job is to collaborate with them until their goal is genuinely handled.\n\n",
-        "# Working with the user"
+        "# Personality"
     )));
     assert!(harness_instructions().contains("# Rules for getting work done"));
     assert!(harness_instructions().ends_with("</system_instructions>"));

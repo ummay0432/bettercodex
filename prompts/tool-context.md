@@ -10,7 +10,7 @@ specifications, and upstream description renderer were rechecked against Codex
 commit
 [`3b366654f1de1b77587ffb026c8f35507f3fe4ef`](https://github.com/openai/codex/tree/3b366654f1de1b77587ffb026c8f35507f3fe4ef)
 on 2026-08-07. bettercodex keeps the runtime protocol and Codex's
-schema-to-TypeScript conversion. Its fixed seven-tool surface uses one compact
+schema-to-TypeScript conversion. Its fixed twelve-tool surface uses one compact
 declaration block instead of Codex's dynamic per-tool headings, prose, wrapper,
 and fenced declaration.
 
@@ -97,15 +97,15 @@ original 20,440-byte catalogue, the reduction is 66.6%.
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable harness input: `instructions` plus `additional_tools` | 15,570 | 3,570 | 3,893 |
+| Complete stable harness input: `instructions` plus `additional_tools` | 17,669 | 3,969 | 4,418 |
 | Complete `additional_tools` developer item | 6,824 | 1,801 | 1,706 |
 | Top-level `exec` specification | 6,328 | 1,682 | 1,582 |
 | `exec` description only | 6,094 | 1,569 | 1,524 |
 | `exec` Lark grammar only | 31 | 12 | 8 |
 | Top-level `wait` specification | 438 | 107 | 110 |
 | `wait` description only | 151 | 40 | 38 |
-| Top-level `instructions` request field | 8,735 | 1,766 | 2,184 |
-| `prompts/system.md` text only | 8,642 | 1,699 | 2,161 |
+| Top-level `instructions` request field | 10,834 | 2,165 | 2,709 |
+| `prompts/system.md` text only | 10,721 | 2,081 | 2,681 |
 <!-- bcodex-tool-context:stable:end -->
 
 The `exec` description contains the Code Mode runtime instructions and every
