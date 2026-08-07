@@ -28,6 +28,18 @@ struct EmbeddedFile {
 
 const EMBEDDED_FILES: &[EmbeddedFile] = &[
     EmbeddedFile {
+        relative_path: "loop/SKILL.md",
+        contents: include_bytes!("../bundled-skills/loop/SKILL.md"),
+    },
+    EmbeddedFile {
+        relative_path: "loop/agents/openai.yaml",
+        contents: include_bytes!("../bundled-skills/loop/agents/openai.yaml"),
+    },
+    EmbeddedFile {
+        relative_path: "loop/references/evals-manifest.md",
+        contents: include_bytes!("../docs/evals/MANIFEST.md"),
+    },
+    EmbeddedFile {
         relative_path: "manifest/SKILL.md",
         contents: include_bytes!("../bundled-skills/manifest/SKILL.md"),
     },

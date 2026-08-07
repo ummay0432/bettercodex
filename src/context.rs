@@ -2,6 +2,7 @@ use crate::compaction::InitialContextInjection;
 use crate::repository;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
+use crate::rollout::OperatorInputRecord;
 use crate::rollout::Rollout;
 use crate::rollout::SessionIdentity;
 use crate::rollout::TurnOutcome;
@@ -105,6 +106,65 @@ pub(crate) struct Conversation {
     server_reasoning_included: bool,
     rollout: Rollout,
     world_state: WorldState,
+    operator_inputs: Vec<OperatorInputRecord>,
+    operator_inputs_complete: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct FrozenLoopContext {
+    world_state: WorldState,
+    history: Vec<Value>,
+    operator_inputs: Vec<OperatorInputRecord>,
+}
+
+impl FrozenLoopContext {
+    pub(crate) fn capture(
+        cwd: &Path,
+        inputs: &[OperatorInputRecord],
+    ) -> Result<(Self, Vec<String>)> {
+        let world_state = WorldState::load(cwd)?;
+        let mut warnings = Vec::new();
+        let mut frozen_inputs = Vec::with_capacity(inputs.len());
+        let mut history = world_state.items();
+        for input in inputs {
+            let injections = world_state
+                .skills
+                .explicit_injections(&input.prompt_text, &input.selected_skills);
+            warnings.extend(injections.warnings);
+            history.extend(injections.items.iter().cloned());
+            history.push(input.message.clone());
+            frozen_inputs.push(OperatorInputRecord {
+                message: input.message.clone(),
+                prompt_text: input.prompt_text.clone(),
+                selected_skills: input.selected_skills.clone(),
+                skill_context: injections.items,
+            });
+        }
+        let tokens = estimated_tokens(&history)
+            .saturating_add(*STABLE_HARNESS_TOKEN_ESTIMATES.first().unwrap_or(&0))
+            .saturating_add(*STABLE_HARNESS_TOKEN_ESTIMATES.get(1).unwrap_or(&0));
+        if tokens > EFFECTIVE_CONTEXT_WINDOW {
+            return Err(anyhow::anyhow!(
+                "frozen operator task requires an estimated {tokens} tokens, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; the quality loop cannot summarize or drop original task inputs"
+            ));
+        }
+        Ok((
+            Self {
+                world_state,
+                history,
+                operator_inputs: frozen_inputs,
+            },
+            warnings,
+        ))
+    }
+
+    pub(crate) fn operator_inputs(&self) -> &[OperatorInputRecord] {
+        &self.operator_inputs
+    }
+
+    pub(crate) fn context_items(&self) -> &[Value] {
+        &self.history
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +302,29 @@ impl Conversation {
             server_reasoning_included: false,
             rollout,
             world_state,
+            operator_inputs: Vec::new(),
+            operator_inputs_complete: true,
+        })
+    }
+
+    pub(crate) fn from_frozen_loop(
+        frozen: &FrozenLoopContext,
+        mut rollout: Rollout,
+    ) -> Result<Self> {
+        let history = frozen.history.clone();
+        rollout.replace_history(&history, HistoryReplacement::Initial)?;
+        let context_metrics = ContextMetrics::from_history(&history, &frozen.world_state);
+        Ok(Self {
+            history,
+            history_lineage: Uuid::new_v4(),
+            context_metrics,
+            usage: None,
+            usage_history_estimate: None,
+            server_reasoning_included: false,
+            rollout,
+            world_state: frozen.world_state.clone(),
+            operator_inputs: Vec::new(),
+            operator_inputs_complete: true,
         })
     }
 
@@ -253,6 +336,8 @@ impl Conversation {
             usage_history_estimate,
             server_reasoning_included,
             unfinished_turn,
+            operator_inputs,
+            operator_inputs_complete,
             ..
         } = loaded;
         let world_state = WorldState::load(cwd)?;
@@ -266,6 +351,8 @@ impl Conversation {
             server_reasoning_included,
             rollout,
             world_state,
+            operator_inputs,
+            operator_inputs_complete,
         };
         if let Some(turn_id) = unfinished_turn {
             conversation.normalize()?;
@@ -279,6 +366,10 @@ impl Conversation {
     }
 
     pub(crate) fn fork(&self, mut rollout: Rollout) -> Result<Self> {
+        rollout.snapshot_operator_inputs(
+            self.operator_inputs.clone(),
+            self.operator_inputs_complete,
+        )?;
         rollout.replace_history(&self.history, HistoryReplacement::Initial)?;
         if let (Some(usage), Some(history_estimate)) = (&self.usage, self.usage_history_estimate) {
             rollout.record_usage(usage, history_estimate, self.server_reasoning_included)?;
@@ -292,7 +383,20 @@ impl Conversation {
             server_reasoning_included: self.server_reasoning_included,
             rollout,
             world_state: self.world_state.clone(),
+            operator_inputs: self.operator_inputs.clone(),
+            operator_inputs_complete: self.operator_inputs_complete,
         })
+    }
+
+    pub(crate) fn operator_inputs(&self) -> Option<&[OperatorInputRecord]> {
+        self.operator_inputs_complete
+            .then_some(self.operator_inputs.as_slice())
+    }
+
+    pub(crate) fn record_operator_input(&mut self, item: OperatorInputRecord) -> Result<()> {
+        self.rollout.record_operator_input(item.clone())?;
+        self.operator_inputs.push(item);
+        Ok(())
     }
 
     pub(crate) fn session_id(&self) -> &str {

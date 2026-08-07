@@ -1,4 +1,5 @@
 use crate::MODEL;
+use crate::skills::SkillSelection;
 use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
@@ -91,6 +92,16 @@ pub(crate) struct LoadedRollout {
     pub(crate) server_reasoning_included: bool,
     pub(crate) compaction_count: u64,
     pub(crate) unfinished_turn: Option<String>,
+    pub(crate) operator_inputs: Vec<OperatorInputRecord>,
+    pub(crate) operator_inputs_complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct OperatorInputRecord {
+    pub(crate) message: Value,
+    pub(crate) prompt_text: String,
+    pub(crate) selected_skills: Vec<SkillSelection>,
+    pub(crate) skill_context: Vec<Value>,
 }
 
 pub(crate) struct Rollout {
@@ -135,6 +146,13 @@ enum RolloutRecordData<Items = Vec<Value>> {
     },
     TranscriptSnapshot {
         items: Vec<SessionTranscriptItem>,
+    },
+    OperatorInputsSnapshot {
+        items: Vec<OperatorInputRecord>,
+        complete: bool,
+    },
+    OperatorInput {
+        item: OperatorInputRecord,
     },
     HistoryAppend {
         items: Items,
@@ -240,6 +258,10 @@ impl Rollout {
             metadata: metadata.clone(),
         };
         rollout.write_record(&RolloutRecord::Session { metadata })?;
+        rollout.write_record(&RolloutRecord::OperatorInputsSnapshot {
+            items: Vec::new(),
+            complete: true,
+        })?;
         Ok(rollout)
     }
 
@@ -293,6 +315,18 @@ impl Rollout {
 
     pub(crate) fn snapshot_transcript(&mut self, items: Vec<SessionTranscriptItem>) -> Result<()> {
         self.write_record(&RolloutRecord::TranscriptSnapshot { items })
+    }
+
+    pub(crate) fn snapshot_operator_inputs(
+        &mut self,
+        items: Vec<OperatorInputRecord>,
+        complete: bool,
+    ) -> Result<()> {
+        self.write_record(&RolloutRecord::OperatorInputsSnapshot { items, complete })
+    }
+
+    pub(crate) fn record_operator_input(&mut self, item: OperatorInputRecord) -> Result<()> {
+        self.write_record(&RolloutRecord::OperatorInput { item })
     }
 
     pub(crate) fn replace_history(
@@ -396,6 +430,8 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut server_reasoning_included = false;
     let mut compaction_count = 0_u64;
     let mut unfinished_turn = None;
+    let mut operator_inputs = Vec::new();
+    let mut operator_inputs_complete = false;
     let mut line_number = 0_usize;
     let mut valid_length = 0_u64;
     let mut valid_record_needs_newline = false;
@@ -448,6 +484,11 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 compaction_count: source_compaction_count,
             } => compaction_count = source_compaction_count,
             RolloutRecord::TranscriptSnapshot { items } => transcript = items,
+            RolloutRecord::OperatorInputsSnapshot { items, complete } => {
+                operator_inputs = items;
+                operator_inputs_complete = complete;
+            }
+            RolloutRecord::OperatorInput { item } => operator_inputs.push(item),
             RolloutRecord::HistoryAppend { items } => {
                 append_transcript_items(&mut transcript, &items);
                 history.extend(items);
@@ -528,6 +569,8 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         server_reasoning_included,
         compaction_count,
         unfinished_turn,
+        operator_inputs,
+        operator_inputs_complete,
     })
 }
 

@@ -607,6 +607,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "supports-color",
  "syntect",
  "textwrap 0.16.2",

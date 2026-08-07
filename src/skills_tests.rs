@@ -214,7 +214,20 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     assert!(catalog.warnings().is_empty());
     assert_eq!(
         catalog.skills().iter().map(Skill::name).collect::<Vec<_>>(),
-        ["manifest", "openai-docs", "papercut"]
+        ["loop", "manifest", "openai-docs", "papercut"]
+    );
+    let loop_skill = catalog
+        .skills()
+        .iter()
+        .find(|skill| skill.name() == "loop")
+        .unwrap();
+    assert_eq!(loop_skill.scope, SkillScope::System);
+    assert!(loop_skill.is_enabled());
+    assert!(!loop_skill.allows_implicit_invocation());
+    assert_eq!(loop_skill.display_name(), "Quality Loop");
+    assert_eq!(
+        loop_skill.display_description(),
+        "Task-specific evaluator and iterative improvement loop"
     );
     let manifest = catalog
         .skills()

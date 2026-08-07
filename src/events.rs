@@ -29,4 +29,6 @@ pub(crate) enum AgentEvent {
     SteeringCommitted(SteerId),
     CompactionStarted,
     CompactionCompleted,
+    LoopProgress(crate::quality_loop::LoopProgress),
+    LoopProgressCleared,
 }

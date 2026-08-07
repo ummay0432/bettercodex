@@ -1520,3 +1520,91 @@ fn resumed_prompt_history_contains_user_inputs_but_not_context_notices() {
     drop(resumed);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn frozen_loop_context_replays_only_verbatim_operator_items_and_invocation_time_world_state() {
+    let (root, cwd) = temporary_repository("frozen-loop");
+    std::fs::write(cwd.join("AGENTS.md"), "frozen repository instruction").unwrap();
+    let first = json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "first operator message"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAEC", "detail": "original"}
+        ]
+    });
+    let second = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "second $loop message"}]
+    });
+    let records = vec![
+        OperatorInputRecord {
+            message: first.clone(),
+            prompt_text: "first operator message".to_string(),
+            selected_skills: Vec::new(),
+            skill_context: Vec::new(),
+        },
+        OperatorInputRecord {
+            message: second.clone(),
+            prompt_text: "second $loop message".to_string(),
+            selected_skills: Vec::new(),
+            skill_context: Vec::new(),
+        },
+    ];
+    let (frozen, warnings) = FrozenLoopContext::capture(&cwd, &records).unwrap();
+    assert!(warnings.is_empty());
+    std::fs::write(cwd.join("AGENTS.md"), "later candidate instruction").unwrap();
+
+    let rollout = Rollout::create_in(&root.join("internal"), &cwd).unwrap();
+    let conversation = Conversation::from_frozen_loop(&frozen, rollout).unwrap();
+    let items = conversation.items();
+    assert!(items.contains(&first));
+    assert!(items.contains(&second));
+    assert!(items.iter().any(|item| {
+        message_text(item).is_some_and(|text| text.contains("frozen repository instruction"))
+    }));
+    assert!(!items.iter().any(|item| {
+        item.get("role").and_then(Value::as_str) == Some("assistant")
+            || message_text(item).is_some_and(|text| text.contains("later candidate instruction"))
+    }));
+    assert_eq!(
+        frozen.operator_inputs()[0].message["content"][1]["image_url"],
+        "data:image/png;base64,AAEC"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| {
+                ["first operator message", "second $loop message"]
+                    .into_iter()
+                    .any(|text| message_text(item) == Some(text))
+            })
+            .collect::<Vec<_>>(),
+        vec![&first, &second]
+    );
+
+    drop(conversation);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn oversized_verbatim_loop_record_is_rejected_instead_of_compacted() {
+    let (root, cwd) = temporary_repository("oversized-frozen-loop");
+    let text = "x".repeat((EFFECTIVE_CONTEXT_WINDOW as usize).saturating_mul(5));
+    let record = OperatorInputRecord {
+        message: json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}]
+        }),
+        prompt_text: text,
+        selected_skills: Vec::new(),
+        skill_context: Vec::new(),
+    };
+    let error = FrozenLoopContext::capture(&cwd, &[record])
+        .err()
+        .expect("oversized frozen record must fail");
+    assert!(format!("{error:#}").contains("cannot summarize or drop"));
+    std::fs::remove_dir_all(root).unwrap();
+}

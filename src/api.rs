@@ -174,6 +174,7 @@ pub(crate) struct ApiClient {
     websocket_reasoning_included: bool,
     websocket_baseline: Option<WebSocketBaseline>,
     stream_idle_timeout: Duration,
+    instructions: String,
 }
 
 struct WebSocketBaseline {
@@ -397,14 +398,52 @@ impl ApiClient {
         identity: &SessionIdentity,
         compaction_count: u64,
     ) -> anyhow::Result<Self> {
-        Self::new_with_base_url(auth, identity, compaction_count, BASE_URL.to_string())
+        Self::new_configured(
+            auth,
+            identity,
+            compaction_count,
+            BASE_URL.to_string(),
+            harness_instructions().to_string(),
+        )
     }
 
+    pub(crate) fn new_with_instructions(
+        auth: Auth,
+        identity: &SessionIdentity,
+        compaction_count: u64,
+        instructions: String,
+    ) -> anyhow::Result<Self> {
+        Self::new_configured(
+            auth,
+            identity,
+            compaction_count,
+            BASE_URL.to_string(),
+            instructions,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_base_url(
         auth: Auth,
         identity: &SessionIdentity,
         compaction_count: u64,
         base_url: String,
+    ) -> anyhow::Result<Self> {
+        Self::new_configured(
+            auth,
+            identity,
+            compaction_count,
+            base_url,
+            harness_instructions().to_string(),
+        )
+    }
+
+    fn new_configured(
+        auth: Auth,
+        identity: &SessionIdentity,
+        compaction_count: u64,
+        base_url: String,
+        instructions: String,
     ) -> anyhow::Result<Self> {
         codex_utils_rustls_provider::ensure_rustls_crypto_provider();
         let mut default_headers = HeaderMap::new();
@@ -432,6 +471,7 @@ impl ApiClient {
             websocket_reasoning_included: false,
             websocket_baseline: None,
             stream_idle_timeout: STREAM_IDLE_TIMEOUT,
+            instructions,
         })
     }
 
@@ -987,7 +1027,7 @@ impl ApiClient {
     fn build_request_from_input(&self, input: Vec<Value>, request_kind: RequestKind) -> Value {
         let mut request = json!({
             "model": MODEL,
-            "instructions": harness_instructions(),
+            "instructions": &self.instructions,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
             "reasoning": {"effort": "max", "summary": "auto", "context": "all_turns"},

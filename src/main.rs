@@ -11,6 +11,7 @@ mod managed_session;
 mod openai_docs;
 mod paths;
 mod prompt_history;
+mod quality_loop;
 mod repository;
 mod rollout;
 mod skill_settings;
@@ -37,6 +38,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
+use tokio::sync::mpsc::unbounded_channel;
 use uuid::Uuid;
 
 const MODEL: &str = "gpt-5.6-sol";
@@ -119,6 +121,14 @@ fn run() -> Result<()> {
         Command::Update => update::run_update(),
         Command::UpdateHelp => {
             write_update_help()?;
+            Ok(())
+        }
+        Command::InternalLoopState { run_root, contract } => {
+            let cwd = std::env::current_dir()?;
+            write_stdout_line(format_args!(
+                "{}",
+                quality_loop::capture_state_identity(&cwd, &run_root, &contract)?
+            ))?;
             Ok(())
         }
         Command::Run(options) => run_agent_command(&arguments, options, None),
@@ -209,7 +219,7 @@ async fn run_agent(
     };
     let cwd = agent.cwd().to_path_buf();
     if let Some(input) = input {
-        let answer = agent.submit_user_input(input).await?;
+        let answer = submit_cli_input(&mut agent, input).await?;
         write_stdout_line(format_args!("{answer}"))?;
         return Ok(());
     }
@@ -236,16 +246,49 @@ async fn run_line_mode(agent: &mut Agent) -> Result<()> {
             write_stdout_line(format_args!(""))?;
             break;
         };
-        let prompt = line.trim();
-        if prompt.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
-        match agent.submit(prompt).await {
+        match submit_cli_input(agent, UserInput::text(line)).await {
             Ok(answer) => write_stdout_line(format_args!("{answer}\n"))?,
             Err(error) => write_stderr_line(format_args!("error: {error:#}\n"))?,
         }
     }
     Ok(())
+}
+
+async fn submit_cli_input(agent: &mut Agent, input: UserInput) -> Result<String> {
+    let invocation = quality_loop::parse_invocation_with_mode(
+        input.submitted_text(),
+        input.has_attachments(),
+        false,
+    )?;
+    let Some(invocation) = invocation else {
+        return agent.submit_user_input(input).await;
+    };
+    let (events_tx, mut events_rx) = unbounded_channel();
+    let progress = tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                events::AgentEvent::LoopProgress(progress) => {
+                    write_stderr_line(format_args!("{}", progress.stderr_line()))?;
+                }
+                events::AgentEvent::Warning(warning) => {
+                    write_stderr_line(format_args!("warning: {warning}"))?;
+                }
+                _ => {}
+            }
+        }
+        Ok::<(), io::Error>(())
+    });
+    let (_, control) = agent::TurnControl::non_steerable_channel();
+    let outcome =
+        quality_loop::submit_with_control(agent, input, invocation, events_tx, control).await?;
+    progress.await??;
+    match outcome {
+        agent::SubmitOutcome::Completed(answer) => Ok(answer),
+        agent::SubmitOutcome::Cancelled => Err(anyhow!("quality loop was cancelled")),
+    }
 }
 
 enum Command {
@@ -264,6 +307,10 @@ enum Command {
     LogoutHelp,
     Update,
     UpdateHelp,
+    InternalLoopState {
+        run_root: PathBuf,
+        contract: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +331,27 @@ struct RunOptions {
 impl Command {
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut arguments = arguments.into_iter().peekable();
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--internal-loop-state")
+        {
+            arguments.next();
+            let run_root = arguments
+                .next()
+                .ok_or_else(|| anyhow!("internal loop state helper requires a run directory"))?;
+            let contract = arguments
+                .next()
+                .ok_or_else(|| anyhow!("internal loop state helper requires a contract"))?;
+            if arguments.next().is_some() {
+                return Err(anyhow!(
+                    "internal loop state helper received extra arguments"
+                ));
+            }
+            return Ok(Self::InternalLoopState {
+                run_root: PathBuf::from(run_root),
+                contract: PathBuf::from(contract),
+            });
+        }
         if arguments
             .peek()
             .is_some_and(|argument| argument == "--help" || argument == "-h")
