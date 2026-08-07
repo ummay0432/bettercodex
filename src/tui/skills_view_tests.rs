@@ -14,6 +14,8 @@ fn test_skills() -> (PathBuf, Vec<Skill>) {
     ));
     let cwd = root.join("repo");
     fs::create_dir_all(cwd.join(".git")).unwrap();
+    let root = root.canonicalize().unwrap();
+    let cwd = root.join("repo");
     for (directory, name, description, implicit) in [
         ("alpha", "Alpha Skill", "Handle alpha work", true),
         ("beta", "Beta Skill", "Handle beta work", false),
