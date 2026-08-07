@@ -165,7 +165,7 @@ Execute raw JavaScript to orchestrate tool calls.
 - An optional first line `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}` controls early yielding and the direct-output token budget; defaults are 10000 for both.
 
 ### `apply_patch`
-The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.
+Validates the complete patch before editing. Relative paths resolve from the turn cwd; absolute paths are accepted. `exec_command.workdir` does not change that base. Input is FREEFORM, so do not wrap it in JSON.
 
 exec tool declaration:
 ```ts
@@ -173,7 +173,7 @@ declare const tools: { apply_patch(input: string): Promise<unknown>; };
 ```
 
 ### `exec_command`
-Runs a command in a PTY, returning output or a session ID for ongoing interaction.
+Runs a shell command, optionally in a PTY, and returns output or a session ID for ongoing interaction.
 
 exec tool declaration:
 ```ts
@@ -186,7 +186,7 @@ declare const tools: { exec_command(args: {
   max_output_tokens?: number;
   // Shell binary to launch. Defaults to the user's default shell.
   shell?: string;
-  // True allocates a PTY for the command; false or omitted uses plain pipes.
+  // True allocates a PTY with TERM=xterm-256color; false or omitted uses plain pipes.
   tty?: boolean;
   // Working directory for the command. Defaults to the turn cwd.
   workdir?: string;

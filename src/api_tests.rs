@@ -545,7 +545,7 @@ fn request_uses_instructions_and_one_stable_tool_prefix() {
     assert_eq!(&first_input[..1], stable_request_prefix());
     assert_eq!(
         serde_json::to_string(&first_input[..1]).unwrap().len(),
-        11_240,
+        11_372,
         "run ./scripts/dev.py tool-context --update"
     );
     assert!(first_input.iter().all(|item| {

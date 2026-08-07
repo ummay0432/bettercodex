@@ -108,3 +108,25 @@ async fn exited_process_uses_codex_output_close_grace() {
     assert!(snapshot.has_exited());
     assert_eq!(snapshot.exit_code, Some(0));
 }
+
+#[tokio::test]
+async fn spawned_pty_processes_receive_a_capable_terminal_type() {
+    let shell = DetectedShell {
+        shell_type: ShellType::Sh,
+        shell_path: PathBuf::from("/bin/sh"),
+    };
+    let session = ProcessSession::spawn(
+        &shell,
+        ShellStartup::NonLogin,
+        "printf '%s' \"$TERM\"",
+        Path::new("/"),
+        ProcessMode::Pty,
+    )
+    .unwrap();
+
+    session.wait(Duration::from_secs(5)).await;
+
+    let snapshot = session.snapshot().unwrap();
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert_eq!(snapshot.output, "xterm-256color");
+}

@@ -94,10 +94,10 @@ tokens, and 45.0% of bytes/4 tokens.
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable harness input: `instructions` plus `additional_tools` | 20,507 | 4,784 | 5,127 |
-| Complete `additional_tools` developer item | 11,238 | 2,939 | 2,810 |
-| Top-level `exec` specification | 10,354 | 2,741 | 2,589 |
-| `exec` description only | 9,727 | 2,371 | 2,432 |
+| Complete stable harness input: `instructions` plus `additional_tools` | 20,639 | 4,809 | 5,160 |
+| Complete `additional_tools` developer item | 11,370 | 2,964 | 2,843 |
+| Top-level `exec` specification | 10,486 | 2,766 | 2,622 |
+| `exec` description only | 9,859 | 2,396 | 2,465 |
 | `exec` Lark grammar only | 177 | 58 | 45 |
 | Top-level `wait` specification | 826 | 186 | 207 |
 | `wait` description only | 247 | 62 | 62 |
@@ -112,8 +112,8 @@ nested tool declaration. This is the text-only breakdown:
 | Section inside `exec` | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
 | Runtime rules and global helpers | 989 | 221 | 248 |
-| `apply_patch` | 233 | 59 | 59 |
-| `exec_command` | 1,374 | 321 | 344 |
+| `apply_patch` | 336 | 76 | 84 |
+| `exec_command` | 1,403 | 329 | 351 |
 | `log_papercut` | 397 | 106 | 100 |
 | `update_plan` | 498 | 126 | 125 |
 | `view_image` | 654 | 153 | 164 |
@@ -191,8 +191,8 @@ bettercodex repository on the audit date:
 <!-- bcodex-tool-context:dynamic:start -->
 | Dynamic message item | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Current `<environment_context>` developer item | 276 | 85 | 69 |
-| Current `<repository_context>` user item | 6,529 | 1,550 | 1,633 |
+| Current `<environment_context>` developer item | 286 | 89 | 72 |
+| Current `<repository_context>` user item | 5,447 | 1,304 | 1,362 |
 | Current `<available_skills>` user item | 646 | 155 | 162 |
 <!-- bcodex-tool-context:dynamic:end -->
 

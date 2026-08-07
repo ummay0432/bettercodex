@@ -39,11 +39,11 @@ static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
     vec![
         freeform_tool(
             "apply_patch",
-            "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "Validates the complete patch before editing. Relative paths resolve from the turn cwd; absolute paths are accepted. `exec_command.workdir` does not change that base. Input is FREEFORM, so do not wrap it in JSON.",
         ),
         function_tool(
             "exec_command",
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+            "Runs a shell command, optionally in a PTY, and returns output or a session ID for ongoing interaction.",
             exec_command_input_schema(),
             Some(unified_exec_output_schema()),
         ),
@@ -377,7 +377,7 @@ fn exec_command_input_schema() -> Value {
             },
             "tty": {
                 "type": "boolean",
-                "description": "True allocates a PTY for the command; false or omitted uses plain pipes."
+                "description": "True allocates a PTY with TERM=xterm-256color; false or omitted uses plain pipes."
             },
             "yield_time_ms": {
                 "type": "number",
@@ -686,10 +686,10 @@ mod tests {
     fn documented_tool_context_byte_counts_do_not_drift() {
         let tools = specifications();
         let update = "run ./scripts/dev.py tool-context --update";
-        assert_eq!(text().len(), 9_727, "{update}");
+        assert_eq!(text().len(), 9_859, "{update}");
         assert_eq!(
             serde_json::to_string(&tools[0]).unwrap().len(),
-            10_354,
+            10_486,
             "{update}"
         );
         assert_eq!(
@@ -704,15 +704,15 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_string(&item).unwrap().len(),
-            11_238,
+            11_370,
             "{update}"
         );
         assert_eq!(
             metrics(),
             CatalogueMetrics {
-                description_bytes: 9_727,
-                request_bytes: 11_238,
-                estimated_tokens: 2_810,
+                description_bytes: 9_859,
+                request_bytes: 11_370,
+                estimated_tokens: 2_843,
             }
         );
     }

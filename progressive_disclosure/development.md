@@ -37,6 +37,12 @@ Run developer workflows through the checked-in helper:
 
 ## Finish a code change
 
+The primary checkout is shared integration state and must stay on `main`.
+Before editing, create a dedicated linked worktree and feature branch for the
+session. Run validation and commit there so another session cannot move the
+checkout's `HEAD` or alter the tested tree. If the primary checkout is dirty,
+leave it untouched; another session owns those changes.
+
 Every change must pass the repository text check:
 
 ```sh
@@ -162,7 +168,19 @@ bytes/4 and pinned `tiktoken` `o200k_base` estimates:
 metrics. `--update` rewrites all tables. If Python cannot import the pinned
 `tiktoken` version, the helper uses an installed `uv` to provide it ephemerally.
 
-## Remote branch verification
+## Remote branch publication and verification
+
+Publish branches with an explicit source and destination refspec:
+
+```sh
+git push origin HEAD:refs/heads/<branch>
+```
+
+Do not rely on plain `git push`: a clone-level `remote.origin.push` setting can
+silently redirect it to `main`. Immediately before integration or publication,
+merge the current local `main` into the feature branch and validate that exact
+commit. Fast-forward a clean local `main`, then publish it explicitly with
+`git push origin main:refs/heads/main`.
 
 A single-branch clone can retain a narrow `origin` fetch refspec even after
 `git push -u` succeeds. The preflight detects that state. Repair it once with:

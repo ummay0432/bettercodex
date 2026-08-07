@@ -25,9 +25,8 @@ use tokio::time::timeout;
 const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 pub(super) const RETAINED_HEAD_BYTES: usize = 512 * 1024;
 pub(super) const RETAINED_TAIL_BYTES: usize = 512 * 1024;
-const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
+const UNIFIED_EXEC_ENV: [(&str, &str); 9] = [
     ("NO_COLOR", "1"),
-    ("TERM", "dumb"),
     ("LANG", "C.UTF-8"),
     ("LC_CTYPE", "C.UTF-8"),
     ("LC_ALL", "C.UTF-8"),
@@ -399,6 +398,7 @@ fn spawn_piped(
         .args(arguments)
         .current_dir(cwd)
         .envs(UNIFIED_EXEC_ENV)
+        .env("TERM", "dumb")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -449,6 +449,7 @@ fn spawn_pty(
     for (key, value) in UNIFIED_EXEC_ENV {
         process.env(key, value);
     }
+    process.env("TERM", "xterm-256color");
     let mut child = pair
         .slave
         .spawn_command(process)

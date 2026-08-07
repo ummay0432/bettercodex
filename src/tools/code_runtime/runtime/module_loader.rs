@@ -16,11 +16,38 @@ pub(super) fn evaluate_main_module(
         .ok_or_else(|| "failed to allocate exec source".to_string())?;
     let origin = script_origin(&mut tc, "exec_main.mjs")?;
     let mut source = v8::script_compiler::Source::new(source, Some(&origin));
-    let module = v8::script_compiler::compile_module(&tc, &mut source).ok_or_else(|| {
-        tc.exception()
+    let Some(module) = v8::script_compiler::compile_module(&tc, &mut source) else {
+        let mut error = tc
+            .exception()
             .map(|exception| value_to_error_text(&mut tc, exception))
-            .unwrap_or_else(|| "unknown code mode exception".to_string())
-    })?;
+            .unwrap_or_else(|| "unknown code mode exception".to_string());
+        if let Some(message) = tc.message() {
+            let resource = message
+                .get_script_resource_name(&tc)
+                .filter(|value| !value.is_null_or_undefined())
+                .map(|value| value.to_rust_string_lossy(&tc))
+                .unwrap_or_else(|| "exec_main.mjs".to_string());
+            let line = message.get_line_number(&tc);
+            let source_line = message
+                .get_source_line(&tc)
+                .map(|line| line.to_rust_string_lossy(&tc));
+            if let Some(line) = line {
+                let column = message.get_start_column();
+                error.push_str(&format!(
+                    "\nLocation: {resource}:{line}:{}",
+                    column.saturating_add(1)
+                ));
+                if let Some(source_line) = source_line {
+                    let caret_column = column.min(source_line.len());
+                    error.push_str(&format!(
+                        "\nSource:\n{source_line}\n{}^",
+                        " ".repeat(caret_column)
+                    ));
+                }
+            }
+        }
+        return Err(error);
+    };
     module
         .instantiate_module(&tc, resolve_module_callback)
         .ok_or_else(|| {
