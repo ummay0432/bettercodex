@@ -18,6 +18,11 @@ explicitly asks to edit the system prompt.
 world-state messages, and their context cost; update its generated regions
 through `./scripts/dev.py tool-context --update`.
 
+`AGENT_CONTEXT.md` is a dated, readable snapshot captured from
+`bcodex --tool-context-json`. When stable context changes, refresh its exact
+system and tool sections and revalidate its clearly marked, intentionally
+truncated repository payload.
+
 ## Writing and placement
 
 Before editing `AGENTS.md`, read `docs/writing-a-good-claude-md.md` completely.

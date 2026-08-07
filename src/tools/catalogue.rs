@@ -760,6 +760,55 @@ mod tests {
     }
 
     #[test]
+    fn agent_context_snapshot_matches_the_stable_request_context() {
+        fn excerpt<'a>(document: &'a str, start: &str, end: &str) -> &'a str {
+            document
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing snapshot marker `{start}`"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing snapshot marker `{end}`"))
+                .0
+        }
+
+        let snapshot = include_str!("../../AGENT_CONTEXT.md");
+        assert_eq!(
+            excerpt(
+                snapshot,
+                "````text\n",
+                "\n````\n\n## 2. `additional_tools` input item",
+            ),
+            crate::api::harness_instructions()
+        );
+
+        let mut exec: Value = serde_json::from_str(excerpt(
+            snapshot,
+            "### 2.1 `exec`\n\nWire fields and grammar:\n\n```json\n",
+            "\n```\n\nExact `description` text:",
+        ))
+        .expect("exec snapshot must be valid JSON");
+        assert_eq!(exec["description"], "Exact text shown below");
+        exec["description"] = Value::String(text().to_string());
+        assert_eq!(exec, specifications()[0]);
+        assert_eq!(
+            excerpt(
+                snapshot,
+                "Exact `description` text:\n\n````markdown\n",
+                "\n````\n\n### 2.2 `wait`",
+            ),
+            text()
+        );
+
+        let wait: Value = serde_json::from_str(excerpt(
+            snapshot,
+            "### 2.2 `wait`\n\nComplete wire definition:\n\n```json\n",
+            "\n```\n\n## 3. Environment context",
+        ))
+        .expect("wait snapshot must be valid JSON");
+        assert_eq!(wait, specifications()[1]);
+    }
+
+    #[test]
     fn request_exposes_only_exec_and_wait() {
         let tools = specifications();
         let names = tools
