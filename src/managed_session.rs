@@ -737,7 +737,7 @@ struct PtyPair {
 }
 
 fn open_pty((columns, rows): (u16, u16)) -> Result<PtyPair> {
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: rows.max(1),
         ws_col: columns.max(1),
         ws_xpixel: 0,
@@ -752,8 +752,8 @@ fn open_pty((columns, rows): (u16, u16)) -> Result<PtyPair> {
             &raw mut master,
             &raw mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &raw const size,
+            std::ptr::null_mut(),
+            &raw mut size,
         )
     } == -1
     {
