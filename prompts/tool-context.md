@@ -8,7 +8,7 @@ The audit baseline is OpenAI Codex commit
 shared Code Mode protocol and utility crates. The fixed catalogue, wrapper
 specifications, and upstream description renderer were rechecked against Codex
 commit
-[`c5d94319715d2598a2e8b2b7d0e21a3b1e83aec6`](https://github.com/openai/codex/tree/c5d94319715d2598a2e8b2b7d0e21a3b1e83aec6)
+[`3b366654f1de1b77587ffb026c8f35507f3fe4ef`](https://github.com/openai/codex/tree/3b366654f1de1b77587ffb026c8f35507f3fe4ef)
 on 2026-08-07. bettercodex keeps the runtime protocol and Codex's
 schema-to-TypeScript conversion. Its fixed seven-tool surface uses one compact
 declaration block instead of Codex's dynamic per-tool headings, prose, wrapper,
@@ -125,12 +125,14 @@ The full `exec` description is stored verbatim in
 [`tool-catalogue.md`](tool-catalogue.md). A snapshot test compares that file to
 the string produced by `src/tools/catalogue.rs`, and `bcodex --tool-catalogue`
 prints the same generated string. Tool declarations still use Codex's
-`render_json_schema_to_typescript` after recursively omitting descriptive JSON
-Schema metadata. The fixed renderer removes insignificant TypeScript whitespace,
-shares the repeated process result type, and emits one declaration block. Schema
-property names, required/optional markers, arrays, enums, and return fields remain
-generated from the source schemas. The full-description row is authoritative;
-the section rows exclude their separator newlines.
+`render_json_schema_to_typescript`; the compact pass strips the renderer's line
+comments without mutating JSON Schema metadata. This preserves arguments whose
+literal property name is `description`. The fixed renderer removes insignificant
+TypeScript whitespace, shares the repeated process result type, and emits one
+declaration block. Schema property names, required/optional markers, arrays,
+enums, and return fields remain generated from the source schemas. The
+full-description row is authoritative; the section rows exclude their separator
+newlines.
 
 ## Description design and evaluation
 
