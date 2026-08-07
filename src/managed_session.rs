@@ -106,7 +106,7 @@ impl WorkerHandoff {
 
         match request {
             Ok(()) => {
-                // The supervisor has already transferred the one live terminal and is becoming
+                // The supervisor has already transferred the one live terminal and is launching
                 // the tmux client. Treat that acknowledgement as the transaction's commit point;
                 // a best-effort timeout reset cannot safely roll it back.
                 let _ = control.set_read_timeout(None);
@@ -150,8 +150,8 @@ impl Drop for PreparedTmuxSession {
 /// Establish the process boundary needed for a later live handoff.
 ///
 /// This returns only in the agent worker (or when no supervisor is needed). The outer interactive
-/// process owns the stable pseudoterminal master, relays it to the invoking terminal, and becomes
-/// the tmux client after a handoff.
+/// process owns the stable pseudoterminal master, relays it to the invoking terminal, and hosts the
+/// tmux client after a handoff so it can restore a clean terminal when that client exits.
 pub(crate) fn enter_agent_process(
     arguments: &[String],
     interactive_tui: bool,
@@ -163,7 +163,7 @@ pub(crate) fn enter_agent_process(
 
     if interactive_tui && !in_tmux_environment() {
         launch_worker(arguments)?;
-        unreachable!("the interactive supervisor exits or replaces itself");
+        unreachable!("the interactive supervisor exits after the worker or tmux client");
     }
 
     prevent_macos_idle_sleep(arguments)?;
@@ -251,6 +251,10 @@ fn launch_worker(arguments: &[String]) -> Result<()> {
     let mut child = command
         .spawn()
         .context("failed to start the interactive agent worker")?;
+    // Command keeps its configured stdio descriptors so it can be spawned again. They are clones
+    // of the PTY slave, so retaining the reusable command would keep that slave alive after the
+    // worker exits and prevent the tmux relay from observing terminal closure.
+    drop(command);
     drop(worker);
     drop(pty.slave);
     supervisor
@@ -492,16 +496,33 @@ fn drain_terminal_output(master_fd: RawFd, buffer: &mut [u8]) -> Result<()> {
 }
 
 fn attach_tmux(session_id: &str) -> ! {
-    // tmux saves the normal screen before entering its alternate screen, then restores that saved
-    // screen when the client exits. The worker's inline UI is still painted there after the PTY
-    // handoff, so erase it before tmux takes its snapshot or the old chat resurfaces under the
-    // shell prompt at the end of the session.
-    let _ = clear_invoking_terminal(io::stdout().lock());
     let mut command = Command::new("tmux");
     command.args(["attach-session", "-t", session_id]);
-    let error = command.exec();
-    eprintln!("bcodex: failed to attach tmux session {session_id}: {error}");
-    std::process::exit(1)
+
+    // tmux saves the normal screen before entering its alternate screen and writes `[exited]`
+    // after restoring that screen. Keep the supervisor around for the client lifetime so it can
+    // erase both the worker's old inline UI before attach and tmux's exit marker afterward.
+    let mut output = io::stdout().lock();
+    let status = run_with_terminal_cleanup(&mut output, |_| command.status());
+    drop(output);
+
+    match status {
+        Ok(status) => exit_with_status(status),
+        Err(error) => {
+            eprintln!("bcodex: failed to attach tmux session {session_id}: {error}");
+            std::process::exit(1)
+        }
+    }
+}
+
+fn run_with_terminal_cleanup<W, T>(output: &mut W, run: impl FnOnce(&mut W) -> T) -> T
+where
+    W: Write,
+{
+    let _ = clear_invoking_terminal(&mut *output);
+    let result = run(output);
+    let _ = clear_invoking_terminal(output);
+    result
 }
 
 fn clear_invoking_terminal(mut output: impl Write) -> io::Result<()> {

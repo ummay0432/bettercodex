@@ -215,7 +215,7 @@ fn supervisor_passes_the_existing_pty_master_to_the_tmux_relay() {
 }
 
 #[test]
-fn tmux_exit_does_not_restore_the_old_inline_terminal_surface() {
+fn tmux_client_exit_returns_to_a_clean_shell_surface() {
     let mut terminal = vt100::Parser::new(24, 80, 0);
     terminal
         .write_all(
@@ -230,13 +230,21 @@ fn tmux_exit_does_not_restore_the_old_inline_terminal_surface() {
             .contains("move this live session")
     );
 
-    clear_invoking_terminal(&mut terminal).unwrap();
-    terminal
-        .write_all(b"\x1b[?1049htmux session\x1b[?1049l[exited]\r\n")
-        .unwrap();
+    run_with_terminal_cleanup(&mut terminal, |terminal| {
+        terminal
+            .write_all(b"\x1b[?1049htmux session\x1b[?1049l[exited]\r\n\r\n")
+            .unwrap();
+    });
 
-    assert_eq!(terminal.screen().contents(), "[exited]");
-    assert_eq!(terminal.screen().cursor_position(), (1, 0));
+    assert_eq!(terminal.screen().contents(), "");
+    assert_eq!(terminal.screen().cursor_position(), (0, 0));
+    terminal
+        .write_all(b"sysadmin@srv-atlas:~/monorepo/bettercodex$ ")
+        .unwrap();
+    assert_eq!(
+        terminal.screen().contents(),
+        "sysadmin@srv-atlas:~/monorepo/bettercodex$ "
+    );
 }
 
 #[test]
