@@ -303,6 +303,7 @@ fn supervise_worker(
 ) -> Result<SupervisorOutcome> {
     let mut buffer = [0_u8; 16 * 1024];
     let mut last_size = None;
+    let mut control_open = true;
     sync_terminal_size(libc::STDIN_FILENO, master_fd, &mut last_size)?;
 
     loop {
@@ -327,7 +328,11 @@ fn supervise_worker(
                 revents: 0,
             },
             libc::pollfd {
-                fd: control.as_raw_fd(),
+                fd: if control_open {
+                    control.as_raw_fd()
+                } else {
+                    -1
+                },
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -343,7 +348,6 @@ fn supervise_worker(
             }
             return Err(error).context("interactive terminal relay poll failed");
         }
-
         if descriptors[1].revents & libc::POLLIN != 0 {
             let Some(read) = read_fd(master_fd, &mut buffer)? else {
                 return wait_for_worker(child, master_fd, &mut buffer);
@@ -359,23 +363,24 @@ fn supervise_worker(
             write_all_fd(master_fd, &buffer[..read])
                 .context("failed to relay invoking terminal input")?;
         }
-        if descriptors[2].revents & libc::POLLIN != 0 {
-            let Some(relay_fd) = receive_optional_fd(control)? else {
-                return wait_for_worker(child, master_fd, &mut buffer);
-            };
-            let session_id = read_control_line(control)?;
-            let handoff = validate_session_id(&session_id).and_then(|()| {
-                drain_terminal_output(master_fd, &mut buffer)?;
-                complete_relay_handoff(relay_fd, master_fd)
-            });
-            match handoff {
-                Ok(()) => {
-                    control
-                        .write_all(&[HANDOFF_COMMITTED_TAG])
-                        .context("failed to confirm the tmux terminal transfer")?;
-                    return Ok(SupervisorOutcome::EnterTmux(session_id));
+        if control_open && descriptors[2].revents & libc::POLLIN != 0 {
+            if let Some(relay_fd) = receive_optional_fd(control)? {
+                let session_id = read_control_line(control)?;
+                let handoff = validate_session_id(&session_id).and_then(|()| {
+                    drain_terminal_output(master_fd, &mut buffer)?;
+                    complete_relay_handoff(relay_fd, master_fd)
+                });
+                match handoff {
+                    Ok(()) => {
+                        control
+                            .write_all(&[HANDOFF_COMMITTED_TAG])
+                            .context("failed to confirm the tmux terminal transfer")?;
+                        return Ok(SupervisorOutcome::EnterTmux(session_id));
+                    }
+                    Err(error) => reject_handoff(control, &error)?,
                 }
-                Err(error) => reject_handoff(control, &error)?,
+            } else {
+                control_open = false;
             }
         }
 
@@ -387,8 +392,11 @@ fn supervise_worker(
         if descriptors[1].revents & closed != 0 && descriptors[1].revents & libc::POLLIN == 0 {
             return wait_for_worker(child, master_fd, &mut buffer);
         }
-        if descriptors[2].revents & closed != 0 && descriptors[2].revents & libc::POLLIN == 0 {
-            return wait_for_worker(child, master_fd, &mut buffer);
+        if control_open
+            && descriptors[2].revents & closed != 0
+            && descriptors[2].revents & libc::POLLIN == 0
+        {
+            control_open = false;
         }
     }
 }
