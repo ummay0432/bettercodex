@@ -1758,3 +1758,124 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
         body,
     }
 }
+
+#[test]
+fn compressed_request_body_preserves_exact_json_bytes() {
+    let body = json!({
+        "escaped": "quote: \"; slash: \\; controls: \n\t\u{0000}",
+        "unicode": "Zażółć gęślą jaźń — 東京",
+        "values": [null, true, false, -42, 1.25e100],
+        "nested": {"input": [{"type": "input_text", "text": "final"}]},
+    });
+    let expected = serde_json::to_vec(&body).unwrap();
+
+    let compressed = encode_request_body(&body).unwrap();
+    let decoded = zstd::stream::decode_all(compressed.as_ref()).unwrap();
+
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_responses_request_encoding() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    const RUNS: usize = 12;
+    const TEXT_BYTES: usize = 4 * 1024 * 1024;
+    const IMAGE_BYTES: usize = 12 * 1024 * 1024;
+
+    let mut text = String::with_capacity(TEXT_BYTES + 128);
+    let mut line = 0_u64;
+    while text.len() < TEXT_BYTES {
+        let value = line.wrapping_mul(6_364_136_223_846_793_005).rotate_left(17);
+        text.push_str(&format!(
+            "src/worker_{:04}.rs:{line}: let result_{line} = process(input, {value}); // preserve cache lineage and retry state\n",
+            line % 4_096,
+        ));
+        line += 1;
+    }
+    text.truncate(TEXT_BYTES);
+    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut random_state = 0x4d59_5df4_d0f3_3173_u64;
+    let image = String::from_utf8(
+        (0..IMAGE_BYTES)
+            .map(|_| {
+                random_state ^= random_state << 13;
+                random_state ^= random_state >> 7;
+                random_state ^= random_state << 17;
+                BASE64[(random_state & 63) as usize]
+            })
+            .collect(),
+    )
+    .unwrap();
+    let body = json!({
+        "model": MODEL,
+        "instructions": "You are a coding agent.",
+        "input": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Inspect this image."},
+                    {
+                        "type": "input_image",
+                        "image_url": format!("data:image/png;base64,{image}"),
+                    },
+                ],
+            },
+        ],
+    });
+    let json = serde_json::to_vec(&body).unwrap();
+    let text_body = json!({
+        "model": MODEL,
+        "input": [body.pointer("/input/0").unwrap()],
+    });
+    let text_json = serde_json::to_vec(&text_body).unwrap();
+
+    fn baseline(body: &Value) -> Bytes {
+        let encoded = serde_json::to_vec(body).unwrap();
+        Bytes::from(zstd::stream::encode_all(Cursor::new(encoded), 3).unwrap())
+    }
+
+    fn measure<T: AsRef<[u8]>>(
+        name: &str,
+        body: &Value,
+        json: &[u8],
+        encode: impl Fn(&Value) -> T,
+    ) {
+        let warmup = encode(body);
+        assert_eq!(zstd::stream::decode_all(warmup.as_ref()).unwrap(), json);
+        let output_len = warmup.as_ref().len();
+        let started = Instant::now();
+        for _ in 0..RUNS {
+            std::hint::black_box(encode(std::hint::black_box(body)));
+        }
+        let elapsed = started.elapsed();
+        let mib = (json.len() * RUNS) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "{name:>20}: {:8.2} ms/run, {:8.1} MiB/s, {:8} bytes ({:.2}%)",
+            elapsed.as_secs_f64() * 1_000.0 / RUNS as f64,
+            mib / elapsed.as_secs_f64(),
+            output_len,
+            output_len as f64 * 100.0 / json.len() as f64,
+        );
+    }
+
+    eprintln!("request JSON: {} bytes", json.len());
+    measure("staged level 3", &body, &json, baseline);
+    measure("direct level 1", &body, &json, |body| {
+        encode_request_body(body).unwrap()
+    });
+
+    eprintln!("text-only request JSON: {} bytes", text_json.len());
+    measure("staged level 3", &text_body, &text_json, baseline);
+    measure("direct level 1", &text_body, &text_json, |body| {
+        encode_request_body(body).unwrap()
+    });
+}

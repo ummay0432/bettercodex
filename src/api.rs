@@ -57,6 +57,10 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WEBSOCKET_PREWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STREAM_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16_000;
+// Encoding is on the critical path before network I/O. Level 1 retains strong compression for the
+// long-context JSON workloads in `benchmark_responses_request_encoding` while materially reducing
+// CPU time versus zstd's level-3 default.
+const REQUEST_COMPRESSION_LEVEL: i32 = 1;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
@@ -1110,14 +1114,7 @@ impl ApiClient {
         accept: &str,
         request_kind: RequestKind,
     ) -> ApiResult<reqwest::Response> {
-        let encoded_body = serde_json::to_vec(body).map_err(|error| {
-            ApiError::fatal(format!("failed to encode Responses request: {error}"))
-        })?;
-        let compressed_body = Bytes::from(
-            zstd::stream::encode_all(std::io::Cursor::new(encoded_body), 3).map_err(|error| {
-                ApiError::fatal(format!("failed to compress Responses request: {error}"))
-            })?,
-        );
+        let compressed_body = encode_request_body(body)?;
         let mut auth = self
             .auth
             .refreshed_snapshot(&self.client)
@@ -1217,6 +1214,26 @@ impl ApiClient {
             self.turn_state = Some(value.to_string());
         }
     }
+}
+
+fn encode_request_body(body: &Value) -> ApiResult<Bytes> {
+    // Keep serde and zstd connected: staging through `serde_json::to_vec` would grow and retain a
+    // complete uncompressed request before `encode_all` copied it through `std::io::copy`.
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), REQUEST_COMPRESSION_LEVEL)
+        .map_err(|error| {
+            ApiError::fatal(format!(
+                "failed to initialize Responses request compression: {error}"
+            ))
+        })?;
+    serde_json::to_writer(&mut encoder, body).map_err(|error| {
+        ApiError::fatal(format!(
+            "failed to encode compressed Responses request: {error}"
+        ))
+    })?;
+    encoder
+        .finish()
+        .map(Bytes::from)
+        .map_err(|error| ApiError::fatal(format!("failed to compress Responses request: {error}")))
 }
 
 #[derive(Clone, Copy)]
