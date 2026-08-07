@@ -349,6 +349,44 @@ fn benchmark_websocket_event_handoff() {
 }
 
 #[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_http_sse_event_handoff() {
+    const EVENTS: usize = 100_000;
+    const DELTA_BYTES: usize = 512;
+
+    let wire = json!({
+        "type": "response.output_text.delta",
+        "delta": "x".repeat(DELTA_BYTES),
+    })
+    .to_string();
+    let frame = format!("data: {wire}\n\n");
+    let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::default();
+    let mut decoder = SseDecoder::default();
+
+    let started = std::time::Instant::now();
+    for _ in 0..EVENTS {
+        for data in decoder
+            .push(std::hint::black_box(frame.as_bytes()))
+            .unwrap()
+        {
+            process_event(&data, &mut collected, &completed_items, Some(&events)).unwrap();
+        }
+    }
+    drop(events);
+    let received = std::iter::from_fn(|| received.try_recv().ok())
+        .map(std::hint::black_box)
+        .count();
+    let elapsed = started.elapsed();
+
+    eprintln!(
+        "{EVENTS} HTTP SSE events with {DELTA_BYTES}-byte deltas decoded and handed to the TUI in {elapsed:?}"
+    );
+    assert_eq!(received, EVENTS);
+}
+
+#[test]
 fn extracts_text_and_forwards_streaming_events() {
     assert_eq!(
         terminal_answer(&[assistant_item("done")]).as_deref(),
