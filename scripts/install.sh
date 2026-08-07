@@ -7,6 +7,10 @@ RELEASE="${BCODEX_RELEASE:-latest}"
 BIN_DIR="${BCODEX_INSTALL_DIR:-$HOME/.local/bin}"
 BIN_PATH="$BIN_DIR/bcodex"
 
+existing_install=0
+if [ -f "$BIN_PATH" ]; then
+  existing_install=1
+fi
 path_action="already"
 path_profile=""
 tmp_dir=""
@@ -269,19 +273,28 @@ configure_path() {
 
 configure_path
 
-step "Installed $installed_version at $BIN_PATH"
-case "$path_action" in
-  added | updated)
-    step "Open a new terminal and run: bcodex login"
-    step "For this terminal: export PATH=\"$BIN_DIR:\$PATH\" && bcodex login"
-    step "PATH was configured in $path_profile"
-    ;;
-  configured)
-    step "Open a new terminal and run: bcodex login"
-    step "PATH is configured in $path_profile"
-    ;;
-  *)
-    step "Run: bcodex login"
-    ;;
-esac
-step "After signing in, run bcodex from a project directory"
+if [ "$existing_install" -eq 1 ]; then
+  step "Updated $installed_version at $BIN_PATH"
+  case "$path_action" in
+    added | updated) step "PATH was configured in $path_profile" ;;
+    configured) step "PATH is configured in $path_profile" ;;
+  esac
+  step "Restart bettercodex to use the updated version"
+else
+  step "Installed $installed_version at $BIN_PATH"
+  case "$path_action" in
+    added | updated)
+      step "Open a new terminal and run: bcodex login"
+      step "For this terminal: export PATH=\"$BIN_DIR:\$PATH\" && bcodex login"
+      step "PATH was configured in $path_profile"
+      ;;
+    configured)
+      step "Open a new terminal and run: bcodex login"
+      step "PATH is configured in $path_profile"
+      ;;
+    *)
+      step "Run: bcodex login"
+      ;;
+  esac
+  step "After signing in, run bcodex from a project directory"
+fi

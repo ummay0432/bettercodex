@@ -51,10 +51,32 @@ The ChatGPT credential cache stays in `$CODEX_HOME/auth.json`, or
 `$HOME/.codex/auth.json` when `CODEX_HOME` is unset. bettercodex settings and
 saved sessions stay under `$HOME/.bcodex`. Both remain local to that computer.
 
-Run the same installer command whenever the maintainer publishes an update.
-The installer authenticates with `gh`, selects the native release asset,
-verifies its SHA-256 checksum, checks the reported version, and replaces the
-installed binary atomically.
+After the interactive TUI renders its first frame, bettercodex checks the latest
+private GitHub Release in the background through the authenticated `gh` CLI.
+Startup does not wait for this request. If a newer stable version exists, the
+TUI shows an update card with the command to run in another terminal:
+
+```sh
+bcodex update
+```
+
+The command runs the same private release installer used for first-time setup.
+It selects the native release asset, verifies its SHA-256 checksum and reported
+version, and replaces the installed binary atomically. The running TUI keeps
+using its old in-memory version until it is restarted. Failed background checks
+stay silent and are retried on the next launch; set
+`BCODEX_SKIP_UPDATE_CHECK=1` to disable them. Raw pushes to `main` are not
+advertised because they do not have an installable binary—the maintainer must
+publish a matching GitHub Release.
+
+For an installation outside `$HOME/.local/bin`, pass the same directory when
+updating:
+
+```sh
+BCODEX_INSTALL_DIR="$HOME/bin" bcodex update
+```
+
+The original installer command can also update an existing installation.
 
 To install a specific release:
 

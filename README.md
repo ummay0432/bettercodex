@@ -20,6 +20,12 @@ bcodex login
 bcodex
 ```
 
-The same installer command updates an existing installation. See
-[`docs/install.md`](docs/install.md) for first-time GitHub setup, supported
-platforms, privacy boundaries, and release instructions.
+Interactive sessions check for a newer private release in the background after
+the TUI is ready. When an update is available, install it from another terminal:
+
+```sh
+bcodex update
+```
+
+See [`docs/install.md`](docs/install.md) for first-time GitHub setup, supported
+platforms, update behavior, privacy boundaries, and release instructions.

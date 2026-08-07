@@ -26,6 +26,10 @@ class InstallScriptTest(unittest.TestCase):
 
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("Installed bcodex", first.stdout)
+            self.assertIn("Updated bcodex", second.stdout)
+            self.assertIn("Restart bettercodex", second.stdout)
+            self.assertNotIn("bcodex login", second.stdout)
             installed = root / "install" / "bin" / "bcodex"
             self.assertEqual(
                 subprocess.run(

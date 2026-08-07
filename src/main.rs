@@ -19,6 +19,7 @@ mod state_file;
 mod system_skills;
 mod tools;
 mod tui;
+mod update;
 mod usage;
 mod web_search;
 
@@ -113,6 +114,11 @@ fn run() -> Result<()> {
         Command::Logout => run_logout_command(),
         Command::LogoutHelp => {
             write_logout_help()?;
+            Ok(())
+        }
+        Command::Update => update::run_update(),
+        Command::UpdateHelp => {
+            write_update_help()?;
             Ok(())
         }
         Command::Run(options) => run_agent_command(&arguments, options, None),
@@ -256,6 +262,8 @@ enum Command {
     Login(LoginCommand),
     Logout,
     LogoutHelp,
+    Update,
+    UpdateHelp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,6 +323,13 @@ impl Command {
         {
             arguments.next();
             return parse_logout_command(arguments);
+        }
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "update")
+        {
+            arguments.next();
+            return parse_update_command(arguments);
         }
 
         let resume = arguments
@@ -397,9 +412,18 @@ fn parse_logout_command(arguments: impl IntoIterator<Item = String>) -> Result<C
     }
 }
 
+fn parse_update_command(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(Command::Update),
+        [argument] if argument == "--help" || argument == "-h" => Ok(Command::UpdateHelp),
+        [argument, ..] => Err(anyhow!("unknown update argument `{argument}`")),
+    }
+}
+
 fn write_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest private release\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     ))
 }
@@ -413,6 +437,12 @@ fn write_login_help() -> io::Result<()> {
 fn write_logout_help() -> io::Result<()> {
     write_stdout_line(format_args!(
         "Remove stored ChatGPT credentials\n\nUsage:\n  bcodex logout\n\nOptions:\n  -h, --help  Show this help"
+    ))
+}
+
+fn write_update_help() -> io::Result<()> {
+    write_stdout_line(format_args!(
+        "Install the latest private bettercodex release\n\nUsage:\n  bcodex update\n\nThe update uses the authenticated GitHub CLI and verifies the release checksum before replacing the installed binary."
     ))
 }
 
@@ -493,6 +523,19 @@ mod tests {
         ));
         assert!(Command::parse(["login".to_string(), "unexpected".to_string()]).is_err());
         assert!(Command::parse(["logout".to_string(), "unexpected".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_update_command_and_help() {
+        assert!(matches!(
+            Command::parse(["update".to_string()]).unwrap(),
+            Command::Update
+        ));
+        assert!(matches!(
+            Command::parse(["update".to_string(), "--help".to_string()]).unwrap(),
+            Command::UpdateHelp
+        ));
+        assert!(Command::parse(["update".to_string(), "unexpected".to_string()]).is_err());
     }
 
     #[test]

@@ -9,6 +9,7 @@ use super::view::View;
 use crate::assistant_message::AssistantMessage;
 use crate::events::AgentEvent;
 use crate::rollout::SessionTranscriptItem;
+use crate::update::AvailableUpdate;
 use codex_protocol::models::MessagePhase;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -169,6 +170,55 @@ fn prepared_streaming_layout_tracks_new_deltas_and_finalizes_to_history() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(finalized.contains("alpha omega"), "{finalized}");
+}
+
+#[test]
+fn update_available_card_renders_the_release_and_standalone_command() {
+    const WIDTH: u16 = 80;
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    let _ = view.take_pending_history_lines(WIDTH);
+    view.add_update_available(AvailableUpdate {
+        current_version: "1.2.2".to_string(),
+        latest_version: "1.2.3".to_string(),
+    });
+
+    let rendered = view
+        .take_pending_history_lines(WIDTH)
+        .iter()
+        .map(plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Update available"), "{rendered}");
+    assert!(
+        rendered.contains("bettercodex 1.2.2 -> 1.2.3"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.lines().any(|line| line.contains("bcodex update")),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains('╭') && rendered.contains('╰'),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn asynchronous_update_card_does_not_split_a_streaming_assistant_message() {
+    const WIDTH: u16 = 80;
+    const SCREEN_HEIGHT: u16 = 24;
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn("stream around an update check");
+    let _ = view.take_pending_history_lines(WIDTH);
+    view.handle_agent_event(AgentEvent::ModelMessageDelta("alpha".to_string()));
+    view.add_update_available(AvailableUpdate {
+        current_version: "1.2.2".to_string(),
+        latest_version: "1.2.3".to_string(),
+    });
+    view.handle_agent_event(AgentEvent::ModelMessageDelta(" omega".to_string()));
+
+    let rendered = render_view(&mut view, WIDTH, SCREEN_HEIGHT);
+    assert!(rendered.contains("alpha omega"), "{rendered}");
 }
 
 #[test]

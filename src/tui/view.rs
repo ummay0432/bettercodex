@@ -16,6 +16,7 @@ use super::palette;
 use super::palette::TerminalColors;
 use super::pending_input::PendingInput;
 use super::reasoning_status::ReasoningStatus;
+use super::render::line_utils::line_to_static;
 use super::resume_picker::ResumePicker;
 use super::resume_picker::ResumePickerAction;
 use super::skill_popup::SkillPopup;
@@ -25,6 +26,7 @@ use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
+use super::wrapping::word_wrap_line;
 use crate::MODEL;
 use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
@@ -39,6 +41,7 @@ use crate::skills::Skill;
 use crate::skills::SkillSelection;
 use crate::skills::SkillUpdate;
 use crate::tools::BackgroundProcess;
+use crate::update::AvailableUpdate;
 use codex_ansi_escape::ansi_escape_line;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::parse_command::ParsedCommand;
@@ -267,6 +270,7 @@ enum TranscriptEntry {
         sealed: bool,
     },
     Notice(String),
+    UpdateAvailable(AvailableUpdate),
     Error(String),
     Diff(String),
     Processes(Vec<BackgroundProcess>),
@@ -566,6 +570,15 @@ impl View {
 
     pub(super) fn add_notice(&mut self, notice: impl Into<String>) {
         self.entries.push(TranscriptEntry::Notice(notice.into()));
+    }
+
+    pub(super) fn add_update_available(&mut self, update: AvailableUpdate) {
+        let insertion = self.entries[self.committed_entries..]
+            .iter()
+            .position(|entry| !entry.is_finalized())
+            .map_or(self.entries.len(), |offset| self.committed_entries + offset);
+        self.entries
+            .insert(insertion, TranscriptEntry::UpdateAvailable(update));
     }
 
     pub(super) fn take_clear_request(&mut self) -> bool {
@@ -1658,6 +1671,7 @@ impl View {
                 TranscriptEntry::Tool(_)
                 | TranscriptEntry::Exploration { .. }
                 | TranscriptEntry::Notice(_)
+                | TranscriptEntry::UpdateAvailable(_)
                 | TranscriptEntry::Error(_)
                 | TranscriptEntry::Diff(_)
                 | TranscriptEntry::Processes(_)
@@ -2563,6 +2577,7 @@ impl TranscriptEntry {
         match self {
             Self::User(_)
             | Self::Notice(_)
+            | Self::UpdateAvailable(_)
             | Self::Error(_)
             | Self::Diff(_)
             | Self::Processes(_)
@@ -2645,6 +2660,7 @@ impl TranscriptEntry {
                 Span::from("• ").dim(),
                 Span::from(message.clone()).dim(),
             ])],
+            Self::UpdateAvailable(update) => update_available_lines(update, width),
             Self::Error(message) => vec![Line::from(vec![
                 Span::styled("■ ", Style::default().fg(Color::Red)),
                 Span::styled(message.clone(), Style::default().fg(Color::Red)),
@@ -3465,9 +3481,47 @@ fn welcome_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
     with_card_border(content)
 }
 
+fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec<Line<'static>> {
+    if available_width < 5 {
+        return Vec::new();
+    }
+    let content_width = usize::from(available_width.saturating_sub(4)).min(60);
+    let warning = Style::default().fg(Color::Yellow);
+    let source = [
+        Line::from(Span::styled(
+            "Update available",
+            warning.add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::from("bettercodex ").dim(),
+            Span::from(update.current_version.clone()).dim(),
+            Span::from(" -> ").dim(),
+            Span::from(update.latest_version.clone()).dim(),
+        ]),
+        Line::default(),
+        Line::from("Run in another terminal:").dim(),
+        Line::from(Span::styled(
+            "bcodex update",
+            Style::default().fg(Color::Cyan),
+        )),
+    ];
+    let mut content = Vec::new();
+    for line in &source {
+        content.extend(
+            word_wrap_line(line, content_width.max(1))
+                .iter()
+                .map(line_to_static),
+        );
+    }
+    with_card_border_style(content, warning)
+}
+
 fn with_card_border(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    with_card_border_style(lines, Style::default().fg(RULE))
+}
+
+fn with_card_border_style(lines: Vec<Line<'static>>, border_style: Style) -> Vec<Line<'static>> {
     let content_width = lines.iter().map(line_width).max().unwrap_or_default();
-    let border_style = Style::default().fg(RULE);
     let mut output = Vec::with_capacity(lines.len().saturating_add(2));
     output.push(Line::from(Span::styled(
         format!("╭{}╮", "─".repeat(content_width.saturating_add(2))),
