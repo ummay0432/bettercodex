@@ -95,6 +95,54 @@ impl Editor {
         self.image_attachments.len()
     }
 
+    pub(super) fn slash_command_query(&self) -> Option<(String, Range<usize>)> {
+        let mut image_ranges = self
+            .image_attachments
+            .iter()
+            .map(|attachment| attachment.range().clone())
+            .collect::<Vec<_>>();
+        image_ranges.sort_by_key(|range| range.start);
+
+        let mut plain = String::with_capacity(self.text.len());
+        let mut segments = Vec::with_capacity(image_ranges.len().saturating_add(1));
+        let mut raw_cursor = 0;
+        for image in image_ranges {
+            if image.start < raw_cursor || image.end > self.text.len() {
+                return None;
+            }
+            append_plain_segment(
+                &self.text,
+                raw_cursor..image.start,
+                &mut plain,
+                &mut segments,
+            );
+            raw_cursor = image.end;
+        }
+        append_plain_segment(
+            &self.text,
+            raw_cursor..self.text.len(),
+            &mut plain,
+            &mut segments,
+        );
+
+        let trimmed_start = plain.len().saturating_sub(plain.trim_start().len());
+        let command = &plain[trimmed_start..];
+        let query = command.strip_prefix('/')?;
+        if query.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let trimmed_end = trimmed_start.saturating_add(command.len());
+        let segment = segments.into_iter().find(|segment| {
+            segment.plain.start <= trimmed_start && segment.plain.end >= trimmed_end
+        })?;
+        let raw_start = segment
+            .raw
+            .start
+            .saturating_add(trimmed_start.saturating_sub(segment.plain.start));
+        let raw_end = raw_start.saturating_add(command.len());
+        Some((query.to_string(), raw_start..raw_end))
+    }
+
     pub(super) fn history_search_active(&self) -> bool {
         self.history_search.is_some()
     }
@@ -902,6 +950,29 @@ impl Editor {
         self.saved_draft.clear();
         (text, mentions, images)
     }
+}
+
+#[derive(Debug)]
+struct PlainSegment {
+    plain: Range<usize>,
+    raw: Range<usize>,
+}
+
+fn append_plain_segment(
+    text: &str,
+    raw: Range<usize>,
+    plain: &mut String,
+    segments: &mut Vec<PlainSegment>,
+) {
+    if raw.is_empty() {
+        return;
+    }
+    let plain_start = plain.len();
+    plain.push_str(&text[raw.clone()]);
+    segments.push(PlainSegment {
+        plain: plain_start..plain.len(),
+        raw,
+    });
 }
 
 fn case_insensitive_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {

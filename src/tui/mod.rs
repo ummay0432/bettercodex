@@ -154,6 +154,25 @@ struct OperatorCommandCompletion {
     output: std::result::Result<Value, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveSubmissionRoute {
+    QueueLoop,
+    SteerOrdinary,
+}
+
+fn active_submission_route(prompt: &UserPrompt) -> Result<ActiveSubmissionRoute> {
+    let invocation = crate::quality_loop::parse_invocation_with_mode(
+        &prompt.text_without_image_placeholders(),
+        prompt.image_count() > 0,
+        true,
+    )?;
+    Ok(if invocation.is_some() {
+        ActiveSubmissionRoute::QueueLoop
+    } else {
+        ActiveSubmissionRoute::SteerOrdinary
+    })
+}
+
 impl Runtime {
     fn new(
         mut agent: Agent,
@@ -475,13 +494,20 @@ impl Runtime {
             Action::Submit(prompt) => {
                 self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
-                    let steering = self
-                        .turn_handle
-                        .as_ref()
-                        .and_then(|turn| turn.steer(UserInput::prompt(prompt.clone())).ok());
-                    match steering {
-                        Some(id) => self.view.add_pending_steer(id, prompt),
-                        None => self.view.queue_follow_up(prompt),
+                    match active_submission_route(&prompt) {
+                        Ok(ActiveSubmissionRoute::QueueLoop) => self.view.queue_follow_up(prompt),
+                        Err(error) => self
+                            .view
+                            .add_notice(format!("Invalid quality loop request: {error:#}")),
+                        Ok(ActiveSubmissionRoute::SteerOrdinary) => {
+                            let steering = self.turn_handle.as_ref().and_then(|turn| {
+                                turn.steer(UserInput::prompt(prompt.clone())).ok()
+                            });
+                            match steering {
+                                Some(id) => self.view.add_pending_steer(id, prompt),
+                                None => self.view.queue_follow_up(prompt),
+                            }
+                        }
                     }
                 } else {
                     self.start_turn(prompt);
@@ -760,20 +786,48 @@ impl Runtime {
     }
 
     fn start_turn(&mut self, prompt: UserPrompt) {
+        let invocation = match crate::quality_loop::parse_invocation_with_mode(
+            &prompt.text_without_image_placeholders(),
+            prompt.image_count() > 0,
+            true,
+        ) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.view
+                    .add_notice(format!("Invalid quality loop request: {error:#}"));
+                return;
+            }
+        };
         let mut agent = self
             .agent
             .take()
             .expect("an idle runtime always owns its agent");
         let (events_tx, events_rx) = unbounded_channel();
-        let (turn_handle, turn_control) = crate::agent::TurnControl::channel();
+        let (turn_handle, turn_control) = if invocation.is_some() {
+            crate::agent::TurnControl::non_steerable_channel()
+        } else {
+            crate::agent::TurnControl::channel()
+        };
         self.view.start_turn(prompt.clone());
         self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
         self.turn = Some(tokio::spawn(async move {
-            let result = agent
-                .submit_with_control(UserInput::prompt(prompt), events_tx, turn_control)
-                .await;
+            let input = UserInput::prompt(prompt);
+            let result = if let Some(invocation) = invocation {
+                crate::quality_loop::submit_with_control(
+                    &mut agent,
+                    input,
+                    invocation,
+                    events_tx,
+                    turn_control,
+                )
+                .await
+            } else {
+                agent
+                    .submit_with_control(input, events_tx, turn_control)
+                    .await
+            };
             (agent, TurnCompletion::Submission(result))
         }));
     }

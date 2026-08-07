@@ -20,6 +20,12 @@ bcodex login
 bcodex
 ```
 
+For a task that merits evaluator-backed iteration, use `/loop <task>` in the
+TUI or include `$loop` anywhere in an interactive or non-interactive prompt.
+The default runs one evaluator session followed by three fresh working
+sessions; see [`docs/slash_commands.md`](docs/slash_commands.md#quality-loop)
+for counts, progress, restoration, and repository-local evidence.
+
 Interactive sessions check for a newer private release in the background after
 the TUI is ready. When an update is available, install it from another terminal:
 

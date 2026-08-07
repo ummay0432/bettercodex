@@ -1,6 +1,8 @@
+use super::ActiveSubmissionRoute;
 use super::MAX_READY_AGENT_EVENTS;
 use super::ReceiverState;
 use super::abort_join_task;
+use super::active_submission_route;
 use super::drain_ready_agent_events;
 use super::prompt_history_for_session;
 use super::terminal;
@@ -8,6 +10,8 @@ use super::terminal_hyperlinks;
 use super::view::View;
 use crate::assistant_message::AssistantMessage;
 use crate::events::AgentEvent;
+use crate::input::UserInput;
+use crate::input::UserPrompt;
 use crate::rollout::SessionTranscriptItem;
 use crate::update::AvailableUpdate;
 use codex_protocol::models::MessagePhase;
@@ -24,6 +28,32 @@ fn completed_message(text: impl Into<String>) -> AgentEvent {
         text: text.into(),
         phase: Some(MessagePhase::FinalAnswer),
     })
+}
+
+#[test]
+fn loop_submissions_queue_instead_of_steering_an_active_turn() {
+    assert_eq!(
+        active_submission_route(&UserPrompt::text("/loop improve startup"))
+            .expect("valid slash loop"),
+        ActiveSubmissionRoute::QueueLoop
+    );
+    assert_eq!(
+        active_submission_route(&UserPrompt::text("improve startup $loop"))
+            .expect("valid inline loop"),
+        ActiveSubmissionRoute::QueueLoop
+    );
+    assert_eq!(
+        active_submission_route(&UserPrompt::text("ordinary follow-up")).expect("ordinary prompt"),
+        ActiveSubmissionRoute::SteerOrdinary
+    );
+    assert!(active_submission_route(&UserPrompt::text("/loop 0x invalid")).is_err());
+
+    let (non_steerable, _control) = crate::agent::TurnControl::non_steerable_channel();
+    assert!(
+        non_steerable
+            .steer(UserInput::text("wait until the loop ends"))
+            .is_err()
+    );
 }
 
 #[test]
