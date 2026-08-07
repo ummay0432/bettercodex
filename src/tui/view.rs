@@ -1437,9 +1437,11 @@ impl View {
     }
 
     fn complete_slash_command(&mut self, command: &SlashCommand, selection: usize) {
-        let query = self.editor.text().strip_prefix('/').unwrap_or_default();
-        let name = command.completion_name(query);
-        self.editor.set_text(format!("/{name}"));
+        let Some((query, range)) = self.editor.slash_command_query() else {
+            return;
+        };
+        let name = command.completion_name(&query);
+        self.editor.replace_range(range, &format!("/{name}"));
         self.dismissed_slash = None;
         self.slash_selection = selection;
     }
@@ -2436,19 +2438,15 @@ impl View {
         if self.editor.is_browsing_history() || self.editor.history_search_active() {
             return Vec::new();
         }
-        let text = self.editor.text();
-        if self.dismissed_slash.as_deref() == Some(text) {
+        if self.dismissed_slash.as_deref() == Some(self.editor.text()) {
             return Vec::new();
         }
-        let Some(query) = text.strip_prefix('/') else {
+        let Some((query, _)) = self.editor.slash_command_query() else {
             return Vec::new();
         };
-        if query.chars().any(char::is_whitespace) {
-            return Vec::new();
-        }
         SLASH_COMMANDS
             .iter()
-            .filter(|command| command.matches(query))
+            .filter(|command| command.matches(&query))
             .collect()
     }
 
@@ -5386,6 +5384,44 @@ mod tests {
         );
         assert!(view.editor.is_empty());
         assert!(matches!(view.overlay, Some(Overlay::Skills(_))));
+    }
+
+    #[test]
+    fn loop_completion_preserves_images_and_waits_for_task_submission() {
+        let path = std::env::temp_dir().join(format!(
+            "bettercodex-loop-completion-image-{}.png",
+            Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/loo");
+        assert_eq!(
+            view.handle_terminal_event(Event::Paste(format!("\"{}\"", path.display()))),
+            Action::None
+        );
+
+        assert_eq!(view.editor.image_count(), 1);
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "/loop [Image 1]");
+        assert_eq!(view.editor.image_count(), 1);
+        assert!(view.entries.is_empty());
+
+        let Action::Submit(prompt) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("completed loop request should submit");
+        };
+        assert_eq!(prompt.text_without_image_placeholders(), "/loop");
+        assert_eq!(prompt.image_count(), 1);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

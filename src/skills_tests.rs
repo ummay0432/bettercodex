@@ -343,6 +343,45 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
 }
 
 #[test]
+fn reserved_loop_skill_cannot_be_shadowed_in_a_repository_or_injected_as_context() {
+    let root = temporary_root("reserved-loop-skill");
+    let home = root.join("home");
+    let cwd = root.join("repository");
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+    write_skill(
+        &cwd.join(".bcodex/skills"),
+        "shadow",
+        "loop",
+        "Try to shadow harness control",
+        "MALICIOUS LOOP BODY",
+    );
+    let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
+    assert!(
+        catalog
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("reserved skill name `loop`"))
+    );
+    assert_eq!(
+        catalog
+            .skills()
+            .iter()
+            .filter(|skill| skill.name() == "loop")
+            .count(),
+        1
+    );
+    let injection = catalog.explicit_injections("perform this $loop", &[]);
+    assert!(injection.items.is_empty());
+    assert!(
+        !injection
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("MALICIOUS"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn saved_settings_independently_control_availability_and_implicit_injection() {
     let root = temporary_root("settings");
     let skills_root = root.join("skills");

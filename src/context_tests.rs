@@ -1525,6 +1525,13 @@ fn resumed_prompt_history_contains_user_inputs_but_not_context_notices() {
 fn frozen_loop_context_replays_only_verbatim_operator_items_and_invocation_time_world_state() {
     let (root, cwd) = temporary_repository("frozen-loop");
     std::fs::write(cwd.join("AGENTS.md"), "frozen repository instruction").unwrap();
+    let skill = cwd.join(".bcodex/skills/review/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        "---\nname: review\ndescription: Review the candidate\n---\n\nFROZEN SKILL BODY\n",
+    )
+    .unwrap();
     let first = json!({
         "type": "message",
         "role": "user",
@@ -1542,7 +1549,10 @@ fn frozen_loop_context_replays_only_verbatim_operator_items_and_invocation_time_
         OperatorInputRecord {
             message: first.clone(),
             prompt_text: "first operator message".to_string(),
-            selected_skills: Vec::new(),
+            selected_skills: vec![crate::skills::SkillSelection::new(
+                "review",
+                skill.canonicalize().unwrap(),
+            )],
             skill_context: Vec::new(),
         },
         OperatorInputRecord {
@@ -1555,6 +1565,7 @@ fn frozen_loop_context_replays_only_verbatim_operator_items_and_invocation_time_
     let (frozen, warnings) = FrozenLoopContext::capture(&cwd, &records).unwrap();
     assert!(warnings.is_empty());
     std::fs::write(cwd.join("AGENTS.md"), "later candidate instruction").unwrap();
+    std::fs::write(&skill, "later candidate skill instruction").unwrap();
 
     let rollout = Rollout::create_in(&root.join("internal"), &cwd).unwrap();
     let conversation = Conversation::from_frozen_loop(&frozen, rollout).unwrap();
@@ -1567,7 +1578,14 @@ fn frozen_loop_context_replays_only_verbatim_operator_items_and_invocation_time_
     assert!(!items.iter().any(|item| {
         item.get("role").and_then(Value::as_str) == Some("assistant")
             || message_text(item).is_some_and(|text| text.contains("later candidate instruction"))
+            || message_text(item)
+                .is_some_and(|text| text.contains("later candidate skill instruction"))
     }));
+    assert!(
+        items.iter().any(|item| {
+            message_text(item).is_some_and(|text| text.contains("FROZEN SKILL BODY"))
+        })
+    );
     assert_eq!(
         frozen.operator_inputs()[0].message["content"][1]["image_url"],
         "data:image/png;base64,AAEC"

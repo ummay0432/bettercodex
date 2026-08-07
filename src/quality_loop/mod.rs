@@ -20,6 +20,7 @@ pub(crate) use evaluator::EvaluationReport;
 pub(crate) use evaluator::ImprovementDecision;
 pub(crate) use evaluator::apply_structured_artifact;
 pub(crate) use evaluator::compare_reports;
+pub(crate) use evaluator::run_discrimination_checks;
 pub(crate) use evaluator::run_machine_evaluation;
 pub(crate) use integrity::PackageManifest;
 
@@ -63,11 +64,14 @@ pub(crate) fn capture_state_identity(
     if state.phase != state::RunPhase::Iteration {
         anyhow::bail!("internal loop state helper is unavailable outside a working iteration");
     }
+    let iteration_relative = std::path::PathBuf::from("iterations").join(iteration.to_string());
+    state::verify_private_directory_chain(&canonical_run, &iteration_relative, false)?;
     let contract = EvaluatorContract::load(&canonical_contract, worktree.root())?;
-    let capture_root = canonical_run
-        .join("iterations")
-        .join(iteration.to_string())
-        .join("identity-capture");
+    let capture_root = state::verify_private_directory_chain(
+        &canonical_run,
+        &iteration_relative.join("identity-capture"),
+        true,
+    )?;
     let snapshot = worktree.capture(&capture_root, &contract.snapshot_paths())?;
     Ok(serde_json::to_value(snapshot.state)?)
 }

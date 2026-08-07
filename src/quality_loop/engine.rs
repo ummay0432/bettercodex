@@ -12,8 +12,12 @@ use super::WorkerEnvelope;
 use super::WorkerVerdict;
 use super::apply_structured_artifact;
 use super::compare_reports;
+use super::contract::ArtifactRoot;
+use super::contract::ComparisonKind;
+use super::contract::SideEffects;
 use super::parse_setup_envelope;
 use super::parse_worker_envelope;
+use super::run_discrimination_checks;
 use super::run_machine_evaluation;
 use super::state::LedgerRow;
 use crate::agent::Agent;
@@ -23,19 +27,23 @@ use crate::context::FrozenLoopContext;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
 use crate::rollout::TurnOutcome;
+use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -67,6 +75,8 @@ struct LoopSummary {
 struct PhaseOutput {
     response: String,
     session_id: String,
+    usage: Option<TokenUsage>,
+    duration_ms: u64,
 }
 
 trait PhaseRunner {
@@ -108,6 +118,8 @@ impl PhaseRunner for LivePhaseRunner {
 struct IterationRecord<'a> {
     iteration: usize,
     session_id: &'a str,
+    usage: Option<&'a TokenUsage>,
+    session_duration_ms: Option<u64>,
     incumbent_state: &'a str,
     candidate_state: &'a str,
     model_verdict: &'a str,
@@ -250,8 +262,17 @@ async fn execute_phases<R: PhaseRunner>(
     }
     let setup = setup.expect("checked phase output");
     verify_control_digest(run.root(), None, &control_before)?;
+    run.write_json(
+        "evaluator/session.json",
+        &serde_json::json!({
+            "session_id": &setup.session_id,
+            "usage": &setup.usage,
+            "duration_ms": setup.duration_ms,
+        }),
+    )?;
     let envelope = parse_setup_envelope(&setup.response);
     worktree.restore(run.root(), original)?;
+    PackageManifest::make_private(&evaluator_workspace)?;
     let envelope = envelope?;
     if envelope.verdict == SetupVerdict::Blocked {
         run.update(|state| {
@@ -312,6 +333,40 @@ async fn execute_phases<R: PhaseRunner>(
     run.write_json("starting-state.json", &baseline_snapshot.state)?;
     let baseline_directory = run.create_directory("baseline")?;
     let cancellation = control.cancellation();
+    let discrimination_directory = run.create_directory("baseline/discrimination")?;
+    let Some(discrimination) = run_discrimination_checks(
+        &contract,
+        worktree.root(),
+        &discrimination_directory,
+        &cancellation,
+    )
+    .await?
+    else {
+        worktree.restore(run.root(), &baseline_snapshot)?;
+        run.update(|state| state.phase = RunPhase::Interrupted)?;
+        return Ok(interrupted_setup_summary(&baseline_snapshot));
+    };
+    let discrimination_after = worktree.capture(run.root(), &snapshot_paths)?;
+    let discrimination_side_effects = verify_evaluator_side_effects(
+        worktree,
+        &contract,
+        &baseline_snapshot,
+        &discrimination_after,
+    );
+    worktree.restore(run.root(), &baseline_snapshot)?;
+    discrimination_side_effects
+        .context("discrimination probe crossed its declared scratch boundary")?;
+    let failed_probes = discrimination
+        .iter()
+        .filter(|(_, report)| !report.passed)
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    if !failed_probes.is_empty() {
+        return Err(anyhow!(
+            "evaluator discrimination probes did not catch their frozen failures: {}",
+            failed_probes.join(", ")
+        ));
+    }
     let Some(mut baseline) = run_machine_evaluation(
         &contract,
         worktree.root(),
@@ -325,9 +380,14 @@ async fn execute_phases<R: PhaseRunner>(
         run.update(|state| state.phase = RunPhase::Interrupted)?;
         return Ok(interrupted_setup_summary(&baseline_snapshot));
     };
-    apply_structured_artifact(&contract, &mut baseline, &declared_baseline_path)?;
-    run.write_json("baseline/evaluation.json", &baseline)?;
+    let baseline_after = worktree.capture(run.root(), &snapshot_paths)?;
+    let side_effects =
+        verify_evaluator_side_effects(worktree, &contract, &baseline_snapshot, &baseline_after);
     worktree.restore(run.root(), &baseline_snapshot)?;
+    side_effects.context("baseline evaluator crossed its declared scratch boundary")?;
+    apply_structured_artifact(&contract, &mut baseline, &declared_baseline_path)?;
+    ensure_comparable_baseline(&contract, &baseline)?;
+    run.write_json("baseline/evaluation.json", &baseline)?;
     package.verify(&evaluator_workspace)?;
     let baseline_evidence = "baseline/evaluation.json";
     run.append_ledger(&LedgerRow {
@@ -370,6 +430,7 @@ async fn execute_phases<R: PhaseRunner>(
             state.phase = RunPhase::Iteration;
             state.active_iteration = Some(iteration);
             state.active_candidate_snapshot = None;
+            state.prepared_iteration = None;
         })?;
         let incumbent_diff = worktree
             .text_diff_counts(run.root(), &baseline_snapshot, &incumbent_snapshot)
@@ -393,23 +454,25 @@ async fn execute_phases<R: PhaseRunner>(
             restore_iteration_snapshot(worktree, run, &incumbent_snapshot)?;
             counts.interrupted += 1;
             let description = "operator interrupted the active iteration";
-            let record_path = format!("{evidence_relative}/resolved.json");
-            run.write_json(
-                &record_path,
-                &serde_json::json!({
-                    "iteration": iteration,
-                    "status": "interrupted",
-                    "state": incumbent_snapshot.state.digest,
-                }),
-            )?;
-            run.append_ledger(&LedgerRow {
+            let resolved = ResolvedIteration {
+                incumbent_state: incumbent_snapshot.state.digest.clone(),
+                status: "interrupted".to_string(),
+                pulse: "interrupted",
+                result: "interrupted".to_string(),
+                description: description.to_string(),
+                unvalidated: "none".to_string(),
+                snapshot: incumbent_snapshot.clone(),
+                report: None,
+            };
+            let phase_output = worker.as_ref().ok().and_then(|output| output.as_ref());
+            publish_iteration(
+                run,
                 iteration,
-                state: &incumbent_snapshot.state.digest,
-                result: "interrupted",
-                status: "interrupted",
-                description,
-                evidence: &record_path,
-            })?;
+                &evidence_relative,
+                &resolved,
+                phase_output,
+                None,
+            )?;
             run.update(|state| {
                 state.phase = RunPhase::Interrupted;
                 state.active_iteration = None;
@@ -464,6 +527,36 @@ async fn execute_phases<R: PhaseRunner>(
             "blocked" => {
                 counts.blocked += 1;
                 blocker = Some(resolved.description.clone());
+            }
+            "interrupted" => {
+                counts.interrupted += 1;
+                if !resolved.unvalidated.eq_ignore_ascii_case("none") {
+                    unvalidated.push(resolved.unvalidated.clone());
+                }
+                run.update(|state| {
+                    state.phase = RunPhase::Interrupted;
+                    state.active_iteration = None;
+                    state.active_candidate_snapshot = None;
+                })?;
+                progress(
+                    events,
+                    run,
+                    &phase,
+                    resolved.pulse,
+                    Some(&resolved.result),
+                    resolved_diff,
+                );
+                return Ok(LoopSummary {
+                    setup: "ready".to_string(),
+                    baseline: Some(baseline),
+                    final_report: Some(incumbent_report),
+                    counts,
+                    final_state: incumbent_snapshot.state.digest,
+                    blind_spots: blind_spots(&contract),
+                    unvalidated,
+                    blocked: None,
+                    interrupted: true,
+                });
             }
             _ => unreachable!("iteration resolver returned a known status"),
         }
@@ -562,6 +655,7 @@ async fn resolve_iteration(
             return Ok(resolved);
         }
     };
+    PackageManifest::make_private(evidence_directory)?;
     if let Err(error) = verify_control_digest(run.root(), Some(iteration), control_before) {
         return block_integrity_raw(
             worktree,
@@ -569,7 +663,7 @@ async fn resolve_iteration(
             incumbent,
             iteration,
             evidence_relative,
-            Some(&worker.session_id),
+            Some(&worker),
             "none",
             format!("worker modified harness-owned loop state: {error:#}"),
         );
@@ -581,7 +675,7 @@ async fn resolve_iteration(
             incumbent,
             iteration,
             evidence_relative,
-            Some(&worker.session_id),
+            Some(&worker),
             "none",
             format!("worker modified the frozen evaluator: {error:#}"),
         );
@@ -596,7 +690,7 @@ async fn resolve_iteration(
                 iteration,
                 evidence_relative,
                 &resolved,
-                Some(&worker.session_id),
+                Some(&worker),
                 None,
             )?;
             return Ok(resolved);
@@ -612,7 +706,7 @@ async fn resolve_iteration(
                 iteration,
                 evidence_relative,
                 &resolved,
-                Some(&worker.session_id),
+                Some(&worker),
                 None,
             )?;
             return Ok(resolved);
@@ -628,7 +722,7 @@ async fn resolve_iteration(
                 incumbent,
                 iteration,
                 evidence_relative,
-                Some(&worker.session_id),
+                Some(&worker),
                 &envelope.unvalidated,
                 format!("candidate state could not be captured safely: {error:#}"),
             );
@@ -753,14 +847,14 @@ async fn resolve_iteration(
             iteration,
             evidence_relative,
             &resolved,
-            Some(&worker.session_id),
+            Some(&worker),
             Some((&candidate, &delta, &envelope)),
         )?;
         return Ok(resolved);
     }
 
     if envelope.verdict == WorkerVerdict::Blocked {
-        let accepted = supported_blocker(&envelope);
+        let accepted = supported_blocker(&evidence_path).unwrap_or(false);
         restore_iteration_snapshot(worktree, run, incumbent)?;
         let resolved = if accepted {
             ResolvedIteration {
@@ -784,7 +878,7 @@ async fn resolve_iteration(
             iteration,
             evidence_relative,
             &resolved,
-            Some(&worker.session_id),
+            Some(&worker),
             Some((&candidate, &delta, &envelope)),
         )?;
         return Ok(resolved);
@@ -807,45 +901,104 @@ async fn resolve_iteration(
             iteration,
             evidence_relative,
             &resolved,
-            Some(&worker.session_id),
+            Some(&worker),
             Some((&candidate, &delta, &envelope)),
         )?;
         return Ok(resolved);
     }
 
     let validation_directory = run.create_directory(&format!("{evidence_relative}/harness"))?;
-    let Some(mut candidate_report) = run_machine_evaluation(
+    let evaluation = run_machine_evaluation(
         contract,
         worktree.root(),
         &candidate.state.digest,
         &validation_directory,
         cancellation,
     )
-    .await?
-    else {
-        restore_iteration_snapshot(worktree, run, incumbent)?;
-        let resolved = crash("candidate validation was interrupted".to_string());
-        publish_iteration(
-            run,
-            iteration,
-            evidence_relative,
-            &resolved,
-            Some(&worker.session_id),
-            Some((&candidate, &delta, &envelope)),
-        )?;
-        return Ok(resolved);
-    };
-    let evaluation_result =
-        apply_structured_artifact(contract, &mut candidate_report, &evidence_path)
-            .and_then(|()| package.verify(&run.root().join("evaluator/workspace")))
-            .map(|()| compare_reports(contract, incumbent_report, &candidate_report));
+    .await;
+    let observed = worktree.capture(run.root(), &contract.snapshot_paths());
+    let side_effects = observed
+        .as_ref()
+        .map_err(|error| anyhow!("{error:#}"))
+        .and_then(|after| verify_evaluator_side_effects(worktree, contract, &candidate, after));
     restore_iteration_snapshot(worktree, run, &candidate)?;
     let exact = worktree.capture(run.root(), &contract.snapshot_paths())?;
     if exact.state != candidate.state {
-        return Err(anyhow!(
-            "candidate state changed while evaluator side effects were restored"
-        ));
+        return block_integrity_raw(
+            worktree,
+            run,
+            incumbent,
+            iteration,
+            evidence_relative,
+            Some(&worker),
+            &envelope.unvalidated,
+            "candidate state changed while evaluator side effects were restored".to_string(),
+        );
     }
+    if let Err(error) = side_effects {
+        return block_integrity_raw(
+            worktree,
+            run,
+            incumbent,
+            iteration,
+            evidence_relative,
+            Some(&worker),
+            &envelope.unvalidated,
+            format!("frozen evaluator crossed its declared scratch boundary: {error:#}"),
+        );
+    }
+    if let Err(error) = package.verify(&run.root().join("evaluator/workspace")) {
+        return block_integrity_raw(
+            worktree,
+            run,
+            incumbent,
+            iteration,
+            evidence_relative,
+            Some(&worker),
+            &envelope.unvalidated,
+            format!("frozen evaluator modified its own package: {error:#}"),
+        );
+    }
+    let mut candidate_report = match evaluation {
+        Ok(Some(report)) => report,
+        Ok(None) => {
+            restore_iteration_snapshot(worktree, run, incumbent)?;
+            let resolved = ResolvedIteration {
+                incumbent_state: incumbent.state.digest.clone(),
+                status: "interrupted".to_string(),
+                pulse: "interrupted",
+                result: "operator interrupted candidate validation".to_string(),
+                description: "operator interrupted candidate validation".to_string(),
+                unvalidated: envelope.unvalidated.clone(),
+                snapshot: incumbent.clone(),
+                report: None,
+            };
+            publish_iteration(
+                run,
+                iteration,
+                evidence_relative,
+                &resolved,
+                Some(&worker),
+                Some((&candidate, &delta, &envelope)),
+            )?;
+            return Ok(resolved);
+        }
+        Err(error) => {
+            return block_integrity_raw(
+                worktree,
+                run,
+                incumbent,
+                iteration,
+                evidence_relative,
+                Some(&worker),
+                &envelope.unvalidated,
+                format!("frozen evaluator could not run: {error:#}"),
+            );
+        }
+    };
+    let evaluation_result =
+        apply_structured_artifact(contract, &mut candidate_report, &evidence_path)
+            .map(|()| compare_reports(contract, incumbent_report, &candidate_report));
     let decision = match evaluation_result {
         Ok(decision) => decision,
         Err(error) => ImprovementDecision::Inconclusive(format!("validation failed: {error:#}")),
@@ -857,12 +1010,6 @@ async fn resolve_iteration(
         | ImprovementDecision::Inconclusive(reason) => reason.clone(),
     };
     let resolved = if keep {
-        run.update(|state| {
-            state.incumbent_snapshot = candidate_snapshot_relative;
-            state.final_result = Some(candidate_report.decisive.clone());
-            state.active_iteration = None;
-            state.active_candidate_snapshot = None;
-        })?;
         ResolvedIteration {
             incumbent_state: incumbent.state.digest.clone(),
             status: "keep".to_string(),
@@ -891,7 +1038,7 @@ async fn resolve_iteration(
         iteration,
         evidence_relative,
         &resolved,
-        Some(&worker.session_id),
+        Some(&worker),
         Some((&candidate, &delta, &envelope)),
     )?;
     Ok(resolved)
@@ -923,7 +1070,7 @@ fn block_integrity(
         incumbent,
         iteration,
         evidence_relative,
-        Some(&worker.session_id),
+        Some(worker),
         &envelope.unvalidated,
         description,
     )
@@ -936,7 +1083,7 @@ fn block_integrity_raw(
     incumbent: &RepositorySnapshot,
     iteration: usize,
     evidence_relative: &str,
-    session_id: Option<&str>,
+    phase: Option<&PhaseOutput>,
     unvalidated: &str,
     description: String,
 ) -> Result<ResolvedIteration> {
@@ -951,23 +1098,16 @@ fn block_integrity_raw(
         snapshot: incumbent.clone(),
         report: None,
     };
-    publish_iteration(
-        run,
-        iteration,
-        evidence_relative,
-        &resolved,
-        session_id,
-        None,
-    )?;
+    publish_iteration(run, iteration, evidence_relative, &resolved, phase, None)?;
     Ok(resolved)
 }
 
 fn publish_iteration(
-    run: &LoopRun,
+    run: &mut LoopRun,
     iteration: usize,
     evidence_relative: &str,
     resolved: &ResolvedIteration,
-    session_id: Option<&str>,
+    phase: Option<&PhaseOutput>,
     candidate: Option<(
         &RepositorySnapshot,
         &super::repository::SnapshotDelta,
@@ -994,7 +1134,9 @@ fn publish_iteration(
         };
     let record = IterationRecord {
         iteration,
-        session_id: session_id.unwrap_or("none"),
+        session_id: phase.map_or("none", |phase| phase.session_id.as_str()),
+        usage: phase.and_then(|phase| phase.usage.as_ref()),
+        session_duration_ms: phase.map(|phase| phase.duration_ms),
         incumbent_state: &resolved.incumbent_state,
         candidate_state,
         model_verdict,
@@ -1008,7 +1150,7 @@ fn publish_iteration(
         unvalidated: &resolved.unvalidated,
     };
     run.write_json(&resolved_path, &record)?;
-    run.append_ledger(&LedgerRow {
+    run.publish_iteration(&LedgerRow {
         iteration,
         state: &resolved.snapshot.state.digest,
         result: &resolved.result,
@@ -1030,9 +1172,12 @@ async fn run_live_phase(
     let mut agent = Agent::new_frozen_loop_session(cwd, &session_root, frozen, prompt)?;
     let session_id = agent.session_id().to_string();
     let processes = agent.background_processes();
+    let started = Instant::now();
     let result = agent
         .submit_preloaded_with_control(None, parent_control.child_non_steerable())
         .await;
+    let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    let usage = agent.latest_usage();
     processes.stop_all_background_processes();
     if !processes.list_background_processes().is_empty() {
         return Err(anyhow!(
@@ -1050,6 +1195,8 @@ async fn run_live_phase(
         SubmitOutcome::Completed(response) => Ok(Some(PhaseOutput {
             response,
             session_id,
+            usage,
+            duration_ms,
         })),
         SubmitOutcome::Cancelled => Ok(None),
     }
@@ -1131,6 +1278,20 @@ fn validate_contract_artifacts(
             run.resolve_existing_file(path, workspace)?;
         }
     }
+    for artifact in contract
+        .machine_checks
+        .iter()
+        .chain(
+            contract
+                .discrimination_checks
+                .iter()
+                .map(|probe| &probe.check),
+        )
+        .flat_map(|check| check.input_paths.iter().chain(&check.fixture_paths))
+        .filter(|artifact| artifact.root == ArtifactRoot::Evaluator)
+    {
+        run.resolve_existing_file(&artifact.path, workspace)?;
+    }
     Ok(())
 }
 
@@ -1153,21 +1314,38 @@ fn validate_evidence_state(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn supported_blocker(envelope: &WorkerEnvelope) -> bool {
-    let text = format!("{} {}", envelope.description, envelope.unvalidated).to_ascii_lowercase();
-    [
-        "contradict",
-        "prerequisite",
-        "authority",
-        "permission",
-        "unavailable",
-        "state integrity",
-        "unsafe",
-        "external conflict",
-        "cannot restore",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockerArtifact {
+    #[serde(rename = "kind")]
+    _kind: BlockerKind,
+    detail: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BlockerKind {
+    TaskEvaluatorContradiction,
+    MissingPrerequisite,
+    MissingAuthority,
+    StateIntegrity,
+    ExternalConflict,
+}
+
+fn supported_blocker(path: &Path) -> Result<bool> {
+    let document: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let Some(value) = document.get("blocker") else {
+        return Ok(false);
+    };
+    let blocker: BlockerArtifact = serde_json::from_value(value.clone())?;
+    let detail = blocker.detail.trim();
+    let evidence_is_concrete = !blocker.evidence.is_empty()
+        && blocker
+            .evidence
+            .iter()
+            .all(|item| !item.trim().is_empty() && item.chars().count() <= 4_096);
+    Ok(!detail.is_empty() && detail.chars().count() <= 4_096 && evidence_is_concrete)
 }
 
 fn immutable_control_digest(root: &Path, active_iteration: Option<usize>) -> Result<String> {
@@ -1199,6 +1377,7 @@ fn hash_control_tree(
     let metadata = std::fs::symlink_metadata(path)?;
     hasher.update(relative.as_os_str().as_encoded_bytes());
     hasher.update(metadata.permissions().mode().to_le_bytes());
+    hasher.update(metadata.nlink().to_le_bytes());
     if metadata.file_type().is_symlink() {
         hasher.update(b"link");
         hasher.update(std::fs::read_link(path)?.as_os_str().as_encoded_bytes());
@@ -1286,6 +1465,65 @@ fn blind_spots(contract: &super::EvaluatorContract) -> Vec<String> {
         .collect()
 }
 
+fn ensure_comparable_baseline(
+    contract: &super::EvaluatorContract,
+    report: &EvaluationReport,
+) -> Result<()> {
+    if contract.comparison.kind == ComparisonKind::Metric {
+        let check_id = contract
+            .comparison
+            .check_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("metric comparison omitted its check ID"))?;
+        if super::evaluator::metric_value(report, check_id).is_none() {
+            return Err(anyhow!(
+                "baseline metric `{check_id}` did not produce comparable finite values"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_evaluator_side_effects(
+    worktree: &super::Worktree,
+    contract: &super::EvaluatorContract,
+    before: &RepositorySnapshot,
+    after: &RepositorySnapshot,
+) -> Result<()> {
+    let delta = worktree.delta(before, after);
+    if delta.git_changed {
+        return Err(anyhow!("evaluator changed Git state"));
+    }
+    let scratch_is_writable = contract
+        .machine_checks
+        .iter()
+        .chain(
+            contract
+                .discrimination_checks
+                .iter()
+                .map(|probe| &probe.check),
+        )
+        .any(|check| check.side_effects == SideEffects::DeclaredScratch);
+    let outside = delta
+        .paths()
+        .filter(|path| {
+            !scratch_is_writable
+                || !contract
+                    .scratch_paths
+                    .iter()
+                    .any(|spec| spec.covers(Path::new(path)))
+        })
+        .take(16)
+        .collect::<Vec<_>>();
+    if !outside.is_empty() {
+        return Err(anyhow!(
+            "evaluator changed paths outside declared scratch: {}",
+            outside.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn format_final(run: &LoopRun, summary: &LoopSummary) -> String {
     let baseline = summary
         .baseline
@@ -1346,6 +1584,7 @@ mod tests {
         InvalidBlocked,
         ValidBlocked,
         TamperEvaluator,
+        TamperControl,
         Interrupt(i32),
     }
 
@@ -1372,9 +1611,11 @@ mod tests {
         fn setup(&mut self, cwd: &Path, run: &LoopRun, session_id: &str) -> Result<PhaseOutput> {
             let workspace = run.root().join("evaluator/workspace");
             let script = workspace.join("metric.sh");
+            let known_failure = workspace.join("known-failure.txt");
+            std::fs::write(&known_failure, "known failure\n")?;
             std::fs::write(
                 &script,
-                "#!/bin/sh\nmkdir -p scratch\nprintf check > scratch/check.log\nprintf '{\"value\": %s}\\n' \"$(cat candidate.txt)\"\n",
+                "#!/bin/sh\nif [ \"$1\" = --known-failure ]; then\n  [ \"$(cat \"$2\")\" = \"known failure\" ] || exit 1\n  exit 0\nfi\nmkdir -p scratch\nprintf check > scratch/check.log\nvalue=$(cat candidate.txt)\nif [ \"$value\" = 77 ]; then printf illegal > evaluator-side-effect.txt; fi\nprintf '{\"value\": %s}\\n' \"$value\"\n",
             )?;
             let mut permissions = std::fs::metadata(&script)?.permissions();
             permissions.set_mode(0o700);
@@ -1404,6 +1645,8 @@ mod tests {
                     "argv": [script],
                     "cwd": ".",
                     "env": {},
+                    "input_paths": [{"root": "worktree", "path": "candidate.txt"}],
+                    "fixture_paths": [],
                     "timeout_seconds": 5,
                     "resource_budget": "one local process",
                     "side_effects": "declared_scratch",
@@ -1411,6 +1654,28 @@ mod tests {
                     "expected_exit_codes": [0],
                     "extract": {"kind": "json_number", "json_pointer": "/value"},
                     "baseline_repeats": 1
+                }],
+                "discrimination_checks": [{
+                    "linked_check_id": "metric-check",
+                    "check": {
+                        "id": "metric-known-failure",
+                        "promise_ids": ["metric"],
+                        "argv": [script, "--known-failure", known_failure],
+                        "cwd": ".",
+                        "env": {},
+                        "input_paths": [{"root": "worktree", "path": "candidate.txt"}],
+                        "fixture_paths": [{
+                            "root": "evaluator",
+                            "path": "evaluator/workspace/known-failure.txt"
+                        }],
+                        "timeout_seconds": 5,
+                        "resource_budget": "one local process",
+                        "side_effects": "none",
+                        "approval": "none",
+                        "expected_exit_codes": [0],
+                        "extract": {"kind": "pass"},
+                        "baseline_repeats": 1
+                    }
                 }],
                 "model_checks": [],
                 "acceptance": {"required_check_ids": ["metric-check"]},
@@ -1444,6 +1709,8 @@ mod tests {
             Ok(PhaseOutput {
                 response: "SETUP: READY\nCONTRACT: evaluator/workspace/contract.json\nBASELINE: evaluator/workspace/baseline.json\nBLOCKER: none".to_string(),
                 session_id: session_id.to_string(),
+                usage: None,
+                duration_ms: 1,
             })
         }
 
@@ -1463,36 +1730,50 @@ mod tests {
                 .strip_prefix("worker-")
                 .ok_or_else(|| anyhow!("invalid scripted worker name"))?
                 .parse::<usize>()?;
-            let (verdict, description, unvalidated) = match action {
+            let (verdict, description, unvalidated, blocker) = match action {
                 ScriptedAction::Keep(value) => {
                     std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
-                    ("KEEP", "raised the candidate metric", "none")
+                    ("KEEP", "raised the candidate metric", "none", None)
                 }
                 ScriptedAction::Discard(value) => {
                     std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
-                    ("DISCARD", "declined the provisional candidate", "none")
+                    (
+                        "DISCARD",
+                        "declined the provisional candidate",
+                        "none",
+                        None,
+                    )
                 }
                 ScriptedAction::KeepWithoutChange => {
-                    ("KEEP", "claimed an unchanged candidate", "none")
+                    ("KEEP", "claimed an unchanged candidate", "none", None)
                 }
                 ScriptedAction::Crash(value) => {
                     std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
                     return Err(anyhow!("scripted worker crash"));
                 }
                 ScriptedAction::InvalidBlocked => {
-                    ("BLOCKED", "the task is already finished", "none")
+                    ("BLOCKED", "the task is already finished", "none", None)
                 }
                 ScriptedAction::ValidBlocked => (
                     "BLOCKED",
                     "a required prerequisite is unavailable",
                     "the fixture lacks the prerequisite",
+                    Some(json!({
+                        "kind": "missing_prerequisite",
+                        "detail": "the fixture lacks the required local prerequisite",
+                        "evidence": ["fixture preflight reported the missing prerequisite"]
+                    })),
                 ),
                 ScriptedAction::TamperEvaluator => {
                     std::fs::write(
                         run.root().join("evaluator/workspace/RATIONALE.md"),
                         "weakened ruler\n",
                     )?;
-                    ("KEEP", "tampered with the evaluator", "none")
+                    ("KEEP", "tampered with the evaluator", "none", None)
+                }
+                ScriptedAction::TamperControl => {
+                    std::fs::write(run.root().join("baseline/evaluation.json"), b"{}\n")?;
+                    ("KEEP", "tampered with prior evidence", "none", None)
                 }
                 ScriptedAction::Interrupt(value) => {
                     std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
@@ -1503,18 +1784,24 @@ mod tests {
             let contract = run.root().join("evaluator/workspace/contract.json");
             let state = crate::quality_loop::capture_state_identity(cwd, run.root(), &contract)?;
             let evidence_relative = format!("iterations/{iteration}/worker.json");
+            let mut evidence = json!({
+                "state": state["digest"],
+                "checks": {"metric-check": {"passed": true}}
+            });
+            if let Some(blocker) = blocker {
+                evidence["blocker"] = blocker;
+            }
             std::fs::write(
                 run.root().join(&evidence_relative),
-                serde_json::to_vec_pretty(&json!({
-                    "state": state["digest"],
-                    "checks": {"metric-check": {"passed": true}}
-                }))?,
+                serde_json::to_vec_pretty(&evidence)?,
             )?;
             Ok(Some(PhaseOutput {
                 response: format!(
                     "VERDICT: {verdict}\nDESCRIPTION: {description}\nEVIDENCE: {evidence_relative}\nUNVALIDATED: {unvalidated}"
                 ),
                 session_id: session_id.to_string(),
+                usage: None,
+                duration_ms: 1,
             }))
         }
     }
@@ -1710,6 +1997,23 @@ mod tests {
         assert!(ledger.contains("\tkeep\t"));
         assert!(ledger.contains("\tdiscard\t"));
         assert!(ledger.contains("\tcrash\t"));
+        let attempt: Value = serde_json::from_slice(
+            &std::fs::read(run.root().join("iterations/1/resolved.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempt["session_duration_ms"], 1);
+        assert!(attempt["usage"].is_null());
+        assert!(
+            attempt["session_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(
+            std::fs::read_dir(run.root().join("sessions"))
+                .unwrap()
+                .count(),
+            0
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::LoopProgress(progress)
@@ -1765,6 +2069,36 @@ mod tests {
             std::fs::read_to_string(second.root.join("candidate.txt")).unwrap(),
             "10\n"
         );
+
+        let third = Fixture::new();
+        let (_run, summary, runner, _) = third
+            .run(vec![
+                ScriptedAction::TamperControl,
+                ScriptedAction::Keep(20),
+            ])
+            .await;
+        assert_eq!(summary.counts.blocked, 1);
+        assert_eq!(runner.captured.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(third.root.join("candidate.txt")).unwrap(),
+            "10\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_check_side_effects_block_without_retaining_the_candidate() {
+        let fixture = Fixture::new();
+        let (_run, summary, runner, _) = fixture
+            .run(vec![ScriptedAction::Keep(77), ScriptedAction::Keep(20)])
+            .await;
+        assert_eq!(summary.counts.blocked, 1);
+        assert_eq!(summary.counts.kept, 0);
+        assert_eq!(runner.captured.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("candidate.txt")).unwrap(),
+            "10\n"
+        );
+        assert!(!fixture.root.join("evaluator-side-effect.txt").exists());
     }
 
     #[tokio::test]

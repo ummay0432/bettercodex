@@ -30,6 +30,8 @@ bounded version-1 shape (unknown fields are rejected):
     "argv": ["program", "literal-argument"],
     "cwd": ".",
     "env": {},
+    "input_paths": [{"root": "worktree", "path": "candidate/path"}],
+    "fixture_paths": [{"root": "evaluator", "path": "evaluator/workspace/fixture"}],
     "timeout_seconds": 300,
     "resource_budget": "bounded local budget",
     "side_effects": "none|declared_scratch",
@@ -37,6 +39,28 @@ bounded version-1 shape (unknown fields are rejected):
     "expected_exit_codes": [0],
     "extract": {"kind": "pass|last_line|json_number", "json_pointer": "/optional"},
     "baseline_repeats": 1
+  }],
+  "discrimination_checks": [{
+    "linked_check_id": "stable-check-id",
+    "check": {
+      "id": "stable-known-failure-id",
+      "promise_ids": ["stable-id"],
+      "argv": ["same-runner", "known-failure-arguments"],
+      "cwd": ".",
+      "env": {},
+      "input_paths": [{"root": "worktree", "path": "candidate/path"}],
+      "fixture_paths": [{
+        "root": "evaluator",
+        "path": "evaluator/workspace/known-failure-fixture"
+      }],
+      "timeout_seconds": 300,
+      "resource_budget": "bounded local budget",
+      "side_effects": "none|declared_scratch",
+      "approval": "none",
+      "expected_exit_codes": [0],
+      "extract": {"kind": "pass|last_line|json_number", "json_pointer": "/optional"},
+      "baseline_repeats": 1
+    }
   }],
   "model_checks": [{
     "id": "stable-check-id",
@@ -50,7 +74,7 @@ bounded version-1 shape (unknown fields are rejected):
   }],
   "acceptance": {"required_check_ids": ["stable-check-id"]},
   "comparison": {
-    "kind": "acceptance_transition|metric",
+    "kind": "acceptance_transition|metric|pairwise",
     "check_id": null,
     "direction": null,
     "minimum_delta": 0.0,
@@ -71,12 +95,26 @@ its descendants. The whole-root path `.` is not a valid candidate boundary
 because it includes harness-owned `.bcodex/loops/`; enumerate the actual editable
 files or disjoint trees. Machine checks are argument vectors, never shell strings;
 their working directories are relative to the candidate root. Automatic checks
-must use `approval: "none"` and may write only declared scratch paths. Use
+must enumerate at least one input. Worktree inputs must be inside the candidate
+or integrity boundary, and every worktree fixture must be protected by the
+integrity boundary. Evaluator inputs and fixtures use run-relative paths under
+`evaluator/workspace/`. Automatic checks must use `approval: "none"` and may
+write only declared scratch paths. Use
 `json_number` only for a finite numeric metric. `acceptance_transition` keeps a
 candidate only when it changes an unacceptable incumbent into an acceptable
 candidate. `metric` additionally requires the named check to improve in the
 declared `higher` or `lower` direction by more than tolerance and at least the
-minimum delta. Ties and inconclusive results are always discarded.
+minimum delta. `pairwise` names a pairwise model check with at least two frozen
+calibration examples, zero numeric thresholds, both candidate-first and
+incumbent-first judgments, and a consistent result. Ties and inconclusive
+results are always discarded.
+
+Every machine check used by acceptance or metric comparison needs at least one
+`discrimination_checks` entry. Its nested check must cover the same promises,
+run the same program, execute exactly once, and name a frozen evaluator fixture
+representing the linked check's stated failure. The harness runs these probes
+against the restored starting state and rejects setup unless all probes prove
+that the runner catches their known failures.
 
 The setup baseline file must be a bounded JSON object with this control shape:
 `{"state":"<digest from {{starting_state_file}}>","checks":{"<check-id>":
@@ -85,6 +123,14 @@ repeats, values, or variance in additional fields inside each check object.
 Machine `passed` claims must agree with the harness reproduction. Every model
 check supplies a boolean `passed` and concrete string `artifacts` covering its
 declared evidence, plus any calibration result needed by its frozen rubric.
+For a `pairwise` model check, also supply `calibration_passed: true`, exact
+`orders: ["candidate_first", "incumbent_first"]`, and `consistent: true`; the
+harness will not accept a better judgment without both position orders.
+For a `BLOCKED` worker verdict, the artifact also needs a `blocker` object with
+exact fields `kind`, `detail`, and non-empty `evidence`. `kind` is one of
+`task_evaluator_contradiction`, `missing_prerequisite`, `missing_authority`,
+`state_integrity`, or `external_conflict`; completion or lack of a better idea
+is not a blocker.
 Also write a concise `RATIONALE.md` in the evaluator workspace. The harness
 restores all production changes before reproducing machine results itself; do
 not rely on setup-session changes outside this workspace.

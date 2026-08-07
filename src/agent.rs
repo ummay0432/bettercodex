@@ -265,6 +265,10 @@ impl Agent {
         self.conversation.session_id()
     }
 
+    pub(crate) fn latest_usage(&self) -> Option<crate::usage::TokenUsage> {
+        self.conversation.latest_usage().cloned()
+    }
+
     pub(crate) fn context_tokens(&self) -> Option<u64> {
         self.conversation.context_tokens()
     }

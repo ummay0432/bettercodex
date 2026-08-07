@@ -154,6 +154,25 @@ struct OperatorCommandCompletion {
     output: std::result::Result<Value, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveSubmissionRoute {
+    QueueLoop,
+    SteerOrdinary,
+}
+
+fn active_submission_route(prompt: &UserPrompt) -> Result<ActiveSubmissionRoute> {
+    let invocation = crate::quality_loop::parse_invocation_with_mode(
+        &prompt.text_without_image_placeholders(),
+        prompt.image_count() > 0,
+        true,
+    )?;
+    Ok(if invocation.is_some() {
+        ActiveSubmissionRoute::QueueLoop
+    } else {
+        ActiveSubmissionRoute::SteerOrdinary
+    })
+}
+
 impl Runtime {
     fn new(
         mut agent: Agent,
@@ -475,17 +494,12 @@ impl Runtime {
             Action::Submit(prompt) => {
                 self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
-                    let loop_request = crate::quality_loop::parse_invocation_with_mode(
-                        &prompt.text_without_image_placeholders(),
-                        prompt.image_count() > 0,
-                        true,
-                    );
-                    match loop_request {
-                        Ok(Some(_)) => self.view.queue_follow_up(prompt),
+                    match active_submission_route(&prompt) {
+                        Ok(ActiveSubmissionRoute::QueueLoop) => self.view.queue_follow_up(prompt),
                         Err(error) => self
                             .view
                             .add_notice(format!("Invalid quality loop request: {error:#}")),
-                        Ok(None) => {
+                        Ok(ActiveSubmissionRoute::SteerOrdinary) => {
                             let steering = self.turn_handle.as_ref().and_then(|turn| {
                                 turn.steer(UserInput::prompt(prompt.clone())).ok()
                             });

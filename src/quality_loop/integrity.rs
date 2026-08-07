@@ -38,6 +38,16 @@ enum ManifestKind {
 }
 
 impl PackageManifest {
+    pub(crate) fn make_private(root: &Path) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(root)
+            .with_context(|| format!("failed to inspect evaluator workspace {}", root.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(anyhow!("evaluator workspace is not a safe directory"));
+        }
+        let mut count = 0;
+        make_tree_private(root, &mut count)
+    }
+
     pub(crate) fn capture(root: &Path) -> Result<Self> {
         let metadata = std::fs::symlink_metadata(root)
             .with_context(|| format!("failed to inspect evaluator workspace {}", root.display()))?;
@@ -77,6 +87,37 @@ impl PackageManifest {
     }
 }
 
+fn make_tree_private(path: &Path, count: &mut usize) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    *count = count.saturating_add(1);
+    if *count > MAX_PACKAGE_FILES {
+        return Err(anyhow!(
+            "evaluator package exceeds the {MAX_PACKAGE_FILES}-entry limit"
+        ));
+    }
+    if metadata.is_dir() {
+        let mut entries = std::fs::read_dir(path)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            make_tree_private(&entry.path(), count)?;
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    } else if metadata.is_file() {
+        let mode = metadata.permissions().mode();
+        let private_mode = 0o600 | (mode & 0o100);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(private_mode))?;
+    } else {
+        return Err(anyhow!(
+            "unsupported object in evaluator package: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn collect(
     root: &Path,
     directory: &Path,
@@ -112,6 +153,11 @@ fn collect(
                 digest_or_target: None,
             }
         } else if metadata.is_file() {
+            if metadata.len() > MAX_PACKAGE_BYTES.saturating_sub(*total_bytes) {
+                return Err(anyhow!(
+                    "evaluator package exceeds the {MAX_PACKAGE_BYTES}-byte limit"
+                ));
+            }
             let bytes = std::fs::read(&path)?;
             *total_bytes = total_bytes.saturating_add(bytes.len() as u64);
             ManifestEntry {
@@ -168,4 +214,62 @@ fn differing_paths(
 
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn package_manifest_bounds_sparse_files_and_detects_type_mode_and_target_changes() {
+        let root =
+            std::env::temp_dir().join(format!("bettercodex-loop-package-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("check.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(root.join("check.sh"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(root.join("check.sh"), permissions).unwrap();
+        std::os::unix::fs::symlink("check.sh", root.join("current")).unwrap();
+        let manifest = PackageManifest::capture(&root).unwrap();
+
+        std::fs::set_permissions(
+            root.join("check.sh"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(manifest.verify(&root).is_err());
+        std::fs::set_permissions(
+            root.join("check.sh"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::remove_file(root.join("current")).unwrap();
+        std::os::unix::fs::symlink("missing", root.join("current")).unwrap();
+        assert!(manifest.verify(&root).is_err());
+
+        std::fs::remove_file(root.join("current")).unwrap();
+        let sparse = std::fs::File::create(root.join("oversized")).unwrap();
+        sparse.set_len(MAX_PACKAGE_BYTES + 1).unwrap();
+        assert!(PackageManifest::capture(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_privacy_rejects_a_symlinked_workspace_root() {
+        let parent = std::env::temp_dir().join(format!(
+            "bettercodex-loop-package-symlink-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = parent.join("workspace");
+        let target = parent.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &workspace).unwrap();
+
+        assert!(PackageManifest::make_private(&workspace).is_err());
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
 }

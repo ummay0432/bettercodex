@@ -109,6 +109,29 @@ pub(crate) async fn run_machine_evaluation(
     Ok(Some(report))
 }
 
+pub(crate) async fn run_discrimination_checks(
+    contract: &EvaluatorContract,
+    worktree_root: &Path,
+    evidence_directory: &Path,
+    cancellation: &CancellationToken,
+) -> Result<Option<BTreeMap<String, CheckReport>>> {
+    create_private_directory(evidence_directory)?;
+    let mut reports = BTreeMap::new();
+    for discrimination in &contract.discrimination_checks {
+        let check = &discrimination.check;
+        let Some(report) =
+            run_check(check, worktree_root, evidence_directory, cancellation).await?
+        else {
+            return Ok(None);
+        };
+        reports.insert(check.id.clone(), report);
+    }
+    let mut bytes = serde_json::to_vec_pretty(&reports)?;
+    bytes.push(b'\n');
+    super::state::atomic_private_write(&evidence_directory.join("evaluation.json"), &bytes)?;
+    Ok(Some(reports))
+}
+
 pub(crate) fn compare_reports(
     contract: &EvaluatorContract,
     incumbent: &EvaluationReport,
@@ -126,6 +149,24 @@ pub(crate) fn compare_reports(
             }
         }
         ComparisonKind::Metric => compare_metric(contract, incumbent, candidate),
+        ComparisonKind::Pairwise => {
+            let Some(id) = contract.comparison.check_id.as_deref() else {
+                return ImprovementDecision::Inconclusive(
+                    "pairwise comparison check is missing".to_string(),
+                );
+            };
+            match candidate.checks.get(id) {
+                Some(report) if report.passed => {
+                    ImprovementDecision::Better(format!("{id} preferred the candidate"))
+                }
+                Some(_) => ImprovementDecision::NotBetter(format!(
+                    "{id} did not prefer the candidate in both positions"
+                )),
+                None => ImprovementDecision::Inconclusive(format!(
+                    "pairwise check `{id}` produced no judgment"
+                )),
+            }
+        }
     }
 }
 
@@ -201,16 +242,49 @@ pub(crate) fn apply_structured_artifact(
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("model check `{}` omitted artifact evidence", check.id))?;
         if artifacts.len() < check.required_artifacts.len()
+            || artifacts.len() > 256
             || artifacts.iter().any(|artifact| {
-                artifact
-                    .as_str()
-                    .is_none_or(|artifact| artifact.trim().is_empty())
+                artifact.as_str().is_none_or(|artifact| {
+                    artifact.trim().is_empty()
+                        || artifact.chars().count() > 4_096
+                        || artifact.chars().any(char::is_control)
+                })
             })
         {
             return Err(anyhow!(
                 "model check `{}` has incomplete artifact evidence",
                 check.id
             ));
+        }
+        if (check.hard_gate || matches!(check.kind, super::contract::ModelCheckKind::Pairwise))
+            && value
+                .as_object()
+                .and_then(|value| value.get("calibration_passed"))
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Err(anyhow!(
+                "model check `{}` omitted successful calibration evidence",
+                check.id
+            ));
+        }
+        if matches!(check.kind, super::contract::ModelCheckKind::Pairwise) {
+            let object = value
+                .as_object()
+                .ok_or_else(|| anyhow!("pairwise check `{}` is not structured", check.id))?;
+            let orders = object
+                .get("orders")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("pairwise check `{}` omitted position orders", check.id))?;
+            let observed = orders.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            if observed != ["candidate_first", "incumbent_first"]
+                || object.get("consistent").and_then(Value::as_bool) != Some(true)
+            {
+                return Err(anyhow!(
+                    "pairwise check `{}` did not control position order consistently",
+                    check.id
+                ));
+            }
         }
         report.checks.insert(
             check.id.clone(),
@@ -321,11 +395,20 @@ async fn run_check(
             values.push(CheckValue::Pass(false));
             continue;
         }
-        let extracted = extract(check, &stdout, true)?;
-        if matches!(extracted, CheckValue::Pass(false)) {
-            passed = false;
+        match extract(check, &stdout, true) {
+            Ok(extracted) => {
+                if matches!(extracted, CheckValue::Pass(false)) {
+                    passed = false;
+                }
+                values.push(extracted);
+            }
+            Err(error) => {
+                passed = false;
+                values.push(CheckValue::Text(bound_decisive(&format!(
+                    "result extraction failed: {error:#}"
+                ))));
+            }
         }
-        values.push(extracted);
     }
     Ok(Some(CheckReport {
         passed,
@@ -472,6 +555,12 @@ fn decisive_result(
 ) -> String {
     if contract.comparison.kind == ComparisonKind::Metric
         && let Some(id) = contract.comparison.check_id.as_deref()
+        && let Some(number) = metric_from_reports(reports, id)
+    {
+        return format!("{id}={}", concise_number(number));
+    }
+    if contract.comparison.kind == ComparisonKind::Metric
+        && let Some(id) = contract.comparison.check_id.as_deref()
         && let Some(value) = reports.get(id).and_then(|report| report.values.last())
     {
         return match value {
@@ -481,6 +570,19 @@ fn decisive_result(
                 format!("{id}={}", if *value { "pass" } else { "fail" })
             }
         };
+    }
+    if contract.comparison.kind == ComparisonKind::Pairwise
+        && let Some(id) = contract.comparison.check_id.as_deref()
+        && let Some(report) = reports.get(id)
+    {
+        return format!(
+            "{id}={}",
+            if report.passed {
+                "candidate preferred"
+            } else {
+                "candidate not preferred"
+            }
+        );
     }
     let passed = contract
         .acceptance
@@ -495,9 +597,8 @@ fn decisive_result(
     )
 }
 
-fn metric_value(report: &EvaluationReport, id: &str) -> Option<f64> {
-    report
-        .checks
+fn metric_from_reports(reports: &BTreeMap<String, CheckReport>, id: &str) -> Option<f64> {
+    let values = reports
         .get(id)?
         .values
         .iter()
@@ -505,7 +606,16 @@ fn metric_value(report: &EvaluationReport, id: &str) -> Option<f64> {
             CheckValue::Number(number) => Some(*number),
             _ => None,
         })
-        .next_back()
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+pub(crate) fn metric_value(report: &EvaluationReport, id: &str) -> Option<f64> {
+    metric_from_reports(&report.checks, id)
 }
 
 fn concise_number(value: f64) -> String {
@@ -597,6 +707,8 @@ mod tests {
                 "argv": [program],
                 "cwd": ".",
                 "env": {},
+                "input_paths": [{"root": "worktree", "path": "candidate.txt"}],
+                "fixture_paths": [],
                 "timeout_seconds": 2,
                 "resource_budget": "one process",
                 "side_effects": "none",
@@ -604,6 +716,28 @@ mod tests {
                 "expected_exit_codes": [0],
                 "extract": {"kind": "json_number", "json_pointer": "/value"},
                 "baseline_repeats": repeats
+            }],
+            "discrimination_checks": [{
+                "linked_check_id": "metric-check",
+                "check": {
+                    "id": "metric-known-failure",
+                    "promise_ids": ["metric"],
+                    "argv": [program],
+                    "cwd": ".",
+                    "env": {},
+                    "input_paths": [{"root": "worktree", "path": "candidate.txt"}],
+                    "fixture_paths": [{
+                        "root": "evaluator",
+                        "path": "evaluator/workspace/known-failure.txt"
+                    }],
+                    "timeout_seconds": 2,
+                    "resource_budget": "one process",
+                    "side_effects": "none",
+                    "approval": "none",
+                    "expected_exit_codes": [0],
+                    "extract": {"kind": "pass"},
+                    "baseline_repeats": 1
+                }
             }],
             "model_checks": [],
             "acceptance": {"required_check_ids": ["metric-check"]},
@@ -649,6 +783,48 @@ mod tests {
         assert_eq!(report.checks["metric-check"].values.len(), 2);
         assert!(evidence.join("metric-check-1.log").is_file());
         assert!(evidence.join("metric-check-2.log").is_file());
+    }
+
+    #[tokio::test]
+    async fn harness_reproduces_frozen_known_failure_discrimination() {
+        let fixture = Fixture::new();
+        let known_failure = fixture.root.join("evaluator/workspace/known-failure.txt");
+        std::fs::create_dir_all(known_failure.parent().unwrap()).unwrap();
+        std::fs::write(&known_failure, "known failure\n").unwrap();
+        let script = fixture.script(
+            "metric.sh",
+            "#!/bin/sh\nif [ \"$1\" = --probe ]; then\n  grep -qx 'known failure' \"$2\"\n  exit\nfi\nprintf '{\"value\": %s}\\n' \"$(cat candidate.txt)\"\n",
+        );
+        let mut contract = contract(&fixture.root, &script, 1);
+        contract.discrimination_checks[0].check.argv = vec![
+            script.display().to_string(),
+            "--probe".to_string(),
+            known_failure.display().to_string(),
+        ];
+        contract.validate(&fixture.root).unwrap();
+
+        let reports = run_discrimination_checks(
+            &contract,
+            &fixture.root,
+            &fixture.root.join("discrimination-pass"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(reports["metric-known-failure"].passed);
+
+        std::fs::write(&known_failure, "healthy fixture\n").unwrap();
+        let reports = run_discrimination_checks(
+            &contract,
+            &fixture.root,
+            &fixture.root.join("discrimination-fail"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!reports["metric-known-failure"].passed);
     }
 
     #[tokio::test]
@@ -799,6 +975,103 @@ mod tests {
                 &report(Some(10.0), true),
                 &report(Some(20.0), false)
             ),
+            ImprovementDecision::NotBetter(_)
+        ));
+    }
+
+    #[test]
+    fn calibrated_pairwise_artifacts_require_both_position_orders() {
+        let fixture = Fixture::new();
+        let script = fixture.script("metric.sh", "#!/bin/sh\nprintf '{\"value\":10}'\n");
+        let base = contract(&fixture.root, &script, 1);
+        let mut value = serde_json::to_value(base).unwrap();
+        value["model_checks"] = json!([{
+            "id": "quality-judge",
+            "promise_ids": ["metric"],
+            "kind": "pairwise",
+            "rubric_path": "evaluator/workspace/rubric.md",
+            "required_artifacts": ["candidate and incumbent evidence"],
+            "calibration_paths": [
+                "evaluator/workspace/calibration-pass.json",
+                "evaluator/workspace/calibration-fail.json"
+            ],
+            "output_shape": "two-order boolean pairwise result",
+            "hard_gate": false
+        }]);
+        value["comparison"] = json!({
+            "kind": "pairwise",
+            "check_id": "quality-judge",
+            "direction": null,
+            "minimum_delta": 0.0,
+            "tolerance": 0.0,
+            "ties": "discard",
+            "inconclusive": "discard"
+        });
+        let contract: EvaluatorContract = serde_json::from_value(value).unwrap();
+        contract.validate(&fixture.root).unwrap();
+        let mut candidate = EvaluationReport {
+            state: "candidate".to_string(),
+            accepted: true,
+            decisive: "metric-check=10".to_string(),
+            checks: BTreeMap::from([(
+                "metric-check".to_string(),
+                CheckReport {
+                    passed: true,
+                    values: vec![CheckValue::Number(10.0)],
+                    evidence: Vec::new(),
+                },
+            )]),
+        };
+        let artifact = fixture.root.join("pairwise.json");
+        let write = |orders: Value| {
+            std::fs::write(
+                &artifact,
+                serde_json::to_vec(&json!({
+                    "state": "candidate",
+                    "checks": {
+                        "metric-check": {"passed": true},
+                        "quality-judge": {
+                            "passed": true,
+                            "artifacts": ["candidate.json and incumbent.json"],
+                            "calibration_passed": true,
+                            "orders": orders,
+                            "consistent": true
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write(json!(["candidate_first"]));
+        assert!(apply_structured_artifact(&contract, &mut candidate, &artifact).is_err());
+        write(json!(["candidate_first", "incumbent_first"]));
+        apply_structured_artifact(&contract, &mut candidate, &artifact).unwrap();
+        assert!(matches!(
+            compare_reports(&contract, &candidate.clone(), &candidate),
+            ImprovementDecision::Better(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_numeric_output_is_an_inconclusive_failed_check() {
+        let fixture = Fixture::new();
+        let script = fixture.script("invalid-json.sh", "#!/bin/sh\nprintf not-json\n");
+        let contract = contract(&fixture.root, &script, 1);
+        let report = run_machine_evaluation(
+            &contract,
+            &fixture.root,
+            "state-1",
+            &fixture.root.join("evidence"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!report.accepted);
+        assert!(metric_value(&report, "metric-check").is_none());
+        assert!(matches!(
+            compare_reports(&contract, &report, &report),
             ImprovementDecision::NotBetter(_)
         ));
     }

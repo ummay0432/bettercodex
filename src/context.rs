@@ -403,6 +403,10 @@ impl Conversation {
         &self.rollout.identity().session_id
     }
 
+    pub(crate) fn latest_usage(&self) -> Option<&TokenUsage> {
+        self.usage.as_ref()
+    }
+
     pub(crate) fn identity(&self) -> &SessionIdentity {
         self.rollout.identity()
     }

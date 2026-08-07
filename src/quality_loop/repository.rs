@@ -62,6 +62,8 @@ struct GitState {
     refs: BTreeMap<String, String>,
     config_digest: String,
     hooks_digest: String,
+    linked_worktrees_digest: String,
+    submodule_repositories_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -134,6 +136,17 @@ impl Worktree {
 
     pub(crate) fn install_loop_exclude(&self) -> Result<()> {
         let exclude = absolute_git_path(&self.root, &["rev-parse", "--git-path", "info/exclude"])?;
+        match std::fs::symlink_metadata(&exclude) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(anyhow!(
+                    "unsafe repository-local Git exclusion {}",
+                    exclude.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let existing = match std::fs::read(&exclude) {
             Ok(existing) => existing,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -583,6 +596,9 @@ impl Worktree {
             self.git_dir.join("config.worktree"),
         ])?;
         let hooks_digest = digest_tree(&self.common_git_dir.join("hooks"))?;
+        let linked_worktrees_digest =
+            digest_other_worktree_admin(&self.common_git_dir.join("worktrees"), &self.git_dir)?;
+        let submodule_repositories_digest = digest_tree(&self.common_git_dir.join("modules"))?;
         Ok(GitState {
             head,
             branch,
@@ -590,6 +606,8 @@ impl Worktree {
             refs,
             config_digest,
             hooks_digest,
+            linked_worktrees_digest,
+            submodule_repositories_digest,
         })
     }
 
@@ -599,6 +617,12 @@ impl Worktree {
         }
         if before.hooks_digest != after.hooks_digest {
             return Err(anyhow!("candidate changed repository Git hooks"));
+        }
+        if before.linked_worktrees_digest != after.linked_worktrees_digest {
+            return Err(anyhow!("candidate changed another linked worktree"));
+        }
+        if before.submodule_repositories_digest != after.submodule_repositories_digest {
+            return Err(anyhow!("candidate changed a submodule repository"));
         }
         let allowed = [before.branch.as_deref(), after.branch.as_deref()]
             .into_iter()
@@ -627,11 +651,27 @@ impl Worktree {
 
     fn restore_git(&self, run_root: &Path, wanted: &GitState, current: &GitState) -> Result<()> {
         self.verify_supported_git_change(wanted, current)?;
-        if let Some(current_branch) = &current.branch
-            && current_branch != wanted.branch.as_ref().unwrap_or(current_branch)
-            && !wanted.refs.contains_key(current_branch)
-        {
-            let _ = git_output(&self.root, &["update-ref", "-d", current_branch], None)?;
+        let allowed = [wanted.branch.as_deref(), current.branch.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<HashSetRef>();
+        let names = wanted
+            .refs
+            .keys()
+            .chain(current.refs.keys())
+            .collect::<BTreeSet<_>>();
+        for name in names {
+            if !allowed.contains(name.as_str()) || wanted.refs.get(name) == current.refs.get(name) {
+                continue;
+            }
+            match wanted.refs.get(name) {
+                Some(object) => {
+                    git_output(&self.root, &["update-ref", name, object], None)?;
+                }
+                None => {
+                    git_output(&self.root, &["update-ref", "-d", name], None)?;
+                }
+            }
         }
         match (&wanted.branch, &wanted.head) {
             (Some(branch), Some(head)) => {
@@ -754,9 +794,21 @@ fn capture_entry(path: &Path, blob_root: &Path, total_bytes: &mut u64) -> Result
 }
 
 fn capture_file(path: &Path, blob_root: &Path, total_bytes: &mut u64) -> Result<String> {
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
+    let remaining = MAX_SNAPSHOT_BYTES.saturating_sub(*total_bytes);
+    if file.metadata()?.len() > remaining {
+        return Err(anyhow!(
+            "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
+        ));
+    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.take(remaining.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > remaining {
+        return Err(anyhow!(
+            "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
+        ));
+    }
     *total_bytes = total_bytes.saturating_add(bytes.len() as u64);
     store_blob(blob_root, &bytes)
 }
@@ -961,6 +1013,28 @@ fn digest_optional_files(paths: &[PathBuf]) -> Result<String> {
         }
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn digest_other_worktree_admin(root: &Path, current_git_dir: &Path) -> Result<String> {
+    let current = current_git_dir.canonicalize().ok();
+    let mut entries = BTreeMap::new();
+    let children = match std::fs::read_dir(root) {
+        Ok(children) => children.collect::<std::result::Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    for child in children {
+        let path = child.path();
+        if path.canonicalize().ok().as_ref() == current.as_ref() {
+            continue;
+        }
+        let name = child
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("linked-worktree metadata path is not UTF-8"))?;
+        entries.insert(name, digest_tree(&path)?);
+    }
+    Ok(hash_bytes(&serde_json::to_vec(&entries)?))
 }
 
 fn digest_tree(root: &Path) -> Result<String> {
@@ -1332,6 +1406,28 @@ mod tests {
                 .verify_supported_git_change(&before.git, &after.git)
                 .is_err()
         );
+
+        std::fs::remove_file(worktree.common_git_dir().join("hooks/pre-commit")).unwrap();
+        let linked = worktree.common_git_dir().join("worktrees/other");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join("HEAD"), "ref: refs/heads/other\n").unwrap();
+        let after = worktree.capture(&run_root, &[]).unwrap();
+        assert!(
+            worktree
+                .verify_supported_git_change(&before.git, &after.git)
+                .is_err()
+        );
+
+        std::fs::remove_dir_all(worktree.common_git_dir().join("worktrees")).unwrap();
+        let submodule = worktree.common_git_dir().join("modules/component");
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::write(submodule.join("HEAD"), "changed\n").unwrap();
+        let after = worktree.capture(&run_root, &[]).unwrap();
+        assert!(
+            worktree
+                .verify_supported_git_change(&before.git, &after.git)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1380,5 +1476,23 @@ mod tests {
             std::fs::read(fixture.root.join(".gitignore")).unwrap(),
             b".cache/\n"
         );
+
+        let unsafe_fixture = Fixture::new();
+        let unsafe_worktree = Worktree::discover(&unsafe_fixture.root).unwrap();
+        let exclude = unsafe_fixture.root.join(".git/info/exclude");
+        std::fs::remove_file(&exclude).unwrap();
+        std::os::unix::fs::symlink("../config", &exclude).unwrap();
+        assert!(unsafe_worktree.install_loop_exclude().is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_an_oversized_sparse_file_before_reading_it() {
+        let fixture = Fixture::new();
+        let worktree = Worktree::discover(&fixture.root).unwrap();
+        worktree.install_loop_exclude().unwrap();
+        let run_root = fixture.run_root();
+        let sparse = std::fs::File::create(fixture.root.join("oversized.bin")).unwrap();
+        sparse.set_len(MAX_SNAPSHOT_BYTES + 1).unwrap();
+        assert!(worktree.capture(&run_root, &[]).is_err());
     }
 }

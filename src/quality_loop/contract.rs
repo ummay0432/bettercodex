@@ -32,6 +32,7 @@ pub(crate) struct EvaluatorContract {
     pub(crate) integrity_paths: Vec<PathSpec>,
     pub(crate) scratch_paths: Vec<PathSpec>,
     pub(crate) machine_checks: Vec<MachineCheck>,
+    pub(crate) discrimination_checks: Vec<DiscriminationCheck>,
     pub(crate) model_checks: Vec<ModelCheck>,
     pub(crate) acceptance: AcceptanceRule,
     pub(crate) comparison: ComparisonRule,
@@ -71,6 +72,8 @@ pub(crate) struct MachineCheck {
     pub(crate) argv: Vec<String>,
     pub(crate) cwd: String,
     pub(crate) env: BTreeMap<String, String>,
+    pub(crate) input_paths: Vec<ArtifactPath>,
+    pub(crate) fixture_paths: Vec<ArtifactPath>,
     pub(crate) timeout_seconds: u64,
     pub(crate) resource_budget: String,
     pub(crate) side_effects: SideEffects,
@@ -80,7 +83,28 @@ pub(crate) struct MachineCheck {
     pub(crate) baseline_repeats: u8,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DiscriminationCheck {
+    pub(crate) linked_check_id: String,
+    pub(crate) check: MachineCheck,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactPath {
+    pub(crate) root: ArtifactRoot,
+    pub(crate) path: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ArtifactRoot {
+    Worktree,
+    Evaluator,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SideEffects {
     None,
@@ -152,6 +176,7 @@ pub(crate) struct ComparisonRule {
 pub(crate) enum ComparisonKind {
     AcceptanceTransition,
     Metric,
+    Pairwise,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -259,7 +284,7 @@ impl EvaluatorContract {
         bounded_count("promises", self.promises.len(), 1, MAX_PROMISES)?;
         bounded_count(
             "checks",
-            self.machine_checks.len() + self.model_checks.len(),
+            self.machine_checks.len() + self.discrimination_checks.len() + self.model_checks.len(),
             1,
             MAX_CHECKS,
         )?;
@@ -298,77 +323,24 @@ impl EvaluatorContract {
 
         let mut check_ids = HashSet::new();
         for check in &self.machine_checks {
-            validate_check_identity(&check.id, &check.promise_ids, &promise_ids, &mut check_ids)?;
-            bounded_count("check arguments", check.argv.len(), 1, MAX_ARGUMENTS)?;
-            for argument in &check.argv {
-                validate_text("check argument", argument, false)?;
-                if argument.contains('\0') {
-                    return Err(anyhow!("check arguments may not contain NUL bytes"));
-                }
-            }
-            validate_relative_path(&check.cwd, false)?;
-            validate_check_cwd(worktree_root, &check.cwd)?;
-            if check.env.len() > MAX_ENVIRONMENT_ENTRIES {
-                return Err(anyhow!(
-                    "machine check `{}` declares too much environment",
-                    check.id
-                ));
-            }
-            for (name, value) in &check.env {
-                if name.is_empty()
-                    || !name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                    || name.as_bytes()[0].is_ascii_digit()
-                {
-                    return Err(anyhow!(
-                        "machine check `{}` has invalid environment name",
-                        check.id
-                    ));
-                }
-                validate_text("environment value", value, true)?;
-            }
-            if !(1..=MAX_TIMEOUT_SECONDS).contains(&check.timeout_seconds) {
-                return Err(anyhow!(
-                    "machine check `{}` has an invalid timeout",
-                    check.id
-                ));
-            }
-            if !(1..=MAX_BASELINE_REPEATS).contains(&check.baseline_repeats) {
-                return Err(anyhow!(
-                    "machine check `{}` has an invalid repeat count",
-                    check.id
-                ));
-            }
-            validate_text("resource budget", &check.resource_budget, false)?;
-            bounded_count(
-                "expected exit codes",
-                check.expected_exit_codes.len(),
-                1,
-                16,
-            )?;
-            if check.extract.kind == ExtractKind::JsonNumber {
-                let pointer =
-                    check.extract.json_pointer.as_deref().ok_or_else(|| {
-                        anyhow!("machine check `{}` needs a JSON pointer", check.id)
-                    })?;
-                if !pointer.starts_with('/') || pointer.len() > MAX_PATH_BYTES {
-                    return Err(anyhow!(
-                        "machine check `{}` has an invalid JSON pointer",
-                        check.id
-                    ));
-                }
-            } else if check.extract.json_pointer.is_some() {
-                return Err(anyhow!(
-                    "machine check `{}` supplies a JSON pointer for a non-JSON extractor",
-                    check.id
-                ));
-            }
+            validate_machine_check(self, worktree_root, check, &promise_ids, &mut check_ids)?;
         }
         for check in &self.model_checks {
             validate_check_identity(&check.id, &check.promise_ids, &promise_ids, &mut check_ids)?;
             validate_relative_path(&check.rubric_path, false)?;
+            bounded_count(
+                "model-check artifacts",
+                check.required_artifacts.len(),
+                1,
+                MAX_PATHS,
+            )?;
             validate_text_list("model-check artifacts", &check.required_artifacts)?;
+            if check.calibration_paths.len() > MAX_PATHS {
+                return Err(anyhow!(
+                    "model check `{}` declares too many calibration paths",
+                    check.id
+                ));
+            }
             for path in &check.calibration_paths {
                 validate_relative_path(path, false)?;
             }
@@ -376,6 +348,54 @@ impl EvaluatorContract {
             if check.hard_gate && check.calibration_paths.is_empty() {
                 return Err(anyhow!(
                     "model check `{}` cannot be a hard gate without calibration evidence",
+                    check.id
+                ));
+            }
+        }
+        let selectable_check_ids = check_ids.clone();
+        for discrimination in &self.discrimination_checks {
+            let linked = self
+                .machine_checks
+                .iter()
+                .find(|check| check.id == discrimination.linked_check_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "discrimination check `{}` references unknown machine check `{}`",
+                        discrimination.check.id,
+                        discrimination.linked_check_id
+                    )
+                })?;
+            let check = &discrimination.check;
+            validate_machine_check(self, worktree_root, check, &promise_ids, &mut check_ids)?;
+            if check.promise_ids.iter().collect::<HashSet<_>>()
+                != linked.promise_ids.iter().collect::<HashSet<_>>()
+            {
+                return Err(anyhow!(
+                    "discrimination check `{}` must cover the same promises as `{}`",
+                    check.id,
+                    linked.id
+                ));
+            }
+            if check.argv.first() != linked.argv.first() {
+                return Err(anyhow!(
+                    "discrimination check `{}` must exercise the same runner as `{}`",
+                    check.id,
+                    linked.id
+                ));
+            }
+            if check.baseline_repeats != 1 {
+                return Err(anyhow!(
+                    "discrimination check `{}` must run exactly once",
+                    check.id
+                ));
+            }
+            if !check
+                .fixture_paths
+                .iter()
+                .any(|fixture| fixture.root == ArtifactRoot::Evaluator)
+            {
+                return Err(anyhow!(
+                    "discrimination check `{}` requires a frozen evaluator failure fixture",
                     check.id
                 ));
             }
@@ -388,7 +408,7 @@ impl EvaluatorContract {
             MAX_CHECKS,
         )?;
         for id in &self.acceptance.required_check_ids {
-            if !check_ids.contains(id.as_str()) {
+            if !selectable_check_ids.contains(id.as_str()) {
                 return Err(anyhow!("acceptance rule references unknown check `{id}`"));
             }
             if let Some(model_check) = self.model_checks.iter().find(|check| check.id == *id)
@@ -410,9 +430,13 @@ impl EvaluatorContract {
         }
         match self.comparison.kind {
             ComparisonKind::AcceptanceTransition => {
-                if self.comparison.check_id.is_some() || self.comparison.direction.is_some() {
+                if self.comparison.check_id.is_some()
+                    || self.comparison.direction.is_some()
+                    || self.comparison.minimum_delta != 0.0
+                    || self.comparison.tolerance != 0.0
+                {
                     return Err(anyhow!(
-                        "acceptance-transition comparison may not name a metric"
+                        "acceptance-transition comparison may not name a metric or numeric threshold"
                     ));
                 }
             }
@@ -435,6 +459,57 @@ impl EvaluatorContract {
                     ));
                 }
             }
+            ComparisonKind::Pairwise => {
+                let id = self
+                    .comparison
+                    .check_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("pairwise comparison must name a model check"))?;
+                let check = self
+                    .model_checks
+                    .iter()
+                    .find(|check| check.id == id)
+                    .ok_or_else(|| {
+                        anyhow!("pairwise comparison references unknown check `{id}`")
+                    })?;
+                if !matches!(check.kind, ModelCheckKind::Pairwise)
+                    || check.calibration_paths.len() < 2
+                    || self.comparison.direction.is_some()
+                    || self.comparison.minimum_delta != 0.0
+                    || self.comparison.tolerance != 0.0
+                {
+                    return Err(anyhow!(
+                        "pairwise comparison requires a calibrated pairwise model check and zero numeric thresholds"
+                    ));
+                }
+            }
+        }
+        let mut decisive_machine_checks = self
+            .acceptance
+            .required_check_ids
+            .iter()
+            .filter(|id| {
+                self.machine_checks
+                    .iter()
+                    .any(|check| check.id == id.as_str())
+            })
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if self.comparison.kind == ComparisonKind::Metric
+            && let Some(id) = self.comparison.check_id.as_deref()
+        {
+            decisive_machine_checks.insert(id);
+        }
+        for id in decisive_machine_checks {
+            if !self
+                .discrimination_checks
+                .iter()
+                .any(|probe| probe.linked_check_id == id)
+            {
+                return Err(anyhow!(
+                    "decisive machine check `{id}` has no frozen discrimination probe"
+                ));
+            }
         }
         Ok(())
     }
@@ -452,6 +527,155 @@ impl EvaluatorContract {
             .chain(&self.scratch_paths)
             .cloned()
             .collect()
+    }
+}
+
+fn validate_machine_check(
+    contract: &EvaluatorContract,
+    worktree_root: &Path,
+    check: &MachineCheck,
+    promise_ids: &HashSet<&str>,
+    check_ids: &mut HashSet<String>,
+) -> Result<()> {
+    validate_check_identity(&check.id, &check.promise_ids, promise_ids, check_ids)?;
+    bounded_count("check arguments", check.argv.len(), 1, MAX_ARGUMENTS)?;
+    for argument in &check.argv {
+        validate_text("check argument", argument, false)?;
+        if argument.contains('\0') {
+            return Err(anyhow!("check arguments may not contain NUL bytes"));
+        }
+    }
+    validate_relative_path(&check.cwd, false)?;
+    validate_check_cwd(worktree_root, &check.cwd)?;
+    bounded_count("check input paths", check.input_paths.len(), 1, MAX_PATHS)?;
+    if check.fixture_paths.len() > MAX_PATHS {
+        return Err(anyhow!(
+            "machine check `{}` declares too many fixtures",
+            check.id
+        ));
+    }
+    for input in &check.input_paths {
+        validate_artifact_path(contract, worktree_root, input, false)?;
+    }
+    for fixture in &check.fixture_paths {
+        validate_artifact_path(contract, worktree_root, fixture, true)?;
+    }
+    if check.env.len() > MAX_ENVIRONMENT_ENTRIES {
+        return Err(anyhow!(
+            "machine check `{}` declares too much environment",
+            check.id
+        ));
+    }
+    for (name, value) in &check.env {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || name.as_bytes()[0].is_ascii_digit()
+        {
+            return Err(anyhow!(
+                "machine check `{}` has invalid environment name",
+                check.id
+            ));
+        }
+        validate_text("environment value", value, true)?;
+    }
+    if !(1..=MAX_TIMEOUT_SECONDS).contains(&check.timeout_seconds) {
+        return Err(anyhow!(
+            "machine check `{}` has an invalid timeout",
+            check.id
+        ));
+    }
+    if !(1..=MAX_BASELINE_REPEATS).contains(&check.baseline_repeats) {
+        return Err(anyhow!(
+            "machine check `{}` has an invalid repeat count",
+            check.id
+        ));
+    }
+    if check.side_effects == SideEffects::DeclaredScratch && contract.scratch_paths.is_empty() {
+        return Err(anyhow!(
+            "machine check `{}` declares scratch side effects without a scratch path",
+            check.id
+        ));
+    }
+    validate_text("resource budget", &check.resource_budget, false)?;
+    bounded_count(
+        "expected exit codes",
+        check.expected_exit_codes.len(),
+        1,
+        16,
+    )?;
+    if check.extract.kind == ExtractKind::JsonNumber {
+        let pointer = check
+            .extract
+            .json_pointer
+            .as_deref()
+            .ok_or_else(|| anyhow!("machine check `{}` needs a JSON pointer", check.id))?;
+        if !pointer.starts_with('/') || pointer.len() > MAX_PATH_BYTES {
+            return Err(anyhow!(
+                "machine check `{}` has an invalid JSON pointer",
+                check.id
+            ));
+        }
+    } else if check.extract.json_pointer.is_some() {
+        return Err(anyhow!(
+            "machine check `{}` supplies a JSON pointer for a non-JSON extractor",
+            check.id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_path(
+    contract: &EvaluatorContract,
+    worktree_root: &Path,
+    artifact: &ArtifactPath,
+    fixture: bool,
+) -> Result<()> {
+    validate_relative_path(&artifact.path, false)?;
+    if artifact.root == ArtifactRoot::Evaluator {
+        if !artifact.path.starts_with("evaluator/workspace/") {
+            return Err(anyhow!(
+                "evaluator artifact `{}` is outside evaluator/workspace",
+                artifact.path
+            ));
+        }
+        return Ok(());
+    }
+    let relative = Path::new(&artifact.path);
+    let candidate = contract
+        .candidate_paths
+        .iter()
+        .any(|path| path.covers(relative));
+    let integrity = contract
+        .integrity_paths
+        .iter()
+        .any(|path| path.covers(relative));
+    if fixture && !integrity {
+        return Err(anyhow!(
+            "worktree fixture `{}` is not protected by the integrity boundary",
+            artifact.path
+        ));
+    }
+    if !candidate && !integrity {
+        return Err(anyhow!(
+            "worktree input `{}` is outside the candidate and integrity boundaries",
+            artifact.path
+        ));
+    }
+    validate_no_symlink_escape(worktree_root, &PathSpec(artifact.path.clone()))?;
+    match std::fs::symlink_metadata(worktree_root.join(relative)) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "worktree evaluator input `{}` is a symlink",
+            artifact.path
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !fixture => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "worktree fixture `{}` does not exist",
+            artifact.path
+        )),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -499,14 +723,14 @@ fn validate_path_sets(contract: &EvaluatorContract) -> Result<()> {
     Ok(())
 }
 
-fn validate_check_identity<'a>(
-    id: &'a str,
+fn validate_check_identity(
+    id: &str,
     references: &[String],
     promises: &HashSet<&str>,
-    checks: &mut HashSet<&'a str>,
+    checks: &mut HashSet<String>,
 ) -> Result<()> {
     validate_id("check", id)?;
-    if !checks.insert(id) {
+    if !checks.insert(id.to_string()) {
         return Err(anyhow!("duplicate check ID `{id}`"));
     }
     bounded_count("promise references", references.len(), 1, MAX_PROMISES)?;
@@ -702,6 +926,8 @@ mod tests {
                 "argv": ["/bin/true"],
                 "cwd": ".",
                 "env": {},
+                "input_paths": [{"root": "worktree", "path": "src"}],
+                "fixture_paths": [],
                 "timeout_seconds": 5,
                 "resource_budget": "one local process",
                 "side_effects": "none",
@@ -709,6 +935,28 @@ mod tests {
                 "expected_exit_codes": [0],
                 "extract": {"kind": "pass"},
                 "baseline_repeats": 1
+            }],
+            "discrimination_checks": [{
+                "linked_check_id": "behavior-check",
+                "check": {
+                    "id": "behavior-known-failure",
+                    "promise_ids": ["behavior"],
+                    "argv": ["/bin/true"],
+                    "cwd": ".",
+                    "env": {},
+                    "input_paths": [{"root": "worktree", "path": "src"}],
+                    "fixture_paths": [{
+                        "root": "evaluator",
+                        "path": "evaluator/workspace/known-failure.txt"
+                    }],
+                    "timeout_seconds": 5,
+                    "resource_budget": "one local process",
+                    "side_effects": "none",
+                    "approval": "none",
+                    "expected_exit_codes": [0],
+                    "extract": {"kind": "pass"},
+                    "baseline_repeats": 1
+                }
             }],
             "model_checks": [],
             "acceptance": {"required_check_ids": ["behavior-check"]},
@@ -787,6 +1035,26 @@ mod tests {
             .acceptance
             .required_check_ids
             .push("judge".to_string());
+        assert!(contract.validate(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn every_decisive_machine_gate_requires_a_linked_frozen_failure_probe() {
+        let root = fixture();
+        let mut contract = valid(&root);
+        contract.discrimination_checks.clear();
+        assert!(contract.validate(&root).is_err());
+
+        let mut contract = valid(&root);
+        contract.discrimination_checks[0].check.argv = vec!["/bin/false".to_string()];
+        assert!(contract.validate(&root).is_err());
+
+        let mut contract = valid(&root);
+        contract.discrimination_checks[0]
+            .check
+            .fixture_paths
+            .clear();
         assert!(contract.validate(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
