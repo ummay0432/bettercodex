@@ -1,27 +1,13 @@
 # bettercodex
 
-bettercodex is my personal Codex CLI fork. I have been an avid Codex user since
-forever, but Codex has grown into a product made for everyone, full of
-compromises, bloat, and trash I do not need. bettercodex strips it back to a
-bare coding-agent harness bespoke to how I work: one Cargo package, one
-`bcodex` binary, `gpt-5.6-sol`, the inference loop, local tools, and a terminal
-UI for one operator. Commands and patches run with the invoking user's
-permissions; bettercodex does not sandbox them. Its two non-negotiable success
-criteria are that tool usage must be the same as Codex CLI, if not better, and
-that there must be absolutely zero model degradation compared with Codex CLI.
-Generic coding-agent instructions chain the model down: do the least amount
-possible, ignore problems outside the exact task, prefer the smallest patch,
-and stop as soon as a local test passes. bettercodex should let the model
-stretch its legs and be genuinely proactive without losing any of Codex's
-capability. I am a CEO who knows my way around terminals and Linux but does
-**zero** programming; I make the product decisions, and the agent owns the
-engineering. My business codebases were built through thousands of AI sessions,
-many when the models were stupid—very stupid—so they contain slop: duplicated
-paths, shallow fixes, needless abstractions, dead code, disorganization, and
-implementations far from the best design today. Keep them tidy; when relevant
-work exposes poor engineering, refactor, delete, consolidate, or clean it up
-instead of compounding it. Do not invent unrelated features, but do not preserve
-bad engineering just to keep a diff small.
+The reason we're making bettercodex is that, when you're working on a long-term
+project that grows over time—for example, business operations—you rack up
+compounding technical debt, trash, and scope creep through thousands of Codex
+sessions because of the way the harness steers the model. It confines the model
+to being extremely passive, the opposite of proactive, and steers it to make
+the least amount of changes possible. This is where bettercodex differs: it lets
+the model stretch its legs and live up to its potential. It gives the model the
+freedom to be proactive.
 
 Do not use emojis, except for Codex's established checkmark status marker.
 

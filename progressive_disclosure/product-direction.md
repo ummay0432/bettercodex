@@ -3,8 +3,7 @@
 Read this before changing what bettercodex is, what it supports, or which
 upstream Codex behavior belongs here.
 
-[`AGENTS.md`](../AGENTS.md) defines why bettercodex exists, its success criteria,
-and the engineering ownership expected in every session. This file defines
+[`AGENTS.md`](../AGENTS.md) defines why bettercodex exists. This file defines
 which Codex behavior belongs here and the fixed product boundaries.
 
 ## Relationship to Codex
