@@ -972,6 +972,86 @@ text("after");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_timeout_prevents_a_queued_callback() {
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
+            .execute(
+                "call-clear-timeout",
+                r#"
+let fired = false;
+const timeout = setTimeout(() => { fired = true; }, 0);
+clearTimeout(timeout);
+await new Promise(resolve => setTimeout(resolve, 20));
+text(String(fired));
+"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.preview.contains("false"), "{}", result.preview);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_timeouts_use_runtime_tasks_owned_by_the_cell() {
+        const TIMEOUT_COUNT: usize = 256;
+
+        let runtime = runtime(PathBuf::from("."));
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let tasks_before = metrics.num_alive_tasks();
+
+        let source = format!(
+            r#"
+for (let index = 0; index < {TIMEOUT_COUNT}; index += 1) {{
+  setTimeout(() => {{}}, 10000);
+}}
+yield_control();
+await new Promise(() => {{}});
+"#
+        );
+        let yielded = runtime
+            .execute(
+                "call-many-timeouts",
+                &source,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while metrics.num_alive_tasks() < tasks_before + TIMEOUT_COUNT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timeout tasks were not scheduled on the shared runtime");
+        let cell_id = yielded
+            .preview
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Script running with cell ID ")
+            .unwrap();
+        runtime
+            .wait(
+                &json!({"cell_id": cell_id, "terminate": true}).to_string(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while metrics.num_alive_tasks() > tasks_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminating the cell did not cancel its timeout tasks");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_can_terminate_a_yielded_cell() {
         let runtime = runtime(PathBuf::from("."));
         let yielded = runtime

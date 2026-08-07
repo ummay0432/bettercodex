@@ -18,6 +18,7 @@ use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::enabled_tool_metadata;
 use codex_protocol::ToolName;
 use serde_json::Value as JsonValue;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::tools::code_runtime::TaskFailureHandler;
@@ -84,6 +85,8 @@ pub(crate) fn spawn_runtime(
     String,
 > {
     ensure_v8_initialized()?;
+    let timer_runtime = Handle::try_current()
+        .map_err(|_| "code mode runtime requires an active Tokio runtime".to_string())?;
 
     let (command_tx, command_rx) = std_mpsc::channel();
     let (control_tx, control_rx) = std_mpsc::channel();
@@ -99,6 +102,7 @@ pub(crate) fn spawn_runtime(
         enabled_tools,
         source: request.source,
         stored_values,
+        timer_runtime,
     };
 
     spawn_supervised_runtime_thread(event_tx.clone(), task_failure_handler, move || {
@@ -140,6 +144,7 @@ struct RuntimeConfig {
     enabled_tools: Vec<EnabledToolMetadata>,
     source: String,
     stored_values: Arc<HashMap<String, JsonValue>>,
+    timer_runtime: Handle,
 }
 
 pub(super) struct RuntimeState {
@@ -153,6 +158,7 @@ pub(super) struct RuntimeState {
     next_timeout_id: u64,
     tool_call_id: String,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
+    timer_runtime: Handle,
     exit_requested: bool,
 }
 
@@ -195,6 +201,7 @@ fn run_runtime(
         next_timeout_id: 1,
         tool_call_id: config.tool_call_id,
         runtime_command_tx,
+        timer_runtime: config.timer_runtime,
         exit_requested: false,
     });
 
