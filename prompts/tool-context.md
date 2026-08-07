@@ -98,15 +98,15 @@ shapes: empty objects for `apply_patch` and `update_plan`, and a string for
 <!-- bcodex-tool-context:stable:start -->
 | Injected component | UTF-8 bytes | o200k | bytes/4 |
 | --- | ---: | ---: | ---: |
-| Complete stable harness input: `instructions` plus `additional_tools` | 13,819 | 3,148 | 3,455 |
+| Complete stable harness input: `instructions` plus `additional_tools` | 15,918 | 3,547 | 3,980 |
 | Complete `additional_tools` developer item | 5,073 | 1,379 | 1,269 |
 | Top-level `exec` specification | 4,577 | 1,260 | 1,145 |
 | `exec` description only | 4,353 | 1,162 | 1,089 |
 | `exec` Lark grammar only | 31 | 12 | 8 |
 | Top-level `wait` specification | 438 | 107 | 110 |
 | `wait` description only | 151 | 40 | 38 |
-| Top-level `instructions` request field | 8,735 | 1,766 | 2,184 |
-| `prompts/system.md` text only | 8,642 | 1,699 | 2,161 |
+| Top-level `instructions` request field | 10,834 | 2,165 | 2,709 |
+| `prompts/system.md` text only | 10,721 | 2,081 | 2,681 |
 <!-- bcodex-tool-context:stable:end -->
 
 The `exec` description contains the Code Mode runtime instructions and every
