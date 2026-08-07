@@ -1,65 +1,121 @@
-## Installing & building
+# Installing bettercodex
 
-### System requirements
+bettercodex is distributed as private, prebuilt GitHub Release binaries. A
+friend needs repository access, but does not need Rust, npm, or a copy of the
+source tree.
 
-| Requirement                 | Details                                                         |
-| --------------------------- | --------------------------------------------------------------- |
-| Operating systems           | macOS 12+, Ubuntu 20.04+/Debian 10+, or Windows 11 **via WSL2** |
-| Git (optional, recommended) | 2.23+ for built-in PR helpers                                   |
-| RAM                         | 4-GB minimum (8-GB recommended)                                 |
+## Supported systems
 
-### DotSlash
+The release workflow builds native binaries for:
 
-The GitHub Release also contains a [DotSlash](https://dotslash-cli.com/) file for the Codex CLI named `codex`. Using a DotSlash file makes it possible to make a lightweight commit to source control to ensure all contributors use the same version of an executable, regardless of what platform they use for development.
+| Operating system | Architectures | Baseline |
+| --- | --- | --- |
+| macOS | Apple Silicon and Intel | macOS 12 or newer |
+| Linux | ARM64 and x86-64 | Ubuntu 22.04 or a compatible newer distribution |
 
-### Build from source
+Windows is not supported. The installer writes `bcodex` to
+`$HOME/.local/bin` and adds that directory to the appropriate shell profile
+when necessary.
 
-```bash
-# Clone the repository and navigate to the root of the Cargo workspace.
-git clone https://github.com/openai/codex.git
-cd codex/codex-rs
+## Friend setup
 
-# Install the Rust toolchain, if necessary.
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-rustup component add rustfmt
-rustup component add clippy
-# Install helper tools used by the workspace justfile:
-cargo install --locked just
-# DotSlash fetches pinned development tools such as buildifier on first use.
-cargo install --locked dotslash
-# Install nextest for the `just test` helper.
-cargo install --locked cargo-nextest
+1. The maintainer sends a read-only GitHub repository invitation. Accept it
+   while signed in to the GitHub account that should retain access.
+2. Install the [GitHub CLI](https://github.com/cli/cli#installation), then sign
+   in:
 
-# Build Codex.
-cargo build
+   ```sh
+   gh auth login
+   ```
 
-# Launch the TUI with a sample prompt.
-cargo run --bin codex -- "explain this codebase to me"
+3. Install bettercodex:
 
-# After making changes, use the root justfile helpers (they default to codex-rs):
-just fmt
-just fix -p <crate-you-touched>
+   ```sh
+   gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | sh
+   ```
 
-# Run the relevant tests (project-specific is fastest), for example:
-just test -p codex-tui
-# `just test` runs the test suite via nextest:
-just test
-# Avoid `--all-features` for routine local runs because it increases build
-# time and `target/` disk usage by compiling additional feature combinations.
+4. Open a new terminal, enter a project directory, and run:
+
+   ```sh
+   bcodex
+   ```
+
+5. Sign in with your own ChatGPT account when prompted. Authentication,
+   settings, and saved sessions stay under `$HOME/.bcodex` on that computer.
+
+Run the same installer command whenever the maintainer publishes an update.
+The installer authenticates with `gh`, selects the native release asset,
+verifies its SHA-256 checksum, checks the reported version, and replaces the
+installed binary atomically.
+
+To install a specific release:
+
+```sh
+gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | BCODEX_RELEASE=v0.1.0 sh
 ```
 
-## Tracing / verbose logging
+To use a different binary directory:
 
-Codex is written in Rust, so it honors the `RUST_LOG` environment variable to configure its logging behavior.
-
-The TUI records diagnostics in bounded local stores by default. Set `log_dir` explicitly to enable a plaintext TUI log for a run:
-
-```bash
-codex -c log_dir=./.codex-log
-tail -F ./.codex-log/codex-tui.log
+```sh
+gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | BCODEX_INSTALL_DIR="$HOME/bin" sh
 ```
 
-The non-interactive mode (`codex exec`) defaults to `RUST_LOG=error`, but messages are printed inline, so there is no need to monitor a separate file.
+## Privacy boundary
 
-See the Rust documentation on [`RUST_LOG`](https://docs.rs/env_logger/latest/env_logger/#enabling-logging) for more information on the configuration options.
+The private repository and its private release assets are the invite gate.
+Each friend authenticates as themselves, so the install command contains no
+shared token to leak. Give friends the read role; they do not need write
+access.
+
+Removing a collaborator blocks future source and release downloads. It cannot
+erase binaries or source that the collaborator already downloaded, so this is
+private distribution rather than digital-rights management. Friends should
+never share GitHub tokens, ChatGPT credentials, or `$HOME/.bcodex` contents.
+
+## Maintainer setup
+
+GitHub Actions must be enabled for this private repository. Private-repository
+runner minutes count against the repository owner's GitHub plan, and macOS
+jobs consume more billed minutes than Linux jobs.
+
+Invite a friend with read-only access by replacing `FRIEND` with their GitHub
+username:
+
+```sh
+gh api --method PUT repos/ummay0432/bettercodex/collaborators/FRIEND -f permission=pull
+```
+
+GitHub emails the invitation. The friend must accept it before the installer
+can read the repository or its releases.
+
+## Publishing a release
+
+The package version and release tag must match. From a clean, validated `main`
+branch that has already been pushed to `origin`:
+
+```sh
+git tag -a v0.1.0 -m "Release 0.1.0"
+git push origin v0.1.0
+```
+
+The `Release` workflow builds and smoke-tests all four platform binaries,
+creates `SHA256SUMS`, and publishes or repairs the matching private GitHub
+Release. Follow it with:
+
+```sh
+gh run watch --repo ummay0432/bettercodex
+```
+
+For a later release, update the `version` in `Cargo.toml`, refresh `Cargo.lock`,
+validate the change, merge and push it, then create the matching tag.
+
+## Building from source
+
+Contributors should use the checked-in development helper so the pinned V8
+artifacts are downloaded and verified correctly:
+
+```sh
+./scripts/dev.py cargo build --release
+```
+
+The resulting binary is under the target directory printed by the helper.

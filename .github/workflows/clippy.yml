@@ -23,7 +23,7 @@ jobs:
       - name: Check formatting
         run: ./scripts/dev.py cargo fmt --all -- --check
       - name: Test developer workflows
-        run: python3 -m unittest -v scripts.dev_tests scripts.evaluate_harness_tests
+        run: python3 -m unittest -v scripts.dev_tests scripts.evaluate_harness_tests scripts.install_tests
       - name: Run test suite
         run: ./scripts/dev.py cargo test --locked
       - name: Run Clippy

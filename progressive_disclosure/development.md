@@ -64,6 +64,12 @@ Changes to `scripts/dev.py` must also pass its dependency-free unit tests:
 python3 -m unittest -v scripts.dev_tests
 ```
 
+Changes to the private release installer or its asset contract must pass:
+
+```sh
+python3 -m unittest -v scripts.install_tests
+```
+
 Changes to the matched live-evaluation runner must pass its offline protocol
 tests as well:
 

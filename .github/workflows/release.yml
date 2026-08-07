@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]]
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          [[ "$version" == "$cargo_version" ]]
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Validate installer contract
+        run: |
+          sh -n scripts/install.sh
+          python3 -m unittest -v scripts.install_tests
+          ./scripts/check-no-emoji.sh
+
+  build:
+    needs: validate-tag
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      TARGET: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+      - name: Verify native target
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          [[ "$host" == "$TARGET" ]]
+      - name: Set macOS compatibility target
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "MACOSX_DEPLOYMENT_TARGET=12.0" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: ./scripts/dev.py cargo build --release --locked
+      - name: Sign and verify macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          codesign --force --sign - target/release/bcodex
+          codesign --verify --verbose target/release/bcodex
+      - name: Smoke test release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="bcodex ${GITHUB_REF_NAME#v}"
+          actual="$(target/release/bcodex --version)"
+          [[ "$actual" == "$expected" ]]
+      - name: Check Linux runtime libraries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          libraries="$(ldd target/release/bcodex)"
+          printf '%s\n' "$libraries"
+          ! grep -F "not found" <<<"$libraries"
+      - name: Package release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          install -m 0755 target/release/bcodex dist/package/bcodex
+          tar -C dist/package -czf "dist/bcodex-$TARGET.tar.gz" bcodex
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: bcodex-${{ matrix.target }}
+          path: dist/bcodex-${{ matrix.target }}.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - validate-tag
+      - build
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: bcodex-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            test -f "dist/bcodex-$target.tar.gz"
+          done
+          (cd dist && sha256sum bcodex-*.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish private GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="${RUNNER_TEMP}/release-notes.md"
+          printf 'Private bettercodex build %s.\n' "${TAG#v}" > "$notes"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" \
+              --latest \
+              --notes-file "$notes" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "bettercodex ${TAG#v}"
+          else
+            gh release create "$TAG" dist/* \
+              --latest \
+              --notes-file "$notes" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "bettercodex ${TAG#v}" \
+              --verify-tag
+          fi
