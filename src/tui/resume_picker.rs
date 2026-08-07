@@ -1,4 +1,9 @@
+// Ported from OpenAI Codex 85e0661c3b, chiefly
+// codex-rs/tui/src/resume_picker.rs. bettercodex keeps its local rollout listing
+// and resume lifecycle while retaining Codex's picker layout and row rendering.
+
 use super::markdown;
+use super::palette;
 use crate::rollout::SessionSummary;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -21,27 +26,25 @@ use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
-const MUTED: Color = Color::Indexed(245);
 const RULE: Color = Color::Indexed(8);
-const SELECTED: Color = Color::Yellow;
 const MAX_QUERY_CHARS: usize = 256;
 const HORIZONTAL_CHROME_INSET: u16 = 1;
 const LIST_HORIZONTAL_INSET: u16 = 2;
 const FOOTER_HEIGHT: u16 = 3;
-const SESSION_ROW_HEIGHT: u16 = 3;
 const METADATA_DATE_WIDTH: usize = 12;
 
 pub(super) struct ResumePicker {
     cwd: PathBuf,
-    current_session: Uuid,
     sessions: Option<Vec<SessionSummary>>,
     filtered: Vec<usize>,
     query: String,
     filter: SessionFilter,
     sort: SessionSort,
+    density: SessionListDensity,
     toolbar_focus: ToolbarControl,
     selected: usize,
     status: Option<PickerStatus>,
+    relative_time_reference_unix_ms: u64,
 }
 
 enum PickerStatus {
@@ -80,6 +83,28 @@ impl SessionSort {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionListDensity {
+    Dense,
+    Comfortable,
+}
+
+impl SessionListDensity {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Dense => Self::Comfortable,
+            Self::Comfortable => Self::Dense,
+        }
+    }
+
+    fn row_height(self) -> u16 {
+        match self {
+            Self::Dense => 1,
+            Self::Comfortable => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolbarControl {
     Filter,
     Sort,
@@ -102,23 +127,24 @@ pub(super) enum ResumePickerAction {
 }
 
 impl ResumePicker {
-    pub(super) fn loading(cwd: &Path, current_session: Uuid) -> Self {
+    pub(super) fn loading(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
-            current_session,
             sessions: None,
             filtered: Vec::new(),
             query: String::new(),
             filter: SessionFilter::Cwd,
             sort: SessionSort::Updated,
+            density: SessionListDensity::Dense,
             toolbar_focus: ToolbarControl::Filter,
             selected: 0,
             status: None,
+            relative_time_reference_unix_ms: unix_timestamp_millis(),
         }
     }
 
-    pub(super) fn resuming(cwd: &Path, current_session: Uuid, target: Uuid) -> Self {
-        let mut picker = Self::loading(cwd, current_session);
+    pub(super) fn resuming(cwd: &Path, target: Uuid) -> Self {
+        let mut picker = Self::loading(cwd);
         picker.sessions = Some(Vec::new());
         picker.status = Some(PickerStatus::Resuming(target));
         picker
@@ -155,6 +181,14 @@ impl ResumePicker {
             return ResumePickerAction::Close;
         }
         match key.code {
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.density = self.density.toggle();
+                self.clear_error();
+            }
+            KeyCode::Char('\u{000f}') if key.modifiers.is_empty() => {
+                self.density = self.density.toggle();
+                self.clear_error();
+            }
             KeyCode::Esc if !self.query.is_empty() => {
                 self.query.clear();
                 self.clear_error();
@@ -258,10 +292,14 @@ impl ResumePicker {
         frame.render_widget(Clear, area);
 
         let header = inset_row(area, area.y, HORIZONTAL_CHROME_INSET);
-        frame.render_widget(
-            Paragraph::new(Line::from("Resume a previous session").cyan().bold()),
-            header,
-        );
+        let title = if palette::default_background().is_some_and(palette::is_light) {
+            Span::from("Resume a previous session")
+                .fg(Color::Rgb(0, 100, 0))
+                .bold()
+        } else {
+            Span::from("Resume a previous session").cyan().bold()
+        };
+        frame.render_widget(Paragraph::new(Line::from(title)), header);
 
         let search_y = area.y.saturating_add(2);
         if search_y < area.bottom() {
@@ -412,13 +450,12 @@ impl ResumePicker {
             return;
         }
 
-        let visible = visible_session_count(area.height);
+        let visible = visible_session_count(area.height, self.density);
         let start = self
             .selected
             .saturating_add(1)
             .saturating_sub(visible)
             .min(self.filtered.len().saturating_sub(visible));
-        let now = unix_timestamp_millis();
         let mut y = area.y;
         for (position, index) in self.filtered.iter().enumerate().skip(start).take(visible) {
             if y >= area.bottom() {
@@ -426,29 +463,36 @@ impl ResumePicker {
             }
             let session = &sessions[*index];
             let selected = position == self.selected;
-            frame.render_widget(
-                Paragraph::new(session_title_line(
+            let zebra = position.is_multiple_of(2);
+            let lines = match self.density {
+                SessionListDensity::Dense => vec![dense_session_line(
                     session,
+                    self.relative_time_reference_unix_ms,
+                    self.sort,
                     selected,
-                    session.id == self.current_session,
+                    zebra,
                     area.width,
-                )),
-                Rect::new(area.x, y, area.width, 1),
-            );
-            y = y.saturating_add(1);
-            if y >= area.bottom() {
-                break;
-            }
-            frame.render_widget(
-                Paragraph::new(session_metadata_line(
+                )],
+                SessionListDensity::Comfortable => comfortable_session_lines(
                     session,
-                    now,
+                    self.relative_time_reference_unix_ms,
+                    self.sort,
                     self.filter == SessionFilter::All,
+                    selected,
+                    zebra,
                     area.width,
-                )),
-                Rect::new(area.x, y, area.width, 1),
-            );
-            y = y.saturating_add(2);
+                ),
+            };
+            for line in lines {
+                if y >= area.bottom() {
+                    break;
+                }
+                frame.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
+                y = y.saturating_add(1);
+            }
+            if self.density == SessionListDensity::Comfortable {
+                y = y.saturating_add(1);
+            }
         }
     }
 
@@ -456,7 +500,7 @@ impl ResumePicker {
         if area.is_empty() {
             return;
         }
-        let visible = visible_session_count(list_height);
+        let visible = visible_session_count(list_height, self.density);
         frame.render_widget(
             Paragraph::new(self.footer_separator(area.width, visible)),
             Rect::new(area.x, area.y, area.width, 1),
@@ -492,7 +536,16 @@ impl ResumePicker {
             Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         );
         if area.height > 2 {
-            let second = [("↑/↓", "browse"), ("home/end", "jump"), ("type", "search")];
+            let density_label = match self.density {
+                SessionListDensity::Dense => "comfortable view",
+                SessionListDensity::Comfortable => "dense view",
+            };
+            let second = [
+                ("ctrl+o", density_label),
+                ("↑/↓", "browse"),
+                ("home/end", "jump"),
+                ("type", "search"),
+            ];
             frame.render_widget(
                 Paragraph::new(footer_hints(&second, area.width)),
                 Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
@@ -587,77 +640,204 @@ fn inset_row(area: Rect, y: u16, inset: u16) -> Rect {
     )
 }
 
-fn visible_session_count(height: u16) -> usize {
-    usize::from(height.saturating_add(SESSION_ROW_HEIGHT - 1) / SESSION_ROW_HEIGHT).max(1)
+fn visible_session_count(height: u16, density: SessionListDensity) -> usize {
+    let row_height = density.row_height();
+    usize::from(height.saturating_add(row_height - 1) / row_height).max(1)
 }
 
-fn session_title_line(
+fn dense_session_line(
     session: &SessionSummary,
+    now_unix_ms: u64,
+    sort: SessionSort,
     selected: bool,
-    current: bool,
+    zebra: bool,
     width: u16,
 ) -> Line<'static> {
-    let marker = if selected { "❯ " } else { "  " };
-    let current = if current { "  current" } else { "" };
-    let title = session
-        .preview
-        .as_deref()
-        .map(markdown::sanitize)
-        .unwrap_or_else(|| "New session".to_string());
-    let title_width = usize::from(width)
-        .saturating_sub(UnicodeWidthStr::width(marker))
-        .saturating_sub(UnicodeWidthStr::width(current));
-    let title = truncate_text(&title, title_width);
-    let selected_style = Style::default().fg(SELECTED).bold();
-    let mut spans = vec![
-        Span::styled(
-            marker.to_string(),
-            if selected {
-                selected_style
-            } else {
-                Style::default()
-            },
-        ),
-        Span::styled(
-            title,
-            if selected {
-                selected_style
-            } else {
-                Style::default()
-            },
-        ),
-    ];
-    if !current.is_empty() {
-        spans.push(Span::from(current.to_string()).yellow().dim());
+    let date = format_relative_time(now_unix_ms, session_timestamp(session, sort));
+    dense_summary_line(DenseSummaryInput {
+        marker: selection_marker(selected),
+        date: &date,
+        title: &session_title(session),
+        selected,
+        zebra,
+        width,
+    })
+}
+
+struct DenseSummaryInput<'a> {
+    marker: Span<'static>,
+    date: &'a str,
+    title: &'a str,
+    selected: bool,
+    zebra: bool,
+    width: u16,
+}
+
+fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
+    let marker_width = input.marker.width();
+    let available = usize::from(input.width).saturating_sub(marker_width);
+    let title_width = available.saturating_sub(METADATA_DATE_WIDTH);
+    let title = dense_column_text(input.title, title_width);
+    let title = if input.selected {
+        Span::styled(title, selected_session_style())
+    } else {
+        Span::from(title)
+    };
+    let mut line = Line::from(vec![
+        input.marker,
+        Span::from(dense_column_text(input.date, METADATA_DATE_WIDTH)).dim(),
+        title,
+    ]);
+    let style = if input.selected {
+        Some(selected_row_style())
+    } else if input.zebra {
+        Some(zebra_row_style())
+    } else {
+        None
+    };
+    if let Some(style) = style {
+        line = apply_line_background(line, style, input.width);
     }
-    Line::from(spans)
+    line
+}
+
+fn dense_column_text(text: &str, width: usize) -> String {
+    let text = truncate_text(text, width.saturating_sub(1));
+    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    format!("{text}{}", " ".repeat(padding))
+}
+
+fn comfortable_session_lines(
+    session: &SessionSummary,
+    now_unix_ms: u64,
+    sort: SessionSort,
+    show_cwd: bool,
+    selected: bool,
+    zebra: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        session_title_line(session, selected, width),
+        session_metadata_line(session, now_unix_ms, sort, show_cwd, width),
+    ];
+    let style = if selected {
+        Some(selected_row_style())
+    } else if zebra {
+        Some(zebra_row_style())
+    } else {
+        None
+    };
+    if let Some(style) = style {
+        lines = lines
+            .into_iter()
+            .map(|line| apply_line_background(line, style, width))
+            .collect();
+    }
+    lines
+}
+
+fn session_title_line(session: &SessionSummary, selected: bool, width: u16) -> Line<'static> {
+    let marker = selection_marker(selected);
+    let title = session_title(session);
+    let title_width = usize::from(width).saturating_sub(marker.width());
+    let title = truncate_text(&title, title_width);
+    let title = if selected {
+        Span::styled(title, selected_session_style())
+    } else {
+        Span::from(title)
+    };
+    Line::from(vec![marker, title])
 }
 
 fn session_metadata_line(
     session: &SessionSummary,
     now_unix_ms: u64,
+    sort: SessionSort,
     show_cwd: bool,
     width: u16,
 ) -> Line<'static> {
-    let age = format_relative_time(now_unix_ms, session.updated_at_unix_ms);
+    let age = format_relative_time(now_unix_ms, session_timestamp(session, sort));
     let prefix = format!("  {age:<METADATA_DATE_WIDTH$}");
-    let suffix = format!("  {}", &session.id.to_string()[..8]);
     let metadata = if show_cwd {
         let cwd_prefix = "  ⌁ ";
         let cwd_width = usize::from(width)
             .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
-            .saturating_sub(UnicodeWidthStr::width(cwd_prefix))
-            .saturating_sub(UnicodeWidthStr::width(suffix.as_str()));
+            .saturating_sub(UnicodeWidthStr::width(cwd_prefix));
         format!(
-            "{prefix}{cwd_prefix}{}{suffix}",
+            "{prefix}{cwd_prefix}{}",
             truncate_text(&display_cwd(&session.cwd), cwd_width)
         )
     } else {
-        format!("{prefix}{suffix}")
+        prefix
     };
-    Line::from(truncate_text(&metadata, usize::from(width)))
-        .fg(MUTED)
-        .dim()
+    Line::from(truncate_text(&metadata, usize::from(width))).dim()
+}
+
+fn session_title(session: &SessionSummary) -> String {
+    session
+        .preview
+        .as_deref()
+        .map(markdown::sanitize)
+        .unwrap_or_else(|| "New session".to_string())
+}
+
+fn session_timestamp(session: &SessionSummary, sort: SessionSort) -> u64 {
+    match sort {
+        SessionSort::Updated => session.updated_at_unix_ms,
+        SessionSort::Created => session.created_at_unix_ms,
+    }
+}
+
+fn selection_marker(selected: bool) -> Span<'static> {
+    if selected {
+        Span::styled("❯ ", selected_session_style().bold())
+    } else {
+        Span::from("  ")
+    }
+}
+
+fn selected_session_style() -> Style {
+    if palette::default_background().is_some_and(palette::is_light) {
+        Style::default().fg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::Yellow)
+    }
+}
+
+fn selected_row_style() -> Style {
+    selected_session_style().patch(row_background_style(true))
+}
+
+fn zebra_row_style() -> Style {
+    row_background_style(false)
+}
+
+fn row_background_style(selected: bool) -> Style {
+    palette::default_background().map_or_else(Style::default, |background| {
+        Style::default().bg(row_background_color(background, selected))
+    })
+}
+
+fn row_background_color(background: (u8, u8, u8), selected: bool) -> Color {
+    let (overlay, alpha) = if palette::is_light(background) {
+        ((0, 0, 0), if selected { 0.12 } else { 0.04 })
+    } else {
+        ((255, 255, 255), if selected { 0.12 } else { 0.055 })
+    };
+    let (red, green, blue) = palette::blend(overlay, background, alpha);
+    Color::Rgb(red, green, blue)
+}
+
+fn apply_line_background(mut line: Line<'static>, style: Style, width: u16) -> Line<'static> {
+    let padding = usize::from(width).saturating_sub(line.width());
+    if padding > 0 {
+        line.spans.push(Span::styled(" ".repeat(padding), style));
+    }
+    line.style = line.style.patch(style);
+    for span in &mut line.spans {
+        span.style = span.style.patch(style);
+    }
+    line
 }
 
 fn footer_hints(hints: &[(&str, &str)], width: u16) -> Line<'static> {

@@ -557,8 +557,7 @@ impl Runtime {
     }
 
     fn open_resume_picker(&mut self) -> Result<()> {
-        let current_session = self.current_session_id()?;
-        self.view.show_resume_picker(current_session);
+        self.view.show_resume_picker();
         if self.session_scan.is_none() {
             self.session_scan = Some(tokio::task::spawn_blocking(Rollout::list_sessions));
         }
@@ -574,7 +573,7 @@ impl Runtime {
         if self.resume_task.is_some() {
             return Ok(());
         }
-        self.view.show_resume_progress(current_session, target);
+        self.view.show_resume_progress(target);
         let requested_cwd = self.cwd.clone();
         self.resume_task = Some(tokio::task::spawn_blocking(move || {
             let mut agent = Agent::resume(&requested_cwd, ResumeSelector::Id(target))?;

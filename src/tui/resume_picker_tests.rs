@@ -16,7 +16,7 @@ fn summary(id: Uuid, cwd: &str, updated_at_unix_ms: u64, preview: &str) -> Sessi
 fn search_and_cwd_filter_select_the_matching_session() {
     let current = Uuid::new_v4();
     let other = Uuid::new_v4();
-    let mut picker = ResumePicker::loading(Path::new("/work/current"), current);
+    let mut picker = ResumePicker::loading(Path::new("/work/current"));
     picker.set_sessions(vec![
         summary(current, "/work/current", 2_000, "Current work"),
         summary(other, "/work/other", 1_000, "Find the regression"),
@@ -56,7 +56,7 @@ fn tab_focuses_toolbar_and_arrows_change_the_selected_option() {
         updated_at_unix_ms: 3_000,
         preview: Some("Created most recently".to_string()),
     };
-    let mut picker = ResumePicker::loading(Path::new("/work/current"), current);
+    let mut picker = ResumePicker::loading(Path::new("/work/current"));
     picker.set_sessions(vec![newer_update, newer_creation]);
     assert_eq!(picker.filtered, vec![0, 1]);
 
@@ -72,7 +72,7 @@ fn tab_focuses_toolbar_and_arrows_change_the_selected_option() {
 #[test]
 fn escape_clears_search_before_closing_the_picker() {
     let current = Uuid::new_v4();
-    let mut picker = ResumePicker::loading(Path::new("/work/current"), current);
+    let mut picker = ResumePicker::loading(Path::new("/work/current"));
     picker.set_sessions(vec![summary(
         current,
         "/work/current",
@@ -97,9 +97,8 @@ fn escape_clears_search_before_closing_the_picker() {
 
 #[test]
 fn a_stale_listing_cannot_replace_direct_resume_progress() {
-    let current = Uuid::new_v4();
     let target = Uuid::new_v4();
-    let mut picker = ResumePicker::resuming(Path::new("/work/current"), current, target);
+    let mut picker = ResumePicker::resuming(Path::new("/work/current"), target);
 
     picker.set_sessions(vec![summary(
         target,
@@ -127,11 +126,11 @@ fn a_stale_listing_cannot_replace_direct_resume_progress() {
 }
 
 #[test]
-fn picker_matches_codex_full_screen_chrome_and_sanitizes_preview_text() {
+fn picker_matches_codex_dense_screen_and_sanitizes_preview_text() {
     let current = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
     let other = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
-    let now = unix_timestamp_millis();
-    let mut picker = ResumePicker::loading(Path::new("/work/current"), current);
+    let mut picker = ResumePicker::loading(Path::new("/work/current"));
+    let now = picker.relative_time_reference_unix_ms;
     picker.set_sessions(vec![
         summary(current, "/work/current", now, "Current work"),
         summary(
@@ -153,11 +152,21 @@ fn picker_matches_codex_full_screen_chrome_and_sanitizes_preview_text() {
     assert!(rendered.contains("Type to search"), "{rendered}");
     assert!(rendered.contains("Filter: [Cwd] All"), "{rendered}");
     assert!(rendered.contains("Sort: [Updated] Created"), "{rendered}");
-    assert!(rendered.contains("❯ Current work  current"), "{rendered}");
-    assert!(rendered.contains("Unsafe title"), "{rendered}");
+    let lines = rendered.lines().collect::<Vec<_>>();
+    assert!(
+        lines[4].contains("❯ now         Current work"),
+        "{rendered}"
+    );
+    assert!(
+        lines[5].contains("  1s ago      Unsafe title"),
+        "{rendered}"
+    );
     assert!(!rendered.contains('\x1b'), "{rendered:?}");
-    assert!(rendered.contains("11111111"), "{rendered}");
+    assert!(!rendered.contains("11111111"), "{rendered}");
+    assert!(!rendered.contains("22222222"), "{rendered}");
+    assert!(!rendered.contains("current"), "{rendered}");
     assert!(rendered.contains("enter resume"), "{rendered}");
+    assert!(rendered.contains("ctrl+o comfortable view"), "{rendered}");
     assert!(rendered.contains("1 / 2 · 100%"), "{rendered}");
     assert!(
         !rendered.contains('┌') && !rendered.contains('┐'),
@@ -166,17 +175,21 @@ fn picker_matches_codex_full_screen_chrome_and_sanitizes_preview_text() {
 }
 
 #[test]
-fn all_filter_shows_abbreviated_cwd_and_keeps_short_id_visible() {
+fn ctrl_o_toggles_the_codex_comfortable_view_with_responsive_cwd() {
     let current = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
     let cwd = format!("/{}/{}", "directory".repeat(8), "nested".repeat(8));
-    let mut picker = ResumePicker::loading(Path::new(&cwd), current);
+    let mut picker = ResumePicker::loading(Path::new(&cwd));
+    let now = picker.relative_time_reference_unix_ms;
     picker.set_sessions(vec![summary(
         current,
         &cwd,
-        unix_timestamp_millis(),
+        now,
         &"conversation ".repeat(30),
     )]);
     picker.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    picker.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+    assert_eq!(picker.density, SessionListDensity::Comfortable);
 
     let backend = TestBackend::new(64, 16);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -185,10 +198,55 @@ fn all_filter_shows_abbreviated_cwd_and_keeps_short_id_visible() {
         .unwrap();
     let rendered = render_buffer(terminal.backend().buffer());
 
-    assert!(rendered.contains("current"), "{rendered}");
     assert!(rendered.contains('⌁'), "{rendered}");
-    assert!(rendered.contains("11111111"), "{rendered}");
+    assert!(!rendered.contains("11111111"), "{rendered}");
     assert!(rendered.contains('…'), "{rendered}");
+    assert!(rendered.contains("ctrl+o dense view"), "{rendered}");
+
+    picker.handle_key(KeyEvent::new(KeyCode::Char('\u{000f}'), KeyModifiers::NONE));
+    assert_eq!(picker.density, SessionListDensity::Dense);
+}
+
+#[test]
+fn dense_rows_fill_their_width_and_use_codex_theme_blends() {
+    let selected = dense_summary_line(DenseSummaryInput {
+        marker: selection_marker(true),
+        date: "15m ago",
+        title: "Selected dense row",
+        selected: true,
+        zebra: false,
+        width: 80,
+    });
+    let zebra = dense_summary_line(DenseSummaryInput {
+        marker: selection_marker(false),
+        date: "15m ago",
+        title: "Zebra dense row",
+        selected: false,
+        zebra: true,
+        width: 80,
+    });
+
+    assert_eq!(selected.width(), 80);
+    assert_eq!(selected.style.fg, selected_session_style().fg);
+    assert_eq!(selected.spans[0].content, "❯ ");
+    assert_eq!(zebra.width(), 80);
+    assert_eq!(zebra.style.bg, zebra_row_style().bg);
+    assert_eq!(
+        row_background_color((30, 30, 30), false),
+        Color::Rgb(42, 42, 42)
+    );
+    assert_eq!(
+        row_background_color((30, 30, 30), true),
+        Color::Rgb(57, 57, 57)
+    );
+    assert_eq!(
+        row_background_color((240, 240, 240), false),
+        Color::Rgb(230, 230, 230)
+    );
+    assert_eq!(
+        row_background_color((240, 240, 240), true),
+        Color::Rgb(211, 211, 211)
+    );
 }
 
 #[test]
@@ -204,7 +262,7 @@ fn relative_time_uses_codex_style_units() {
 #[test]
 fn picker_rendering_is_bounded_for_tiny_terminals() {
     let current = Uuid::new_v4();
-    let mut picker = ResumePicker::loading(Path::new("/tiny"), current);
+    let mut picker = ResumePicker::loading(Path::new("/tiny"));
     picker.set_sessions(vec![summary(current, "/tiny", 0, "A session")]);
 
     for (width, height) in [(1, 1), (4, 2), (12, 4)] {
@@ -220,8 +278,7 @@ fn picker_rendering_is_bounded_for_tiny_terminals() {
 
 #[test]
 fn pasted_search_queries_are_bounded() {
-    let current = Uuid::new_v4();
-    let mut picker = ResumePicker::loading(Path::new("/work/current"), current);
+    let mut picker = ResumePicker::loading(Path::new("/work/current"));
     picker.set_sessions(Vec::new());
 
     picker.handle_paste(&"x".repeat(MAX_QUERY_CHARS * 2));
