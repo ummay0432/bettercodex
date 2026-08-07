@@ -13,7 +13,21 @@ fn embedded_system_skill_is_materialized_privately_and_idempotently() {
 
     let installed_root = install(&home).unwrap();
     assert_eq!(installed_root, root(&home));
-    let expected: [(&str, &[u8]); 2] = [
+    let expected: [(&str, &[u8]); 5] = [
+        (
+            "manifest/SKILL.md",
+            include_bytes!("../bundled-skills/manifest/SKILL.md"),
+        ),
+        (
+            "manifest/agents/openai.yaml",
+            include_bytes!("../bundled-skills/manifest/agents/openai.yaml"),
+        ),
+        (
+            "manifest/references/exemplar-shopify-graphql-manifest.md",
+            include_bytes!(
+                "../bundled-skills/manifest/references/exemplar-shopify-graphql-manifest.md"
+            ),
+        ),
         (
             "papercut/SKILL.md",
             include_bytes!("../bundled-skills/papercut/SKILL.md"),
