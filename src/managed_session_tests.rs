@@ -215,6 +215,31 @@ fn supervisor_passes_the_existing_pty_master_to_the_tmux_relay() {
 }
 
 #[test]
+fn tmux_exit_does_not_restore_the_old_inline_terminal_surface() {
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+    terminal
+        .write_all(
+            b"chat transcript\r\nagent response\x1b[20;1H> /tmux\x1b[22;3H/tmux  move this live session into tmux",
+        )
+        .unwrap();
+    assert!(terminal.screen().contents().contains("chat transcript"));
+    assert!(
+        terminal
+            .screen()
+            .contents()
+            .contains("move this live session")
+    );
+
+    clear_invoking_terminal(&mut terminal).unwrap();
+    terminal
+        .write_all(b"\x1b[?1049htmux session\x1b[?1049l[exited]\r\n")
+        .unwrap();
+
+    assert_eq!(terminal.screen().contents(), "[exited]");
+    assert_eq!(terminal.screen().cursor_position(), (1, 0));
+}
+
+#[test]
 fn relay_command_is_private_and_strictly_parsed() {
     assert!(run_relay_command(&[]).is_none());
     assert!(run_relay_command(&["--help".to_string()]).is_none());

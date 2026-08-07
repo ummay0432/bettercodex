@@ -55,6 +55,7 @@ const MAX_CONTROL_MESSAGE_BYTES: usize = 256;
 const RELAY_START_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const RELAY_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CLEAR_VISIBLE_TERMINAL: &[u8] = b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[H";
 
 static HOT_TMUX_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -491,11 +492,21 @@ fn drain_terminal_output(master_fd: RawFd, buffer: &mut [u8]) -> Result<()> {
 }
 
 fn attach_tmux(session_id: &str) -> ! {
+    // tmux saves the normal screen before entering its alternate screen, then restores that saved
+    // screen when the client exits. The worker's inline UI is still painted there after the PTY
+    // handoff, so erase it before tmux takes its snapshot or the old chat resurfaces under the
+    // shell prompt at the end of the session.
+    let _ = clear_invoking_terminal(io::stdout().lock());
     let mut command = Command::new("tmux");
     command.args(["attach-session", "-t", session_id]);
     let error = command.exec();
     eprintln!("bcodex: failed to attach tmux session {session_id}: {error}");
     std::process::exit(1)
+}
+
+fn clear_invoking_terminal(mut output: impl Write) -> io::Result<()> {
+    output.write_all(CLEAR_VISIBLE_TERMINAL)?;
+    output.flush()
 }
 
 fn exit_with_status(status: std::process::ExitStatus) -> ! {
