@@ -554,12 +554,8 @@ fn request_uses_instructions_and_one_stable_tool_prefix() {
 
     assert_eq!(first["model"], MODEL);
     assert_eq!(first["instructions"], harness_instructions());
-    assert!(
-        harness_instructions().starts_with(
-            "<system_instructions>\nYou are Sol, the coding agent inside bettercodex."
-        )
-    );
-    assert!(harness_instructions().contains("# Engineering ownership"));
+    assert!(harness_instructions().starts_with("<system_instructions>\n# Working with the user"));
+    assert!(harness_instructions().contains("# Rules for getting work done"));
     assert!(harness_instructions().ends_with("</system_instructions>"));
     assert!(
         first.get("max_output_tokens").is_none(),
