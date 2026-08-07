@@ -1,3 +1,5 @@
+use ratatui::style::Color;
+use ratatui::style::Style;
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +40,15 @@ pub(super) fn default_background() -> Option<(u8, u8, u8)> {
 
 pub(super) fn is_light((red, green, blue): (u8, u8, u8)) -> bool {
     0.299 * red as f32 + 0.587 * green as f32 + 0.114 * blue as f32 > 128.0
+}
+
+/// Codex's shared style for the active row in command menus.
+pub(super) fn accent_style() -> Style {
+    if default_background().is_some_and(is_light) {
+        Style::default().fg(Color::Rgb(0, 95, 135)).bold()
+    } else {
+        Style::default().fg(Color::Cyan).bold()
+    }
 }
 
 pub(super) fn blend(

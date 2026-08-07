@@ -1,21 +1,20 @@
+use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
+use super::bottom_pane::selection_popup_common::render_menu_surface;
 use crate::tools::CatalogueMetrics;
 use crate::tools::CatalogueRoute;
 use crate::tools::CatalogueTool;
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use ratatui::widgets::Block;
-use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 
-const RULE: Color = Color::Indexed(8);
-const PREFERRED_WIDTH: u16 = 32;
+const HEADER_HEIGHT: u16 = 2;
+const FOOTER_HEIGHT: u16 = 1;
 
 pub(super) struct ToolCatalogueView {
     metrics: CatalogueMetrics,
@@ -35,41 +34,62 @@ impl ToolCatalogueView {
     }
 
     pub(super) fn preferred_height(&self) -> u16 {
-        catalogue_content_height(crate::tools::display_tools()).saturating_add(2)
+        catalogue_content_height(crate::tools::display_tools())
+            .saturating_add(HEADER_HEIGHT)
+            .saturating_add(menu_surface_padding_height())
+            .saturating_add(FOOTER_HEIGHT)
     }
 
     pub(super) fn handle_key(&self, code: KeyCode) -> CatalogueAction {
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => CatalogueAction::Close,
+            KeyCode::Esc => CatalogueAction::Close,
             _ => CatalogueAction::StayOpen,
         }
     }
 
-    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, surface_style: Style) {
         if area.is_empty() {
             return;
         }
-        let panel = Rect::new(
+        frame.render_widget(Clear, area);
+        let footer_height = FOOTER_HEIGHT.min(area.height);
+        let content_area = Rect::new(
             area.x,
             area.y,
-            PREFERRED_WIDTH.min(area.width),
-            self.preferred_height().min(area.height),
+            area.width,
+            area.height.saturating_sub(footer_height),
         );
-        frame.render_widget(Clear, area);
-        let block = Block::default()
-            .title(" Tools ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(RULE));
-        let inner = block.inner(panel);
-        frame.render_widget(block, panel);
+        let footer_area = Rect::new(area.x, content_area.bottom(), area.width, footer_height);
+        let inner = render_menu_surface(content_area, frame.buffer_mut(), surface_style);
         if inner.is_empty() {
             return;
         }
 
+        let header_height = HEADER_HEIGHT.min(inner.height);
+        let header_area = Rect::new(inner.x, inner.y, inner.width, header_height);
+        frame.render_widget(
+            Paragraph::new(vec![Line::from("Tools").bold(), Line::default()]),
+            header_area,
+        );
+        let body_area = Rect::new(
+            inner.x,
+            header_area.bottom(),
+            inner.width,
+            inner.height.saturating_sub(header_height),
+        );
         frame.render_widget(
             Paragraph::new(catalogue_lines(crate::tools::display_tools(), self.metrics)),
-            inner,
+            body_area,
         );
+        if !footer_area.is_empty() {
+            let hint_area = Rect::new(
+                footer_area.x.saturating_add(2),
+                footer_area.y,
+                footer_area.width.saturating_sub(2),
+                footer_area.height,
+            );
+            frame.render_widget(Paragraph::new("Press esc to go back").dim(), hint_area);
+        }
     }
 }
 

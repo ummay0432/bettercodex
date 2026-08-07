@@ -94,19 +94,21 @@ fn renders_capacity_grid_categories_and_compaction_headroom() {
         ],
         [1, 2, 1, 3, 4, 3, 6, 75, 5]
     );
-    assert_eq!(context.preferred_height(92), 16);
-    assert_eq!(context.preferred_height(40), 15);
+    assert_eq!(context.preferred_height(92), 17);
+    assert_eq!(context.preferred_height(40), 16);
     let backend = TestBackend::new(92, context.preferred_height(92));
     let mut terminal = Terminal::new(backend).unwrap();
+    let surface = Style::default().bg(Color::Rgb(55, 55, 55));
     terminal
-        .draw(|frame| context.render(frame, frame.area()))
+        .draw(|frame| context.render(frame, frame.area(), surface))
         .unwrap();
     let buffer = terminal.backend().buffer();
     let rendered = render_buffer(buffer);
 
-    assert_eq!(buffer[(0, 0)].symbol(), "┌");
-    assert_eq!(buffer[(PREFERRED_WIDTH - 1, 0)].symbol(), "┐");
-    assert_eq!(buffer[(PREFERRED_WIDTH, 0)].symbol(), " ");
+    assert_eq!(buffer[(0, 0)].symbol(), " ");
+    assert_eq!(buffer[(0, 0)].bg, Color::Rgb(55, 55, 55));
+    assert_eq!(buffer[(91, 0)].bg, Color::Rgb(55, 55, 55));
+    assert_eq!(buffer[(0, 16)].bg, Color::Reset);
     assert!(rendered.contains("Context"), "{rendered}");
     assert!(rendered.contains("51.7K / 258.4K tokens"), "{rendered}");
     assert!(rendered.contains("20.0% used"), "{rendered}");
@@ -133,7 +135,7 @@ fn omits_accounting_notes() {
         let backend = TestBackend::new(92, context.preferred_height(92));
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| context.render(frame, frame.area()))
+            .draw(|frame| context.render(frame, frame.area(), Style::default()))
             .unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
 
@@ -168,12 +170,12 @@ fn height_expands_to_fit_a_legend_larger_than_the_grid() {
     ]);
     let context = ContextWindowView::new(snapshot);
     assert_eq!(context.segments().len(), 12);
-    assert_eq!(context.preferred_height(92), 18);
+    assert_eq!(context.preferred_height(92), 19);
 
     let backend = TestBackend::new(92, context.preferred_height(92));
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| context.render(frame, frame.area()))
+        .draw(|frame| context.render(frame, frame.area(), Style::default()))
         .unwrap();
     let rendered = render_buffer(terminal.backend().buffer());
     assert!(rendered.contains("Compacted history"), "{rendered}");
@@ -188,7 +190,7 @@ fn rendering_is_bounded_for_tiny_terminals() {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| context.render(frame, frame.area()))
+            .draw(|frame| context.render(frame, frame.area(), Style::default()))
             .unwrap();
     }
 }

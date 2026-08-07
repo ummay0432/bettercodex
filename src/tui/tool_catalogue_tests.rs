@@ -1,39 +1,44 @@
 use super::*;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::style::Color;
 
 #[test]
-fn renders_a_compact_catalogue_attached_to_the_left_edge() {
+fn renders_on_the_shared_codex_command_surface() {
     let catalogue = ToolCatalogueView::new();
     let backend = TestBackend::new(88, catalogue.preferred_height());
     let mut terminal = Terminal::new(backend).unwrap();
+    let surface = Style::default().bg(Color::Rgb(55, 55, 55));
     terminal
-        .draw(|frame| catalogue.render(frame, frame.area()))
+        .draw(|frame| catalogue.render(frame, frame.area(), surface))
         .unwrap();
     let buffer = terminal.backend().buffer();
 
-    assert_eq!(buffer[(0, 0)].symbol(), "┌");
-    assert_eq!(buffer[(PREFERRED_WIDTH - 1, 0)].symbol(), "┐");
-    assert_eq!(buffer[(PREFERRED_WIDTH, 0)].symbol(), " ");
+    assert_eq!(buffer[(0, 0)].bg, Color::Rgb(55, 55, 55));
+    assert_eq!(buffer[(87, 0)].bg, Color::Rgb(55, 55, 55));
+    assert_eq!(buffer[(0, 18)].bg, Color::Reset);
     assert_eq!(
         render_buffer(buffer),
         [
-            "┌ Tools ───────────────────────┐",
-            "│Request tools                 │",
-            "│  ├─ ● exec                   │",
-            "│  └─ ● wait                   │",
-            "│                              │",
-            "│Inside exec                   │",
-            "│  ├─ ● apply_patch            │",
-            "│  ├─ ● exec_command           │",
-            "│  ├─ ● log_papercut           │",
-            "│  ├─ ● update_plan            │",
-            "│  ├─ ● view_image             │",
-            "│  ├─ ● write_stdin            │",
-            "│  └─ ● web__run               │",
-            "│                              │",
-            "│9 tools · ~2.8K prompt tokens │",
-            "└──────────────────────────────┘",
+            "",
+            "  Tools",
+            "",
+            "  Request tools",
+            "    ├─ ● exec",
+            "    └─ ● wait",
+            "",
+            "  Inside exec",
+            "    ├─ ● apply_patch",
+            "    ├─ ● exec_command",
+            "    ├─ ● log_papercut",
+            "    ├─ ● update_plan",
+            "    ├─ ● view_image",
+            "    ├─ ● write_stdin",
+            "    └─ ● web__run",
+            "",
+            "  9 tools · ~2.8K prompt tokens",
+            "",
+            "  Press esc to go back",
         ]
         .join("\n")
     );
@@ -46,19 +51,22 @@ fn preferred_height_is_derived_from_the_active_catalogue() {
         catalogue.preferred_height(),
         u16::try_from(catalogue_lines(crate::tools::display_tools(), catalogue.metrics).len())
             .unwrap()
-            .saturating_add(2)
+            .saturating_add(5)
     );
 }
 
 #[test]
-fn only_escape_and_q_close_the_catalogue() {
+fn only_escape_closes_the_catalogue() {
     let catalogue = ToolCatalogueView::new();
-    for key in [KeyCode::Down, KeyCode::Enter, KeyCode::Char('x')] {
+    for key in [
+        KeyCode::Down,
+        KeyCode::Enter,
+        KeyCode::Char('q'),
+        KeyCode::Char('x'),
+    ] {
         assert_eq!(catalogue.handle_key(key), CatalogueAction::StayOpen);
     }
-    for key in [KeyCode::Esc, KeyCode::Char('q')] {
-        assert_eq!(catalogue.handle_key(key), CatalogueAction::Close);
-    }
+    assert_eq!(catalogue.handle_key(KeyCode::Esc), CatalogueAction::Close);
 }
 
 #[test]
@@ -68,7 +76,7 @@ fn rendering_is_bounded_for_tiny_terminals() {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| catalogue.render(frame, frame.area()))
+            .draw(|frame| catalogue.render(frame, frame.area(), Style::default()))
             .unwrap();
     }
 }
