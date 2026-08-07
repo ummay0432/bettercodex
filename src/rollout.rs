@@ -595,7 +595,7 @@ fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>
         let Some(metadata) = read_metadata(&path)? else {
             continue;
         };
-        if metadata.cwd != cwd {
+        if metadata.cwd != cwd || compatible_session_id(&path, &metadata).is_none() {
             continue;
         }
         let modified_at = entry
@@ -666,20 +666,9 @@ fn read_session_summary(
     let Ok(RolloutRecord::Session { metadata }) = serde_json::from_slice(&record) else {
         return Ok(None);
     };
-    if metadata.version != ROLLOUT_VERSION
-        || metadata.model != MODEL
-        || metadata.reasoning_effort != "max"
-    {
-        return Ok(None);
-    }
-    let Ok(id) = Uuid::parse_str(&metadata.identity.session_id) else {
+    let Some(id) = compatible_session_id(path, &metadata) else {
         return Ok(None);
     };
-    if path.file_stem().and_then(|stem| stem.to_str())
-        != Some(metadata.identity.session_id.as_str())
-    {
-        return Ok(None);
-    }
 
     let mut preview = None;
     while read_next_history_append_record(&mut reader, &mut record)
@@ -705,6 +694,18 @@ fn read_session_summary(
         updated_at_unix_ms,
         preview,
     }))
+}
+
+fn compatible_session_id(path: &Path, metadata: &SessionMetadata) -> Option<Uuid> {
+    if metadata.version != ROLLOUT_VERSION
+        || metadata.model != MODEL
+        || metadata.reasoning_effort != "max"
+        || path.file_stem().and_then(|stem| stem.to_str())
+            != Some(metadata.identity.session_id.as_str())
+    {
+        return None;
+    }
+    Uuid::parse_str(&metadata.identity.session_id).ok()
 }
 
 /// Reads the next history-append record without materializing records that cannot match.

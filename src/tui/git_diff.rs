@@ -1,45 +1,78 @@
 //! Safe local Git diff collection for `/diff`, including untracked files.
 
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::ExitStatus;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command as TokioCommand;
+use tokio::time::Instant;
+use tokio::time::timeout_at;
+
+#[cfg(test)]
 use std::process::Command;
-use std::process::Output;
 
 const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GIT_METADATA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
+const GIT_DIFF_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) async fn get_git_diff(cwd: PathBuf) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || get_git_diff_blocking(&cwd))
-        .await
-        .map_err(|error| format!("Git diff task failed: {error}"))?
+    get_git_diff_with_program(cwd, OsString::from("git")).await
 }
 
-fn get_git_diff_blocking(cwd: &Path) -> Result<String, String> {
-    let inside = run_git(cwd, &[], &["rev-parse", "--is-inside-work-tree"])?;
+async fn get_git_diff_with_program(cwd: PathBuf, program: OsString) -> Result<String, String> {
+    let runner = GitRunner::new(&cwd, &program);
+    let inside = runner
+        .run(
+            &[],
+            &["rev-parse", "--is-inside-work-tree"],
+            MAX_GIT_METADATA_BYTES,
+        )
+        .await?;
+    if inside.stdout_truncated {
+        return Err("git rev-parse produced too much output".to_string());
+    }
     if !inside.status.success() {
         return Ok("`/diff` — _not inside a Git repository_".to_string());
     }
 
-    let filter_overrides = filter_overrides(cwd)?;
-    let tracked = run_git(
-        cwd,
-        &filter_overrides,
-        &[
-            "diff",
-            "--no-textconv",
-            "--no-ext-diff",
-            "--submodule=short",
-            "--ignore-submodules=dirty",
-            "--color=always",
-        ],
-    )?;
-    let mut diff = diff_output(tracked, "git diff")?;
+    let filter_overrides = filter_overrides(&runner).await?;
+    let tracked = runner
+        .run(
+            &filter_overrides,
+            &[
+                "diff",
+                "--no-textconv",
+                "--no-ext-diff",
+                "--submodule=short",
+                "--ignore-submodules=dirty",
+                "--color=always",
+            ],
+            MAX_DIFF_BYTES,
+        )
+        .await?;
+    let (mut diff, tracked_truncated) = diff_output(tracked, "git diff")?;
+    if tracked_truncated {
+        truncate_diff(&mut diff);
+        return Ok(diff);
+    }
 
-    let untracked = run_git(
-        cwd,
-        &[],
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )?;
+    let untracked = runner
+        .run(
+            &[],
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            MAX_GIT_METADATA_BYTES,
+        )
+        .await?;
+    if untracked.stdout_truncated {
+        truncate_diff(&mut diff);
+        return Ok(diff);
+    }
     if !untracked.status.success() {
         return Err(command_failure("git ls-files", &untracked));
     }
@@ -67,9 +100,17 @@ fn get_git_diff_blocking(cwd: &Path) -> Result<String, String> {
             OsString::from("/dev/null"),
             path,
         ];
-        let output = run_git_os(cwd, &filter_overrides, &arguments)?;
-        diff.push_str(&diff_output(output, "git diff --no-index")?);
-        if diff.len() > MAX_DIFF_BYTES {
+        let remaining = MAX_DIFF_BYTES.saturating_sub(diff.len());
+        if remaining == 0 {
+            truncate_diff(&mut diff);
+            break;
+        }
+        let output = runner
+            .run_os(&filter_overrides, &arguments, remaining)
+            .await?;
+        let (untracked_diff, truncated) = diff_output(output, "git diff --no-index")?;
+        diff.push_str(&untracked_diff);
+        if truncated || diff.len() > MAX_DIFF_BYTES {
             truncate_diff(&mut diff);
             break;
         }
@@ -85,18 +126,23 @@ fn get_git_diff_blocking(cwd: &Path) -> Result<String, String> {
     }
 }
 
-fn filter_overrides(cwd: &Path) -> Result<Vec<(String, String)>, String> {
-    let output = run_git(
-        cwd,
-        &[],
-        &[
-            "config",
-            "--null",
-            "--name-only",
-            "--get-regexp",
-            "^filter\\..*\\.(clean|process)$",
-        ],
-    )?;
+async fn filter_overrides(runner: &GitRunner<'_>) -> Result<Vec<(String, String)>, String> {
+    let output = runner
+        .run(
+            &[],
+            &[
+                "config",
+                "--null",
+                "--name-only",
+                "--get-regexp",
+                "^filter\\..*\\.(clean|process)$",
+            ],
+            MAX_GIT_METADATA_BYTES,
+        )
+        .await?;
+    if output.stdout_truncated {
+        return Err("git config produced too much output".to_string());
+    }
     if !output.status.success() && output.status.code() != Some(1) {
         return Err(command_failure("git config", &output));
     }
@@ -122,42 +168,150 @@ fn filter_overrides(cwd: &Path) -> Result<Vec<(String, String)>, String> {
         .collect())
 }
 
-fn run_git(cwd: &Path, overrides: &[(String, String)], args: &[&str]) -> Result<Output, String> {
-    let args = args.iter().map(OsString::from).collect::<Vec<_>>();
-    run_git_os(cwd, overrides, &args)
+struct GitRunner<'a> {
+    cwd: &'a Path,
+    program: &'a OsStr,
+    deadline: Instant,
 }
 
-fn run_git_os(
-    cwd: &Path,
-    overrides: &[(String, String)],
-    args: &[OsString],
-) -> Result<Output, String> {
-    let mut command = Command::new("git");
-    command.current_dir(cwd).args([
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-    ]);
-    for (key, value) in overrides {
-        command.arg("-c").arg(format!("{key}={value}"));
+impl<'a> GitRunner<'a> {
+    fn new(cwd: &'a Path, program: &'a OsStr) -> Self {
+        Self {
+            cwd,
+            program,
+            deadline: Instant::now() + GIT_DIFF_TIMEOUT,
+        }
     }
-    command
-        .args(args)
-        .output()
-        .map_err(|error| format!("failed to run git: {error}"))
+
+    async fn run(
+        &self,
+        overrides: &[(String, String)],
+        args: &[&str],
+        stdout_limit: usize,
+    ) -> Result<GitOutput, String> {
+        let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        self.run_os(overrides, &args, stdout_limit).await
+    }
+
+    async fn run_os(
+        &self,
+        overrides: &[(String, String)],
+        args: &[OsString],
+        stdout_limit: usize,
+    ) -> Result<GitOutput, String> {
+        if Instant::now() >= self.deadline {
+            return Err("Git diff exceeded its 30-second time limit".to_string());
+        }
+
+        let mut command = TokioCommand::new(self.program);
+        command
+            .current_dir(self.cwd)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for (key, value) in overrides {
+            command.arg("-c").arg(format!("{key}={value}"));
+        }
+        let mut child = command
+            .args(args)
+            .spawn()
+            .map_err(|error| format!("failed to run git: {error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to capture git stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to capture git stderr".to_string())?;
+        let output = timeout_at(self.deadline, async {
+            tokio::join!(
+                child.wait(),
+                capture_stream(stdout, stdout_limit),
+                capture_stream(stderr, MAX_GIT_STDERR_BYTES),
+            )
+        })
+        .await;
+        let (status, stdout, stderr) = match output {
+            Ok(output) => output,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err("Git diff exceeded its 30-second time limit".to_string());
+            }
+        };
+        let status = status.map_err(|error| format!("failed to wait for git: {error}"))?;
+        let stdout = stdout.map_err(|error| format!("failed to read git stdout: {error}"))?;
+        let stderr = stderr.map_err(|error| format!("failed to read git stderr: {error}"))?;
+        Ok(GitOutput {
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
+        })
+    }
 }
 
-fn diff_output(output: Output, command: &str) -> Result<String, String> {
+struct GitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn capture_stream(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<CapturedStream> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut truncated = false;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let retained = read.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..retained]);
+        if retained < read {
+            truncated = true;
+            break;
+        }
+    }
+    Ok(CapturedStream { bytes, truncated })
+}
+
+fn diff_output(output: GitOutput, command: &str) -> Result<(String, bool), String> {
+    if output.stdout_truncated {
+        return Ok((String::from_utf8_lossy(&output.stdout).into_owned(), true));
+    }
     if output.status.success() || output.status.code() == Some(1) {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok((String::from_utf8_lossy(&output.stdout).into_owned(), false))
     } else {
         Err(command_failure(command, &output))
     }
 }
 
-fn command_failure(command: &str, output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+fn command_failure(command: &str, output: &GitOutput) -> String {
+    let mut stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.stderr_truncated {
+        stderr.push_str(" … stderr truncated …");
+    }
     if stderr.is_empty() {
         format!("{command} exited with {}", output.status)
     } else {
@@ -171,15 +325,19 @@ fn truncate_diff(diff: &mut String) {
         boundary = boundary.saturating_sub(1);
     }
     diff.truncate(boundary);
-    if !diff.ends_with('\n') {
+    if !diff.is_empty() && !diff.ends_with('\n') {
         diff.push('\n');
     }
-    diff.push_str("\n… diff truncated at 8 MiB …\n");
+    if !diff.is_empty() {
+        diff.push('\n');
+    }
+    diff.push_str("… diff truncated at 8 MiB …\n");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use uuid::Uuid;
 
     fn temporary_directory() -> PathBuf {
@@ -231,5 +389,81 @@ mod tests {
             "`/diff` — _not inside a Git repository_"
         );
         std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[tokio::test]
+    async fn diff_stops_capturing_at_the_display_limit() {
+        let cwd = temporary_directory();
+        assert!(
+            Command::new("git")
+                .current_dir(&cwd)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(
+            cwd.join("large.txt"),
+            "x\n".repeat(MAX_DIFF_BYTES / 2 + 4_096),
+        )
+        .unwrap();
+
+        let diff = tokio::time::timeout(Duration::from_secs(20), get_git_diff(cwd.clone()))
+            .await
+            .expect("bounded Git diff did not finish")
+            .unwrap();
+
+        assert!(diff.contains("diff truncated at 8 MiB"));
+        assert!(diff.len() < MAX_DIFF_BYTES + 128);
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_diff_stops_the_git_process() {
+        let cwd = temporary_directory();
+        let fake_git = cwd.join("fake-git");
+        let pid_file = cwd.join("fake-git.pid");
+        std::fs::write(
+            &fake_git,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nwhile :; do :; done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_git, permissions).unwrap();
+        let task = tokio::spawn(get_git_diff_with_program(
+            cwd.clone(),
+            fake_git.into_os_string(),
+        ));
+
+        let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = pid.trim().parse::<i32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake Git process did not start");
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while process_exists(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled Git process remained alive");
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal zero does not deliver a signal; it only probes a numeric process ID.
+        (unsafe { libc::kill(pid, 0) == 0 })
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 }

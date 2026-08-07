@@ -250,7 +250,7 @@ impl PromptImage {
     }
 }
 
-fn image_size_error() -> anyhow::Error {
+pub(crate) fn image_size_error() -> anyhow::Error {
     anyhow!(
         "attached images exceed bettercodex's {} MiB input limit",
         MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)

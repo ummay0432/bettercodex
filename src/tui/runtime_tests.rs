@@ -1,5 +1,6 @@
 use super::MAX_READY_AGENT_EVENTS;
 use super::ReceiverState;
+use super::abort_join_task;
 use super::drain_ready_agent_events;
 use super::prompt_history_for_session;
 use super::terminal;
@@ -12,8 +13,10 @@ use codex_protocol::models::MessagePhase;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::Path;
+use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::oneshot;
 
 fn completed_message(text: impl Into<String>) -> AgentEvent {
     AgentEvent::ModelMessageCompleted(AssistantMessage {
@@ -41,6 +44,36 @@ fn resumed_prompts_precede_global_duplicates_during_recall() {
             "resumed newer",
         ]
     );
+}
+
+#[tokio::test]
+async fn terminal_shutdown_aborts_owned_tasks() {
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    let (started_tx, started_rx) = oneshot::channel();
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let mut task = Some(tokio::spawn(async move {
+        let _drop_signal = DropSignal(Some(dropped_tx));
+        started_tx.send(()).unwrap();
+        std::future::pending::<()>().await;
+    }));
+    started_rx.await.unwrap();
+
+    abort_join_task(&mut task);
+
+    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("terminal-owned task remained detached after shutdown")
+        .unwrap();
+    assert!(task.is_none());
 }
 
 #[test]

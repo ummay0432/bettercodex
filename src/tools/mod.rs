@@ -21,6 +21,8 @@ pub(crate) use executor::command_argv_for_display;
 use self::code_runtime::CodeModeNestedToolCall as NestedToolCall;
 use self::code_runtime::CodeModeToolKind as NestedToolKind;
 use crate::events::AgentEvent;
+use crate::input::MAX_TOTAL_IMAGE_BYTES;
+use crate::input::image_size_error;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Context;
@@ -34,6 +36,8 @@ use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -267,8 +271,18 @@ fn view_image(cwd: &Path, input: Value) -> Result<Value> {
     if !metadata.is_file() {
         return Err(anyhow!("image path `{}` is not a file", path.display()));
     }
-    let bytes = std::fs::read(&path)
+    if metadata.len() > MAX_TOTAL_IMAGE_BYTES as u64 {
+        return Err(image_size_error());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+    File::open(&path)
+        .with_context(|| format!("unable to read image at `{}`", path.display()))?
+        .take(MAX_TOTAL_IMAGE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("unable to read image at `{}`", path.display()))?;
+    if bytes.len() > MAX_TOTAL_IMAGE_BYTES {
+        return Err(image_size_error());
+    }
     Ok(json!({
         "image_url": data_url_from_bytes("application/octet-stream", &bytes),
         "detail": detail,

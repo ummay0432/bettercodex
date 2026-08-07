@@ -765,13 +765,23 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.processes.stop_all_background_processes();
+        if let Some(turn) = self.turn_handle.take() {
+            turn.cancel();
+        }
+        abort_join_task(&mut self.turn);
+        abort_join_task(&mut self.session_scan);
+        abort_join_task(&mut self.resume_task);
         for (_, task) in self.operator_command_tasks.drain() {
             task.abort();
         }
-        if let Some(task) = self.diff_task.take() {
-            task.abort();
-        }
+        abort_join_task(&mut self.diff_task);
+        self.processes.stop_all_background_processes();
+    }
+}
+
+fn abort_join_task<T>(task: &mut Option<JoinHandle<T>>) {
+    if let Some(task) = task.take() {
+        task.abort();
     }
 }
 

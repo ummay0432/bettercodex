@@ -135,14 +135,22 @@ async fn run_agent(
     resume: Option<ResumeSelector>,
     tmux_mode: operator_settings::TmuxMode,
 ) -> Result<()> {
+    let input = if !options.prompt.is_empty() || !options.images.is_empty() {
+        Some(UserInput::from_paths(
+            options.prompt,
+            &options.images,
+            options.image_detail,
+        )?)
+    } else {
+        None
+    };
     let requested_cwd = std::env::current_dir()?;
     let mut agent = match resume {
         Some(selector) => Agent::resume(&requested_cwd, selector)?,
         None => Agent::new(&requested_cwd)?,
     };
     let cwd = agent.cwd().to_path_buf();
-    if !options.prompt.is_empty() || !options.images.is_empty() {
-        let input = UserInput::from_paths(options.prompt, &options.images, options.image_detail)?;
+    if let Some(input) = input {
         let answer = agent.submit_user_input(input).await?;
         write_stdout_line(format_args!("{answer}"))?;
         return Ok(());

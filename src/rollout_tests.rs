@@ -224,6 +224,48 @@ fn latest_resume_prefers_the_most_recently_used_matching_session() {
 }
 
 #[test]
+fn latest_resume_skips_newer_incompatible_sessions() {
+    let root = temporary_directory("rollout-compatible-latest");
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let valid = Rollout::create_in(&root, &cwd).unwrap();
+    let valid_id = valid.identity().session_id.clone();
+    let mut incompatible_metadata = valid.metadata.clone();
+    drop(valid);
+
+    let incompatible_id = Uuid::new_v4();
+    incompatible_metadata.version = ROLLOUT_VERSION + 1;
+    incompatible_metadata.identity.session_id = incompatible_id.to_string();
+    incompatible_metadata.created_at_unix_ms =
+        incompatible_metadata.created_at_unix_ms.saturating_add(1);
+    let incompatible_path = root
+        .join(SESSIONS_DIRECTORY)
+        .join(format!("{incompatible_id}.jsonl"));
+    let mut record = serde_json::to_vec(&RolloutRecord::Session {
+        metadata: incompatible_metadata,
+    })
+    .unwrap();
+    record.push(b'\n');
+    std::fs::write(&incompatible_path, record).unwrap();
+    let file = OpenOptions::new()
+        .write(true)
+        .open(incompatible_path)
+        .unwrap();
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(5)),
+    )
+    .unwrap();
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::LatestForCwd, &cwd).unwrap();
+    assert_eq!(loaded.metadata.identity.session_id, valid_id);
+    drop(loaded);
+    assert_eq!(list_sessions_in(&root).unwrap().len(), 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn session_listing_drives_resume_and_uses_the_first_real_user_message() {
     let root = temporary_directory("rollout-list");
     let first_cwd = root.join("first");

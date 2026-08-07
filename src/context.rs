@@ -3,6 +3,7 @@ use crate::repository;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
 use crate::rollout::Rollout;
+use crate::rollout::SessionIdentity;
 use crate::rollout::TurnOutcome;
 use crate::skills::SkillCatalog;
 use crate::usage::TokenUsage;
@@ -216,8 +217,19 @@ struct ContextMetrics {
 }
 
 impl Conversation {
-    pub(crate) fn new(cwd: &Path, mut rollout: Rollout) -> Result<Self> {
+    pub(crate) fn create(cwd: &Path) -> Result<Self> {
         let world_state = WorldState::load(cwd)?;
+        let rollout = Rollout::create(cwd)?;
+        Self::from_world_state(world_state, rollout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(cwd: &Path, rollout: Rollout) -> Result<Self> {
+        let world_state = WorldState::load(cwd)?;
+        Self::from_world_state(world_state, rollout)
+    }
+
+    fn from_world_state(world_state: WorldState, mut rollout: Rollout) -> Result<Self> {
         let history = world_state.items();
         rollout.replace_history(&history, HistoryReplacement::Initial)?;
         let context_metrics = ContextMetrics::from_history(&history, &world_state);
@@ -285,6 +297,10 @@ impl Conversation {
 
     pub(crate) fn session_id(&self) -> &str {
         &self.rollout.identity().session_id
+    }
+
+    pub(crate) fn identity(&self) -> &SessionIdentity {
+        self.rollout.identity()
     }
 
     pub(crate) fn start_turn(&mut self, turn_id: &str) -> Result<()> {
