@@ -93,6 +93,7 @@ async fn published_release_lookup_reports_both_exact_commits() {
             curl.path.as_os_str(),
             "owner/project",
             current,
+            "0.1.2",
             Duration::from_secs(1),
         )
         .await,
@@ -106,10 +107,23 @@ async fn published_release_lookup_reports_both_exact_commits() {
             curl.path.as_os_str(),
             "owner/project",
             latest,
+            "0.1.2",
             Duration::from_secs(1),
         )
         .await,
         None
+    );
+    assert_eq!(
+        check_for_release_update_with(
+            curl.path.as_os_str(),
+            "owner/project",
+            current,
+            "0.1.3",
+            Duration::from_secs(1),
+        )
+        .await,
+        None,
+        "an older published package must not downgrade a newer local build"
     );
 }
 
@@ -128,6 +142,7 @@ async fn failed_malformed_and_timed_out_release_lookups_are_silent() {
                 curl.path.as_os_str(),
                 "owner/project",
                 revision,
+                "0.1.2",
                 Duration::from_secs(1),
             )
             .await,
@@ -141,6 +156,7 @@ async fn failed_malformed_and_timed_out_release_lookups_are_silent() {
             slow.path.as_os_str(),
             "owner/project",
             revision,
+            "0.1.2",
             Duration::from_millis(20),
         )
         .await,
@@ -151,6 +167,7 @@ async fn failed_malformed_and_timed_out_release_lookups_are_silent() {
             slow.path.as_os_str(),
             "invalid repository",
             revision,
+            "0.1.2",
             Duration::from_secs(1),
         )
         .await,

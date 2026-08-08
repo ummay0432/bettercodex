@@ -125,6 +125,7 @@ pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
         OsStr::new("curl"),
         &repository,
         current_revision,
+        env!("CARGO_PKG_VERSION"),
         UPDATE_CHECK_TIMEOUT,
     )
     .await
@@ -138,6 +139,7 @@ async fn check_for_release_update_with(
     curl_program: &OsStr,
     repository: &str,
     current_revision: &str,
+    current_version: &str,
     timeout: Duration,
 ) -> Option<AvailableUpdate> {
     if !is_source_revision(current_revision) || validate_repository(repository).is_err() {
@@ -159,6 +161,7 @@ async fn check_for_release_update_with(
     }
     let release = parse_github_release(&output.stdout).ok()?;
     if release.revision.eq_ignore_ascii_case(current_revision)
+        || package_version_precedes(&release.version, current_version)
         || !install::has_native_full_asset(&release)
     {
         return None;
@@ -214,14 +217,23 @@ fn parse_release_tag(tag: &str) -> Result<PublishedRelease> {
 }
 
 fn is_package_version(version: &str) -> bool {
+    package_version(version).is_some()
+}
+
+fn package_version(version: &str) -> Option<[u64; 3]> {
     let mut components = version.split('.');
-    let valid_component = |component: &str| {
-        !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
-    };
-    valid_component(components.next().unwrap_or_default())
-        && valid_component(components.next().unwrap_or_default())
-        && valid_component(components.next().unwrap_or_default())
-        && components.next().is_none()
+    let version = [
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+    ];
+    components.next().is_none().then_some(version)
+}
+
+fn package_version_precedes(candidate: &str, current: &str) -> bool {
+    package_version(candidate)
+        .zip(package_version(current))
+        .is_some_and(|(candidate, current)| candidate < current)
 }
 
 fn is_source_revision(revision: &str) -> bool {
@@ -268,8 +280,20 @@ pub(crate) fn run_update() -> Result<()> {
         let mut output = std::io::stdout().lock();
         writeln!(
             output,
-            "BetterCodex is already current at {}.",
+            "The latest published BetterCodex release is already installed at {}.",
             short_revision(current_revision)
+        )?;
+        return Ok(());
+    }
+    if package_version_precedes(&release.version, env!("CARGO_PKG_VERSION")) {
+        let mut output = std::io::stdout().lock();
+        writeln!(
+            output,
+            "This BetterCodex {} build ({}) is newer than the latest published {} release ({}); no downgrade was installed.",
+            env!("CARGO_PKG_VERSION"),
+            short_revision(current_revision),
+            release.version,
+            short_revision(&release.revision)
         )?;
         return Ok(());
     }
