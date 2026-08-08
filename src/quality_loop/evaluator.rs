@@ -63,13 +63,20 @@ pub(crate) async fn run_machine_evaluation(
     worktree_root: &Path,
     state: &str,
     evidence_directory: &Path,
+    command_environment: &HashMap<String, String>,
     cancellation: &CancellationToken,
 ) -> Result<Option<EvaluationReport>> {
     create_private_directory(evidence_directory)?;
     let mut reports = BTreeMap::new();
     for check in &contract.machine_checks {
-        let Some(report) =
-            run_check(check, worktree_root, evidence_directory, cancellation).await?
+        let Some(report) = run_check(
+            check,
+            worktree_root,
+            evidence_directory,
+            command_environment,
+            cancellation,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -112,14 +119,21 @@ pub(crate) async fn run_discrimination_checks(
     contract: &EvaluatorContract,
     worktree_root: &Path,
     evidence_directory: &Path,
+    command_environment: &HashMap<String, String>,
     cancellation: &CancellationToken,
 ) -> Result<Option<BTreeMap<String, CheckReport>>> {
     create_private_directory(evidence_directory)?;
     let mut reports = BTreeMap::new();
     for discrimination in &contract.discrimination_checks {
         let check = &discrimination.check;
-        let Some(report) =
-            run_check(check, worktree_root, evidence_directory, cancellation).await?
+        let Some(report) = run_check(
+            check,
+            worktree_root,
+            evidence_directory,
+            command_environment,
+            cancellation,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -402,13 +416,15 @@ async fn run_check(
     check: &MachineCheck,
     worktree_root: &Path,
     evidence_directory: &Path,
+    command_environment: &HashMap<String, String>,
     cancellation: &CancellationToken,
 ) -> Result<Option<CheckReport>> {
     let mut values = Vec::new();
     let mut evidence = Vec::new();
     let mut passed = true;
     for repeat in 1..=check.baseline_repeats {
-        let command_result = run_command(check, worktree_root, cancellation).await?;
+        let command_result =
+            run_command(check, worktree_root, command_environment, cancellation).await?;
         let Some((status, stdout, stderr, exceeded)) = command_result else {
             return Ok(None);
         };
@@ -462,6 +478,7 @@ async fn run_check(
 async fn run_command(
     check: &MachineCheck,
     worktree_root: &Path,
+    command_environment: &HashMap<String, String>,
     cancellation: &CancellationToken,
 ) -> Result<Option<(i32, Vec<u8>, Vec<u8>, bool)>> {
     let program = check
@@ -473,6 +490,7 @@ async fn run_command(
     for (name, value) in &check.env {
         environment.insert(name.clone(), value.clone());
     }
+    environment.extend(command_environment.clone());
     let SpawnedProcess {
         session,
         stdout_rx,
@@ -787,6 +805,7 @@ mod tests {
             &fixture.root,
             "state-1",
             &evidence,
+            &HashMap::new(),
             &CancellationToken::new(),
         )
         .await
@@ -797,6 +816,39 @@ mod tests {
         assert_eq!(report.checks["metric-check"].values.len(), 2);
         assert!(evidence.join("metric-check-1.log").is_file());
         assert!(evidence.join("metric-check-2.log").is_file());
+    }
+
+    #[tokio::test]
+    async fn harness_environment_overrides_contract_environment() {
+        let fixture = Fixture::new();
+        let script = fixture.script(
+            "environment.sh",
+            "#!/bin/sh\nif [ \"$CARGO_TARGET_DIR\" = \"$1\" ]; then value=10; else value=0; fi\nprintf '{\"value\": %s}\\n' \"$value\"\n",
+        );
+        let target = fixture.root.join("runtime/cargo-target");
+        let mut contract = contract(&fixture.root, &script, 1);
+        contract.machine_checks[0].argv =
+            vec![script.display().to_string(), target.display().to_string()];
+        contract.machine_checks[0].env.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "contract-controlled-target".to_string(),
+        );
+        let command_environment =
+            HashMap::from([("CARGO_TARGET_DIR".to_string(), target.display().to_string())]);
+
+        let report = run_machine_evaluation(
+            &contract,
+            &fixture.root,
+            "state-1",
+            &fixture.root.join("evidence"),
+            &command_environment,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.decisive, "metric-check=10");
     }
 
     #[tokio::test]
@@ -821,6 +873,7 @@ mod tests {
             &contract,
             &fixture.root,
             &fixture.root.join("discrimination-pass"),
+            &HashMap::new(),
             &CancellationToken::new(),
         )
         .await
@@ -833,6 +886,7 @@ mod tests {
             &contract,
             &fixture.root,
             &fixture.root.join("discrimination-fail"),
+            &HashMap::new(),
             &CancellationToken::new(),
         )
         .await
@@ -851,6 +905,7 @@ mod tests {
             &fixture.root,
             "state-1",
             &fixture.root.join("evidence"),
+            &HashMap::new(),
             &CancellationToken::new(),
         )
         .await
@@ -878,6 +933,7 @@ mod tests {
             &fixture.root,
             "state-1",
             &fixture.root.join("evidence"),
+            &HashMap::new(),
             &CancellationToken::new(),
         )
         .await
@@ -907,6 +963,7 @@ mod tests {
                 &fixture.root,
                 "state-1",
                 &fixture.root.join("evidence"),
+                &HashMap::new(),
                 &CancellationToken::new(),
             ),
         )
@@ -1138,6 +1195,7 @@ mod tests {
             &fixture.root,
             "state-1",
             &fixture.root.join("evidence"),
+            &HashMap::new(),
             &CancellationToken::new(),
         )
         .await

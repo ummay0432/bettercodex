@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 pub(crate) const LOOP_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CONTRACT_VERSION: u32 = 1;
+const RUNTIME_DIRECTORY: &str = "runtime";
 
 const EVALUATOR_PROMPT: &str = include_str!("../../prompts/loop-evaluator.md");
 const WORKER_PROMPT: &str = include_str!("../../prompts/loop-worker.md");
@@ -276,6 +277,10 @@ impl LoopRun {
         verify_private_directory_chain(&self.root, &Path::new("sessions").join(phase), true)
     }
 
+    pub(crate) fn cleanup_runtime(&self) -> Result<()> {
+        cleanup_runtime_directory(&self.root)
+    }
+
     pub(crate) fn verify_runtime_identity(&self) -> Result<()> {
         verify_runtime_state(&self.state)
     }
@@ -283,6 +288,7 @@ impl LoopRun {
 
 impl Drop for LoopRun {
     fn drop(&mut self) {
+        let _ = self.cleanup_runtime();
         let _ = self.lock.sync_all();
         let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
@@ -325,6 +331,7 @@ fn recover_incomplete_runs(worktree: &Worktree, loops: &Path) -> Result<usize> {
                 entry.path().display()
             ));
         }
+        cleanup_runtime_directory(&entry.path())?;
         recovered += usize::from(recover_run(worktree, &entry.path(), name)?);
     }
     Ok(recovered)
@@ -630,6 +637,22 @@ fn discard_incomplete_run(lock: &mut File, root: &Path) -> Result<()> {
     lock.set_len(0)?;
     lock.sync_all()?;
     Ok(())
+}
+
+fn cleanup_runtime_directory(root: &Path) -> Result<()> {
+    let runtime = root.join(RUNTIME_DIRECTORY);
+    let metadata = match std::fs::symlink_metadata(&runtime) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(&runtime)
+    } else {
+        std::fs::remove_file(&runtime)
+    }
+    .with_context(|| format!("failed to remove loop runtime state {}", runtime.display()))?;
+    sync_directory(root)
 }
 
 fn resolve_existing_file(root: &Path, value: &str, under: &Path) -> Result<PathBuf> {
@@ -1007,6 +1030,39 @@ mod tests {
         assert_ne!(second.root(), first_root);
         second
             .update(|state| state.phase = RunPhase::Completed)
+            .unwrap();
+    }
+
+    #[test]
+    fn dropping_a_run_removes_its_disposable_runtime_tree() {
+        let fixture = Fixture::new();
+        let run = fixture.create_run();
+        let run_root = run.root().to_path_buf();
+        let target = run.create_directory("runtime/cargo-target").unwrap();
+        std::fs::write(target.join("artifact"), "temporary\n").unwrap();
+
+        drop(run);
+
+        assert!(!run_root.join("runtime").exists());
+    }
+
+    #[test]
+    fn creating_a_run_removes_stale_runtime_from_prior_runs() {
+        let fixture = Fixture::new();
+        let mut prior = fixture.create_run();
+        let prior_root = prior.root().to_path_buf();
+        prior
+            .update(|state| state.phase = RunPhase::Completed)
+            .unwrap();
+        drop(prior);
+        let stale_target = prior_root.join("runtime/cargo-target");
+        std::fs::create_dir_all(&stale_target).unwrap();
+        std::fs::write(stale_target.join("artifact"), "stale\n").unwrap();
+
+        let mut next = fixture.create_run();
+
+        assert!(!prior_root.join("runtime").exists());
+        next.update(|state| state.phase = RunPhase::Completed)
             .unwrap();
     }
 

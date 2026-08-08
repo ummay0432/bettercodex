@@ -28,6 +28,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
@@ -367,6 +368,7 @@ impl Agent {
         local_state_root: &Path,
         frozen: &FrozenLoopContext,
         phase_prompt: &str,
+        command_environment: HashMap<String, String>,
     ) -> Result<Self> {
         let auth = Auth::load()?;
         let rollout = Rollout::create_in(local_state_root, cwd)?;
@@ -378,10 +380,11 @@ impl Agent {
             phase_prompt.trim()
         );
         let api = ApiClient::new_with_instructions(auth, &identity, 0, instructions)?;
-        let tools = ToolRuntime::new(
+        let tools = ToolRuntime::with_environment(
             cwd.to_path_buf(),
             api.web_search_client(),
             api.openai_docs_client(),
+            command_environment,
         );
         Ok(Self {
             cwd: cwd.to_path_buf(),

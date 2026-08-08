@@ -36,6 +36,7 @@ use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -168,9 +169,14 @@ struct NestedTools {
 }
 
 impl NestedTools {
-    fn new(cwd: PathBuf, web_search: WebSearchClient, openai_docs: OpenAiDocsClient) -> Self {
+    fn new(
+        cwd: PathBuf,
+        web_search: WebSearchClient,
+        openai_docs: OpenAiDocsClient,
+        environment: HashMap<String, String>,
+    ) -> Self {
         Self {
-            processes: ProcessManager::new(cwd.clone()),
+            processes: ProcessManager::with_environment(cwd.clone(), environment),
             cwd,
             openai_docs,
             web_search,

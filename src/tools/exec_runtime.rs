@@ -56,8 +56,17 @@ impl ToolRuntime {
         web_search: WebSearchClient,
         openai_docs: OpenAiDocsClient,
     ) -> Self {
+        Self::with_environment(cwd, web_search, openai_docs, HashMap::new())
+    }
+
+    pub(crate) fn with_environment(
+        cwd: PathBuf,
+        web_search: WebSearchClient,
+        openai_docs: OpenAiDocsClient,
+        environment: HashMap<String, String>,
+    ) -> Self {
         let state = Arc::new(RuntimeState {
-            tools: NestedTools::new(cwd, web_search, openai_docs),
+            tools: NestedTools::new(cwd, web_search, openai_docs, environment),
             notifications: Notifications::default(),
             ui_events: UiEvents::default(),
         });

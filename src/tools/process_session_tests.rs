@@ -28,6 +28,7 @@ async fn dropping_an_exited_session_terminates_descendants_holding_output_open()
         "sleep 30 & child=$!; printf 'child:%s\\n' \"$child\"",
         &cwd,
         ProcessMode::Piped,
+        &HashMap::new(),
     )
     .await
     .unwrap();

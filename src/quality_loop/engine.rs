@@ -38,6 +38,7 @@ use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -80,6 +81,13 @@ struct PhaseOutput {
     duration_ms: u64,
 }
 
+#[derive(Clone, Copy)]
+struct LoopExecution<'a> {
+    command_environment: &'a HashMap<String, String>,
+    events: &'a UnboundedSender<AgentEvent>,
+    control: &'a TurnControl,
+}
+
 trait PhaseRunner {
     fn run<'a>(
         &'a mut self,
@@ -88,7 +96,7 @@ trait PhaseRunner {
         frozen: &'a FrozenLoopContext,
         name: &'a str,
         prompt: &'a str,
-        parent_control: &'a TurnControl,
+        execution: LoopExecution<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<PhaseOutput>>> + Send + 'a>>;
 }
 
@@ -102,16 +110,9 @@ impl PhaseRunner for LivePhaseRunner {
         frozen: &'a FrozenLoopContext,
         name: &'a str,
         prompt: &'a str,
-        parent_control: &'a TurnControl,
+        execution: LoopExecution<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<PhaseOutput>>> + Send + 'a>> {
-        Box::pin(run_live_phase(
-            cwd,
-            run,
-            frozen,
-            name,
-            prompt,
-            parent_control,
-        ))
+        Box::pin(run_live_phase(cwd, run, frozen, name, prompt, execution))
     }
 }
 
@@ -200,17 +201,30 @@ async fn execute(
     run.write_json("starting-state.json", &original.state)?;
     progress(events, &run, "eval", "building evaluator", None, None);
 
+    let command_environment = loop_command_environment(&run)?;
+    let execution = LoopExecution {
+        command_environment: &command_environment,
+        events,
+        control,
+    };
     let mut runner = LivePhaseRunner;
     let result = execute_phases(
         worktree,
         &frozen,
         &mut run,
         &original,
-        events,
-        control,
+        execution,
         &mut runner,
     )
     .await;
+    let result = match (result, run.cleanup_runtime()) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+            "{error:#}; failed to clean loop runtime state: {cleanup_error:#}"
+        )),
+    };
     let summary = match result {
         Ok(summary) => summary,
         Err(error) => {
@@ -254,8 +268,7 @@ async fn execute_phases<R: PhaseRunner>(
     frozen: &FrozenLoopContext,
     run: &mut LoopRun,
     original: &RepositorySnapshot,
-    events: &UnboundedSender<AgentEvent>,
-    control: &TurnControl,
+    execution: LoopExecution<'_>,
     runner: &mut R,
 ) -> Result<LoopSummary> {
     let evaluator_workspace = run.root().join("evaluator/workspace");
@@ -268,7 +281,7 @@ async fn execute_phases<R: PhaseRunner>(
             frozen,
             "setup",
             &phase_prompt,
-            control,
+            execution,
         )
         .await?
     else {
@@ -295,7 +308,7 @@ async fn execute_phases<R: PhaseRunner>(
             state.blocker = Some(envelope.blocker.clone());
         })?;
         progress(
-            events,
+            execution.events,
             run,
             "eval",
             "blocked",
@@ -329,7 +342,7 @@ async fn execute_phases<R: PhaseRunner>(
         state.phase = RunPhase::Baselining;
         state.display_name = contract.loop_name.clone();
     })?;
-    progress(events, run, "eval", "baselining", None, None);
+    progress(execution.events, run, "eval", "baselining", None, None);
 
     let snapshot_paths = contract.snapshot_paths();
     let baseline_snapshot = worktree.capture(run.root(), &snapshot_paths)?;
@@ -347,12 +360,13 @@ async fn execute_phases<R: PhaseRunner>(
     })?;
     run.write_json("starting-state.json", &baseline_snapshot.state)?;
     let baseline_directory = run.create_directory("baseline")?;
-    let cancellation = control.cancellation();
+    let cancellation = execution.control.cancellation();
     let discrimination_directory = run.create_directory("baseline/discrimination")?;
     let Some(discrimination) = run_discrimination_checks(
         &contract,
         worktree.root(),
         &discrimination_directory,
+        execution.command_environment,
         &cancellation,
     )
     .await?
@@ -387,6 +401,7 @@ async fn execute_phases<R: PhaseRunner>(
         worktree.root(),
         &baseline_snapshot.state.digest,
         &baseline_directory,
+        execution.command_environment,
         &cancellation,
     )
     .await?
@@ -418,7 +433,7 @@ async fn execute_phases<R: PhaseRunner>(
         state.final_result = Some(baseline.decisive.clone());
     })?;
     progress(
-        events,
+        execution.events,
         run,
         "eval",
         "baseline complete",
@@ -450,7 +465,14 @@ async fn execute_phases<R: PhaseRunner>(
         let incumbent_diff = worktree
             .text_diff_counts(run.root(), &baseline_snapshot, &incumbent_snapshot)
             .ok();
-        progress(events, run, &phase, "exploring", None, incumbent_diff);
+        progress(
+            execution.events,
+            run,
+            &phase,
+            "exploring",
+            None,
+            incumbent_diff,
+        );
         let worker_prompt =
             worker_prompt(run, iteration, total, &evidence_directory, &contract_path)?;
         let control_before = immutable_control_digest(run.root(), Some(iteration))?;
@@ -461,11 +483,11 @@ async fn execute_phases<R: PhaseRunner>(
                 frozen,
                 &format!("worker-{iteration}"),
                 &worker_prompt,
-                control,
+                execution,
             )
             .await;
 
-        if control.is_cancelled() {
+        if execution.control.is_cancelled() {
             restore_iteration_snapshot(worktree, run, &incumbent_snapshot)?;
             counts.interrupted += 1;
             let description = "operator interrupted the active iteration";
@@ -519,8 +541,9 @@ async fn execute_phases<R: PhaseRunner>(
             total,
             &evidence_directory,
             &evidence_relative,
-            events,
+            execution.events,
             &baseline_snapshot,
+            execution.command_environment,
             &cancellation,
         )
         .await?;
@@ -554,7 +577,7 @@ async fn execute_phases<R: PhaseRunner>(
                     state.active_candidate_snapshot = None;
                 })?;
                 progress(
-                    events,
+                    execution.events,
                     run,
                     &phase,
                     resolved.pulse,
@@ -579,7 +602,7 @@ async fn execute_phases<R: PhaseRunner>(
             unvalidated.push(resolved.unvalidated.clone());
         }
         progress(
-            events,
+            execution.events,
             run,
             &phase,
             resolved.pulse,
@@ -643,6 +666,7 @@ async fn resolve_iteration(
     evidence_relative: &str,
     events: &UnboundedSender<AgentEvent>,
     starting: &RepositorySnapshot,
+    command_environment: &HashMap<String, String>,
     cancellation: &CancellationToken,
 ) -> Result<ResolvedIteration> {
     let crash = |description: String| ResolvedIteration {
@@ -907,6 +931,7 @@ async fn resolve_iteration(
         worktree.root(),
         &candidate.state.digest,
         &validation_directory,
+        command_environment,
         cancellation,
     )
     .await;
@@ -1183,31 +1208,69 @@ async fn run_live_phase(
     frozen: &FrozenLoopContext,
     name: &str,
     prompt: &str,
-    parent_control: &TurnControl,
+    execution: LoopExecution<'_>,
 ) -> Result<Option<PhaseOutput>> {
     let session_root = run.session_root(name)?;
-    let mut agent = Agent::new_frozen_loop_session(cwd, &session_root, frozen, prompt)?;
+    let agent = Agent::new_frozen_loop_session(
+        cwd,
+        &session_root,
+        frozen,
+        prompt,
+        execution.command_environment.clone(),
+    );
+    let mut agent = match agent {
+        Ok(agent) => agent,
+        Err(error) => {
+            return match remove_phase_session(&session_root) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(anyhow!(
+                    "{error:#}; failed to clean private phase session: {cleanup_error:#}"
+                )),
+            };
+        }
+    };
     let session_id = agent.session_id().to_string();
     let processes = agent.background_processes();
     let started = Instant::now();
-    let result = agent
-        .submit_preloaded_with_control(None, parent_control.child_non_steerable())
-        .await;
+    let (phase_events, mut phase_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut relay = PhaseEventRelay::default();
+    let result = {
+        let submission = agent.submit_preloaded_with_control(
+            Some(phase_events),
+            execution.control.child_non_steerable(),
+        );
+        tokio::pin!(submission);
+        let mut phase_events_open = true;
+        loop {
+            tokio::select! {
+                result = &mut submission => break result,
+                event = phase_event_rx.recv(), if phase_events_open => {
+                    match event {
+                        Some(event) => relay.forward(event, execution.events),
+                        None => phase_events_open = false,
+                    }
+                }
+            }
+        }
+    };
+    while let Ok(event) = phase_event_rx.try_recv() {
+        relay.forward(event, execution.events);
+    }
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     let usage = agent.latest_usage();
     processes.stop_all_background_processes();
-    if !processes.list_background_processes().is_empty() {
-        return Err(anyhow!(
-            "phase-owned background processes could not be contained"
-        ));
-    }
+    let containment_error = (!processes.list_background_processes().is_empty())
+        .then(|| anyhow!("phase-owned background processes could not be contained"));
     drop(agent);
-    std::fs::remove_dir_all(&session_root).with_context(|| {
-        format!(
-            "failed to remove private internal session state {}",
-            session_root.display()
-        )
-    })?;
+    let result = containment_error.map_or(result, Err);
+    let result = match (result, remove_phase_session(&session_root)) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+            "{error:#}; failed to clean private phase session: {cleanup_error:#}"
+        )),
+    };
     match result? {
         SubmitOutcome::Completed(response) => Ok(Some(PhaseOutput {
             response,
@@ -1217,6 +1280,71 @@ async fn run_live_phase(
         })),
         SubmitOutcome::Cancelled => Ok(None),
     }
+}
+
+fn remove_phase_session(session_root: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(session_root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove private internal session state {}",
+                session_root.display()
+            )
+        }),
+    }
+}
+
+#[derive(Default)]
+struct PhaseEventRelay {
+    visible_message_open: bool,
+}
+
+impl PhaseEventRelay {
+    fn forward(&mut self, event: AgentEvent, target: &UnboundedSender<AgentEvent>) {
+        // Phase-final text is the private SETUP/VERDICT envelope parsed by the harness. Sending it
+        // would also mark the parent TUI turn terminal and suppress the loop's real final summary.
+        // Context, steering, compaction, and nested-loop state belong to the private phase session;
+        // reasoning, commentary, warnings, and tool events are safe operator-visible activity.
+        let visible = match event {
+            AgentEvent::ModelMessageStarted(message) => {
+                self.visible_message_open = !message.is_terminal();
+                self.visible_message_open
+                    .then_some(AgentEvent::ModelMessageStarted(message))
+            }
+            AgentEvent::ModelMessageDelta(delta) => self
+                .visible_message_open
+                .then_some(AgentEvent::ModelMessageDelta(delta)),
+            AgentEvent::ModelMessageCompleted(message) => {
+                self.visible_message_open = false;
+                (!message.is_terminal()).then_some(AgentEvent::ModelMessageCompleted(message))
+            }
+            AgentEvent::ContextUpdated(_)
+            | AgentEvent::SteeringCommitted(_)
+            | AgentEvent::CompactionStarted
+            | AgentEvent::CompactionCompleted
+            | AgentEvent::LoopProgress(_)
+            | AgentEvent::LoopProgressCleared => None,
+            event => Some(event),
+        };
+        if let Some(event) = visible {
+            let _ = target.send(event);
+        }
+    }
+}
+
+fn loop_command_environment(run: &LoopRun) -> Result<HashMap<String, String>> {
+    let cargo_target = run.create_directory("runtime/cargo-target")?;
+    let cargo_target = cargo_target.to_str().ok_or_else(|| {
+        anyhow!(
+            "loop runtime path is not valid UTF-8: {}",
+            cargo_target.display()
+        )
+    })?;
+    Ok(HashMap::from([
+        ("CARGO_TARGET_DIR".to_string(), cargo_target.to_string()),
+        ("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string()),
+    ]))
 }
 
 fn evaluator_prompt(run: &LoopRun, worktree: &super::Worktree, workspace: &Path) -> Result<String> {
@@ -1395,13 +1523,16 @@ fn hash_control_tree(
 
 fn mutable_phase_path(relative: &Path, active_iteration: Option<usize>) -> bool {
     let evaluator_workspace = Path::new("evaluator/workspace");
+    let runtime = Path::new("runtime");
     let allowed_session = active_iteration.map_or_else(
         || PathBuf::from("sessions/setup"),
         |iteration| PathBuf::from(format!("sessions/worker-{iteration}")),
     );
     let allowed_iteration =
         active_iteration.map(|iteration| PathBuf::from(format!("iterations/{iteration}")));
-    relative == allowed_session
+    relative == runtime
+        || relative.starts_with(runtime)
+        || relative == allowed_session
         || relative.starts_with(&allowed_session)
         || active_iteration.is_none()
             && (relative == evaluator_workspace || relative.starts_with(evaluator_workspace))
@@ -1591,6 +1722,7 @@ mod tests {
         prompt: String,
         context: Vec<Value>,
         session_id: String,
+        command_environment: HashMap<String, String>,
     }
 
     struct ScriptedRunner {
@@ -1820,20 +1952,26 @@ mod tests {
             frozen: &'a FrozenLoopContext,
             name: &'a str,
             prompt: &'a str,
-            parent_control: &'a TurnControl,
+            execution: LoopExecution<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<Option<PhaseOutput>>> + Send + 'a>> {
             Box::pin(async move {
                 let session_id = Uuid::new_v4().to_string();
+                let _ = execution
+                    .events
+                    .send(AgentEvent::ReasoningSummaryDelta(format!(
+                        "Running loop phase {name}"
+                    )));
                 self.captured.push(CapturedPhase {
                     name: name.to_string(),
                     prompt: prompt.to_string(),
                     context: frozen.context_items().to_vec(),
                     session_id: session_id.clone(),
+                    command_environment: execution.command_environment.clone(),
                 });
                 if name == "setup" {
                     self.setup(cwd, run, &session_id).map(Some)
                 } else {
-                    self.worker(cwd, run, name, &session_id, parent_control)
+                    self.worker(cwd, run, name, &session_id, execution.control)
                 }
             })
         }
@@ -1898,20 +2036,28 @@ mod tests {
             let original = load_snapshot(&run, &run.state.starting_snapshot).unwrap();
             run.write_json("starting-state.json", &original.state)
                 .unwrap();
+            let command_environment = loop_command_environment(&run).unwrap();
             let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
             let (_handle, control) = TurnControl::non_steerable_channel();
+            let execution = LoopExecution {
+                command_environment: &command_environment,
+                events: &events_tx,
+                control: &control,
+            };
             let mut runner = ScriptedRunner::new(actions);
             let summary = execute_phases(
                 &self.worktree,
                 &self.frozen,
                 &mut run,
                 &original,
-                &events_tx,
-                &control,
+                execution,
                 &mut runner,
             )
             .await
             .unwrap();
+            assert!(run.root().join("runtime").is_dir());
+            run.cleanup_runtime().unwrap();
+            assert!(!run.root().join("runtime").exists());
             drop(events_tx);
             let mut events = Vec::new();
             while let Ok(event) = events_rx.try_recv() {
@@ -1939,6 +2085,127 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn phase_event_relay_exposes_activity_without_leaking_internal_terminal_state() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut relay = PhaseEventRelay::default();
+        let commentary = crate::assistant_message::AssistantMessage {
+            text: String::new(),
+            phase: Some(crate::protocol::MessagePhase::Commentary),
+        };
+        let terminal = crate::assistant_message::AssistantMessage {
+            text: String::new(),
+            phase: Some(crate::protocol::MessagePhase::FinalAnswer),
+        };
+
+        relay.forward(
+            AgentEvent::ReasoningSummaryDelta("Inspecting dependencies".to_string()),
+            &events_tx,
+        );
+        relay.forward(
+            AgentEvent::ModelMessageStarted(commentary.clone()),
+            &events_tx,
+        );
+        relay.forward(
+            AgentEvent::ModelMessageDelta("Running cargo metadata".to_string()),
+            &events_tx,
+        );
+        relay.forward(
+            AgentEvent::ModelMessageCompleted(commentary.clone()),
+            &events_tx,
+        );
+        relay.forward(
+            AgentEvent::ModelMessageStarted(terminal.clone()),
+            &events_tx,
+        );
+        relay.forward(
+            AgentEvent::ModelMessageDelta("SETUP: READY".to_string()),
+            &events_tx,
+        );
+        relay.forward(AgentEvent::ModelMessageCompleted(terminal), &events_tx);
+        relay.forward(
+            AgentEvent::ContextUpdated(crate::context::ContextSnapshot {
+                used_tokens: 42,
+                context_window: 100,
+                compact_at_tokens: 90,
+                measured: true,
+                sections: Vec::new(),
+            }),
+            &events_tx,
+        );
+        relay.forward(AgentEvent::CompactionStarted, &events_tx);
+        relay.forward(
+            AgentEvent::LoopProgress(LoopProgress::new("nested", "eval", None, None, "hidden")),
+            &events_tx,
+        );
+        relay.forward(
+            AgentEvent::ToolStarted {
+                call_id: "call-1".to_string(),
+                name: "exec_command".to_string(),
+                input: Some(json!({"cmd": "cargo metadata"})),
+            },
+            &events_tx,
+        );
+        relay.forward(
+            AgentEvent::ToolCompleted {
+                call_id: "call-1".to_string(),
+                output: Ok(json!({"output": "done"})),
+                duration: std::time::Duration::from_millis(10),
+            },
+            &events_tx,
+        );
+        relay.forward(AgentEvent::ModelResponseCompleted, &events_tx);
+
+        drop(events_tx);
+        let mut visible = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            visible.push(event);
+        }
+        assert_eq!(
+            visible,
+            vec![
+                AgentEvent::ReasoningSummaryDelta("Inspecting dependencies".to_string()),
+                AgentEvent::ModelMessageStarted(commentary.clone()),
+                AgentEvent::ModelMessageDelta("Running cargo metadata".to_string()),
+                AgentEvent::ModelMessageCompleted(commentary),
+                AgentEvent::ToolStarted {
+                    call_id: "call-1".to_string(),
+                    name: "exec_command".to_string(),
+                    input: Some(json!({"cmd": "cargo metadata"})),
+                },
+                AgentEvent::ToolCompleted {
+                    call_id: "call-1".to_string(),
+                    output: Ok(json!({"output": "done"})),
+                    duration: std::time::Duration::from_millis(10),
+                },
+                AgentEvent::ModelResponseCompleted,
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_runtime_artifacts_are_excluded_from_phase_integrity_digest() {
+        let fixture = Fixture::new();
+        let run = LoopRun::create(
+            &fixture.worktree,
+            &LoopInvocation {
+                iterations: 1,
+                triggers: Vec::new(),
+                counts: Vec::new(),
+            },
+            fixture.frozen.operator_inputs(),
+            fixture.frozen.context_items(),
+        )
+        .unwrap();
+        let environment = loop_command_environment(&run).unwrap();
+        let before = immutable_control_digest(run.root(), None).unwrap();
+        let target = Path::new(environment.get("CARGO_TARGET_DIR").unwrap());
+        std::fs::write(target.join("build-output"), "temporary\n").unwrap();
+        assert_eq!(immutable_control_digest(run.root(), None).unwrap(), before);
+        run.cleanup_runtime().unwrap();
+        assert!(!run.root().join("runtime").exists());
     }
 
     #[tokio::test]
@@ -1998,6 +2265,27 @@ mod tests {
                 .iter()
                 .all(|phase| phase.context == runner.captured[0].context)
         );
+        let cargo_targets = runner
+            .captured
+            .iter()
+            .map(|phase| {
+                phase
+                    .command_environment
+                    .get("CARGO_TARGET_DIR")
+                    .map(String::as_str)
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(cargo_targets.len(), 1);
+        assert_eq!(
+            cargo_targets.into_iter().next().flatten(),
+            run.root().join("runtime/cargo-target").to_str()
+        );
+        assert!(runner.captured.iter().all(|phase| {
+            phase
+                .command_environment
+                .get("PYTHONDONTWRITEBYTECODE")
+                .is_some_and(|value| value == "1")
+        }));
         let ledger = std::fs::read_to_string(run.root().join("results.tsv")).unwrap();
         assert_eq!(ledger.lines().count(), 5);
         assert!(ledger.contains("\tkeep\t"));
@@ -2024,6 +2312,10 @@ mod tests {
             event,
             AgentEvent::LoopProgress(progress)
                 if progress.phase == "1/3" && progress.additions == Some(1) && progress.deletions == Some(1)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ReasoningSummaryDelta(detail) if detail == "Running loop phase setup"
         )));
         drop(run);
     }
