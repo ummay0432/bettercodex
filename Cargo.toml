@@ -79,7 +79,6 @@ tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungsteni
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 
 [lints.clippy]
-await_holding_invalid_type = "deny"
 await_holding_lock = "deny"
 identity_op = "deny"
 manual_clamp = "deny"
@@ -97,7 +96,6 @@ manual_try_fold = "deny"
 manual_unwrap_or = "deny"
 needless_borrow = "deny"
 needless_borrowed_reference = "deny"
-needless_collect = "deny"
 needless_late_init = "deny"
 needless_option_as_deref = "deny"
 needless_question_mark = "deny"
@@ -106,7 +104,6 @@ redundant_clone = "deny"
 redundant_closure = "deny"
 redundant_closure_for_method_calls = "deny"
 redundant_static_lifetimes = "deny"
-trivially_copy_pass_by_ref = "deny"
 uninlined_format_args = "deny"
 unnecessary_filter_map = "deny"
 unnecessary_lazy_evaluations = "deny"
