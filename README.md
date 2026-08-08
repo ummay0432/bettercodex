@@ -28,25 +28,9 @@ bettercodex supports macOS 12 or newer and Linux with glibc 2.31 or newer.
 curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
 ```
 
-Native releases are still in progress. Until they are ready, the installer
-builds from source and needs rustup, a native C toolchain, and several gigabytes
-of free space.
-
 Open a new terminal, then run:
 
 ```sh
 bcodex login
 bcodex
 ```
-
-## Clean up slop
-
-```text
-/review src/tui
-```
-
-Use `/review <target>` in the TUI or put `$review <target>` in any prompt. Review
-edits the code. Point it at a messy part of the codebase and let it clean it up.
-
-More detail is in the [install docs](docs/install.md) and
-[slash command docs](docs/slash_commands.md).
