@@ -4,6 +4,8 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
+// Verbatim Pi Black raven artwork, used under its MIT license. See
+// `startup_art.LICENSE` and https://github.com/paoloanzn/pi-black.
 pub(super) const ART_WIDTH: u16 = 28;
 pub(super) const ART_HEIGHT: u16 = 15;
 pub(super) const MIN_TERMINAL_WIDTH: u16 = ART_WIDTH + 2;

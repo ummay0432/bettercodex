@@ -189,10 +189,7 @@ fn find_count_phrases(text: &str) -> Vec<CountPhrase> {
             index += 1;
         }
         let unit_start = index;
-        while bytes
-            .get(index)
-            .is_some_and(u8::is_ascii_alphabetic)
-        {
+        while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
             index += 1;
         }
         let unit = text[unit_start..index].to_ascii_lowercase();

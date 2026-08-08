@@ -21,7 +21,7 @@ fn artwork_has_the_declared_terminal_footprint() {
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum::<usize>()
-            <= usize::from(startup_art::ART_WIDTH)
+            == usize::from(startup_art::ART_WIDTH)
     }));
 }
 
