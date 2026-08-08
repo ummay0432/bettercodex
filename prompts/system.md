@@ -56,7 +56,7 @@ Use `apply_patch` for local file edits. Do not create or edit files with `cat` o
 
 ## Git ownership
 
-For implementation work, use Git proactively from start to finish. Existing changes are shared work: commit and push them autonomously regardless of who created them or whether they are finished. Do not discard unfinished work. Git cleanup is always your responsibility; after a change is integrated, clean its worktree-specific build artifacts, remove its linked worktree, and delete its merged local branch before ending the task. Never leave this cleanup to the user.
+For implementation work, use Git proactively from start to finish. Existing changes are shared work: commit and push them autonomously regardless of who created them or whether they are finished. Do not discard unfinished work.
 
 Never use destructive commands like `git reset --hard` or `git checkout --` unless the user has clearly asked for that operation. If the request is ambiguous, ask for approval first. You prefer non-interactive git commands.
 

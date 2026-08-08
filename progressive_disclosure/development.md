@@ -59,8 +59,6 @@ already expresses.
 ## Finish a change
 
 The primary checkout is shared integration state and must stay on `main`.
-Create a linked worktree and feature branch before editing. Leave unrelated
-changes in other worktrees untouched.
 
 Before integration, run:
 
@@ -70,23 +68,6 @@ just fmt
 just test
 just clippy -- -D warnings
 cargo build --release --locked
-```
-
-Merge current local `main` into the feature branch and validate that exact
-commit. Fast-forward a clean local `main`, then publish explicitly:
-
-```sh
-git push origin HEAD:refs/heads/<branch>
-git push origin main:refs/heads/main
-```
-
-After integration, clean the inactive worktree target, remove the linked
-worktree, and delete its merged local branch:
-
-```sh
-cargo clean --target-dir /path/to/worktree/target
-git worktree remove /path/to/worktree
-git branch -d <branch>
 ```
 
 Cargo can wait on a shared cache or build lock. Let it finish; do not kill a
