@@ -13,8 +13,7 @@ harness. The plan is to use hooks, Andrej Karpathy's
 looping to make the agent notice problems, do the work, and clean up after
 itself.
 
-`$review` is goated, good at cleaning up slop and refactoring code. the agent
-can use it on its own too.
+$review is goated, use rigirously to deslop for the time being
 
 This is early, unofficial, and not an OpenAI product.
 
