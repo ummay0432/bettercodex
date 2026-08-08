@@ -36,12 +36,11 @@ class InstallScriptTest(unittest.TestCase):
             temporary.mkdir()
             marker = root / "installer-ran"
             write_executable(
-                fake_bin / "gh",
+                fake_bin / "curl",
                 "#!/bin/sh\n"
-                "case \"$*\" in\n"
-                "  'auth status --active --hostname github.com') exit 0 ;;\n"
-                "  'api --hostname github.com -H Accept: application/vnd.github.raw+json "
-                "repos/ummay0432/bettercodex/contents/scripts/install.sh')\n"
+                "for argument do url=\"$argument\"; done\n"
+                "case \"$url\" in\n"
+                "  'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh')\n"
                 "    printf '%s\\n' '#!/bin/sh' "
                 "'printf canonical >\"$BCODEX_TEST_BOOTSTRAP_MARKER\"' ;;\n"
                 "  *) exit 2 ;;\n"
@@ -76,13 +75,8 @@ class InstallScriptTest(unittest.TestCase):
             temporary = root / "temporary"
             temporary.mkdir()
             write_executable(
-                fake_bin / "gh",
-                "#!/bin/sh\n"
-                "case \"$1:$2\" in\n"
-                "  auth:status) exit 0 ;;\n"
-                "  api:--hostname) printf '%s\\n' '#!/bin/sh' 'exit 0'; exit 7 ;;\n"
-                "  *) exit 2 ;;\n"
-                "esac\n",
+                fake_bin / "curl",
+                "#!/bin/sh\nprintf '%s\\n' '#!/bin/sh' 'exit 0'; exit 7\n",
             )
             environment = os.environ.copy()
             environment.update(
@@ -101,17 +95,17 @@ class InstallScriptTest(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("could not fetch the private installer", result.stderr)
+            self.assertIn("could not fetch the public installer", result.stderr)
             self.assertEqual(list(temporary.iterdir()), [])
 
-    def test_bootstrap_reports_missing_github_auth_before_creating_a_temp_file(self) -> None:
+    def test_bootstrap_rejects_an_invalid_downloaded_installer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "fake-bin"
             fake_bin.mkdir()
             temporary = root / "temporary"
             temporary.mkdir()
-            write_executable(fake_bin / "gh", "#!/bin/sh\nexit 1\n")
+            write_executable(fake_bin / "curl", "#!/bin/sh\nprintf 'not a shell script\\n'\n")
             environment = os.environ.copy()
             environment.update(
                 {
@@ -129,10 +123,10 @@ class InstallScriptTest(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("gh auth login --hostname github.com", result.stderr)
+            self.assertIn("GitHub returned an invalid installer", result.stderr)
             self.assertEqual(list(temporary.iterdir()), [])
 
-    def test_bootstrap_reports_a_missing_github_cli_without_creating_a_temp_file(self) -> None:
+    def test_bootstrap_reports_missing_curl_without_creating_a_temp_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "empty-bin"
@@ -156,10 +150,10 @@ class InstallScriptTest(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("GitHub CLI is required", result.stderr)
+            self.assertIn("curl is required", result.stderr)
             self.assertEqual(list(temporary.iterdir()), [])
 
-    def test_install_and_update_reuse_downloads_without_retaining_build_output(self) -> None:
+    def test_install_and_update_reuse_downloads_and_compiled_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "friend's better codex"
             legacy = root / "cache" / "bettercodex"
@@ -178,7 +172,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertIn("Installed bcodex", first.stdout)
             self.assertIn("Updated bcodex", second.stdout)
-            self.assertIn("retained dependency downloads", second.stdout)
+            self.assertIn("retained compiled dependencies", second.stdout)
             installed = root / "install" / "bin" / "bcodex"
             self.assertEqual(run_binary(installed, "--version"), f"bcodex {VERSION}\n")
             self.assertEqual(run_binary(installed, "--internal-source-revision"), f"{COMMIT}\n")
@@ -190,7 +184,7 @@ class InstallScriptTest(unittest.TestCase):
                 f"export PATH='{escaped_install_dir}':\"$PATH\"",
                 profile,
             )
-            self.assertFalse((legacy / "build").exists())
+            self.assertFalse((legacy / "build" / "target").exists())
             self.assertFalse((legacy / "tmp").exists())
             self.assertTrue((legacy / "rusty-v8-retained-development-cache").is_dir())
             self.assertEqual((legacy / "keep").read_text(encoding="utf-8"), "operator data")
@@ -199,6 +193,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertEqual(len(builds), 2)
             expected_cargo_home = legacy / "cargo"
             expected_cache_home = root / "cache"
+            expected_target = legacy / "build" / "x86_64-unknown-linux-gnu" / "target"
             for build in builds:
                 revision, cargo_home, target, cache_home, compiler_tmp, arguments = build.split(
                     "|", 5
@@ -207,17 +202,23 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertEqual(arguments, "build --release --locked --bin bcodex")
                 self.assertEqual(Path(cargo_home), expected_cargo_home)
                 self.assertEqual(Path(cache_home), expected_cache_home)
-                for disposable_path in (target, compiler_tmp):
-                    self.assertIn("bettercodex-install.", disposable_path)
-                    self.assertFalse(Path(disposable_path).exists())
+                self.assertEqual(Path(target), expected_target)
+                self.assertIn("bettercodex-install.", compiler_tmp)
+                self.assertFalse(Path(compiler_tmp).exists())
             self.assertTrue(expected_cargo_home.is_dir())
+            self.assertTrue((expected_target / "release" / "deps" / "fixture-dependency.rlib").is_file())
+            self.assertFalse((expected_target / "release" / "bcodex").exists())
+            self.assertEqual(
+                (root / "compile.log").read_text(encoding="utf-8").splitlines(),
+                ["dependency"],
+            )
             self.assertEqual(
                 (root / "download.log").read_text(encoding="utf-8").splitlines(),
                 ["cargo", "v8"],
             )
             assert_no_installer_residue(self, root)
 
-    def test_retries_with_a_fresh_target_when_main_advances(self) -> None:
+    def test_retries_with_the_same_dependency_cache_when_main_advances(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
 
@@ -234,10 +235,14 @@ class InstallScriptTest(unittest.TestCase):
             )
             builds = (root / "build.log").read_text(encoding="utf-8").splitlines()
             self.assertEqual([build.split("|", 1)[0] for build in builds], [COMMIT, NEXT_COMMIT])
-            self.assertNotEqual(builds[0].split("|")[2], builds[1].split("|")[2])
-            requests = (root / "gh.log").read_text(encoding="utf-8")
-            self.assertIn(f"tarball/{COMMIT}", requests)
-            self.assertIn(f"tarball/{NEXT_COMMIT}", requests)
+            self.assertEqual(builds[0].split("|")[2], builds[1].split("|")[2])
+            self.assertEqual(
+                (root / "compile.log").read_text(encoding="utf-8").splitlines(),
+                ["dependency"],
+            )
+            requests = (root / "github.log").read_text(encoding="utf-8")
+            self.assertIn(f"tar.gz/{COMMIT}", requests)
+            self.assertIn(f"tar.gz/{NEXT_COMMIT}", requests)
             assert_no_installer_residue(self, root)
 
     def test_failed_build_or_verification_preserves_the_existing_binary(self) -> None:
@@ -259,7 +264,17 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(expected_error, result.stderr)
                 self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
-                self.assertFalse(retired_build.parent.exists())
+                self.assertFalse(retired_build.exists())
+                self.assertTrue(
+                    (
+                        retired_build.parent
+                        / "x86_64-unknown-linux-gnu"
+                        / "target"
+                        / "release"
+                        / "deps"
+                        / "fixture-dependency.rlib"
+                    ).is_file()
+                )
                 assert_no_installer_residue(self, root)
 
     def test_stale_lock_recovers_an_orphaned_temp_tree_and_stage(self) -> None:
@@ -285,12 +300,12 @@ class InstallScriptTest(unittest.TestCase):
 
     def test_all_supported_native_hosts_use_the_same_exact_source_flow(self) -> None:
         platforms = (
-            ("Darwin", "arm64", "/bin/zsh", ".zprofile", "macOS ARM64"),
-            ("Darwin", "x86_64", "/bin/zsh", ".zprofile", "macOS x86-64"),
-            ("Linux", "aarch64", "/bin/bash", ".bashrc", "Linux ARM64"),
-            ("Linux", "x86_64", "/bin/bash", ".bashrc", "Linux x86-64"),
+            ("Darwin", "arm64", "/bin/zsh", ".zprofile", "macOS ARM64", "aarch64-apple-darwin"),
+            ("Darwin", "x86_64", "/bin/zsh", ".zprofile", "macOS x86-64", "x86_64-apple-darwin"),
+            ("Linux", "aarch64", "/bin/bash", ".bashrc", "Linux ARM64", "aarch64-unknown-linux-gnu"),
+            ("Linux", "x86_64", "/bin/bash", ".bashrc", "Linux x86-64", "x86_64-unknown-linux-gnu"),
         )
-        for system, machine, shell, profile, label in platforms:
+        for system, machine, shell, profile, label, host_target in platforms:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
 
@@ -298,8 +313,16 @@ class InstallScriptTest(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f"for {label}", result.stdout)
-                self.assertIn(f"tarball/{COMMIT}", (root / "gh.log").read_text(encoding="utf-8"))
+                self.assertIn(
+                    f"tar.gz/{COMMIT}",
+                    (root / "github.log").read_text(encoding="utf-8"),
+                )
                 self.assertTrue((root / "home" / profile).is_file())
+                build = (root / "build.log").read_text(encoding="utf-8").strip().split("|")
+                self.assertEqual(
+                    Path(build[2]),
+                    root / "cache" / "bettercodex" / "build" / host_target / "target",
+                )
                 assert_no_installer_residue(self, root)
 
     def test_explicit_install_directory_works_without_home(self) -> None:
@@ -325,6 +348,16 @@ class InstallScriptTest(unittest.TestCase):
             self.assertEqual(
                 Path(build[1]), root / "home" / ".cache" / "bettercodex" / "cargo"
             )
+            self.assertEqual(
+                Path(build[2]),
+                root
+                / "home"
+                / ".cache"
+                / "bettercodex"
+                / "build"
+                / "x86_64-unknown-linux-gnu"
+                / "target",
+            )
             self.assertEqual(Path(build[3]), root / "home" / ".cache")
             assert_no_installer_residue(self, root)
 
@@ -337,7 +370,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("dependency downloads cannot be reused", result.stderr)
             build = (root / "build.log").read_text(encoding="utf-8").strip().split("|")
-            for disposable_path in (build[1], build[3]):
+            for disposable_path in (build[1], build[2], build[3], build[4]):
                 self.assertIn("bettercodex-install.", disposable_path)
                 self.assertFalse(Path(disposable_path).exists())
             assert_no_installer_residue(self, root)
@@ -362,7 +395,50 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn("bettercodex-install.", install_home)
             self.assertTrue(install_home.endswith("/rustup-home"))
             self.assertFalse(Path(install_home).exists())
-            self.assertIn("disposable install tree", result.stdout)
+            self.assertIn("retained compiled dependencies", result.stdout)
+            assert_no_installer_residue(self, root)
+
+    def test_known_revision_skips_the_redundant_initial_main_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, install_revision=COMMIT)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (root / "main-request-count").read_text(encoding="utf-8").strip(),
+                "1",
+            )
+            self.assertEqual(
+                run_binary(root / "install" / "bin" / "bcodex", "--internal-source-revision"),
+                f"{COMMIT}\n",
+            )
+            assert_no_installer_residue(self, root)
+
+    def test_changed_build_identity_replaces_one_cache_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            first = run_installer(root)
+            identity = (
+                root
+                / "cache"
+                / "bettercodex"
+                / "build"
+                / "x86_64-unknown-linux-gnu"
+                / "identity"
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            identity.write_text("incompatible fixture\n", encoding="utf-8")
+
+            second = run_installer(root)
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("Resetting incompatible compiled-dependency cache", second.stdout)
+            self.assertEqual(
+                (root / "compile.log").read_text(encoding="utf-8").splitlines(),
+                ["dependency", "dependency"],
+            )
             assert_no_installer_residue(self, root)
 
     def test_transient_github_failures_retry_without_mixing_partial_archives(self) -> None:
@@ -475,7 +551,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn(" to PATH in your shell profile", result.stdout)
             assert_no_installer_residue(self, root)
 
-    def test_retired_cache_cleanup_never_follows_a_symlink(self) -> None:
+    def test_compiled_cache_never_follows_a_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             outside = root / "operator-cache"
@@ -489,9 +565,21 @@ class InstallScriptTest(unittest.TestCase):
             result = run_installer(root)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("not removing retired cache symlink", result.stderr)
+            self.assertIn("is not a regular directory; using disposable output", result.stderr)
             self.assertTrue((legacy / "build").is_symlink())
             self.assertEqual(keep.read_text(encoding="utf-8"), "operator data")
+            assert_no_installer_residue(self, root)
+
+    def test_invalid_requested_revision_stops_before_network_or_build_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, install_revision="not-a-commit")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("BCODEX_INSTALL_REVISION must be a full", result.stderr)
+            self.assertFalse((root / "github.log").exists())
+            self.assertFalse((root / "build.log").exists())
             assert_no_installer_residue(self, root)
 
     def test_failed_exit_cleanup_keeps_a_record_for_the_next_install(self) -> None:
@@ -522,7 +610,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertNotEqual(
                 result.returncode,
                 0,
-                f"{result.stdout}\n{result.stderr}\n{(root / 'gh.log').read_text(encoding='utf-8')}",
+                f"{result.stdout}\n{result.stderr}\n{(root / 'github.log').read_text(encoding='utf-8')}",
             )
             self.assertIn("main kept advancing during all 3 build attempts", result.stderr)
             self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
@@ -576,11 +664,11 @@ def run_installer(
     *,
     system: str = "Linux",
     machine: str = "x86_64",
-    authenticated: bool = True,
     archive_failures: int = 0,
     build_success: bool = True,
     compiler_works: bool = True,
     embedded_revision: str | None = None,
+    install_revision: str | None = None,
     main_failures: int = 0,
     smoke_success: bool = True,
     next_commit: str = COMMIT,
@@ -616,16 +704,14 @@ def run_installer(
         ),
     )
     write_executable(
-        fake_bin / "gh",
+        fake_bin / "curl",
         textwrap.dedent(
             """\
             #!/bin/sh
-            printf '%s\\n' "$*" >>"$BCODEX_TEST_GH_LOG"
-            case "$*" in
-              'auth status --active --hostname github.com')
-                [ "$BCODEX_TEST_AUTHENTICATED" = "1" ]
-                ;;
-              "api --hostname github.com repos/$BCODEX_TEST_REPOSITORY/commits/main --jq .sha")
+            printf '%s\\n' "$*" >>"$BCODEX_TEST_GITHUB_LOG"
+            for argument do url="$argument"; done
+            case "$url" in
+              "https://api.github.com/repos/$BCODEX_TEST_REPOSITORY/commits/main")
                 count=0
                 if [ -f "$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE" ]; then
                   count="$(sed -n '1p' "$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE")"
@@ -638,18 +724,19 @@ def run_installer(
                 success_count=$((count - BCODEX_TEST_MAIN_FAILURES))
                 if [ "$BCODEX_TEST_ADVANCING_MAIN" = 1 ]; then
                   case "$success_count" in
-                    1) printf '%s\\n' "$BCODEX_TEST_COMMIT" ;;
-                    2 | 3) printf '%s\\n' "$BCODEX_TEST_NEXT_COMMIT" ;;
-                    4 | 5) printf '%040d\\n' 0 | tr 0 c ;;
-                    *) printf '%040d\\n' 0 | tr 0 d ;;
+                    1) revision="$BCODEX_TEST_COMMIT" ;;
+                    2 | 3) revision="$BCODEX_TEST_NEXT_COMMIT" ;;
+                    4 | 5) revision="$(printf '%040d\\n' 0 | tr 0 c)" ;;
+                    *) revision="$(printf '%040d\\n' 0 | tr 0 d)" ;;
                   esac
                 elif [ "$success_count" -eq 1 ]; then
-                  printf '%s\\n' "$BCODEX_TEST_COMMIT"
+                  revision="$BCODEX_TEST_COMMIT"
                 else
-                  printf '%s\\n' "$BCODEX_TEST_NEXT_COMMIT"
+                  revision="$BCODEX_TEST_NEXT_COMMIT"
                 fi
+                printf '{\\n  "sha": "%s"\\n}\\n' "$revision"
                 ;;
-              "api --hostname github.com repos/$BCODEX_TEST_REPOSITORY/tarball/"*)
+              "https://codeload.github.com/$BCODEX_TEST_REPOSITORY/tar.gz/"*)
                 count=0
                 if [ -f "$BCODEX_TEST_ARCHIVE_REQUEST_COUNT_FILE" ]; then
                   count="$(sed -n '1p' "$BCODEX_TEST_ARCHIVE_REQUEST_COUNT_FILE")"
@@ -667,7 +754,7 @@ def run_installer(
             """
         ),
     )
-    for command in ("cargo", "curl", "rustc"):
+    for command in ("cargo", "rustc"):
         write_executable(fake_bin / command, "#!/bin/sh\nexit 0\n")
     write_executable(
         fake_bin / "cc",
@@ -723,13 +810,16 @@ def run_installer(
     environment = os.environ.copy()
     for name in (
         "BCODEX_INSTALL_DIR",
+        "BCODEX_INSTALL_REVISION",
         "BCODEX_REPOSITORY",
         "BCODEX_SOURCE_REVISION",
+        "CARGO_BUILD_JOBS",
         "CARGO_BUILD_BUILD_DIR",
         "CARGO_BUILD_TARGET",
         "CARGO_BUILD_TARGET_DIR",
         "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_HOME",
+        "CARGO_INCREMENTAL",
         "CARGO_INSTALL_ROOT",
         "CARGO_TARGET_DIR",
         "RUSTC_WORKSPACE_WRAPPER",
@@ -751,17 +841,17 @@ def run_installer(
             "BCODEX_TEST_ARCHIVE_REQUEST_COUNT_FILE": str(
                 root / "archive-request-count"
             ),
-            "BCODEX_TEST_AUTHENTICATED": "1" if authenticated else "0",
             "BCODEX_TEST_BUILD_LOG": str(root / "build.log"),
             "BCODEX_TEST_BUILD_SUCCESS": "1" if build_success else "0",
             "BCODEX_TEST_BUILT_VERSION": VERSION,
             "BCODEX_TEST_COMMIT": COMMIT,
+            "BCODEX_TEST_COMPILE_LOG": str(root / "compile.log"),
             "BCODEX_TEST_CLEANUP_SUCCESS": "1" if cleanup_success else "0",
             "BCODEX_TEST_COMPILER_WORKS": "1" if compiler_works else "0",
             "BCODEX_TEST_DOWNLOAD_LOG": str(root / "download.log"),
             "BCODEX_TEST_EMBEDDED_REVISION": embedded_revision or "",
             "BCODEX_TEST_FAKE_BIN": str(fake_bin),
-            "BCODEX_TEST_GH_LOG": str(root / "gh.log"),
+            "BCODEX_TEST_GITHUB_LOG": str(root / "github.log"),
             "BCODEX_TEST_MAIN_FAILURES": str(main_failures),
             "BCODEX_TEST_MAIN_REQUEST_COUNT_FILE": str(root / "main-request-count"),
             "BCODEX_TEST_NEXT_COMMIT": next_commit,
@@ -777,6 +867,8 @@ def run_installer(
     )
     if xdg_cache_enabled:
         environment["XDG_CACHE_HOME"] = str(root / "cache")
+    if install_revision is not None:
+        environment["BCODEX_INSTALL_REVISION"] = install_revision
     if home_enabled:
         environment["HOME"] = str(home)
     else:
@@ -812,6 +904,12 @@ def create_source_archive(root: Path) -> Path:
               mkdir -p "$(dirname "$v8_download")"
               printf '%s\\n' v8 >>"$BCODEX_TEST_DOWNLOAD_LOG"
               : >"$v8_download"
+            fi
+            compiled_dependency="$CARGO_TARGET_DIR/release/deps/fixture-dependency.rlib"
+            if [ ! -f "$compiled_dependency" ]; then
+              mkdir -p "$(dirname "$compiled_dependency")"
+              printf '%s\\n' dependency >>"$BCODEX_TEST_COMPILE_LOG"
+              : >"$compiled_dependency"
             fi
             printf '%s|%s|%s|%s|%s|%s\\n' \
               "$BCODEX_SOURCE_REVISION" "$CARGO_HOME" "$CARGO_TARGET_DIR" \

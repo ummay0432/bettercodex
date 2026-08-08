@@ -1,14 +1,14 @@
-//! Source-revision checks and the self-cleaning update command.
+//! Source-revision checks and the local update command.
 //!
-//! Installed builds compare their embedded source revision with private `main`
+//! Installed builds compare their embedded source revision with public `main`
 //! after the TUI renders. The explicit command fetches the current installer,
 //! mirroring upstream Codex's standalone update path, and that installer builds
-//! one immutable source commit with disposable build output and a reusable
-//! dependency download cache.
+//! one immutable source commit while reusing compatible dependency artifacts.
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use serde::Deserialize;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
@@ -19,11 +19,34 @@ use std::time::Duration;
 use tokio::process::Command as AsyncProcessCommand;
 
 const DEFAULT_REPOSITORY: &str = "ummay0432/bettercodex";
-const GITHUB_HOST: &str = "github.com";
+const GITHUB_API_ROOT: &str = "https://api.github.com";
+const GITHUB_RAW_ROOT: &str = "https://raw.githubusercontent.com";
 const INSTALLER_PATH: &str = "scripts/install.sh";
 const MAX_INSTALLER_BYTES: usize = 1024 * 1024;
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const INSTALL_DIR_ENV: &str = "BCODEX_INSTALL_DIR";
+const INSTALL_REVISION_ENV: &str = "BCODEX_INSTALL_REVISION";
+
+const CURL_ARGUMENTS: &[&str] = &[
+    "--proto",
+    "=https",
+    "--tlsv1.2",
+    "--fail",
+    "--silent",
+    "--show-error",
+    "--location",
+    "--connect-timeout",
+    "10",
+    "--max-time",
+    "30",
+    "--user-agent",
+    "bettercodex",
+];
+
+#[derive(Deserialize)]
+struct GitHubCommitResponse {
+    sha: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AvailableUpdate {
@@ -56,7 +79,7 @@ impl AvailableUpdate {
     }
 }
 
-/// Checks once for a different private `main` revision after the TUI renders.
+/// Checks once for a different public `main` revision after the TUI renders.
 ///
 /// Development builds stay offline. Installed builds can opt out by setting
 /// `BCODEX_SKIP_UPDATE_CHECK`. Failures stay silent and are retried on the next
@@ -66,10 +89,9 @@ pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
         return None;
     }
     let current_revision = source_revision()?;
-    let _ = tokio::task::spawn_blocking(cleanup_legacy_updater_cache).await;
     let repository = configured_repository().ok()?;
     check_for_source_update_with(
-        OsStr::new("gh"),
+        OsStr::new("curl"),
         &repository,
         current_revision,
         UPDATE_CHECK_TIMEOUT,
@@ -82,7 +104,7 @@ pub(crate) fn source_revision() -> Option<&'static str> {
 }
 
 async fn check_for_source_update_with(
-    gh_program: &OsStr,
+    curl_program: &OsStr,
     repository: &str,
     current_revision: &str,
     timeout: Duration,
@@ -90,11 +112,11 @@ async fn check_for_source_update_with(
     if !is_source_revision(current_revision) || validate_repository(repository).is_err() {
         return None;
     }
-    let endpoint = format!("repos/{repository}/commits/main");
-    let mut command = AsyncProcessCommand::new(gh_program);
+    let url = commit_api_url(repository);
+    let mut command = AsyncProcessCommand::new(curl_program);
     command
-        .args(["api", "--hostname", GITHUB_HOST, &endpoint, "--jq", ".sha"])
-        .env("GH_PROMPT_DISABLED", "1")
+        .args(CURL_ARGUMENTS)
+        .args(["--header", "Accept: application/vnd.github+json", &url])
         .stdin(Stdio::null())
         .kill_on_drop(true);
     let output = tokio::time::timeout(timeout, command.output())
@@ -104,13 +126,28 @@ async fn check_for_source_update_with(
     if !output.status.success() {
         return None;
     }
-    let latest_revision = std::str::from_utf8(&output.stdout).ok()?.trim();
-    if !is_source_revision(latest_revision)
-        || latest_revision.eq_ignore_ascii_case(current_revision)
-    {
+    let latest_revision = parse_github_revision(&output.stdout).ok()?;
+    if latest_revision.eq_ignore_ascii_case(current_revision) {
         return None;
     }
-    Some(AvailableUpdate::new(current_revision, latest_revision))
+    Some(AvailableUpdate::new(current_revision, &latest_revision))
+}
+
+fn commit_api_url(repository: &str) -> String {
+    format!("{GITHUB_API_ROOT}/repos/{repository}/commits/main")
+}
+
+fn installer_url(repository: &str, revision: &str) -> String {
+    format!("{GITHUB_RAW_ROOT}/{repository}/{revision}/{INSTALLER_PATH}")
+}
+
+fn parse_github_revision(response: &[u8]) -> Result<String> {
+    let response: GitHubCommitResponse = serde_json::from_slice(response)
+        .context("GitHub returned an invalid BetterCodex revision response")?;
+    if !is_source_revision(&response.sha) {
+        bail!("GitHub returned an invalid BetterCodex source revision");
+    }
+    Ok(response.sha.to_ascii_lowercase())
 }
 
 fn is_source_revision(revision: &str) -> bool {
@@ -152,8 +189,7 @@ pub(crate) fn run_update() -> Result<()> {
         "this build has no embedded source revision; install BetterCodex with INSTALL_COMMAND.txt before using `bcodex update`",
     )?;
     let repository = configured_repository()?;
-    cleanup_legacy_updater_cache()?;
-    let latest_revision = resolve_source_revision(OsStr::new("gh"), &repository)?;
+    let latest_revision = resolve_source_revision(OsStr::new("curl"), &repository)?;
     if latest_revision.eq_ignore_ascii_case(current_revision) {
         let mut output = std::io::stdout().lock();
         writeln!(
@@ -169,37 +205,37 @@ pub(crate) fn run_update() -> Result<()> {
     let configured_dir = std::env::var_os(INSTALL_DIR_ENV);
     let install_dir = update_install_dir(&executable, configured_dir.as_deref())?;
     let installer = fetch_installer(
-        OsStr::new("gh"),
+        OsStr::new("curl"),
         &repository,
         &latest_revision,
         MAX_INSTALLER_BYTES,
     )?;
-    run_installer_script(&installer, OsStr::new("/bin/sh"), &install_dir, &repository)
+    run_installer_script(
+        &installer,
+        OsStr::new("/bin/sh"),
+        &install_dir,
+        &repository,
+        &latest_revision,
+    )
 }
 
-fn resolve_source_revision(gh_program: &OsStr, repository: &str) -> Result<String> {
+fn resolve_source_revision(curl_program: &OsStr, repository: &str) -> Result<String> {
     validate_repository(repository)?;
-    let endpoint = format!("repos/{repository}/commits/main");
-    let output = ProcessCommand::new(gh_program)
-        .args(["api", "--hostname", GITHUB_HOST, &endpoint, "--jq", ".sha"])
-        .env("GH_PROMPT_DISABLED", "1")
+    let url = commit_api_url(repository);
+    let output = ProcessCommand::new(curl_program)
+        .args(CURL_ARGUMENTS)
+        .args(["--header", "Accept: application/vnd.github+json", &url])
         .stdin(Stdio::null())
         .output()
         .context("could not query the current BetterCodex main commit")?;
     if !output.status.success() {
-        bail!("GitHub could not resolve private BetterCodex main");
+        bail!("GitHub could not resolve BetterCodex main");
     }
-    let revision = std::str::from_utf8(&output.stdout)
-        .context("GitHub returned a non-UTF-8 BetterCodex revision")?
-        .trim();
-    if !is_source_revision(revision) {
-        bail!("GitHub returned an invalid BetterCodex source revision");
-    }
-    Ok(revision.to_ascii_lowercase())
+    parse_github_revision(&output.stdout)
 }
 
 fn fetch_installer(
-    gh_program: &OsStr,
+    curl_program: &OsStr,
     repository: &str,
     revision: &str,
     maximum_bytes: usize,
@@ -208,17 +244,10 @@ fn fetch_installer(
     if !is_source_revision(revision) {
         bail!("cannot fetch the installer from an invalid source revision");
     }
-    let endpoint = format!("repos/{repository}/contents/{INSTALLER_PATH}?ref={revision}");
-    let output = ProcessCommand::new(gh_program)
-        .args([
-            "api",
-            "--hostname",
-            GITHUB_HOST,
-            "-H",
-            "Accept: application/vnd.github.raw+json",
-            &endpoint,
-        ])
-        .env("GH_PROMPT_DISABLED", "1")
+    let url = installer_url(repository, revision);
+    let output = ProcessCommand::new(curl_program)
+        .args(CURL_ARGUMENTS)
+        .arg(&url)
         .stdin(Stdio::null())
         .output()
         .context("could not fetch the current BetterCodex installer")?;
@@ -254,10 +283,15 @@ fn run_installer_script(
     shell: &OsStr,
     install_dir: &Path,
     repository: &str,
+    revision: &str,
 ) -> Result<()> {
+    if !is_source_revision(revision) {
+        bail!("cannot run the installer for an invalid source revision");
+    }
     let mut child = ProcessCommand::new(shell)
         .arg("-s")
         .env(INSTALL_DIR_ENV, install_dir)
+        .env(INSTALL_REVISION_ENV, revision)
         .env("BCODEX_REPOSITORY", repository)
         .stdin(Stdio::piped())
         .spawn()
@@ -277,54 +311,6 @@ fn run_installer_script(
         .context("could not wait for the BetterCodex installer")?;
     if !status.success() {
         bail!("BetterCodex installer exited with {status}");
-    }
-    Ok(())
-}
-
-fn cleanup_legacy_updater_cache() -> Result<()> {
-    let xdg_cache_home = std::env::var_os("XDG_CACHE_HOME");
-    let home = std::env::var_os("HOME");
-    let cache_root = legacy_cache_root_from(xdg_cache_home.as_deref(), home.as_deref())?;
-    let Some(cache_root) = cache_root else {
-        return Ok(());
-    };
-    cleanup_legacy_updater_cache_in(&cache_root)
-}
-
-fn legacy_cache_root_from(
-    xdg_cache_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-) -> Result<Option<PathBuf>> {
-    let (base, variable) = if let Some(cache) = xdg_cache_home.filter(|value| !value.is_empty()) {
-        (PathBuf::from(cache), "XDG_CACHE_HOME")
-    } else if let Some(home) = home.filter(|value| !value.is_empty()) {
-        (PathBuf::from(home).join(".cache"), "HOME")
-    } else {
-        return Ok(None);
-    };
-    if !base.is_absolute() {
-        bail!("{variable} must be an absolute path before retired cache cleanup");
-    }
-    Ok(Some(base.join("bettercodex")))
-}
-
-fn cleanup_legacy_updater_cache_in(cache_root: &Path) -> Result<()> {
-    for name in ["build", "tmp"] {
-        let path = cache_root.join(name);
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("could not inspect retired cache {}", path.display())
-                });
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            continue;
-        }
-        std::fs::remove_dir_all(&path)
-            .with_context(|| format!("could not remove retired cache {}", path.display()))?;
     }
     Ok(())
 }

@@ -1,1 +1,24 @@
 /target/
+
+# Local credentials and runtime state must never enter repository history.
+.bcodex/
+.codex/
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+.netrc
+.npmrc
+.pypirc
+.ssh/
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519

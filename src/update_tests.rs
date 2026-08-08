@@ -29,7 +29,7 @@ struct TemporaryProgram {
 impl TemporaryProgram {
     fn new(contents: &str) -> Self {
         let root = TemporaryDirectory::new("update");
-        let path = root.path.join("gh");
+        let path = root.path.join("curl");
         fs::write(&path, contents).unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -59,19 +59,18 @@ fn accepts_only_full_source_revisions_and_safe_repository_names() {
 }
 
 #[tokio::test]
-async fn authenticated_revision_lookup_reports_both_exact_commits() {
+async fn public_revision_lookup_reports_both_exact_commits() {
     let current = "1111111111111111111111111111111111111111";
     let latest = "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD";
-    let gh = TemporaryProgram::new(&format!(
+    let curl = TemporaryProgram::new(&format!(
         "#!/bin/sh\n\
-         test \"$*\" = \"api --hostname github.com repos/owner/private/commits/main --jq .sha\" || exit 2\n\
-         printf '%s\\n' '{latest}'\n"
+         printf '{{\"sha\":\"%s\"}}\\n' '{latest}'\n"
     ));
 
     assert_eq!(
         check_for_source_update_with(
-            gh.path.as_os_str(),
-            "owner/private",
+            curl.path.as_os_str(),
+            "owner/project",
             current,
             Duration::from_secs(1),
         )
@@ -83,8 +82,8 @@ async fn authenticated_revision_lookup_reports_both_exact_commits() {
     );
     assert_eq!(
         check_for_source_update_with(
-            gh.path.as_os_str(),
-            "owner/private",
+            curl.path.as_os_str(),
+            "owner/project",
             latest,
             Duration::from_secs(1),
         )
@@ -98,13 +97,13 @@ async fn failed_malformed_and_timed_out_revision_lookups_are_silent() {
     let revision = "1111111111111111111111111111111111111111";
     for program in [
         "#!/bin/sh\nexit 1\n",
-        "#!/bin/sh\nprintf 'not-a-commit\\n'\n",
+        "#!/bin/sh\nprintf '{\"sha\":\"not-a-commit\"}\\n'\n",
     ] {
-        let gh = TemporaryProgram::new(program);
+        let curl = TemporaryProgram::new(program);
         assert_eq!(
             check_for_source_update_with(
-                gh.path.as_os_str(),
-                "owner/private",
+                curl.path.as_os_str(),
+                "owner/project",
                 revision,
                 Duration::from_secs(1),
             )
@@ -117,7 +116,7 @@ async fn failed_malformed_and_timed_out_revision_lookups_are_silent() {
     assert_eq!(
         check_for_source_update_with(
             slow.path.as_os_str(),
-            "owner/private",
+            "owner/project",
             revision,
             Duration::from_millis(20),
         )
@@ -163,40 +162,44 @@ fn updater_targets_the_running_binary_directory_unless_configured() {
 #[test]
 fn updater_resolves_main_and_fetches_the_installer_from_that_revision() {
     let revision = "2222222222222222222222222222222222222222";
-    let gh = TemporaryProgram::new(&format!(
+    let curl = TemporaryProgram::new(&format!(
         "#!/bin/sh\n\
-         case \"$*\" in\n\
-           'api --hostname github.com repos/owner/private/commits/main --jq .sha') printf '%s\\n' '{revision}' ;;\n\
-           'api --hostname github.com -H Accept: application/vnd.github.raw+json repos/owner/private/contents/scripts/install.sh?ref={revision}') printf '%s\\n' '#!/bin/sh' 'exit 0' ;;\n\
+         for argument do url=\"$argument\"; done\n\
+         case \"$url\" in\n\
+           'https://api.github.com/repos/owner/project/commits/main') printf '{{\"sha\":\"%s\"}}\\n' '{revision}' ;;\n\
+           'https://raw.githubusercontent.com/owner/project/{revision}/scripts/install.sh') printf '%s\\n' '#!/bin/sh' 'exit 0' ;;\n\
            *) exit 2 ;;\n\
          esac\n"
     ));
 
     assert_eq!(
-        resolve_source_revision(gh.path.as_os_str(), "owner/private").unwrap(),
+        resolve_source_revision(curl.path.as_os_str(), "owner/project").unwrap(),
         revision
     );
     assert_eq!(
         fetch_installer(
-            gh.path.as_os_str(),
-            "owner/private",
+            curl.path.as_os_str(),
+            "owner/project",
             revision,
             MAX_INSTALLER_BYTES,
         )
         .unwrap(),
         b"#!/bin/sh\nexit 0\n"
     );
-    assert!(fetch_installer(gh.path.as_os_str(), "owner/private", revision, 8,).is_err());
+    assert!(fetch_installer(curl.path.as_os_str(), "owner/project", revision, 8,).is_err());
 }
 
 #[test]
-fn updater_passes_the_target_directory_and_repository_to_the_installer() {
+fn updater_passes_the_target_directory_repository_and_revision_to_the_installer() {
+    let revision = "2222222222222222222222222222222222222222";
     run_installer_script(
         b"test \"$BCODEX_INSTALL_DIR\" = '/tmp/custom bettercodex'\n\
-          test \"$BCODEX_REPOSITORY\" = owner/private\n",
+          test \"$BCODEX_REPOSITORY\" = owner/project\n\
+          test \"$BCODEX_INSTALL_REVISION\" = 2222222222222222222222222222222222222222\n",
         OsStr::new("/bin/sh"),
         Path::new("/tmp/custom bettercodex"),
-        "owner/private",
+        "owner/project",
+        revision,
     )
     .unwrap();
     assert!(
@@ -204,48 +207,23 @@ fn updater_passes_the_target_directory_and_repository_to_the_installer() {
             b"exit 7\n",
             OsStr::new("/bin/sh"),
             Path::new("/tmp/custom bettercodex"),
-            "owner/private",
+            "owner/project",
+            revision,
         )
         .unwrap_err()
         .to_string()
         .contains("exit status: 7")
     );
-}
-
-#[test]
-fn legacy_cleanup_removes_only_retired_directories() {
-    let temporary = TemporaryDirectory::new("cache");
-    let root = &temporary.path;
-    fs::create_dir_all(root.join("build/target/release")).unwrap();
-    fs::create_dir_all(root.join("tmp/source")).unwrap();
-    fs::create_dir_all(root.join("cargo/git/db")).unwrap();
-    fs::create_dir_all(root.join("rusty-v8-150.4.0-host")).unwrap();
-    fs::write(root.join("keep"), "operator data").unwrap();
-
-    cleanup_legacy_updater_cache_in(root).unwrap();
-
-    assert!(!root.join("build").exists());
-    assert!(!root.join("tmp").exists());
-    assert!(root.join("cargo/git/db").is_dir());
-    assert!(root.join("rusty-v8-150.4.0-host").is_dir());
-    assert_eq!(
-        fs::read_to_string(root.join("keep")).unwrap(),
-        "operator data"
+    assert!(
+        run_installer_script(
+            b"exit 0\n",
+            OsStr::new("/bin/sh"),
+            Path::new("/tmp/custom bettercodex"),
+            "owner/project",
+            "not-a-revision",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("invalid source revision")
     );
-}
-
-#[test]
-fn legacy_cache_root_requires_absolute_environment_paths() {
-    assert_eq!(
-        legacy_cache_root_from(Some(OsStr::new("/srv/cache")), Some(OsStr::new("/home/me")))
-            .unwrap(),
-        Some(PathBuf::from("/srv/cache/bettercodex"))
-    );
-    assert_eq!(
-        legacy_cache_root_from(Some(OsStr::new("")), Some(OsStr::new("/home/me"))).unwrap(),
-        Some(PathBuf::from("/home/me/.cache/bettercodex"))
-    );
-    assert!(legacy_cache_root_from(Some(OsStr::new("relative")), None).is_err());
-    assert!(legacy_cache_root_from(None, Some(OsStr::new("relative"))).is_err());
-    assert_eq!(legacy_cache_root_from(None, None).unwrap(), None);
 }

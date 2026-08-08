@@ -1,14 +1,15 @@
 #!/bin/sh
 
-# Install the current integrated BetterCodex source with a reusable dependency
-# download cache but no retained source or compilation output. This script is
-# also fetched and run by `bcodex update`, following upstream Codex's
-# standalone-updater pattern.
+# Install the current integrated BetterCodex source with reusable dependency
+# downloads and compiled dependencies. Source and compiler scratch space remain
+# disposable. This script is also fetched and run by `bcodex update`, following
+# upstream Codex's standalone-updater pattern.
 
 set -eu
 
 DEFAULT_REPOSITORY="ummay0432/bettercodex"
-GITHUB_HOST="github.com"
+GITHUB_API_ROOT="https://api.github.com"
+GITHUB_ARCHIVE_ROOT="https://codeload.github.com"
 MAX_GITHUB_ATTEMPTS=3
 MAX_SOURCE_ATTEMPTS=3
 
@@ -16,6 +17,8 @@ tmp_dir=""
 staged_binary=""
 lock_dir=""
 lock_acquired=0
+build_cache_used=0
+target_dir=""
 
 step() {
   printf '==> %s\n' "$1"
@@ -34,11 +37,11 @@ usage() {
   cat <<EOF
 Usage: install.sh
 
-Resolves private BetterCodex main to an immutable commit, compiles that source
+Resolves public BetterCodex main to an immutable commit, compiles that source
 for this Mac or Linux computer, verifies the result, and atomically installs it.
-Source, compiler scratch space, compilation output, and any installer-only Rust
-toolchain created by the install are removed. Cargo dependency downloads and
-verified V8 artifacts are reused from the BetterCodex cache.
+Source, compiler scratch space, BetterCodex-owned outputs, and any installer-only
+Rust toolchain created by the install are removed. Cargo dependency downloads,
+verified V8 artifacts, and compatible compiled dependencies are reused.
 
 Environment:
   BCODEX_INSTALL_DIR  Binary directory (default: \$HOME/.local/bin).
@@ -82,6 +85,12 @@ cleanup_recorded_temp() {
 cleanup() {
   set +e
   cleanup_incomplete=0
+  if [ "$build_cache_used" -eq 1 ] && [ -n "$target_dir" ]; then
+    if ! remove_bettercodex_outputs; then
+      cleanup_incomplete=1
+      warn "could not remove BetterCodex-owned compilation output from $target_dir"
+    fi
+  fi
   if [ -n "$staged_binary" ]; then
     if ! rm -f "$staged_binary"; then
       cleanup_incomplete=1
@@ -178,6 +187,14 @@ case "$(uname -m)" in
   *) fail "unsupported architecture: $(uname -m)" ;;
 esac
 
+case "$os:$arch" in
+  macOS:x86-64) host_target="x86_64-apple-darwin" ;;
+  macOS:ARM64) host_target="aarch64-apple-darwin" ;;
+  Linux:x86-64) host_target="x86_64-unknown-linux-gnu" ;;
+  Linux:ARM64) host_target="aarch64-unknown-linux-gnu" ;;
+  *) fail "could not determine the native Rust target" ;;
+esac
+
 require_command awk
 require_command cmp
 require_command curl
@@ -187,9 +204,6 @@ require_command mktemp
 require_command sed
 require_command tar
 
-if ! command -v gh >/dev/null 2>&1; then
-  fail "GitHub CLI is required; install it from https://cli.github.com/ and retry"
-fi
 if ! command -v rustup >/dev/null 2>&1; then
   fail "rustup is required; install Rust from https://rustup.rs/ and retry"
 fi
@@ -198,11 +212,6 @@ if ! command -v cc >/dev/null 2>&1 || ! cc --version >/dev/null 2>&1; then
     fail "Xcode Command Line Tools are required; run 'xcode-select --install', finish the installation, and retry"
   fi
   fail "a working native C compiler is required; install your system's C build tools and retry"
-fi
-
-export GH_PROMPT_DISABLED=1
-if ! gh auth status --active --hostname "$GITHUB_HOST" >/dev/null 2>&1; then
-  fail "GitHub CLI is not signed in to $GITHUB_HOST; run 'gh auth login --hostname $GITHUB_HOST' and retry"
 fi
 
 mkdir -p "$bin_dir"
@@ -268,7 +277,9 @@ fi
 cleanup_retired_updater_cache() {
   [ -n "$cache_root" ] || return 0
 
-  for legacy_path in "$cache_root/build" "$cache_root/tmp"; do
+  # The retired cache used build/target directly. The current cache stores one
+  # compatible generation below build/<host>/target.
+  for legacy_path in "$cache_root/build/target" "$cache_root/tmp"; do
     if [ -L "$legacy_path" ]; then
       warn "not removing retired cache symlink $legacy_path"
     elif [ -d "$legacy_path" ]; then
@@ -278,19 +289,39 @@ cleanup_retired_updater_cache() {
   done
 }
 
-# Free space held by the retired updater before this source build needs its
-# several-gigabyte temporary target. Only the old updater's build and source
-# directories are in scope; reusable dependency downloads stay untouched.
+# Remove only layouts that cannot be reused by the current updater.
 cleanup_retired_updater_cache
+
+github_get() {
+  curl \
+    --proto '=https' \
+    --tlsv1.2 \
+    --fail \
+    --silent \
+    --show-error \
+    --location \
+    --connect-timeout 10 \
+    --max-time 120 \
+    --user-agent bettercodex \
+    --header 'Accept: application/vnd.github+json' \
+    "$1"
+}
 
 resolve_main_commit() {
   github_attempt=1
   while [ "$github_attempt" -le "$MAX_GITHUB_ATTEMPTS" ]; do
-    if github_commit="$(
-      gh api --hostname "$GITHUB_HOST" "repos/$repository/commits/main" --jq .sha 2>/dev/null
+    if github_response="$(
+      github_get "$GITHUB_API_ROOT/repos/$repository/commits/main" 2>/dev/null
     )"; then
-      printf '%s\n' "$github_commit"
-      return 0
+      github_commit="$(
+        printf '%s\n' "$github_response" |
+          sed -n 's/^[[:space:]]*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' |
+          sed -n '1p'
+      )"
+      if is_source_revision "$github_commit"; then
+        printf '%s\n' "$github_commit"
+        return 0
+      fi
     fi
     if [ "$github_attempt" -lt "$MAX_GITHUB_ATTEMPTS" ]; then
       warn "GitHub request failed; retrying ($((github_attempt + 1))/$MAX_GITHUB_ATTEMPTS)"
@@ -308,8 +339,8 @@ download_source_archive() {
   github_attempt=1
   while [ "$github_attempt" -le "$MAX_GITHUB_ATTEMPTS" ]; do
     rm -f "$archive_partial"
-    if gh api --hostname "$GITHUB_HOST" \
-      "repos/$repository/tarball/$archive_revision" >"$archive_partial" &&
+    if github_get \
+      "$GITHUB_ARCHIVE_ROOT/$repository/tar.gz/$archive_revision" >"$archive_partial" &&
       [ -s "$archive_partial" ]; then
       mv "$archive_partial" "$archive_destination"
       return 0
@@ -326,6 +357,102 @@ download_source_archive() {
 
 is_source_revision() {
   printf '%s\n' "$1" | grep -Eq '^[0-9a-fA-F]{40}$'
+}
+
+requested_revision="${BCODEX_INSTALL_REVISION:-}"
+if [ -n "$requested_revision" ] && ! is_source_revision "$requested_revision"; then
+  fail "BCODEX_INSTALL_REVISION must be a full 40-character commit ID"
+fi
+
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  else
+    return 1
+  fi
+}
+
+prepare_compilation_target() {
+  build_cache_used=0
+  target_dir="$attempt_root/target"
+  [ -n "$cache_root" ] || return 0
+
+  build_root="$cache_root/build"
+  target_cache="$build_root/$host_target"
+  if [ -L "$build_root" ] || { [ -e "$build_root" ] && [ ! -d "$build_root" ]; }; then
+    warn "compiled-dependency cache $build_root is not a regular directory; using disposable output"
+    return 0
+  fi
+  mkdir -p "$build_root"
+  if [ -L "$target_cache" ] || { [ -e "$target_cache" ] && [ ! -d "$target_cache" ]; }; then
+    warn "compiled-dependency cache $target_cache is not a regular directory; using disposable output"
+    return 0
+  fi
+  mkdir -p "$target_cache"
+
+  desired_identity="$attempt_root/build-cache-identity"
+  if ! toolchain_hash="$(file_sha256 "$source_dir/rust-toolchain.toml")" ||
+    ! manifest_hash="$(file_sha256 "$source_dir/Cargo.toml")" ||
+    ! lockfile_hash="$(file_sha256 "$source_dir/Cargo.lock")" ||
+    ! v8_wrapper_hash="$(file_sha256 "$source_dir/scripts/cargo-with-v8.sh")"; then
+    warn "sha256sum or shasum is unavailable; using disposable compilation output"
+    return 0
+  fi
+  printf '%s\n' \
+    'bettercodex-build-cache-v1' \
+    "host=$host_target" \
+    "toolchain=$toolchain_hash" \
+    "manifest=$manifest_hash" \
+    "lockfile=$lockfile_hash" \
+    "v8-wrapper=$v8_wrapper_hash" >"$desired_identity"
+
+  identity_path="$target_cache/identity"
+  if ! cmp -s "$desired_identity" "$identity_path"; then
+    step "Resetting incompatible compiled-dependency cache for $host_target"
+    if [ -L "$target_cache/target" ]; then
+      rm -f "$target_cache/target" || fail "could not replace the compiled-dependency cache"
+    else
+      rm -rf "$target_cache/target" || fail "could not reset the compiled-dependency cache"
+    fi
+    if [ -L "$identity_path" ]; then
+      rm -f "$identity_path" || fail "could not replace the compiled-dependency cache identity"
+    elif [ -d "$identity_path" ]; then
+      rm -rf "$identity_path" || fail "could not replace the compiled-dependency cache identity"
+    fi
+    mv -f "$desired_identity" "$identity_path" ||
+      fail "could not record the compiled-dependency cache identity"
+  fi
+
+  target_dir="$target_cache/target"
+  if [ -L "$target_dir" ] || { [ -e "$target_dir" ] && [ ! -d "$target_dir" ]; }; then
+    warn "compiled-dependency cache $target_dir is not a regular directory; using disposable output"
+    target_dir="$attempt_root/target"
+    return 0
+  fi
+  mkdir -p "$target_dir"
+  build_cache_used=1
+  step "Reusing compiled dependencies at $target_dir"
+}
+
+remove_bettercodex_outputs() {
+  # The source archive has a new workspace path on every update. Remove only
+  # this package's prior outputs so those path-specific files cannot accumulate;
+  # registry and Git dependency artifacts remain available to Cargo.
+  for build_output in \
+    "$target_dir/release/bcodex" \
+    "$target_dir/release/bcodex.d" \
+    "$target_dir/release/deps"/bcodex-* \
+    "$target_dir/release/deps"/bettercodex-* \
+    "$target_dir/release/.fingerprint"/bettercodex-* \
+    "$target_dir/release/incremental"/bcodex-* \
+    "$target_dir/release/incremental"/bettercodex-*; do
+    if [ -e "$build_output" ] || [ -L "$build_output" ]; then
+      rm -rf "$build_output" || return 1
+    fi
+  done
+  return 0
 }
 
 install_temp_parent="${TMPDIR:-/tmp}"
@@ -354,8 +481,12 @@ source_attempt=1
 installed_revision=""
 installed_version=""
 while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
-  if ! resolved_commit="$(resolve_main_commit)"; then
-    fail "could not resolve the current BetterCodex main commit"
+  if [ "$source_attempt" -eq 1 ] && [ -n "$requested_revision" ]; then
+    resolved_commit="$requested_revision"
+  else
+    if ! resolved_commit="$(resolve_main_commit)"; then
+      fail "could not resolve the current BetterCodex main commit"
+    fi
   fi
   is_source_revision "$resolved_commit" ||
     fail "BetterCodex main did not resolve to a valid commit"
@@ -364,7 +495,6 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
   attempt_root="$tmp_dir/attempt-$source_attempt-$short_commit"
   archive_path="$attempt_root/source.tar.gz"
   source_dir="$attempt_root/source"
-  target_dir="$attempt_root/target"
   compiler_tmp="$attempt_root/compiler-tmp"
   smoke_root="$attempt_root/smoke"
   mkdir -p "$source_dir" "$compiler_tmp"
@@ -372,7 +502,7 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
   step "Installing BetterCodex main $short_commit for $os $arch"
   step "Downloading the immutable source snapshot"
   if ! download_source_archive "$archive_path" "$resolved_commit"; then
-    fail "could not download BetterCodex source commit $resolved_commit; confirm the active GitHub account can access $repository"
+    fail "could not download public BetterCodex source commit $resolved_commit from $repository"
   fi
   [ -s "$archive_path" ] || fail "downloaded source archive is empty"
   if ! tar -xzf "$archive_path" -C "$source_dir" --strip-components=1; then
@@ -422,16 +552,24 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
   [ -x "$rustc_program" ] || fail "pinned rustc executable is unavailable"
   rust_toolchain_bin="$(dirname "$cargo_program")"
 
-  step "Compiling BetterCodex $expected_version in a disposable build directory"
+  prepare_compilation_target
+  remove_bettercodex_outputs || fail "could not remove obsolete BetterCodex output"
+  if [ "$build_cache_used" -eq 1 ]; then
+    step "Compiling BetterCodex $expected_version with cached dependencies"
+  else
+    step "Compiling BetterCodex $expected_version in a disposable build directory"
+  fi
   if ! (
     unset \
       BCODEX_SOURCE_REVISION \
       CARGO \
+      CARGO_BUILD_JOBS \
       CARGO_BUILD_BUILD_DIR \
       CARGO_BUILD_TARGET \
       CARGO_BUILD_TARGET_DIR \
       CARGO_ENCODED_RUSTFLAGS \
       CARGO_HOME \
+      CARGO_INCREMENTAL \
       CARGO_INSTALL_ROOT \
       CARGO_TARGET_DIR \
       RUSTC \
@@ -447,6 +585,7 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
     BCODEX_SOURCE_REVISION="$resolved_commit" \
       CARGO="$cargo_program" \
       CARGO_HOME="$cargo_home" \
+      CARGO_INCREMENTAL=0 \
       CARGO_TARGET_DIR="$target_dir" \
       PATH="$rust_toolchain_bin:$PATH" \
       RUSTC="$rustc_program" \
@@ -507,7 +646,8 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
       fail "BetterCodex main kept advancing during all $MAX_SOURCE_ATTEMPTS build attempts"
     fi
     latest_short="$(printf '%.12s' "$latest_commit")"
-    step "Main advanced from $short_commit to $latest_short while building; retrying from scratch"
+    step "Main advanced from $short_commit to $latest_short while building; retrying with cached dependencies"
+    requested_revision=""
     source_attempt=$((source_attempt + 1))
     continue
   fi
@@ -524,6 +664,8 @@ cmp -s "$built_binary" "$bin_path" ||
   fail "installed binary does not exactly match the verified build"
 [ "$("$bin_path" --internal-source-revision 2>/dev/null || true)" = "$installed_revision" ] ||
   fail "installed binary could not be verified"
+remove_bettercodex_outputs ||
+  fail "could not remove BetterCodex-owned compilation output after installation"
 
 pick_profile() {
   case "$os:${SHELL:-}" in
@@ -641,7 +783,11 @@ else
   step "Installed bcodex $installed_version ($short_installed) at $bin_path"
 fi
 if [ -n "$cache_root" ]; then
-  step "Removed the disposable source and build output; retained dependency downloads at $cache_root"
+  if [ "$build_cache_used" -eq 1 ]; then
+    step "Removed disposable source and BetterCodex scratch output; retained compiled dependencies at $cache_root/build/$host_target"
+  else
+    step "Removed disposable source and build output; retained dependency downloads at $cache_root"
+  fi
 else
   step "Removed the disposable install tree: source, dependency downloads, optional Rust toolchain, and build output"
 fi

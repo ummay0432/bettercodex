@@ -1,7 +1,7 @@
 # Installing and building bettercodex
 
 Bettercodex is one Rust package and one `bcodex` binary. It is built from the
-private source repository with the Cargo workflow retained from upstream Codex;
+public source repository with the Cargo workflow retained from upstream Codex;
 there are no Bettercodex release binaries, hosted release builds, Bazel
 workspace, or Node workspace.
 
@@ -14,26 +14,23 @@ workspace, or Node workspace.
 
 Windows is not supported.
 
-## Install with a small retained footprint
+## Install with a reusable build cache
 
-Install an authenticated [GitHub CLI](https://cli.github.com/), `curl`, a native
-C toolchain, and Rust through [rustup](https://rustup.rs/). On a new Mac,
-install Xcode or Apple's
+Install `curl`, a native C toolchain, and Rust through
+[rustup](https://rustup.rs/). On a new Mac, install Xcode or Apple's
 [Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/)
 first:
 
 ```sh
 xcode-select --install
-gh auth login --hostname github.com
 ```
 
-The GitHub account must have access to the private repository. Then copy and
-run the repository's one-line
-[`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt). Its preflight reports missing
-GitHub CLI or authentication before creating a temporary file.
+Copy and run the repository's one-line
+[`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt). It fetches the installer over
+HTTPS without requiring a GitHub account or GitHub CLI login.
 
 The one-line bootstrap always fetches the canonical `scripts/install.sh` from
-private `main`. That installer resolves `main` to a 40-character commit ID,
+public `main`. That installer resolves `main` to a 40-character commit ID,
 downloads GitHub's source archive for that exact commit, and uses the checked-in
 lockfile and pinned Rust toolchain for a release build. This avoids a Homebrew
 or system Cargo earlier on `PATH` silently selecting a different compiler. An
@@ -41,37 +38,46 @@ already-installed matching Rust toolchain is reused. If that exact toolchain is
 missing, rustup downloads its minimal profile inside the temporary install tree
 instead of adding another persistent toolchain.
 
-Source, the compilation target, and compiler scratch space live under one
-temporary install tree. Cargo dependency downloads and checksum-verified V8
-artifacts live under `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`, so later
-updates reuse unchanged inputs without reusing compiled output.
+Source and compiler scratch space live under one temporary install tree. Cargo
+dependency downloads, checksum-verified V8 artifacts, and compatible compiled
+dependencies live under `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. The
+compiled target is keyed by native Rust target plus hashes of the pinned
+toolchain, manifest, lockfile, and V8 build wrapper. A normal source-only update
+reuses that target and recompiles only BetterCodex; an incompatible build-input
+change replaces the previous target generation before compiling.
 
 Before replacement, the candidate binary must report the expected package
 version and embedded source commit, initialize V8, and materialize every
 embedded system resource in an isolated home. The installer then checks
-private `main` again. If `main` advanced during the build, it discards that
-source and target and retries the newer commit, up to three attempts. Only a
-candidate matching the final check is renamed over `bcodex`; the rename is in
-the destination directory, and the staged and installed bytes are compared with
-the verified build. A failed build, copy, or smoke test leaves the existing
-binary untouched. Transient GitHub revision and source-download failures are
-also retried three times; partial archives are discarded between attempts.
+public `main` again. If `main` advanced during the build, it discards that
+source and retries the newer commit against the same dependency cache, up to
+three attempts. Only a candidate matching the final check is renamed over
+`bcodex`; the rename is in the destination directory, and the staged and
+installed bytes are compared with the verified build. A failed build, copy, or
+smoke test leaves the existing binary untouched. Transient GitHub revision and
+source-download failures are also retried three times; partial archives are
+discarded between attempts.
 
 An exit trap removes the complete temporary install tree after success, build
 failure, `SIGHUP`, `SIGINT`, or `SIGTERM`. A lock records the tree so the next
 install can remove it after an untrappable crash or `SIGKILL`. The installed
 binary, a small shell-profile PATH entry when needed, BetterCodex user data, and
-the dependency download cache remain. The prerequisite rustup installation,
+the dependency caches remain. BetterCodex's own binary, fingerprints, and
+incremental output are removed from the shared target after verification; only
+dependency artifacts are retained. The prerequisite rustup installation,
 any matching toolchain that existed before the install, and the native compiler
 are left alone because other software may share them. An installer-only pinned
 toolchain is removed with the temporary tree.
 
-The source build still needs several gigabytes of free temporary space while it
-runs because every update compiles into a fresh target. Cargo automatically
-ages unused registry and Git entries out of its global cache; BetterCodex never
-retains an older compilation target. If neither `XDG_CACHE_HOME` nor `HOME` is
-available, the installer falls back to temporary dependency downloads and
-reports that they cannot be reused.
+The first source build still needs several gigabytes of free space and may
+retain several gigabytes of compiled dependencies. That is the cache which
+prevents subsequent updates from compiling hundreds of packages again. It is
+bounded to one compatible generation per native target; replacing an input
+listed above removes the old generation first. Delete
+`${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex/build` at any time to reclaim it;
+the next update will be a cold build. If neither `XDG_CACHE_HOME` nor `HOME` is
+available, all dependency downloads and build output are temporary and every
+update is cold.
 
 Open a new terminal if `$HOME/.local/bin` was not already on `PATH`, then
 sign in and launch BetterCodex from a project directory:
@@ -96,7 +102,7 @@ BetterCodex settings and saved sessions stay under `$HOME/.bcodex`.
 
 The installer embeds its exact source revision in the binary. After the TUI
 renders its first frame, an installed release compares that revision with the
-current private `main` commit in a failure-silent background check. This uses
+current public `main` commit in a failure-silent background check. This uses
 the source commit, not the package version, so improvements are detected even
 while both binaries report the same `bcodex` version. When they differ, the TUI
 shows both short commit IDs and the command to run in another terminal:
@@ -105,43 +111,46 @@ shows both short commit IDs and the command to run in another terminal:
 bcodex update
 ```
 
-`bcodex update` first resolves private `main`. If its exact commit is already
+`bcodex update` first resolves public `main`. If its exact commit is already
 installed, it exits without rebuilding. Otherwise it fetches the installer
-from that observed commit, runs the same verified temporary build, and targets
-the directory containing the running executable. An install lock rejects a
-second concurrent update. The running TUI keeps using its old in-memory code
-until restarted; new processes use the atomically replaced binary. Failed
-background checks stay silent and are retried on the next launch; set
-`BCODEX_SKIP_UPDATE_CHECK=1` to disable them. Rerunning
+from that observed commit and passes the already-resolved revision into it,
+avoiding a duplicate initial GitHub lookup. The installer runs the same
+verified build and targets the directory containing the running executable. An
+install lock rejects a second concurrent update. The running TUI keeps using
+its old in-memory code until restarted; new processes use the atomically
+replaced binary. Failed background checks stay silent and are retried on the
+next launch; set `BCODEX_SKIP_UPDATE_CHECK=1` to disable them. Rerunning
 [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) remains an equivalent manual
 update path for the default `$HOME/.local/bin` installation.
 
 Each update uses a fresh immutable source archive, so it cannot merge local
-source changes or reuse stale build output. The lockfile identifies exact Cargo
-registry versions and Git commits; only those downloaded inputs and the
-hash-checked V8 pair are reused.
+source changes or install stale BetterCodex output. The lockfile identifies
+exact Cargo registry versions and Git commits. Cargo reuses compatible compiled
+dependencies, while the installer removes BetterCodex-owned output before and
+after every build.
 
 ### What other devices can see
 
-Private `main` on GitHub is the distribution channel. Work that exists only in
-this development checkout—uncommitted changes, an unpushed commit, or a commit
-on another branch—is intentionally invisible to installed devices. Commit the
-finished change and push it to `ummay0432/bettercodex` `main`; the next TUI
-launch on another signed-in device will compare against that commit, and
+Public `main` on GitHub is the distribution channel. Work that exists only in
+this development checkout—uncommitted changes or an unpushed commit—is not
+visible to installed devices. Every branch and tag pushed to the public
+repository is visible to everyone, even though only `main` is installed.
+Commit the finished change and push it to `ummay0432/bettercodex` `main`; the
+next TUI launch on another device will compare against that commit, and
 `bcodex update` will install it. A commit pushed after an installer's final
 check is a new update, not silent drift, and is detected on the next launch.
 
 ### Cleanup and embedded-file integrity
 
-Current installs and updates automatically remove the retired updater's
-`${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex/build` and `tmp` directories. They
-do this before compiling so the old multi-gigabyte target cannot crowd out the
-temporary replacement build. The sibling `cargo` dependency cache and
-`rusty-v8-*` artifact directories are retained and reused. They do not remove
-credentials, sessions, settings, Rust toolchains, or native compiler tools that
-existed before the install. A missing pinned Rust toolchain created solely for
-an install is temporary. Retired cache paths that are symbolic links are left
-untouched rather than followed.
+Current installs and updates remove the retired updater's old `build/target`
+layout and `tmp` directory before compiling. The current compiled cache lives
+at `build/<native-target>/target`, alongside its compatibility identity. The
+`cargo` dependency cache and `rusty-v8-*` artifact directories are also
+retained and reused. The installer does not remove credentials, sessions,
+settings, Rust toolchains, or native compiler tools that existed before the
+install. A missing pinned Rust toolchain created solely for an install is
+temporary. Cache roots that are symbolic links or non-directories are not used
+for compilation output.
 
 Embedded system skills are checked on launch independently of the source
 revision marker. BetterCodex verifies every expected file's bytes and private
@@ -155,15 +164,15 @@ beside `.system`, not inside that reserved directory.
 
 An installed 0.1.2-era binary may still show `Update available` and advertise
 `bcodex update`. That executable compares its embedded source commit with
-private `main`, so any later commit triggers the notice even though both builds
+`main`, so any later commit triggers the notice even though both builds
 report version 0.1.2. Some older executables embed the retired persistent-build-
 cache installer and cannot migrate across its removal by updating themselves.
 
 Run [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) once to install current
 source. Existing ChatGPT credentials, Bettercodex settings, and saved sessions
 are unaffected. The newly installed binary restores `bcodex update` with the
-self-cleaning installer and removes the retired updater's build and temporary
-source directories automatically.
+reusable compiled-dependency cache and removes the retired updater's temporary
+source layout automatically.
 
 For a development checkout elsewhere on disk, use that clean `main` checkout
 instead of cloning another copy:
@@ -177,7 +186,7 @@ git pull --ff-only &&
 Run those commands from the Bettercodex repository root.
 Development builds intentionally have no embedded distribution revision and do
 not perform update checks. Use [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt)
-for an operator/device installation that must track pushed private `main`.
+for an installation that must track pushed public `main`.
 
 ## Build without installing
 
@@ -195,10 +204,9 @@ downloads the matching archive and generated binding from the
 `rusty-v8-v150.4.0` OpenAI Codex release, verifies their pinned SHA-256 digests,
 caches them under `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`, and then runs
 Cargo with both required overrides. Installs, updates, and development checkouts
-share that persistent V8 cache. The installer keeps its Cargo dependency cache
-in the sibling `cargo` directory while keeping its compilation target
-disposable. Explicit paired overrides and `V8_FROM_SOURCE=1` remain
-authoritative.
+share that persistent V8 cache. The installer keeps Cargo downloads in the
+sibling `cargo` directory and compatible compiled dependencies below `build`.
+Explicit paired overrides and `V8_FROM_SOURCE=1` remain authoritative.
 
 ## Development checks
 
