@@ -81,6 +81,9 @@ bcodex
 If another `bcodex` earlier on `PATH` would still launch an older binary, the
 installer reports its path, prepends the managed install directory for future
 terminals, and prints the `export PATH=...` command for the current terminal.
+Managed PATH-block updates preserve the profile's permissions. If replacing a
+symlinked profile or safely rewriting its block is not possible, installation
+still succeeds and reports the manual PATH step instead.
 
 Use an existing Codex ChatGPT credential at
 `${CODEX_HOME:-$HOME/.codex}/auth.json`, or sign in through `bcodex login`.

@@ -390,6 +390,54 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn("For this terminal: export PATH=", result.stdout)
             assert_no_installer_residue(self, root)
 
+    def test_path_block_update_preserves_private_profile_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir(parents=True)
+            profile = home / ".profile"
+            profile.write_text(
+                "operator setting\n"
+                "# >>> bettercodex installer >>>\n"
+                "export PATH='/old/install':\"$PATH\"\n"
+                "# <<< bettercodex installer <<<\n",
+                encoding="utf-8",
+            )
+            profile.chmod(0o600)
+
+            result = run_installer(root)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
+            self.assertIn("operator setting", profile.read_text(encoding="utf-8"))
+            self.assertIn(str(root / "install" / "bin"), profile.read_text(encoding="utf-8"))
+            assert_no_installer_residue(self, root)
+
+    def test_path_block_update_does_not_replace_a_symlinked_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir(parents=True)
+            profile_target = root / "managed-profile"
+            original = (
+                "# >>> bettercodex installer >>>\n"
+                "export PATH='/old/install':\"$PATH\"\n"
+                "# <<< bettercodex installer <<<\n"
+            )
+            profile_target.write_text(original, encoding="utf-8")
+            profile = home / ".profile"
+            profile.symlink_to(profile_target)
+
+            result = run_installer(root)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(profile.is_symlink())
+            self.assertEqual(profile_target.read_text(encoding="utf-8"), original)
+            self.assertIn("not replacing symlinked shell profile", result.stderr)
+            self.assertIn("Add ", result.stdout)
+            self.assertIn(" to PATH in your shell profile", result.stdout)
+            assert_no_installer_residue(self, root)
+
     def test_retired_cache_cleanup_never_follows_a_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -551,8 +551,18 @@ configure_path() {
       return
     fi
     if grep -F "$end_marker" "$path_profile" >/dev/null 2>&1; then
+      if [ -L "$path_profile" ]; then
+        warn "not replacing symlinked shell profile $path_profile; update its BetterCodex PATH block manually"
+        path_action="unavailable"
+        return
+      fi
       rewritten_profile="$tmp_dir/profile"
-      awk -v begin="$begin_marker" -v end="$end_marker" -v line="$path_line" '
+      if ! cp -p "$path_profile" "$rewritten_profile"; then
+        warn "could not stage an update for $path_profile"
+        path_action="unavailable"
+        return
+      fi
+      if ! awk -v begin="$begin_marker" -v end="$end_marker" -v line="$path_line" '
         BEGIN { in_block = 0; replaced = 0 }
         $0 == begin {
           if (!replaced) {
@@ -570,18 +580,33 @@ configure_path() {
         }
         { print }
         END { if (in_block) exit 1 }
-      ' "$path_profile" >"$rewritten_profile" || fail "could not update $path_profile"
-      mv "$rewritten_profile" "$path_profile"
+      ' "$path_profile" >"$rewritten_profile"; then
+        warn "could not rewrite the BetterCodex PATH block in $path_profile"
+        path_action="unavailable"
+        return
+      fi
+      if ! mv "$rewritten_profile" "$path_profile"; then
+        warn "could not replace $path_profile with its updated PATH block"
+        path_action="unavailable"
+        return
+      fi
       path_action="updated"
       return
     fi
+    warn "the BetterCodex PATH block in $path_profile is incomplete; update it manually"
+    path_action="unavailable"
+    return
   fi
 
-  {
+  if ! {
     printf '\n%s\n' "$begin_marker"
     printf '%s\n' "$path_line"
     printf '%s\n' "$end_marker"
-  } >>"$path_profile"
+  } >>"$path_profile"; then
+    warn "could not add $bin_dir to PATH in $path_profile"
+    path_action="unavailable"
+    return
+  fi
   path_action="added"
 }
 
