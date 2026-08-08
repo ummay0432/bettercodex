@@ -1,11 +1,13 @@
-//! Lazy tag checks and the self-update command.
+//! Lazy source-revision checks and the self-update command.
 //!
 //! The one-shot, failure-silent background check follows Pi's startup behavior
 //! (`packages/coding-agent/src/utils/version-check.ts` and
 //! `modes/interactive/interactive-mode.ts` at
 //! `e47b8e37a6211ebd0b2942fa87059d64f81eec02`). Bettercodex adapts the lookup
-//! to authenticated private repository tags and reuses its checked-in,
-//! source-building installer for the explicit update command.
+//! to an authenticated private repository and reuses its checked-in,
+//! source-building installer for the explicit update command. Installed builds
+//! compare immutable source revisions so integrated updates do not depend on a
+//! separate version bump or release tag.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -23,13 +25,10 @@ const DEFAULT_REPOSITORY: &str = "ummay0432/bettercodex";
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const INSTALLER_SCRIPT: &[u8] = include_bytes!("../scripts/install.sh");
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AvailableUpdate {
-    pub(crate) current_version: String,
-    pub(crate) latest_version: String,
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AvailableUpdate;
 
-/// Checks once for a newer private source tag after the TUI has rendered.
+/// Checks once for a newer private source revision after the TUI has rendered.
 ///
 /// Development builds stay offline by default. Installed builds can
 /// opt out by setting `BCODEX_SKIP_UPDATE_CHECK`.
@@ -39,16 +38,67 @@ pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
     }
     let repository =
         std::env::var("BCODEX_REPOSITORY").unwrap_or_else(|_| DEFAULT_REPOSITORY.to_string());
-    check_for_update_with(
-        OsStr::new("gh"),
-        &repository,
-        env!("CARGO_PKG_VERSION"),
-        UPDATE_CHECK_TIMEOUT,
-    )
-    .await
+    match source_revision() {
+        Some(current_revision) => {
+            check_for_source_update_with(
+                OsStr::new("gh"),
+                &repository,
+                current_revision,
+                UPDATE_CHECK_TIMEOUT,
+            )
+            .await
+        }
+        None => {
+            // Release builds made outside the installer predate, or omit, the source-revision
+            // contract. Preserve the tag check so those builds still receive versioned updates.
+            check_for_release_update_with(
+                OsStr::new("gh"),
+                &repository,
+                env!("CARGO_PKG_VERSION"),
+                UPDATE_CHECK_TIMEOUT,
+            )
+            .await
+        }
+    }
 }
 
-async fn check_for_update_with(
+pub(crate) fn source_revision() -> Option<&'static str> {
+    option_env!("BCODEX_SOURCE_REVISION").filter(|revision| is_source_revision(revision))
+}
+
+async fn check_for_source_update_with(
+    gh_program: &OsStr,
+    repository: &str,
+    current_revision: &str,
+    timeout: Duration,
+) -> Option<AvailableUpdate> {
+    if !is_source_revision(current_revision) {
+        return None;
+    }
+    let mut command = AsyncProcessCommand::new(gh_program);
+    let endpoint = format!("repos/{repository}/commits/main");
+    command
+        .args(["api", &endpoint, "--jq", ".sha"])
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let latest_revision = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if !is_source_revision(latest_revision)
+        || latest_revision.eq_ignore_ascii_case(current_revision)
+    {
+        return None;
+    }
+    Some(AvailableUpdate)
+}
+
+async fn check_for_release_update_with(
     gh_program: &OsStr,
     repository: &str,
     current_version: &str,
@@ -77,10 +127,7 @@ async fn check_for_update_with(
         })
         .max_by_key(|(parsed, _)| *parsed)?
         .1;
-    is_newer(latest_version, current_version)?.then(|| AvailableUpdate {
-        current_version: current_version.to_string(),
-        latest_version: latest_version.to_string(),
-    })
+    is_newer(latest_version, current_version)?.then_some(AvailableUpdate)
 }
 
 fn is_newer(latest: &str, current: &str) -> Option<bool> {
@@ -96,6 +143,10 @@ fn parse_stable_version(version: &str) -> Option<(u64, u64, u64)> {
         return None;
     }
     Some((major, minor, patch))
+}
+
+fn is_source_revision(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub(crate) fn run_update() -> Result<()> {

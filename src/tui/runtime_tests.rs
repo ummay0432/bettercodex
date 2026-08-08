@@ -213,14 +213,11 @@ fn prepared_streaming_layout_tracks_new_deltas_and_finalizes_to_history() {
 }
 
 #[test]
-fn update_available_card_renders_the_release_and_standalone_command() {
+fn update_available_card_renders_the_standalone_command() {
     const WIDTH: u16 = 80;
     let mut view = View::new(Path::new("/tmp/bettercodex"));
     let _ = view.take_pending_history_lines(WIDTH);
-    view.add_update_available(AvailableUpdate {
-        current_version: "1.2.2".to_string(),
-        latest_version: "1.2.3".to_string(),
-    });
+    view.add_update_available(AvailableUpdate);
 
     let rendered = view
         .take_pending_history_lines(WIDTH)
@@ -229,10 +226,6 @@ fn update_available_card_renders_the_release_and_standalone_command() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Update available"), "{rendered}");
-    assert!(
-        rendered.contains("bettercodex 1.2.2 -> 1.2.3"),
-        "{rendered}"
-    );
     assert!(
         rendered.lines().any(|line| line.contains("bcodex update")),
         "{rendered}"
@@ -251,10 +244,7 @@ fn asynchronous_update_card_does_not_split_a_streaming_assistant_message() {
     view.start_turn("stream around an update check");
     let _ = view.take_pending_history_lines(WIDTH);
     view.handle_agent_event(AgentEvent::ModelMessageDelta("alpha".to_string()));
-    view.add_update_available(AvailableUpdate {
-        current_version: "1.2.2".to_string(),
-        latest_version: "1.2.3".to_string(),
-    });
+    view.add_update_available(AvailableUpdate);
     view.handle_agent_event(AgentEvent::ModelMessageDelta(" omega".to_string()));
 
     let rendered = render_view(&mut view, WIDTH, SCREEN_HEIGHT);

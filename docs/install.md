@@ -1,8 +1,9 @@
 # Installing bettercodex
 
-bettercodex is distributed as tagged source in a private GitHub repository.
-The installer compiles that source natively on each computer. There are no
-prebuilt GitHub Release binaries and no hosted release builds.
+bettercodex is distributed directly from the integrated `main` branch of a
+private GitHub repository. The installer resolves `main` to one immutable Git
+commit and compiles that source natively on each computer. There are no prebuilt
+GitHub Release binaries and no hosted release builds.
 
 ## Supported systems
 
@@ -60,16 +61,19 @@ saved sessions stay under `$HOME/.bcodex`. Both remain local to that computer.
 
 The installer:
 
-1. lists private repository tags and selects the highest stable `vX.Y.Z` tag;
-2. resolves that tag to an exact Git commit and downloads that source snapshot;
-3. requires the package version in `Cargo.toml` to match the tag;
+1. resolves private repository `main` to an exact Git commit and downloads that
+   immutable source snapshot;
+2. embeds the resolved source revision in the compiled binary;
+3. retries from the newer commit if `main` advances while the local build is
+   running;
 4. downloads and SHA-256 verifies the pinned sandbox-enabled V8 archive and
    matching Rust bindings for the local Rust host;
 5. builds the locked source in release mode using a persistent Cargo cache;
 6. requires the result to report the expected `bcodex X.Y.Z`;
 7. starts V8 and ICU, materializes the embedded skills and evaluator manifest,
    and checks the generated tool context; and
-8. atomically replaces the installed binary only after every prior step passes.
+8. atomically replaces the installed binary only after every prior step passes
+   and `main` still resolves to the embedded revision.
 
 The default binary is `$HOME/.local/bin/bcodex`. The default build cache is
 `$HOME/.cache/bettercodex/build`, or the corresponding location under
@@ -79,9 +83,10 @@ the selected immutable source snapshot.
 
 ## Updating
 
-After the TUI renders, an installed release checks private source tags in the
-background. Startup does not wait for the request. When a newer stable tag is
-available, run this in another terminal:
+After the TUI renders, an installed build compares its embedded source revision
+with the current private `main` commit in the background. Startup does not wait
+for the request. When they differ, the TUI shows `Update available` and the
+single command to run in another terminal:
 
 ```sh
 bcodex update
@@ -91,20 +96,25 @@ The running TUI keeps its old in-memory code until it is restarted. Failed
 background checks stay silent and are retried on the next launch; set
 `BCODEX_SKIP_UPDATE_CHECK=1` to disable them.
 
+Version 0.1.2 is the one-time bridge from version-based checks to source
+revision checks. Existing 0.1.1 devices discover that bridge through its stable
+tag; after installing it, later integrated changes need no version bump or tag.
+
 Version 0.1.0 embedded the retired prebuilt-release installer. It cannot learn
 the source-build flow retroactively. To move an existing 0.1.0 installation to
-0.1.1, rerun the original installer command once:
+the current update channel, rerun the original installer command once:
 
 ```sh
 gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | sh
 ```
 
-After that one-time bootstrap, `bcodex update` uses local source builds.
+After that one-time bootstrap, `bcodex update` uses local source builds and
+tracks the integrated source revision.
 
 To install a specific stable tag:
 
 ```sh
-gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | BCODEX_RELEASE=v0.1.1 sh
+gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | BCODEX_RELEASE=v0.1.2 sh
 ```
 
 To use custom binary and build-cache directories:
@@ -145,19 +155,20 @@ This personal GitHub repository gives collaborators write access. If operators
 should have read-only access, transfer it to an organization and grant the Read
 role. Never share GitHub tokens, `$HOME/.codex/auth.json`, or `$HOME/.bcodex`.
 
-## Maintainer release process
+## Source checkpoints
 
-The package version and source tag must match. Validate a clean `main` locally,
-including a release build on the maintainer's machine, then push `main` and an
-annotated tag explicitly:
+Normal device updates track integrated `main` and do not require a package
+version change or source tag. Stable `vX.Y.Z` tags remain supported as explicit,
+immutable checkpoints. When intentionally publishing one, its package version
+must match. Validate a clean `main`, then push the annotated tag explicitly:
 
 ```sh
-git tag -a v0.1.1 -m "Release bettercodex 0.1.1"
-git push origin refs/tags/v0.1.1:refs/tags/v0.1.1
+git tag -a v0.1.2 -m "Release bettercodex 0.1.2"
+git push origin refs/tags/v0.1.2:refs/tags/v0.1.2
 ```
 
-The stable tag is the release. Do not move a published tag. There is no GitHub
-Release object or artifact matrix to maintain.
+Do not move a published tag. There is no GitHub Release object or artifact
+matrix to maintain.
 
 Contributors should build through the checked-in helper so the pinned V8 pair
 is selected and verified correctly:

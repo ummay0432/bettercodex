@@ -120,6 +120,12 @@ fn run() -> Result<()> {
             ))?;
             Ok(())
         }
+        Command::InternalSourceRevision => {
+            let revision = update::source_revision()
+                .ok_or_else(|| anyhow!("this build has no embedded source revision"))?;
+            write_stdout_line(format_args!("{revision}"))?;
+            Ok(())
+        }
         Command::Login(command) => run_login_command(command),
         Command::Logout => run_logout_command(),
         Command::LogoutHelp => {
@@ -311,6 +317,7 @@ enum Command {
     ToolCatalogueStats,
     ToolContextJson,
     InternalPackageSmoke,
+    InternalSourceRevision,
     Login(LoginCommand),
     Logout,
     LogoutHelp,
@@ -351,6 +358,18 @@ impl Command {
                 ));
             }
             return Ok(Self::InternalPackageSmoke);
+        }
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--internal-source-revision")
+        {
+            arguments.next();
+            if arguments.next().is_some() {
+                return Err(anyhow!(
+                    "internal source revision helper received extra arguments"
+                ));
+            }
+            return Ok(Self::InternalSourceRevision);
         }
         if arguments
             .peek()
@@ -512,7 +531,7 @@ fn parse_update_command(arguments: impl IntoIterator<Item = String>) -> Result<C
 
 fn write_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Build and install the latest private source tag\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring. Use /loop <task> or $loop for the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Build and install the latest integrated source\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring. Use /loop <task> or $loop for the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     ))
 }
@@ -531,7 +550,7 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Build and install the latest private bettercodex source tag\n\nUsage:\n  bcodex update\n\nThe update uses the authenticated GitHub CLI, compiles the tagged source for this machine, smoke-tests its runtime and embedded resources, and then replaces the installed binary."
+        "Build and install the latest integrated bettercodex source\n\nUsage:\n  bcodex update\n\nThe update uses the authenticated GitHub CLI, resolves the current main commit, compiles that immutable source snapshot for this machine, smoke-tests its runtime and embedded resources, and then replaces the installed binary."
     ))
 }
 
@@ -661,6 +680,21 @@ mod tests {
         assert!(
             Command::parse([
                 "--internal-package-smoke".to_string(),
+                "unexpected".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn internal_source_revision_is_strictly_parsed() {
+        assert!(matches!(
+            Command::parse(["--internal-source-revision".to_string()]).unwrap(),
+            Command::InternalSourceRevision
+        ));
+        assert!(
+            Command::parse([
+                "--internal-source-revision".to_string(),
                 "unexpected".to_string(),
             ])
             .is_err()
