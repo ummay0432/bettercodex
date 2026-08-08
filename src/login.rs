@@ -896,11 +896,12 @@ async fn poll_for_device_token(device_code: &DeviceCode) -> io::Result<DeviceCod
             status,
             ReqwestStatusCode::FORBIDDEN | ReqwestStatusCode::NOT_FOUND
         ) {
-            if started.elapsed() >= maximum_wait {
+            let elapsed = started.elapsed();
+            if elapsed >= maximum_wait {
                 return Err(io::Error::other("device auth timed out after 15 minutes"));
             }
             let delay =
-                Duration::from_secs(device_code.interval).min(maximum_wait - started.elapsed());
+                Duration::from_secs(device_code.interval).min(maximum_wait.saturating_sub(elapsed));
             tokio::time::sleep(delay).await;
             continue;
         }

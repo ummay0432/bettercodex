@@ -837,7 +837,7 @@ fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>
             .ok()
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos())
-            .unwrap_or(u128::from(metadata.created_at_unix_ms) * 1_000_000);
+            .unwrap_or_else(|| u128::from(metadata.created_at_unix_ms) * 1_000_000);
         let candidate = (modified_at, metadata.created_at_unix_ms, path);
         if latest
             .as_ref()

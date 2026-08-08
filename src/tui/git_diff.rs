@@ -275,7 +275,9 @@ async fn capture_stream(
 ) -> std::io::Result<CapturedStream> {
     let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
     let mut truncated = false;
-    let mut buffer = [0_u8; 16 * 1024];
+    // This buffer lives across an await, so heap allocation keeps the nested
+    // Git-diff future small enough to spawn without a large stack frame.
+    let mut buffer = vec![0_u8; 16 * 1024];
     loop {
         let read = match reader.read(&mut buffer).await {
             Ok(0) => break,

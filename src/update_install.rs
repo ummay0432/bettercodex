@@ -706,7 +706,9 @@ fn lock_is_active(path: &Path) -> Result<bool> {
     if let Some(pid) = pid {
         return Ok(process_is_alive(pid));
     }
-    let modified = fs::metadata(path)?.modified().unwrap_or(SystemTime::now());
+    let modified = fs::metadata(path)?
+        .modified()
+        .unwrap_or_else(|_| SystemTime::now());
     Ok(modified.elapsed().unwrap_or_default() < LOCK_FRESHNESS)
 }
 

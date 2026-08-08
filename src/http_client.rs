@@ -50,9 +50,8 @@ pub(crate) async fn bounded_error_body(
     while body.len() < max_bytes {
         let chunk = match response.chunk().await {
             Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
             Err(_) if body.is_empty() => return "unreadable response".to_string(),
-            Err(_) => break,
+            Ok(None) | Err(_) => break,
         };
         let remaining = max_bytes.saturating_sub(body.len());
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
