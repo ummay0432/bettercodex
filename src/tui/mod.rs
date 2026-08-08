@@ -84,6 +84,12 @@ const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
 const MAX_READY_AGENT_EVENTS: usize = 4_096;
 
+pub(crate) struct Startup(terminal::TerminalStartup);
+
+pub(crate) fn begin_startup() -> Result<Startup> {
+    terminal::TerminalStartup::begin().map(Startup)
+}
+
 enum TurnCompletion {
     Submission(Result<SubmitOutcome>),
     Compaction(Result<CompactionOutcome>),
@@ -103,9 +109,10 @@ pub(crate) async fn run(
     agent: Agent,
     cwd: PathBuf,
     worker_handoff: Option<crate::managed_session::WorkerHandoff>,
+    startup: Startup,
 ) -> Result<()> {
     let mut runtime = Runtime::new(agent, cwd, worker_handoff)?;
-    let mut session = terminal::TerminalSession::enter()?;
+    let mut session = startup.0.enter()?;
     runtime
         .view
         .set_terminal_colors(session.default_foreground(), session.default_background());

@@ -217,16 +217,24 @@ fn run_agent_command(
     let interactive_tui =
         interactive_terminal && options.prompt.is_empty() && options.images.is_empty();
     let worker_handoff = managed_session::enter_agent_process(arguments, interactive_tui)?;
-    tokio::runtime::Builder::new_multi_thread()
+    let tui_startup = interactive_tui.then(tui::begin_startup).transpose()?;
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        // BetterCodex serves one operator and moves blocking work off the async pool. Two workers
+        // retain scheduler redundancy without eagerly creating one startup thread per CPU.
+        runtime.worker_threads(2);
+    }
+    runtime
         .enable_all()
         .build()?
-        .block_on(run_agent(options, resume, worker_handoff))
+        .block_on(run_agent(options, resume, worker_handoff, tui_startup))
 }
 
 async fn run_agent(
     options: RunOptions,
     resume: Option<ResumeSelector>,
     worker_handoff: Option<managed_session::WorkerHandoff>,
+    tui_startup: Option<tui::Startup>,
 ) -> Result<()> {
     let input = if !options.prompt.is_empty() || !options.images.is_empty() {
         Some(UserInput::from_paths(
@@ -250,7 +258,11 @@ async fn run_agent(
     }
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return tui::run(agent, cwd, worker_handoff).await;
+        let startup = match tui_startup {
+            Some(startup) => startup,
+            None => tui::begin_startup()?,
+        };
+        return tui::run(agent, cwd, worker_handoff, startup).await;
     }
 
     run_line_mode(&mut agent).await
