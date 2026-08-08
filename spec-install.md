@@ -29,9 +29,9 @@ It must compile zero Cargo packages.
 The pre-optimization Linux x86-64 `bcodex` executable is 67,385,384 bytes and
 compresses to 25,392,260 bytes with `gzip -9` or 19,482,024 bytes with
 single-threaded `zstd -19`. The final reviewed size-optimized distribution
-candidate is 52,951,080 bytes raw, 21,542,242 bytes in gzip, and 17,163,521
+candidate is 52,942,888 bytes raw, 21,544,720 bytes in gzip, and 17,171,847
 bytes in single-threaded `zstd --ultra -22`. A real raw-prefix patch from that
-installed predecessor is 8,358,062 bytes. These are observations, not fixed
+installed predecessor is 8,350,900 bytes. These are observations, not fixed
 format limits, but they establish the expected order of magnitude. The roughly
 2.5 GB seen during a source update is predominantly locally generated compiler
 output, not network download volume.
