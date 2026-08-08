@@ -251,6 +251,8 @@ pub(super) struct View {
     dismissed_slash: Option<String>,
     user_message_style: Style,
     process_commands: HashMap<i64, String>,
+    deferred_interactions: HashMap<String, ToolEntry>,
+    unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
 }
 
 pub(super) struct PreparedView {
@@ -374,12 +376,19 @@ struct ToolEntry {
 }
 
 #[derive(Debug)]
+struct UnifiedExecWaitStreak {
+    session_id: i64,
+    tool: ToolEntry,
+}
+
+#[derive(Debug)]
 enum ToolDisplay {
     Command {
         command: String,
         parsed: Vec<ParsedCommand>,
     },
     Interaction {
+        session_id: i64,
         command: String,
         input: String,
     },
@@ -532,6 +541,8 @@ impl View {
             dismissed_slash: None,
             user_message_style: user_message_style_for(Some((31, 31, 31))),
             process_commands: HashMap::new(),
+            deferred_interactions: HashMap::new(),
+            unified_exec_wait_streak: None,
         }
     }
 
@@ -612,6 +623,8 @@ impl View {
 
     pub(super) fn start_turn(&mut self, prompt: impl Into<UserPrompt>) {
         let prompt = prompt.into();
+        self.flush_unified_exec_wait_streak();
+        self.deferred_interactions.clear();
         self.seal_exploration();
         self.entries
             .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
@@ -644,6 +657,7 @@ impl View {
     }
 
     pub(super) fn add_user_message(&mut self, prompt: &UserPrompt) {
+        self.flush_unified_exec_wait_streak();
         self.close_streaming_entries();
         self.seal_exploration();
         self.entries
@@ -695,6 +709,8 @@ impl View {
         &mut self,
         result: anyhow::Result<SubmitOutcome>,
     ) -> Option<UserPrompt> {
+        self.flush_unified_exec_wait_streak();
+        self.deferred_interactions.clear();
         self.close_streaming_entries();
         self.seal_exploration();
         self.finish_incomplete_tools();
@@ -754,6 +770,8 @@ impl View {
     }
 
     pub(super) fn finish_compaction(&mut self, result: anyhow::Result<CompactionOutcome>) {
+        self.flush_unified_exec_wait_streak();
+        self.deferred_interactions.clear();
         self.working_since = None;
         self.busy = false;
         self.interrupting = None;
@@ -811,6 +829,7 @@ impl View {
     }
 
     pub(super) fn start_operator_command(&mut self, call_id: String, command: &str) {
+        self.flush_unified_exec_wait_streak();
         self.seal_exploration();
         self.entries.push(TranscriptEntry::Tool(ToolEntry::new(
             call_id,
@@ -957,6 +976,8 @@ impl View {
         self.slash_selection = 0;
         self.dismissed_slash = None;
         self.process_commands.clear();
+        self.deferred_interactions.clear();
+        self.unified_exec_wait_streak = None;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
     }
@@ -964,6 +985,7 @@ impl View {
     pub(super) fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::ModelMessageStarted(message) => {
+                self.flush_unified_exec_wait_streak();
                 self.seal_exploration();
                 self.close_streaming_entries();
                 self.active_message_phase = message.phase;
@@ -979,6 +1001,7 @@ impl View {
                 self.status_detail = None;
             }
             AgentEvent::ModelMessageDelta(delta) => {
+                self.flush_unified_exec_wait_streak();
                 self.seal_exploration();
                 match self.entries.last_mut() {
                     Some(TranscriptEntry::Assistant {
@@ -1019,7 +1042,14 @@ impl View {
                 self.close_streaming_entries();
                 let entry = ToolEntry::new(call_id, name, input, &self.cwd, &self.process_commands);
                 self.status_detail = Some(entry.activity_label());
-                if entry.is_exploration() {
+                if entry.is_interaction() {
+                    if entry.has_interaction_input() {
+                        self.flush_unified_exec_wait_streak();
+                    }
+                    self.deferred_interactions
+                        .insert(entry.call_id.clone(), entry);
+                } else if entry.is_exploration() {
+                    self.flush_unified_exec_wait_streak();
                     let last_is_uncommitted = self.entries.len() > self.committed_entries;
                     match self.entries.last_mut() {
                         Some(TranscriptEntry::Exploration {
@@ -1034,6 +1064,7 @@ impl View {
                         }),
                     }
                 } else {
+                    self.flush_unified_exec_wait_streak();
                     self.seal_exploration();
                     self.entries.push(TranscriptEntry::Tool(entry));
                 }
@@ -1043,21 +1074,24 @@ impl View {
                 output,
                 duration: _,
             } => {
-                let completed_work = self.find_tool_mut(&call_id).is_some_and(|tool| {
-                    let completed_work = matches!(
-                        &tool.display,
-                        ToolDisplay::Command { .. }
-                            | ToolDisplay::Interaction { .. }
-                            | ToolDisplay::Patch(_)
-                            | ToolDisplay::Papercut
-                            | ToolDisplay::WebSearch(_)
-                            | ToolDisplay::Other
-                    );
-                    tool.outcome = Some(ToolOutcome { output });
-                    completed_work
-                });
-                self.turn_had_work |= completed_work;
-                self.remember_process_command(&call_id);
+                if let Some(tool) = self.deferred_interactions.remove(&call_id) {
+                    self.complete_deferred_interaction(tool, output);
+                } else {
+                    let completed_work = self.find_tool_mut(&call_id).is_some_and(|tool| {
+                        let completed_work = matches!(
+                            &tool.display,
+                            ToolDisplay::Command { .. }
+                                | ToolDisplay::Patch(_)
+                                | ToolDisplay::Papercut
+                                | ToolDisplay::WebSearch(_)
+                                | ToolDisplay::Other
+                        );
+                        tool.outcome = Some(ToolOutcome { output });
+                        completed_work
+                    });
+                    self.turn_had_work |= completed_work;
+                    self.remember_process_command(&call_id);
+                }
                 self.repository = Repository::discover(&self.cwd);
                 self.status_detail = self.latest_tool_activity();
             }
@@ -1657,6 +1691,7 @@ impl View {
     }
 
     fn complete_assistant_message(&mut self, message: AssistantMessage) {
+        self.flush_unified_exec_wait_streak();
         self.seal_exploration();
         self.terminal_assistant_received_this_turn |=
             message.is_terminal() && !message.text.trim().is_empty();
@@ -1735,6 +1770,81 @@ impl View {
         })
     }
 
+    fn complete_deferred_interaction(
+        &mut self,
+        mut tool: ToolEntry,
+        output: Result<Value, String>,
+    ) {
+        let ToolDisplay::Interaction {
+            session_id, input, ..
+        } = &tool.display
+        else {
+            return;
+        };
+        let session_id = *session_id;
+        let waited_only = input.is_empty();
+        let process_is_still_running = output.as_ref().ok().is_some_and(|output| {
+            output.get("session_id").and_then(Value::as_i64) == Some(session_id)
+        });
+        let process_finished = output
+            .as_ref()
+            .ok()
+            .is_some_and(|output| output.get("session_id").is_none());
+        let unknown_process = output
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.contains(&format!("Unknown process id {session_id}")));
+
+        tool.outcome = Some(ToolOutcome { output });
+        if process_finished || unknown_process {
+            self.process_commands.remove(&session_id);
+        }
+
+        if waited_only {
+            // Match current Codex unified-exec events: an empty poll is transcript-worthy only
+            // when it returns while the background process is still alive. Finished and stale
+            // polls remain model-visible but do not create misleading terminal history cells.
+            if process_is_still_running {
+                self.record_unified_exec_wait(session_id, tool);
+            }
+            return;
+        }
+
+        // Codex emits terminal-interaction history only after a successful write. Transport
+        // failures are returned to the model without adding a second user-facing error surface.
+        if tool
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.output.is_ok())
+        {
+            self.turn_had_work = true;
+            self.entries.push(TranscriptEntry::Tool(tool));
+        }
+    }
+
+    fn record_unified_exec_wait(&mut self, session_id: i64, tool: ToolEntry) {
+        match self.unified_exec_wait_streak.take() {
+            Some(wait) if wait.session_id == session_id => {
+                self.unified_exec_wait_streak = Some(wait);
+            }
+            Some(wait) => {
+                self.turn_had_work = true;
+                self.entries.push(TranscriptEntry::Tool(wait.tool));
+                self.unified_exec_wait_streak = Some(UnifiedExecWaitStreak { session_id, tool });
+            }
+            None => {
+                self.unified_exec_wait_streak = Some(UnifiedExecWaitStreak { session_id, tool });
+            }
+        }
+    }
+
+    fn flush_unified_exec_wait_streak(&mut self) {
+        if let Some(wait) = self.unified_exec_wait_streak.take() {
+            self.turn_had_work = true;
+            self.entries.push(TranscriptEntry::Tool(wait.tool));
+        }
+    }
+
     fn remember_process_command(&mut self, call_id: &str) {
         let remembered = self.find_tool_mut(call_id).and_then(|tool| {
             let ToolDisplay::Command { command, .. } = &tool.display else {
@@ -1750,7 +1860,7 @@ impl View {
     }
 
     fn latest_tool_activity(&self) -> Option<String> {
-        self.entries[self.committed_entries..]
+        let transcript_tool = self.entries[self.committed_entries..]
             .iter()
             .rev()
             .find_map(|entry| match entry {
@@ -1763,7 +1873,19 @@ impl View {
                     .find(|tool| tool.outcome.is_none())
                     .map(ToolEntry::activity_label),
                 _ => None,
+            });
+        let deferred_tool = self
+            .deferred_interactions
+            .values()
+            .max_by_key(|tool| tool.started_at)
+            .map(ToolEntry::activity_label);
+        deferred_tool
+            .or_else(|| {
+                self.unified_exec_wait_streak
+                    .as_ref()
+                    .map(|wait| wait.tool.activity_label())
             })
+            .or(transcript_tool)
     }
 
     pub(super) fn take_pending_history_lines(
@@ -2476,6 +2598,8 @@ impl View {
             "Interrupting"
         } else if self.status_detail.as_deref() == Some("Compacting conversation") {
             "Compacting"
+        } else if self.waiting_for_background_terminal() {
+            "Waiting for background terminal"
         } else {
             self.reasoning_status.heading().unwrap_or("Working")
         };
@@ -2511,6 +2635,14 @@ impl View {
             spans.push(Span::from(summary).dim());
         }
         Line::from(spans)
+    }
+
+    fn waiting_for_background_terminal(&self) -> bool {
+        self.unified_exec_wait_streak.is_some()
+            || self
+                .deferred_interactions
+                .values()
+                .any(|tool| tool.is_empty_interaction())
     }
 }
 
@@ -2865,6 +2997,7 @@ impl ToolEntry {
                     .unwrap_or_default()
                     .to_string();
                 ToolDisplay::Interaction {
+                    session_id,
                     command: process_commands
                         .get(&session_id)
                         .cloned()
@@ -2911,6 +3044,24 @@ impl ToolEntry {
         }
     }
 
+    fn is_interaction(&self) -> bool {
+        matches!(self.display, ToolDisplay::Interaction { .. })
+    }
+
+    fn is_empty_interaction(&self) -> bool {
+        matches!(
+            &self.display,
+            ToolDisplay::Interaction { input, .. } if input.is_empty()
+        )
+    }
+
+    fn has_interaction_input(&self) -> bool {
+        matches!(
+            &self.display,
+            ToolDisplay::Interaction { input, .. } if !input.is_empty()
+        )
+    }
+
     fn activity_label(&self) -> String {
         match &self.display {
             ToolDisplay::Command { command, .. } => first_display_line(command),
@@ -2935,7 +3086,7 @@ impl ToolEntry {
     fn display_lines(&self, width: u16, user_style: Style) -> Vec<Line<'static>> {
         match &self.display {
             ToolDisplay::Command { command, .. } => command_lines(self, command, width),
-            ToolDisplay::Interaction { command, input } => {
+            ToolDisplay::Interaction { command, input, .. } => {
                 interaction_lines(self, command, input, width)
             }
             ToolDisplay::Patch(patch) => {
@@ -3987,46 +4138,44 @@ fn command_lines(tool: &ToolEntry, command: &str, width: u16) -> Vec<Line<'stati
 }
 
 fn interaction_lines(
-    tool: &ToolEntry,
+    _tool: &ToolEntry,
     command: &str,
     input: &str,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let bullet = match tool.succeeded() {
-        None => activity_marker(Some(tool.started_at)),
-        Some(true) => "•".green().bold(),
-        Some(false) => "•".red().bold(),
-    };
-    let detail = if input.is_empty() {
-        format!("Waited for `{command}`")
+    let waited_only = input.is_empty();
+    let command = first_display_line(&markdown::sanitize(command));
+    let mut header_spans = if waited_only {
+        vec!["• Waited for background terminal".bold()]
     } else {
-        format!(
-            "Interacted with `{command}`, sent `{}`",
-            summarize_interaction_input(input)
-        )
+        vec!["↳ ".dim(), "Interacted with background terminal".bold()]
     };
-    let rows = editor::wrap_text(&detail, width.saturating_sub(4).max(1));
-    let mut lines = rows
-        .into_iter()
-        .enumerate()
-        .map(|(index, row)| {
-            if index == 0 {
-                Line::from(vec![bullet.clone(), " ".into(), Span::from(row)])
-            } else {
-                Line::from(vec!["  │ ".dim(), Span::from(row)])
-            }
-        })
-        .collect::<Vec<_>>();
-    if let Some(outcome) = &tool.outcome {
-        match &outcome.output {
-            Ok(output) => {
-                if let Some(output) = output.get("output").and_then(Value::as_str)
-                    && !output.is_empty()
-                {
-                    append_bounded_output(output, width, &mut lines);
-                }
-            }
-            Err(error) => append_bounded_output(error, width, &mut lines),
+    if !command.is_empty() {
+        header_spans.push(" · ".dim());
+        header_spans.push(command.dim());
+    }
+    let mut lines = wrap_styled_line(&Line::from(header_spans), width.max(1));
+    if waited_only {
+        return lines;
+    }
+
+    let input = markdown::sanitize(input);
+    let content_width = width.saturating_sub(4).max(1);
+    let mut first_row = true;
+    for source in input.lines() {
+        let mut rows = editor::wrap_text(source, content_width);
+        if rows.is_empty() {
+            rows.push(String::new());
+        }
+        for row in rows {
+            lines.push(Line::from(vec![
+                if std::mem::replace(&mut first_row, false) {
+                    "  └ ".dim()
+                } else {
+                    "    ".into()
+                },
+                Span::from(row),
+            ]));
         }
     }
     lines
@@ -4466,17 +4615,6 @@ fn blend(foreground: (u8, u8, u8), background: (u8, u8, u8), alpha: f32) -> (u8,
         (foreground.1 as f32 * alpha + background.1 as f32 * (1.0 - alpha)) as u8,
         (foreground.2 as f32 * alpha + background.2 as f32 * (1.0 - alpha)) as u8,
     )
-}
-
-fn summarize_interaction_input(input: &str) -> String {
-    let sanitized = input.replace('\n', "\\n").replace('`', "\\`");
-    let mut characters = sanitized.chars();
-    let preview = characters.by_ref().take(80).collect::<String>();
-    if characters.next().is_some() {
-        format!("{preview}...")
-    } else {
-        preview
-    }
 }
 
 fn first_display_line(source: &str) -> String {
@@ -5000,7 +5138,7 @@ mod tests {
     }
 
     #[test]
-    fn write_stdin_uses_codex_interaction_cell_and_keeps_output() {
+    fn write_stdin_uses_current_codex_interaction_cell_shape() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.handle_agent_event(AgentEvent::ToolStarted {
@@ -5030,10 +5168,99 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            rendered.contains("• Interacted with `bash`, sent `echo ready\\n`"),
+            rendered.contains("↳ Interacted with background terminal · bash"),
             "{rendered}"
         );
-        assert!(rendered.contains("  └ ready"), "{rendered}");
+        assert!(rendered.contains("  └ echo ready"), "{rendered}");
+        assert!(!rendered.contains("  └ ready"), "{rendered}");
+    }
+
+    #[test]
+    fn stale_empty_write_stdin_poll_is_not_rendered() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:start".to_string(),
+            name: "exec_command".to_string(),
+            input: Some(json!({"cmd": "set -eu\nprintf done"})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:start".to_string(),
+            output: Ok(json!({"session_id": 42, "output": ""})),
+            duration: Duration::from_millis(10),
+        });
+        let _ = view.take_pending_history_lines(80, 24);
+
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:stale-wait".to_string(),
+            name: "write_stdin".to_string(),
+            input: Some(json!({"session_id": 42})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:stale-wait".to_string(),
+            output: Err("Unknown process id 42".to_string()),
+            duration: Duration::from_millis(10),
+        });
+
+        assert!(view.take_pending_history_lines(80, 24).is_empty());
+        assert!(view.active_lines(80).is_empty());
+        assert!(!view.process_commands.contains_key(&42));
+    }
+
+    #[test]
+    fn completed_empty_write_stdin_poll_is_not_rendered() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.process_commands.insert(42, "cargo test".to_string());
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:final-wait".to_string(),
+            name: "write_stdin".to_string(),
+            input: Some(json!({"session_id": 42})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:final-wait".to_string(),
+            output: Ok(json!({"exit_code": 0, "output": "done\n"})),
+            duration: Duration::from_millis(10),
+        });
+
+        assert!(view.take_pending_history_lines(80, 24).is_empty());
+        assert!(view.active_lines(80).is_empty());
+        assert!(!view.process_commands.contains_key(&42));
+    }
+
+    #[test]
+    fn repeated_live_write_stdin_polls_coalesce_like_codex() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.process_commands.insert(42, "just fix".to_string());
+        for call_id in ["cell:wait-1", "cell:wait-2"] {
+            view.handle_agent_event(AgentEvent::ToolStarted {
+                call_id: call_id.to_string(),
+                name: "write_stdin".to_string(),
+                input: Some(json!({"session_id": 42})),
+            });
+            view.handle_agent_event(AgentEvent::ToolCompleted {
+                call_id: call_id.to_string(),
+                output: Ok(json!({"session_id": 42, "output": ""})),
+                duration: Duration::from_millis(10),
+            });
+        }
+        view.handle_agent_event(completed_message("Finished."));
+
+        let rendered = view
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered
+                .matches("• Waited for background terminal · just fix")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Unknown process id"), "{rendered}");
     }
 
     #[test]
