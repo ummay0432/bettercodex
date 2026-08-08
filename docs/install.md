@@ -14,22 +14,17 @@ or Node workspace.
 
 Windows is not supported.
 
-## Build from source
+## Install from source
 
-Install Git, a native C toolchain, and Rust through
-[rustup](https://rustup.rs/). Then clone the private repository and build:
-
-```sh
-gh repo clone ummay0432/bettercodex
-cd bettercodex
-cargo build --locked
-cargo run --bin bcodex
-```
-
-To install the binary under `$HOME/.local/bin`:
+Install an authenticated [GitHub CLI](https://cli.github.com/), a native C
+toolchain, and Rust through [rustup](https://rustup.rs/). Then clone the private
+repository into a stable local path and install the package:
 
 ```sh
-cargo install --locked --path . --force --root "$HOME/.local"
+bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
+mkdir -p "$(dirname "$bcodex_source")" &&
+gh repo clone ummay0432/bettercodex "$bcodex_source" &&
+cargo install --locked --path "$bcodex_source" --force --root "$HOME/.local"
 ```
 
 Open a new terminal if `$HOME/.local/bin` was not already on `PATH`, then
@@ -43,6 +38,63 @@ bcodex
 Use an existing Codex ChatGPT credential at
 `${CODEX_HOME:-$HOME/.codex}/auth.json`, or sign in through `bcodex login`.
 BetterCodex settings and saved sessions stay under `$HOME/.bcodex`.
+
+## Updating
+
+Bettercodex does not carry a separate updater or release-packaging system. Pull
+the retained source checkout forward and reinstall the same Cargo package:
+
+```sh
+bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
+git -C "$bcodex_source" pull --ff-only &&
+cargo install --locked --path "$bcodex_source" --force --root "$HOME/.local"
+```
+
+`git pull --ff-only` stops instead of merging when the checkout has diverged;
+the chained Cargo command therefore installs only the requested revision.
+The one-line [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) performs either the
+first clone or this update against the same checkout.
+
+## Migrating from the retired updater
+
+An installed 0.1.2-era binary may still show `Update available` and advertise
+`bcodex update`. That executable compares its embedded source commit with
+private `main`, so any later commit triggers the notice even though both builds
+report version 0.1.2. The updater itself was subsequently removed with the
+private packaging scripts; an old executable cannot migrate across that removal
+by updating itself.
+
+Run [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) once to install current
+source through Cargo. Existing ChatGPT credentials, Bettercodex settings, and
+saved sessions are unaffected. After the newly installed binary launches, the
+retired updater's dedicated build cache is unused and can be removed:
+
+```sh
+rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex"
+```
+
+The cache contains only the retired updater's downloaded source and build
+artifacts; it does not contain credentials, settings, or sessions.
+
+For a development checkout elsewhere on disk, use that clean `main` checkout
+instead of cloning another copy:
+
+```sh
+git pull --ff-only &&
+cargo install --locked --path . --force --root "$HOME/.local"
+```
+
+Run those commands from the Bettercodex repository root.
+
+## Build without installing
+
+From any Bettercodex source checkout, build or run the binary directly with
+Cargo:
+
+```sh
+cargo build --locked
+cargo run --bin bcodex
+```
 
 ## Development checks
 
