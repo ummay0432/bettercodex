@@ -1,68 +1,53 @@
 # bettercodex
 
-bettercodex is a focused public port of the OpenAI Codex CLI for people who
-want a more proactive coding agent. It is an unofficial community project, not
-an OpenAI product.
+You cannot motivate agents to be proactive by tweaking the system prompt. You
+have to do it through orchestration.
 
-BetterCodex runs commands and applies patches with your user account's full
-permissions. It does not provide Codex's sandbox. Use it only on machines and
-repositories where you accept that trust model.
+Claude Code and Codex steer the model toward the smallest change that gets the
+task done. Over thousands of sessions, that compounds slop and technical debt.
+
+bettercodex is a work in progress port of
+[OpenAI Codex](https://github.com/openai/codex) trying to fix this in the
+harness. The plan is to use hooks, Andrej Karpathy's
+[`autoresearch`](https://github.com/karpathy/autoresearch), and context efficient
+loops to make the agent notice problems, do the work, and clean up after itself.
+
+Right now, bettercodex has an `autoresearch` inspired quality loop. One session
+builds an evaluator. Fresh sessions then take turns improving the same task. The
+harness keeps better results and throws away regressions.
+
+This is early, unofficial, and not an OpenAI product.
+
+bettercodex has no Codex sandbox. Commands and patches run with your full user
+permissions.
 
 ## Install
 
-On macOS 12+ or Linux with glibc 2.31+, copy and run this command:
+bettercodex supports macOS 12 or newer and Linux with glibc 2.31 or newer.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
 ```
 
-[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt) contains the same one-line command.
-When a compatible native release exists, it downloads the roughly 22 MB
-compressed executable, verifies its checksum, version, source revision, V8
-runtime, and embedded resources, then atomically installs it. That path needs
-`curl` but no npm, GitHub login, Rust, compiler, or local source build.
+Native releases are still in progress. Until they are ready, the installer
+builds from source and needs rustup, a native C toolchain, and several gigabytes
+of free space.
 
-The first complete four-platform native release has not been published yet.
-Until it is, the installer clearly enters its source fallback, which requires
-[rustup](https://rustup.rs/), a native C toolchain, several gigabytes of free
-space, and more time. The same command automatically starts using native assets
-after the release is available.
-
-Then open a new terminal, sign in with a ChatGPT account that has Codex access,
-and launch bettercodex from a project directory:
+Open a new terminal, then run:
 
 ```sh
 bcodex login
 bcodex
 ```
 
-Installed builds compare their embedded source revision with the latest
-published release after the TUI renders. When an update is available, run
-`bcodex update` in another terminal. It streams a compact patch from the
-installed revision when available, otherwise a roughly 17 MB full native
-update, and atomically installs the verified executable. It compiles zero Cargo
-packages, never enters source fallback, and retains no Rust build cache. A
-bounded source build exists only in the bootstrap installer when no compatible
-first-install asset exists.
+## Quality loop
 
-Only complete, non-prerelease GitHub Releases are distributed. Public branches
-and tags remain visible but do not trigger user updates. Missing or edited
-embedded system files are integrity-checked and atomically repaired when the
-updated binary launches.
+```text
+/loop improve startup time
+```
 
-For a task that merits evaluator-backed iteration, use `/loop <task>` in the
-TUI or include `$loop` anywhere in an interactive or non-interactive prompt.
-The default runs one evaluator session followed by three fresh working
-sessions; see [`docs/slash_commands.md`](docs/slash_commands.md#quality-loop)
-for counts, progress, restoration, and repository-local evidence.
+You can also put `$loop` anywhere in a prompt. The default is one evaluator
+session and three fresh work sessions.
 
-For an active engineering review and evidence-backed refactoring, use
-`/review <target>` in the TUI or invoke `$review <target>` in any prompt. The
-workflow develops a deep understanding of the target, applies explicit quality
-criteria, and acts on clear net improvements. The agent can also select this
-workflow proactively during implementation work; see
-[`docs/slash_commands.md`](docs/slash_commands.md#engineering-review).
-
-See [`docs/install.md`](docs/install.md) for supported platforms, verification,
-fallback, and migration details. [`spec-install.md`](spec-install.md) defines
-the release and updater contract.
+More detail is in the [install docs](docs/install.md) and
+[slash command docs](docs/slash_commands.md).
