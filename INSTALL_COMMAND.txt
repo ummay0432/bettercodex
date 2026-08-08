@@ -1,0 +1,1 @@
+gh repo clone ummay0432/bettercodex && cd bettercodex && cargo install --locked --path . --force --root "$HOME/.local"
