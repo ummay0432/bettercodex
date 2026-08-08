@@ -14,7 +14,12 @@ import unittest
 
 
 INSTALL_SCRIPT = Path(__file__).with_name("install.sh")
-VERSION = "0.1.0"
+CARGO_MANIFEST = INSTALL_SCRIPT.parent.parent / "Cargo.toml"
+VERSION = next(
+    line.removeprefix('version = "').removesuffix('"')
+    for line in CARGO_MANIFEST.read_text(encoding="utf-8").splitlines()
+    if line.startswith('version = "')
+)
 
 
 class InstallScriptTest(unittest.TestCase):
@@ -48,22 +53,27 @@ class InstallScriptTest(unittest.TestCase):
                 "--pattern bcodex-x86_64-unknown-linux-gnu.tar.gz", requests
             )
 
-    def test_selects_apple_silicon_release_and_accepts_bare_version(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            result = run_installer(
-                root,
-                system="Darwin",
-                machine="arm64",
-                arguments=("--release", VERSION),
-            )
+    def test_selects_every_native_asset_and_accepts_bare_version(self) -> None:
+        platforms = (
+            ("Darwin", "arm64", "aarch64-apple-darwin"),
+            ("Darwin", "x86_64", "x86_64-apple-darwin"),
+            ("Linux", "aarch64", "aarch64-unknown-linux-gnu"),
+            ("Linux", "x86_64", "x86_64-unknown-linux-gnu"),
+        )
+        for system, machine, target in platforms:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result = run_installer(
+                    root,
+                    system=system,
+                    machine=machine,
+                    arguments=("--release", VERSION),
+                )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            requests = (root / "gh.log").read_text(encoding="utf-8")
-            self.assertIn(f"release view v{VERSION}", requests)
-            self.assertIn(
-                "--pattern bcodex-aarch64-apple-darwin.tar.gz", requests
-            )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                requests = (root / "gh.log").read_text(encoding="utf-8")
+                self.assertIn(f"release view v{VERSION}", requests)
+                self.assertIn(f"--pattern bcodex-{target}.tar.gz", requests)
 
     def test_rejects_checksum_mismatch_without_replacing_existing_binary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -162,7 +172,7 @@ def run_installer(
             #!/bin/sh
             printf '%s\\n' "$*" >>"$BCODEX_TEST_GH_LOG"
             case "$1:$2" in
-              api:user)
+              auth:status)
                 [ "$BCODEX_TEST_AUTHENTICATED" = "1" ]
                 ;;
               api:repos/*)

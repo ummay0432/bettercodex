@@ -12,6 +12,8 @@ use anyhow::Result;
 use anyhow::bail;
 use std::ffi::OsStr;
 use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::process::Stdio;
 use std::time::Duration;
@@ -91,13 +93,33 @@ fn parse_stable_version(version: &str) -> Option<(u64, u64, u64)> {
 }
 
 pub(crate) fn run_update() -> Result<()> {
-    run_installer_script(INSTALLER_SCRIPT, OsStr::new("/bin/sh"))
+    let executable =
+        std::env::current_exe().context("could not locate the running bettercodex binary")?;
+    let configured_install_dir = std::env::var_os("BCODEX_INSTALL_DIR");
+    let install_dir = update_install_dir(&executable, configured_install_dir.as_deref())?;
+    run_installer_script(
+        INSTALLER_SCRIPT,
+        OsStr::new("/bin/sh"),
+        install_dir.as_os_str(),
+    )
 }
 
-fn run_installer_script(script: &[u8], shell: &OsStr) -> Result<()> {
+fn update_install_dir(executable: &Path, configured: Option<&OsStr>) -> Result<PathBuf> {
+    if let Some(configured) = configured {
+        return Ok(PathBuf::from(configured));
+    }
+    executable
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .context("could not locate the running bettercodex binary directory")
+}
+
+fn run_installer_script(script: &[u8], shell: &OsStr, install_dir: &OsStr) -> Result<()> {
     let mut child = ProcessCommand::new(shell)
         .arg("-s")
         .env("BCODEX_RELEASE", "latest")
+        .env("BCODEX_INSTALL_DIR", install_dir)
         .stdin(Stdio::piped())
         .spawn()
         .context("could not start the bettercodex installer")?;

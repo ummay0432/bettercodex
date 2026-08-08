@@ -84,13 +84,37 @@ jobs:
           set -euo pipefail
           codesign --force --sign - target/release/bcodex
           codesign --verify --verbose target/release/bcodex
-      - name: Smoke test release binary
+      - name: Smoke test release binary and embedded resources
         shell: bash
         run: |
           set -euo pipefail
           expected="bcodex ${GITHUB_REF_NAME#v}"
           actual="$(target/release/bcodex --version)"
           [[ "$actual" == "$expected" ]]
+          runtime_smoke="$(target/release/bcodex --internal-release-smoke)"
+          [[ "$runtime_smoke" == "$expected release smoke passed" ]]
+
+          smoke_root="$(mktemp -d "${RUNNER_TEMP}/bettercodex-release-smoke.XXXXXX")"
+          trap 'rm -rf "$smoke_root"' EXIT
+          mkdir -p \
+            "$smoke_root/home" \
+            "$smoke_root/codex-home" \
+            "$smoke_root/bcodex-home" \
+            "$smoke_root/workspace"
+          (
+            cd "$smoke_root/workspace"
+            HOME="$smoke_root/home" \
+              CODEX_HOME="$smoke_root/codex-home" \
+              BCODEX_HOME="$smoke_root/bcodex-home" \
+              BCODEX_SKIP_UPDATE_CHECK=1 \
+              "$GITHUB_WORKSPACE/target/release/bcodex" --tool-context-json \
+              >"$smoke_root/context.json"
+          )
+          test -s "$smoke_root/context.json"
+          test -s "$smoke_root/bcodex-home/skills/.system/loop/references/evals-manifest.md"
+          test -s "$smoke_root/bcodex-home/skills/.system/openai-docs/SKILL.md"
+          test -s "$smoke_root/bcodex-home/skills/.system/openai-docs/scripts/resolve-latest-model-info.cjs"
+          grep -Fq 'openaiDeveloperDocs__search_openai_docs' "$smoke_root/context.json"
       - name: Check Linux runtime libraries
         if: runner.os == 'Linux'
         shell: bash
@@ -165,3 +189,45 @@ jobs:
               --title "bettercodex ${TAG#v}" \
               --verify-tag
           fi
+
+  verify-install:
+    needs: publish
+    name: Verify update ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install and self-update the published release
+        env:
+          BCODEX_RELEASE: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/bettercodex/bin"
+          mkdir -p "$install_dir"
+          export PATH="$install_dir:$PATH"
+          BCODEX_INSTALL_DIR="$install_dir" ./scripts/install.sh
+
+          expected="bcodex ${GITHUB_REF_NAME#v}"
+          actual="$("$install_dir/bcodex" --version)"
+          [[ "$actual" == "$expected" ]]
+
+          unset BCODEX_INSTALL_DIR
+          "$install_dir/bcodex" update
+          updated="$("$install_dir/bcodex" --version)"
+          [[ "$updated" == "$expected" ]]

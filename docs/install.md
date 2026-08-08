@@ -69,8 +69,9 @@ stay silent and are retried on the next launch; set
 advertised because they do not have an installable binary—the maintainer must
 publish a matching GitHub Release.
 
-For an installation outside `$HOME/.local/bin`, pass the same directory when
-updating:
+`bcodex update` defaults to the directory containing the running binary, so an
+installation outside `$HOME/.local/bin` stays in its original location. To
+explicitly install into a different directory:
 
 ```sh
 BCODEX_INSTALL_DIR="$HOME/bin" bcodex update
@@ -81,7 +82,7 @@ The original installer command can also update an existing installation.
 To install a specific release:
 
 ```sh
-gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | BCODEX_RELEASE=v0.1.0 sh
+gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | BCODEX_RELEASE=v0.1.1 sh
 ```
 
 To use a different binary directory:
@@ -143,8 +144,8 @@ The package version and release tag must match. From a clean, validated `main`
 branch that has already been pushed to `origin`:
 
 ```sh
-git tag -a v0.1.0 -m "Release 0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "Release 0.1.1"
+git push origin refs/tags/v0.1.1:refs/tags/v0.1.1
 ```
 
 The `Release` workflow builds and smoke-tests all four platform binaries,
@@ -168,3 +169,18 @@ artifacts are downloaded and verified correctly:
 ```
 
 The resulting binary is under the target directory printed by the helper.
+
+The release archive intentionally contains one executable. Rust links the
+crate dependencies into that executable, while bettercodex embeds its prompts,
+installer, system skills, evaluator manifest, V8 runtime, and ICU data at
+compile time. The release workflow runs each native binary with an isolated
+home and working directory to verify that those resources materialize without
+a source checkout, initializes its bundled V8 and ICU runtime, then exercises
+`bcodex update` against the published asset.
+
+A successful local build proves that the source and embedded resources compile
+for that build host. It does not prove another CPU/operating-system artifact was
+built or published; the four-target release workflow provides that evidence.
+The installed program still expects normal host facilities where relevant:
+network access and an authenticated `gh` for private updates, `git` for
+repository work, and `tmux` when automatic terminal management is enabled.

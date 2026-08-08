@@ -1,6 +1,7 @@
 use super::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -100,16 +101,39 @@ async fn lookup_failures_and_unexpected_tags_are_silent() {
 }
 
 #[test]
-fn updater_pipes_the_installer_to_a_shell_and_requests_latest() {
+fn updater_targets_the_running_binary_directory_unless_configured() {
+    assert_eq!(
+        update_install_dir(Path::new("/opt/bettercodex/bin/bcodex"), None).unwrap(),
+        PathBuf::from("/opt/bettercodex/bin")
+    );
+    assert_eq!(
+        update_install_dir(
+            Path::new("/opt/bettercodex/bin/bcodex"),
+            Some(OsStr::new("/srv/custom bin")),
+        )
+        .unwrap(),
+        PathBuf::from("/srv/custom bin")
+    );
+    assert!(update_install_dir(Path::new("bcodex"), None).is_err());
+}
+
+#[test]
+fn updater_pipes_the_installer_to_a_shell_with_release_and_location() {
     run_installer_script(
-        b"test \"$BCODEX_RELEASE\" = latest\n",
+        b"test \"$BCODEX_RELEASE\" = latest\n\
+          test \"$BCODEX_INSTALL_DIR\" = '/tmp/custom bettercodex'\n",
         OsStr::new("/bin/sh"),
+        OsStr::new("/tmp/custom bettercodex"),
     )
     .unwrap();
     assert!(
-        run_installer_script(b"exit 7\n", OsStr::new("/bin/sh"))
-            .unwrap_err()
-            .to_string()
-            .contains("exit status: 7")
+        run_installer_script(
+            b"exit 7\n",
+            OsStr::new("/bin/sh"),
+            OsStr::new("/tmp/custom bettercodex"),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exit status: 7")
     );
 }

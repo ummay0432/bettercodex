@@ -112,6 +112,14 @@ fn run() -> Result<()> {
             ))?;
             Ok(())
         }
+        Command::InternalReleaseSmoke => {
+            tools::release_smoke_test().map_err(anyhow::Error::msg)?;
+            write_stdout_line(format_args!(
+                "bcodex {} release smoke passed",
+                env!("CARGO_PKG_VERSION")
+            ))?;
+            Ok(())
+        }
         Command::Login(command) => run_login_command(command),
         Command::Logout => run_logout_command(),
         Command::LogoutHelp => {
@@ -302,6 +310,7 @@ enum Command {
     ToolCatalogue,
     ToolCatalogueStats,
     ToolContextJson,
+    InternalReleaseSmoke,
     Login(LoginCommand),
     Logout,
     LogoutHelp,
@@ -331,6 +340,18 @@ struct RunOptions {
 impl Command {
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut arguments = arguments.into_iter().peekable();
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--internal-release-smoke")
+        {
+            arguments.next();
+            if arguments.next().is_some() {
+                return Err(anyhow!(
+                    "internal release smoke helper received extra arguments"
+                ));
+            }
+            return Ok(Self::InternalReleaseSmoke);
+        }
         if arguments
             .peek()
             .is_some_and(|argument| argument == "--internal-loop-state")
@@ -629,6 +650,21 @@ mod tests {
             Command::parse(["--tool-context-json".to_string()]).unwrap(),
             Command::ToolContextJson
         ));
+    }
+
+    #[test]
+    fn internal_release_smoke_is_strictly_parsed() {
+        assert!(matches!(
+            Command::parse(["--internal-release-smoke".to_string()]).unwrap(),
+            Command::InternalReleaseSmoke
+        ));
+        assert!(
+            Command::parse([
+                "--internal-release-smoke".to_string(),
+                "unexpected".to_string(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

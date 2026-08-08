@@ -32,7 +32,7 @@ Usage: install.sh [--release VERSION]
 Downloads a private bettercodex release with the authenticated GitHub CLI.
 
 Environment:
-  BCODEX_RELEASE      Version to install, such as v0.1.0 (default: latest).
+  BCODEX_RELEASE      Version to install, such as v1.2.3 (default: latest).
   BCODEX_INSTALL_DIR  Binary directory (default: ~/.local/bin).
   BCODEX_REPOSITORY   GitHub repository (default: $REPOSITORY).
 EOF
@@ -88,7 +88,9 @@ require_command mktemp
 require_command sed
 require_command tar
 
-if ! gh api user >/dev/null 2>&1; then
+export GH_PROMPT_DISABLED=1
+
+if ! gh auth status --active --hostname github.com >/dev/null 2>&1; then
   fail "GitHub CLI is not signed in; run 'gh auth login' and retry"
 fi
 
