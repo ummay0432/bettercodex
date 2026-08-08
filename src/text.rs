@@ -36,8 +36,38 @@ fn parse_markdown_hash_location_point(point: &str) -> Option<(&str, Option<&str>
     }
 }
 
+pub(crate) fn escape_xml(value: &str) -> String {
+    escape_xml_with(value, true)
+}
+
+pub(crate) fn escape_xml_text(value: &str) -> String {
+    escape_xml_with(value, false)
+}
+
+fn escape_xml_with(value: &str, escape_quotes: bool) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' if escape_quotes => escaped.push_str("&quot;"),
+            '\'' if escape_quotes => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+pub(crate) fn escape_cdata(value: &str) -> String {
+    value.replace("]]>", "]]]]><![CDATA[>")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::escape_cdata;
+    use super::escape_xml;
+    use super::escape_xml_text;
     use super::normalize_markdown_hash_location_suffix;
 
     #[test]
@@ -60,5 +90,19 @@ mod tests {
     fn rejects_non_markdown_locations() {
         assert_eq!(normalize_markdown_hash_location_suffix(":74:3"), None);
         assert_eq!(normalize_markdown_hash_location_suffix("#74"), None);
+    }
+
+    #[test]
+    fn escapes_xml_attributes_and_text() {
+        assert_eq!(
+            escape_xml("<&>\"'"),
+            "&lt;&amp;&gt;&quot;&apos;"
+        );
+        assert_eq!(escape_xml_text("<&>\"'"), "&lt;&amp;&gt;\"'");
+    }
+
+    #[test]
+    fn splits_cdata_terminators() {
+        assert_eq!(escape_cdata("left]]>right"), "left]]]]><![CDATA[>right");
     }
 }

@@ -41,6 +41,28 @@ pub(crate) fn backoff(base: Duration, attempt: u64) -> Duration {
     Duration::from_millis((raw_millis as f64 * jitter) as u64)
 }
 
+pub(crate) async fn bounded_error_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    max_chars: usize,
+) -> String {
+    let mut body = Vec::with_capacity(max_bytes);
+    while body.len() < max_bytes {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) if body.is_empty() => return "unreadable response".to_string(),
+            Err(_) => break,
+        };
+        let remaining = max_bytes.saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&body)
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 /// Installs Codex's process-wide AWS-LC rustls provider.
 ///
 /// AWS-LC retains ECDSA P-521/SHA-512 support needed by some enterprise TLS

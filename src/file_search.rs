@@ -58,26 +58,6 @@ struct IndexedEntry {
     match_type: MatchType,
 }
 
-impl FileMatch {
-    pub fn full_path(&self) -> PathBuf {
-        self.root.join(&self.path)
-    }
-}
-
-/// Returns the final path component for a matched path, falling back to the full path.
-pub fn file_name_from_path(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
-}
-
-#[derive(Debug)]
-pub struct FileSearchResults {
-    pub matches: Vec<FileMatch>,
-    pub total_match_count: usize,
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct FileSearchSnapshot {
     pub query: String,
@@ -199,21 +179,6 @@ pub fn create_session(
     thread::spawn(move || walker_worker(walker_inner, override_matcher, injector));
 
     Ok(FileSearchSession { inner })
-}
-
-pub fn cmp_by_score_desc_then_path_asc<T, FScore, FPath>(
-    score_of: FScore,
-    path_of: FPath,
-) -> impl FnMut(&T, &T) -> std::cmp::Ordering
-where
-    FScore: Fn(&T) -> u32,
-    FPath: Fn(&T) -> &str,
-{
-    use std::cmp::Ordering;
-    move |a, b| match score_of(b).cmp(&score_of(a)) {
-        Ordering::Equal => path_of(a).cmp(path_of(b)),
-        other => other,
-    }
 }
 
 struct SessionInner {

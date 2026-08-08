@@ -3,6 +3,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use crate::http_client::bounded_error_body;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -173,7 +174,12 @@ impl Auth {
             .context("failed to refresh ChatGPT credentials")?;
         let status = response.status();
         if status != StatusCode::OK {
-            let body = bounded_error_body(response).await;
+            let body = bounded_error_body(
+                response,
+                MAX_REFRESH_ERROR_BODY_BYTES,
+                MAX_REFRESH_ERROR_BODY_CHARS,
+            )
+            .await;
             return Err(anyhow!(
                 "ChatGPT credential refresh failed with {status}: {body}; run `bcodex login`"
             ));
@@ -492,24 +498,6 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
         let _ = std::fs::remove_file(&temp);
     }
     result
-}
-
-async fn bounded_error_body(mut response: reqwest::Response) -> String {
-    let mut body = Vec::with_capacity(MAX_REFRESH_ERROR_BODY_BYTES);
-    while body.len() < MAX_REFRESH_ERROR_BODY_BYTES {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(_) if body.is_empty() => return "unreadable response".to_string(),
-            Err(_) => break,
-        };
-        let remaining = MAX_REFRESH_ERROR_BODY_BYTES.saturating_sub(body.len());
-        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-    }
-    String::from_utf8_lossy(&body)
-        .chars()
-        .take(MAX_REFRESH_ERROR_BODY_CHARS)
-        .collect()
 }
 
 #[cfg(test)]

@@ -2,6 +2,8 @@ use crate::paths;
 use crate::repository;
 use crate::skill_settings;
 use crate::system_skills;
+use crate::text::escape_cdata;
+use crate::text::escape_xml_text;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -445,7 +447,7 @@ impl SkillCatalog {
         for skill in selected {
             match read_skill_prompt(&skill.path) {
                 Ok((contents, truncated)) => {
-                    let path = escape_xml(&skill.path.to_string_lossy());
+                    let path = escape_xml_text(&skill.path.to_string_lossy());
                     let truncation_notice = truncated.then(|| {
                         format!(
                             "\n<skill_truncated>The injected copy reached bettercodex's {MAX_SKILL_PROMPT_BYTES}-byte item limit. Read the complete SKILL.md at {path} before acting.</skill_truncated>"
@@ -457,7 +459,7 @@ impl SkillCatalog {
                             skill.name, MAX_SKILL_PROMPT_BYTES
                         )));
                     }
-                    let name = escape_xml(&skill.name);
+                    let name = escape_xml_text(&skill.name);
                     let prompt = format!(
                         "<skill_context>\n<name>{name}</name>\n<path>{path}</path>\n<instructions><![CDATA[\n{}\n]]></instructions>{}\n</skill_context>",
                         escape_cdata(&contents),
@@ -934,7 +936,7 @@ fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize
     let full_descriptions = skills
         .iter()
         .map(|skill| {
-            escape_xml(
+            escape_xml_text(
                 &skill
                     .description
                     .chars()
@@ -991,10 +993,10 @@ fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize
 
 fn catalog_line(skill: &Skill, description: &str) -> String {
     let path = truncate_bytes(
-        &escape_xml(&skill.path.to_string_lossy().replace('\\', "/")),
+        &escape_xml_text(&skill.path.to_string_lossy().replace('\\', "/")),
         1_024,
     );
-    let name = truncate_bytes(&escape_xml(&skill.name), 256);
+    let name = truncate_bytes(&escape_xml_text(&skill.name), 256);
     if description.is_empty() {
         format!("- {name}: (file: {path})")
     } else {
@@ -1038,17 +1040,6 @@ fn bounded_warning(warning: String) -> String {
     } else {
         bounded
     }
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn escape_cdata(value: &str) -> String {
-    value.replace("]]>", "]]]]><![CDATA[>")
 }
 
 struct Mentions<'a> {

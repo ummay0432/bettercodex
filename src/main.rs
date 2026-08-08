@@ -8,9 +8,6 @@ mod cache;
 mod compaction;
 mod context;
 mod events;
-// This is an in-tree port of an upstream crate API; BetterCodex currently uses
-// only part of that retained surface.
-#[allow(dead_code)]
 mod file_search;
 mod fuzzy_match;
 mod http_client;
@@ -25,9 +22,6 @@ mod protocol;
 mod quality_loop;
 mod repository;
 mod rollout;
-// This is an in-tree port of an upstream crate API; BetterCodex currently uses
-// only part of that retained surface.
-#[allow(dead_code)]
 mod shell_command;
 mod skill_settings;
 mod skills;
@@ -35,6 +29,7 @@ mod state_file;
 mod system_skills;
 mod terminal_color;
 mod text;
+mod time;
 mod tools;
 mod truncation;
 mod tui;

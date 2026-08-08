@@ -232,7 +232,7 @@ fn active_token(
     if !skills.iter().any(Skill::is_enabled) {
         return None;
     }
-    let cursor = previous_char_boundary(text, cursor.min(text.len()));
+    let cursor = text.floor_char_boundary(cursor);
     let line_start = text[..cursor].rfind('\n').map_or(0, |index| index + 1);
     let line_end = text[cursor..]
         .find('\n')
@@ -370,11 +370,4 @@ fn display_width(value: &str) -> usize {
         .chars()
         .map(|character| character.width().unwrap_or(0))
         .sum()
-}
-
-fn previous_char_boundary(text: &str, mut index: usize) -> usize {
-    while !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }

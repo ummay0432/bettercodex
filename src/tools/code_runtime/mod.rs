@@ -9,11 +9,9 @@
 //! bettercodex exposes the runtime unconditionally.
 
 mod cell_actor;
-// Keep the complete upstream description API available in this in-tree port.
-#[allow(dead_code)]
 mod description;
 // Protocol variant names deliberately mirror the upstream wire representation.
-#[allow(dead_code, clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names)]
 mod protocol;
 mod runtime;
 mod service;

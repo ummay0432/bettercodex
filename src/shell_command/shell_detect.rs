@@ -11,28 +11,11 @@ pub enum ShellType {
     Sh,
     Cmd,
 }
-impl ShellType {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Zsh => "zsh",
-            Self::Bash => "bash",
-            Self::PowerShell => "powershell",
-            Self::Sh => "sh",
-            Self::Cmd => "cmd",
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectedShell {
     pub shell_type: ShellType,
     pub shell_path: PathBuf,
-}
-
-impl DetectedShell {
-    pub fn name(&self) -> &'static str {
-        self.shell_type.name()
-    }
 }
 
 pub fn detect_shell_type(shell_path: impl AsRef<std::path::Path>) -> Option<ShellType> {

@@ -12,10 +12,12 @@ use crate::context::HistoryCursor;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::http_client::backoff;
+use crate::http_client::bounded_error_body;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
 use crate::tools;
 use crate::tools::ToolCall;
+use crate::time::unix_timestamp_millis;
 use crate::usage::TokenUsage;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
@@ -35,8 +37,6 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::LazyLock;
 use std::time::Duration;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
@@ -57,6 +57,7 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WEBSOCKET_PREWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STREAM_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16_000;
+const MAX_ERROR_BODY_CHARS: usize = 4_000;
 // Encoding is on the critical path before network I/O. Level 1 retains strong compression for the
 // long-context JSON workloads in `benchmark_responses_request_encoding` while materially reducing
 // CPU time versus zstd's level-3 default.
@@ -1232,7 +1233,12 @@ impl ApiClient {
                 attempt = attempt.saturating_add(1);
                 continue;
             }
-            let body = bounded_error_body(response).await;
+            let body = bounded_error_body(
+                response,
+                MAX_ERROR_BODY_BYTES,
+                MAX_ERROR_BODY_CHARS,
+            )
+            .await;
             let message = format!("Responses request failed with {status}: {body}");
             if status == StatusCode::TOO_MANY_REQUESTS || transport_retryable {
                 return Err(ApiError::retryable_after(message, retry_after));
@@ -1863,30 +1869,6 @@ fn parse_rate_limit_delay(message: &str) -> Option<Duration> {
     } else {
         None
     }
-}
-
-fn unix_timestamp_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
-async fn bounded_error_body(mut response: reqwest::Response) -> String {
-    let mut body = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
-    while body.len() < MAX_ERROR_BODY_BYTES {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(_) if body.is_empty() => return "unreadable response".to_string(),
-            Err(_) => break,
-        };
-        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
-        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-    }
-    String::from_utf8_lossy(&body).chars().take(4_000).collect()
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 use super::markdown;
 use super::palette;
 use crate::rollout::SessionSummary;
+use crate::time::unix_timestamp_millis;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -20,8 +21,6 @@ use ratatui::widgets::Paragraph;
 use std::cmp::Ordering;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
@@ -877,15 +876,6 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
             .preview
             .as_ref()
             .is_some_and(|preview| preview.to_lowercase().contains(query))
-}
-
-fn unix_timestamp_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn format_relative_time(now_unix_ms: u64, timestamp_unix_ms: u64) -> String {

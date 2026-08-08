@@ -1,6 +1,7 @@
 use crate::MODEL;
 use crate::protocol::MessagePhase;
 use crate::skills::SkillSelection;
+use crate::time::unix_timestamp_millis;
 use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
@@ -1176,15 +1177,6 @@ fn open_private_replace(path: &Path) -> Result<File> {
     options
         .open(path)
         .with_context(|| format!("failed to open private file {}", path.display()))
-}
-
-fn unix_timestamp_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

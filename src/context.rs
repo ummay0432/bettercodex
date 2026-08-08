@@ -7,6 +7,8 @@ use crate::rollout::Rollout;
 use crate::rollout::SessionIdentity;
 use crate::rollout::TurnOutcome;
 use crate::skills::SkillCatalog;
+use crate::text::escape_cdata;
+use crate::text::escape_xml;
 use crate::truncation::TruncationPolicy;
 use crate::truncation::formatted_truncate_text;
 use crate::usage::TokenUsage;
@@ -1565,19 +1567,6 @@ fn synthetic_output(call: &CallDescriptor) -> Value {
             "output": "aborted",
         })
     }
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn escape_cdata(value: &str) -> String {
-    value.replace("]]>", "]]]]><![CDATA[>")
 }
 
 #[cfg(test)]

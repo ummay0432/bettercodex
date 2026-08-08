@@ -361,7 +361,7 @@ impl FileSearchPopup {
 }
 
 fn active_token(text: &str, cursor: usize) -> Option<ActiveToken> {
-    let cursor = previous_char_boundary(text, cursor.min(text.len()));
+    let cursor = text.floor_char_boundary(cursor);
     let before_cursor = &text[..cursor];
     let after_cursor = &text[cursor..];
     let at_whitespace = after_cursor.chars().next().is_some_and(char::is_whitespace);
@@ -444,13 +444,6 @@ pub(super) fn is_horizontal_whitespace(character: char) -> bool {
             character,
             '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
         )
-}
-
-fn previous_char_boundary(text: &str, mut index: usize) -> usize {
-    while !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 fn file_match_line(file_match: &FileMatch, selected: bool, width: usize) -> Line<'static> {
