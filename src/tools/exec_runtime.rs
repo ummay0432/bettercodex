@@ -25,10 +25,9 @@ use crate::openai_docs::OpenAiDocsClient;
 use crate::protocol::DEFAULT_IMAGE_DETAIL;
 use crate::protocol::FunctionCallOutputContentItem;
 use crate::protocol::ImageDetail;
-use crate::truncation::TruncationPolicy;
 use crate::truncation::formatted_truncate_text;
-use crate::truncation::formatted_truncate_text_content_items_with_policy;
-use crate::truncation::truncate_function_output_items_with_policy;
+use crate::truncation::formatted_truncate_text_content_items;
+use crate::truncation::truncate_function_output_items;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Result;
@@ -429,15 +428,15 @@ fn truncate_items(
     items: Vec<FunctionCallOutputContentItem>,
     max_tokens: Option<usize>,
 ) -> Vec<FunctionCallOutputContentItem> {
-    let policy = TruncationPolicy::Tokens(output_token_budget(max_tokens));
+    let max_tokens = output_token_budget(max_tokens);
     if items
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
-        return formatted_truncate_text_content_items_with_policy(&items, policy).0;
+        return formatted_truncate_text_content_items(&items, max_tokens).0;
     }
 
-    truncate_function_output_items_with_policy(&items, policy, estimate_audio_token_count)
+    truncate_function_output_items(&items, max_tokens, estimate_audio_token_count)
 }
 
 fn output_token_budget(requested: Option<usize>) -> usize {
@@ -447,10 +446,7 @@ fn output_token_budget(requested: Option<usize>) -> usize {
 }
 
 fn bounded_runtime_text(text: &str) -> String {
-    formatted_truncate_text(
-        text,
-        TruncationPolicy::Tokens(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
-    )
+    formatted_truncate_text(text, super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS)
 }
 
 fn output_body(items: Vec<FunctionCallOutputContentItem>) -> Result<Value> {

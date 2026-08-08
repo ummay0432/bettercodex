@@ -9,7 +9,6 @@ use crate::rollout::TurnOutcome;
 use crate::skills::SkillCatalog;
 use crate::text::escape_cdata;
 use crate::text::escape_xml;
-use crate::truncation::TruncationPolicy;
 use crate::truncation::formatted_truncate_text;
 use crate::usage::TokenUsage;
 use anyhow::Context;
@@ -687,10 +686,7 @@ impl Conversation {
     }
 
     fn append_context_notice(&mut self, tag: &str, guidance: &str) -> Result<()> {
-        let guidance = formatted_truncate_text(
-            guidance,
-            TruncationPolicy::Tokens(MAX_CONTEXT_NOTICE_TEXT_TOKENS),
-        );
+        let guidance = formatted_truncate_text(guidance, MAX_CONTEXT_NOTICE_TEXT_TOKENS);
         self.extend([message("user", format!("<{tag}>\n{guidance}\n</{tag}>"))])
     }
 

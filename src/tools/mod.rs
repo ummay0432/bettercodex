@@ -25,7 +25,6 @@ use crate::events::AgentEvent;
 use crate::image::data_url_from_bytes;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::protocol::UpdatePlanArgs;
-use crate::truncation::TruncationPolicy;
 use crate::truncation::formatted_truncate_text;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
@@ -145,10 +144,7 @@ pub(crate) struct ToolResult {
 
 impl ToolResult {
     pub(crate) fn text(text: String) -> Self {
-        let text = formatted_truncate_text(
-            &text,
-            TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
-        );
+        let text = formatted_truncate_text(&text, MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS);
         #[cfg(test)]
         let preview = text.clone();
         Self {

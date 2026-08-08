@@ -1,6 +1,5 @@
 use crate::context::estimated_tokens;
 use crate::context::is_contextual_user_message;
-use crate::truncation::TruncationPolicy;
 use crate::truncation::approx_token_count;
 use crate::truncation::truncate_text;
 use serde_json::Value;
@@ -227,7 +226,7 @@ fn truncate_message_text(mut item: Value, max_tokens: usize) -> Option<Value> {
             if token_count <= remaining {
                 remaining = remaining.saturating_sub(token_count);
             } else {
-                *text = truncate_text(text, TruncationPolicy::Tokens(remaining));
+                *text = truncate_text(text, remaining);
                 remaining = 0;
             }
             if !text.is_empty() {

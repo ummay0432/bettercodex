@@ -14,8 +14,8 @@ use crate::protocol::ImageDetail;
 use crate::protocol::InternalChatMessageMetadataPassthrough;
 use crate::protocol::MessagePhase;
 use crate::protocol::ResponseItem;
-use crate::truncation::TruncationPolicy;
 use crate::truncation::approx_token_count;
+use crate::truncation::approx_bytes_for_tokens;
 use crate::truncation::formatted_truncate_text;
 use crate::truncation::truncate_text;
 use anyhow::Context;
@@ -440,11 +440,10 @@ impl WebSearchClient {
 }
 
 fn bounded_search_output(output: String) -> String {
-    let policy = TruncationPolicy::Tokens(MAX_OUTPUT_TOKENS);
-    if output.len() <= policy.byte_budget() {
+    if output.len() <= approx_bytes_for_tokens(MAX_OUTPUT_TOKENS) {
         output
     } else {
-        formatted_truncate_text(&output, policy)
+        formatted_truncate_text(&output, MAX_OUTPUT_TOKENS)
     }
 }
 
@@ -840,8 +839,7 @@ impl HistoryMessage<'_> {
                             *assistant_tokens = assistant_tokens.saturating_sub(tokens);
                             text.to_string()
                         } else {
-                            let text =
-                                truncate_text(text, TruncationPolicy::Tokens(*assistant_tokens));
+                            let text = truncate_text(text, *assistant_tokens);
                             *assistant_tokens = 0;
                             text
                         };

@@ -8,7 +8,7 @@
 
 use crate::shell_command::shell_detect::default_user_shell;
 use crate::shell_command::shell_detect::get_shell_by_model_provided_path;
-use crate::truncation::TruncationPolicy;
+use crate::truncation::approx_bytes_for_tokens;
 use crate::truncation::approx_tokens_from_byte_count;
 use crate::truncation::formatted_truncate_text;
 use crate::truncation::truncate_text;
@@ -604,11 +604,10 @@ fn truncate_output(
     let max_tokens = max_tokens
         .unwrap_or(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS)
         .min(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS);
-    let policy = TruncationPolicy::Tokens(max_tokens);
     if omitted_bytes == 0 {
-        return formatted_truncate_text(output, policy);
+        return formatted_truncate_text(output, max_tokens);
     }
-    if output.len() <= policy.byte_budget() {
+    if output.len() <= approx_bytes_for_tokens(max_tokens) {
         return output.to_string();
     }
 
@@ -620,7 +619,7 @@ fn truncate_output(
     };
     format!(
         "Warning: truncated output (original token count: {original_token_count})\n{omission_notice}\n{}",
-        truncate_text(output, policy),
+        truncate_text(output, max_tokens),
     )
 }
 

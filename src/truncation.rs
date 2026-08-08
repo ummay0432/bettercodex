@@ -8,58 +8,29 @@ mod string;
 pub(crate) use self::string::approx_bytes_for_tokens;
 pub(crate) use self::string::approx_token_count;
 pub(crate) use self::string::approx_tokens_from_byte_count;
-use self::string::truncate_middle_chars;
 use self::string::truncate_middle_with_token_budget;
 use crate::protocol::FunctionCallOutputContentItem;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum TruncationPolicy {
-    Bytes(usize),
-    Tokens(usize),
-}
-
-impl TruncationPolicy {
-    pub(crate) fn token_budget(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => {
-                usize::try_from(approx_tokens_from_byte_count(*bytes)).unwrap_or(usize::MAX)
-            }
-            Self::Tokens(tokens) => *tokens,
-        }
-    }
-
-    pub(crate) fn byte_budget(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => *bytes,
-            Self::Tokens(tokens) => approx_bytes_for_tokens(*tokens),
-        }
-    }
-}
-
-pub(crate) fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
-    if content.len() <= policy.byte_budget() {
+pub(crate) fn formatted_truncate_text(content: &str, max_tokens: usize) -> String {
+    if content.len() <= approx_bytes_for_tokens(max_tokens) {
         return content.to_string();
     }
 
     let original_token_count = approx_token_count(content);
     let total_lines = content.lines().count();
-    let result = truncate_text(content, policy);
+    let result = truncate_text(content, max_tokens);
     format!(
         "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{result}"
     )
 }
 
-pub(crate) fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
-    match policy {
-        TruncationPolicy::Bytes(bytes) => truncate_middle_chars(content, bytes),
-        TruncationPolicy::Tokens(tokens) => truncate_middle_with_token_budget(content, tokens).0,
-    }
+pub(crate) fn truncate_text(content: &str, max_tokens: usize) -> String {
+    truncate_middle_with_token_budget(content, max_tokens).0
 }
 
-pub(crate) fn formatted_truncate_text_content_items_with_policy(
+pub(crate) fn formatted_truncate_text_content_items(
     items: &[FunctionCallOutputContentItem],
-    policy: TruncationPolicy,
+    max_tokens: usize,
 ) -> (Vec<FunctionCallOutputContentItem>, Option<usize>) {
     let text_segments = items
         .iter()
@@ -83,13 +54,13 @@ pub(crate) fn formatted_truncate_text_content_items_with_policy(
         combined.push_str(text);
     }
 
-    if combined.len() <= policy.byte_budget() {
+    if combined.len() <= approx_bytes_for_tokens(max_tokens) {
         return (items.to_vec(), None);
     }
 
     let original_token_count = approx_token_count(&combined);
     let mut out = vec![FunctionCallOutputContentItem::InputText {
-        text: formatted_truncate_text(&combined, policy),
+        text: formatted_truncate_text(&combined, max_tokens),
     }];
     out.extend(items.iter().filter_map(|item| match item {
         FunctionCallOutputContentItem::InputImage { image_url, detail } => {
@@ -114,16 +85,13 @@ pub(crate) fn formatted_truncate_text_content_items_with_policy(
     (out, Some(original_token_count))
 }
 
-pub(crate) fn truncate_function_output_items_with_policy(
+pub(crate) fn truncate_function_output_items(
     items: &[FunctionCallOutputContentItem],
-    policy: TruncationPolicy,
+    max_tokens: usize,
     estimate_audio_token_count: impl Fn(&str) -> usize,
 ) -> Vec<FunctionCallOutputContentItem> {
     let mut out: Vec<FunctionCallOutputContentItem> = Vec::with_capacity(items.len());
-    let mut remaining_budget = match policy {
-        TruncationPolicy::Bytes(_) => policy.byte_budget(),
-        TruncationPolicy::Tokens(_) => policy.token_budget(),
-    };
+    let mut remaining_budget = max_tokens;
     let mut omitted_text_items = 0usize;
     let mut omitted_audio_items = 0usize;
 
@@ -135,20 +103,13 @@ pub(crate) fn truncate_function_output_items_with_policy(
                     continue;
                 }
 
-                let cost = match policy {
-                    TruncationPolicy::Bytes(_) => text.len(),
-                    TruncationPolicy::Tokens(_) => approx_token_count(text),
-                };
+                let cost = approx_token_count(text);
 
                 if cost <= remaining_budget {
                     out.push(FunctionCallOutputContentItem::InputText { text: text.clone() });
                     remaining_budget = remaining_budget.saturating_sub(cost);
                 } else {
-                    let snippet_policy = match policy {
-                        TruncationPolicy::Bytes(_) => TruncationPolicy::Bytes(remaining_budget),
-                        TruncationPolicy::Tokens(_) => TruncationPolicy::Tokens(remaining_budget),
-                    };
-                    let snippet = truncate_text(text, snippet_policy);
+                    let snippet = truncate_text(text, remaining_budget);
                     if snippet.is_empty() {
                         omitted_text_items += 1;
                     } else {
@@ -164,11 +125,7 @@ pub(crate) fn truncate_function_output_items_with_policy(
                 });
             }
             FunctionCallOutputContentItem::InputAudio { audio_url } => {
-                let token_cost = estimate_audio_token_count(audio_url);
-                let cost = match policy {
-                    TruncationPolicy::Bytes(_) => approx_bytes_for_tokens(token_cost),
-                    TruncationPolicy::Tokens(_) => token_cost,
-                };
+                let cost = estimate_audio_token_count(audio_url);
                 if cost <= remaining_budget {
                     out.push(FunctionCallOutputContentItem::InputAudio {
                         audio_url: audio_url.clone(),
@@ -198,16 +155,6 @@ pub(crate) fn truncate_function_output_items_with_policy(
     }
 
     out
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn approx_tokens_from_byte_count_i64(bytes: i64) -> i64 {
-    if bytes <= 0 {
-        return 0;
-    }
-
-    let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
-    i64::try_from(approx_tokens_from_byte_count(bytes)).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
