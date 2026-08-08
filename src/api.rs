@@ -11,6 +11,7 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::HistoryCursor;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
+use crate::http_client::backoff;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
 use crate::tools;
@@ -20,7 +21,6 @@ use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Context;
 use bytes::Bytes;
-use codex_client::backoff;
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_ENCODING;
 use reqwest::header::CONTENT_TYPE;
@@ -448,12 +448,13 @@ impl ApiClient {
         codex_utils_rustls_provider::ensure_rustls_crypto_provider();
         let mut default_headers = HeaderMap::new();
         default_headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
-        let client = codex_client::with_chatgpt_cloudflare_cookie_store(reqwest::Client::builder())
-            .default_headers(default_headers)
-            .user_agent(concat!("bettercodex/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(20))
-            .build()
-            .context("failed to create HTTP client")?;
+        let client = crate::http_client::build_client(
+            crate::http_client::with_chatgpt_cloudflare_cookie_store(reqwest::Client::builder())
+                .default_headers(default_headers)
+                .user_agent(concat!("bettercodex/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(20)),
+        )
+        .context("failed to create HTTP client")?;
         Ok(Self {
             client,
             auth: SharedAuth::new(auth),

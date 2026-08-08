@@ -1,18 +1,19 @@
-//! Single-environment adaptation of Codex unified exec at
-//! `1669c2403f793d0230065397dfc25f52b844244e`.
+//! Single-environment adaptation of Codex's model-visible unified exec contract at
+//! `1669c2403f793d0230065397dfc25f52b844244e`. Low-level process transport is delegated to the
+//! newer upstream runtime documented in `process_session`.
 //!
 //! bettercodex removes Codex's sandbox, approval, remote-environment, hook,
 //! and telemetry layers, while retaining its model-visible process/session,
 //! PTY, yield, environment, and output-truncation behavior.
 
+use crate::shell_command::shell_detect::default_user_shell;
+use crate::shell_command::shell_detect::get_shell_by_model_provided_path;
+use crate::truncation::TruncationPolicy;
+use crate::truncation::approx_tokens_from_byte_count;
+use crate::truncation::formatted_truncate_text;
+use crate::truncation::truncate_text;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_shell_command::shell_detect::default_user_shell;
-use codex_shell_command::shell_detect::get_shell_by_model_provided_path;
-use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::approx_tokens_from_byte_count;
-use codex_utils_output_truncation::formatted_truncate_text;
-use codex_utils_output_truncation::truncate_text;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
@@ -173,7 +174,8 @@ impl ProcessManager {
         } else {
             ProcessMode::Piped
         };
-        let session = ProcessSession::spawn(&shell, shell_startup, &arguments.cmd, &workdir, mode)?;
+        let session =
+            ProcessSession::spawn(&shell, shell_startup, &arguments.cmd, &workdir, mode).await?;
         let started = Instant::now();
         let storage = if session.has_exited() {
             ProcessStorage::Transient

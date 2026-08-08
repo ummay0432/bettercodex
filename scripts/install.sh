@@ -121,7 +121,9 @@ validate_absolute_path() {
   esac
 }
 
-validate_absolute_path "${HOME:-}" HOME
+if [ -n "${HOME:-}" ]; then
+  validate_absolute_path "$HOME" HOME
+fi
 validate_absolute_path "$bin_dir" BCODEX_INSTALL_DIR
 if [ -n "${TMPDIR:-}" ]; then
   validate_absolute_path "$TMPDIR" TMPDIR
@@ -135,14 +137,13 @@ require_command() {
 }
 
 require_command awk
-require_command awk
-require_command cargo
 require_command cc
+require_command cmp
 require_command curl
+require_command dirname
 require_command gh
 require_command grep
 require_command mktemp
-require_command rustc
 require_command rustup
 require_command sed
 require_command tar
@@ -209,6 +210,30 @@ acquire_install_lock() {
 
 acquire_install_lock
 
+cleanup_retired_updater_cache() {
+  legacy_cache_root=""
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    legacy_cache_root="$XDG_CACHE_HOME/bettercodex"
+  elif [ -n "${HOME:-}" ]; then
+    legacy_cache_root="$HOME/.cache/bettercodex"
+  fi
+  [ -n "$legacy_cache_root" ] || return
+
+  for legacy_path in "$legacy_cache_root/build" "$legacy_cache_root/tmp"; do
+    if [ -L "$legacy_path" ]; then
+      warn "not removing retired cache symlink $legacy_path"
+    elif [ -d "$legacy_path" ]; then
+      step "Removing retired updater cache at $legacy_path"
+      rm -rf "$legacy_path" || fail "could not remove retired updater cache $legacy_path"
+    fi
+  done
+}
+
+# Free space held by the retired updater before this source build needs its
+# several-gigabyte temporary target. Only the old updater's build and source
+# directories are in scope; retained development V8 caches stay untouched.
+cleanup_retired_updater_cache
+
 resolve_main_commit() {
   gh api "repos/$repository/commits/main" --jq .sha 2>/dev/null
 }
@@ -243,8 +268,9 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
   archive_path="$attempt_root/source.tar.gz"
   source_dir="$attempt_root/source"
   target_dir="$attempt_root/target"
+  compiler_tmp="$attempt_root/compiler-tmp"
   smoke_root="$attempt_root/smoke"
-  mkdir -p "$source_dir"
+  mkdir -p "$source_dir" "$compiler_tmp"
 
   step "Installing BetterCodex main $short_commit for $os $arch"
   step "Downloading the immutable source snapshot"
@@ -256,6 +282,8 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
     fail "downloaded source archive could not be extracted"
   fi
   [ -f "$source_dir/Cargo.lock" ] || fail "source commit has no Cargo.lock"
+  [ -f "$source_dir/rust-toolchain.toml" ] ||
+    fail "source commit has no pinned Rust toolchain"
   [ -x "$source_dir/scripts/cargo-with-v8.sh" ] ||
     fail "source commit has no executable Cargo/V8 wrapper"
 
@@ -264,6 +292,28 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
       sed -n '1p'
   )"
   [ -n "$expected_version" ] || fail "source commit has no BetterCodex package version"
+
+  rust_toolchain="$(
+    sed -n 's/^channel = "\([A-Za-z0-9._-]*\)"/\1/p' "$source_dir/rust-toolchain.toml" |
+      sed -n '1p'
+  )"
+  [ -n "$rust_toolchain" ] || fail "source commit has no valid pinned Rust toolchain"
+  step "Using the pinned Rust $rust_toolchain toolchain"
+  if cargo_program="$(rustup which --toolchain "$rust_toolchain" cargo 2>/dev/null)" &&
+    rustc_program="$(rustup which --toolchain "$rust_toolchain" rustc 2>/dev/null)" &&
+    [ -x "$cargo_program" ] && [ -x "$rustc_program" ]; then
+    :
+  else
+    rustup toolchain install "$rust_toolchain" --profile minimal ||
+      fail "could not install the pinned Rust $rust_toolchain toolchain"
+    cargo_program="$(rustup which --toolchain "$rust_toolchain" cargo)" ||
+      fail "could not locate Cargo for Rust $rust_toolchain"
+    rustc_program="$(rustup which --toolchain "$rust_toolchain" rustc)" ||
+      fail "could not locate rustc for Rust $rust_toolchain"
+  fi
+  [ -x "$cargo_program" ] || fail "pinned Cargo executable is unavailable"
+  [ -x "$rustc_program" ] || fail "pinned rustc executable is unavailable"
+  rust_toolchain_bin="$(dirname "$cargo_program")"
 
   step "Compiling BetterCodex $expected_version in a disposable build directory"
   if ! (
@@ -288,8 +338,14 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
       XDG_CACHE_HOME
     cd "$source_dir"
     BCODEX_SOURCE_REVISION="$resolved_commit" \
+      CARGO="$cargo_program" \
       CARGO_HOME="$cargo_home" \
       CARGO_TARGET_DIR="$target_dir" \
+      PATH="$rust_toolchain_bin:$PATH" \
+      RUSTC="$rustc_program" \
+      TEMP="$compiler_tmp" \
+      TMP="$compiler_tmp" \
+      TMPDIR="$compiler_tmp" \
       XDG_CACHE_HOME="$v8_cache_home" \
       ./scripts/cargo-with-v8.sh build --release --locked --bin bcodex
   ); then
@@ -324,6 +380,8 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
   rm -f "$staged_binary"
   cp "$built_binary" "$staged_binary"
   chmod 0755 "$staged_binary"
+  cmp -s "$built_binary" "$staged_binary" ||
+    fail "staged binary does not exactly match the verified build"
   [ "$("$staged_binary" --version 2>/dev/null || true)" = "bcodex $expected_version" ] ||
     fail "staged binary could not be verified"
   [ "$("$staged_binary" --internal-source-revision 2>/dev/null || true)" = "$resolved_commit" ] ||
@@ -355,6 +413,8 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
 done
 
 [ -n "$installed_revision" ] || fail "no BetterCodex source revision was installed"
+cmp -s "$built_binary" "$bin_path" ||
+  fail "installed binary does not exactly match the verified build"
 [ "$("$bin_path" --internal-source-revision 2>/dev/null || true)" = "$installed_revision" ] ||
   fail "installed binary could not be verified"
 
@@ -427,23 +487,6 @@ configure_path() {
 }
 
 configure_path
-
-legacy_cache_root=""
-if [ -n "${XDG_CACHE_HOME:-}" ]; then
-  legacy_cache_root="$XDG_CACHE_HOME/bettercodex"
-elif [ -n "${HOME:-}" ]; then
-  legacy_cache_root="$HOME/.cache/bettercodex"
-fi
-if [ -n "$legacy_cache_root" ]; then
-  for legacy_path in "$legacy_cache_root/build" "$legacy_cache_root/tmp"; do
-    if [ -L "$legacy_path" ]; then
-      warn "not removing retired cache symlink $legacy_path"
-    elif [ -d "$legacy_path" ]; then
-      step "Removing retired updater cache at $legacy_path"
-      rm -rf "$legacy_path" || fail "could not remove retired updater cache $legacy_path"
-    fi
-  done
-fi
 
 cd /
 if ! rm -rf "$tmp_dir"; then

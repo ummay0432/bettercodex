@@ -1,4 +1,4 @@
-use codex_protocol::models::MessagePhase;
+use crate::protocol::MessagePhase;
 use serde_json::Value;
 
 /// Assistant text together with the Responses output phase that defines its lifecycle.

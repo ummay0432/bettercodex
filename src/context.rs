@@ -7,11 +7,11 @@ use crate::rollout::Rollout;
 use crate::rollout::SessionIdentity;
 use crate::rollout::TurnOutcome;
 use crate::skills::SkillCatalog;
+use crate::truncation::TruncationPolicy;
+use crate::truncation::formatted_truncate_text;
 use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
-use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::formatted_truncate_text;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -1244,7 +1244,7 @@ fn estimate_value_tokens(value: &Value) -> u64 {
                     return;
                 };
                 let replacement =
-                    u64::try_from(codex_utils_audio::estimate_audio_token_count(audio_url))
+                    u64::try_from(crate::audio::estimate_audio_token_count(audio_url))
                         .unwrap_or(u64::MAX)
                         .saturating_mul(4);
                 bytes = bytes

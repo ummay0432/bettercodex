@@ -1,9 +1,9 @@
-use codex_code_mode_protocol::CodeModeToolKind;
-use codex_code_mode_protocol::ExecuteRequest;
-use codex_code_mode_protocol::FunctionCallOutputContentItem;
-use codex_code_mode_protocol::ImageDetail;
-use codex_code_mode_protocol::ToolDefinition;
-use codex_protocol::ToolName;
+use crate::protocol::ToolName;
+use crate::tools::code_runtime::CodeModeToolKind;
+use crate::tools::code_runtime::ExecuteRequest;
+use crate::tools::code_runtime::FunctionCallOutputContentItem;
+use crate::tools::code_runtime::ImageDetail;
+use crate::tools::code_runtime::ToolDefinition;
 
 use crate::tools::code_runtime::session_runtime::CreateCellRequest as CellRequest;
 use crate::tools::code_runtime::session_runtime::ImageDetail as CellImageDetail;

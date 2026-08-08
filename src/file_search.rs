@@ -18,21 +18,10 @@ use std::num::NonZero;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Condvar;
-use std::sync::Mutex;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
-
-#[cfg(test)]
-use nucleo::Utf32Str;
-#[cfg(test)]
-use nucleo::pattern::AtomKind;
-#[cfg(test)]
-use nucleo::pattern::Pattern;
-
 
 /// A single match result returned from the search.
 ///
@@ -492,5 +481,3 @@ fn matcher_worker(
 
     Ok(())
 }
-
-#[derive(Default)]

@@ -1,8 +1,8 @@
 use serde_json::Value as JsonValue;
 
-use codex_code_mode_protocol::DEFAULT_IMAGE_DETAIL;
-use codex_code_mode_protocol::FunctionCallOutputContentItem;
-use codex_code_mode_protocol::ImageDetail;
+use crate::tools::code_runtime::DEFAULT_IMAGE_DETAIL;
+use crate::tools::code_runtime::FunctionCallOutputContentItem;
+use crate::tools::code_runtime::ImageDetail;
 
 const IMAGE_HELPER_EXPECTS_MESSAGE: &str = "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block";
 const AUDIO_HELPER_EXPECTS_MESSAGE: &str = "audio expects a non-empty audio URL string, an object with audio_url, or a raw MCP audio block";

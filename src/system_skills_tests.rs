@@ -71,17 +71,10 @@ fn current_marker_does_not_hide_modified_missing_or_retired_files() {
         EMBEDDED_FILES[0].contents
     );
     assert_eq!(
-        std::fs::metadata(&modified)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
+        std::fs::metadata(&modified).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    assert_eq!(
-        std::fs::read(&missing).unwrap(),
-        EMBEDDED_FILES[1].contents
-    );
+    assert_eq!(std::fs::read(&missing).unwrap(), EMBEDDED_FILES[1].contents);
     assert!(!retired.exists());
 }
 

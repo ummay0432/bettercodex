@@ -1,7 +1,40 @@
-//! Helpers for truncating tool and exec output.\n//!\n//! Ported from OpenAI Codex commit\n//! `1669c2403f793d0230065397dfc25f52b844244e`.\n\nmod string;\n\nuse crate::protocol::FunctionCallOutputContentItem;
-pub(crate) use self::string::approx_bytes_for_tokens;\npub(crate) use self::string::approx_token_count;\npub(crate) use self::string::approx_tokens_from_byte_count;\nuse self::string::truncate_middle_chars;\nuse self::string::truncate_middle_with_token_budget;
+//! Helpers for truncating tool and exec output.
+//!
+//! Ported from OpenAI Codex commit
+//! `1669c2403f793d0230065397dfc25f52b844244e`.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) enum TruncationPolicy {\n    Bytes(usize),\n    Tokens(usize),\n}\n\nimpl TruncationPolicy {\n    pub(crate) fn token_budget(&self) -> usize {\n        match self {\n            Self::Bytes(bytes) => usize::try_from(approx_tokens_from_byte_count(*bytes))\n                .unwrap_or(usize::MAX),\n            Self::Tokens(tokens) => *tokens,\n        }\n    }\n\n    pub(crate) fn byte_budget(&self) -> usize {\n        match self {\n            Self::Bytes(bytes) => *bytes,\n            Self::Tokens(tokens) => approx_bytes_for_tokens(*tokens),\n        }\n    }\n}
+mod string;
+
+pub(crate) use self::string::approx_bytes_for_tokens;
+pub(crate) use self::string::approx_token_count;
+pub(crate) use self::string::approx_tokens_from_byte_count;
+use self::string::truncate_middle_chars;
+use self::string::truncate_middle_with_token_budget;
+use crate::protocol::FunctionCallOutputContentItem;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TruncationPolicy {
+    Bytes(usize),
+    Tokens(usize),
+}
+
+impl TruncationPolicy {
+    pub(crate) fn token_budget(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => {
+                usize::try_from(approx_tokens_from_byte_count(*bytes)).unwrap_or(usize::MAX)
+            }
+            Self::Tokens(tokens) => *tokens,
+        }
+    }
+
+    pub(crate) fn byte_budget(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => *bytes,
+            Self::Tokens(tokens) => approx_bytes_for_tokens(*tokens),
+        }
+    }
+}
 
 pub(crate) fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
     if content.len() <= policy.byte_budget() {
@@ -175,5 +208,6 @@ pub(crate) fn approx_tokens_from_byte_count_i64(bytes: i64) -> i64 {
     i64::try_from(approx_tokens_from_byte_count(bytes)).unwrap_or(i64::MAX)
 }
 
-#[cfg(test)]\n#[path = "truncation_tests.rs"]\nmod tests;
-
+#[cfg(test)]
+#[path = "truncation_tests.rs"]
+mod tests;

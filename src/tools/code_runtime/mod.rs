@@ -9,6 +9,12 @@
 //! bettercodex exposes the runtime unconditionally.
 
 mod cell_actor;
+// Keep the complete upstream description API available in this in-tree port.
+#[allow(dead_code)]
+mod description;
+// Protocol variant names deliberately mirror the upstream wire representation.
+#[allow(dead_code, clippy::enum_variant_names)]
+mod protocol;
 mod runtime;
 mod service;
 mod session_runtime;
@@ -16,8 +22,12 @@ mod v8_init;
 
 pub(crate) type TaskFailureHandler = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
-pub use codex_code_mode_protocol::*;
-pub use service::InProcessCodeModeSession;
+pub(crate) use description::*;
+pub(crate) use protocol::*;
+pub(crate) use service::InProcessCodeModeSession;
+
+pub(crate) const PUBLIC_TOOL_NAME: &str = "exec";
+pub(crate) const WAIT_TOOL_NAME: &str = "wait";
 
 pub(crate) fn package_smoke_test() -> Result<(), String> {
     v8_init::ensure_v8_initialized()

@@ -278,14 +278,30 @@ fn run_installer_script(
 }
 
 fn cleanup_legacy_updater_cache() -> Result<()> {
-    let cache_root = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .map(|cache| cache.join("bettercodex"));
+    let xdg_cache_home = std::env::var_os("XDG_CACHE_HOME");
+    let home = std::env::var_os("HOME");
+    let cache_root = legacy_cache_root_from(xdg_cache_home.as_deref(), home.as_deref())?;
     let Some(cache_root) = cache_root else {
         return Ok(());
     };
     cleanup_legacy_updater_cache_in(&cache_root)
+}
+
+fn legacy_cache_root_from(
+    xdg_cache_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<Option<PathBuf>> {
+    let (base, variable) = if let Some(cache) = xdg_cache_home.filter(|value| !value.is_empty()) {
+        (PathBuf::from(cache), "XDG_CACHE_HOME")
+    } else if let Some(home) = home.filter(|value| !value.is_empty()) {
+        (PathBuf::from(home).join(".cache"), "HOME")
+    } else {
+        return Ok(None);
+    };
+    if !base.is_absolute() {
+        bail!("{variable} must be an absolute path before retired cache cleanup");
+    }
+    Ok(Some(base.join("bettercodex")))
 }
 
 fn cleanup_legacy_updater_cache_in(cache_root: &Path) -> Result<()> {

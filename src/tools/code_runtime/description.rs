@@ -1,13 +1,11 @@
-Warning: truncated output (original token count: 10515)
-Total output lines: 1152
-
 use crate::protocol::ToolName;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
-use crate::PUBLIC_TOOL_NAME;
+use super::PUBLIC_TOOL_NAME;
+use super::WAIT_TOOL_NAME;
 
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
@@ -131,6 +129,7 @@ pub enum CodeModeToolKind {
     Function,
     Freeform,
 }
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolDefinition {
     pub name: String,
@@ -248,7 +247,7 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
 }
 
 pub fn is_code_mode_nested_tool(tool_name: &str) -> bool {
-    tool_name != crate::PUBLIC_TOOL_NAME && tool_name != crate::WAIT_TOOL_NAME
+    tool_name != PUBLIC_TOOL_NAME && tool_name != WAIT_TOOL_NAME
 }
 
 pub fn build_exec_tool_description(
@@ -535,7 +534,67 @@ fn render_json_schema_to_typescript_inner(schema: &JsonValue) -> String {
             }
 
             if let Some(schema_type) = map.get("type") {
-                if let Some(types) = schema_type.as_ar…515 tokens truncated…n format!("[{}]", item_types.join(", "));
+                if let Some(types) = schema_type.as_array() {
+                    let rendered = types
+                        .iter()
+                        .filter_map(JsonValue::as_str)
+                        .map(|schema_type| render_json_schema_type_keyword(map, schema_type))
+                        .collect::<Vec<_>>();
+                    if !rendered.is_empty() {
+                        return rendered.join(" | ");
+                    }
+                }
+
+                if let Some(schema_type) = schema_type.as_str() {
+                    return render_json_schema_type_keyword(map, schema_type);
+                }
+            }
+
+            if map.contains_key("properties")
+                || map.contains_key("additionalProperties")
+                || map.contains_key("required")
+            {
+                return render_json_schema_object(map);
+            }
+
+            if map.contains_key("items") || map.contains_key("prefixItems") {
+                return render_json_schema_array(map);
+            }
+
+            "unknown".to_string()
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+fn render_json_schema_type_keyword(
+    map: &serde_json::Map<String, JsonValue>,
+    schema_type: &str,
+) -> String {
+    match schema_type {
+        "string" => "string".to_string(),
+        "number" | "integer" => "number".to_string(),
+        "boolean" => "boolean".to_string(),
+        "null" => "null".to_string(),
+        "array" => render_json_schema_array(map),
+        "object" => render_json_schema_object(map),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn render_json_schema_array(map: &serde_json::Map<String, JsonValue>) -> String {
+    if let Some(items) = map.get("items") {
+        let item_type = render_json_schema_to_typescript_inner(items);
+        return format!("Array<{item_type}>");
+    }
+
+    if let Some(items) = map.get("prefixItems").and_then(JsonValue::as_array) {
+        let item_types = items
+            .iter()
+            .map(render_json_schema_to_typescript_inner)
+            .collect::<Vec<_>>();
+        if !item_types.is_empty() {
+            return format!("[{}]", item_types.join(", "));
         }
     }
 
@@ -655,6 +714,7 @@ fn render_json_schema_literal(value: &JsonValue) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::DEFAULT_EXEC_YIELD_TIME_MS;
     use super::CodeModeToolKind;
     use super::ParsedExecSource;
     use super::ToolDefinition;
@@ -814,7 +874,7 @@ mod tests {
             }],
             &[],
             &BTreeMap::new(),
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
         );
         assert!(description.contains(
@@ -830,7 +890,7 @@ bar"
             &[],
             &[],
             &BTreeMap::new(),
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ false,
         );
         assert!(description.contains("`audio(audioUrlOrItem:"));
@@ -884,7 +944,7 @@ bar"
             ],
             &[],
             &namespace_descriptions,
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
         );
         assert_eq!(description.matches("## mcp__sample").count(), 1);
@@ -925,7 +985,7 @@ bar"
             }],
             &[],
             &namespace_descriptions,
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
         );
 
@@ -1025,7 +1085,7 @@ bar"
             ],
             &[],
             &BTreeMap::new(),
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
         );
 
@@ -1061,7 +1121,7 @@ bar"
             &[],
             &[deferred_tool],
             &BTreeMap::new(),
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
         );
 
@@ -1083,7 +1143,7 @@ bar"
                 output_schema: None,
             }],
             &BTreeMap::new(),
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ false,
         );
 

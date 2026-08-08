@@ -299,27 +299,31 @@ fn recover_interrupted_install(
                     ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).with_context(|| {
-                    format!("could not inspect system skills backup {}", backup.display())
-                }),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "could not inspect system skills backup {}",
+                            backup.display()
+                        )
+                    });
+                }
             }
         }
-        Err(error) => return Err(error).with_context(|| {
-            format!(
-                "could not inspect the system skills path {}",
-                destination.display()
-            )
-        }),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not inspect the system skills path {}",
+                    destination.display()
+                )
+            });
+        }
     }
     remove_work_path(staging)
 }
 
 fn installation_matches(destination: &Path, expected_fingerprint: &str) -> Result<bool> {
     let marker = destination.join(MARKER_FILE_NAME);
-    if !regular_file_matches(
-        &marker,
-        format!("{expected_fingerprint}\n").as_bytes(),
-    )? {
+    if !regular_file_matches(&marker, format!("{expected_fingerprint}\n").as_bytes())? {
         return Ok(false);
     }
     for embedded in EMBEDDED_FILES {
@@ -390,12 +394,7 @@ fn exact_tree_matches(
             .with_context(|| format!("could not inspect {}", entry.path().display()))?;
         if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() {
             if !expected_directories.contains(&child_relative)
-                || !exact_tree_matches(
-                    root,
-                    &child_relative,
-                    expected_files,
-                    expected_directories,
-                )?
+                || !exact_tree_matches(root, &child_relative, expected_files, expected_directories)?
             {
                 return Ok(false);
             }
@@ -419,9 +418,7 @@ fn remove_work_path(path: &Path) -> Result<()> {
         Ok(_) => std::fs::remove_file(path)
             .with_context(|| format!("could not remove {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("could not inspect {}", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("could not inspect {}", path.display())),
     }
 }
 

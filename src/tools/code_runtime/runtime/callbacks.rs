@@ -1,4 +1,4 @@
-use codex_code_mode_protocol::FunctionCallOutputContentItem;
+use crate::tools::code_runtime::FunctionCallOutputContentItem;
 
 use super::EXIT_SENTINEL;
 use super::RuntimeEvent;

@@ -1,24 +1,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use codex_code_mode_protocol::CellId;
-use codex_code_mode_protocol::CodeModeNestedToolCall;
-use codex_code_mode_protocol::CodeModeSession;
-use codex_code_mode_protocol::CodeModeSessionDelegate;
-use codex_code_mode_protocol::CodeModeSessionResultFuture;
-use codex_code_mode_protocol::CodeModeToolKind;
-use codex_code_mode_protocol::DEFAULT_EXEC_YIELD_TIME_MS;
-use codex_code_mode_protocol::ExecuteRequest;
-use codex_code_mode_protocol::ExecuteToPendingOutcome;
-use codex_code_mode_protocol::FunctionCallOutputContentItem;
-use codex_code_mode_protocol::ImageDetail;
-use codex_code_mode_protocol::NoopCodeModeSessionDelegate;
-use codex_code_mode_protocol::RuntimeResponse;
-use codex_code_mode_protocol::StartedCell;
-use codex_code_mode_protocol::WaitOutcome;
-use codex_code_mode_protocol::WaitRequest;
-use codex_code_mode_protocol::WaitToPendingOutcome;
-use codex_code_mode_protocol::WaitToPendingRequest;
+use crate::tools::code_runtime::CellId;
+use crate::tools::code_runtime::CodeModeNestedToolCall;
+use crate::tools::code_runtime::CodeModeSession;
+use crate::tools::code_runtime::CodeModeSessionDelegate;
+use crate::tools::code_runtime::CodeModeSessionResultFuture;
+use crate::tools::code_runtime::CodeModeToolKind;
+use crate::tools::code_runtime::DEFAULT_EXEC_YIELD_TIME_MS;
+use crate::tools::code_runtime::ExecuteRequest;
+use crate::tools::code_runtime::ExecuteToPendingOutcome;
+use crate::tools::code_runtime::FunctionCallOutputContentItem;
+use crate::tools::code_runtime::ImageDetail;
+use crate::tools::code_runtime::NoopCodeModeSessionDelegate;
+use crate::tools::code_runtime::RuntimeResponse;
+use crate::tools::code_runtime::StartedCell;
+use crate::tools::code_runtime::WaitOutcome;
+use crate::tools::code_runtime::WaitRequest;
+use crate::tools::code_runtime::WaitToPendingOutcome;
+use crate::tools::code_runtime::WaitToPendingRequest;
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -219,7 +219,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
                 CodeModeNestedToolCall {
                     cell_id: protocol_cell_id(&invocation.cell_id),
                     runtime_tool_call_id: invocation.runtime_tool_call_id,
-                    tool_name: codex_protocol::ToolName {
+                    tool_name: crate::protocol::ToolName {
                         name: invocation.tool_name.name,
                         namespace: invocation.tool_name.namespace,
                     },

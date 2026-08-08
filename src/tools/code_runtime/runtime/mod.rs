@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
-use codex_code_mode_protocol::CodeModeToolKind;
-use codex_code_mode_protocol::EnabledToolMetadata;
-use codex_code_mode_protocol::ExecuteRequest;
-use codex_code_mode_protocol::FunctionCallOutputContentItem;
-use codex_code_mode_protocol::enabled_tool_metadata;
-use codex_protocol::ToolName;
+use crate::protocol::ToolName;
+use crate::tools::code_runtime::CodeModeToolKind;
+use crate::tools::code_runtime::EnabledToolMetadata;
+use crate::tools::code_runtime::ExecuteRequest;
+use crate::tools::code_runtime::FunctionCallOutputContentItem;
+use crate::tools::code_runtime::enabled_tool_metadata;
 use serde_json::Value as JsonValue;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;

@@ -14,7 +14,7 @@
 use super::code_runtime;
 use super::code_runtime::CodeModeToolKind as ToolKind;
 use super::code_runtime::ToolDefinition;
-use codex_protocol::ToolName;
+use crate::protocol::ToolName;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::LazyLock;

@@ -39,6 +39,7 @@
 //! body rows, or even 3-char-wide columns cannot fit, body rows render as
 //! key/value records.
 
+use crate::text::normalize_markdown_hash_location_suffix;
 use crate::tui::markdown_style::table_separator_style;
 use crate::tui::markdown_text_merge::DecodedTextMerge;
 use crate::tui::render::highlight::foreground_style_for_scopes;
@@ -55,7 +56,6 @@ use crate::tui::width::display_width;
 use crate::tui::wrapping::RtOptions;
 use crate::tui::wrapping::adaptive_wrap_line;
 use crate::tui::wrapping::word_wrap_line;
-use codex_utils_string::normalize_markdown_hash_location_suffix;
 use dirs::home_dir;
 use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;

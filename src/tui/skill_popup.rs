@@ -1,6 +1,6 @@
+use crate::fuzzy_match::fuzzy_match;
 use crate::skills::Skill;
 use crate::skills::is_mention_name_byte;
-use codex_utils_fuzzy_match::fuzzy_match;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;

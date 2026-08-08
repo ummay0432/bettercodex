@@ -1,24 +1,38 @@
 mod agent;
 mod api;
 mod assistant_message;
+mod audio;
 mod auth;
 mod compaction;
 mod context;
 mod events;
+// This is an in-tree port of an upstream crate API; BetterCodex currently uses
+// only part of that retained surface.
+#[allow(dead_code)]
+mod file_search;
+mod fuzzy_match;
+mod http_client;
 mod input;
 mod login;
 mod managed_session;
 mod openai_docs;
 mod paths;
 mod prompt_history;
+mod protocol;
 mod quality_loop;
 mod repository;
 mod rollout;
+// This is an in-tree port of an upstream crate API; BetterCodex currently uses
+// only part of that retained surface.
+#[allow(dead_code)]
+mod shell_command;
 mod skill_settings;
 mod skills;
 mod state_file;
 mod system_skills;
+mod text;
 mod tools;
+mod truncation;
 mod tui;
 mod update;
 mod usage;
