@@ -34,7 +34,7 @@ jobs:
       - name: Validate installer contract
         run: |
           sh -n scripts/install.sh
-          python3 -m unittest -v scripts.install_tests
+          python3 -m unittest -v scripts.check_no_emoji_tests scripts.install_tests
           ./scripts/check-no-emoji.sh
 
   build:
