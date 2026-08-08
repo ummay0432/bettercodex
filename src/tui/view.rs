@@ -2611,15 +2611,6 @@ impl View {
             )
             .dim(),
         );
-        if !waiting_for_background_terminal
-            && let Some(detail) = self
-                .status_detail
-                .as_deref()
-                .filter(|detail| *detail != "Compacting conversation")
-        {
-            spans.push(Span::from(" · ").dim());
-            spans.push(Span::from(detail.to_string()).dim());
-        }
         let pending_steers = self.pending_input.steer_count();
         let queued_follow_ups = self.pending_input.follow_up_count();
         if pending_steers > 0 {
@@ -2763,18 +2754,19 @@ impl View {
         }
 
         let mut lines = vec![truncate_line(self.working_line(), usize::from(width))];
-        lines.extend(self.waiting_status_detail_line(width));
+        lines.extend(self.status_detail_line(width));
         // BetterCodex deliberately keeps this footer on its own row while busy. Codex folds it
         // into the status header, which hides both surfaces behind the same truncation boundary.
         lines.extend(self.background_process_line(width));
         lines
     }
 
-    fn waiting_status_detail_line(&self, width: u16) -> Option<Line<'static>> {
-        if !self.waiting_for_background_terminal() {
-            return None;
-        }
-        let detail = self.status_detail.as_deref()?.trim();
+    fn status_detail_line(&self, width: u16) -> Option<Line<'static>> {
+        let detail = self
+            .status_detail
+            .as_deref()
+            .filter(|detail| *detail != "Compacting conversation")?
+            .trim();
         if detail.is_empty() {
             return None;
         }
@@ -2782,8 +2774,8 @@ impl View {
         if detail.is_empty() {
             return None;
         }
-        // Match Codex's one-row unified-exec details surface: the command belongs below the
-        // waiting header, where it cannot displace the elapsed time or interrupt affordance.
+        // Match Codex's status-details surface: live tool activity belongs below the header, where
+        // it cannot displace the elapsed time or interrupt affordance.
         Some(truncate_line(
             Line::from(vec![STATUS_DETAIL_PREFIX.dim(), detail.dim()]),
             usize::from(width),
@@ -5007,7 +4999,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_background_terminal_uses_a_dedicated_row_between_status_and_composer() {
+    fn busy_terminal_detail_and_background_summary_use_dedicated_rows() {
         const WIDTH: u16 = 96;
 
         let mut view = View::new(Path::new("/tmp/bettercodex"));
@@ -5034,8 +5026,12 @@ mod tests {
         let rows = rendered.lines().collect::<Vec<_>>();
         let status_y = rows
             .iter()
-            .position(|row| row.contains("Working (") && row.contains("install_tests.py"))
+            .position(|row| row.contains("Working ("))
             .expect("rendered activity status") as u16;
+        let detail_y = rows
+            .iter()
+            .position(|row| row.contains("└ python3 scripts/install_tests.py"))
+            .expect("rendered terminal detail row") as u16;
         let background_terminal_y = rows
             .iter()
             .position(|row| row.contains("1 background terminal running"))
@@ -5046,13 +5042,20 @@ mod tests {
             .expect("rendered composer");
 
         assert!(
-            !rows[usize::from(status_y)].contains("background terminal"),
+            !rows[usize::from(status_y)].contains("install_tests.py")
+                && !rows[usize::from(status_y)].contains("background terminal"),
             "{rendered}"
         );
-        assert_eq!(background_terminal_y, status_y + 1, "{rendered}");
+        assert_eq!(detail_y, status_y + 1, "{rendered}");
+        assert_eq!(background_terminal_y, detail_y + 1, "{rendered}");
         assert_eq!(
             composer_y,
             background_terminal_y + 1 + ACTIVITY_COMPOSER_GAP,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("install_tests.py").count(),
+            1,
             "{rendered}"
         );
         assert_eq!(
