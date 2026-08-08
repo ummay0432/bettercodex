@@ -89,6 +89,8 @@ const ACTIVITY_COMPOSER_GAP: u16 = 1;
 const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
 const LOOP_LINE_HEIGHT: u16 = 1;
+const LOOP_INDENT: &str = "  ";
+const LOOP_SEPARATOR: &str = " · ";
 const LOOP_NAME_COLOR: Color = Color::Indexed(245);
 const LOOP_FIELD_COLOR: Color = Color::Indexed(243);
 const LOOP_SEPARATOR_COLOR: Color = Color::Indexed(240);
@@ -1941,17 +1943,21 @@ impl View {
             .saturating_add(2);
         let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
         let activity_height = u16::from(self.has_activity_surface(width));
-        let activity_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(activity_height);
+        let loop_height = LOOP_LINE_HEIGHT.saturating_mul(u16::from(self.loop_progress.is_some()));
+        let activity_composer_height = if activity_height > 0 {
+            ACTIVITY_COMPOSER_GAP.max(loop_height)
+        } else {
+            loop_height
+        };
         let bottom_spacing: u16 = 1;
         let popup_height = self.completion_popup_height(width);
-        let loop_height = LOOP_LINE_HEIGHT.saturating_mul(u16::from(self.loop_progress.is_some()));
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
         // extends downward from the composer instead of becoming an overlay above it.
-        let trailing_height = loop_height.saturating_add(if popup_height > 0 {
+        let trailing_height = if popup_height > 0 {
             popup_height
         } else {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
-        });
+        };
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => shortcuts_height(width),
             Some(Overlay::Context(context)) => context.preferred_height(width),
@@ -1963,7 +1969,7 @@ impl View {
         let transcript_chrome_height = bottom_spacing
             .saturating_add(pending_height)
             .saturating_add(activity_height)
-            .saturating_add(activity_composer_spacing)
+            .saturating_add(activity_composer_height)
             .saturating_add(composer_height)
             .saturating_add(trailing_height);
         (transcript_chrome_height, overlay_height)
@@ -1992,11 +1998,11 @@ impl View {
         };
         let requested_loop_height =
             LOOP_LINE_HEIGHT.saturating_mul(u16::from(self.loop_progress.is_some()));
-        let requested_trailing_height = requested_loop_height.saturating_add(if popup_height > 0 {
+        let requested_trailing_height = if popup_height > 0 {
             popup_height
         } else {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
-        });
+        };
         // Like Codex, let the composer consume the available terminal height before its textarea
         // scrolls. The footer/completion area and active-work status retain their own rows.
         let minimum_composer_height = area.height.min(3);
@@ -2004,22 +2010,25 @@ impl View {
             requested_trailing_height.min(area.height.saturating_sub(minimum_composer_height));
         let height_above_trailing = area.height.saturating_sub(trailing_height);
         let has_activity_surface = self.has_activity_surface(area.width);
-        let activity_reserve = if has_activity_surface {
-            STATUS_LINE_HEIGHT
-                .saturating_add(ACTIVITY_COMPOSER_GAP)
-                .min(height_above_trailing.saturating_sub(minimum_composer_height))
+        let requested_activity_height = u16::from(has_activity_surface);
+        let requested_activity_composer_height = if has_activity_surface {
+            ACTIVITY_COMPOSER_GAP.max(requested_loop_height)
         } else {
-            0
+            requested_loop_height
         };
+        let requested_pre_composer_height =
+            requested_activity_height.saturating_add(requested_activity_composer_height);
+        let pre_composer_height = requested_pre_composer_height
+            .min(height_above_trailing.saturating_sub(minimum_composer_height));
         let pending_lines = self.pending_input.lines();
         let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
         let pending_height = requested_pending_height.min(
             height_above_trailing
-                .saturating_sub(activity_reserve)
+                .saturating_sub(pre_composer_height)
                 .saturating_sub(minimum_composer_height),
         );
         let composer_height_limit = height_above_trailing
-            .saturating_sub(activity_reserve)
+            .saturating_sub(pre_composer_height)
             .saturating_sub(pending_height);
         let editor_height_limit = composer_height_limit.saturating_sub(2).max(1);
         let editor_layout = self
@@ -2032,47 +2041,31 @@ impl View {
             .saturating_sub(composer_height.saturating_add(trailing_height));
         let composer_area = Rect::new(area.x, composer_y, area.width, composer_height);
         let trailing_area = Rect::new(area.x, composer_area.bottom(), area.width, trailing_height);
-        let loop_height = requested_loop_height.min(trailing_area.height);
-        let loop_area = Rect::new(
-            trailing_area.x,
-            trailing_area.y,
-            trailing_area.width,
-            loop_height,
-        );
-        let after_loop = Rect::new(
-            trailing_area.x,
-            trailing_area.y.saturating_add(loop_height),
-            trailing_area.width,
-            trailing_area.height.saturating_sub(loop_height),
-        );
         let footer_area = if popup_height == 0 {
-            after_loop
+            trailing_area
         } else {
             Rect::default()
         };
         let popup_area = if popup_height > 0 {
-            after_loop
+            trailing_area
         } else {
             Rect::default()
         };
-        let activity_height = u16::from(has_activity_surface && composer_y > area.y);
-        let activity_composer_spacing = if activity_height > 0 {
-            ACTIVITY_COMPOSER_GAP.min(
-                composer_y
-                    .saturating_sub(area.y)
-                    .saturating_sub(activity_height),
-            )
-        } else {
-            0
-        };
-        let activity_area = Rect::new(
+        // The loop replaces Codex's quiet activity-to-composer spacer. Keeping it in this
+        // interstitial row makes the loop read as nested live activity instead of a second footer.
+        let pre_composer_top = composer_y.saturating_sub(pre_composer_height);
+        let activity_height = requested_activity_height.min(pre_composer_height);
+        let activity_area = Rect::new(area.x, pre_composer_top, area.width, activity_height);
+        let interstitial_height = pre_composer_height.saturating_sub(activity_height);
+        let loop_height = requested_loop_height.min(interstitial_height);
+        let loop_area = Rect::new(
             area.x,
-            composer_y.saturating_sub(activity_height + activity_composer_spacing),
+            composer_y.saturating_sub(loop_height),
             area.width,
-            activity_height,
+            loop_height,
         );
-        let pending_bottom = if activity_height > 0 {
-            activity_area.y
+        let pending_bottom = if pre_composer_height > 0 {
+            pre_composer_top
         } else {
             composer_area.y
         };
@@ -2084,8 +2077,8 @@ impl View {
         );
         let content_bottom = if pending_height > 0 {
             pending_area.y
-        } else if activity_height > 0 {
-            activity_area.y
+        } else if pre_composer_height > 0 {
+            pre_composer_top
         } else {
             composer_area.y
         };
@@ -2483,6 +2476,14 @@ fn loop_status_line(progress: &LoopProgress, width: u16) -> Line<'static> {
     if width == 0 {
         return Line::default();
     }
+    let phase_width = UnicodeWidthStr::width(progress.phase.as_str());
+    let preferred_indent_width = UnicodeWidthStr::width(LOOP_INDENT);
+    let indent = if width >= phase_width.saturating_add(preferred_indent_width) {
+        LOOP_INDENT
+    } else {
+        ""
+    };
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(indent));
     let diff = progress
         .additions
         .zip(progress.deletions)
@@ -2494,8 +2495,8 @@ fn loop_status_line(progress: &LoopProgress, width: u16) -> Line<'static> {
             diff,
             progress.pulse.as_str(),
         ];
-        if loop_fields_width(&fields) <= width {
-            return styled_loop_fields(&fields);
+        if loop_fields_width(&fields) <= content_width {
+            return styled_loop_fields(&fields, indent, true);
         }
     }
     let fields = [
@@ -2503,39 +2504,43 @@ fn loop_status_line(progress: &LoopProgress, width: u16) -> Line<'static> {
         progress.phase.as_str(),
         progress.pulse.as_str(),
     ];
-    if loop_fields_width(&fields) <= width {
-        return styled_loop_fields(&fields);
+    if loop_fields_width(&fields) <= content_width {
+        return styled_loop_fields(&fields, indent, true);
     }
 
-    let fixed = UnicodeWidthStr::width(progress.phase.as_str())
-        .saturating_add(UnicodeWidthStr::width(progress.pulse.as_str()))
-        .saturating_add(6);
-    if width > fixed {
-        let name = crate::quality_loop::truncate_width(&progress.name, width.saturating_sub(fixed));
+    let fixed = loop_fields_width(&[progress.phase.as_str(), progress.pulse.as_str()])
+        .saturating_add(UnicodeWidthStr::width(LOOP_SEPARATOR));
+    if content_width > fixed {
+        let name = crate::quality_loop::truncate_width(
+            &progress.name,
+            content_width.saturating_sub(fixed),
+        );
         if !name.is_empty() {
             let fields = [
                 name.as_str(),
                 progress.phase.as_str(),
                 progress.pulse.as_str(),
             ];
-            if loop_fields_width(&fields) <= width {
-                return styled_loop_fields(&fields);
+            if loop_fields_width(&fields) <= content_width {
+                return styled_loop_fields(&fields, indent, true);
             }
         }
     }
 
-    let phase_width = UnicodeWidthStr::width(progress.phase.as_str());
-    if width > phase_width.saturating_add(3) {
+    let separator_width = UnicodeWidthStr::width(LOOP_SEPARATOR);
+    if content_width > phase_width.saturating_add(separator_width) {
         let pulse = crate::quality_loop::truncate_width(
             &progress.pulse,
-            width.saturating_sub(phase_width).saturating_sub(3),
+            content_width
+                .saturating_sub(phase_width)
+                .saturating_sub(separator_width),
         );
         if !pulse.is_empty() {
-            return styled_loop_fields(&[progress.phase.as_str(), pulse.as_str()]);
+            return styled_loop_fields(&[progress.phase.as_str(), pulse.as_str()], indent, false);
         }
     }
-    let phase = crate::quality_loop::truncate_width(&progress.phase, width);
-    Line::from(Span::styled(phase, Style::default().fg(LOOP_FIELD_COLOR)))
+    let phase = crate::quality_loop::truncate_width(&progress.phase, content_width);
+    styled_loop_fields(&[phase.as_str()], indent, false)
 }
 
 fn loop_fields_width(fields: &[&str]) -> usize {
@@ -2543,19 +2548,27 @@ fn loop_fields_width(fields: &[&str]) -> usize {
         .iter()
         .map(|field| UnicodeWidthStr::width(*field))
         .sum::<usize>()
-        .saturating_add(fields.len().saturating_sub(1).saturating_mul(3))
+        .saturating_add(
+            fields
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(UnicodeWidthStr::width(LOOP_SEPARATOR)),
+        )
 }
 
-fn styled_loop_fields(fields: &[&str]) -> Line<'static> {
-    let mut spans = Vec::with_capacity(fields.len().saturating_mul(2).saturating_sub(1));
+fn styled_loop_fields(fields: &[&str], indent: &str, first_is_name: bool) -> Line<'static> {
+    let mut spans = Vec::with_capacity(fields.len().saturating_mul(2));
+    if !indent.is_empty() {
+        spans.push(Span::from(indent.to_string()));
+    }
     for (index, field) in fields.iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(
-                " │ ",
+                LOOP_SEPARATOR,
                 Style::default().fg(LOOP_SEPARATOR_COLOR),
             ));
         }
-        let color = if index == 0 && fields.len() >= 3 {
+        let color = if index == 0 && first_is_name {
             LOOP_NAME_COLOR
         } else {
             LOOP_FIELD_COLOR
