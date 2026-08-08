@@ -213,14 +213,8 @@ struct PreviewContent {
 // records—including base64 images, reasoning, and tool payloads—are scanned but never allocated.
 #[derive(Debug)]
 enum PreviewRolloutRecord {
-    Session {
-        metadata: SessionMetadata,
-    },
-    HistoryAppend {
-        #[serde(default)]
-        items: Vec<PreviewItem>,
-    },
-    #[serde(other)]
+    Session { metadata: SessionMetadata },
+    HistoryAppend { items: Vec<PreviewItem> },
     Other,
 }
 
@@ -390,7 +384,13 @@ fn read_json_line<T: DeserializeOwned>(
     reader: &mut impl BufRead,
 ) -> std::io::Result<Option<FramedJsonLine<T>>> {
     let mut line = JsonLineReader::new(reader);
-    let record = serde_json::from_reader(&mut line);
+    // serde_json's generic reader advances one byte at a time. Buffer the framed adapter so those
+    // reads come from a fixed-size block instead of calling fill_buf for every byte in a large
+    // ignored payload.
+    let record = {
+        let mut buffered = BufReader::with_capacity(JOURNAL_BUFFER_BYTES, &mut line);
+        serde_json::from_reader(&mut buffered)
+    };
     line.finish()?;
     if line.bytes_read == 0 {
         return Ok(None);
@@ -972,7 +972,7 @@ fn preview_from_items(items: &[PreviewItem]) -> Option<String> {
             .content
             .iter()
             .filter(|content| content.kind == "input_text")
-            .map(|content| content.text.as_ref());
+            .map(|content| content.text.as_str());
         let first = texts.next().unwrap_or_default();
         let text = if let Some(second) = texts.next() {
             let mut joined = String::with_capacity(first.len() + second.len() + 1);
