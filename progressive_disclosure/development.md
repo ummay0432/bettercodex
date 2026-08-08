@@ -16,12 +16,17 @@ cargo install --locked cargo-nextest
 just install
 ```
 
-Build or run the binary directly with Cargo:
+Build or run the binary through the checked-in Cargo wrapper:
 
 ```sh
-cargo build
-cargo run --bin bcodex -- "explain this codebase"
+./scripts/cargo-with-v8.sh build
+./scripts/cargo-with-v8.sh run --bin bcodex -- "explain this codebase"
 ```
+
+The wrapper downloads and verifies the sandbox-enabled V8 archive and generated
+binding published by upstream Codex, then delegates every argument to Cargo.
+Use it for commands that build Bettercodex; formatting and dependency-only
+commands can invoke Cargo directly.
 
 Use the matching upstream-style recipes for routine development:
 
@@ -67,7 +72,7 @@ just fix
 just fmt
 just test
 just clippy -- -D warnings
-cargo build --release --locked
+./scripts/cargo-with-v8.sh build --release --locked
 ```
 
 Cargo can wait on a shared cache or build lock. Let it finish; do not kill a

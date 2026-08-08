@@ -6,15 +6,16 @@ group of trusted operators.
 ## Install from source
 
 Repository access is the invite gate. After accepting an invitation, sign in
-with the [GitHub CLI](https://cli.github.com/), install Rust through rustup and
-a native C toolchain, then clone the single Cargo package into a stable local
-path and install it:
+with the [GitHub CLI](https://cli.github.com/), then install `curl`, Rust through
+rustup, and a native C toolchain. Clone the single Cargo package into a stable
+local path and install it:
 
 ```sh
 bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
 mkdir -p "$(dirname "$bcodex_source")" &&
 gh repo clone ummay0432/bettercodex "$bcodex_source" &&
-cargo install --locked --path "$bcodex_source" --force --root "$HOME/.local"
+"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
+  --path "$bcodex_source" --force --root "$HOME/.local"
 ```
 
 Then open a new terminal, sign in with your own ChatGPT account, and launch
@@ -31,7 +32,8 @@ the same package:
 ```sh
 bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
 git -C "$bcodex_source" pull --ff-only &&
-cargo install --locked --path "$bcodex_source" --force --root "$HOME/.local"
+"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
+  --path "$bcodex_source" --force --root "$HOME/.local"
 ```
 
 [`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt) combines first install and later

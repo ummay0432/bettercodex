@@ -1,9 +1,9 @@
 # Installing and building bettercodex
 
 Bettercodex is one Rust package and one `bcodex` binary. It is built from the
-private source repository with the same Cargo workflow documented by upstream
-Codex; there are no prebuilt releases, hosted release builds, Bazel workspace,
-or Node workspace.
+private source repository with the Cargo workflow retained from upstream Codex;
+there are no Bettercodex release binaries, hosted release builds, Bazel
+workspace, or Node workspace.
 
 ## Supported systems
 
@@ -16,15 +16,16 @@ Windows is not supported.
 
 ## Install from source
 
-Install an authenticated [GitHub CLI](https://cli.github.com/), a native C
-toolchain, and Rust through [rustup](https://rustup.rs/). Then clone the private
-repository into a stable local path and install the package:
+Install an authenticated [GitHub CLI](https://cli.github.com/), `curl`, a native
+C toolchain, and Rust through [rustup](https://rustup.rs/). Then clone the
+private repository into a stable local path and install the package:
 
 ```sh
 bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
 mkdir -p "$(dirname "$bcodex_source")" &&
 gh repo clone ummay0432/bettercodex "$bcodex_source" &&
-cargo install --locked --path "$bcodex_source" --force --root "$HOME/.local"
+"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
+  --path "$bcodex_source" --force --root "$HOME/.local"
 ```
 
 Open a new terminal if `$HOME/.local/bin` was not already on `PATH`, then
@@ -47,11 +48,12 @@ the retained source checkout forward and reinstall the same Cargo package:
 ```sh
 bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
 git -C "$bcodex_source" pull --ff-only &&
-cargo install --locked --path "$bcodex_source" --force --root "$HOME/.local"
+"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
+  --path "$bcodex_source" --force --root "$HOME/.local"
 ```
 
 `git pull --ff-only` stops instead of merging when the checkout has diverged;
-the chained Cargo command therefore installs only the requested revision.
+the chained Cargo wrapper therefore installs only the requested revision.
 The one-line [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) performs either the
 first clone or this update against the same checkout.
 
@@ -67,34 +69,47 @@ by updating itself.
 Run [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) once to install current
 source through Cargo. Existing ChatGPT credentials, Bettercodex settings, and
 saved sessions are unaffected. After the newly installed binary launches, the
-retired updater's dedicated build cache is unused and can be removed:
+retired updater's build target and temporary source cache can be removed:
 
 ```sh
-rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex"
+retired_cache="${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex"
+cargo clean --target-dir "$retired_cache/build/target" &&
+rm -rf "$retired_cache/build" "$retired_cache/tmp"
 ```
 
-The cache contains only the retired updater's downloaded source and build
-artifacts; it does not contain credentials, settings, or sessions.
+Those directories contain only the retired updater's downloaded source and
+build artifacts; they do not contain credentials, settings, or sessions. Keep
+the sibling `rusty-v8-*` directory: the current Cargo wrapper verifies and
+reuses those official OpenAI Codex artifacts.
 
 For a development checkout elsewhere on disk, use that clean `main` checkout
 instead of cloning another copy:
 
 ```sh
 git pull --ff-only &&
-cargo install --locked --path . --force --root "$HOME/.local"
+./scripts/cargo-with-v8.sh install --locked --path . --force \
+  --root "$HOME/.local"
 ```
 
 Run those commands from the Bettercodex repository root.
 
 ## Build without installing
 
-From any Bettercodex source checkout, build or run the binary directly with
-Cargo:
+From any Bettercodex source checkout, build or run the binary through the
+checked-in Cargo wrapper:
 
 ```sh
-cargo build --locked
-cargo run --bin bcodex
+./scripts/cargo-with-v8.sh build --locked
+./scripts/cargo-with-v8.sh run --bin bcodex
 ```
+
+Bettercodex enables V8's in-process sandbox. The matching archive is not in the
+default `rusty_v8` release, so the wrapper follows current upstream Codex: it
+downloads the matching archive and generated binding from the
+`rusty-v8-v150.4.0` OpenAI Codex release, verifies their pinned SHA-256 digests,
+caches them under `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`, and then runs
+Cargo with both required overrides. Explicit paired overrides and
+`V8_FROM_SOURCE=1` remain authoritative.
 
 ## Development checks
 
