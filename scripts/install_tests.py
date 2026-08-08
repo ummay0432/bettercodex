@@ -175,6 +175,23 @@ class InstallScriptTest(unittest.TestCase):
             )
             assert_no_installer_residue(self, root)
 
+    def test_compact_release_metadata_selects_the_prebuilt_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(
+                root,
+                prebuilt=True,
+                compact_release_metadata=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("without Rust, Cargo, or local compilation", result.stdout)
+            self.assertFalse((root / "build.log").exists())
+            installed = root / "install" / "bin" / "bcodex"
+            self.assertEqual(run_binary(installed, "--version"), f"bcodex {VERSION}\n")
+            assert_no_installer_residue(self, root)
+
     def test_prebuilt_cleanup_never_follows_a_symlinked_cache_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -775,6 +792,7 @@ def run_installer(
     prebuilt_corrupt: bool = False,
     release_via_environment: bool = False,
     release_failures: int = 0,
+    compact_release_metadata: bool = False,
     main_failures: int = 0,
     smoke_success: bool = True,
     next_commit: str = COMMIT,
@@ -882,7 +900,15 @@ def run_installer(
                   emit_empty 404
                   exit 0
                 fi
-                if [ -n "$output" ]; then
+                if [ "$BCODEX_TEST_COMPACT_RELEASE_METADATA" = 1 ]; then
+                  if [ -n "$output" ]; then
+                    printf '{"tag_name":"%s","draft":false,"prerelease":false}\\n' \
+                      "$BCODEX_TEST_RELEASE_TAG" >"$output"
+                  else
+                    printf '{"tag_name":"%s","draft":false,"prerelease":false}\\n' \
+                      "$BCODEX_TEST_RELEASE_TAG"
+                  fi
+                elif [ -n "$output" ]; then
                   printf '{\\n  "tag_name": "%s",\\n  "draft": false,\\n  "prerelease": false\\n}\\n' \
                     "$BCODEX_TEST_RELEASE_TAG" >"$output"
                 else
@@ -1052,6 +1078,9 @@ def run_installer(
             "BCODEX_TEST_COMPILE_LOG": str(root / "compile.log"),
             "BCODEX_TEST_CLEANUP_SUCCESS": "1" if cleanup_success else "0",
             "BCODEX_TEST_COMPILER_WORKS": "1" if compiler_works else "0",
+            "BCODEX_TEST_COMPACT_RELEASE_METADATA": (
+                "1" if compact_release_metadata else "0"
+            ),
             "BCODEX_TEST_DOWNLOAD_LOG": str(root / "download.log"),
             "BCODEX_TEST_EMBEDDED_REVISION": embedded_revision or "",
             "BCODEX_TEST_FAKE_BIN": str(fake_bin),

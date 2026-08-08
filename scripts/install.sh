@@ -469,6 +469,17 @@ parse_release_tag() {
   printf '%s|%s|%s\n' "$parsed_tag" "$parsed_version" "$parsed_revision"
 }
 
+exactly_one_line() {
+  awk '
+    NR == 1 { value = $0; next }
+    { duplicate = 1 }
+    END {
+      if (NR != 1 || duplicate) exit 1
+      print value
+    }
+  '
+}
+
 resolve_latest_release() {
   release_metadata="$tmp_dir/latest-release.json"
   if download_release_file \
@@ -479,19 +490,26 @@ resolve_latest_release() {
   else
     return $?
   fi
-  release_tag="$({
-    sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-      "$release_metadata"
-  } | sed -n '1p')"
+  # GitHub may return either pretty-printed or compact JSON. Split structural
+  # object separators before matching exact scalar fields; quotes inside JSON
+  # strings are escaped, so release notes cannot masquerade as these keys.
+  # Reject missing or duplicate fields rather than selecting one ambiguously.
+  release_tag="$(
+    LC_ALL=C tr ',{}' '\n' <"$release_metadata" |
+      sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' |
+      exactly_one_line
+  )" || return 1
   # Use portable basic regular expressions; BSD sed does not support GNU's \|.
-  release_draft="$({
-    sed -n 's/^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\).*/\1/p' \
-      "$release_metadata"
-  } | sed -n '1p')"
-  release_prerelease="$({
-    sed -n 's/^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\).*/\1/p' \
-      "$release_metadata"
-  } | sed -n '1p')"
+  release_draft="$(
+    LC_ALL=C tr ',{}' '\n' <"$release_metadata" |
+      sed -n 's/^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\)[[:space:]]*$/\1/p' |
+      exactly_one_line
+  )" || return 1
+  release_prerelease="$(
+    LC_ALL=C tr ',{}' '\n' <"$release_metadata" |
+      sed -n 's/^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\)[[:space:]]*$/\1/p' |
+      exactly_one_line
+  )" || return 1
   [ "$release_draft" = false ] && [ "$release_prerelease" = false ] || return 1
   parse_release_tag "$release_tag"
 }
