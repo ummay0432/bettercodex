@@ -838,14 +838,24 @@ fn validate_no_symlink_escape(root: &Path, spec: &PathSpec) -> Result<()> {
     for (index, component) in components.components().enumerate() {
         current.push(component.as_os_str());
         match std::fs::symlink_metadata(&current) {
-            Ok(metadata)
-                if metadata.file_type().is_symlink() && (index + 1 < count || spec.is_tree()) =>
-            {
-                return Err(anyhow!(
-                    "path `{}` traverses symlink {}",
-                    spec.as_str(),
-                    current.display()
-                ));
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = current.canonicalize().with_context(|| {
+                    format!("path `{}` names an unresolved symlink", spec.as_str())
+                })?;
+                if !target.starts_with(root) {
+                    return Err(anyhow!(
+                        "path `{}` escapes the worktree through symlink {}",
+                        spec.as_str(),
+                        current.display()
+                    ));
+                }
+                if index + 1 < count || spec.is_tree() {
+                    return Err(anyhow!(
+                        "path `{}` traverses symlink {}",
+                        spec.as_str(),
+                        current.display()
+                    ));
+                }
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
@@ -1011,6 +1021,10 @@ mod tests {
         symlink("/tmp", root.join("outside")).unwrap();
         let mut contract = valid(&root);
         contract.machine_checks[0].cwd = "outside".to_string();
+        assert!(contract.validate(&root).is_err());
+
+        let mut contract = valid(&root);
+        contract.candidate_paths = vec![PathSpec::try_from("outside".to_string()).unwrap()];
         assert!(contract.validate(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }

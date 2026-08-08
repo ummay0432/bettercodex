@@ -215,9 +215,12 @@ fn validate_symlink_target(root: &Path, path: &Path) -> Result<()> {
         ));
     }
     let canonical_root = root.canonicalize()?;
-    let canonical_target = path
-        .canonicalize()
-        .with_context(|| format!("evaluator package symlink is unresolved: {}", path.display()))?;
+    let canonical_target = path.canonicalize().with_context(|| {
+        format!(
+            "evaluator package symlink is unresolved: {}",
+            path.display()
+        )
+    })?;
     if !canonical_target.starts_with(&canonical_root) {
         return Err(anyhow!(
             "evaluator package symlink escapes its workspace: {}",

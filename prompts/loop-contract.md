@@ -109,6 +109,16 @@ calibration examples, zero numeric thresholds, both candidate-first and
 incumbent-first judgments, and a consistent result. Ties and inconclusive
 results are always discarded.
 
+An existing repository test, benchmark, schema, or script may be a decisive
+gate only when every oracle-bearing worktree path that gives it meaning is in
+`integrity_paths`, or when an independent oracle has been copied into the
+evaluator package. Do not protect mutable production code under test. If the
+candidate must edit a repository-owned oracle and it cannot be separated, keep
+that check supplemental: do not make it the sole acceptance or comparison gate.
+Never turn a network write, deployment, purchase, message, destructive action,
+or another approval-bearing operation into an automatic check; report a setup
+blocker when such authority is indispensable.
+
 Every machine check used by acceptance or metric comparison needs at least one
 `discrimination_checks` entry. Its nested check must cover the same promises,
 run the same program, execute exactly once, and name a frozen evaluator fixture

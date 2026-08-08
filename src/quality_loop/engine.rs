@@ -174,12 +174,27 @@ async fn execute(
     events: &UnboundedSender<AgentEvent>,
     control: &TurnControl,
 ) -> Result<(String, bool)> {
-    let mut run = LoopRun::create(
+    let mut run = match LoopRun::create(
         worktree,
         &invocation,
         frozen.operator_inputs(),
         frozen.context_items(),
-    )?;
+    ) {
+        Ok(run) => run,
+        Err(error) => {
+            let _ = events.send(AgentEvent::LoopProgress(LoopProgress::new(
+                "Quality loop",
+                "eval",
+                None,
+                None,
+                "blocked",
+            )));
+            return Err(error);
+        }
+    };
+    if run.recovered_runs() > 0 {
+        progress(events, &run, "eval", "recovered", None, None);
+    }
     run.verify_runtime_identity()?;
     let original = load_snapshot(&run, &run.state.starting_snapshot)?;
     run.write_json("starting-state.json", &original.state)?;
@@ -1730,12 +1745,7 @@ mod tests {
                 }
                 ScriptedAction::DiscardWithoutChecks(value) => {
                     std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
-                    (
-                        "DISCARD",
-                        "omitted the frozen check results",
-                        "none",
-                        None,
-                    )
+                    ("DISCARD", "omitted the frozen check results", "none", None)
                 }
                 ScriptedAction::KeepWithoutChange => {
                     ("KEEP", "claimed an unchanged candidate", "none", None)

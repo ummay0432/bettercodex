@@ -87,6 +87,7 @@ pub(crate) struct FrozenTaskRecord<'a> {
 pub(crate) struct LoopRun {
     root: PathBuf,
     lock: File,
+    recovered_runs: usize,
     pub(crate) state: RunState,
 }
 
@@ -101,7 +102,7 @@ impl LoopRun {
         worktree.install_loop_exclude()?;
         let loops = prepare_loop_directories(worktree.root())?;
         let mut lock = acquire_lock(&loops)?;
-        recover_incomplete_runs(worktree, &loops)?;
+        let recovered_runs = recover_incomplete_runs(worktree, &loops)?;
         let run_id = uuid::Uuid::new_v4().to_string();
         let root = loops.join(&run_id);
         create_new_private_directory(&root)?;
@@ -167,11 +168,20 @@ impl LoopRun {
                 return Err(error);
             }
         };
-        Ok(Self { root, lock, state })
+        Ok(Self {
+            root,
+            lock,
+            recovered_runs,
+            state,
+        })
     }
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn recovered_runs(&self) -> usize {
+        self.recovered_runs
     }
 
     pub(crate) fn run_id(&self) -> &str {
@@ -287,9 +297,10 @@ pub(crate) struct LedgerRow<'a> {
     pub(crate) evidence: &'a str,
 }
 
-fn recover_incomplete_runs(worktree: &Worktree, loops: &Path) -> Result<()> {
+fn recover_incomplete_runs(worktree: &Worktree, loops: &Path) -> Result<usize> {
     let mut entries = std::fs::read_dir(loops)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut recovered = 0;
     for entry in entries {
         let name = entry.file_name();
         if name == "worktree.lock" {
@@ -314,12 +325,12 @@ fn recover_incomplete_runs(worktree: &Worktree, loops: &Path) -> Result<()> {
                 entry.path().display()
             ));
         }
-        recover_run(worktree, &entry.path(), name)?;
+        recovered += usize::from(recover_run(worktree, &entry.path(), name)?);
     }
-    Ok(())
+    Ok(recovered)
 }
 
-fn recover_run(worktree: &Worktree, root: &Path, directory_id: &str) -> Result<()> {
+fn recover_run(worktree: &Worktree, root: &Path, directory_id: &str) -> Result<bool> {
     let state_path = root.join("state.json");
     let metadata = std::fs::symlink_metadata(&state_path)
         .with_context(|| format!("incomplete loop run `{directory_id}` has no state record"))?;
@@ -340,7 +351,7 @@ fn recover_run(worktree: &Worktree, root: &Path, directory_id: &str) -> Result<(
         state.phase,
         RunPhase::Completed | RunPhase::Blocked | RunPhase::Interrupted
     ) {
-        return Ok(());
+        return Ok(false);
     }
     verify_runtime_state(&state)
         .with_context(|| format!("cannot recover incomplete quality-loop run `{directory_id}`"))?;
@@ -353,7 +364,8 @@ fn recover_run(worktree: &Worktree, root: &Path, directory_id: &str) -> Result<(
         ));
     }
     if let Some(prepared) = state.prepared_iteration.clone() {
-        return recover_prepared_iteration(worktree, root, directory_id, &mut state, prepared);
+        recover_prepared_iteration(worktree, root, directory_id, &mut state, prepared)?;
+        return Ok(true);
     }
     let incumbent = load_run_snapshot(root, &state.incumbent_snapshot)?;
     if !worktree.state_matches(root, &incumbent)? {
@@ -415,7 +427,7 @@ fn recover_run(worktree: &Worktree, root: &Path, directory_id: &str) -> Result<(
     state.prepared_iteration = None;
     state.blocker = None;
     atomic_json(&state_path, &state)?;
-    Ok(())
+    Ok(true)
 }
 
 fn recover_prepared_iteration(
@@ -1054,6 +1066,7 @@ mod tests {
         drop(run);
 
         let mut next = fixture.create_run();
+        assert_eq!(next.recovered_runs(), 1);
         assert_eq!(
             std::fs::read_to_string(fixture.root.join("tracked.txt")).unwrap(),
             "incumbent\n"

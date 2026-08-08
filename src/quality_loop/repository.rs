@@ -535,6 +535,20 @@ impl Worktree {
                 outside.join(", ")
             ));
         }
+        for path in delta.paths() {
+            if after
+                .entries
+                .get(path)
+                .is_some_and(|entry| entry.kind == EntryKind::Symlink)
+            {
+                let target = self.root.join(path).canonicalize().with_context(|| {
+                    format!("candidate symlink `{path}` does not resolve inside the worktree")
+                })?;
+                if !target.starts_with(&self.root) {
+                    return Err(anyhow!("candidate symlink `{path}` escapes the worktree"));
+                }
+            }
+        }
         self.verify_supported_git_change(&before.git, &after.git)?;
         Ok(delta)
     }
@@ -962,6 +976,9 @@ fn capture_entry(
         }
     };
     let mode = metadata.permissions().mode() & 0o7777;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        ensure_single_link(path, &metadata)?;
+    }
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path)?;
         let bytes = target.into_os_string().into_vec();
@@ -1010,6 +1027,9 @@ fn snapshot_entry_size(path: &Path) -> Result<u64> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error.into()),
     };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        ensure_single_link(path, &metadata)?;
+    }
     if metadata.file_type().is_symlink() {
         return Ok(std::fs::read_link(path)?.into_os_string().into_vec().len() as u64);
     }
@@ -1029,6 +1049,7 @@ fn capture_file(
     next_cache: &mut SnapshotCacheState,
     prepared_blob_directories: &mut HashSet<String>,
 ) -> Result<String> {
+    ensure_single_link(path, initial_metadata)?;
     let remaining = MAX_SNAPSHOT_BYTES.saturating_sub(*total_bytes);
     if initial_metadata.len() > remaining {
         return Err(anyhow!(
@@ -1083,6 +1104,16 @@ fn capture_file(
         },
     );
     Ok(digest)
+}
+
+fn ensure_single_link(path: &Path, metadata: &Metadata) -> Result<()> {
+    if metadata.nlink() != 1 {
+        return Err(anyhow!(
+            "hard-linked worktree objects are not safely recoverable: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn capture_optional_file(
@@ -1795,6 +1826,38 @@ mod tests {
                 .verify_supported_git_change(&before.git, &after.git)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn hard_links_and_escaping_candidate_symlinks_are_not_recoverable_state() {
+        let fixture = Fixture::new();
+        let worktree = Worktree::discover(&fixture.root).unwrap();
+        worktree.install_loop_exclude().unwrap();
+        let run_root = fixture.run_root();
+
+        std::fs::hard_link(
+            fixture.root.join("tracked.txt"),
+            fixture.root.join("hard-link.txt"),
+        )
+        .unwrap();
+        let error = worktree.capture(&run_root, &[]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("hard-linked worktree objects"),
+            "{error:#}"
+        );
+        std::fs::remove_file(fixture.root.join("hard-link.txt")).unwrap();
+
+        let before = worktree.capture(&run_root, &[]).unwrap();
+        std::os::unix::fs::symlink("/tmp", fixture.root.join("candidate-link")).unwrap();
+        let after = worktree.capture(&run_root, &[]).unwrap();
+        let error = worktree
+            .verify_candidate_boundary(
+                &before,
+                &after,
+                &[PathSpec::try_from("candidate-link".to_string()).unwrap()],
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("escapes the worktree"));
     }
 
     #[test]

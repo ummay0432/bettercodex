@@ -191,8 +191,8 @@ pub(crate) fn apply_structured_artifact(
         let value = checks
             .get(&check.id)
             .expect("validated phase evidence has every machine check");
-        let claimed = judgment_passed(value)
-            .expect("validated machine evidence has a boolean verdict");
+        let claimed =
+            judgment_passed(value).expect("validated machine evidence has a boolean verdict");
         let observed = report
             .checks
             .get(&check.id)
