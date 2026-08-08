@@ -1,0 +1,13 @@
+# Retain upstream's strict production policy without making concise test
+# assertions artificially noisy.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+
+await-holding-invalid-types = [
+    "tokio::sync::MutexGuard",
+    "tokio::sync::RwLockReadGuard",
+    "tokio::sync::RwLockWriteGuard",
+]
+
+# Accommodate the richer error variants retained from upstream Codex.
+large-error-threshold = 256

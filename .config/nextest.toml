@@ -1,2 +1,7 @@
+[profile.default]
+# Match upstream's bounded handling of transient and stuck tests.
+slow-timeout = { period = "30s", terminate-after = 2 }
+retries = 1
+
 [profile.local]
 inherits = "default"
