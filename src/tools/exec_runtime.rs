@@ -499,16 +499,20 @@ mod tests {
     }
 
     fn runtime(cwd: PathBuf) -> ToolRuntime {
+        let http_client = || {
+            crate::http_client::build_client(reqwest::Client::builder())
+                .expect("build test HTTP client")
+        };
         ToolRuntime::new(
             cwd,
             crate::web_search::WebSearchClient::new(
-                reqwest::Client::new(),
+                http_client(),
                 crate::auth::SharedAuth::new(crate::auth::Auth::for_test("test-token")),
                 "http://127.0.0.1:1".to_string(),
                 "test-session".to_string(),
             ),
             crate::openai_docs::OpenAiDocsClient::with_endpoint(
-                reqwest::Client::new(),
+                http_client(),
                 "http://127.0.0.1:1",
             ),
         )

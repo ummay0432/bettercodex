@@ -18,11 +18,14 @@ use rustls_pki_types::pem::SectionKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Once;
 use std::time::Duration;
 
 const CODEX_CA_CERT_ENV: &str = "CODEX_CA_CERTIFICATE";
 const SSL_CERT_FILE_ENV: &str = "SSL_CERT_FILE";
 const CA_CERT_HINT: &str = "ensure it points to a PEM file containing one or more CERTIFICATE blocks, or unset it to use system roots";
+const REQUIRED_SIGNATURE_SCHEME: rustls::SignatureScheme =
+    rustls::SignatureScheme::ECDSA_NISTP521_SHA512;
 type PemSection = (SectionKind, Vec<u8>);
 
 static SHARED_CHATGPT_CLOUDFLARE_COOKIE_STORE: LazyLock<Arc<ChatGptCloudflareCookieStore>> =
@@ -38,6 +41,33 @@ pub(crate) fn backoff(base: Duration, attempt: u64) -> Duration {
     Duration::from_millis((raw_millis as f64 * jitter) as u64)
 }
 
+/// Installs Codex's process-wide AWS-LC rustls provider.
+///
+/// AWS-LC retains ECDSA P-521/SHA-512 support needed by some enterprise TLS
+/// proxies. A provider installed earlier by an embedding host is preserved.
+pub(crate) fn ensure_rustls_crypto_provider() {
+    static RUSTLS_PROVIDER_INIT: Once = Once::new();
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        if rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .is_err()
+        {
+            return;
+        }
+
+        let Some(provider) = rustls::crypto::CryptoProvider::get_default() else {
+            panic!("aws-lc-rs rustls crypto provider should be installed");
+        };
+        assert!(
+            provider
+                .signature_verification_algorithms
+                .supported_schemes()
+                .contains(&REQUIRED_SIGNATURE_SCHEME),
+            "installed rustls crypto provider must support {REQUIRED_SIGNATURE_SCHEME:?}"
+        );
+    });
+}
+
 pub(crate) fn with_chatgpt_cloudflare_cookie_store(
     builder: reqwest::ClientBuilder,
 ) -> reqwest::ClientBuilder {
@@ -46,13 +76,15 @@ pub(crate) fn with_chatgpt_cloudflare_cookie_store(
 
 /// Builds a Reqwest client with Codex's custom-CA precedence and parsing policy.
 pub(crate) fn build_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client> {
+    // Reqwest is built without a bundled provider, so this is required even
+    // when the system root set is used unchanged.
+    ensure_rustls_crypto_provider();
     let Some(bundle) = ConfiguredCaBundle::from_environment() else {
         return builder
             .build()
             .context("failed to build HTTP client with system roots");
     };
 
-    codex_utils_rustls_provider::ensure_rustls_crypto_provider();
     let certificates = bundle.load_certificates()?;
     let mut builder = builder.use_rustls_tls();
     for (index, certificate) in certificates.iter().enumerate() {
