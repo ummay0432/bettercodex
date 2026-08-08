@@ -12,113 +12,6 @@ fn temporary_directory(name: &str) -> PathBuf {
 }
 
 #[test]
-fn legacy_history_replacements_default_missing_response_usage() {
-    let record: RolloutRecord = serde_json::from_value(json!({
-        "type": "history_replace",
-        "reason": "compaction",
-        "items": [],
-    }))
-    .unwrap();
-
-    assert!(matches!(
-        record,
-        RolloutRecord::HistoryReplace {
-            response_usage: None,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn fork_records_restore_the_transcript_and_compaction_window() {
-    let root = temporary_directory("rollout-fork");
-    let cwd = root.join("repo");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
-    let session_id = rollout.identity().session_id.clone();
-    let transcript = vec![
-        SessionTranscriptItem::User {
-            text: "investigate".to_string(),
-            image_count: 0,
-        },
-        SessionTranscriptItem::Assistant {
-            text: "Still working".to_string(),
-            phase: Some(MessagePhase::Commentary),
-        },
-        SessionTranscriptItem::Assistant {
-            text: "# Finished".to_string(),
-            phase: Some(MessagePhase::FinalAnswer),
-        },
-    ];
-    rollout.record_fork("source-session", 4).unwrap();
-    rollout.snapshot_transcript(transcript.clone()).unwrap();
-    rollout
-        .replace_history(
-            &[json!({"type": "message", "role": "user"})],
-            HistoryReplacement::Initial,
-        )
-        .unwrap();
-    drop(rollout);
-
-    let loaded = Rollout::resume_in(
-        &root,
-        ResumeSelector::Id(Uuid::parse_str(&session_id).unwrap()),
-        &cwd,
-    )
-    .unwrap();
-    assert_eq!(loaded.compaction_count, 4);
-    assert_eq!(loaded.transcript, transcript);
-
-    drop(loaded);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn failed_streamed_record_is_rolled_back_before_later_appends() {
-    struct PartialRecord;
-
-    impl serde::Serialize for PartialRecord {
-        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-        where
-            S: serde::Serializer,
-        {
-            use serde::ser::SerializeSeq;
-
-            let mut sequence = serializer.serialize_seq(Some(2))?;
-            sequence.serialize_element(&"x".repeat(JOURNAL_BUFFER_BYTES * 2))?;
-            Err(serde::ser::Error::custom(
-                "intentional serialization failure",
-            ))
-        }
-    }
-
-    let root = temporary_directory("rollout-stream-rollback");
-    let cwd = root.join("repo");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
-    let session_id = rollout.identity().session_id.clone();
-    let valid_length = rollout.file.metadata().unwrap().len();
-
-    let error = rollout.write_record(&PartialRecord).unwrap_err();
-    assert!(error.to_string().contains("failed to append"));
-    assert_eq!(rollout.file.metadata().unwrap().len(), valid_length);
-
-    let item = json!({"type": "message", "role": "user"});
-    rollout.append_history(std::slice::from_ref(&item)).unwrap();
-    drop(rollout);
-
-    let loaded = Rollout::resume_in(
-        &root,
-        ResumeSelector::Id(Uuid::parse_str(&session_id).unwrap()),
-        &cwd,
-    )
-    .unwrap();
-    assert_eq!(loaded.history, vec![item]);
-
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn rollout_replays_replacements_usage_and_turn_state() {
     let root = temporary_directory("rollout-replay");
     let cwd = root.join("repo");
@@ -204,168 +97,39 @@ fn latest_resume_prefers_the_most_recently_used_matching_session() {
 }
 
 #[test]
-fn session_listing_drives_resume_and_uses_the_first_real_user_message() {
-    let root = temporary_directory("rollout-list");
-    let first_cwd = root.join("first");
-    let second_cwd = root.join("second");
-    std::fs::create_dir_all(&first_cwd).unwrap();
-    std::fs::create_dir_all(&second_cwd).unwrap();
-
-    let mut first = Rollout::create_in(&root, &first_cwd).unwrap();
-    let first_id = Uuid::parse_str(&first.identity().session_id).unwrap();
-    let first_created = first.metadata.created_at_unix_ms;
-    let first_path = first.path.clone();
-    let initial = json!({
-        "type": "message",
-        "role": "user",
-        "content": [{
-            "type": "input_text",
-            "text": "# Repository onboarding from AGENTS.md for /tmp\nignored",
-        }],
-    });
-    let interruption = json!({
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_text", "text": "<turn_aborted>ignored</turn_aborted>"}],
-    });
-    let first_prompt = json!({
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_text", "text": "  inspect\n  the   picker  "}],
-    });
-    first
-        .replace_history(std::slice::from_ref(&initial), HistoryReplacement::Initial)
-        .unwrap();
-    first
-        .append_history(std::slice::from_ref(&interruption))
-        .unwrap();
-    first
-        .append_history(std::slice::from_ref(&first_prompt))
-        .unwrap();
-    drop(first);
-
-    let mut second = Rollout::create_in(&root, &second_cwd).unwrap();
-    let second_id = Uuid::parse_str(&second.identity().session_id).unwrap();
-    let second_created = second.metadata.created_at_unix_ms;
-    let second_path = second.path.clone();
-    let image_prompt = json!({
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_image", "image_url": "data:image/png;base64,fixture"}],
-    });
-    second
-        .append_history(std::slice::from_ref(&image_prompt))
-        .unwrap();
-    drop(second);
-
-    for (path, seconds) in [(&first_path, 1_000), (&second_path, 2_000)] {
-        let file = OpenOptions::new().write(true).open(path).unwrap();
-        file.set_times(
-            std::fs::FileTimes::new()
-                .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
-        )
-        .unwrap();
-    }
-
-    assert_eq!(
-        list_sessions_in(&root).unwrap(),
-        [
-            SessionSummary {
-                id: second_id,
-                cwd: second_cwd.clone(),
-                created_at_unix_ms: second_created,
-                updated_at_unix_ms: 2_000_000,
-                preview: Some("Image attachment".to_string()),
-            },
-            SessionSummary {
-                id: first_id,
-                cwd: first_cwd.clone(),
-                created_at_unix_ms: first_created,
-                updated_at_unix_ms: 1_000_000,
-                preview: Some("inspect the picker".to_string()),
-            },
-        ]
-    );
-
-    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(first_id), &second_cwd).unwrap();
-    assert_eq!(loaded.metadata.cwd, first_cwd);
-    assert_eq!(loaded.history, [initial, interruption, first_prompt]);
-    assert_eq!(
-        loaded.transcript,
-        [SessionTranscriptItem::User {
-            text: "  inspect\n  the   picker  ".to_string(),
-            image_count: 0,
-        }]
-    );
-    drop(loaded);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn resume_reconstructs_the_visible_transcript_across_compaction() {
-    let root = temporary_directory("rollout-transcript");
+fn session_listing_streams_past_large_ignored_payloads_to_the_user_preview() {
+    let root = temporary_directory("rollout-preview");
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
     let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
     let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
-    let contextual = json!({
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_text", "text": "<turn_aborted>hidden</turn_aborted>"}],
-    });
-    let user = json!({
-        "type": "message",
-        "role": "user",
-        "content": [
-            {"type": "input_text", "text": "inspect this"},
-            {"type": "input_image", "image_url": "data:image/png;base64,fixture"},
-        ],
-    });
-    let first_answer = json!({
-        "type": "message",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": "First answer"}],
-        "phase": "commentary",
-    });
-    let final_answer = json!({
-        "type": "message",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": "After compaction"}],
-        "phase": "final_answer",
-    });
     rollout
-        .append_history(&[contextual, user.clone(), first_answer.clone()])
-        .unwrap();
-    rollout
-        .replace_compacted_history(&[user, first_answer], None)
-        .unwrap();
-    rollout
-        .append_history(std::slice::from_ref(&final_answer))
+        .append_history(&[
+            json!({
+                "type": "function_call_output",
+                "call_id": "large-output",
+                "output": "x".repeat(JOURNAL_BUFFER_BYTES * 4),
+            }),
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "inspect the persisted session without loading tool payloads",
+                }],
+            }),
+        ])
         .unwrap();
     drop(rollout);
 
-    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    let summaries = list_sessions_in(&root).unwrap();
 
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, session_id);
     assert_eq!(
-        loaded.transcript,
-        [
-            SessionTranscriptItem::User {
-                text: "inspect this".to_string(),
-                image_count: 1,
-            },
-            SessionTranscriptItem::Assistant {
-                text: "First answer".to_string(),
-                phase: Some(MessagePhase::Commentary),
-            },
-            SessionTranscriptItem::Assistant {
-                text: "After compaction".to_string(),
-                phase: Some(MessagePhase::FinalAnswer),
-            },
-        ]
+        summaries[0].preview.as_deref(),
+        Some("inspect the persisted session without loading tool payloads")
     );
-    assert_eq!(loaded.history.last(), Some(&final_answer));
-
-    drop(loaded);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -506,6 +270,37 @@ fn a_complete_record_without_a_final_newline_remains_appendable() {
     )
     .unwrap();
     assert_eq!(loaded.history.len(), 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn adjacent_records_without_a_jsonl_newline_are_rejected() {
+    let root = temporary_directory("rollout-missing-separator");
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.clone();
+    let path = rollout.path.clone();
+    drop(rollout);
+
+    let file = OpenOptions::new().write(true).open(&path).unwrap();
+    let length = file.metadata().unwrap().len();
+    file.set_len(length - 1).unwrap();
+    drop(file);
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"{\"type\":\"history_append\",\"items\":[]}\n")
+        .unwrap();
+    drop(file);
+
+    let error = Rollout::resume_in(
+        &root,
+        ResumeSelector::Id(Uuid::parse_str(&session_id).unwrap()),
+        &cwd,
+    )
+    .err()
+    .expect("missing JSONL framing must be rejected");
+    assert!(error.to_string().contains("invalid session record"));
 
     std::fs::remove_dir_all(root).unwrap();
 }

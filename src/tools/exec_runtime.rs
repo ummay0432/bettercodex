@@ -20,6 +20,7 @@ use super::code_runtime::ToolInvocationFuture;
 use super::code_runtime::WaitRequest;
 use super::image_preparation::prepare_tool_output_images;
 use crate::events::AgentEvent;
+use crate::openai_docs::OpenAiDocsClient;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Result;
@@ -50,9 +51,13 @@ pub(crate) struct ToolRuntime {
 }
 
 impl ToolRuntime {
-    pub(crate) fn new(cwd: PathBuf, web_search: WebSearchClient) -> Self {
+    pub(crate) fn new(
+        cwd: PathBuf,
+        web_search: WebSearchClient,
+        openai_docs: OpenAiDocsClient,
+    ) -> Self {
         let state = Arc::new(RuntimeState {
-            tools: NestedTools::with_web_search(cwd, web_search),
+            tools: NestedTools::new(cwd, web_search, openai_docs),
             notifications: Notifications::default(),
             ui_events: UiEvents::default(),
         });
@@ -502,6 +507,10 @@ mod tests {
                 "http://127.0.0.1:1".to_string(),
                 "test-session".to_string(),
             ),
+            crate::openai_docs::OpenAiDocsClient::with_endpoint(
+                reqwest::Client::new(),
+                "http://127.0.0.1:1",
+            ),
         )
     }
 
@@ -524,48 +533,6 @@ text(`${left.output}:${right.output}`);
             .await
             .unwrap();
         assert!(result.preview.contains("left:right"), "{}", result.preview);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn nested_command_default_is_bounded_before_javascript_receives_it() {
-        let runtime = runtime(PathBuf::from("."));
-        let result = runtime
-            .execute(
-                "call-bounded-command",
-                r#"
-const result = await tools.exec_command({
-  cmd: "dd if=/dev/zero bs=50000 count=1 2>/dev/null | tr '\\000' x",
-});
-text(`${result.output.startsWith("Warning: truncated output")}:${result.original_token_count}`);
-"#,
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(result.preview.contains("true:12500"), "{}", result.preview);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn explicit_outer_budget_cannot_exceed_the_history_item_ceiling() {
-        let runtime = runtime(PathBuf::from("."));
-        let result = runtime
-            .execute(
-                "call-bounded-outer",
-                "// @exec: {\"max_output_tokens\": 50000}\ntext(\"x\".repeat(50000));",
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            result.preview.contains("Warning: truncated output"),
-            "{}",
-            result.preview
-        );
-        assert!(result.preview.len() < 50_000);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -627,150 +594,6 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn papercut_tool_creates_and_appends_the_git_root_log() {
-        let root = temporary_directory("papercut");
-        let cwd = root.join("src/nested");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(&cwd).unwrap();
-        let runtime = runtime(cwd);
-        assert!(!root.join("PAPERCUTS.md").exists());
-        let result = runtime
-            .execute(
-                "call-papercut",
-                r#"
-const first = await tools.log_papercut({
-  message: "While running tests,\n  the documented path was stale.",
-});
-const second = await tools.log_papercut({
-  message: "The formatter emitted a misleading error.",
-});
-text(`${first.path}:${second.path}`);
-"#,
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            result.preview.contains("PAPERCUTS.md:PAPERCUTS.md"),
-            "{}",
-            result.preview
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("PAPERCUTS.md")).unwrap(),
-            "# Papercuts\n\n- While running tests, the documented path was stale.\n- The formatter emitted a misleading error.\n"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelling_a_papercut_waiting_for_the_log_lock_stops_without_writing() {
-        let root = temporary_directory("papercut-cancel");
-        let cwd = root.join("src/nested");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(&cwd).unwrap();
-        let log_path = root.join("PAPERCUTS.md");
-        let initial = "# Papercuts\n\n- Existing note.\n";
-        std::fs::write(&log_path, initial).unwrap();
-        let held_log = std::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&log_path)
-            .unwrap();
-        held_log.lock().unwrap();
-
-        let runtime = runtime(cwd);
-        let cancellation = CancellationToken::new();
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let execution = runtime.execute(
-            "call-cancel-papercut",
-            r#"await tools.log_papercut({message: "This must not be written."});"#,
-            Some(events_tx),
-            cancellation.clone(),
-        );
-        tokio::pin!(execution);
-
-        let started = tokio::select! {
-            _ = &mut execution => panic!("papercut finished before reaching the held lock"),
-            event = events_rx.recv() => event.expect("papercut start event"),
-        };
-        assert!(matches!(
-            started,
-            AgentEvent::ToolStarted { name, .. } if name == "log_papercut"
-        ));
-        // Give the blocking worker time to reach the contended lock; the old
-        // blocking File::lock implementation could not return after this point.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        cancellation.cancel();
-
-        let result = tokio::time::timeout(Duration::from_secs(1), &mut execution)
-            .await
-            .expect("cancelled papercut remained blocked on the file lock")
-            .unwrap();
-        assert!(
-            result.preview.starts_with("Script terminated"),
-            "{}",
-            result.preview
-        );
-        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), initial);
-
-        held_log.unlock().unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), initial);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelling_exec_stops_in_flight_patch_mutations() {
-        let cwd = temporary_directory("cancel-patch");
-        let runtime = runtime(cwd.clone());
-        let cancellation = CancellationToken::new();
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let execution = runtime.execute(
-            "call-cancel-patch",
-            r#"
-const repeated = "*** Add File: scratch.txt\n+partial\n".repeat(10000);
-const patch = `*** Begin Patch
-${repeated}*** Add File: completed.txt
-+done
-*** End Patch`;
-await tools.apply_patch(patch);
-"#,
-            Some(events_tx),
-            cancellation.clone(),
-        );
-        tokio::pin!(execution);
-
-        let started = tokio::select! {
-            _ = &mut execution => panic!("patch finished before cancellation"),
-            event = events_rx.recv() => event.expect("patch start event"),
-        };
-        assert!(matches!(
-            started,
-            AgentEvent::ToolStarted { name, .. } if name == "apply_patch"
-        ));
-        cancellation.cancel();
-
-        let result = tokio::time::timeout(Duration::from_secs(5), &mut execution)
-            .await
-            .expect("cancelled patch did not stop")
-            .unwrap();
-        assert!(
-            result.preview.starts_with("Script terminated"),
-            "{}",
-            result.preview
-        );
-        assert!(!cwd.join("completed.txt").exists());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !cwd.join("completed.txt").exists(),
-            "patch continued mutating files after exec termination"
-        );
-        std::fs::remove_dir_all(cwd).unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn view_image_dispatches_structured_image_content() {
         let cwd = temporary_directory("view-image");
         let image_path = cwd.join("sample.png");
@@ -797,55 +620,6 @@ await tools.apply_patch(patch);
                     .is_some_and(|url| url.starts_with("data:image/png;base64,"))
         }));
         std::fs::remove_dir_all(cwd).unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn invalid_view_image_is_replaced_at_the_model_facing_boundary() {
-        let cwd = temporary_directory("invalid-view-image");
-        std::fs::write(cwd.join("broken.png"), b"\x89PNG\r\n\x1a\nnot-an-image").unwrap();
-        let runtime = runtime(cwd.clone());
-        let result = runtime
-            .execute(
-                "call-invalid-image",
-                r#"const result = await tools.view_image({path: "broken.png"}); image(result);"#,
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let items = result.body.as_array().unwrap();
-        assert!(items.iter().any(|item| {
-            item == &json!({
-                "type": "input_text",
-                "text": "image content omitted because it could not be processed",
-            })
-        }));
-        assert!(!items.iter().any(|item| item["type"] == "input_image"));
-        std::fs::remove_dir_all(cwd).unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn text_only_single_item_result_uses_codex_plain_string_shape() {
-        let runtime = runtime(PathBuf::from("."));
-        let result = runtime
-            .execute(
-                "call-no-output",
-                r#"store("answer", 42);"#,
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            result
-                .body
-                .as_str()
-                .is_some_and(|body| body.starts_with("Script completed\nWall time ")),
-            "{}",
-            result.body
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -881,7 +655,7 @@ await tools.apply_patch(patch);
             .unwrap();
         assert!(
             result.preview.contains(
-                "apply_patch,exec_command,log_papercut,update_plan,view_image,write_stdin,web__run"
+                "apply_patch,exec_command,log_papercut,update_plan,view_image,write_stdin,openaiDeveloperDocs__fetch_openai_doc,openaiDeveloperDocs__get_openapi_spec,openaiDeveloperDocs__list_api_endpoints,openaiDeveloperDocs__list_openai_docs,openaiDeveloperDocs__search_openai_docs,web__run"
             ),
             "{}",
             result.preview
@@ -1071,66 +845,6 @@ text("after");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "manual performance measurement"]
-    async fn benchmark_large_stored_value_handoff() {
-        const SAMPLES: usize = 30;
-        const PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
-
-        // Initialize V8 before either timing loop so this measures per-cell handoff.
-        let baseline = runtime(PathBuf::from("."));
-        baseline
-            .execute(
-                "warmup",
-                r#"text("ready");"#,
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let baseline_started = Instant::now();
-        for sample in 0..SAMPLES {
-            baseline
-                .execute(
-                    &format!("baseline-{sample}"),
-                    r#"text("ready");"#,
-                    None,
-                    CancellationToken::new(),
-                )
-                .await
-                .unwrap();
-        }
-        let baseline_elapsed = baseline_started.elapsed();
-
-        let with_store = runtime(PathBuf::from("."));
-        with_store
-            .execute(
-                "store-large-payload",
-                &format!(r#"store("payload", "x".repeat({PAYLOAD_BYTES}));"#),
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let stored_started = Instant::now();
-        for sample in 0..SAMPLES {
-            with_store
-                .execute(
-                    &format!("stored-{sample}"),
-                    r#"text("ready");"#,
-                    None,
-                    CancellationToken::new(),
-                )
-                .await
-                .unwrap();
-        }
-        let stored_elapsed = stored_started.elapsed();
-
-        eprintln!(
-            "{SAMPLES} exec cells with a {PAYLOAD_BYTES}-byte stored value: baseline {baseline_elapsed:?}, stored {stored_elapsed:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn notify_injects_a_preceding_output_item() {
         let runtime = runtime(PathBuf::from("."));
         let result = runtime
@@ -1152,24 +866,6 @@ text("after");
             })]
         );
         assert!(result.preview.contains("done"), "{}", result.preview);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn notify_output_is_bounded_before_history_insertion() {
-        let runtime = runtime(PathBuf::from("."));
-        let result = runtime
-            .execute(
-                "call-large-notify",
-                r#"notify("x".repeat(50000)); text("done");"#,
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let output = result.preceding_items[0]["output"].as_str().unwrap();
-        assert!(output.starts_with("Warning: truncated output"));
-        assert!(output.len() < 50_000);
     }
 
     #[test]

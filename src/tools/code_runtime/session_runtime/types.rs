@@ -29,7 +29,7 @@ impl fmt::Display for CellId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObserveMode {
     YieldAfter(Duration),
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     PendingFrontier,
 }
 

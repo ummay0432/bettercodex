@@ -6,6 +6,9 @@ use std::process::Command;
 use std::process::Stdio;
 
 const OSC52_MAX_RAW_BYTES: usize = 100_000;
+#[cfg(target_os = "macos")]
+static STDERR_SUPPRESSION_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
 
 pub(super) fn copy_to_clipboard(text: &str) -> Result<Option<ClipboardLease>, String> {
     copy_to_clipboard_with(
@@ -13,7 +16,7 @@ pub(super) fn copy_to_clipboard(text: &str) -> Result<Option<ClipboardLease>, St
         CopyEnvironment {
             ssh: std::env::var_os("SSH_TTY").is_some()
                 || std::env::var_os("SSH_CONNECTION").is_some(),
-            tmux: std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some(),
+            tmux: crate::managed_session::is_tmux_active(),
             wsl: is_wsl(),
         },
         tmux_copy,
@@ -97,9 +100,16 @@ fn native_copy(text: &str) -> Result<Option<ClipboardLease>, String> {
 
 #[cfg(target_os = "macos")]
 fn native_copy(text: &str) -> Result<Option<ClipboardLease>, String> {
-    // `pbcopy` is part of macOS and avoids temporarily redirecting the process-wide stderr file
-    // descriptor while the terminal UI and command workers are active.
-    pipe_to_command("pbcopy", &[], text)?;
+    let _lock = STDERR_SUPPRESSION_MUTEX
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .map_err(|_| "clipboard stderr suppression lock was poisoned".to_string())?;
+    let _stderr = SuppressStderr::new();
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("clipboard unavailable: {error}"))?;
+    clipboard
+        .set_text(text)
+        .map_err(|error| format!("failed to set clipboard text: {error}"))?;
     Ok(None)
 }
 
@@ -116,7 +126,7 @@ fn tmux_copy(text: &str) -> Result<(), String> {
 }
 
 fn osc52_copy(text: &str) -> Result<(), String> {
-    let sequence = osc52_sequence(text, std::env::var_os("TMUX").is_some())?;
+    let sequence = osc52_sequence(text, crate::managed_session::is_tmux_active())?;
     match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
         Ok(mut tty) => write_and_flush(&mut tty, sequence.as_bytes()),
         Err(_) => write_and_flush(&mut std::io::stdout().lock(), sequence.as_bytes()),
@@ -214,6 +224,45 @@ fn is_wsl() -> bool {
 #[cfg(target_os = "macos")]
 fn is_wsl() -> bool {
     false
+}
+
+#[cfg(target_os = "macos")]
+struct SuppressStderr {
+    saved: Option<libc::c_int>,
+}
+
+#[cfg(target_os = "macos")]
+impl SuppressStderr {
+    fn new() -> Self {
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if saved < 0 {
+            return Self { saved: None };
+        }
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+        if null < 0 || unsafe { libc::dup2(null, libc::STDERR_FILENO) } < 0 {
+            unsafe {
+                libc::close(saved);
+                if null >= 0 {
+                    libc::close(null);
+                }
+            }
+            return Self { saved: None };
+        }
+        unsafe { libc::close(null) };
+        Self { saved: Some(saved) }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SuppressStderr {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved {
+            unsafe {
+                libc::dup2(saved, libc::STDERR_FILENO);
+                libc::close(saved);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

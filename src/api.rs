@@ -11,6 +11,7 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::HistoryCursor;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
+use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
 use crate::tools;
 use crate::tools::ToolCall;
@@ -57,6 +58,10 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WEBSOCKET_PREWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STREAM_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16_000;
+// Encoding is on the critical path before network I/O. Level 1 retains strong compression for the
+// long-context JSON workloads in `benchmark_responses_request_encoding` while materially reducing
+// CPU time versus zstd's level-3 default.
+const REQUEST_COMPRESSION_LEVEL: i32 = 1;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
@@ -169,6 +174,7 @@ pub(crate) struct ApiClient {
     websocket_reasoning_included: bool,
     websocket_baseline: Option<WebSocketBaseline>,
     stream_idle_timeout: Duration,
+    instructions: String,
 }
 
 struct WebSocketBaseline {
@@ -392,14 +398,52 @@ impl ApiClient {
         identity: &SessionIdentity,
         compaction_count: u64,
     ) -> anyhow::Result<Self> {
-        Self::new_with_base_url(auth, identity, compaction_count, BASE_URL.to_string())
+        Self::new_configured(
+            auth,
+            identity,
+            compaction_count,
+            BASE_URL.to_string(),
+            harness_instructions().to_string(),
+        )
     }
 
+    pub(crate) fn new_with_instructions(
+        auth: Auth,
+        identity: &SessionIdentity,
+        compaction_count: u64,
+        instructions: String,
+    ) -> anyhow::Result<Self> {
+        Self::new_configured(
+            auth,
+            identity,
+            compaction_count,
+            BASE_URL.to_string(),
+            instructions,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_base_url(
         auth: Auth,
         identity: &SessionIdentity,
         compaction_count: u64,
         base_url: String,
+    ) -> anyhow::Result<Self> {
+        Self::new_configured(
+            auth,
+            identity,
+            compaction_count,
+            base_url,
+            harness_instructions().to_string(),
+        )
+    }
+
+    fn new_configured(
+        auth: Auth,
+        identity: &SessionIdentity,
+        compaction_count: u64,
+        base_url: String,
+        instructions: String,
     ) -> anyhow::Result<Self> {
         codex_utils_rustls_provider::ensure_rustls_crypto_provider();
         let mut default_headers = HeaderMap::new();
@@ -427,6 +471,7 @@ impl ApiClient {
             websocket_reasoning_included: false,
             websocket_baseline: None,
             stream_idle_timeout: STREAM_IDLE_TIMEOUT,
+            instructions,
         })
     }
 
@@ -441,6 +486,13 @@ impl ApiClient {
         self.window
     }
 
+    pub(crate) fn commit_compaction(&mut self) {
+        self.window = self.window.saturating_add(1);
+        // Compaction replaces history instead of appending to it, so no prefix
+        // from the compaction request is a valid baseline for the next sample.
+        self.websocket_baseline = None;
+    }
+
     pub(crate) fn web_search_client(&self) -> WebSearchClient {
         WebSearchClient::new(
             self.client.clone(),
@@ -448,6 +500,10 @@ impl ApiClient {
             self.base_url.clone(),
             self.session_id.clone(),
         )
+    }
+
+    pub(crate) fn openai_docs_client(&self) -> OpenAiDocsClient {
+        OpenAiDocsClient::new(self.client.clone())
     }
 
     pub(crate) fn tool_turn_context(&self, history: &[Value]) -> ToolTurnContext {
@@ -707,7 +763,7 @@ impl ApiClient {
             if text.len() > MAX_STREAM_EVENT_BYTES {
                 return Err(ApiError::fatal("model sent an oversized WebSocket event"));
             }
-            let event: Value = serde_json::from_str(&text).map_err(|error| {
+            let event: Value = serde_json::from_str(text.as_str()).map_err(|error| {
                 ApiError::fatal(format!("failed to decode WebSocket event: {error}"))
             })?;
             self.capture_event_turn_state(&event);
@@ -890,10 +946,7 @@ impl ApiClient {
         mut input_identity: RequestInputIdentity,
     ) -> ApiResult<CompactionResult> {
         if history.is_empty() {
-            return Ok(CompactionResult {
-                items: Vec::new(),
-                usage: None,
-            });
+            return Err(ApiError::fatal("cannot compact an empty conversation"));
         }
         let trigger = compaction::compaction_trigger();
         let [tools_item] = stable_input_prefix_items();
@@ -952,11 +1005,16 @@ impl ApiClient {
                 Err(error) => return Err(error),
             }
         };
-        let compaction_output =
-            compaction::opaque_compaction_item(&response.items).map_err(ApiError::fatal)?;
+        let compaction_output = match compaction::opaque_compaction_item(&response.items) {
+            Ok(compaction_output) => compaction_output,
+            Err(error) => {
+                // A completed but unusable response must not become the baseline
+                // for a later request using the unchanged conversation.
+                self.abandon_response();
+                return Err(ApiError::fatal(error));
+            }
+        };
         items.push(compaction_output);
-        self.window = self.window.saturating_add(1);
-        self.websocket_baseline = None;
         Ok(CompactionResult {
             items,
             usage: response.usage,
@@ -984,7 +1042,7 @@ impl ApiClient {
     fn build_request_from_input(&self, input: Vec<Value>, request_kind: RequestKind) -> Value {
         let mut request = json!({
             "model": MODEL,
-            "instructions": harness_instructions(),
+            "instructions": &self.instructions,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
             "reasoning": {"effort": "max", "summary": "auto", "context": "all_turns"},
@@ -1116,14 +1174,7 @@ impl ApiClient {
         accept: &str,
         request_kind: RequestKind,
     ) -> ApiResult<reqwest::Response> {
-        let encoded_body = serde_json::to_vec(body).map_err(|error| {
-            ApiError::fatal(format!("failed to encode Responses request: {error}"))
-        })?;
-        let compressed_body = Bytes::from(
-            zstd::stream::encode_all(std::io::Cursor::new(encoded_body), 3).map_err(|error| {
-                ApiError::fatal(format!("failed to compress Responses request: {error}"))
-            })?,
-        );
+        let compressed_body = encode_request_body(body)?;
         let mut auth = self
             .auth
             .refreshed_snapshot(&self.client)
@@ -1225,6 +1276,26 @@ impl ApiClient {
     }
 }
 
+fn encode_request_body(body: &Value) -> ApiResult<Bytes> {
+    // Keep serde and zstd connected: staging through `serde_json::to_vec` would grow and retain a
+    // complete uncompressed request before `encode_all` copied it through `std::io::copy`.
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), REQUEST_COMPRESSION_LEVEL)
+        .map_err(|error| {
+            ApiError::fatal(format!(
+                "failed to initialize Responses request compression: {error}"
+            ))
+        })?;
+    serde_json::to_writer(&mut encoder, body).map_err(|error| {
+        ApiError::fatal(format!(
+            "failed to encode compressed Responses request: {error}"
+        ))
+    })?;
+    encoder
+        .finish()
+        .map(Bytes::from)
+        .map_err(|error| ApiError::fatal(format!("failed to compress Responses request: {error}")))
+}
+
 #[derive(Clone, Copy)]
 enum RequestKind {
     Turn,
@@ -1319,6 +1390,7 @@ async fn collect_http_stream(
 ) -> ApiResult<ModelResponse> {
     let mut decoder = SseDecoder::default();
     let mut collected = CollectedResponse::default();
+    let mut decoded = Vec::new();
     let mut event_deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
         let chunk = tokio::time::timeout_at(event_deadline, response.chunk())
@@ -1328,16 +1400,17 @@ async fn collect_http_stream(
                 ApiError::retryable(format!("failed to read model response: {error}"))
             })?;
         let Some(chunk) = chunk else {
-            for data in decoder.finish()? {
+            decoder.finish(&mut decoded)?;
+            for data in decoded.drain(..) {
                 process_event(&data, &mut collected, completed_items, events)?;
             }
             break;
         };
-        let decoded = decoder.push(&chunk)?;
+        decoder.push(&chunk, &mut decoded)?;
         if !decoded.is_empty() {
             event_deadline = tokio::time::Instant::now() + idle_timeout;
         }
-        for data in decoded {
+        for data in decoded.drain(..) {
             process_event(&data, &mut collected, completed_items, events)?;
         }
         if collected.completed {
@@ -1475,17 +1548,17 @@ fn process_event_value(
             }
         }
         Some("response.output_text.delta") => {
-            if let Some(delta) = event.get("delta").and_then(Value::as_str)
+            if let Some(Value::String(delta)) = event.get_mut("delta")
                 && let Some(events) = events
             {
-                let _ = events.send(AgentEvent::ModelMessageDelta(delta.to_string()));
+                let _ = events.send(AgentEvent::ModelMessageDelta(std::mem::take(delta)));
             }
         }
         Some("response.reasoning_summary_text.delta") => {
-            if let Some(delta) = event.get("delta").and_then(Value::as_str)
+            if let Some(Value::String(delta)) = event.get_mut("delta")
                 && let Some(events) = events
             {
-                let _ = events.send(AgentEvent::ReasoningSummaryDelta(delta.to_string()));
+                let _ = events.send(AgentEvent::ReasoningSummaryDelta(std::mem::take(delta)));
             }
         }
         Some("response.reasoning_summary_part.added") => {

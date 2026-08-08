@@ -5,41 +5,33 @@
 //! and telemetry layers, while retaining its model-visible process/session,
 //! PTY, yield, environment, and output-truncation behavior.
 
-use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_shell_command::shell_detect::DetectedShell;
-use codex_shell_command::shell_detect::ShellType;
 use codex_shell_command::shell_detect::default_user_shell;
 use codex_shell_command::shell_detect::get_shell_by_model_provided_path;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::truncate_text;
-use portable_pty::ChildKiller;
-use portable_pty::CommandBuilder;
-use portable_pty::PtySize;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
-use std::io::Read;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::Notify;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use super::process_session::ProcessMode;
+use super::process_session::ProcessSession;
+use super::process_session::ShellStartup;
+use super::process_session::shell_command;
 
 const DEFAULT_EXEC_YIELD: Duration = Duration::from_secs(10);
 const MIN_EXEC_YIELD: Duration = Duration::from_millis(250);
@@ -47,22 +39,7 @@ const MAX_EXEC_YIELD: Duration = Duration::from_secs(30);
 const DEFAULT_WRITE_YIELD: Duration = Duration::from_millis(250);
 const DEFAULT_POLL_YIELD: Duration = Duration::from_secs(5);
 const MAX_POLL_YIELD: Duration = Duration::from_secs(5 * 60);
-const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 const MAX_PROCESSES: usize = 64;
-const RETAINED_HEAD_BYTES: usize = 512 * 1024;
-const RETAINED_TAIL_BYTES: usize = 512 * 1024;
-const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
-    ("NO_COLOR", "1"),
-    ("TERM", "dumb"),
-    ("LANG", "C.UTF-8"),
-    ("LC_CTYPE", "C.UTF-8"),
-    ("LC_ALL", "C.UTF-8"),
-    ("COLORTERM", ""),
-    ("PAGER", "cat"),
-    ("GIT_PAGER", "cat"),
-    ("GH_PAGER", "cat"),
-    ("CODEX_CI", "1"),
-];
 
 #[derive(Clone)]
 pub(crate) struct ProcessManager {
@@ -184,14 +161,19 @@ impl ProcessManager {
             .map_or_else(default_user_shell, |shell| {
                 get_shell_by_model_provided_path(&PathBuf::from(shell))
             });
-        let login = arguments.login.unwrap_or(true);
+        let shell_startup = if arguments.login.unwrap_or(true) {
+            ShellStartup::Login
+        } else {
+            ShellStartup::NonLogin
+        };
         let session_id_reservation = self.reserve_session_id()?;
         let session_id = session_id_reservation.session_id;
-        let session = if arguments.tty.unwrap_or(false) {
-            spawn_pty(&shell, login, &arguments.cmd, &workdir)?
+        let mode = if arguments.tty.unwrap_or(false) {
+            ProcessMode::Pty
         } else {
-            spawn_piped(&shell, login, &arguments.cmd, &workdir)?
+            ProcessMode::Piped
         };
+        let session = ProcessSession::spawn(&shell, shell_startup, &arguments.cmd, &workdir, mode)?;
         let started = Instant::now();
         let storage = if session.has_exited() {
             ProcessStorage::Transient
@@ -247,7 +229,7 @@ impl ProcessManager {
             .get(&arguments.session_id)
             .map(|entry| Arc::clone(&entry.session))
             .ok_or_else(|| anyhow!("Unknown process id {}", arguments.session_id))?;
-        let _interaction = Arc::clone(&session.interaction).lock_owned().await;
+        let _interaction = session.interaction().lock_owned().await;
         {
             let mut store = self
                 .store
@@ -263,7 +245,7 @@ impl ProcessManager {
 
         let has_input = !arguments.chars.is_empty();
         if has_input {
-            if !session.tty {
+            if !session.has_terminal() {
                 if arguments.chars == "\u{3}" {
                     session.interrupt()?;
                 } else {
@@ -334,7 +316,7 @@ impl ProcessManager {
             }
             ProcessStorage::Transient => session.snapshot()?,
         };
-        if storage == ProcessStorage::Stored && snapshot.exited {
+        if storage == ProcessStorage::Stored && snapshot.has_exited() {
             self.remove_session(session_id)?;
         }
         let original_token_count =
@@ -354,7 +336,7 @@ impl ProcessManager {
         if let Some(exit_code) = snapshot.exit_code {
             result["exit_code"] = json!(exit_code);
         }
-        if storage == ProcessStorage::Stored && !snapshot.exited {
+        if storage == ProcessStorage::Stored && !snapshot.has_exited() {
             result["session_id"] = json!(session_id);
         }
         result["original_token_count"] = json!(original_token_count);
@@ -451,9 +433,7 @@ impl ProcessManager {
                 return None;
             }
 
-            if let Some(interaction) = candidate
-                .as_ref()
-                .map(|session| Arc::clone(&session.interaction))
+            if let Some(interaction) = candidate.as_ref().map(|session| session.interaction())
                 && let Ok(_interaction) = interaction.try_lock_owned()
                 && let Some(entry) = sessions.remove(&session_id)
             {
@@ -551,440 +531,11 @@ struct WriteStdinArgs {
     max_output_tokens: Option<usize>,
 }
 
-struct ProcessSession {
-    state: Mutex<ProcessState>,
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    notify: Notify,
-    interaction: Arc<AsyncMutex<()>>,
-    tty: bool,
-    process_group_id: Option<i32>,
-}
-
-impl ProcessSession {
-    fn new(
-        writer: Option<Box<dyn Write + Send>>,
-        killer: Box<dyn ChildKiller + Send + Sync>,
-        readers: usize,
-        tty: bool,
-        process_group_id: Option<i32>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(ProcessState {
-                output: PendingOutput::default(),
-                exit_code: None,
-                readers,
-                errors: Vec::new(),
-            }),
-            writer: Mutex::new(writer),
-            killer: Mutex::new(killer),
-            notify: Notify::new(),
-            interaction: Arc::new(AsyncMutex::new(())),
-            tty,
-            process_group_id,
-        })
-    }
-
-    fn append(&self, bytes: &[u8]) {
-        if let Ok(mut state) = self.state.lock() {
-            state.output.append(bytes);
-        }
-        self.notify.notify_waiters();
-    }
-
-    fn reader_finished(&self, error: Option<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.readers = state.readers.saturating_sub(1);
-            if let Some(error) = error {
-                state.errors.push(error);
-            }
-        }
-        self.notify.notify_waiters();
-    }
-
-    fn exited(&self, exit_code: i32, error: Option<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.exit_code = Some(exit_code);
-            if let Some(error) = error {
-                state.errors.push(error);
-            }
-        }
-        if let Ok(mut writer) = self.writer.lock() {
-            *writer = None;
-        }
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self, duration: Duration) {
-        let deadline = Instant::now() + duration;
-        let mut post_exit_deadline = None;
-        loop {
-            let notified = self.notify.notified();
-            let (exited, output_closed) = self
-                .state
-                .lock()
-                .map(|state| (state.exit_code.is_some(), state.readers == 0))
-                .unwrap_or((true, true));
-            if exited && output_closed {
-                return;
-            }
-            let now = Instant::now();
-            let wait_deadline = if exited {
-                *post_exit_deadline.get_or_insert_with(|| {
-                    now + deadline
-                        .saturating_duration_since(now)
-                        .min(POST_EXIT_CLOSE_WAIT_CAP)
-                })
-            } else {
-                deadline
-            };
-            if now >= wait_deadline {
-                return;
-            }
-            let remaining = wait_deadline.saturating_duration_since(now);
-            if timeout(remaining, notified).await.is_err() {
-                return;
-            }
-        }
-    }
-
-    async fn write(&self, bytes: Vec<u8>) -> Result<()> {
-        let writer = self
-            .writer
-            .lock()
-            .map_err(|_| anyhow!("process stdin lock was poisoned"))?
-            .take()
-            .ok_or_else(|| anyhow!("stdin is closed"))?;
-        let result = tokio::task::spawn_blocking(move || {
-            let mut writer = writer;
-            writer.write_all(&bytes)?;
-            writer.flush()?;
-            Ok::<_, std::io::Error>(writer)
-        })
-        .await
-        .context("stdin writer task failed")?;
-        match result {
-            Ok(writer) => {
-                *self
-                    .writer
-                    .lock()
-                    .map_err(|_| anyhow!("process stdin lock was poisoned"))? = Some(writer);
-                Ok(())
-            }
-            Err(error) => Err(error).context("failed to write process stdin"),
-        }
-    }
-
-    fn interrupt(&self) -> Result<()> {
-        if self.signal_process_group(libc::SIGINT) {
-            Ok(())
-        } else {
-            Err(anyhow!("failed to interrupt process"))
-        }
-    }
-
-    fn kill(&self) {
-        if self
-            .state
-            .lock()
-            .is_ok_and(|state| state.exit_code.is_some())
-        {
-            return;
-        }
-        if self.signal_process_group(libc::SIGKILL) {
-            return;
-        }
-        if let Ok(mut killer) = self.killer.lock() {
-            let _ = killer.kill();
-        }
-    }
-
-    fn has_exited(&self) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|state| state.exit_code.is_some())
-    }
-
-    fn signal_process_group(&self, signal: i32) -> bool {
-        let Some(process_group_id) = self.process_group_id else {
-            return false;
-        };
-        // Both the piped and PTY launch paths create a new process group whose
-        // leader is the spawned shell, matching Codex's whole-command signals.
-        unsafe { libc::kill(-process_group_id, signal) == 0 }
-    }
-
-    fn snapshot(&self) -> Result<ProcessSnapshot> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("process output lock was poisoned"))?;
-        let output_closed = state.readers == 0;
-        let mut output = state.output.take(output_closed);
-        if !state.errors.is_empty() {
-            if !output.text.is_empty() && !output.text.ends_with('\n') {
-                output.text.push('\n');
-            }
-            let errors = state.errors.join("\n");
-            output.total_bytes = output.total_bytes.saturating_add(errors.len());
-            output.text.push_str(&errors);
-            state.errors.clear();
-        }
-        Ok(ProcessSnapshot {
-            output: output.text,
-            exit_code: state.exit_code,
-            exited: state.exit_code.is_some(),
-            total_bytes: output.total_bytes,
-            omitted_bytes: output.omitted_bytes,
-        })
-    }
-}
-
-struct ProcessState {
-    output: PendingOutput,
-    exit_code: Option<i32>,
-    readers: usize,
-    errors: Vec<String>,
-}
-
-struct ProcessSnapshot {
-    output: String,
-    exit_code: Option<i32>,
-    exited: bool,
-    total_bytes: usize,
-    omitted_bytes: usize,
-}
-
-#[derive(Default)]
-struct PendingOutput {
-    head: Vec<u8>,
-    tail: VecDeque<u8>,
-    omitted: usize,
-}
-
-impl PendingOutput {
-    fn append(&mut self, mut bytes: &[u8]) {
-        let head_space = RETAINED_HEAD_BYTES.saturating_sub(self.head.len());
-        let head_bytes = head_space.min(bytes.len());
-        self.head.extend_from_slice(&bytes[..head_bytes]);
-        bytes = &bytes[head_bytes..];
-        if bytes.is_empty() {
-            return;
-        }
-
-        if bytes.len() >= RETAINED_TAIL_BYTES {
-            self.omitted = self
-                .omitted
-                .saturating_add(self.tail.len())
-                .saturating_add(bytes.len().saturating_sub(RETAINED_TAIL_BYTES));
-            self.tail.clear();
-            self.tail
-                .extend(&bytes[bytes.len() - RETAINED_TAIL_BYTES..]);
-            return;
-        }
-        let excess = (self.tail.len() + bytes.len()).saturating_sub(RETAINED_TAIL_BYTES);
-        if excess > 0 {
-            // A Vec shifts the entire retained tail on every process read after reaching the
-            // limit. Advancing VecDeque's front keeps append work proportional to new output.
-            drop(self.tail.drain(..excess));
-            self.omitted = self.omitted.saturating_add(excess);
-        }
-        self.tail.extend(bytes);
-    }
-
-    fn take(&mut self, output_closed: bool) -> PendingOutputSnapshot {
-        let omitted_bytes = self.omitted;
-        let buffered_bytes = self
-            .head
-            .len()
-            .saturating_add(self.tail.len())
-            .saturating_add(omitted_bytes);
-        let mut bytes = std::mem::take(&mut self.head);
-        if omitted_bytes > 0 {
-            let marker = format!("\n... {omitted_bytes} bytes omitted ...\n");
-            bytes.reserve(marker.len().saturating_add(self.tail.len()));
-            bytes.extend_from_slice(marker.as_bytes());
-        } else {
-            bytes.reserve(self.tail.len());
-        }
-        bytes.extend(std::mem::take(&mut self.tail));
-        self.omitted = 0;
-
-        // A process can write one UTF-8 scalar across separate reads or tool polls. Keep an
-        // incomplete suffix until another byte arrives instead of replacing both halves with the
-        // Unicode replacement character. Once every output reader closes, truly incomplete bytes
-        // are final and retain the existing lossy-decoding behavior.
-        if !output_closed && let Some(carry_start) = trailing_incomplete_utf8_start(&bytes) {
-            self.head = bytes.split_off(carry_start);
-        }
-        let total_bytes = buffered_bytes.saturating_sub(self.head.len());
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
-        };
-        PendingOutputSnapshot {
-            text,
-            total_bytes,
-            omitted_bytes,
-        }
-    }
-}
-
-fn trailing_incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
-    let mut offset = 0_usize;
-    while offset < bytes.len() {
-        match std::str::from_utf8(&bytes[offset..]) {
-            Ok(_) => return None,
-            Err(error) => {
-                let invalid_start = offset.saturating_add(error.valid_up_to());
-                let Some(invalid_length) = error.error_len() else {
-                    return Some(invalid_start);
-                };
-                offset = invalid_start.saturating_add(invalid_length);
-            }
-        }
-    }
-    None
-}
-
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-struct PendingOutputSnapshot {
-    text: String,
-    total_bytes: usize,
-    omitted_bytes: usize,
-}
-
-fn spawn_piped(
-    shell: &DetectedShell,
-    login: bool,
-    cmd: &str,
-    cwd: &Path,
-) -> Result<Arc<ProcessSession>> {
-    let (program, arguments) = shell_command(shell, login, cmd);
-    let mut command = std::process::Command::new(program);
-    use std::os::unix::process::CommandExt;
-    command
-        .args(arguments)
-        .current_dir(cwd)
-        .envs(UNIFIED_EXEC_ENV)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command.process_group(0);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start command in {}", cwd.display()))?;
-    let stdout = child.stdout.take().context("failed to capture stdout")?;
-    let stderr = child.stderr.take().context("failed to capture stderr")?;
-    let process_group_id = i32::try_from(child.id()).ok();
-    let killer = child.clone_killer();
-    let session = ProcessSession::new(None, killer, 2, false, process_group_id);
-    spawn_reader(Arc::clone(&session), stdout, "stdout");
-    spawn_reader(Arc::clone(&session), stderr, "stderr");
-    let waiter = Arc::clone(&session);
-    std::thread::spawn(move || match child.wait() {
-        Ok(status) => waiter.exited(
-            status
-                .code()
-                .unwrap_or_else(|| if status.success() { 0 } else { 1 }),
-            None,
-        ),
-        Err(error) => waiter.exited(1, Some(format!("failed to wait for command: {error}"))),
-    });
-    Ok(session)
-}
-
-fn spawn_pty(
-    shell: &DetectedShell,
-    login: bool,
-    cmd: &str,
-    cwd: &Path,
-) -> Result<Arc<ProcessSession>> {
-    let pair = portable_pty::native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("failed to open PTY")?;
-    let (program, arguments) = shell_command(shell, login, cmd);
-    let mut command = CommandBuilder::new(program);
-    for argument in arguments {
-        command.arg(argument);
-    }
-    command.cwd(cwd);
-    for (key, value) in UNIFIED_EXEC_ENV {
-        command.env(key, value);
-    }
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .with_context(|| format!("failed to start PTY command in {}", cwd.display()))?;
-    drop(pair.slave);
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .context("failed to capture PTY output")?;
-    let writer = pair
-        .master
-        .take_writer()
-        .context("failed to capture PTY input")?;
-    let process_group_id = child.process_id().and_then(|id| i32::try_from(id).ok());
-    let killer = child.clone_killer();
-    let session = ProcessSession::new(Some(writer), killer, 1, true, process_group_id);
-    spawn_reader(Arc::clone(&session), reader, "PTY");
-    let waiter = Arc::clone(&session);
-    std::thread::spawn(move || match child.wait() {
-        Ok(status) => waiter.exited(status.exit_code() as i32, None),
-        Err(error) => waiter.exited(1, Some(format!("failed to wait for PTY command: {error}"))),
-    });
-    Ok(session)
-}
-
-fn spawn_reader(
-    session: Arc<ProcessSession>,
-    mut reader: impl Read + Send + 'static,
-    label: &'static str,
-) {
-    std::thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
-        let error = loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break None,
-                Ok(read) => session.append(&buffer[..read]),
-                Err(error) => break Some(format!("failed to read {label}: {error}")),
-            }
-        };
-        session.reader_finished(error);
-    });
-}
-
 fn resolve_workdir(cwd: &Path, requested: Option<&str>) -> PathBuf {
     requested
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .map_or_else(|| cwd.to_path_buf(), |path| cwd.join(path))
-}
-
-fn shell_command(shell: &DetectedShell, login: bool, cmd: &str) -> (PathBuf, Vec<String>) {
-    let arguments = match shell.shell_type {
-        ShellType::Zsh | ShellType::Bash | ShellType::Sh => vec![
-            if login { "-lc" } else { "-c" }.to_string(),
-            cmd.to_string(),
-        ],
-        ShellType::PowerShell => {
-            let mut arguments = Vec::new();
-            if !login {
-                arguments.push("-NoProfile".to_string());
-            }
-            arguments.push("-Command".to_string());
-            arguments.push(cmd.to_string());
-            arguments
-        }
-        ShellType::Cmd => vec!["/c".to_string(), cmd.to_string()],
-    };
-    (shell.shell_path.clone(), arguments)
 }
 
 pub(crate) fn command_argv_for_display(input: &Value) -> Vec<String> {
@@ -994,9 +545,13 @@ pub(crate) fn command_argv_for_display(input: &Value) -> Vec<String> {
         .map_or_else(default_user_shell, |shell| {
             get_shell_by_model_provided_path(&PathBuf::from(shell))
         });
-    let login = input.get("login").and_then(Value::as_bool).unwrap_or(true);
+    let shell_startup = if input.get("login").and_then(Value::as_bool).unwrap_or(true) {
+        ShellStartup::Login
+    } else {
+        ShellStartup::NonLogin
+    };
     let cmd = input.get("cmd").and_then(Value::as_str).unwrap_or_default();
-    let (program, arguments) = shell_command(&shell, login, cmd);
+    let (program, arguments) = shell_command(&shell, shell_startup, cmd);
     std::iter::once(program.to_string_lossy().into_owned())
         .chain(arguments)
         .collect()
@@ -1050,171 +605,6 @@ fn truncate_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Clone, Debug)]
-    struct NoopKiller;
-
-    impl ChildKiller for NoopKiller {
-        fn kill(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-            Box::new(self.clone())
-        }
-    }
-
-    fn fake_session(exited: bool) -> Arc<ProcessSession> {
-        let session = ProcessSession::new(None, Box::new(NoopKiller), 0, false, None);
-        if exited {
-            session.exited(0, None);
-        }
-        session
-    }
-
-    #[test]
-    fn retained_output_keeps_head_and_tail() {
-        let mut output = PendingOutput::default();
-        let bytes = vec![b'x'; RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + 17];
-        output.append(&bytes);
-        let snapshot = output.take(true);
-        let rendered = snapshot.text;
-        assert_eq!(snapshot.total_bytes, bytes.len());
-        assert_eq!(snapshot.omitted_bytes, 17);
-        assert!(rendered.starts_with(&"x".repeat(RETAINED_HEAD_BYTES)));
-        assert!(rendered.contains("17 bytes omitted"));
-        assert!(rendered.ends_with(&"x".repeat(RETAINED_TAIL_BYTES)));
-    }
-
-    #[test]
-    fn retained_output_ring_preserves_order_across_many_reads() {
-        let omitted_bytes = RETAINED_TAIL_BYTES / 2 + 137;
-        let input_bytes = RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + omitted_bytes;
-        let bytes = (0..input_bytes)
-            .map(|index| b'a' + u8::try_from(index % 26).unwrap())
-            .collect::<Vec<_>>();
-        let mut output = PendingOutput::default();
-        for chunk in bytes.chunks(8_191) {
-            output.append(chunk);
-        }
-
-        let snapshot = output.take(true);
-
-        let expected = format!(
-            "{}\n... {omitted_bytes} bytes omitted ...\n{}",
-            String::from_utf8_lossy(&bytes[..RETAINED_HEAD_BYTES]),
-            String::from_utf8_lossy(&bytes[bytes.len() - RETAINED_TAIL_BYTES..]),
-        );
-        assert_eq!(
-            snapshot,
-            PendingOutputSnapshot {
-                text: expected,
-                total_bytes: input_bytes,
-                omitted_bytes,
-            }
-        );
-    }
-
-    #[test]
-    fn retained_output_replaces_invalid_utf8() {
-        let mut output = PendingOutput::default();
-        output.append(b"before\x80after");
-
-        assert_eq!(output.take(true).text, "before\u{fffd}after");
-    }
-
-    #[test]
-    fn retained_output_preserves_utf8_split_across_snapshots() {
-        let mut output = PendingOutput::default();
-        let scalar = "🦀".as_bytes();
-        output.append(&scalar[..2]);
-
-        assert_eq!(
-            output.take(false),
-            PendingOutputSnapshot {
-                text: String::new(),
-                total_bytes: 0,
-                omitted_bytes: 0,
-            }
-        );
-
-        output.append(&scalar[2..]);
-        assert_eq!(
-            output.take(true),
-            PendingOutputSnapshot {
-                text: "🦀".to_string(),
-                total_bytes: scalar.len(),
-                omitted_bytes: 0,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn process_store_matches_codex_soft_cap_and_exited_lru_policy() {
-        let manager = ProcessManager::new(std::env::current_dir().unwrap());
-        let now = Instant::now();
-        {
-            let mut store = manager.store.lock().unwrap();
-            for offset in 0..MAX_PROCESSES {
-                let session_id = 1_000 + i32::try_from(offset).unwrap();
-                store.sessions.insert(
-                    session_id,
-                    ProcessEntry {
-                        session: fake_session(session_id == 1_001),
-                        command: format!("command {session_id}"),
-                        cwd: PathBuf::from("/tmp"),
-                        started_at: now,
-                        last_used: now
-                            .checked_sub(Duration::from_secs(
-                                u64::try_from(MAX_PROCESSES - offset).unwrap(),
-                            ))
-                            .unwrap(),
-                    },
-                );
-                store.reserved_session_ids.insert(session_id);
-            }
-            store.reserved_session_ids.insert(2_000);
-        }
-
-        manager
-            .store_session(
-                2_000,
-                fake_session(false),
-                "new command".to_string(),
-                PathBuf::from("/tmp"),
-                now,
-            )
-            .unwrap();
-
-        {
-            let store = manager.store.lock().unwrap();
-            assert_eq!(store.sessions.len(), MAX_PROCESSES);
-            assert!(!store.sessions.contains_key(&1_001));
-            assert!(store.sessions.contains_key(&1_000));
-            assert!(store.sessions.contains_key(&2_000));
-            assert!(!store.reserved_session_ids.contains(&1_001));
-        }
-
-        let error = manager
-            .write_stdin(json!({"session_id": 1_001}), CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "Unknown process id 1001");
-    }
-
-    #[tokio::test]
-    async fn exited_process_uses_codex_output_close_grace() {
-        let session = ProcessSession::new(None, Box::new(NoopKiller), 1, false, None);
-        session.exited(0, None);
-        let started = Instant::now();
-
-        session.wait(Duration::from_secs(5)).await;
-
-        assert!(started.elapsed() < Duration::from_secs(1));
-        let snapshot = session.snapshot().unwrap();
-        assert!(snapshot.exited);
-        assert_eq!(snapshot.exit_code, Some(0));
-    }
 
     #[test]
     fn chunk_ids_match_codex_shape() {
@@ -1273,85 +663,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloned_process_table_lists_and_stops_background_commands() {
-        let cwd = std::env::current_dir().unwrap();
-        let manager = ProcessManager::new(cwd.clone());
-        let control = manager.clone();
-        let started = manager
-            .exec_command(
-                json!({
-                    "cmd": "sleep 30",
-                    "shell": "/bin/sh",
-                    "login": false,
-                    "yield_time_ms": 250,
-                }),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let session_id = started["session_id"].as_i64().unwrap() as i32;
-
-        let processes = control.list_background_processes();
-        let running_for = processes[0].running_for;
-        assert_eq!(
-            processes,
-            [BackgroundProcess {
-                session_id,
-                command: "sleep 30".to_string(),
-                cwd,
-                running_for,
-            }]
-        );
-        assert_eq!(control.stop_all_background_processes(), 1);
-        assert!(manager.list_background_processes().is_empty());
-        let error = manager
-            .write_stdin(json!({"session_id": session_id}), CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!("Unknown process id {session_id}")
-        );
-    }
-
-    #[tokio::test]
-    async fn noisy_command_returns_bounded_head_and_tail() {
-        let cwd = std::env::current_dir().unwrap();
-        let manager = ProcessManager::new(cwd);
-        let generated_bytes = RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + 256 * 1024;
-        let command = format!(
-            "printf 'BEGIN\\n'; yes 0123456789abcdef | head -c {generated_bytes}; printf '\\nEND\\n'"
-        );
-
-        let result = manager
-            .exec_command(
-                json!({
-                    "cmd": command,
-                    "shell": "/bin/sh",
-                    "login": false,
-                    "yield_time_ms": 5_000,
-                    "max_output_tokens": 10_000,
-                }),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let output = result["output"].as_str().unwrap();
-        assert_eq!(result["exit_code"], 0);
-        assert!(result.get("session_id").is_none());
-        assert!(output.starts_with("Warning: truncated output"));
-        assert!(output.contains("BEGIN\n"));
-        assert!(output.ends_with("\nEND\n"));
-        assert!(output.len() < generated_bytes);
-        assert!(
-            result["original_token_count"]
-                .as_u64()
-                .is_some_and(|tokens| tokens > 300_000)
-        );
-    }
-
-    #[tokio::test]
     async fn non_tty_commands_match_codex_closed_stdin_behavior() {
         let cwd = std::env::current_dir().unwrap();
         let manager = ProcessManager::new(cwd);
@@ -1398,21 +709,6 @@ mod tests {
             .unwrap();
         assert_eq!(output["exit_code"], 0);
         assert!(output["output"].as_str().unwrap().contains("tty"));
-    }
-
-    #[test]
-    fn default_and_explicit_output_budgets_use_stable_head_tail_truncation() {
-        let text = "x".repeat(50_000);
-        let default_truncated = truncate_output(&text, None, 12_500, 0);
-        assert!(default_truncated.starts_with("Warning: truncated output"));
-        assert!(default_truncated.len() < text.len());
-        assert_eq!(
-            truncate_output(&text, Some(50_000), 12_500, 0),
-            default_truncated,
-            "an explicit request cannot exceed the model-visible item ceiling"
-        );
-        let truncated = truncate_output(&text, Some(5), 20, 0);
-        assert!(truncated.starts_with("Warning: truncated output"));
     }
 
     #[test]

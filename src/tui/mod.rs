@@ -1,19 +1,37 @@
+mod bottom_pane;
 mod clipboard;
+mod clipboard_paste;
 mod context_window;
 mod editor;
 mod file_search;
 mod git_diff;
 mod markdown;
+mod markdown_cache;
+mod markdown_render;
+mod markdown_style;
+mod markdown_text_merge;
 mod notifications;
+mod palette;
 mod pending_input;
 mod reasoning_status;
+mod render;
 mod resume_picker;
+#[cfg(test)]
+#[path = "review_tests.rs"]
+mod review_tests;
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod runtime_tests;
 mod skill_popup;
 mod skills_view;
+mod table_detect;
 mod terminal;
+mod terminal_hyperlinks;
 mod terminal_title;
 mod tool_catalogue;
 mod view;
+mod width;
+mod wrapping;
 
 use crate::agent::Agent;
 use crate::agent::CompactionOutcome;
@@ -55,6 +73,7 @@ use tokio::time::Interval;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 use view::Action;
+use view::InterruptIntent;
 use view::View;
 
 type TurnResult = (Agent, TurnCompletion);
@@ -81,13 +100,17 @@ impl TurnCompletion {
     }
 }
 
-pub(crate) async fn run(agent: Agent, cwd: PathBuf) -> Result<()> {
-    let mut runtime = Runtime::new(agent, cwd)?;
+pub(crate) async fn run(
+    agent: Agent,
+    cwd: PathBuf,
+    worker_handoff: Option<crate::managed_session::WorkerHandoff>,
+) -> Result<()> {
+    let mut runtime = Runtime::new(agent, cwd, worker_handoff)?;
     let mut session = terminal::TerminalSession::enter()?;
     runtime
         .view
         .set_terminal_colors(session.default_foreground(), session.default_background());
-    let result = runtime.event_loop(session.terminal_mut()).await;
+    let result = runtime.event_loop(&mut session).await;
     drop(session);
     result
 }
@@ -99,7 +122,6 @@ struct Runtime {
     turn: Option<TurnTask>,
     turn_events: Option<UnboundedReceiver<AgentEvent>>,
     turn_handle: Option<TurnHandle>,
-    submit_steers_after_interrupt: bool,
     exit_after_turn: bool,
     context_snapshot: ContextSnapshot,
     diff_task: Option<JoinHandle<()>>,
@@ -118,6 +140,7 @@ struct Runtime {
     terminal_focused: bool,
     terminal_title: TerminalTitle,
     turn_started_at: Option<Instant>,
+    worker_handoff: Option<crate::managed_session::WorkerHandoff>,
     view: View,
 }
 
@@ -133,8 +156,34 @@ struct OperatorCommandCompletion {
     output: std::result::Result<Value, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveSubmissionRoute {
+    QueueNextTurn,
+    SteerOrdinary,
+}
+
+fn active_submission_route(prompt: &UserPrompt) -> Result<ActiveSubmissionRoute> {
+    let text = prompt.text_without_image_placeholders();
+    let invocation =
+        crate::quality_loop::parse_invocation_with_mode(&text, prompt.image_count() > 0, true)?;
+    let invokes_review = prompt
+        .skill_mentions()
+        .iter()
+        .any(|mention| mention.selection().name() == "review")
+        || crate::skills::explicitly_invokes_review(&text);
+    Ok(if invocation.is_some() || invokes_review {
+        ActiveSubmissionRoute::QueueNextTurn
+    } else {
+        ActiveSubmissionRoute::SteerOrdinary
+    })
+}
+
 impl Runtime {
-    fn new(mut agent: Agent, cwd: PathBuf) -> Result<Self> {
+    fn new(
+        mut agent: Agent,
+        cwd: PathBuf,
+        worker_handoff: Option<crate::managed_session::WorkerHandoff>,
+    ) -> Result<Self> {
         let mut view = View::new(&cwd);
         view.replay_transcript(agent.take_resumed_transcript());
         view.set_skills(agent.skills().to_vec());
@@ -158,7 +207,6 @@ impl Runtime {
             turn: None,
             turn_events: None,
             turn_handle: None,
-            submit_steers_after_interrupt: false,
             exit_after_turn: false,
             context_snapshot,
             diff_task: None,
@@ -177,10 +225,11 @@ impl Runtime {
             terminal_focused: true,
             terminal_title: TerminalTitle::new(),
             turn_started_at: None,
+            worker_handoff,
         })
     }
 
-    async fn event_loop(&mut self, terminal: &mut terminal::AppTerminal) -> Result<()> {
+    async fn event_loop(&mut self, session: &mut terminal::TerminalSession) -> Result<()> {
         let mut input = EventStream::new();
         let mut ticks =
             tokio::time::interval_at(tokio::time::Instant::now() + FRAME_INTERVAL, FRAME_INTERVAL);
@@ -199,6 +248,7 @@ impl Runtime {
             };
             self.terminal_title.refresh(title_state)?;
             if redraw {
+                let terminal = session.terminal_mut();
                 let clear_requested = self.view.take_clear_request();
                 let mut resize_reflow_requested = self.view.take_resize_reflow_request();
                 let width = terminal.width()?;
@@ -224,7 +274,7 @@ impl Runtime {
             tokio::select! {
                 terminal_event = input.next() => {
                     let Some(terminal_event) = terminal_event else {
-                        self.cancel_turn();
+                        self.cancel_turn(InterruptIntent::StopTurn);
                         break;
                     };
                     let event = terminal_event.context("failed to read terminal input")?;
@@ -237,6 +287,17 @@ impl Runtime {
                     self.file_search
                         .on_query_changed(self.view.file_search_query());
                     redraw = true;
+                    if matches!(action, Action::EnterTmux) {
+                        self.enter_tmux(session).await;
+                        continue;
+                    }
+                    if matches!(action, Action::Logout) {
+                        match crate::login::logout().await {
+                            Ok(_) => break,
+                            Err(error) => self.view.add_notice(format!("Logout failed: {error:#}")),
+                        }
+                        continue;
+                    }
                     if self.handle_action(action)? {
                         break;
                     }
@@ -299,17 +360,19 @@ impl Runtime {
                         _ => None,
                     };
                     let completed = completion.completed();
-                    match completion {
+                    let steering_after_interrupt = match completion {
                         TurnCompletion::Submission(result) => self.view.finish_turn(result),
-                        TurnCompletion::Compaction(result) => self.view.finish_compaction(result),
-                    }
+                        TurnCompletion::Compaction(result) => {
+                            self.view.finish_compaction(result);
+                            None
+                        }
+                    };
                     redraw = true;
 
                     if self.exit_after_turn {
                         break;
                     }
                     if completed {
-                        self.submit_steers_after_interrupt = false;
                         if let Some(prompt) = self.view.pop_next_queued_follow_up() {
                             self.start_turn(prompt);
                         } else if let (Some(message), Some(elapsed)) = (notification, elapsed)
@@ -320,18 +383,8 @@ impl Runtime {
                         {
                             self.post_notification(&message);
                         }
-                    } else if self.submit_steers_after_interrupt {
-                        self.submit_steers_after_interrupt = false;
-                        let steers = self.view.take_pending_steers();
-                        if steers.is_empty() {
-                            self.view.restore_pending_input_to_composer();
-                        } else {
-                            self.view.add_notice(
-                                "Model interrupted to submit steering input".to_string(),
-                            );
-                            let prompt = UserPrompt::joined(steers);
-                            self.start_turn(prompt);
-                        }
+                    } else if let Some(prompt) = steering_after_interrupt {
+                        self.start_turn(prompt);
                     } else {
                         self.view.restore_pending_input_to_composer();
                     }
@@ -362,26 +415,102 @@ impl Runtime {
         Ok(())
     }
 
+    async fn enter_tmux(&mut self, session: &mut terminal::TerminalSession) {
+        if crate::managed_session::is_tmux_active() {
+            self.view
+                .add_notice("This session is already running in tmux".to_string());
+            return;
+        }
+        if self.worker_handoff.is_none() {
+            self.view.tmux_handoff_failed(
+                "Could not move this session into tmux: the interactive supervisor is unavailable",
+            );
+            return;
+        }
+        let size = {
+            let terminal = session.terminal_mut();
+            terminal.width().and_then(|width| {
+                terminal
+                    .height()
+                    .map(|height| (width.max(1), height.max(1)))
+            })
+        };
+        let size = match size {
+            Ok(size) => size,
+            Err(error) => {
+                self.view.tmux_handoff_failed(format!(
+                    "Could not move this session into tmux: failed to read terminal size: {error:#}"
+                ));
+                return;
+            }
+        };
+        let cwd = self.cwd.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::managed_session::prepare_tmux_session(&cwd, size)
+        })
+        .await;
+        let prepared = match prepared {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                self.view.tmux_handoff_failed(format!(
+                    "Could not move this session into tmux: {error:#}"
+                ));
+                return;
+            }
+            Err(error) => {
+                self.view.tmux_handoff_failed(format!(
+                    "Could not move this session into tmux: relay setup task failed: {error}"
+                ));
+                return;
+            }
+        };
+
+        let worker_handoff = self
+            .worker_handoff
+            .as_mut()
+            .expect("the interactive supervisor was checked before tmux setup");
+        match session.migrate_to_tmux(prepared, worker_handoff) {
+            Ok(session_name) => {
+                self.worker_handoff = None;
+                self.notifier = Some(Notifier::detect());
+                self.view.tmux_handoff_succeeded(&session_name);
+            }
+            Err(error) => self
+                .view
+                .tmux_handoff_failed(format!("Could not move this session into tmux: {error:#}")),
+        }
+        self.view.request_terminal_reflow();
+    }
+
     fn handle_action(&mut self, action: Action) -> Result<bool> {
         match action {
             Action::None => {}
             Action::Submit(prompt) => {
-                self.persist_prompt(prompt.as_str());
+                self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
-                    let steering = self
-                        .turn_handle
-                        .as_ref()
-                        .and_then(|turn| turn.steer(UserInput::prompt(prompt.clone())).ok());
-                    match steering {
-                        Some(id) => self.view.add_pending_steer(id, prompt),
-                        None => self.view.queue_follow_up(prompt),
+                    match active_submission_route(&prompt) {
+                        Ok(ActiveSubmissionRoute::QueueNextTurn) => {
+                            self.view.queue_follow_up(prompt)
+                        }
+                        Err(error) => self
+                            .view
+                            .add_notice(format!("Invalid quality loop request: {error:#}")),
+                        Ok(ActiveSubmissionRoute::SteerOrdinary) => {
+                            let steering = self.turn_handle.as_ref().and_then(|turn| {
+                                turn.steer(UserInput::prompt(prompt.clone())).ok()
+                            });
+                            match steering {
+                                Some(id) => self.view.add_pending_steer(id, prompt),
+                                None => self.view.queue_follow_up(prompt),
+                            }
+                        }
                     }
                 } else {
                     self.start_turn(prompt);
                 }
             }
             Action::Queue(prompt) => {
-                self.persist_prompt(prompt.as_str());
+                self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
                     self.view.queue_follow_up(prompt);
                 } else {
@@ -428,7 +557,6 @@ impl Runtime {
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.prompt_history = Some(prompt_history);
-                    self.submit_steers_after_interrupt = false;
                     self.view.clear();
                     let agent = self
                         .agent
@@ -479,6 +607,8 @@ impl Runtime {
                 self.view
                     .add_notice(format!("Stopped {count} background terminal{plural}"));
             }
+            Action::EnterTmux => unreachable!("tmux handoffs are handled by the event loop"),
+            Action::Logout => unreachable!("logout is handled by the event loop"),
             Action::UpdateSkill { path, update } => {
                 let result = self
                     .agent
@@ -503,7 +633,7 @@ impl Runtime {
             Action::Quit => {
                 if self.turn.is_some() {
                     self.exit_after_turn = true;
-                    self.cancel_turn();
+                    self.cancel_turn(InterruptIntent::StopTurn);
                 } else {
                     return Ok(true);
                 }
@@ -539,15 +669,13 @@ impl Runtime {
         self.view.set_background_processes(Vec::new());
         self.agent = Some(agent);
         self.prompt_history = Some(prompt_history);
-        self.submit_steers_after_interrupt = false;
         self.view
             .add_notice(format!("Forked conversation into session {session_id}"));
         Ok(())
     }
 
     fn open_resume_picker(&mut self) -> Result<()> {
-        let current_session = self.current_session_id()?;
-        self.view.show_resume_picker(current_session);
+        self.view.show_resume_picker();
         if self.session_scan.is_none() {
             self.session_scan = Some(tokio::task::spawn_blocking(Rollout::list_sessions));
         }
@@ -563,7 +691,7 @@ impl Runtime {
         if self.resume_task.is_some() {
             return Ok(());
         }
-        self.view.show_resume_progress(current_session, target);
+        self.view.show_resume_progress(target);
         let requested_cwd = self.cwd.clone();
         self.resume_task = Some(tokio::task::spawn_blocking(move || {
             let mut agent = Agent::resume(&requested_cwd, ResumeSelector::Id(target))?;
@@ -642,7 +770,6 @@ impl Runtime {
         self.processes = processes;
         self.context_snapshot = context_snapshot;
         self.agent = Some(agent);
-        self.submit_steers_after_interrupt = false;
         self.exit_after_turn = false;
         self.file_search = file_search;
         self.file_search_updates = file_search_updates;
@@ -655,20 +782,48 @@ impl Runtime {
     }
 
     fn start_turn(&mut self, prompt: UserPrompt) {
+        let invocation = match crate::quality_loop::parse_invocation_with_mode(
+            &prompt.text_without_image_placeholders(),
+            prompt.image_count() > 0,
+            true,
+        ) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.view
+                    .add_notice(format!("Invalid quality loop request: {error:#}"));
+                return;
+            }
+        };
         let mut agent = self
             .agent
             .take()
             .expect("an idle runtime always owns its agent");
         let (events_tx, events_rx) = unbounded_channel();
-        let (turn_handle, turn_control) = crate::agent::TurnControl::channel();
+        let (turn_handle, turn_control) = if invocation.is_some() {
+            crate::agent::TurnControl::non_steerable_channel()
+        } else {
+            crate::agent::TurnControl::channel()
+        };
         self.view.start_turn(prompt.clone());
         self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
         self.turn = Some(tokio::spawn(async move {
-            let result = agent
-                .submit_with_control(UserInput::prompt(prompt), events_tx, turn_control)
-                .await;
+            let input = UserInput::prompt(prompt);
+            let result = if let Some(invocation) = invocation {
+                crate::quality_loop::submit_with_control(
+                    &mut agent,
+                    input,
+                    invocation,
+                    events_tx,
+                    turn_control,
+                )
+                .await
+            } else {
+                agent
+                    .submit_with_control(input, events_tx, turn_control)
+                    .await
+            };
             (agent, TurnCompletion::Submission(result))
         }));
     }
@@ -690,16 +845,20 @@ impl Runtime {
         }));
     }
 
-    fn cancel_turn(&mut self) {
+    fn cancel_turn(&mut self, intent: InterruptIntent) {
         if let Some(turn) = &self.turn_handle {
             turn.cancel();
-            self.view.set_interrupting();
+            self.view.set_interrupting(intent);
         }
     }
 
     fn interrupt_turn(&mut self) {
-        self.submit_steers_after_interrupt = self.view.has_pending_steers();
-        self.cancel_turn();
+        let intent = if self.view.has_pending_steers() {
+            InterruptIntent::SubmitSteering
+        } else {
+            InterruptIntent::StopTurn
+        };
+        self.cancel_turn(intent);
     }
 
     fn drain_agent_events(&mut self) {
@@ -759,13 +918,23 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.processes.stop_all_background_processes();
+        if let Some(turn) = self.turn_handle.take() {
+            turn.cancel();
+        }
+        abort_join_task(&mut self.turn);
+        abort_join_task(&mut self.session_scan);
+        abort_join_task(&mut self.resume_task);
         for (_, task) in self.operator_command_tasks.drain() {
             task.abort();
         }
-        if let Some(task) = self.diff_task.take() {
-            task.abort();
-        }
+        abort_join_task(&mut self.diff_task);
+        self.processes.stop_all_background_processes();
+    }
+}
+
+fn abort_join_task<T>(task: &mut Option<JoinHandle<T>>) {
+    if let Some(task) = task.take() {
+        task.abort();
     }
 }
 
@@ -864,7 +1033,3 @@ async fn receive_resume_completion(
         None => pending().await,
     }
 }
-
-#[cfg(test)]
-#[path = "runtime_tests.rs"]
-mod tests;

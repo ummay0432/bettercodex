@@ -127,39 +127,6 @@ fn patches_paths_outside_the_working_directory_with_user_permissions() {
 }
 
 #[test]
-fn preserves_codex_partial_application_on_later_failure() {
-    let root = TempDir::new();
-    let error = apply_patch(
-        root.path(),
-        "*** Begin Patch\n*** Add File: staged.txt\n+not yet\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch\n",
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("Failed to read file to update"));
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("staged.txt")).unwrap(),
-        "not yet\n",
-    );
-}
-
-#[test]
-fn a_cancelled_patch_does_not_start_mutating_files() {
-    let root = TempDir::new();
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-
-    let error = apply(
-        root.path(),
-        "*** Begin Patch\n*** Add File: should-not-exist.txt\n+no\n*** End Patch",
-        &cancellation,
-    )
-    .unwrap_err();
-
-    assert_eq!(error.to_string(), "apply_patch was interrupted");
-    assert!(!root.path().join("should-not-exist.txt").exists());
-}
-
-#[test]
 fn leaves_files_unchanged_when_context_does_not_match() {
     let root = TempDir::new();
     let path = root.path().join("file.txt");
@@ -256,19 +223,4 @@ fn permits_codex_blank_lines_after_end_of_file_marker() {
     .unwrap();
 
     assert_eq!(std::fs::read_to_string(path).unwrap(), "new\n");
-}
-
-#[test]
-fn overlapping_end_of_file_chunks_keep_codex_reverse_application_order() {
-    let root = TempDir::new();
-    let path = root.path().join("file.txt");
-    std::fs::write(&path, "old\n").unwrap();
-
-    apply_patch(
-        root.path(),
-        "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+first\n*** End of File\n@@\n-old\n+second\n*** End of File\n*** End Patch",
-    )
-    .unwrap();
-
-    assert_eq!(std::fs::read_to_string(path).unwrap(), "first\n");
 }

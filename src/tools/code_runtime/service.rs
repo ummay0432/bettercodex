@@ -53,19 +53,6 @@ impl InProcessCodeModeSession {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn with_delegate_and_task_failure_handler(
-        delegate: Arc<dyn CodeModeSessionDelegate>,
-        task_failure_handler: Arc<dyn Fn(String) + Send + Sync>,
-    ) -> Self {
-        Self {
-            runtime: SessionRuntime::new_with_task_failure_handler(
-                Arc::new(ProtocolDelegate { delegate }),
-                Some(task_failure_handler),
-            ),
-        }
-    }
-
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
         let yield_time_ms = request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS);
         let started = self
@@ -90,7 +77,7 @@ impl InProcessCodeModeSession {
         Ok(StartedCell::from_result_receiver(cell_id, response_rx))
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn execute_to_pending(
         &self,
         request: ExecuteRequest,
@@ -158,7 +145,7 @@ impl InProcessCodeModeSession {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn wait_to_pending(
         &self,
         request: WaitToPendingRequest,
@@ -300,7 +287,7 @@ fn protocol_cell_id(cell_id: &runtime::CellId) -> CellId {
     CellId::new(cell_id.as_str().to_string())
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn pending_outcome(
     cell_id: &CellId,
     event: runtime::CellEvent,
@@ -378,3 +365,11 @@ fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
 fn missing_wait(cell_id: CellId) -> CodeModeSessionResultFuture<'static, WaitOutcome> {
     Box::pin(async move { Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id))) })
 }
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "service_contract_tests.rs"]
+mod contract_tests;

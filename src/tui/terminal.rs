@@ -1,3 +1,7 @@
+use super::terminal_hyperlinks;
+use super::terminal_hyperlinks::HyperlinkLine;
+use crate::managed_session::PreparedTmuxSession;
+use crate::managed_session::WorkerHandoff;
 use anyhow::Context;
 use anyhow::Result;
 use crossterm::cursor::MoveTo;
@@ -29,6 +33,7 @@ use ratatui::backend::IntoCrossterm;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::layout::Size;
+#[cfg(test)]
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
@@ -68,21 +73,9 @@ pub(super) struct TerminalSession {
 impl TerminalSession {
     pub(super) fn enter() -> Result<Self> {
         install_panic_hook();
-        enable_raw_mode().context("failed to enable terminal raw mode")?;
+        initialize_terminal_modes()?;
         let mut output = stdout();
         let result = (|| -> Result<Self> {
-            execute!(
-                output,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                ),
-                EnableBracketedPaste,
-                EnableFocusChange,
-                SetCursorStyle::SteadyBar,
-            )
-            .context("failed to initialize terminal input modes")?;
-
             let probe = startup_probe(STARTUP_PROBE_TIMEOUT).unwrap_or_default();
             let screen_size = crossterm::terminal::size()
                 .map(|(width, height)| Size::new(width, height))
@@ -131,6 +124,15 @@ impl TerminalSession {
     pub(super) fn default_foreground(&self) -> Option<(u8, u8, u8)> {
         self.default_foreground
     }
+
+    pub(super) fn migrate_to_tmux(
+        &mut self,
+        prepared: PreparedTmuxSession,
+        supervisor: &mut WorkerHandoff,
+    ) -> Result<String> {
+        supervisor.transfer(&prepared)?;
+        Ok(prepared.commit())
+    }
 }
 
 impl<B> AppTerminal<B>
@@ -167,7 +169,7 @@ where
 
     pub(super) fn insert_history_lines(
         &mut self,
-        lines: Vec<Line<'static>>,
+        lines: Vec<HyperlinkLine>,
         next_viewport_height: u16,
     ) -> Result<()> {
         if lines.is_empty() {
@@ -331,12 +333,12 @@ where
 /// paragraph collapses that background to the text itself. Codex's scrollback writer clears each
 /// row with the `Line` style before writing its spans; using that style as the per-line paragraph
 /// style preserves the same behavior while retaining Ratatui's wrapping here.
-pub(super) fn render_history_lines(lines: &[Line<'static>], width: u16) -> Buffer {
+pub(super) fn render_history_lines(lines: &[HyperlinkLine], width: u16) -> Buffer {
     let width = width.max(1);
     let rendered_height = lines
         .iter()
         .map(|line| {
-            Paragraph::new(line.clone())
+            Paragraph::new(line.line.clone())
                 .wrap(Wrap { trim: false })
                 .line_count(width)
                 .max(1)
@@ -352,7 +354,7 @@ pub(super) fn render_history_lines(lines: &[Line<'static>], width: u16) -> Buffe
         if y >= rendered_height {
             break;
         }
-        let paragraph = Paragraph::new(line.clone())
+        let paragraph = Paragraph::new(line.line.clone())
             .style(line.style)
             .wrap(Wrap { trim: false });
         let line_height = u16::try_from(paragraph.line_count(width).max(1)).unwrap_or(u16::MAX);
@@ -360,6 +362,8 @@ pub(super) fn render_history_lines(lines: &[Line<'static>], width: u16) -> Buffe
         paragraph.render(Rect::new(0, y, width, height), &mut buffer);
         y = y.saturating_add(height);
     }
+
+    terminal_hyperlinks::mark_buffer_hyperlinks(&mut buffer, area, lines, /*scroll_rows*/ 0);
 
     buffer
 }
@@ -375,6 +379,24 @@ impl Drop for TerminalSession {
         self.terminal.finish();
         let _ = restore();
     }
+}
+
+fn initialize_terminal_modes() -> Result<()> {
+    enable_raw_mode().context("failed to enable terminal raw mode")?;
+    if let Err(error) = execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        ),
+        EnableBracketedPaste,
+        EnableFocusChange,
+        SetCursorStyle::SteadyBar,
+    ) {
+        let _ = restore();
+        return Err(error).context("failed to initialize terminal input modes");
+    }
+    Ok(())
 }
 
 fn restore() -> io::Result<()> {
@@ -567,299 +589,6 @@ fn parse_osc_component(value: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MODEL;
-    use crate::events::AgentEvent;
-    use crate::tui::view::View;
-    use ratatui::backend::ClearType as BackendClearType;
-    use ratatui::backend::WindowSize;
-    use ratatui::buffer::Cell;
-    use ratatui::layout::Position;
-    use std::cell::RefCell;
-    use std::path::Path;
-    use std::rc::Rc;
-
-    const TEST_SCROLLBACK_ROWS: usize = 512;
-
-    #[derive(Clone)]
-    struct SharedParser {
-        parser: Rc<RefCell<vt100::Parser>>,
-    }
-
-    impl SharedParser {
-        fn new(width: u16, height: u16) -> Self {
-            Self {
-                parser: Rc::new(RefCell::new(vt100::Parser::new(
-                    height,
-                    width,
-                    TEST_SCROLLBACK_ROWS,
-                ))),
-            }
-        }
-
-        fn screen(&self) -> String {
-            self.parser.borrow().screen().contents()
-        }
-
-        fn history_contains(&self, needle: &str) -> bool {
-            let mut parser = self.parser.borrow_mut();
-            let mut found = false;
-            for offset in 1..=TEST_SCROLLBACK_ROWS {
-                parser.screen_mut().set_scrollback(offset);
-                found |= parser.screen().contents().contains(needle);
-                if found || parser.screen().scrollback() < offset {
-                    break;
-                }
-            }
-            parser.screen_mut().set_scrollback(0);
-            found
-        }
-    }
-
-    impl Write for SharedParser {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.parser.borrow_mut().write(buffer)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.parser.borrow_mut().flush()
-        }
-    }
-
-    struct VtBackend {
-        backend: CrosstermBackend<SharedParser>,
-        output: SharedParser,
-        size: Size,
-    }
-
-    impl VtBackend {
-        fn new(width: u16, height: u16) -> (Self, SharedParser) {
-            let output = SharedParser::new(width, height);
-            (
-                Self {
-                    backend: CrosstermBackend::new(output.clone()),
-                    output: output.clone(),
-                    size: Size::new(width, height),
-                },
-                output,
-            )
-        }
-    }
-
-    impl Write for VtBackend {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.backend.write(buffer)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Write::flush(&mut self.backend)
-        }
-    }
-
-    impl Backend for VtBackend {
-        type Error = io::Error;
-
-        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
-        where
-            I: Iterator<Item = (u16, u16, &'a Cell)>,
-        {
-            self.backend.draw(content)
-        }
-
-        fn hide_cursor(&mut self) -> io::Result<()> {
-            self.backend.hide_cursor()
-        }
-
-        fn show_cursor(&mut self) -> io::Result<()> {
-            self.backend.show_cursor()
-        }
-
-        fn get_cursor_position(&mut self) -> io::Result<Position> {
-            Ok(self
-                .output
-                .parser
-                .borrow()
-                .screen()
-                .cursor_position()
-                .into())
-        }
-
-        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
-            self.backend.set_cursor_position(position)
-        }
-
-        fn clear(&mut self) -> io::Result<()> {
-            self.backend.clear()
-        }
-
-        fn clear_region(&mut self, clear_type: BackendClearType) -> io::Result<()> {
-            self.backend.clear_region(clear_type)
-        }
-
-        fn append_lines(&mut self, line_count: u16) -> io::Result<()> {
-            self.backend.append_lines(line_count)
-        }
-
-        fn size(&self) -> io::Result<Size> {
-            Ok(self.size)
-        }
-
-        fn window_size(&mut self) -> io::Result<WindowSize> {
-            Ok(WindowSize {
-                columns_rows: self.size,
-                pixels: Size::new(640, 480),
-            })
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Write::flush(self)
-        }
-    }
-
-    fn test_terminal(
-        width: u16,
-        screen_height: u16,
-        viewport_height: u16,
-    ) -> (AppTerminal<VtBackend>, SharedParser) {
-        let viewport_top = screen_height - viewport_height;
-        let viewport_area = Rect::new(0, viewport_top, width, viewport_height);
-        let (backend, output) = VtBackend::new(width, screen_height);
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(viewport_area),
-            },
-        )
-        .unwrap();
-        (
-            AppTerminal {
-                terminal,
-                viewport_area,
-                screen_size: Size::new(width, screen_height),
-                viewport_top,
-            },
-            output,
-        )
-    }
-
-    #[test]
-    fn history_scroll_repaints_unchanged_composer_and_footer() {
-        const WIDTH: u16 = 60;
-        const SCREEN_HEIGHT: u16 = 12;
-
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        let _ = view.take_pending_history_lines(WIDTH);
-        view.start_turn("test the viewport");
-        let _ = view.take_pending_history_lines(WIDTH);
-
-        let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
-        let viewport_height = prepared.height();
-        let (mut terminal, output) = test_terminal(WIDTH, SCREEN_HEIGHT, viewport_height);
-        terminal
-            .draw(viewport_height, |frame| {
-                view.render_prepared(frame, prepared);
-            })
-            .unwrap();
-        let initial = output.screen();
-        assert!(initial.contains('›'), "{initial}");
-        assert!(initial.contains(MODEL), "{initial}");
-
-        let history = (0..viewport_height)
-            .map(|row| Line::from(format!("history row {row}")))
-            .collect();
-        terminal
-            .insert_history_lines(history, viewport_height)
-            .unwrap();
-        view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
-        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
-            "**Inspecting viewport state**".to_string(),
-        ));
-        let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
-        terminal
-            .draw(prepared.height(), |frame| {
-                view.render_prepared(frame, prepared);
-            })
-            .unwrap();
-
-        let repainted = output.screen();
-        assert!(repainted.contains("history row"), "{repainted}");
-        assert!(
-            repainted.contains("Inspecting viewport state ("),
-            "{repainted}"
-        );
-        assert!(repainted.contains(" • esc to interrupt)"), "{repainted}");
-        assert!(repainted.contains('›'), "{repainted}");
-        assert!(repainted.contains(MODEL), "{repainted}");
-        let parser = output.parser.borrow();
-        let screen = parser.screen();
-        let activity_row = (0..SCREEN_HEIGHT)
-            .find(|&row| {
-                (0..WIDTH)
-                    .filter_map(|column| screen.cell(row, column))
-                    .map(vt100::Cell::contents)
-                    .collect::<String>()
-                    .contains("Inspecting viewport state")
-            })
-            .expect("rendered activity row");
-        assert!(
-            (0..WIDTH).all(|column| screen
-                .cell(activity_row, column)
-                .is_some_and(|cell| cell.bgcolor() == vt100::Color::Default)),
-            "activity row retained a stale background"
-        );
-    }
-
-    #[test]
-    fn oversized_live_response_enters_terminal_scrollback_while_streaming() {
-        const WIDTH: u16 = 48;
-        const SCREEN_HEIGHT: u16 = 12;
-
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        let mut history = view.take_pending_history_lines(WIDTH);
-        view.start_turn("stream beyond the viewport");
-        history.extend(view.take_pending_history_lines(WIDTH));
-        let prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
-        let viewport_height = prepared.height();
-        let (mut terminal, output) = test_terminal(WIDTH, SCREEN_HEIGHT, viewport_height);
-        terminal
-            .insert_history_lines(history, viewport_height)
-            .unwrap();
-        terminal
-            .draw(viewport_height, |frame| {
-                view.render_prepared(frame, prepared);
-            })
-            .unwrap();
-
-        view.handle_agent_event(AgentEvent::ModelMessageDelta(
-            (0..40)
-                .map(|index| format!("- stream row {index}\n"))
-                .collect(),
-        ));
-        let mut prepared = view.prepare(WIDTH, SCREEN_HEIGHT);
-        let streamed_history = prepared.take_history_lines();
-        assert!(
-            streamed_history.iter().any(|line| line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-                .ends_with("stream row 0")),
-            "{streamed_history:?}"
-        );
-        let viewport_height = prepared.height();
-        terminal
-            .insert_history_lines(streamed_history, viewport_height)
-            .unwrap();
-        terminal
-            .draw(viewport_height, |frame| {
-                view.render_prepared(frame, prepared);
-            })
-            .unwrap();
-
-        let current = output.screen();
-        assert!(current.contains("stream row 39"), "{current}");
-        assert!(current.contains(MODEL), "{current}");
-        assert!(output.history_contains("stream row 0"));
-    }
 
     #[test]
     fn startup_probe_parses_terminal_colors() {
@@ -892,6 +621,7 @@ mod tests {
             Line::from("plain"),
         ];
 
+        let lines = terminal_hyperlinks::plain_hyperlink_lines(lines);
         let buffer = render_history_lines(&lines, 12);
 
         for y in 0..3 {

@@ -12,6 +12,12 @@ compaction, caching, streaming, recovery, tools, or saved sessions.
   tokens.
 - Search for breakage in CLI arguments, saved JSONL sessions and resume,
   Responses request and output items, and model-visible tool names and schemas.
+- Install compaction transactionally: validate the opaque output, restore exact
+  turn-scoped context, prove the replacement restores automatic-compaction
+  headroom, and persist it before advancing cache/window lineage.
+- Exercise repeated compaction cadences and cold resume. A one-compaction test
+  cannot prove that older summaries, tool artifacts, or selected skill bodies
+  are replaced correctly over a long task.
 
 ## Evidence and validation
 
@@ -22,9 +28,9 @@ public OpenAI documentation for wire contracts, the Codex source linked from
 what bettercodex actually does. Recheck live sources before porting behavior
 that may have changed.
 
-`docs/5-5-prompt-guidance.md` is a local copy of public GPT-5.6 guidance. Read
-it only when model capabilities or prompt design are part of the task; verify
-time-sensitive claims against the live OpenAI documentation.
+`docs/5.6-prompting.md` links to the public GPT-5.6 guidance. Read it only when
+model capabilities or prompt design are part of the task, and use the linked
+live OpenAI documentation as the authoritative source.
 
 Changes to turns, Responses transport, history, compaction, saved sessions, or
 tools need a test that drives the changed behavior and inspects the resulting

@@ -6,11 +6,17 @@ mod compaction;
 mod context;
 mod events;
 mod input;
+mod login;
+mod managed_session;
+mod openai_docs;
+mod paths;
 mod prompt_history;
+mod quality_loop;
 mod repository;
 mod rollout;
 mod skill_settings;
 mod skills;
+mod state_file;
 mod system_skills;
 mod tools;
 mod tui;
@@ -23,105 +29,248 @@ use anyhow::anyhow;
 use input::ImageDetail;
 use input::UserInput;
 use rollout::ResumeSelector;
+use std::fmt;
+use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
+use tokio::sync::mpsc::unbounded_channel;
 use uuid::Uuid;
 
 const MODEL: &str = "gpt-5.6-sol";
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("error: {error:#}");
+fn main() {
+    if let Err(error) = run() {
+        if is_broken_pipe(&error) {
+            return;
+        }
+        let _ = write_stderr_line(format_args!("error: {error:#}"));
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let command = Command::parse(std::env::args().skip(1))?;
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn write_stdout(arguments: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    output.write_fmt(arguments)?;
+    output.flush()
+}
+
+fn write_stdout_line(arguments: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    writeln!(output, "{arguments}")
+}
+
+fn write_stderr_line(arguments: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut output = io::stderr().lock();
+    writeln!(output, "{arguments}")
+}
+
+fn run() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(result) = managed_session::run_relay_command(&arguments) {
+        return result;
+    }
+    let command = Command::parse(arguments.iter().cloned())?;
     match command {
         Command::Help => {
-            print_help();
+            write_help()?;
             Ok(())
         }
         Command::Version => {
-            println!("bcodex {}", env!("CARGO_PKG_VERSION"));
+            write_stdout_line(format_args!("bcodex {}", env!("CARGO_PKG_VERSION")))?;
             Ok(())
         }
         Command::ToolCatalogue => {
-            println!("{}", tools::catalogue_text());
+            write_stdout_line(format_args!("{}", tools::catalogue_text()))?;
             Ok(())
         }
         Command::ToolCatalogueStats => {
-            println!("{}", tool_catalogue_stats());
+            write_stdout_line(format_args!("{}", tool_catalogue_stats()))?;
             Ok(())
         }
-        Command::ToolContextJson => {
-            let cwd = std::env::current_dir()?.canonicalize()?;
-            println!(
+        Command::Login(command) => run_login_command(command),
+        Command::Logout => run_logout_command(),
+        Command::LogoutHelp => {
+            write_logout_help()?;
+            Ok(())
+        }
+        Command::InternalLoopState { run_root, contract } => {
+            let cwd = std::env::current_dir()?;
+            write_stdout_line(format_args!(
                 "{}",
-                serde_json::json!({
-                    "instructions": api::harness_instructions(),
-                    "stable_prefix": api::stable_request_prefix(),
-                    "world_state": context::initial_context_items(&cwd)?,
-                })
-            );
+                quality_loop::capture_state_identity(&cwd, &run_root, &contract)?
+            ))?;
             Ok(())
         }
-        Command::Run(options) => run_agent(options, None).await,
-        Command::Resume { selector, options } => run_agent(options, Some(selector)).await,
+        Command::Run(options) => run_agent_command(&arguments, options, None),
+        Command::Resume { selector, options } => {
+            run_agent_command(&arguments, options, Some(selector))
+        }
     }
 }
 
-async fn run_agent(options: RunOptions, resume: Option<ResumeSelector>) -> Result<()> {
+fn run_login_command(command: LoginCommand) -> Result<()> {
+    let mode = match command {
+        LoginCommand::Browser => login::LoginMode::Browser,
+        LoginCommand::DeviceCode => login::LoginMode::DeviceCode,
+        LoginCommand::Status => {
+            return match login::status()? {
+                login::LoginStatus::ChatGpt => {
+                    write_stderr_line(format_args!("Logged in using ChatGPT"))?;
+                    Ok(())
+                }
+                login::LoginStatus::AccessToken => {
+                    write_stderr_line(format_args!("Logged in using access token"))?;
+                    Ok(())
+                }
+                login::LoginStatus::NotLoggedIn => Err(anyhow!("Not logged in")),
+            };
+        }
+        LoginCommand::Help => {
+            write_login_help()?;
+            return Ok(());
+        }
+    };
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(login::login(mode))?;
+    write_stderr_line(format_args!("Successfully logged in"))?;
+    Ok(())
+}
+
+fn run_logout_command() -> Result<()> {
+    let removed = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(login::logout())?;
+    let message = if removed {
+        "Successfully logged out"
+    } else {
+        "Not logged in"
+    };
+    write_stderr_line(format_args!("{message}"))?;
+    Ok(())
+}
+
+fn run_agent_command(
+    arguments: &[String],
+    options: RunOptions,
+    resume: Option<ResumeSelector>,
+) -> Result<()> {
+    let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let interactive_tui =
+        interactive_terminal && options.prompt.is_empty() && options.images.is_empty();
+    let worker_handoff = managed_session::enter_agent_process(arguments, interactive_tui)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_agent(options, resume, worker_handoff))
+}
+
+async fn run_agent(
+    options: RunOptions,
+    resume: Option<ResumeSelector>,
+    worker_handoff: Option<managed_session::WorkerHandoff>,
+) -> Result<()> {
+    let input = if !options.prompt.is_empty() || !options.images.is_empty() {
+        Some(UserInput::from_paths(
+            options.prompt,
+            &options.images,
+            options.image_detail,
+        )?)
+    } else {
+        None
+    };
     let requested_cwd = std::env::current_dir()?;
     let mut agent = match resume {
         Some(selector) => Agent::resume(&requested_cwd, selector)?,
         None => Agent::new(&requested_cwd)?,
     };
     let cwd = agent.cwd().to_path_buf();
-    if !options.prompt.is_empty() || !options.images.is_empty() {
-        let input = UserInput::from_paths(options.prompt, &options.images, options.image_detail)?;
-        let answer = agent.submit_user_input(input).await?;
-        println!("{answer}");
+    if let Some(input) = input {
+        let answer = submit_cli_input(&mut agent, input).await?;
+        write_stdout_line(format_args!("{answer}"))?;
         return Ok(());
     }
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return tui::run(agent, cwd).await;
+        return tui::run(agent, cwd, worker_handoff).await;
     }
 
     run_line_mode(&mut agent).await
 }
 
 async fn run_line_mode(agent: &mut Agent) -> Result<()> {
-    eprintln!(
+    write_stderr_line(format_args!(
         "bettercodex · {MODEL} · max · session {}",
         agent.session_id()
-    );
-    eprintln!("Commands run with your user permissions. Ctrl-D exits.\n");
+    ))?;
+    write_stderr_line(format_args!(
+        "Commands run with your user permissions. Ctrl-D exits.\n"
+    ))?;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
-        print!("> ");
-        std::io::stdout().flush()?;
+        write_stdout(format_args!("> "))?;
         let Some(line) = lines.next_line().await? else {
-            println!();
+            write_stdout_line(format_args!(""))?;
             break;
         };
-        let prompt = line.trim();
-        if prompt.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
-        match agent.submit(prompt).await {
-            Ok(answer) => println!("{answer}\n"),
-            Err(error) => eprintln!("error: {error:#}\n"),
+        match submit_cli_input(agent, UserInput::text(line)).await {
+            Ok(answer) => write_stdout_line(format_args!("{answer}\n"))?,
+            Err(error) => write_stderr_line(format_args!("error: {error:#}\n"))?,
         }
     }
     Ok(())
+}
+
+async fn submit_cli_input(agent: &mut Agent, input: UserInput) -> Result<String> {
+    let invocation = quality_loop::parse_invocation_with_mode(
+        input.submitted_text(),
+        input.has_attachments(),
+        false,
+    )?;
+    let Some(invocation) = invocation else {
+        return agent.submit_user_input(input).await;
+    };
+    let (events_tx, mut events_rx) = unbounded_channel();
+    let progress = tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                events::AgentEvent::LoopProgress(progress) => {
+                    write_stderr_line(format_args!("{}", progress.stderr_line()))?;
+                }
+                events::AgentEvent::Warning(warning) => {
+                    write_stderr_line(format_args!("warning: {warning}"))?;
+                }
+                _ => {}
+            }
+        }
+        Ok::<(), io::Error>(())
+    });
+    let (_, control) = agent::TurnControl::non_steerable_channel();
+    let outcome =
+        quality_loop::submit_with_control(agent, input, invocation, events_tx, control).await?;
+    progress.await??;
+    match outcome {
+        agent::SubmitOutcome::Completed(answer) => Ok(answer),
+        agent::SubmitOutcome::Cancelled => Err(anyhow!("quality loop was cancelled")),
+    }
 }
 
 enum Command {
@@ -134,7 +283,21 @@ enum Command {
     Version,
     ToolCatalogue,
     ToolCatalogueStats,
-    ToolContextJson,
+    Login(LoginCommand),
+    Logout,
+    LogoutHelp,
+    InternalLoopState {
+        run_root: PathBuf,
+        contract: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginCommand {
+    Browser,
+    DeviceCode,
+    Status,
+    Help,
 }
 
 #[derive(Default)]
@@ -147,6 +310,27 @@ struct RunOptions {
 impl Command {
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut arguments = arguments.into_iter().peekable();
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--internal-loop-state")
+        {
+            arguments.next();
+            let run_root = arguments
+                .next()
+                .ok_or_else(|| anyhow!("internal loop state helper requires a run directory"))?;
+            let contract = arguments
+                .next()
+                .ok_or_else(|| anyhow!("internal loop state helper requires a contract"))?;
+            if arguments.next().is_some() {
+                return Err(anyhow!(
+                    "internal loop state helper received extra arguments"
+                ));
+            }
+            return Ok(Self::InternalLoopState {
+                run_root: PathBuf::from(run_root),
+                contract: PathBuf::from(contract),
+            });
+        }
         if arguments
             .peek()
             .is_some_and(|argument| argument == "--help" || argument == "-h")
@@ -170,11 +354,16 @@ impl Command {
         }) {
             return Ok(Self::ToolCatalogueStats);
         }
+        if arguments.peek().is_some_and(|argument| argument == "login") {
+            arguments.next();
+            return parse_login_command(arguments);
+        }
         if arguments
             .peek()
-            .is_some_and(|argument| argument == "--tool-context-json")
+            .is_some_and(|argument| argument == "logout")
         {
-            return Ok(Self::ToolContextJson);
+            arguments.next();
+            return parse_logout_command(arguments);
         }
 
         let resume = arguments
@@ -235,11 +424,45 @@ impl Command {
     }
 }
 
-fn print_help() {
-    println!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Sessions are saved automatically under the Codex home directory.",
+fn parse_login_command(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(Command::Login(LoginCommand::Browser)),
+        [argument] if argument == "--device-auth" => Ok(Command::Login(LoginCommand::DeviceCode)),
+        [argument] if argument == "status" => Ok(Command::Login(LoginCommand::Status)),
+        [argument] if argument == "--help" || argument == "-h" => {
+            Ok(Command::Login(LoginCommand::Help))
+        }
+        [argument, ..] => Err(anyhow!("unknown login argument `{argument}`")),
+    }
+}
+
+fn parse_logout_command(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(Command::Logout),
+        [argument] if argument == "--help" || argument == "-h" => Ok(Command::LogoutHelp),
+        [argument, ..] => Err(anyhow!("unknown logout argument `{argument}`")),
+    }
+}
+
+fn write_help() -> io::Result<()> {
+    write_stdout_line(format_args!(
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring. Use /loop <task> or $loop for the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
-    );
+    ))
+}
+
+fn write_login_help() -> io::Result<()> {
+    write_stdout_line(format_args!(
+        "Sign in with ChatGPT\n\nUsage:\n  bcodex login [OPTIONS]\n  bcodex login status\n\nOptions:\n      --device-auth  Use device code authentication for remote or headless machines\n  -h, --help         Show this help"
+    ))
+}
+
+fn write_logout_help() -> io::Result<()> {
+    write_stdout_line(format_args!(
+        "Remove stored ChatGPT credentials\n\nUsage:\n  bcodex logout\n\nOptions:\n  -h, --help  Show this help"
+    ))
 }
 
 fn tool_catalogue_stats() -> String {
@@ -305,26 +528,6 @@ mod tests {
             Command::parse(["--tool-catalogue".to_string()]).unwrap(),
             Command::ToolCatalogue
         ));
-    }
-
-    #[test]
-    fn parses_tool_context_json_flag() {
-        assert!(matches!(
-            Command::parse(["--tool-context-json".to_string()]).unwrap(),
-            Command::ToolContextJson
-        ));
-    }
-
-    #[test]
-    fn tool_catalogue_stats_are_derived_from_the_active_request() {
-        assert!(matches!(
-            Command::parse(["--tool-catalogue-stats".to_string()]).unwrap(),
-            Command::ToolCatalogueStats
-        ));
-        assert_eq!(
-            tool_catalogue_stats(),
-            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (7): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, web__run\n\nExec description: 9727 bytes\nComplete additional_tools item: 11238 bytes\nEstimated context cost: 2810 tokens (bytes/4)\nEffective-window share: 0.80%"
-        );
     }
 
     #[test]

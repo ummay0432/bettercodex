@@ -1,3 +1,4 @@
+use crate::paths;
 use crate::repository;
 use crate::skill_settings;
 use crate::system_skills;
@@ -5,6 +6,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -32,6 +34,10 @@ const MAX_WARNINGS: usize = 32;
 const APPROXIMATE_BYTES_PER_TOKEN: u64 = 4;
 const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
 const MAX_SKILLS_CONTEXT_BYTES: usize = 39_000;
+
+fn is_reserved_system_skill_name(name: &str) -> bool {
+    matches!(name, "loop" | "review")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SkillScope {
@@ -86,7 +92,7 @@ pub(crate) enum SkillUpdate {
     AllowImplicitInvocation(bool),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SkillSelection {
     name: String,
     path: PathBuf,
@@ -225,7 +231,7 @@ impl WarningCollector {
 
 impl SkillCatalog {
     pub(crate) fn load(cwd: &Path) -> Self {
-        let home = bettercodex_home();
+        let home = paths::bettercodex_home();
         Self::load_with_home(cwd, home.as_deref())
     }
 
@@ -267,7 +273,21 @@ impl SkillCatalog {
                     continue;
                 }
                 match load_skill(&canonical, root.scope) {
-                    Ok((skill, metadata_warning)) => {
+                    Ok((mut skill, metadata_warning)) => {
+                        if is_reserved_system_skill_name(&skill.name)
+                            && skill.scope != SkillScope::System
+                        {
+                            warnings.push(format!(
+                                "Skipped reserved skill name `{}` at {}",
+                                skill.name,
+                                canonical.display()
+                            ));
+                            continue;
+                        }
+                        if is_reserved_system_skill_name(&skill.name) {
+                            skill.enabled = true;
+                            skill.allow_implicit_invocation = false;
+                        }
                         skills.push(skill);
                         if let Some(warning) = metadata_warning {
                             warnings.push(warning);
@@ -358,6 +378,9 @@ impl SkillCatalog {
 
         for selection in structured {
             blocked_names.insert(selection.name.as_str());
+            if selection.name == "loop" {
+                continue;
+            }
             let Some(skill) = self
                 .skills
                 .iter()
@@ -398,10 +421,14 @@ impl SkillCatalog {
 
         let mut counts = HashMap::<&str, usize>::new();
         for skill in self.skills.iter().filter(|skill| skill.enabled) {
+            if skill.name == "loop" {
+                continue;
+            }
             *counts.entry(skill.name.as_str()).or_default() += 1;
         }
         for skill in self.skills.iter().filter(|skill| skill.enabled) {
-            if seen_paths.contains(&skill.path)
+            if skill.name == "loop"
+                || seen_paths.contains(&skill.path)
                 || blocked_names.contains(skill.name.as_str())
                 || !mentions.plain_names.contains(skill.name.as_str())
                 || counts.get(skill.name.as_str()) != Some(&1)
@@ -465,6 +492,11 @@ impl SkillCatalog {
             }
         };
         for skill in &mut self.skills {
+            if is_reserved_system_skill_name(&skill.name) {
+                skill.enabled = true;
+                skill.allow_implicit_invocation = false;
+                continue;
+            }
             let Some(settings) = settings.skills.get(&skill.path) else {
                 continue;
             };
@@ -479,14 +511,14 @@ impl SkillCatalog {
 }
 
 pub(crate) fn save_skill_update(path: &Path, update: SkillUpdate) -> Result<()> {
-    let home = bettercodex_home().ok_or_else(|| {
+    let home = paths::bettercodex_home().ok_or_else(|| {
         anyhow!("cannot save skill settings because neither BCODEX_HOME nor HOME is set")
     })?;
     skill_settings::save(&home.join(skill_settings::FILE_NAME), path, update)
 }
 
 fn settings_file_display() -> String {
-    bettercodex_home().map_or_else(
+    paths::bettercodex_home().map_or_else(
         || "${BCODEX_HOME:-$HOME/.bcodex}/skills.json".to_string(),
         |home| home.join(skill_settings::FILE_NAME).display().to_string(),
     )
@@ -494,6 +526,10 @@ fn settings_file_display() -> String {
 
 pub(crate) fn is_mention_name_byte(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':')
+}
+
+pub(crate) fn explicitly_invokes_review(text: &str) -> bool {
+    extract_mentions(text).plain_names.contains("review")
 }
 
 fn discovery_roots_with_home(
@@ -529,12 +565,6 @@ fn discovery_roots_with_home(
         roots.push((system_skills::root(home), SkillScope::System));
     }
     roots
-}
-
-fn bettercodex_home() -> Option<PathBuf> {
-    std::env::var_os("BCODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bcodex")))
 }
 
 fn discover_skill_files(root: &Path, warnings: &mut WarningCollector) -> Vec<PathBuf> {
@@ -1025,6 +1055,15 @@ fn extract_mentions(text: &str) -> Mentions<'_> {
     let bytes = text.as_bytes();
     let mut plain_names = HashSet::new();
     let mut paths = HashSet::new();
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("/review")
+        && rest
+            .as_bytes()
+            .first()
+            .is_none_or(|byte| !is_mention_name_byte(*byte))
+    {
+        plain_names.insert("review");
+    }
     let mut index = 0_usize;
     while index < bytes.len() {
         if bytes[index] == b'['
@@ -1109,5 +1148,5 @@ fn is_common_environment_variable(name: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "skills_tests.rs"]
-mod tests;
+#[path = "skills_review_tests.rs"]
+mod review_tests;

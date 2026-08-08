@@ -123,3 +123,7 @@ async fn drain_tasks(
         report_task_result(Some(result), description, task_failure_handler);
     }
 }
+
+#[cfg(test)]
+#[path = "callbacks_tests.rs"]
+mod tests;

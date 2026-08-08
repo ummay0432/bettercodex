@@ -6,14 +6,17 @@ use crate::auth::Auth;
 use crate::compaction::CompactionPhase;
 use crate::compaction::CompactionRequest;
 use crate::compaction::InitialContextInjection;
+use crate::context::ActiveTurnContext;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
+use crate::context::FrozenLoopContext;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserInput;
 use crate::rollout::LoadedRollout;
+use crate::rollout::OperatorInputRecord;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionTranscriptItem;
@@ -130,6 +133,18 @@ impl TurnControl {
         }
     }
 
+    pub(crate) fn child_non_steerable(&self) -> Self {
+        Self::cancellation_only(self.cancellation.clone())
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     fn drain_steering(&self, pending: &mut VecDeque<SteeringInput>) {
         let Some(steering) = &self.steering else {
             return;
@@ -173,12 +188,15 @@ pub(crate) struct Agent {
 impl Agent {
     pub(crate) fn new(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = canonical_directory(cwd.as_ref())?;
-        let rollout = Rollout::create(&cwd)?;
-        let identity = rollout.identity().clone();
-        let conversation = Conversation::new(&cwd, rollout)?;
         let auth = Auth::load()?;
+        let conversation = Conversation::create(&cwd)?;
+        let identity = conversation.identity().clone();
         let api = ApiClient::new(auth, &identity, 0)?;
-        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+        let tools = ToolRuntime::new(
+            cwd.clone(),
+            api.web_search_client(),
+            api.openai_docs_client(),
+        );
         Ok(Self {
             cwd,
             api,
@@ -195,15 +213,19 @@ impl Agent {
     }
 
     pub(crate) fn fork(&self, transcript: Vec<SessionTranscriptItem>) -> Result<Self> {
+        let auth = Auth::load()?;
         let mut rollout = Rollout::create(&self.cwd)?;
         let identity = rollout.identity().clone();
         let compaction_count = self.api.compaction_count();
         rollout.record_fork(self.session_id(), compaction_count)?;
         rollout.snapshot_transcript(transcript)?;
         let conversation = self.conversation.fork(rollout)?;
-        let auth = Auth::load()?;
         let api = ApiClient::new(auth, &identity, compaction_count)?;
-        let tools = ToolRuntime::new(self.cwd.clone(), api.web_search_client());
+        let tools = ToolRuntime::new(
+            self.cwd.clone(),
+            api.web_search_client(),
+            api.openai_docs_client(),
+        );
         Ok(Self {
             cwd: self.cwd.clone(),
             api,
@@ -221,7 +243,11 @@ impl Agent {
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
         let api = ApiClient::new(auth, &identity, compaction_count)?;
-        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client());
+        let tools = ToolRuntime::new(
+            cwd.clone(),
+            api.web_search_client(),
+            api.openai_docs_client(),
+        );
         Ok(Self {
             cwd,
             api,
@@ -237,6 +263,10 @@ impl Agent {
 
     pub(crate) fn session_id(&self) -> &str {
         self.conversation.session_id()
+    }
+
+    pub(crate) fn latest_usage(&self) -> Option<crate::usage::TokenUsage> {
+        self.conversation.latest_usage().cloned()
     }
 
     pub(crate) fn context_tokens(&self) -> Option<u64> {
@@ -267,6 +297,124 @@ impl Agent {
         self.conversation.skill_catalog().warnings()
     }
 
+    pub(crate) fn record_loop_invocation(
+        &mut self,
+        input: UserInput,
+        events: &Option<UnboundedSender<AgentEvent>>,
+    ) -> Result<FrozenLoopContext> {
+        if input.is_empty() {
+            return Err(anyhow!("prompt and image list are both empty"));
+        }
+        let existing = self.conversation.operator_inputs().ok_or_else(|| {
+            anyhow!(
+                "this resumed session predates exact operator-input capture; start a fresh session before invoking the quality loop"
+            )
+        })?;
+        let (message, prompt_text, selected_skills) = input.into_message_and_skills();
+        let injections = self
+            .conversation
+            .skill_catalog()
+            .explicit_injections(&prompt_text, &selected_skills);
+        for warning in &injections.warnings {
+            emit(events, AgentEvent::Warning(warning.clone()));
+        }
+        let record = OperatorInputRecord {
+            message: message.clone(),
+            prompt_text,
+            selected_skills,
+            skill_context: injections.items.clone(),
+        };
+        let mut records = existing.to_vec();
+        records.push(record.clone());
+        let (frozen, warnings) = FrozenLoopContext::capture(&self.cwd, &records)?;
+        for warning in warnings {
+            emit(events, AgentEvent::Warning(warning));
+        }
+        self.conversation.record_operator_input(record)?;
+        self.conversation
+            .extend(injections.items.into_iter().chain([message]))?;
+        self.emit_context(events);
+        Ok(frozen)
+    }
+
+    pub(crate) fn start_loop_turn(&mut self) -> Result<String> {
+        let turn_id = self.api.begin_turn().to_string();
+        self.conversation.start_turn(&turn_id)?;
+        Ok(turn_id)
+    }
+
+    pub(crate) fn finish_loop_turn(
+        &mut self,
+        turn_id: &str,
+        answer: Option<&str>,
+        outcome: TurnOutcome,
+    ) -> Result<()> {
+        if let Some(answer) = answer {
+            self.conversation.extend([serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": answer}],
+            })])?;
+        }
+        if outcome == TurnOutcome::Interrupted {
+            self.conversation.mark_interrupted()?;
+        }
+        self.conversation.finish_turn(turn_id, outcome)
+    }
+
+    pub(crate) fn new_frozen_loop_session(
+        cwd: &Path,
+        local_state_root: &Path,
+        frozen: &FrozenLoopContext,
+        phase_prompt: &str,
+    ) -> Result<Self> {
+        let auth = Auth::load()?;
+        let rollout = Rollout::create_in(local_state_root, cwd)?;
+        let identity = rollout.identity().clone();
+        let conversation = Conversation::from_frozen_loop(frozen, rollout)?;
+        let instructions = format!(
+            "{}\n\n{}",
+            crate::api::harness_instructions(),
+            phase_prompt.trim()
+        );
+        let api = ApiClient::new_with_instructions(auth, &identity, 0, instructions)?;
+        let tools = ToolRuntime::new(
+            cwd.to_path_buf(),
+            api.web_search_client(),
+            api.openai_docs_client(),
+        );
+        Ok(Self {
+            cwd: cwd.to_path_buf(),
+            api,
+            conversation,
+            tools,
+            resumed_transcript: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn submit_preloaded_with_control(
+        &mut self,
+        events: Option<UnboundedSender<AgentEvent>>,
+        control: TurnControl,
+    ) -> Result<SubmitOutcome> {
+        let turn_id = self.api.begin_turn().to_string();
+        self.conversation.start_turn(&turn_id)?;
+        let result = self
+            .run_active_turn(ActiveTurnContext::default(), &events, &control)
+            .await;
+        control.close();
+        let outcome = match &result {
+            Ok(SubmitOutcome::Completed(_)) => TurnOutcome::Completed,
+            Ok(SubmitOutcome::Cancelled) => {
+                self.conversation.mark_interrupted()?;
+                TurnOutcome::Interrupted
+            }
+            Err(_) => TurnOutcome::Failed,
+        };
+        self.conversation.finish_turn(&turn_id, outcome)?;
+        result
+    }
+
     pub(crate) fn update_skill(
         &mut self,
         path: &Path,
@@ -279,10 +427,6 @@ impl Agent {
         self.conversation
             .reload_skills(&self.cwd)
             .context("skill setting was saved, but the active session could not reload skills")
-    }
-
-    pub(crate) async fn submit(&mut self, prompt: &str) -> Result<String> {
-        self.submit_user_input(UserInput::text(prompt)).await
     }
 
     pub(crate) async fn submit_user_input(&mut self, input: UserInput) -> Result<String> {
@@ -315,12 +459,14 @@ impl Agent {
     ) -> Result<CompactionOutcome> {
         let turn_id = self.api.begin_turn().to_string();
         self.conversation.start_turn(&turn_id)?;
+        let active_turn_context = ActiveTurnContext::default();
         let result = self
             .run_compaction(
                 &Some(events),
                 &control.cancellation,
                 CompactionRequest::Manual,
                 InitialContextInjection::AfterCompaction,
+                &active_turn_context,
             )
             .await;
         control.close();
@@ -370,18 +516,30 @@ impl Agent {
         events: &Option<UnboundedSender<AgentEvent>>,
         control: &TurnControl,
     ) -> Result<SubmitOutcome> {
+        let mut active_turn_context = ActiveTurnContext::default();
         if !self
             .record_incoming_user(
                 IncomingUserInput::Initial(input),
                 events,
                 &control.cancellation,
                 CompactionPhase::PreTurn,
+                &mut active_turn_context,
             )
             .await?
         {
             return Ok(SubmitOutcome::Cancelled);
         }
 
+        self.run_active_turn(active_turn_context, events, control)
+            .await
+    }
+
+    async fn run_active_turn(
+        &mut self,
+        mut active_turn_context: ActiveTurnContext,
+        events: &Option<UnboundedSender<AgentEvent>>,
+        control: &TurnControl,
+    ) -> Result<SubmitOutcome> {
         let mut pending_steering = VecDeque::new();
         // Sample the fresh turn input first. After a mid-turn compact, sample the
         // compacted tool continuation once before inserting queued steering.
@@ -396,6 +554,7 @@ impl Agent {
                             events,
                             &control.cancellation,
                             CompactionPhase::MidTurn,
+                            &mut active_turn_context,
                         )
                         .await?
                     {
@@ -468,6 +627,7 @@ impl Agent {
                         &control.cancellation,
                         CompactionRequest::Automatic(CompactionPhase::MidTurn),
                         InitialContextInjection::BeforeLastUserMessage,
+                        &active_turn_context,
                     )
                     .await?
                 {
@@ -598,6 +758,7 @@ impl Agent {
         cancellation: &CancellationToken,
         compaction: CompactionRequest,
         initial_context_injection: InitialContextInjection,
+        active_turn_context: &ActiveTurnContext,
     ) -> Result<bool> {
         if cancellation.is_cancelled() {
             return Ok(false);
@@ -624,11 +785,19 @@ impl Agent {
             return Ok(false);
         };
         let compacted = compacted?;
-        self.conversation.replace_compacted(
+        let replacement = self.conversation.replace_compacted(
             compacted.items,
             initial_context_injection,
+            active_turn_context,
             compacted.usage,
-        )?;
+        );
+        if let Err(error) = replacement {
+            // The server has completed a response that was not installed. Drop
+            // its connection-local baseline before any unchanged history is sent.
+            self.api.abandon_response();
+            return Err(error);
+        }
+        self.api.commit_compaction();
         self.emit_context(events);
         emit(events, AgentEvent::CompactionCompleted);
         Ok(true)
@@ -640,6 +809,7 @@ impl Agent {
         events: &Option<UnboundedSender<AgentEvent>>,
         cancellation: &CancellationToken,
         phase: CompactionPhase,
+        active_turn_context: &mut ActiveTurnContext,
     ) -> Result<bool> {
         let (input, steering_id) = match input {
             IncomingUserInput::Initial(input) => (input, None),
@@ -656,9 +826,10 @@ impl Agent {
         for warning in injections.warnings {
             emit(events, AgentEvent::Warning(warning));
         }
-        let mut projected = Vec::with_capacity(injections.items.len().saturating_add(1));
-        projected.extend(injections.items);
-        projected.push(user_message);
+        let skill_context = injections.items;
+        let mut projected = Vec::with_capacity(skill_context.len().saturating_add(1));
+        projected.extend(skill_context.iter().cloned());
+        projected.push(user_message.clone());
         let incoming_tokens = estimated_tokens(&projected);
         if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
             return Err(anyhow!(
@@ -672,6 +843,7 @@ impl Agent {
                     cancellation,
                     CompactionRequest::Automatic(phase),
                     InitialContextInjection::AfterCompaction,
+                    active_turn_context,
                 )
                 .await?
         {
@@ -683,7 +855,15 @@ impl Agent {
                 "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
+        self.conversation
+            .record_operator_input(OperatorInputRecord {
+                message: user_message,
+                prompt_text,
+                selected_skills,
+                skill_context: skill_context.clone(),
+            })?;
         self.conversation.extend(projected)?;
+        active_turn_context.record_input(skill_context);
         if let Some(id) = steering_id {
             emit(events, AgentEvent::SteeringCommitted(id));
         }
@@ -735,7 +915,3 @@ fn emit(events: &Option<UnboundedSender<AgentEvent>>, event: AgentEvent) {
         let _ = events.send(event);
     }
 }
-
-#[cfg(test)]
-#[path = "agent_tests.rs"]
-mod tests;

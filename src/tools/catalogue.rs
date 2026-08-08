@@ -1,84 +1,86 @@
 //! Fixed JavaScript tool catalogue ported from Codex's `code_mode_only` plan at
-//! `1669c2403f793d0230065397dfc25f52b844244e`. bettercodex exposes this one
+//! `1669c2403f793d0230065397dfc25f52b844244e` and rechecked against upstream at
+//! `3b366654f1de1b77587ffb026c8f35507f3fe4ef`. bettercodex exposes this one
 //! execution path unconditionally; it has no tool-mode selector.
 //!
 //! The schemas mirror `core/src/tools/handlers/{apply_patch_spec,plan_spec,
 //! shell_spec,view_image_spec}.rs`; the `exec` and `wait` wrappers mirror
-//! `core/src/tools/code_mode/{execute_spec,wait_spec}.rs`. bettercodex retains
-//! Codex's schema-to-TypeScript renderer but uses a concise fixed-catalogue
-//! preamble instead of documenting integrations this binary does not expose.
+//! `core/src/tools/code_mode/{execute_spec,wait_spec}.rs`. Upstream renders a
+//! prose section and complete declaration wrapper per tool because its surface
+//! is dynamic. bettercodex's fixed surface instead renders one concise guide
+//! and one schema-derived declaration block, retaining the callable contract
+//! without repeating renderer scaffolding or JSON Schema descriptions.
 
 use super::code_runtime;
 use super::code_runtime::CodeModeToolKind as ToolKind;
 use super::code_runtime::ToolDefinition;
-use super::code_runtime::ToolNamespaceDescription;
 use codex_protocol::ToolName;
 use serde_json::Value;
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-const EXEC_SOURCE_GRAMMAR: &str = r#"
-start: pragma_source | plain_source
-pragma_source: PRAGMA_LINE NEWLINE SOURCE
-plain_source: SOURCE
-
-PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
-NEWLINE: /\r?\n/
-SOURCE: /[\s\S]+/
-"#;
-const EXEC_RUNTIME_GUIDANCE: &str = r#"Execute raw JavaScript to orchestrate tool calls.
-- Input JavaScript directly, without JSON wrapping, quotes, or Markdown fences. A fresh V8 isolate supports top-level `await` but has no Node.js, filesystem, direct network access, console, or persistent global state.
-- Call the typed methods below as `await tools.name(args)`. Use `Promise.all` for independent calls. Tool results are strings or the documented objects; await all work before the script ends.
-- Emit output with `text(value)` or `image(dataUrlOrItem, detail?)`; `notify(value)` emits an interim tool output. `yield_control()` yields accumulated output while the script continues.
-- `store(key, value)` and `load(key)` persist serializable values across exec cells. `exit()` finishes successfully. `setTimeout` and `clearTimeout` are available.
-- An optional first line `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}` controls early yielding and the direct-output token budget; defaults are 10000 for both."#;
-const WAIT_DESCRIPTION: &str = "Resume a yielded `exec` cell. Use only the `cell_id` returned by `exec`; call `wait` again while the cell remains active. Each call returns only new output. `terminate: true` stops the cell. Waiting and output default to 10000 ms and 10000 tokens.";
+const EXEC_SOURCE_GRAMMAR: &str = r#"start: SOURCE
+SOURCE: /[\s\S]+/"#;
+const EXEC_RUNTIME_GUIDANCE: &str = r#"Input raw JavaScript directly (no JSON, string, or Markdown wrapper) into fresh V8: top-level `await`; no Node.js/filesystem/network/console. Call `await tools.name(args)`; errors reject. Use `Promise.all` for independent calls and await all work. Emit with `text(value)`/`image(item,detail?)`; `notify` is interim; `yield_control` yields while code continues; `store`/`load` persist serializable values across cells; `exit`, `setTimeout`, and `clearTimeout` exist. Optional first line `// @exec:{"yield_time_ms":10000,"max_output_tokens":1000}`; both default 10000."#;
+const TOOL_DEFAULTS: &str = "Defaults: command cwd=turn, shell=user, `login:true`, `tty:false`, yield=10s; stdin yield=.25s after writes/5s polling; output=10k tokens; image detail=`high`. Yields clamp to .25–30s (poll 5–300s). Process: `output`+`wall_time_seconds` always; `session_id`=running, `exit_code`=done, `original_token_count`=before truncation, `chunk_id`=output chunk.";
+const WAIT_DESCRIPTION: &str = "Continue yielded `exec` by `cell_id`; returns only new output. Repeat while active; `terminate:true` stops. `yield_time_ms`/`max_tokens` default 10000.";
 
 static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
-    vec![
+    let mut tools = vec![
         freeform_tool(
             "apply_patch",
-            "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "Validates the whole patch before editing. Pass the patch string directly; paths use turn cwd, not `exec_command.workdir`; absolute paths work.",
         ),
         function_tool(
             "exec_command",
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+            "Runs shell. Long commands return `session_id` for `write_stdin`; `tty:true` keeps stdin writable.",
             exec_command_input_schema(),
             Some(unified_exec_output_schema()),
         ),
         function_tool(
             "log_papercut",
-            "Appends one papercut note to `PAPERCUTS.md` at the Git repository root, creating the file on first use.",
+            "Appends one repository-root `PAPERCUTS.md` note: 1–2 sentences on friction and likely fix.",
             log_papercut_input_schema(),
             Some(log_papercut_output_schema()),
         ),
         function_tool(
             "update_plan",
-            "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.",
+            "Replaces plan; allows one `in_progress` step.",
             update_plan_input_schema(),
-            None,
+            Some(empty_object_output_schema()),
         ),
         function_tool(
             "view_image",
-            "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.",
+            "Loads a local image.",
             view_image_input_schema(),
             Some(view_image_output_schema()),
         ),
         function_tool(
             "write_stdin",
-            "Writes characters to an existing unified exec session and returns recent output.",
+            "Writes `chars` or, when omitted, polls an `exec_command` session; returns new output.",
             write_stdin_input_schema(),
             Some(unified_exec_output_schema()),
         ),
+    ];
+    tools.extend(crate::openai_docs::TOOLS.iter().copied().map(|tool| {
         namespaced_function_tool(
-            crate::web_search::JAVASCRIPT_NAME,
-            crate::web_search::NAMESPACE,
-            crate::web_search::TOOL_NAME,
-            crate::web_search::DESCRIPTION,
-            crate::web_search::input_schema().clone(),
-        ),
-    ]
+            tool.javascript_name(),
+            crate::openai_docs::NAMESPACE,
+            tool.name(),
+            tool.description(),
+            tool.input_schema(),
+            Some(json!({"type": "string"})),
+        )
+    }));
+    tools.push(namespaced_function_tool(
+        crate::web_search::JAVASCRIPT_NAME,
+        crate::web_search::NAMESPACE,
+        crate::web_search::TOOL_NAME,
+        crate::web_search::DESCRIPTION,
+        crate::web_search::input_schema().clone(),
+        Some(json!({"type": "string"})),
+    ));
+    tools
 });
 
 // The in-process V8 runtime needs names, descriptions, and calling kinds for
@@ -98,17 +100,6 @@ static RUNTIME_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
         })
         .collect()
 });
-
-static NAMESPACE_DESCRIPTIONS: LazyLock<BTreeMap<String, ToolNamespaceDescription>> =
-    LazyLock::new(|| {
-        BTreeMap::from([(
-            crate::web_search::NAMESPACE.to_string(),
-            ToolNamespaceDescription {
-                name: crate::web_search::NAMESPACE.to_string(),
-                description: format!("Tools in the {} namespace.", crate::web_search::NAMESPACE),
-            },
-        )])
-    });
 
 static EXEC_DESCRIPTION: LazyLock<String> = LazyLock::new(build_exec_description);
 
@@ -217,22 +208,10 @@ pub(crate) fn specifications() -> Vec<Value> {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cell_id": {
-                        "type": "string",
-                        "description": "Identifier of the running exec cell."
-                    },
-                    "yield_time_ms": {
-                        "type": "number",
-                        "description": "Wait before yielding more output. Defaults to 10000 ms."
-                    },
-                    "max_tokens": {
-                        "type": "number",
-                        "description": "Output token budget for this wait call. Defaults to 10000 tokens."
-                    },
-                    "terminate": {
-                        "type": "boolean",
-                        "description": "True stops the running exec cell; false or omitted waits for output."
-                    }
+                    "cell_id": {"type": "string"},
+                    "yield_time_ms": {"type": "number"},
+                    "max_tokens": {"type": "number"},
+                    "terminate": {"type": "boolean"}
                 },
                 "required": ["cell_id"],
                 "additionalProperties": false
@@ -242,56 +221,119 @@ pub(crate) fn specifications() -> Vec<Value> {
 }
 
 fn build_exec_description() -> String {
-    let mut sections = vec![EXEC_RUNTIME_GUIDANCE.to_string()];
-    let mut current_namespace = None;
-    for tool in core_tools() {
-        let namespace = tool.tool_name.namespace.as_deref();
-        if namespace != current_namespace {
-            if let Some(namespace) = namespace
-                && let Some(description) = NAMESPACE_DESCRIPTIONS.get(namespace)
-            {
-                sections.push(format!(
-                    "## {}\n{}",
-                    description.name,
-                    description.description.trim()
-                ));
-            }
-            current_namespace = namespace;
-        }
-        let normalized_name = code_runtime::normalize_code_mode_identifier(&tool.name);
-        let heading = if normalized_name == tool.name {
-            format!("### `{normalized_name}`")
-        } else {
-            format!("### `{normalized_name}` (`{}`)", tool.name)
-        };
-        sections.push(format!("{heading}\n{}", render_tool_declaration(tool)));
-    }
-    sections.join("\n\n")
+    let process_output_schema = unified_exec_output_schema();
+    let tool_reference = core_tools()
+        .iter()
+        .map(render_tool_reference)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let declarations = core_tools()
+        .iter()
+        .map(|tool| render_tool_signature(tool, &process_output_schema))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let process_result = render_compact_schema(&process_output_schema);
+    format!(
+        "{EXEC_RUNTIME_GUIDANCE}\n\nTools:\n{tool_reference}\n\n{TOOL_DEFAULTS}\n\n```ts\ntype ProcessResult = {process_result};\ndeclare const tools: {{\n{declarations}\n}};\n```"
+    )
 }
 
-fn render_tool_declaration(tool: &ToolDefinition) -> String {
+fn render_tool_reference(tool: &ToolDefinition) -> String {
+    let name = match tool.tool_name.namespace.as_deref() {
+        Some(namespace) => format!("`{}` (`{namespace}.{}`)", tool.name, tool.tool_name.name),
+        None => format!("`{}`", tool.name),
+    };
+    let description = tool
+        .description
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("- {name}: {description}")
+}
+
+fn render_tool_signature(tool: &ToolDefinition, process_output_schema: &Value) -> String {
     let (input_name, input_type) = match tool.kind {
         ToolKind::Function => (
             "args",
             tool.input_schema
                 .as_ref()
-                .map(code_runtime::render_json_schema_to_typescript)
+                .map(render_compact_schema)
                 .unwrap_or_else(|| "unknown".to_string()),
         ),
         ToolKind::Freeform => ("input", "string".to_string()),
     };
-    let output_type = tool
-        .output_schema
-        .as_ref()
-        .map(code_runtime::render_json_schema_to_typescript)
-        .unwrap_or_else(|| "unknown".to_string());
-    code_runtime::render_code_mode_sample(
-        tool.description.trim(),
-        &tool.name,
-        input_name,
-        input_type,
-        output_type,
-    )
+    let output_type = match tool.output_schema.as_ref() {
+        Some(schema) if schema == process_output_schema => "ProcessResult".to_string(),
+        Some(schema) => render_compact_schema(schema),
+        None => "unknown".to_string(),
+    };
+    let name = code_runtime::normalize_code_mode_identifier(&tool.name);
+    format!("  {name}({input_name}: {input_type}): Promise<{output_type}>;")
+}
+
+fn render_compact_schema(schema: &Value) -> String {
+    // Upstream renders schema annotations as line comments. Strip those from
+    // the rendered declaration so argument properties named `description`
+    // remain part of the schema.
+    compact_typescript(&code_runtime::render_json_schema_to_typescript(schema))
+}
+
+fn compact_typescript(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut characters = source.chars().peekable();
+    let mut previous = None;
+    let mut pending_whitespace = false;
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(character) = characters.next() {
+        if in_string {
+            output.push(character);
+            previous = Some(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if character == '/' && characters.peek() == Some(&'/') {
+            characters.next();
+            for comment_character in characters.by_ref() {
+                if matches!(comment_character, '\n' | '\r') {
+                    break;
+                }
+            }
+            pending_whitespace = true;
+            continue;
+        }
+
+        if character.is_whitespace() {
+            pending_whitespace = true;
+            continue;
+        }
+
+        if pending_whitespace
+            && previous.is_some_and(|character| !is_compact_typescript_punctuation(character))
+            && !is_compact_typescript_punctuation(character)
+        {
+            output.push(' ');
+        }
+        if character == '}' && previous == Some(';') {
+            output.pop();
+        }
+        output.push(character);
+        previous = Some(character);
+        pending_whitespace = false;
+        in_string = character == '"';
+    }
+    output
+}
+
+fn is_compact_typescript_punctuation(character: char) -> bool {
+    matches!(character, '{' | '}' | ':' | ';' | ',' | '|' | '&')
 }
 
 pub(crate) fn nested_tool_name_map() -> Value {
@@ -333,6 +375,7 @@ fn namespaced_function_tool(
     name: &str,
     description: &str,
     input_schema: Value,
+    output_schema: Option<Value>,
 ) -> ToolDefinition {
     ToolDefinition {
         name: javascript_name.to_string(),
@@ -340,7 +383,7 @@ fn namespaced_function_tool(
         description: description.to_string(),
         kind: ToolKind::Function,
         input_schema: Some(input_schema),
-        output_schema: None,
+        output_schema,
     }
 }
 
@@ -351,8 +394,16 @@ fn freeform_tool(name: &str, description: &str) -> ToolDefinition {
         description: description.to_string(),
         kind: ToolKind::Freeform,
         input_schema: None,
-        output_schema: None,
+        output_schema: Some(empty_object_output_schema()),
     }
+}
+
+fn empty_object_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
 }
 
 fn exec_command_input_schema() -> Value {
@@ -377,7 +428,7 @@ fn exec_command_input_schema() -> Value {
             },
             "tty": {
                 "type": "boolean",
-                "description": "True allocates a PTY for the command; false or omitted uses plain pipes."
+                "description": "True allocates a PTY with TERM=xterm-256color; false or omitted uses plain pipes."
             },
             "yield_time_ms": {
                 "type": "number",
@@ -559,83 +610,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogue_contains_the_fixed_tools_and_codex_web_namespace() {
-        assert_eq!(
-            core_tools()
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "apply_patch",
-                "exec_command",
-                "log_papercut",
-                "update_plan",
-                "view_image",
-                "write_stdin",
-                "web__run",
-            ]
-        );
-    }
-
-    #[test]
-    fn runtime_catalogue_keeps_metadata_but_drops_prompt_only_schemas() {
-        assert_eq!(runtime_tools().len(), core_tools().len());
-        for (runtime, complete) in runtime_tools().iter().zip(core_tools()) {
-            assert_eq!(runtime.name, complete.name);
-            assert_eq!(runtime.tool_name, complete.tool_name);
-            assert_eq!(runtime.description, complete.description);
-            assert_eq!(runtime.kind, complete.kind);
-            assert_eq!(
-                (
-                    runtime.input_schema.as_ref(),
-                    runtime.output_schema.as_ref()
-                ),
-                (None, None)
-            );
-        }
-        let runtime_bytes = serde_json::to_vec(runtime_tools()).unwrap().len();
-        let complete_bytes = serde_json::to_vec(core_tools()).unwrap().len();
-        assert!(
-            runtime_bytes < complete_bytes,
-            "runtime metadata was {runtime_bytes} bytes versus {complete_bytes} complete bytes"
-        );
-    }
-
-    #[test]
     fn model_visible_catalogue_contains_typed_declarations() {
         let text = text();
-        assert!(text.contains("fresh V8 isolate"));
-        assert!(text.contains("### `exec_command`"));
-        assert!(text.contains("exec_command(args:"));
-        assert!(text.contains("### `log_papercut`"));
-        assert!(text.contains("log_papercut(args:"));
-        assert!(text.contains("Promise<{"));
-        assert!(text.contains("### `apply_patch`"));
-        assert!(text.contains("## web\nTools in the web namespace."));
-        assert!(text.contains("### `web__run`"));
-    }
-
-    #[test]
-    fn fixed_catalogue_omits_unavailable_integration_guidance() {
-        let text = text();
-        for omitted in [
-            "MCP tool",
-            "generatedImage",
-            "audio(",
-            "Examples of different commands",
+        assert!(text.starts_with("Input raw JavaScript directly"));
+        assert_eq!(text.matches("declare const tools:").count(), 1);
+        for declaration in [
+            "apply_patch(input: string): Promise<{}>",
+            "exec_command(args: {cmd:string",
+            "log_papercut(args: {message:string}): Promise<{path:string}>",
+            "update_plan(args: {explanation?:string;plan:Array<",
+            "view_image(args: {detail?:\"high\"|\"original\";path:string}",
+            "write_stdin(args: {chars?:string;max_output_tokens?:number;session_id:number",
+            "openaiDeveloperDocs__fetch_openai_doc(args: {anchor?:string;url:string}): Promise<string>",
+            "openaiDeveloperDocs__get_openapi_spec(args: {codeExamplesOnly?:boolean;languages?:Array<string>;url:string}): Promise<string>",
+            "openaiDeveloperDocs__list_api_endpoints(args: {}): Promise<string>",
+            "openaiDeveloperDocs__list_openai_docs(args: {cursor?:string;limit?:number}): Promise<string>",
+            "openaiDeveloperDocs__search_openai_docs(args: {cursor?:string;limit?:number;query:string}): Promise<string>",
+            "web__run(args: {click?:Array<",
+            "): Promise<string>",
         ] {
-            assert!(!text.contains(omitted), "unexpected `{omitted}` in {text}");
+            assert!(
+                text.contains(declaration),
+                "missing `{declaration}` in {text}"
+            );
         }
-        for retained in [
-            "Promise.all",
-            "store(key, value)",
-            "yield_control()",
-            "primary sources",
-            "direct, descriptive Markdown links",
-            "Quote at most 25 words",
-        ] {
-            assert!(text.contains(retained), "missing `{retained}` in {text}");
-        }
+        let declarations = text.split_once("```ts\n").unwrap().1;
+        assert!(!declarations.contains("//"));
+        assert!(!text.contains("exec tool declaration"));
     }
 
     #[test]
@@ -654,66 +655,23 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
         assert_eq!(names, ["exec", "wait"]);
-    }
-
-    #[test]
-    fn display_catalogue_matches_the_request_and_nested_definitions() {
-        let request = specifications();
-        let expected_request = request
-            .iter()
-            .map(|tool| (tool["name"].as_str().unwrap(), CatalogueRoute::Request))
-            .collect::<Vec<_>>();
-        let displayed_request = display_tools()
-            .iter()
-            .filter(|tool| tool.route == CatalogueRoute::Request)
-            .map(|tool| (tool.name.as_str(), tool.route))
-            .collect::<Vec<_>>();
-        assert_eq!(displayed_request, expected_request);
-
-        let expected_nested = core_tools()
-            .iter()
-            .map(|tool| (tool.name.as_str(), CatalogueRoute::InsideExec))
-            .collect::<Vec<_>>();
-        let displayed_nested = display_tools()
-            .iter()
-            .filter(|tool| tool.route == CatalogueRoute::InsideExec)
-            .map(|tool| (tool.name.as_str(), tool.route))
-            .collect::<Vec<_>>();
-        assert_eq!(displayed_nested, expected_nested);
-    }
-
-    #[test]
-    fn documented_tool_context_byte_counts_do_not_drift() {
-        let tools = specifications();
-        let update = "run ./scripts/dev.py tool-context --update";
-        assert_eq!(text().len(), 9_727, "{update}");
         assert_eq!(
-            serde_json::to_string(&tools[0]).unwrap().len(),
-            10_354,
-            "{update}"
+            tools[0]["format"]["definition"],
+            "start: SOURCE\nSOURCE: /[\\s\\S]+/"
         );
         assert_eq!(
-            serde_json::to_string(&tools[1]).unwrap().len(),
-            826,
-            "{update}"
-        );
-        let item = json!({
-            "type": "additional_tools",
-            "role": "developer",
-            "tools": tools,
-        });
-        assert_eq!(
-            serde_json::to_string(&item).unwrap().len(),
-            11_238,
-            "{update}"
-        );
-        assert_eq!(
-            metrics(),
-            CatalogueMetrics {
-                description_bytes: 9_727,
-                request_bytes: 11_238,
-                estimated_tokens: 2_810,
-            }
+            tools[1]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "cell_id": {"type": "string"},
+                    "yield_time_ms": {"type": "number"},
+                    "max_tokens": {"type": "number"},
+                    "terminate": {"type": "boolean"}
+                },
+                "required": ["cell_id"],
+                "additionalProperties": false
+            })
         );
     }
 }

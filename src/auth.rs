@@ -28,7 +28,8 @@ const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
-const MAX_REFRESH_ERROR_BODY_BYTES: usize = 16_000;
+const MAX_REFRESH_ERROR_BODY_BYTES: usize = 8_000;
+const MAX_REFRESH_ERROR_BODY_CHARS: usize = 2_000;
 
 pub(crate) struct Auth {
     access_token: String,
@@ -74,22 +75,6 @@ impl Auth {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn refreshable_for_test(
-        access_token: impl Into<String>,
-        refresh_token: impl Into<String>,
-        refresh_url: impl Into<String>,
-    ) -> Self {
-        Self {
-            access_token: access_token.into(),
-            refresh_token: Some(refresh_token.into()),
-            account_id: Some("test-account".to_string()),
-            expires_at: None,
-            refresh_url: Cow::Owned(refresh_url.into()),
-            storage: None,
-        }
-    }
-
     pub(crate) fn load() -> Result<Self> {
         if let Ok(access_token) = std::env::var(ACCESS_TOKEN_ENV)
             && !access_token.trim().is_empty()
@@ -108,8 +93,16 @@ impl Auth {
             });
         }
 
-        let path = auth_file_path()?;
-        let document = read_auth_document(&path)?;
+        Self::load_from_file(auth_file_path()?)
+    }
+
+    fn load_from_file(path: PathBuf) -> Result<Self> {
+        let document = read_auth_document(&path).with_context(|| {
+            format!(
+                "failed to load ChatGPT credentials at {}; run `bcodex login`",
+                path.display()
+            )
+        })?;
         let tokens = document
             .get("tokens")
             .and_then(Value::as_object)
@@ -149,8 +142,13 @@ impl Auth {
     }
 
     async fn refresh(&mut self, client: &reqwest::Client) -> Result<()> {
+        if self.reload_from_storage_if_changed()? {
+            return Ok(());
+        }
         let refresh_token = self.refresh_token.clone().ok_or_else(|| {
-            anyhow!("the ChatGPT access token cannot be refreshed; run `codex login` and try again")
+            anyhow!(
+                "the ChatGPT access token cannot be refreshed; run `bcodex login` and try again"
+            )
         })?;
         let response = client
             .post(self.refresh_url.as_ref())
@@ -166,7 +164,7 @@ impl Auth {
         if status != StatusCode::OK {
             let body = bounded_error_body(response).await;
             return Err(anyhow!(
-                "ChatGPT credential refresh failed with {status}: {body}; run `codex login`"
+                "ChatGPT credential refresh failed with {status}: {body}; run `bcodex login`"
             ));
         }
         let refreshed: RefreshResponse = response
@@ -193,6 +191,28 @@ impl Auth {
         self.refresh_token = refresh_token;
         self.persist(refreshed.id_token.as_deref())?;
         Ok(())
+    }
+
+    fn reload_from_storage_if_changed(&mut self) -> Result<bool> {
+        let Some(path) = self.storage.as_ref().map(|storage| storage.path.clone()) else {
+            return Ok(false);
+        };
+        let expected_account_id = self.account_id.as_deref().ok_or_else(|| {
+            anyhow!(
+                "cannot safely refresh ChatGPT credentials without an account ID; run `bcodex login`"
+            )
+        })?;
+        let mut reloaded = Self::load_from_file(path)?;
+        if reloaded.account_id.as_deref() != Some(expected_account_id) {
+            return Err(anyhow!(
+                "stored ChatGPT credentials changed accounts; restart bettercodex or run `bcodex login`"
+            ));
+        }
+        let changed = self.storage.as_ref().map(|storage| &storage.document)
+            != reloaded.storage.as_ref().map(|storage| &storage.document);
+        reloaded.refresh_url = self.refresh_url.clone();
+        *self = reloaded;
+        Ok(changed)
     }
 
     fn persist(&mut self, id_token: Option<&str>) -> Result<()> {
@@ -293,12 +313,15 @@ impl SharedAuth {
     }
 }
 
-fn auth_file_path() -> Result<PathBuf> {
-    let codex_home = std::env::var_os("CODEX_HOME")
+pub(crate) fn codex_home() -> Result<PathBuf> {
+    std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .ok_or_else(|| anyhow!("cannot locate Codex credentials: HOME is not set"))?;
-    Ok(codex_home.join("auth.json"))
+        .ok_or_else(|| anyhow!("cannot locate Codex credentials: HOME is not set"))
+}
+
+pub(crate) fn auth_file_path() -> Result<PathBuf> {
+    Ok(codex_home()?.join("auth.json"))
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<&str> {
@@ -414,7 +437,10 @@ async fn bounded_error_body(mut response: reqwest::Response) -> String {
         let remaining = MAX_REFRESH_ERROR_BODY_BYTES.saturating_sub(body.len());
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
-    String::from_utf8_lossy(&body).chars().take(4_000).collect()
+    String::from_utf8_lossy(&body)
+        .chars()
+        .take(MAX_REFRESH_ERROR_BODY_CHARS)
+        .collect()
 }
 
 #[cfg(test)]

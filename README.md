@@ -1,0 +1,55 @@
+# bettercodex
+
+bettercodex is a focused, private port of the OpenAI Codex CLI for a small
+group of trusted operators.
+
+## Install from source
+
+Repository access is the invite gate. After accepting an invitation, sign in
+with the [GitHub CLI](https://cli.github.com/), then install `curl`, Rust through
+rustup, and a native C toolchain. Clone the single Cargo package into a stable
+local path and install it:
+
+```sh
+bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
+mkdir -p "$(dirname "$bcodex_source")" &&
+gh repo clone ummay0432/bettercodex "$bcodex_source" &&
+"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
+  --path "$bcodex_source" --force --root "$HOME/.local"
+```
+
+Then open a new terminal, sign in with your own ChatGPT account, and launch
+bettercodex from a project directory:
+
+```sh
+bcodex login
+bcodex
+```
+
+To update the installed binary later, fast-forward that checkout and reinstall
+the same package:
+
+```sh
+bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
+git -C "$bcodex_source" pull --ff-only &&
+"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
+  --path "$bcodex_source" --force --root "$HOME/.local"
+```
+
+[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt) combines first install and later
+updates into one copyable, idempotent command.
+
+For a task that merits evaluator-backed iteration, use `/loop <task>` in the
+TUI or include `$loop` anywhere in an interactive or non-interactive prompt.
+The default runs one evaluator session followed by three fresh working
+sessions; see [`docs/slash_commands.md`](docs/slash_commands.md#quality-loop)
+for counts, progress, restoration, and repository-local evidence.
+
+For an active engineering review and evidence-backed refactoring, use
+`/review <target>` in the TUI or invoke `$review <target>` in any prompt. The
+workflow develops a deep understanding of the target, applies explicit quality
+criteria, and acts on clear net improvements; see
+[`docs/slash_commands.md`](docs/slash_commands.md#engineering-review).
+
+See [`docs/install.md`](docs/install.md) for supported platforms, migration from
+the retired `bcodex update` command, and the full source-build workflow.

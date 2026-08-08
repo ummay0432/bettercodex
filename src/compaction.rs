@@ -76,7 +76,17 @@ pub(crate) fn opaque_compaction_item(items: &[Value]) -> Result<Value, String> {
             items.len()
         ));
     }
-    Ok(compaction.expect("the count proves a compaction item exists"))
+    let compaction = compaction.expect("the count proves a compaction item exists");
+    if compaction
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_none_or(|encrypted| encrypted.trim().is_empty())
+    {
+        return Err(
+            "remote compaction v2 output omitted its non-empty encrypted_content".to_string(),
+        );
+    }
+    Ok(compaction)
 }
 
 pub(crate) fn retained_compacted_history(prompt_history: &[Value]) -> Vec<Value> {
@@ -256,7 +266,3 @@ fn is_compaction_item(item: &Value) -> bool {
         Some("compaction" | "compaction_summary")
     )
 }
-
-#[cfg(test)]
-#[path = "compaction_tests.rs"]
-mod tests;

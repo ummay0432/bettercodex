@@ -1,5 +1,6 @@
 use std::time::Duration;
-use tokio::task::JoinHandle;
+
+use tokio_util::task::AbortOnDropHandle;
 
 use super::RuntimeCommand;
 use super::RuntimeState;
@@ -7,13 +8,9 @@ use super::value::value_to_error_text;
 
 pub(super) struct ScheduledTimeout {
     callback: v8::Global<v8::Function>,
-    task: JoinHandle<()>,
-}
-
-impl Drop for ScheduledTimeout {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    // A V8 cell owns all of its timers. Dropping the callback because it was
+    // cleared or because the cell ended must also stop the asynchronous wait.
+    _task: AbortOnDropHandle<()>,
 }
 
 pub(super) fn schedule_timeout(
@@ -44,9 +41,13 @@ pub(super) fn schedule_timeout(
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         let _ = runtime_command_tx.send(RuntimeCommand::TimeoutFired { id: timeout_id });
     });
-    state
-        .pending_timeouts
-        .insert(timeout_id, ScheduledTimeout { callback, task });
+    state.pending_timeouts.insert(
+        timeout_id,
+        ScheduledTimeout {
+            callback,
+            _task: AbortOnDropHandle::new(task),
+        },
+    );
 
     Ok(timeout_id)
 }

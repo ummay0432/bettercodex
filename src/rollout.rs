@@ -1,4 +1,5 @@
 use crate::MODEL;
+use crate::skills::SkillSelection;
 use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
@@ -6,14 +7,19 @@ use anyhow::anyhow;
 use codex_protocol::models::MessagePhase;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde::de::IgnoredAny;
+use serde::de::MapAccess;
+use serde::de::Visitor;
 use serde_json::Value;
+use std::borrow::Cow;
+use std::fmt;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::BufRead;
 use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -72,6 +78,7 @@ pub(crate) struct SessionSummary {
 pub(crate) enum SessionTranscriptItem {
     User {
         text: String,
+        #[serde(default)]
         image_count: usize,
     },
     Assistant {
@@ -90,6 +97,16 @@ pub(crate) struct LoadedRollout {
     pub(crate) server_reasoning_included: bool,
     pub(crate) compaction_count: u64,
     pub(crate) unfinished_turn: Option<String>,
+    pub(crate) operator_inputs: Vec<OperatorInputRecord>,
+    pub(crate) operator_inputs_complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct OperatorInputRecord {
+    pub(crate) message: Value,
+    pub(crate) prompt_text: String,
+    pub(crate) selected_skills: Vec<SkillSelection>,
+    pub(crate) skill_context: Vec<Value>,
 }
 
 pub(crate) struct Rollout {
@@ -135,6 +152,13 @@ enum RolloutRecordData<Items = Vec<Value>> {
     TranscriptSnapshot {
         items: Vec<SessionTranscriptItem>,
     },
+    OperatorInputsSnapshot {
+        items: Vec<OperatorInputRecord>,
+        complete: bool,
+    },
+    OperatorInput {
+        item: OperatorInputRecord,
+    },
     HistoryAppend {
         items: Items,
     },
@@ -165,6 +189,8 @@ type RolloutRecord = RolloutRecordData;
 // them into a short-lived record.
 type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value]>;
 
+// Listing only needs message shape and preview text. Deserialize those selected fields directly
+// from the journal stream while scanning all unselected payloads without materializing them.
 #[derive(Debug, Deserialize)]
 struct PreviewItem {
     #[serde(rename = "type", default)]
@@ -183,10 +209,9 @@ struct PreviewContent {
     text: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 // Deserialize previews directly from the journal reader. Fields absent from these lightweight
 // records—including base64 images, reasoning, and tool payloads—are scanned but never allocated.
+#[derive(Debug)]
 enum PreviewRolloutRecord {
     Session {
         metadata: SessionMetadata,
@@ -197,6 +222,189 @@ enum PreviewRolloutRecord {
     },
     #[serde(other)]
     Other,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PreviewRecordKind {
+    Session,
+    HistoryAppend,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum PreviewRecordField {
+    Type,
+    Metadata,
+    Items,
+    #[serde(other)]
+    Other,
+}
+
+struct PreviewRolloutRecordVisitor;
+
+impl<'de> Visitor<'de> for PreviewRolloutRecordVisitor {
+    type Value = PreviewRolloutRecord;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a saved session record")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut kind = None;
+        let mut metadata = None;
+        let mut items = None;
+        while let Some(field) = map.next_key::<PreviewRecordField>()? {
+            match field {
+                PreviewRecordField::Type => {
+                    if kind.is_some() {
+                        return Err(serde::de::Error::duplicate_field("type"));
+                    }
+                    kind = Some(map.next_value::<PreviewRecordKind>()?);
+                }
+                PreviewRecordField::Metadata
+                    if matches!(kind, Some(PreviewRecordKind::Session)) =>
+                {
+                    if metadata.is_some() {
+                        return Err(serde::de::Error::duplicate_field("metadata"));
+                    }
+                    metadata = Some(map.next_value::<SessionMetadata>()?);
+                }
+                PreviewRecordField::Items
+                    if matches!(kind, Some(PreviewRecordKind::HistoryAppend)) =>
+                {
+                    if items.is_some() {
+                        return Err(serde::de::Error::duplicate_field("items"));
+                    }
+                    items = Some(map.next_value::<Vec<PreviewItem>>()?);
+                }
+                PreviewRecordField::Metadata
+                | PreviewRecordField::Items
+                | PreviewRecordField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        match kind.ok_or_else(|| serde::de::Error::missing_field("type"))? {
+            PreviewRecordKind::Session => Ok(PreviewRolloutRecord::Session {
+                metadata: metadata.ok_or_else(|| serde::de::Error::missing_field("metadata"))?,
+            }),
+            PreviewRecordKind::HistoryAppend => Ok(PreviewRolloutRecord::HistoryAppend {
+                items: items.unwrap_or_default(),
+            }),
+            PreviewRecordKind::Other => Ok(PreviewRolloutRecord::Other),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PreviewRolloutRecord {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(PreviewRolloutRecordVisitor)
+    }
+}
+
+enum JsonLineContent<T> {
+    Blank,
+    Record(serde_json::Result<T>),
+}
+
+struct FramedJsonLine<T> {
+    content: JsonLineContent<T>,
+    bytes_read: usize,
+    terminated: bool,
+}
+
+struct JsonLineReader<'a, R> {
+    reader: &'a mut R,
+    bytes_read: usize,
+    content_bytes: usize,
+    content_is_only_carriage_return: bool,
+    terminated: bool,
+    finished: bool,
+}
+
+impl<'a, R: BufRead> JsonLineReader<'a, R> {
+    fn new(reader: &'a mut R) -> Self {
+        Self {
+            reader,
+            bytes_read: 0,
+            content_bytes: 0,
+            content_is_only_carriage_return: true,
+            terminated: false,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        let mut buffer = [0_u8; 8 * 1024];
+        while self.read(&mut buffer)? != 0 {}
+        Ok(())
+    }
+
+    fn is_blank(&self) -> bool {
+        self.content_bytes == 0 || (self.content_bytes == 1 && self.content_is_only_carriage_return)
+    }
+}
+
+impl<R: BufRead> Read for JsonLineReader<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.finished || output.is_empty() {
+            return Ok(0);
+        }
+        let available = self.reader.fill_buf()?;
+        if available.is_empty() {
+            self.finished = true;
+            return Ok(0);
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_available = newline.unwrap_or(available.len());
+        let copied = content_available.min(output.len());
+        output[..copied].copy_from_slice(&available[..copied]);
+        self.content_bytes = self.content_bytes.saturating_add(copied);
+        self.content_is_only_carriage_return &=
+            available[..copied].iter().all(|byte| *byte == b'\r');
+
+        let consumed_newline = newline.is_some() && copied == content_available;
+        let consumed = copied.saturating_add(usize::from(consumed_newline));
+        self.reader.consume(consumed);
+        self.bytes_read = self.bytes_read.saturating_add(consumed);
+        if consumed_newline {
+            self.terminated = true;
+            self.finished = true;
+        }
+        Ok(copied)
+    }
+}
+
+fn read_json_line<T: DeserializeOwned>(
+    reader: &mut impl BufRead,
+) -> std::io::Result<Option<FramedJsonLine<T>>> {
+    let mut line = JsonLineReader::new(reader);
+    let record = serde_json::from_reader(&mut line);
+    line.finish()?;
+    if line.bytes_read == 0 {
+        return Ok(None);
+    }
+    let content = if line.is_blank() {
+        JsonLineContent::Blank
+    } else {
+        JsonLineContent::Record(record)
+    };
+    Ok(Some(FramedJsonLine {
+        content,
+        bytes_read: line.bytes_read,
+        terminated: line.terminated,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -247,6 +455,10 @@ impl Rollout {
             metadata: metadata.clone(),
         };
         rollout.write_record(&RolloutRecord::Session { metadata })?;
+        rollout.write_record(&RolloutRecord::OperatorInputsSnapshot {
+            items: Vec::new(),
+            complete: true,
+        })?;
         Ok(rollout)
     }
 
@@ -300,6 +512,18 @@ impl Rollout {
 
     pub(crate) fn snapshot_transcript(&mut self, items: Vec<SessionTranscriptItem>) -> Result<()> {
         self.write_record(&RolloutRecord::TranscriptSnapshot { items })
+    }
+
+    pub(crate) fn snapshot_operator_inputs(
+        &mut self,
+        items: Vec<OperatorInputRecord>,
+        complete: bool,
+    ) -> Result<()> {
+        self.write_record(&RolloutRecord::OperatorInputsSnapshot { items, complete })
+    }
+
+    pub(crate) fn record_operator_input(&mut self, item: OperatorInputRecord) -> Result<()> {
+        self.write_record(&RolloutRecord::OperatorInput { item })
     }
 
     pub(crate) fn replace_history(
@@ -394,15 +618,7 @@ impl Rollout {
 fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut file = lock_rollout(open_private_append(&path, false)?, &path)?;
     let original_length = file.metadata()?.len();
-    let original_terminated = if original_length == 0 {
-        true
-    } else {
-        file.seek(SeekFrom::End(-1))?;
-        let mut last_byte = [0_u8; 1];
-        file.read_exact(&mut last_byte)?;
-        file.seek(SeekFrom::Start(0))?;
-        last_byte[0] == b'\n'
-    };
+    let mut reader = BufReader::new(&*file);
     let mut metadata = None;
     let mut history = Vec::new();
     let mut transcript = Vec::new();
@@ -411,32 +627,40 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut server_reasoning_included = false;
     let mut compaction_count = 0_u64;
     let mut unfinished_turn = None;
+    let mut operator_inputs = Vec::new();
+    let mut operator_inputs_complete = false;
+    let mut line_number = 0_usize;
     let mut valid_length = 0_u64;
-    let mut partial_tail = false;
-    let mut records =
-        serde_json::Deserializer::from_reader(BufReader::new(&*file)).into_iter::<RolloutRecord>();
+    let mut valid_record_needs_newline = false;
 
-    while let Some(record) = records.next() {
-        let record = match record {
-            Ok(record) => {
-                valid_length = u64::try_from(records.byte_offset())
-                    .context("saved session offset exceeds the supported file size")?;
-                record
+    loop {
+        let Some(line) = read_json_line::<RolloutRecord>(&mut reader)
+            .with_context(|| format!("failed to read {}", path.display()))?
+        else {
+            break;
+        };
+        line_number = line_number.saturating_add(1);
+        let bytes_read = u64::try_from(line.bytes_read)
+            .context("saved session record exceeds the supported file size")?;
+        let record = match line.content {
+            JsonLineContent::Blank => {
+                valid_length = valid_length.saturating_add(bytes_read);
+                valid_record_needs_newline = !line.terminated;
+                continue;
             }
-            Err(error) if error.is_io() => {
+            JsonLineContent::Record(Ok(record)) => record,
+            JsonLineContent::Record(Err(error)) if error.is_io() => {
                 return Err(error).with_context(|| format!("failed to read {}", path.display()));
             }
-            Err(_) if !original_terminated => {
-                partial_tail = true;
-                break;
-            }
-            Err(error) => {
-                let line = error.line();
+            JsonLineContent::Record(Err(_)) if !line.terminated => break,
+            JsonLineContent::Record(Err(error)) => {
                 return Err(error).with_context(|| {
-                    format!("invalid session record at {}:{}", path.display(), line)
+                    format!("invalid session record at {}:{line_number}", path.display())
                 });
             }
         };
+        valid_length = valid_length.saturating_add(bytes_read);
+        valid_record_needs_newline = !line.terminated;
         match record {
             RolloutRecord::Session {
                 metadata: session_metadata,
@@ -453,6 +677,11 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 compaction_count: source_compaction_count,
             } => compaction_count = source_compaction_count,
             RolloutRecord::TranscriptSnapshot { items } => transcript = items,
+            RolloutRecord::OperatorInputsSnapshot { items, complete } => {
+                operator_inputs = items;
+                operator_inputs_complete = complete;
+            }
+            RolloutRecord::OperatorInput { item } => operator_inputs.push(item),
             RolloutRecord::HistoryAppend { items } => {
                 append_transcript_items(&mut transcript, &items);
                 history.extend(items);
@@ -493,12 +722,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         }
     }
 
-    drop(records);
-    let (valid_length, valid_record_needs_newline) = if partial_tail {
-        (valid_length, valid_length > 0)
-    } else {
-        (original_length, original_length > 0 && !original_terminated)
-    };
+    drop(reader);
     repair_rollout_tail(
         &mut file,
         &path,
@@ -538,6 +762,8 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         server_reasoning_included,
         compaction_count,
         unfinished_turn,
+        operator_inputs,
+        operator_inputs_complete,
     })
 }
 
@@ -605,7 +831,7 @@ fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>
         let Some(metadata) = read_metadata(&path)? else {
             continue;
         };
-        if metadata.cwd != cwd {
+        if metadata.cwd != cwd || compatible_session_id(&path, &metadata).is_none() {
             continue;
         }
         let modified_at = entry
@@ -664,53 +890,51 @@ fn read_session_summary(
 ) -> Result<Option<SessionSummary>> {
     let file = File::open(path)
         .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-    let mut records = serde_json::Deserializer::from_reader(BufReader::new(file))
-        .into_iter::<PreviewRolloutRecord>();
-    let Some(header) = records.next() else {
+    let mut reader = BufReader::new(file);
+    let Some(header) = read_json_line::<PreviewRolloutRecord>(&mut reader)
+        .with_context(|| format!("failed to inspect saved session {}", path.display()))?
+    else {
         return Ok(None);
     };
-    let metadata = match header {
-        Ok(PreviewRolloutRecord::Session { metadata }) => metadata,
-        Ok(PreviewRolloutRecord::HistoryAppend { .. } | PreviewRolloutRecord::Other) => {
+    let metadata = match header.content {
+        JsonLineContent::Record(Ok(PreviewRolloutRecord::Session { metadata })) => metadata,
+        JsonLineContent::Blank
+        | JsonLineContent::Record(Ok(
+            PreviewRolloutRecord::HistoryAppend { .. } | PreviewRolloutRecord::Other,
+        )) => {
             return Ok(None);
         }
-        Err(error) if error.is_io() => {
+        JsonLineContent::Record(Err(error)) if error.is_io() => {
             return Err(error)
                 .with_context(|| format!("failed to inspect saved session {}", path.display()));
         }
-        Err(_) => return Ok(None),
+        JsonLineContent::Record(Err(_)) => return Ok(None),
     };
-    if metadata.version != ROLLOUT_VERSION
-        || metadata.model != MODEL
-        || metadata.reasoning_effort != "max"
-    {
-        return Ok(None);
-    }
-    let Ok(id) = Uuid::parse_str(&metadata.identity.session_id) else {
+    let Some(id) = compatible_session_id(path, &metadata) else {
         return Ok(None);
     };
-    if path.file_stem().and_then(|stem| stem.to_str())
-        != Some(metadata.identity.session_id.as_str())
-    {
-        return Ok(None);
-    }
 
     let mut preview = None;
-    for record in records {
-        match record {
-            Ok(PreviewRolloutRecord::HistoryAppend { items }) => {
+    while let Some(record) = read_json_line::<PreviewRolloutRecord>(&mut reader)
+        .with_context(|| format!("failed to inspect saved session {}", path.display()))?
+    {
+        match record.content {
+            JsonLineContent::Record(Ok(PreviewRolloutRecord::HistoryAppend { items })) => {
                 if let Some(found) = preview_from_items(&items) {
                     preview = Some(found);
                     break;
                 }
             }
-            Ok(PreviewRolloutRecord::Session { .. } | PreviewRolloutRecord::Other) => {}
-            Err(error) if error.is_io() => {
+            JsonLineContent::Blank
+            | JsonLineContent::Record(Ok(
+                PreviewRolloutRecord::Session { .. } | PreviewRolloutRecord::Other,
+            )) => {}
+            JsonLineContent::Record(Err(error)) if error.is_io() => {
                 return Err(error).with_context(|| {
                     format!("failed to inspect saved session {}", path.display())
                 });
             }
-            Err(_) => break,
+            JsonLineContent::Record(Err(_)) => break,
         }
     }
 
@@ -727,18 +951,42 @@ fn read_session_summary(
     }))
 }
 
+fn compatible_session_id(path: &Path, metadata: &SessionMetadata) -> Option<Uuid> {
+    if metadata.version != ROLLOUT_VERSION
+        || metadata.model != MODEL
+        || metadata.reasoning_effort != "max"
+        || path.file_stem().and_then(|stem| stem.to_str())
+            != Some(metadata.identity.session_id.as_str())
+    {
+        return None;
+    }
+    Uuid::parse_str(&metadata.identity.session_id).ok()
+}
+
 fn preview_from_items(items: &[PreviewItem]) -> Option<String> {
     for item in items {
         if item.kind != "message" || item.role != "user" {
             continue;
         }
-        let text = item
+        let mut texts = item
             .content
             .iter()
             .filter(|content| content.kind == "input_text")
-            .map(|content| content.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|content| content.text.as_ref());
+        let first = texts.next().unwrap_or_default();
+        let text = if let Some(second) = texts.next() {
+            let mut joined = String::with_capacity(first.len() + second.len() + 1);
+            joined.push_str(first);
+            joined.push('\n');
+            joined.push_str(second);
+            for text in texts {
+                joined.push('\n');
+                joined.push_str(text);
+            }
+            Cow::Owned(joined)
+        } else {
+            Cow::Borrowed(first)
+        };
         if crate::context::is_contextual_user_text(&text) {
             continue;
         }
@@ -816,21 +1064,25 @@ fn repair_rollout_tail(
 fn read_metadata(path: &Path) -> Result<Option<SessionMetadata>> {
     let file = File::open(path)
         .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-    let mut records = serde_json::Deserializer::from_reader(BufReader::new(file))
-        .into_iter::<PreviewRolloutRecord>();
-    let Some(record) = records.next() else {
+    let mut reader = BufReader::new(file);
+    let Some(record) = read_json_line::<PreviewRolloutRecord>(&mut reader)
+        .with_context(|| format!("failed to inspect saved session {}", path.display()))?
+    else {
         return Ok(None);
     };
-    let metadata = match record {
-        Ok(PreviewRolloutRecord::Session { metadata }) => metadata,
-        Ok(PreviewRolloutRecord::HistoryAppend { .. } | PreviewRolloutRecord::Other) => {
+    let metadata = match record.content {
+        JsonLineContent::Record(Ok(PreviewRolloutRecord::Session { metadata })) => metadata,
+        JsonLineContent::Blank
+        | JsonLineContent::Record(Ok(
+            PreviewRolloutRecord::HistoryAppend { .. } | PreviewRolloutRecord::Other,
+        )) => {
             return Ok(None);
         }
-        Err(error) if error.is_io() => {
+        JsonLineContent::Record(Err(error)) if error.is_io() => {
             return Err(error)
                 .with_context(|| format!("failed to inspect saved session {}", path.display()));
         }
-        Err(_) => return Ok(None),
+        JsonLineContent::Record(Err(_)) => return Ok(None),
     };
     Ok(Some(metadata))
 }

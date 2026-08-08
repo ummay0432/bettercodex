@@ -5,6 +5,7 @@ mod executor;
 mod image_preparation;
 mod papercuts;
 mod patch;
+mod process_session;
 
 const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
     code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
@@ -20,6 +21,7 @@ pub(crate) use executor::command_argv_for_display;
 use self::code_runtime::CodeModeNestedToolCall as NestedToolCall;
 use self::code_runtime::CodeModeToolKind as NestedToolKind;
 use crate::events::AgentEvent;
+use crate::openai_docs::OpenAiDocsClient;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Context;
@@ -158,16 +160,18 @@ impl ToolResult {
 
 struct NestedTools {
     cwd: PathBuf,
+    openai_docs: OpenAiDocsClient,
     processes: ProcessManager,
     web_search: WebSearchClient,
     turn: Mutex<ToolTurnContext>,
 }
 
 impl NestedTools {
-    fn with_web_search(cwd: PathBuf, web_search: WebSearchClient) -> Self {
+    fn new(cwd: PathBuf, web_search: WebSearchClient, openai_docs: OpenAiDocsClient) -> Self {
         Self {
             processes: ProcessManager::new(cwd.clone()),
             cwd,
+            openai_docs,
             web_search,
             turn: Mutex::new(ToolTurnContext::default()),
         }
@@ -187,6 +191,13 @@ impl NestedTools {
         let namespace = invocation.tool_name.namespace.as_deref();
         let name = invocation.tool_name.name.as_str();
         match (namespace, name, invocation.tool_kind) {
+            (Some(crate::openai_docs::NAMESPACE), name, NestedToolKind::Function)
+                if crate::openai_docs::is_tool(name) =>
+            {
+                self.openai_docs
+                    .call(name, function_input(name, invocation.input)?, cancellation)
+                    .await
+            }
             (
                 Some(crate::web_search::NAMESPACE),
                 crate::web_search::TOOL_NAME,

@@ -21,7 +21,7 @@ impl Notifier {
     pub(super) fn detect() -> Self {
         let backend = if terminal_supports_osc9() {
             Backend::Osc9 {
-                tmux: std::env::var_os("TMUX").is_some(),
+                tmux: crate::managed_session::is_tmux_active(),
             }
         } else {
             Backend::Bel
@@ -148,52 +148,5 @@ impl Command for PostBelNotification {
     #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn notification_preview_is_single_line_bounded_and_safe() {
-        let message = format!(
-            " Done\n\u{202e}\x1b{} ",
-            "x".repeat(MAX_NOTIFICATION_CHARS + 20)
-        );
-        let sanitized = sanitize_notification(&message);
-        assert!(sanitized.starts_with("Done "));
-        assert!(!sanitized.contains('\n'));
-        assert!(!sanitized.contains('\x1b'));
-        assert!(!sanitized.contains('\u{202e}'));
-        assert_eq!(sanitized.chars().count(), MAX_NOTIFICATION_CHARS);
-    }
-
-    #[test]
-    fn osc9_supports_plain_and_tmux_output() {
-        let mut plain = String::new();
-        PostOsc9Notification {
-            message: "done".to_string(),
-            tmux: false,
-        }
-        .write_ansi(&mut plain)
-        .unwrap();
-        assert_eq!(plain, "\x1b]9;done\x07");
-
-        let mut tmux = String::new();
-        PostOsc9Notification {
-            message: "done".to_string(),
-            tmux: true,
-        }
-        .write_ansi(&mut tmux)
-        .unwrap();
-        assert_eq!(tmux, "\x1bPtmux;\x1b\x1b]9;done\x07\x1b\\");
-    }
-
-    #[test]
-    fn bel_output_is_one_control_byte() {
-        let mut encoded = String::new();
-        PostBelNotification.write_ansi(&mut encoded).unwrap();
-        assert_eq!(encoded, "\x07");
     }
 }

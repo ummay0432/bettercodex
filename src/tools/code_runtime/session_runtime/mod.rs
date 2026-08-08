@@ -94,7 +94,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn observe(
         &self,
         cell_id: &CellId,
@@ -316,3 +316,7 @@ fn actor_error(cell_id: &CellId, error: CellError) -> Error {
         CellError::Closed => Error::ClosedCell(cell_id.clone()),
     }
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

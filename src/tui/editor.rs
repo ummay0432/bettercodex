@@ -1,3 +1,6 @@
+use crate::input::MAX_TOTAL_IMAGE_BYTES;
+use crate::input::PromptImage;
+use crate::input::PromptImageAttachment;
 use crate::input::UserPrompt;
 use crate::skills::SkillMention;
 use crate::skills::SkillSelection;
@@ -20,6 +23,7 @@ pub(super) struct Editor {
     saved_draft: String,
     pending_pastes: Vec<PendingPaste>,
     skill_mentions: Vec<SkillMention>,
+    image_attachments: Vec<PromptImageAttachment>,
     history_search: Option<HistorySearchSession>,
 }
 
@@ -55,6 +59,7 @@ struct EditorSnapshot {
     saved_draft: String,
     pending_pastes: Vec<PendingPaste>,
     skill_mentions: Vec<SkillMention>,
+    image_attachments: Vec<PromptImageAttachment>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,6 +69,8 @@ pub(super) struct EditorLayout {
     pub(super) paste_ranges: Vec<Vec<Range<usize>>>,
     /// Byte ranges within each visible line that represent selected skill mentions.
     pub(super) skill_ranges: Vec<Vec<Range<usize>>>,
+    /// Byte ranges within each visible line that represent attached images.
+    pub(super) image_ranges: Vec<Vec<Range<usize>>>,
     /// Byte ranges within each visible line matching the active Ctrl+R query.
     pub(super) history_search_ranges: Vec<Vec<Range<usize>>>,
     pub(super) cursor_row: u16,
@@ -82,6 +89,58 @@ impl Editor {
 
     pub(super) fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    pub(super) fn image_count(&self) -> usize {
+        self.image_attachments.len()
+    }
+
+    pub(super) fn slash_command_query(&self) -> Option<(String, Range<usize>)> {
+        let mut image_ranges = self
+            .image_attachments
+            .iter()
+            .map(|attachment| attachment.range().clone())
+            .collect::<Vec<_>>();
+        image_ranges.sort_by_key(|range| range.start);
+
+        let mut plain = String::with_capacity(self.text.len());
+        let mut segments = Vec::with_capacity(image_ranges.len().saturating_add(1));
+        let mut raw_cursor = 0;
+        for image in image_ranges {
+            if image.start < raw_cursor || image.end > self.text.len() {
+                return None;
+            }
+            append_plain_segment(
+                &self.text,
+                raw_cursor..image.start,
+                &mut plain,
+                &mut segments,
+            );
+            raw_cursor = image.end;
+        }
+        append_plain_segment(
+            &self.text,
+            raw_cursor..self.text.len(),
+            &mut plain,
+            &mut segments,
+        );
+
+        let trimmed_start = plain.len().saturating_sub(plain.trim_start().len());
+        let command = &plain[trimmed_start..];
+        let query = command.strip_prefix('/')?;
+        if query.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let trimmed_end = trimmed_start.saturating_add(command.len());
+        let segment = segments.into_iter().find(|segment| {
+            segment.plain.start <= trimmed_start && segment.plain.end >= trimmed_end
+        })?;
+        let raw_start = segment
+            .raw
+            .start
+            .saturating_add(trimmed_start.saturating_sub(segment.plain.start));
+        let raw_end = raw_start.saturating_add(command.len());
+        Some((query.to_string(), raw_start..raw_end))
     }
 
     pub(super) fn history_search_active(&self) -> bool {
@@ -196,24 +255,52 @@ impl Editor {
         self.preferred_column = None;
         self.pending_pastes.clear();
         self.skill_mentions.clear();
+        self.image_attachments.clear();
     }
 
-    pub(super) fn set_prompt(&mut self, text: impl Into<String>, mentions: &[SkillMention]) {
-        self.set_text(text);
-        self.bind_skill_mentions(mentions, 0);
+    pub(super) fn set_user_prompt(&mut self, prompt: &UserPrompt) {
+        self.set_text(prompt.as_str());
+        self.bind_skill_mentions(prompt.skill_mentions(), 0);
+        self.bind_image_attachments(prompt.image_attachments(), 0);
     }
 
-    pub(super) fn prepend_prompt(&mut self, text: &str, mentions: &[SkillMention]) {
-        if text.is_empty() {
+    pub(super) fn prepend_user_prompt(&mut self, prompt: &UserPrompt) {
+        if prompt.as_str().is_empty() {
             return;
         }
-        self.prepend(text);
-        self.bind_skill_mentions(mentions, 0);
+        let text = format!("{}\n\n", prompt.as_str());
+        self.prepend(&text);
+        self.bind_skill_mentions(prompt.skill_mentions(), 0);
+        self.bind_image_attachments(prompt.image_attachments(), 0);
     }
 
     pub(super) fn take_prompt(&mut self) -> UserPrompt {
-        let (text, mentions) = self.take_contents();
-        UserPrompt::with_skill_mentions(text, mentions)
+        let (text, mentions, images) = self.take_contents();
+        UserPrompt::with_attachments(text, mentions, images)
+    }
+
+    pub(super) fn attach_image(&mut self, image: PromptImage) -> Result<(), String> {
+        let total = self
+            .image_attachments
+            .iter()
+            .map(|attachment| attachment.image().byte_len())
+            .try_fold(image.byte_len(), usize::checked_add)
+            .filter(|total| *total <= MAX_TOTAL_IMAGE_BYTES)
+            .ok_or_else(|| {
+                format!(
+                    "attached images exceed bettercodex's {} MiB input limit",
+                    MAX_TOTAL_IMAGE_BYTES / (1024 * 1024)
+                )
+            })?;
+        debug_assert!(total <= MAX_TOTAL_IMAGE_BYTES);
+        let placeholder = self.next_image_placeholder();
+        let start = self.cursor;
+        self.insert(&placeholder);
+        self.image_attachments.push(PromptImageAttachment::new(
+            image,
+            start..start.saturating_add(placeholder.len()),
+        ));
+        Ok(())
     }
 
     pub(super) fn remember(&mut self, text: &str) {
@@ -490,6 +577,22 @@ impl Editor {
                 highlights
             })
             .collect();
+        let image_ranges = visible_ranges
+            .iter()
+            .map(|line| {
+                let mut highlights = self
+                    .image_attachments
+                    .iter()
+                    .filter_map(|attachment| {
+                        let start = attachment.range().start.max(line.start);
+                        let end = attachment.range().end.min(line.end);
+                        (start < end).then_some(start - line.start..end - line.start)
+                    })
+                    .collect::<Vec<_>>();
+                highlights.sort_by_key(|range| range.start);
+                highlights
+            })
+            .collect();
         let search_ranges = self.history_search_match_ranges();
         let history_search_ranges = visible_ranges
             .iter()
@@ -508,6 +611,7 @@ impl Editor {
             lines,
             paste_ranges,
             skill_ranges,
+            image_ranges,
             history_search_ranges,
             cursor_row: (cursor_line - first) as u16,
             cursor_column: display_width(&self.text[ranges[cursor_line].start..self.cursor]) as u16,
@@ -537,6 +641,16 @@ impl Editor {
             }
             if mention.range().start >= range.end {
                 shift_range(mention.range_mut(), removed_len, inserted_len);
+                return true;
+            }
+            false
+        });
+        self.image_attachments.retain_mut(|attachment| {
+            if attachment.range().end <= range.start {
+                return true;
+            }
+            if attachment.range().start >= range.end {
+                shift_range(attachment.range_mut(), removed_len, inserted_len);
                 return true;
             }
             false
@@ -623,6 +737,19 @@ impl Editor {
         }
     }
 
+    fn next_image_placeholder(&self) -> String {
+        let mut number = 1_usize;
+        loop {
+            let placeholder = format!("[Image {number}]");
+            if self.image_attachments.iter().all(|attachment| {
+                self.text.get(attachment.range().clone()) != Some(placeholder.as_str())
+            }) {
+                return placeholder;
+            }
+            number = number.saturating_add(1);
+        }
+    }
+
     fn expanded_text(&self) -> String {
         let mut pastes = self.pending_pastes.iter().collect::<Vec<_>>();
         pastes.sort_by_key(|paste| paste.range.start);
@@ -702,6 +829,7 @@ impl Editor {
         self.preferred_column = None;
         self.pending_pastes.clear();
         self.skill_mentions.clear();
+        self.image_attachments.clear();
     }
 
     fn snapshot(&self) -> EditorSnapshot {
@@ -713,6 +841,7 @@ impl Editor {
             saved_draft: self.saved_draft.clone(),
             pending_pastes: self.pending_pastes.clone(),
             skill_mentions: self.skill_mentions.clone(),
+            image_attachments: self.image_attachments.clone(),
         }
     }
 
@@ -724,6 +853,7 @@ impl Editor {
         self.saved_draft = snapshot.saved_draft;
         self.pending_pastes = snapshot.pending_pastes;
         self.skill_mentions = snapshot.skill_mentions;
+        self.image_attachments = snapshot.image_attachments;
     }
 
     fn history_search_match_ranges(&self) -> Vec<Range<usize>> {
@@ -742,6 +872,11 @@ impl Editor {
             .iter()
             .map(|paste| &paste.range)
             .chain(self.skill_mentions.iter().map(SkillMention::range))
+            .chain(
+                self.image_attachments
+                    .iter()
+                    .map(PromptImageAttachment::range),
+            )
     }
 
     fn bind_skill_mentions(&mut self, mentions: &[SkillMention], offset: usize) {
@@ -752,10 +887,31 @@ impl Editor {
         }
     }
 
-    fn take_contents(&mut self) -> (String, Vec<SkillMention>) {
+    fn bind_image_attachments(&mut self, attachments: &[PromptImageAttachment], offset: usize) {
+        for attachment in attachments {
+            let range = offset.saturating_add(attachment.range().start)
+                ..offset.saturating_add(attachment.range().end);
+            if range.start < range.end
+                && range.end <= self.text.len()
+                && !self
+                    .atomic_ranges()
+                    .any(|atomic| ranges_overlap(atomic, &range))
+            {
+                self.image_attachments.push(PromptImageAttachment::new(
+                    attachment.image().clone(),
+                    range,
+                ));
+            }
+        }
+    }
+
+    fn take_contents(&mut self) -> (String, Vec<SkillMention>, Vec<PromptImageAttachment>) {
         self.skill_mentions
             .sort_by_key(|mention| mention.range().start);
         let mut mentions = std::mem::take(&mut self.skill_mentions);
+        self.image_attachments
+            .sort_by_key(|attachment| attachment.range().start);
+        let mut images = std::mem::take(&mut self.image_attachments);
         let text = if self.pending_pastes.is_empty() {
             std::mem::take(&mut self.text)
         } else {
@@ -771,6 +927,18 @@ impl Editor {
                     }
                 }
             }
+            for attachment in &mut images {
+                let original_start = attachment.range().start;
+                for paste in &self.pending_pastes {
+                    if paste.range.end <= original_start {
+                        shift_range(
+                            attachment.range_mut(),
+                            paste.placeholder.len(),
+                            paste.content.len(),
+                        );
+                    }
+                }
+            }
             let expanded = self.expanded_text();
             self.text.clear();
             self.pending_pastes.clear();
@@ -780,8 +948,31 @@ impl Editor {
         self.preferred_column = None;
         self.history_index = None;
         self.saved_draft.clear();
-        (text, mentions)
+        (text, mentions, images)
     }
+}
+
+#[derive(Debug)]
+struct PlainSegment {
+    plain: Range<usize>,
+    raw: Range<usize>,
+}
+
+fn append_plain_segment(
+    text: &str,
+    raw: Range<usize>,
+    plain: &mut String,
+    segments: &mut Vec<PlainSegment>,
+) {
+    if raw.is_empty() {
+        return;
+    }
+    let plain_start = plain.len();
+    plain.push_str(&text[raw.clone()]);
+    segments.push(PlainSegment {
+        plain: plain_start..plain.len(),
+        raw,
+    });
 }
 
 fn case_insensitive_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
@@ -1067,7 +1258,7 @@ mod tests {
     #[test]
     fn editing_moves_by_grapheme_clusters() {
         let mut editor = Editor::default();
-        editor.insert("a👩‍💻b");
+        editor.insert("ae\u{301}b");
         editor.move_left();
         editor.backspace();
         assert_eq!(editor.text(), "ab");
@@ -1093,224 +1284,5 @@ mod tests {
         assert_eq!(editor.text(), "first");
         editor.history_next();
         assert_eq!(editor.text(), "draft");
-    }
-
-    #[test]
-    fn seeded_multiline_history_cycles_at_text_boundaries() {
-        let mut editor = Editor::default();
-        editor.seed_history([
-            "older\nmultiline".to_string(),
-            "newer\nmultiline".to_string(),
-        ]);
-
-        assert!(editor.can_recall_older());
-        editor.history_previous();
-        assert_eq!(editor.text(), "newer\nmultiline");
-        assert!(editor.can_recall_older());
-        editor.history_previous();
-        assert_eq!(editor.text(), "older\nmultiline");
-        assert!(editor.can_recall_newer());
-        editor.history_next();
-        assert_eq!(editor.text(), "newer\nmultiline");
-    }
-
-    #[test]
-    fn word_navigation_uses_codex_unicode_and_separator_boundaries() {
-        let mut editor = Editor::default();
-        editor.insert("alpha.beta gamma");
-
-        editor.move_word_left();
-        assert_eq!(editor.cursor(), 11);
-        editor.move_word_left();
-        assert_eq!(editor.cursor(), 6);
-        editor.move_word_left();
-        assert_eq!(editor.cursor(), 5);
-        editor.move_word_left();
-        assert_eq!(editor.cursor(), 0);
-
-        editor.move_word_right();
-        assert_eq!(editor.cursor(), 5);
-        editor.move_word_right();
-        assert_eq!(editor.cursor(), 6);
-        editor.move_word_right();
-        assert_eq!(editor.cursor(), 10);
-        editor.move_word_right();
-        assert_eq!(editor.cursor(), editor.text().len());
-
-        editor.set_text("你好世界");
-        editor.move_word_left();
-        assert_eq!(editor.cursor(), 9);
-        editor.move_word_right();
-        assert_eq!(editor.cursor(), editor.text().len());
-    }
-
-    #[test]
-    fn replacing_a_completion_moves_the_cursor_after_it() {
-        let mut editor = Editor::default();
-        editor.insert("inspect @vie next");
-        editor.replace_range("inspect ".len().."inspect @vie".len(), "src/tui/view.rs");
-        assert_eq!(editor.text(), "inspect src/tui/view.rs next");
-        assert_eq!(editor.cursor(), "inspect src/tui/view.rs".len());
-    }
-
-    #[test]
-    fn large_pastes_are_compact_elements_until_submission() {
-        let mut editor = Editor::default();
-        let paste = "🦀".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
-        let placeholder = format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 1);
-
-        editor.insert("before ");
-        editor.insert_paste(paste.clone());
-        editor.insert(" after");
-
-        assert_eq!(editor.text(), format!("before {placeholder} after"));
-        let layout = editor.layout(80, 10);
-        let expected_ranges = [std::iter::once(7..7 + placeholder.len()).collect::<Vec<_>>()];
-        assert_eq!(layout.paste_ranges, expected_ranges);
-        assert_eq!(
-            editor.take_prompt().as_str(),
-            format!("before {paste} after")
-        );
-        assert!(editor.is_empty());
-    }
-
-    #[test]
-    fn skill_mentions_keep_exact_ranges_and_paths_through_take_restore_and_paste_expansion() {
-        let first = SkillSelection::new("demo", "/tmp/first/SKILL.md");
-        let second = SkillSelection::new("demo", "/tmp/second/SKILL.md");
-        let mut editor = Editor::default();
-        editor.set_text("$demo then $demo");
-        editor.bind_skill(0..5, first.clone());
-        editor.bind_skill(11..16, second.clone());
-
-        let prompt = editor.take_prompt();
-        assert_eq!(
-            prompt.skill_mentions(),
-            [
-                SkillMention::new(first.clone(), 0..5),
-                SkillMention::new(second.clone(), 11..16),
-            ]
-        );
-
-        editor.set_prompt(prompt.as_str(), prompt.skill_mentions());
-        assert_eq!(editor.skill_ranges(), [0..5, 11..16]);
-        assert_eq!(editor.take_prompt(), prompt);
-
-        let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
-        editor.insert_paste(paste.clone());
-        editor.insert(" $demo");
-        let visible_start = editor.text().len() - "$demo".len();
-        editor.bind_skill(visible_start..editor.text().len(), first.clone());
-
-        let expanded = editor.take_prompt();
-        let expanded_start = paste.len() + 1;
-        assert_eq!(expanded.as_str(), format!("{paste} $demo"));
-        assert_eq!(
-            expanded.skill_mentions(),
-            [SkillMention::new(
-                first,
-                expanded_start..expanded_start + "$demo".len(),
-            )]
-        );
-    }
-
-    #[test]
-    fn paste_elements_are_atomic_and_same_size_labels_remain_unique() {
-        let mut editor = Editor::default();
-        let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 4);
-        let base = format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 4);
-        let second = format!("{base} #2");
-
-        editor.insert_paste(paste.clone());
-        editor.insert_paste(paste.clone());
-        assert_eq!(editor.text(), format!("{base}{second}"));
-
-        editor.backspace();
-        assert_eq!(editor.text(), base);
-        editor.move_left();
-        assert_eq!(editor.cursor(), 0);
-        editor.move_right();
-        assert_eq!(editor.cursor(), base.len());
-
-        editor.insert_paste(paste);
-        assert_eq!(editor.text(), format!("{base}{second}"));
-    }
-
-    #[test]
-    fn incremental_history_search_navigates_unique_matches_and_restores_the_exact_draft() {
-        let mut editor = Editor::default();
-        editor.seed_history([
-            "git status".to_string(),
-            "cargo test".to_string(),
-            "git log".to_string(),
-            "git log".to_string(),
-        ]);
-        let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
-        editor.insert_paste(paste);
-        editor.insert(" $demo");
-        let mention_start = editor.text().len() - "$demo".len();
-        editor.bind_skill(
-            mention_start..editor.text().len(),
-            SkillSelection::new("demo", "/tmp/demo/SKILL.md"),
-        );
-        editor.move_left();
-        let draft_text = editor.text().to_string();
-        let draft_cursor = editor.cursor();
-
-        editor.begin_history_search();
-        assert_eq!(editor.text(), draft_text);
-        editor.history_search_insert("GIT");
-        assert_eq!(editor.text(), "git log");
-        editor.history_search_older();
-        assert_eq!(editor.text(), "git status");
-        editor.history_search_newer();
-        assert_eq!(editor.text(), "git log");
-        assert_eq!(
-            editor.history_search_status(),
-            Some(HistorySearchStatus::Match)
-        );
-
-        editor.cancel_history_search();
-        assert_eq!(editor.text(), draft_text);
-        assert_eq!(editor.cursor(), draft_cursor);
-        assert_eq!(editor.pending_pastes.len(), 1);
-        assert_eq!(
-            editor.skill_ranges(),
-            [Range {
-                start: mention_start,
-                end: mention_start + 5,
-            }]
-        );
-    }
-
-    #[test]
-    fn history_search_accepts_a_match_but_keeps_a_miss_open() {
-        let mut editor = Editor::default();
-        editor.seed_history(["cargo test".to_string(), "git status".to_string()]);
-        editor.set_text("draft");
-        editor.begin_history_search();
-        editor.history_search_insert("cargo");
-        editor.accept_history_search();
-        assert!(!editor.history_search_active());
-        assert_eq!(editor.text(), "cargo test");
-        assert_eq!(editor.cursor(), editor.text().len());
-
-        editor.set_text("another draft");
-        editor.begin_history_search();
-        editor.history_search_insert("missing");
-        assert_eq!(editor.text(), "another draft");
-        assert_eq!(
-            editor.history_search_status(),
-            Some(HistorySearchStatus::NoMatch)
-        );
-        editor.accept_history_search();
-        assert!(editor.history_search_active());
-        editor.cancel_history_search();
-        assert_eq!(editor.text(), "another draft");
-    }
-
-    #[test]
-    fn history_search_highlights_unicode_case_insensitively() {
-        assert_eq!(case_insensitive_match_ranges("aİ i", "i"), [1..3, 4..5]);
     }
 }

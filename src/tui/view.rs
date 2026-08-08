@@ -1,3 +1,8 @@
+use super::bottom_pane::selection_popup_common::MAX_POPUP_ROWS;
+use super::bottom_pane::selection_popup_common::measure_text_height;
+use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
+use super::bottom_pane::selection_popup_common::render_menu_surface;
+use super::clipboard_paste;
 use super::context_window::ContextAction;
 use super::context_window::ContextWindowView;
 use super::editor;
@@ -6,6 +11,9 @@ use super::file_search::FileSearchPopup;
 use super::file_search::FileSearchUpdate;
 use super::file_search::is_horizontal_whitespace;
 use super::markdown;
+use super::markdown_cache::MarkdownRenderCache;
+use super::palette;
+use super::palette::TerminalColors;
 use super::pending_input::PendingInput;
 use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
@@ -13,6 +21,8 @@ use super::resume_picker::ResumePickerAction;
 use super::skill_popup::SkillPopup;
 use super::skills_view::SkillsView;
 use super::skills_view::SkillsViewAction;
+use super::terminal_hyperlinks;
+use super::terminal_hyperlinks::HyperlinkLine;
 use super::tool_catalogue::CatalogueAction;
 use super::tool_catalogue::ToolCatalogueView;
 use crate::MODEL;
@@ -24,6 +34,7 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
+use crate::quality_loop::LoopProgress;
 use crate::rollout::SessionTranscriptItem;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
@@ -49,7 +60,6 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
 use ratatui::widgets::Block;
-use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
@@ -78,7 +88,23 @@ const MAX_PATCH_PREVIEW_ROW_BYTES: usize = 2 * 1024;
 const ACTIVITY_COMPOSER_GAP: u16 = 1;
 const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
+const LOOP_LINE_HEIGHT: u16 = 1;
+const LOOP_INDENT: &str = "  ";
+const LOOP_SEPARATOR: &str = " · ";
+const LOOP_NAME_COLOR: Color = Color::Indexed(245);
+const LOOP_FIELD_COLOR: Color = Color::Indexed(243);
+const LOOP_SEPARATOR_COLOR: Color = Color::Indexed(240);
 const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "loop",
+        aliases: &[],
+        description: "run a task-specific evaluator and improvement loop",
+    },
+    SlashCommand {
+        name: "review",
+        aliases: &[],
+        description: "thoroughly review and refactor a specified target",
+    },
     SlashCommand {
         name: "clear",
         aliases: &[],
@@ -130,6 +156,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "manage installed skills and invocation policy",
     },
     SlashCommand {
+        name: "tmux",
+        aliases: &[],
+        description: "move this live session into tmux",
+    },
+    SlashCommand {
         name: "tools",
         aliases: &[],
         description: "inspect the active tool catalogue",
@@ -138,6 +169,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "stop",
         aliases: &[],
         description: "stop all background terminals",
+    },
+    SlashCommand {
+        name: "logout",
+        aliases: &[],
+        description: "log out of bettercodex",
     },
     SlashCommand {
         name: "quit",
@@ -165,12 +201,20 @@ pub(super) enum Action {
     },
     ShowContext,
     ShowDiff,
+    EnterTmux,
+    Logout,
     StopBackgroundProcesses,
     UpdateSkill {
         path: PathBuf,
         update: SkillUpdate,
     },
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InterruptIntent {
+    StopTurn,
+    SubmitSteering,
 }
 
 pub(super) struct View {
@@ -190,11 +234,12 @@ pub(super) struct View {
     background_processes: Vec<BackgroundProcess>,
     busy: bool,
     action_required: bool,
-    interrupting: bool,
+    interrupting: Option<InterruptIntent>,
     working_since: Option<Instant>,
     turn_had_work: bool,
     reasoning_status: ReasoningStatus,
     status_detail: Option<String>,
+    loop_progress: Option<LoopProgress>,
     pending_input: PendingInput,
     terminal_assistant_received_this_turn: bool,
     active_message_phase: Option<MessagePhase>,
@@ -210,8 +255,8 @@ pub(super) struct PreparedView {
     width: u16,
     height: u16,
     active_height: u16,
-    active_lines: Vec<Line<'static>>,
-    history_lines: Vec<Line<'static>>,
+    active_lines: Vec<HyperlinkLine>,
+    history_lines: Vec<HyperlinkLine>,
 }
 
 impl PreparedView {
@@ -219,19 +264,19 @@ impl PreparedView {
         self.height
     }
 
-    pub(super) fn take_history_lines(&mut self) -> Vec<Line<'static>> {
+    pub(super) fn take_history_lines(&mut self) -> Vec<HyperlinkLine> {
         std::mem::take(&mut self.history_lines)
     }
 }
 
 #[derive(Debug)]
 enum TranscriptEntry {
-    User(UserPrompt),
+    User(DisplayedUserPrompt),
     Assistant {
         text: String,
         phase: Option<MessagePhase>,
         streaming: bool,
-        rendered: Option<RenderedAssistant>,
+        rendered: MarkdownRenderCache,
         history: StreamedAssistantHistory,
     },
     Tool(ToolEntry),
@@ -249,9 +294,60 @@ enum TranscriptEntry {
 }
 
 #[derive(Debug)]
-struct RenderedAssistant {
-    width: u16,
-    lines: Vec<Line<'static>>,
+struct DisplayedUserPrompt {
+    text: String,
+    model_text: String,
+    skill_mentions: Vec<crate::skills::SkillMention>,
+    image_ranges: Vec<std::ops::Range<usize>>,
+    image_count: usize,
+}
+
+impl DisplayedUserPrompt {
+    fn from_prompt(prompt: &UserPrompt) -> Self {
+        Self {
+            text: prompt.as_str().to_string(),
+            model_text: prompt.text_without_image_placeholders(),
+            skill_mentions: prompt.skill_mentions().to_vec(),
+            image_ranges: prompt
+                .image_attachments()
+                .iter()
+                .map(|attachment| attachment.range().clone())
+                .collect(),
+            image_count: prompt.image_count(),
+        }
+    }
+
+    fn replayed(mut text: String, image_count: usize) -> Self {
+        let model_text = text.clone();
+        let mut image_ranges = Vec::with_capacity(image_count);
+        for index in 0..image_count {
+            if !text.trim().is_empty() || index > 0 {
+                text.push_str("\n\n");
+            }
+            let start = text.len();
+            text.push_str(&format!("[Image {}]", index + 1));
+            image_ranges.push(start..text.len());
+        }
+        Self {
+            text,
+            model_text,
+            skill_mentions: Vec::new(),
+            image_ranges,
+            image_count,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn skill_mentions(&self) -> &[crate::skills::SkillMention] {
+        &self.skill_mentions
+    }
+
+    fn image_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.image_ranges
+    }
 }
 
 /// Rows from an in-flight assistant cell that have already moved into terminal scrollback.
@@ -262,7 +358,7 @@ struct RenderedAssistant {
 struct StreamedAssistantHistory {
     width: Option<u16>,
     started: bool,
-    lines: Vec<Line<'static>>,
+    lines: Vec<HyperlinkLine>,
 }
 
 #[derive(Debug)]
@@ -288,7 +384,7 @@ enum ToolDisplay {
     Papercut,
     Plan(PlanDisplay),
     ViewImage(String),
-    WebSearch(codex_protocol::models::WebSearchAction),
+    WebSearch(Vec<crate::web_search::WebActivity>),
     Other,
 }
 
@@ -393,21 +489,14 @@ enum Overlay {
     Tools(ToolCatalogueView),
 }
 
-#[derive(Clone, Copy)]
-struct TerminalColors {
-    foreground: (u8, u8, u8),
-    background: (u8, u8, u8),
-}
-
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
-static TERMINAL_COLORS: OnceLock<TerminalColors> = OnceLock::new();
 
 impl View {
     pub(super) fn new(cwd: &Path) -> Self {
-        Self::with_skills(cwd, Vec::new())
+        Self::with_state(cwd, Vec::new())
     }
 
-    pub(super) fn with_skills(cwd: &Path, skills: Vec<Skill>) -> Self {
+    fn with_state(cwd: &Path, skills: Vec<Skill>) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             repository: Repository::discover(cwd),
@@ -425,11 +514,12 @@ impl View {
             background_processes: Vec::new(),
             busy: false,
             action_required: false,
-            interrupting: false,
+            interrupting: None,
             working_since: None,
             turn_had_work: false,
             reasoning_status: ReasoningStatus::default(),
             status_detail: None,
+            loop_progress: None,
             pending_input: PendingInput::default(),
             terminal_assistant_received_this_turn: false,
             active_message_phase: None,
@@ -448,12 +538,7 @@ impl View {
         background: Option<(u8, u8, u8)>,
     ) {
         self.user_message_style = user_message_style_for(background);
-        if let (Some(foreground), Some(background)) = (foreground, background) {
-            let _ = TERMINAL_COLORS.set(TerminalColors {
-                foreground,
-                background,
-            });
-        }
+        palette::set_terminal_colors(foreground, background);
     }
 
     pub(super) fn seed_prompt_history(&mut self, history: impl IntoIterator<Item = String>) {
@@ -463,6 +548,9 @@ impl View {
     pub(super) fn set_skills(&mut self, skills: Vec<Skill>) {
         self.skills = skills;
         self.skill_popup.hide();
+        if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
+            skills.clear_error();
+        }
     }
 
     pub(super) fn skill_update_failed(&mut self, error: impl Into<String>) {
@@ -473,6 +561,21 @@ impl View {
             self.entries
                 .push(TranscriptEntry::Error(markdown::sanitize(&error)));
         }
+    }
+
+    pub(super) fn tmux_handoff_succeeded(&mut self, session_name: &str) {
+        self.entries.push(TranscriptEntry::Notice(format!(
+            "This live session is now in tmux session {session_name}. Reattach with `tmux attach -t {session_name}`."
+        )));
+    }
+
+    pub(super) fn tmux_handoff_failed(&mut self, error: impl AsRef<str>) {
+        self.entries
+            .push(TranscriptEntry::Error(markdown::sanitize(error.as_ref())));
+    }
+
+    pub(super) fn request_terminal_reflow(&mut self) {
+        self.resize_reflow_requested = true;
     }
 
     pub(super) fn add_notice(&mut self, notice: impl Into<String>) {
@@ -498,13 +601,17 @@ impl View {
     pub(super) fn start_turn(&mut self, prompt: impl Into<UserPrompt>) {
         let prompt = prompt.into();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::User(prompt));
+        self.entries
+            .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
+                &prompt,
+            )));
         self.busy = true;
         self.action_required = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
+        self.loop_progress = None;
         self.status_detail = None;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
@@ -515,7 +622,7 @@ impl View {
         self.context_tokens = None;
         self.busy = true;
         self.action_required = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
@@ -527,7 +634,10 @@ impl View {
     pub(super) fn add_user_message(&mut self, prompt: &UserPrompt) {
         self.close_streaming_entries();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::User(prompt.clone()));
+        self.entries
+            .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
+                prompt,
+            )));
         self.reasoning_status.reset();
         self.status_detail = None;
     }
@@ -548,10 +658,6 @@ impl View {
         self.pending_input.has_steers()
     }
 
-    pub(super) fn take_pending_steers(&mut self) -> Vec<UserPrompt> {
-        self.pending_input.take_steers()
-    }
-
     pub(super) fn restore_pending_input_to_composer(&mut self) {
         let prompts = self.pending_input.take_all();
         self.restore_prompts_to_composer(prompts);
@@ -563,11 +669,9 @@ impl View {
         }
         let restored = UserPrompt::joined(prompts);
         if self.editor.is_empty() {
-            self.editor
-                .set_prompt(restored.as_str(), restored.skill_mentions());
+            self.editor.set_user_prompt(&restored);
         } else {
-            let text = format!("{}\n\n", restored.as_str());
-            self.editor.prepend_prompt(&text, restored.skill_mentions());
+            self.editor.prepend_user_prompt(&restored);
         }
         self.file_search.dismiss();
         self.skill_popup.hide();
@@ -575,7 +679,10 @@ impl View {
         self.slash_selection = 0;
     }
 
-    pub(super) fn finish_turn(&mut self, result: anyhow::Result<SubmitOutcome>) {
+    pub(super) fn finish_turn(
+        &mut self,
+        result: anyhow::Result<SubmitOutcome>,
+    ) -> Option<UserPrompt> {
         self.close_streaming_entries();
         self.seal_exploration();
         self.finish_incomplete_tools();
@@ -585,7 +692,8 @@ impl View {
             .map(|started| started.elapsed().as_secs());
         let turn_had_work = std::mem::take(&mut self.turn_had_work);
         self.busy = false;
-        self.interrupting = false;
+        self.loop_progress = None;
+        let interrupt_intent = self.interrupting.take();
         self.reasoning_status.reset();
         self.status_detail = None;
         self.action_required = result.is_err();
@@ -596,7 +704,7 @@ impl View {
                         text: answer,
                         phase: Some(MessagePhase::FinalAnswer),
                         streaming: false,
-                        rendered: None,
+                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     });
                 }
@@ -604,22 +712,39 @@ impl View {
                     self.entries
                         .push(TranscriptEntry::FinalMessageSeparator { elapsed_seconds });
                 }
+                None
             }
-            Ok(SubmitOutcome::Cancelled) => self
-                .entries
-                .push(TranscriptEntry::Notice("Turn interrupted".to_string())),
-            Err(error) => self
-                .entries
-                .push(TranscriptEntry::Error(markdown::sanitize(&format!(
-                    "{error:#}"
-                )))),
+            Ok(SubmitOutcome::Cancelled) => {
+                let steers = if interrupt_intent == Some(InterruptIntent::SubmitSteering) {
+                    self.pending_input.take_steers()
+                } else {
+                    Vec::new()
+                };
+                if steers.is_empty() {
+                    self.entries
+                        .push(TranscriptEntry::Notice("Turn interrupted".to_string()));
+                    None
+                } else {
+                    self.entries.push(TranscriptEntry::Notice(
+                        "Model interrupted to submit steering input".to_string(),
+                    ));
+                    Some(UserPrompt::joined(steers))
+                }
+            }
+            Err(error) => {
+                self.entries
+                    .push(TranscriptEntry::Error(markdown::sanitize(&format!(
+                        "{error:#}"
+                    ))));
+                None
+            }
         }
     }
 
     pub(super) fn finish_compaction(&mut self, result: anyhow::Result<CompactionOutcome>) {
         self.working_since = None;
         self.busy = false;
-        self.interrupting = false;
+        self.interrupting = None;
         self.reasoning_status.reset();
         self.status_detail = None;
         self.action_required = result.is_err();
@@ -639,9 +764,9 @@ impl View {
         }
     }
 
-    pub(super) fn set_interrupting(&mut self) {
+    pub(super) fn set_interrupting(&mut self, intent: InterruptIntent) {
         if self.busy {
-            self.interrupting = true;
+            self.interrupting = Some(intent);
             self.status_detail = None;
         }
     }
@@ -697,8 +822,8 @@ impl View {
             .iter()
             .filter_map(|entry| match entry {
                 TranscriptEntry::User(prompt) => Some(SessionTranscriptItem::User {
-                    text: prompt.as_str().to_string(),
-                    image_count: 0,
+                    text: prompt.model_text.clone(),
+                    image_count: prompt.image_count,
                 }),
                 TranscriptEntry::Assistant {
                     text,
@@ -718,22 +843,15 @@ impl View {
         self.overlay = Some(Overlay::Context(ContextWindowView::new(snapshot)));
     }
 
-    pub(super) fn show_resume_picker(&mut self, current_session: Uuid) {
-        self.overlay = Some(Overlay::Resume(ResumePicker::loading(
-            &self.cwd,
-            current_session,
-        )));
+    pub(super) fn show_resume_picker(&mut self) {
+        self.overlay = Some(Overlay::Resume(ResumePicker::loading(&self.cwd)));
     }
 
-    pub(super) fn show_resume_progress(&mut self, current_session: Uuid, target: Uuid) {
+    pub(super) fn show_resume_progress(&mut self, target: Uuid) {
         if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
             picker.begin_resume(target);
         } else {
-            self.overlay = Some(Overlay::Resume(ResumePicker::resuming(
-                &self.cwd,
-                current_session,
-                target,
-            )));
+            self.overlay = Some(Overlay::Resume(ResumePicker::resuming(&self.cwd, target)));
         }
     }
 
@@ -771,27 +889,14 @@ impl View {
     ) {
         self.entries
             .extend(transcript.into_iter().map(|item| match item {
-                SessionTranscriptItem::User {
-                    mut text,
-                    image_count,
-                } => {
-                    if image_count > 0 {
-                        if !text.trim().is_empty() {
-                            text.push_str("\n\n");
-                        }
-                        if image_count == 1 {
-                            text.push_str("[Image attachment]");
-                        } else {
-                            text.push_str(&format!("[{image_count} image attachments]"));
-                        }
-                    }
-                    TranscriptEntry::User(UserPrompt::text(text))
+                SessionTranscriptItem::User { text, image_count } => {
+                    TranscriptEntry::User(DisplayedUserPrompt::replayed(text, image_count))
                 }
                 SessionTranscriptItem::Assistant { text, phase } => TranscriptEntry::Assistant {
                     text,
                     phase,
                     streaming: false,
-                    rendered: None,
+                    rendered: MarkdownRenderCache::default(),
                     history: StreamedAssistantHistory::default(),
                 },
             }));
@@ -806,7 +911,7 @@ impl View {
         skills: Vec<Skill>,
     ) {
         let user_message_style = self.user_message_style;
-        *self = Self::with_skills(cwd, skills);
+        *self = Self::with_state(cwd, skills);
         self.user_message_style = user_message_style;
         self.context_tokens = context_tokens;
         self.replay_transcript(transcript);
@@ -855,7 +960,7 @@ impl View {
                         text: message.text,
                         phase: self.active_message_phase.clone(),
                         streaming: true,
-                        rendered: None,
+                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     });
                 }
@@ -865,19 +970,15 @@ impl View {
                 self.seal_exploration();
                 match self.entries.last_mut() {
                     Some(TranscriptEntry::Assistant {
-                        text,
-                        streaming,
-                        rendered,
-                        ..
+                        text, streaming, ..
                     }) if *streaming => {
                         text.push_str(&delta);
-                        *rendered = None;
                     }
                     _ => self.entries.push(TranscriptEntry::Assistant {
                         text: delta,
                         phase: self.active_message_phase.clone(),
                         streaming: true,
-                        rendered: None,
+                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     }),
                 }
@@ -966,6 +1067,8 @@ impl View {
                 self.status_detail = Some("Compacting conversation".to_string());
             }
             AgentEvent::CompactionCompleted => self.status_detail = self.latest_tool_activity(),
+            AgentEvent::LoopProgress(progress) => self.loop_progress = Some(progress),
+            AgentEvent::LoopProgressCleared => self.loop_progress = None,
         }
     }
 
@@ -992,7 +1095,11 @@ impl View {
             Event::Paste(_) if self.overlay.is_some() => Action::None,
             Event::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                self.editor.insert_paste(text);
+                if let Some(image) = clipboard_paste::image_from_pasted_path(&text) {
+                    self.attach_image(image);
+                } else {
+                    self.editor.insert_paste(text);
+                }
                 self.dismissed_slash = None;
                 self.slash_selection = 0;
                 Action::None
@@ -1041,7 +1148,21 @@ impl View {
             return self.handle_history_search_key(key);
         }
         if control && key.code == KeyCode::Char('c') {
-            return Action::Quit;
+            if self.overlay.is_some() {
+                self.overlay = None;
+                return Action::None;
+            }
+            if !self.editor.is_empty() {
+                self.editor.set_text("");
+                self.file_search.hide();
+                self.skill_popup.hide();
+                return Action::None;
+            }
+            return if self.busy {
+                Action::Cancel
+            } else {
+                Action::Quit
+            };
         }
         if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
             return match skills.handle_key(key, &self.skills) {
@@ -1173,26 +1294,42 @@ impl View {
 
         let slash_matches = self.slash_matches();
         if !slash_matches.is_empty() {
+            let plain = key.modifiers == KeyModifiers::NONE;
+            let control_only = key.modifiers == KeyModifiers::CONTROL;
+            let selected = self.slash_selection.min(slash_matches.len() - 1);
+            if (plain && key.code == KeyCode::Up)
+                || (control_only && key.code == KeyCode::Char('p'))
+            {
+                self.slash_selection = if selected == 0 {
+                    slash_matches.len() - 1
+                } else {
+                    selected - 1
+                };
+                return Action::None;
+            }
+            if (plain && key.code == KeyCode::Down)
+                || (control_only && key.code == KeyCode::Char('n'))
+            {
+                self.slash_selection = (selected + 1) % slash_matches.len();
+                return Action::None;
+            }
             match key.code {
                 KeyCode::Enter if !shift && !alt && !control => {
-                    let selection = self.slash_selection.min(slash_matches.len() - 1);
-                    self.complete_slash_command(slash_matches[selection], selection);
+                    let command = slash_matches[selected];
+                    self.complete_slash_command(command, selected);
+                    if command.name == "loop" {
+                        self.editor.insert(" ");
+                        return Action::None;
+                    }
                     return self.submit_action();
                 }
                 KeyCode::Tab => {
-                    let selection = self.slash_selection.min(slash_matches.len() - 1);
-                    self.complete_slash_command(slash_matches[selection], selection);
-                    return Action::None;
-                }
-                KeyCode::Up => {
-                    self.slash_selection = self
-                        .slash_selection
-                        .min(slash_matches.len() - 1)
-                        .saturating_sub(1);
-                    return Action::None;
-                }
-                KeyCode::Down => {
-                    self.slash_selection = (self.slash_selection + 1).min(slash_matches.len() - 1);
+                    let command = slash_matches[selected];
+                    self.complete_slash_command(command, selected);
+                    if command.name == "skills" {
+                        return self.submit_action();
+                    }
+                    self.editor.insert(" ");
                     return Action::None;
                 }
                 _ => {}
@@ -1223,10 +1360,11 @@ impl View {
             KeyCode::Char('h') if control && alt && !shift => {
                 self.editor.delete_previous_word();
             }
-            KeyCode::Char('l') if control => {}
             KeyCode::Char('b') if alt && !control => self.editor.move_word_left(),
             KeyCode::Char('f') if alt && !control => self.editor.move_word_right(),
-            KeyCode::Char(character) if (!control && !alt) || (control && alt) => {
+            KeyCode::Char(character)
+                if ((!control && !alt) || (control && alt)) && !character.is_control() =>
+            {
                 let mut bytes = [0; 4];
                 self.editor.insert(character.encode_utf8(&mut bytes));
             }
@@ -1277,7 +1415,7 @@ impl View {
             KeyCode::Backspace => self.editor.history_search_backspace(),
             KeyCode::Char('h') if control => self.editor.history_search_backspace(),
             KeyCode::Char('u') if control => self.editor.history_search_clear(),
-            KeyCode::Char(character) if !control && !alt => {
+            KeyCode::Char(character) if !control && !alt && !character.is_control() => {
                 let mut bytes = [0; 4];
                 self.editor
                     .history_search_insert(character.encode_utf8(&mut bytes));
@@ -1288,9 +1426,11 @@ impl View {
     }
 
     fn complete_slash_command(&mut self, command: &SlashCommand, selection: usize) {
-        let query = self.editor.text().strip_prefix('/').unwrap_or_default();
-        let name = command.completion_name(query);
-        self.editor.set_text(format!("/{name}"));
+        let Some((query, range)) = self.editor.slash_command_query() else {
+            return;
+        };
+        let name = command.completion_name(&query);
+        self.editor.replace_range(range, &format!("/{name}"));
         self.dismissed_slash = None;
         self.slash_selection = selection;
     }
@@ -1332,15 +1472,29 @@ impl View {
         }
     }
 
+    fn attach_image(&mut self, image: Result<crate::input::PromptImage, String>) {
+        let result = image.and_then(|image| self.editor.attach_image(image));
+        if let Err(error) = result {
+            self.entries.push(TranscriptEntry::Error(format!(
+                "Failed to attach image: {error}"
+            )));
+        }
+        self.file_search.dismiss();
+        self.skill_popup.hide();
+        self.dismissed_slash = None;
+        self.slash_selection = 0;
+    }
+
     fn submit_action(&mut self) -> Action {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
         let prompt = self.editor.take_prompt();
-        let text = prompt.as_str().to_string();
-        self.editor.remember(&text);
-        let command = text.trim();
-        if let Some(shell_command) = command.strip_prefix('!') {
+        let history_text = prompt.text_without_image_placeholders();
+        self.editor.remember(&history_text);
+        let command = history_text.trim();
+        let local_command = prompt.image_count() == 0;
+        if local_command && let Some(shell_command) = command.strip_prefix('!') {
             let shell_command = shell_command.trim();
             if shell_command.is_empty() {
                 self.entries.push(TranscriptEntry::Notice(
@@ -1353,7 +1507,8 @@ impl View {
                 history_text: command.to_string(),
             };
         }
-        if let Some(arguments) = command.strip_prefix("/resume")
+        if local_command
+            && let Some(arguments) = command.strip_prefix("/resume")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
             if self.busy {
@@ -1376,7 +1531,22 @@ impl View {
                 }
             };
         }
+        if local_command
+            && let Some(arguments) = command.strip_prefix("/tmux")
+            && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
+        {
+            return match arguments.trim() {
+                "" => Action::EnterTmux,
+                _ => {
+                    self.entries.push(TranscriptEntry::Error(
+                        "`/tmux` does not accept arguments".to_string(),
+                    ));
+                    Action::None
+                }
+            };
+        }
         match command {
+            _ if !local_command => Action::Submit(prompt),
             "/q" | "/quit" | "/exit" => Action::Quit,
             "/compact" if self.busy => {
                 self.entries.push(TranscriptEntry::Error(
@@ -1403,10 +1573,7 @@ impl View {
             "/clear" => Action::Clear,
             "/context" => Action::ShowContext,
             "/help" => {
-                self.entries.push(TranscriptEntry::Notice(
-                    "Enter submit/steer · !command run shell · Ctrl+R search history · Ctrl+O copy latest answer · Tab queue follow-up · Alt+Up edit queue · Up/Down history · Option+Left/Right jump by word · Option+Backspace delete word · @ files · $ skills · Shift+Enter newline · Esc interrupt · Ctrl+C exit"
-                        .to_string(),
-                ));
+                self.overlay = Some(Overlay::Shortcuts);
                 Action::None
             }
             "/ps" => Action::ListBackgroundProcesses,
@@ -1425,6 +1592,13 @@ impl View {
                 Action::None
             }
             "/stop" => Action::StopBackgroundProcesses,
+            "/logout" if self.busy => {
+                self.entries.push(TranscriptEntry::Notice(
+                    "Interrupt the active turn before logging out".to_string(),
+                ));
+                Action::None
+            }
+            "/logout" => Action::Logout,
             _ => Action::Submit(prompt),
         }
     }
@@ -1433,7 +1607,7 @@ impl View {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
-        if is_local_command(self.editor.text().trim()) {
+        if self.editor.image_count() == 0 && is_local_command(self.editor.text().trim()) {
             self.entries.push(TranscriptEntry::Notice(
                 "Slash commands cannot be queued; use Enter or wait for the active turn"
                     .to_string(),
@@ -1441,8 +1615,8 @@ impl View {
             return Action::None;
         }
         let prompt = self.editor.take_prompt();
-        let text = prompt.as_str().to_string();
-        self.editor.remember(&text);
+        self.editor
+            .remember(&prompt.text_without_image_placeholders());
         Action::Queue(prompt)
     }
 
@@ -1485,14 +1659,13 @@ impl View {
                 *text = message.text;
                 *phase = message.phase;
                 *streaming = false;
-                *rendered = None;
             }
             _ if !message.text.trim().is_empty() => {
                 self.entries.push(TranscriptEntry::Assistant {
                     text: message.text,
                     phase: message.phase,
                     streaming: false,
-                    rendered: None,
+                    rendered: MarkdownRenderCache::default(),
                     history: StreamedAssistantHistory::default(),
                 });
             }
@@ -1580,12 +1753,12 @@ impl View {
             })
     }
 
-    pub(super) fn take_pending_history_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    pub(super) fn take_pending_history_lines(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let width = width.max(1);
         let mut lines = Vec::new();
         if self.welcome_pending {
             append_history_cell(
-                welcome_lines(&self.cwd, width),
+                terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(&self.cwd, width)),
                 &mut lines,
                 &mut self.history_emitted,
             );
@@ -1597,8 +1770,11 @@ impl View {
             .is_some_and(TranscriptEntry::is_finalized)
         {
             let entry = &mut self.entries[self.committed_entries];
-            let (cell, continuation) =
-                entry.display_lines_after_streamed_history(width, self.user_message_style);
+            let (cell, continuation) = entry.display_lines_after_streamed_history(
+                width,
+                self.user_message_style,
+                &self.cwd,
+            );
             if continuation {
                 lines.extend(cell);
             } else {
@@ -1615,7 +1791,7 @@ impl View {
     /// A terminal can reflow the mutable composer into scrollback before crossterm delivers the
     /// resize event. Codex repairs that state by clearing its terminal surface and replaying the
     /// retained transcript at the new width instead of trusting terminal-wrapped rows.
-    pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<Line<'static>> {
+    pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let width = width.max(1);
         for entry in &mut self.entries {
             entry.reset_streamed_history();
@@ -1630,10 +1806,14 @@ impl View {
 
         let mut lines = Vec::new();
         let mut emitted = false;
-        append_history_cell(welcome_lines(&self.cwd, width), &mut lines, &mut emitted);
+        append_history_cell(
+            terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(&self.cwd, width)),
+            &mut lines,
+            &mut emitted,
+        );
         for entry in &mut self.entries[..self.committed_entries] {
             append_history_cell(
-                entry.display_lines(width, self.user_message_style),
+                entry.display_lines(width, self.user_message_style, &self.cwd),
                 &mut lines,
                 &mut emitted,
             );
@@ -1650,9 +1830,10 @@ impl View {
     /// from the retained source before the finalized suffix is inserted.
     pub(super) fn streamed_history_needs_reflow(&mut self, width: u16) -> bool {
         let width = width.max(1);
+        let cwd = &self.cwd;
         self.entries[self.committed_entries..]
             .iter_mut()
-            .any(|entry| entry.streamed_history_needs_reflow(width))
+            .any(|entry| entry.streamed_history_needs_reflow(width, cwd))
     }
 
     /// Move the oldest rendered rows of a growing assistant response into real terminal history.
@@ -1660,7 +1841,7 @@ impl View {
     /// Keeping at least one row live prevents an unterminated final line from being committed while
     /// it is still changing. In normal terminals the complete composer/status layout leaves a much
     /// larger mutable tail; only rows that would otherwise be clipped are emitted.
-    fn spill_streaming_history(&mut self, width: u16, live_capacity: usize) -> Vec<Line<'static>> {
+    fn spill_streaming_history(&mut self, width: u16, live_capacity: usize) -> Vec<HyperlinkLine> {
         let history_was_emitted = self.history_emitted;
         let Some(TranscriptEntry::Assistant {
             text,
@@ -1676,7 +1857,7 @@ impl View {
         if history.started && history.width != Some(width) {
             return Vec::new();
         }
-        let rendered = cached_assistant_lines(text, rendered, width);
+        let rendered = assistant_lines(text, width, &self.cwd, true, rendered);
         if history.lines.len() > rendered.len() {
             return Vec::new();
         }
@@ -1696,7 +1877,7 @@ impl View {
             history.width = Some(width);
             self.history_emitted = true;
             if history_was_emitted {
-                output.push(Line::default());
+                output.push(HyperlinkLine::default());
                 rows_to_spill = rows_to_spill.saturating_sub(1);
             }
         }
@@ -1766,8 +1947,13 @@ impl View {
             .max(1)
             .saturating_add(2);
         let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
-        let status_height = u16::from(self.busy);
-        let status_composer_spacing = ACTIVITY_COMPOSER_GAP.saturating_mul(status_height);
+        let activity_height = u16::from(self.has_activity_surface(width));
+        let loop_height = LOOP_LINE_HEIGHT.saturating_mul(u16::from(self.loop_progress.is_some()));
+        let activity_composer_height = if activity_height > 0 {
+            ACTIVITY_COMPOSER_GAP.max(loop_height)
+        } else {
+            loop_height
+        };
         let bottom_spacing: u16 = 1;
         let popup_height = self.completion_popup_height(width);
         // Match Codex's bottom-pane layout: an active completion list replaces the footer and
@@ -1778,17 +1964,17 @@ impl View {
             COMPOSER_FOOTER_GAP.saturating_add(STATUS_LINE_HEIGHT)
         };
         let overlay_height = match self.overlay.as_ref() {
-            Some(Overlay::Shortcuts) => 17,
+            Some(Overlay::Shortcuts) => shortcuts_height(width),
             Some(Overlay::Context(context)) => context.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
-            Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills),
+            Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills, width),
             Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
             None => 0,
         };
         let transcript_chrome_height = bottom_spacing
             .saturating_add(pending_height)
-            .saturating_add(status_height)
-            .saturating_add(status_composer_spacing)
+            .saturating_add(activity_height)
+            .saturating_add(activity_composer_height)
             .saturating_add(composer_height)
             .saturating_add(trailing_height);
         (transcript_chrome_height, overlay_height)
@@ -1815,6 +2001,8 @@ impl View {
         } else {
             self.completion_popup_height(area.width)
         };
+        let requested_loop_height =
+            LOOP_LINE_HEIGHT.saturating_mul(u16::from(self.loop_progress.is_some()));
         let requested_trailing_height = if popup_height > 0 {
             popup_height
         } else {
@@ -1826,22 +2014,26 @@ impl View {
         let trailing_height =
             requested_trailing_height.min(area.height.saturating_sub(minimum_composer_height));
         let height_above_trailing = area.height.saturating_sub(trailing_height);
-        let status_reserve = if self.busy {
-            STATUS_LINE_HEIGHT
-                .saturating_add(ACTIVITY_COMPOSER_GAP)
-                .min(height_above_trailing.saturating_sub(minimum_composer_height))
+        let has_activity_surface = self.has_activity_surface(area.width);
+        let requested_activity_height = u16::from(has_activity_surface);
+        let requested_activity_composer_height = if has_activity_surface {
+            ACTIVITY_COMPOSER_GAP.max(requested_loop_height)
         } else {
-            0
+            requested_loop_height
         };
+        let requested_pre_composer_height =
+            requested_activity_height.saturating_add(requested_activity_composer_height);
+        let pre_composer_height = requested_pre_composer_height
+            .min(height_above_trailing.saturating_sub(minimum_composer_height));
         let pending_lines = self.pending_input.lines();
         let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
         let pending_height = requested_pending_height.min(
             height_above_trailing
-                .saturating_sub(status_reserve)
+                .saturating_sub(pre_composer_height)
                 .saturating_sub(minimum_composer_height),
         );
         let composer_height_limit = height_above_trailing
-            .saturating_sub(status_reserve)
+            .saturating_sub(pre_composer_height)
             .saturating_sub(pending_height);
         let editor_height_limit = composer_height_limit.saturating_sub(2).max(1);
         let editor_layout = self
@@ -1864,24 +2056,21 @@ impl View {
         } else {
             Rect::default()
         };
-        let status_height = u16::from(self.busy && composer_y > area.y);
-        let status_composer_spacing = if status_height > 0 {
-            ACTIVITY_COMPOSER_GAP.min(
-                composer_y
-                    .saturating_sub(area.y)
-                    .saturating_sub(status_height),
-            )
-        } else {
-            0
-        };
-        let status_area = Rect::new(
+        // The loop replaces Codex's quiet activity-to-composer spacer. Keeping it in this
+        // interstitial row makes the loop read as nested live activity instead of a second footer.
+        let pre_composer_top = composer_y.saturating_sub(pre_composer_height);
+        let activity_height = requested_activity_height.min(pre_composer_height);
+        let activity_area = Rect::new(area.x, pre_composer_top, area.width, activity_height);
+        let interstitial_height = pre_composer_height.saturating_sub(activity_height);
+        let loop_height = requested_loop_height.min(interstitial_height);
+        let loop_area = Rect::new(
             area.x,
-            composer_y.saturating_sub(status_height + status_composer_spacing),
+            composer_y.saturating_sub(loop_height),
             area.width,
-            status_height,
+            loop_height,
         );
-        let pending_bottom = if status_height > 0 {
-            status_area.y
+        let pending_bottom = if pre_composer_height > 0 {
+            pre_composer_top
         } else {
             composer_area.y
         };
@@ -1893,8 +2082,8 @@ impl View {
         );
         let content_bottom = if pending_height > 0 {
             pending_area.y
-        } else if status_height > 0 {
-            status_area.y
+        } else if pre_composer_height > 0 {
+            pre_composer_top
         } else {
             composer_area.y
         };
@@ -1919,13 +2108,24 @@ impl View {
                 pending_area,
             );
         }
-        if status_height > 0 {
+        if activity_height > 0 {
+            let line = if self.busy {
+                self.working_line()
+            } else {
+                self.standalone_background_process_line(area.width)
+                    .expect("an idle activity surface requires background processes")
+            };
             frame.render_widget(
-                Paragraph::new(truncate_line(
-                    self.working_line(),
-                    usize::from(status_area.width),
-                )),
-                status_area,
+                Paragraph::new(truncate_line(line, usize::from(activity_area.width))),
+                activity_area,
+            );
+        }
+        if let Some(progress) = &self.loop_progress
+            && !loop_area.is_empty()
+        {
+            frame.render_widget(
+                Paragraph::new(loop_status_line(progress, loop_area.width)),
+                loop_area,
             );
         }
         self.render_composer(frame, composer_area, footer_area, editor_layout);
@@ -1934,10 +2134,14 @@ impl View {
         }
         match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
-            Some(Overlay::Context(context)) => context.render(frame, area),
+            Some(Overlay::Context(context)) => context.render(frame, area, self.user_message_style),
             Some(Overlay::Resume(picker)) => picker.render(frame, area),
-            Some(Overlay::Skills(skills)) => skills.render(frame, area, &self.skills),
-            Some(Overlay::Tools(catalogue)) => catalogue.render(frame, area),
+            Some(Overlay::Skills(skills)) => {
+                skills.render(frame, area, &self.skills, self.user_message_style)
+            }
+            Some(Overlay::Tools(catalogue)) => {
+                catalogue.render(frame, area, self.user_message_style)
+            }
             None => {}
         }
     }
@@ -1962,12 +2166,14 @@ impl View {
         if lines.is_empty() {
             return;
         }
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(terminal_hyperlinks::visible_lines_ref(&lines)))
+            .wrap(Wrap { trim: false });
         let overflow = usize::from(active_height).saturating_sub(usize::from(area.height));
         frame.render_widget(
             paragraph.scroll((u16::try_from(overflow).unwrap_or(u16::MAX), 0)),
             area,
         );
+        terminal_hyperlinks::mark_buffer_hyperlinks(frame.buffer_mut(), area, &lines, overflow);
     }
 
     fn render_composer(
@@ -1988,6 +2194,7 @@ impl View {
             lines,
             paste_ranges,
             skill_ranges,
+            image_ranges,
             history_search_ranges,
             cursor_row,
             cursor_column,
@@ -2014,6 +2221,10 @@ impl View {
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
                     skill_ranges
+                        .get(usize::from(index))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    image_ranges
                         .get(usize::from(index))
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
@@ -2066,36 +2277,34 @@ impl View {
     }
 
     fn render_shortcuts(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered(area, 62, 15);
-        frame.render_widget(Clear, popup);
-        let block = Block::default()
-            .title(" Keyboard shortcuts ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(RULE));
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        let lines = vec![
-            shortcut_line("Enter", "submit prompt"),
-            shortcut_line("Enter while working", "steer after current model step"),
-            shortcut_line("Tab while working", "queue a follow-up turn"),
-            shortcut_line("Alt+Up / Shift+Left", "edit last queued follow-up"),
-            shortcut_line("Option+Left / Right", "jump by word"),
-            shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
-            shortcut_line("@", "find and insert a file path"),
-            shortcut_line("$", "mention an installed skill"),
-            shortcut_line("Esc", "interrupt active turn"),
-            shortcut_line("Up / Down", "restore prompt history"),
-            shortcut_line(
-                "Ctrl+R / Ctrl+S",
-                "search prompt history backward / forward",
-            ),
-            shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
-            shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
-            shortcut_line("Ctrl+C", "exit"),
-            Line::from(""),
-            Line::from("Press any key to close").dim(),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
+        if area.is_empty() {
+            return;
+        }
+        frame.render_widget(Clear, area);
+        let footer_height = 1.min(area.height);
+        let content_area = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(footer_height),
+        );
+        let footer_area = Rect::new(area.x, content_area.bottom(), area.width, footer_height);
+        let inner = render_menu_surface(content_area, frame.buffer_mut(), self.user_message_style);
+        if !inner.is_empty() {
+            frame.render_widget(
+                Paragraph::new(shortcut_reference_lines()).wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
+        if !footer_area.is_empty() {
+            let hint_area = Rect::new(
+                footer_area.x.saturating_add(2),
+                footer_area.y,
+                footer_area.width.saturating_sub(2),
+                footer_area.height,
+            );
+            frame.render_widget(Paragraph::new("Press any key to go back").dim(), hint_area);
+        }
     }
 
     fn render_completion_popup(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -2138,6 +2347,11 @@ impl View {
             area.height,
         );
         let selected = self.slash_selection.min(matches.len() - 1);
+        let visible = MAX_POPUP_ROWS.min(matches.len());
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(matches.len().saturating_sub(visible));
         let query = self.editor.text().strip_prefix('/').unwrap_or_default();
         let name_width = matches
             .iter()
@@ -2147,6 +2361,8 @@ impl View {
         let lines = matches
             .iter()
             .enumerate()
+            .skip(start)
+            .take(visible)
             .map(|(index, command)| {
                 let mut spans = Vec::with_capacity(command.aliases.len().saturating_mul(4) + 5);
                 for (name_index, name) in command.names().enumerate() {
@@ -2172,9 +2388,7 @@ impl View {
                 spans.push(Span::from(command.description).dim());
                 let mut line = Line::from(spans);
                 if index == selected {
-                    let selected_style = Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD);
+                    let selected_style = palette::accent_style();
                     for span in &mut line.spans {
                         span.style = selected_style;
                     }
@@ -2186,7 +2400,7 @@ impl View {
     }
 
     fn slash_popup_height(&self, _width: u16) -> u16 {
-        u16::try_from(self.slash_matches().len()).unwrap_or(u16::MAX)
+        u16::try_from(MAX_POPUP_ROWS.min(self.slash_matches().len())).unwrap_or(u16::MAX)
     }
 
     fn completion_popup_height(&self, width: u16) -> u16 {
@@ -2203,19 +2417,15 @@ impl View {
         if self.editor.is_browsing_history() || self.editor.history_search_active() {
             return Vec::new();
         }
-        let text = self.editor.text();
-        if self.dismissed_slash.as_deref() == Some(text) {
+        if self.dismissed_slash.as_deref() == Some(self.editor.text()) {
             return Vec::new();
         }
-        let Some(query) = text.strip_prefix('/') else {
+        let Some((query, _)) = self.editor.slash_command_query() else {
             return Vec::new();
         };
-        if query.chars().any(char::is_whitespace) {
-            return Vec::new();
-        }
         SLASH_COMMANDS
             .iter()
-            .filter(|command| command.matches(query))
+            .filter(|command| command.matches(&query))
             .collect()
     }
 
@@ -2224,7 +2434,7 @@ impl View {
             .working_since
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        let heading = if self.interrupting {
+        let heading = if self.interrupting.is_some() {
             "Interrupting"
         } else if self.status_detail.as_deref() == Some("Compacting conversation") {
             "Compacting"
@@ -2258,7 +2468,149 @@ impl View {
             spans.push(Span::from(" · ").dim());
             spans.push(Span::from(format!("{queued_follow_ups} queued")).dim());
         }
+        if let Some(summary) = self.background_process_summary() {
+            spans.push(Span::from(" · ").dim());
+            spans.push(Span::from(summary).dim());
+        }
         Line::from(spans)
+    }
+}
+
+fn loop_status_line(progress: &LoopProgress, width: u16) -> Line<'static> {
+    let width = usize::from(width);
+    if width == 0 {
+        return Line::default();
+    }
+    let phase_width = UnicodeWidthStr::width(progress.phase.as_str());
+    let preferred_indent_width = UnicodeWidthStr::width(LOOP_INDENT);
+    let indent = if width >= phase_width.saturating_add(preferred_indent_width) {
+        LOOP_INDENT
+    } else {
+        ""
+    };
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(indent));
+    let diff = progress
+        .additions
+        .zip(progress.deletions)
+        .map(|(additions, deletions)| format!("+{additions} −{deletions}"));
+    if let Some(diff) = diff.as_deref() {
+        let fields = [
+            progress.name.as_str(),
+            progress.phase.as_str(),
+            diff,
+            progress.pulse.as_str(),
+        ];
+        if loop_fields_width(&fields) <= content_width {
+            return styled_loop_fields(&fields, indent, true);
+        }
+    }
+    let fields = [
+        progress.name.as_str(),
+        progress.phase.as_str(),
+        progress.pulse.as_str(),
+    ];
+    if loop_fields_width(&fields) <= content_width {
+        return styled_loop_fields(&fields, indent, true);
+    }
+
+    let fixed = loop_fields_width(&[progress.phase.as_str(), progress.pulse.as_str()])
+        .saturating_add(UnicodeWidthStr::width(LOOP_SEPARATOR));
+    if content_width > fixed {
+        let name = crate::quality_loop::truncate_width(
+            &progress.name,
+            content_width.saturating_sub(fixed),
+        );
+        if !name.is_empty() {
+            let fields = [
+                name.as_str(),
+                progress.phase.as_str(),
+                progress.pulse.as_str(),
+            ];
+            if loop_fields_width(&fields) <= content_width {
+                return styled_loop_fields(&fields, indent, true);
+            }
+        }
+    }
+
+    let separator_width = UnicodeWidthStr::width(LOOP_SEPARATOR);
+    if content_width > phase_width.saturating_add(separator_width) {
+        let pulse = crate::quality_loop::truncate_width(
+            &progress.pulse,
+            content_width
+                .saturating_sub(phase_width)
+                .saturating_sub(separator_width),
+        );
+        if !pulse.is_empty() {
+            return styled_loop_fields(&[progress.phase.as_str(), pulse.as_str()], indent, false);
+        }
+    }
+    let phase = crate::quality_loop::truncate_width(&progress.phase, content_width);
+    styled_loop_fields(&[phase.as_str()], indent, false)
+}
+
+fn loop_fields_width(fields: &[&str]) -> usize {
+    fields
+        .iter()
+        .map(|field| UnicodeWidthStr::width(*field))
+        .sum::<usize>()
+        .saturating_add(
+            fields
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(UnicodeWidthStr::width(LOOP_SEPARATOR)),
+        )
+}
+
+fn styled_loop_fields(fields: &[&str], indent: &str, first_is_name: bool) -> Line<'static> {
+    let mut spans = Vec::with_capacity(fields.len().saturating_mul(2));
+    if !indent.is_empty() {
+        spans.push(Span::from(indent.to_string()));
+    }
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                LOOP_SEPARATOR,
+                Style::default().fg(LOOP_SEPARATOR_COLOR),
+            ));
+        }
+        let color = if index == 0 && first_is_name {
+            LOOP_NAME_COLOR
+        } else {
+            LOOP_FIELD_COLOR
+        };
+        spans.push(Span::styled(
+            (*field).to_string(),
+            Style::default().fg(color),
+        ));
+    }
+    Line::from(spans)
+}
+
+impl View {
+    fn has_activity_surface(&self, width: u16) -> bool {
+        self.busy || (width >= 4 && !self.background_processes.is_empty())
+    }
+
+    fn background_process_summary(&self) -> Option<String> {
+        let count = self.background_processes.len();
+        if count == 0 {
+            return None;
+        }
+        let plural = if count == 1 { "" } else { "s" };
+        Some(format!(
+            "{count} background terminal{plural} running · /ps to view · /stop to close"
+        ))
+    }
+
+    fn standalone_background_process_line(&self, width: u16) -> Option<Line<'static>> {
+        if width < 4 {
+            return None;
+        }
+        let summary = self.background_process_summary()?;
+        Some(Line::from(vec![
+            Span::from("  ").dim(),
+            Span::from(summary).dim(),
+        ]))
     }
 
     fn status_line(&self, width: u16) -> Line<'static> {
@@ -2300,24 +2652,18 @@ impl View {
             format_context_usage(self.context_tokens),
             Style::default().fg(MUTED),
         ));
-        if !self.background_processes.is_empty() {
-            let count = self.background_processes.len();
-            let plural = if count == 1 { "" } else { "s" };
-            spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
-            spans.push(Span::styled(
-                format!("{count} background terminal{plural} · /ps · /stop"),
-                Style::default().fg(MUTED),
-            ));
-        }
         truncate_line(Line::from(spans), usize::from(width))
     }
 
-    fn active_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    fn active_lines(&mut self, width: u16) -> Vec<HyperlinkLine> {
         let mut lines = Vec::new();
         let mut emitted = self.history_emitted;
         for entry in &mut self.entries[self.committed_entries..] {
-            let (cell, continuation) =
-                entry.display_lines_after_streamed_history(width, self.user_message_style);
+            let (cell, continuation) = entry.display_lines_after_streamed_history(
+                width,
+                self.user_message_style,
+                &self.cwd,
+            );
             if continuation {
                 lines.extend(cell);
             } else {
@@ -2333,6 +2679,11 @@ fn is_local_command(command: &str) -> bool {
         return true;
     }
     if let Some(arguments) = command.strip_prefix("/resume")
+        && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
+    {
+        return true;
+    }
+    if let Some(arguments) = command.strip_prefix("/tmux")
         && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
     {
         return true;
@@ -2376,7 +2727,8 @@ impl TranscriptEntry {
         &mut self,
         width: u16,
         user_style: Style,
-    ) -> (Vec<Line<'static>>, bool) {
+        cwd: &Path,
+    ) -> (Vec<HyperlinkLine>, bool) {
         match self {
             Self::Assistant {
                 text,
@@ -2385,19 +2737,16 @@ impl TranscriptEntry {
                 history,
                 ..
             } if history.started && history.width == Some(width) => {
-                let rendered_lines = cached_assistant_lines(text, rendered, width);
+                let rendered_lines = assistant_lines(text, width, cwd, *streaming, rendered);
                 let start = history.lines.len().min(rendered_lines.len());
                 let output = rendered_lines[start..].to_vec();
-                if !*streaming {
-                    *rendered = None;
-                }
                 (output, true)
             }
-            _ => (self.display_lines(width, user_style), false),
+            _ => (self.display_lines(width, user_style, cwd), false),
         }
     }
 
-    fn streamed_history_needs_reflow(&mut self, width: u16) -> bool {
+    fn streamed_history_needs_reflow(&mut self, width: u16, cwd: &Path) -> bool {
         let Self::Assistant {
             text,
             streaming,
@@ -2420,7 +2769,7 @@ impl TranscriptEntry {
         if *streaming {
             return false;
         }
-        !cached_assistant_lines(text, rendered, width).starts_with(&history.lines)
+        !assistant_lines(text, width, cwd, false, rendered).starts_with(&history.lines)
     }
 
     fn reset_streamed_history(&mut self) {
@@ -2429,29 +2778,15 @@ impl TranscriptEntry {
         }
     }
 
-    fn display_lines(&mut self, width: u16, user_style: Style) -> Vec<Line<'static>> {
-        match self {
+    fn display_lines(&mut self, width: u16, user_style: Style, cwd: &Path) -> Vec<HyperlinkLine> {
+        let plain_lines = match self {
             Self::User(message) => user_message_lines(message, width, user_style),
             Self::Assistant {
                 text,
                 streaming,
                 rendered,
                 ..
-            } => {
-                let _ = cached_assistant_lines(text, rendered, width);
-                if *streaming {
-                    rendered
-                        .as_ref()
-                        .expect("streaming assistant rendering was cached")
-                        .lines
-                        .clone()
-                } else {
-                    rendered
-                        .take()
-                        .expect("finalized assistant rendering was cached")
-                        .lines
-                }
-            }
+            } => return assistant_lines(text, width, cwd, *streaming, rendered),
             Self::Tool(tool) => tool.display_lines(width, user_style),
             Self::Exploration { tools, .. } => exploration_lines(tools, width),
             Self::Notice(message) => vec![Line::from(vec![
@@ -2467,7 +2802,8 @@ impl TranscriptEntry {
             Self::FinalMessageSeparator { elapsed_seconds } => {
                 final_message_separator_lines(*elapsed_seconds, width)
             }
-        }
+        };
+        terminal_hyperlinks::plain_hyperlink_lines(plain_lines)
     }
 }
 
@@ -2530,9 +2866,7 @@ impl ToolEntry {
                     .map(|path| display_tool_path(Path::new(path), cwd))
                     .unwrap_or_else(|| "image".to_string()),
             ),
-            "web.run" => {
-                ToolDisplay::WebSearch(crate::web_search::action_for_display(input.as_ref()))
-            }
+            "web.run" => ToolDisplay::WebSearch(crate::web_search::activities_for_display(input)),
             _ => ToolDisplay::Other,
         };
         Self {
@@ -2545,12 +2879,16 @@ impl ToolEntry {
     }
 
     fn is_exploration(&self) -> bool {
-        matches!(
-            &self.display,
-            ToolDisplay::Command { parsed, .. }
-                if !parsed.is_empty()
-                    && parsed.iter().all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
-        )
+        match &self.display {
+            ToolDisplay::Command { parsed, .. } => {
+                !parsed.is_empty()
+                    && parsed
+                        .iter()
+                        .all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
+            }
+            ToolDisplay::WebSearch(_) => true,
+            _ => false,
+        }
     }
 
     fn activity_label(&self) -> String {
@@ -2586,7 +2924,7 @@ impl ToolEntry {
             ToolDisplay::Papercut => papercut_lines(self, width),
             ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
             ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
-            ToolDisplay::WebSearch(action) => web_search_lines(self, action, width),
+            ToolDisplay::WebSearch(_) => exploration_lines(std::slice::from_ref(self), width),
             ToolDisplay::Other => generic_tool_lines(self, width),
         }
     }
@@ -3276,8 +3614,11 @@ fn welcome_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
 }
 
 fn with_card_border(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    with_card_border_style(lines, Style::default().fg(RULE))
+}
+
+fn with_card_border_style(lines: Vec<Line<'static>>, border_style: Style) -> Vec<Line<'static>> {
     let content_width = lines.iter().map(line_width).max().unwrap_or_default();
-    let border_style = Style::default().fg(RULE);
     let mut output = Vec::with_capacity(lines.len().saturating_add(2));
     output.push(Line::from(Span::styled(
         format!("╭{}╮", "─".repeat(content_width.saturating_add(2))),
@@ -3333,7 +3674,11 @@ fn display_tool_path(path: &Path, cwd: &Path) -> String {
     )
 }
 
-fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Line<'static>> {
+fn user_message_lines(
+    message: &DisplayedUserPrompt,
+    width: u16,
+    style: Style,
+) -> Vec<Line<'static>> {
     let (message_text, skill_ranges) = sanitized_prompt(message);
     let message_text = message_text.trim_end_matches(['\r', '\n']);
     let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS + 1).max(1);
@@ -3359,17 +3704,31 @@ fn user_message_lines(message: &UserPrompt, width: u16, style: Style) -> Vec<Lin
     lines
 }
 
-fn sanitized_prompt(message: &UserPrompt) -> (String, Vec<std::ops::Range<usize>>) {
+fn sanitized_prompt(message: &DisplayedUserPrompt) -> (String, Vec<std::ops::Range<usize>>) {
     let mut text = String::with_capacity(message.as_str().len());
-    let mut ranges = Vec::with_capacity(message.skill_mentions().len());
+    let mut source_ranges = message
+        .skill_mentions()
+        .iter()
+        .filter_map(|mention| {
+            let range = mention.range();
+            (range.end <= message.as_str().len()
+                && message.as_str().get(range.clone())
+                    == Some(format!("${}", mention.selection().name()).as_str()))
+            .then_some(range.clone())
+        })
+        .chain(message.image_ranges().iter().filter_map(|range| {
+            message
+                .as_str()
+                .get(range.clone())
+                .is_some_and(|label| label.starts_with("[Image ") && label.ends_with(']'))
+                .then_some(range.clone())
+        }))
+        .collect::<Vec<_>>();
+    source_ranges.sort_by_key(|range| range.start);
+    let mut ranges = Vec::with_capacity(source_ranges.len());
     let mut cursor = 0_usize;
-    for mention in message.skill_mentions() {
-        let range = mention.range();
-        if range.start < cursor
-            || range.end > message.as_str().len()
-            || message.as_str().get(range.clone())
-                != Some(format!("${}", mention.selection().name()).as_str())
-        {
+    for range in source_ranges {
+        if range.start < cursor {
             continue;
         }
         text.push_str(&markdown::sanitize(&message.as_str()[cursor..range.start]));
@@ -3412,31 +3771,19 @@ fn styled_skill_mentions(
     spans
 }
 
-fn assistant_lines(message: &str, width: u16) -> Vec<Line<'static>> {
-    let content_width = width.saturating_sub(2).max(1);
-    let rendered = markdown::render(message, content_width);
-    let mut wrapped = Vec::new();
-    for line in rendered {
-        wrapped.extend(wrap_styled_line(&line, content_width));
-    }
-    prefix_styled_lines(wrapped, "• ", "  ")
-}
-
-fn cached_assistant_lines<'a>(
-    text: &str,
-    rendered: &'a mut Option<RenderedAssistant>,
+fn assistant_lines(
+    message: &str,
     width: u16,
-) -> &'a [Line<'static>] {
-    if rendered.as_ref().is_none_or(|cached| cached.width != width) {
-        *rendered = Some(RenderedAssistant {
-            width,
-            lines: assistant_lines(text, width),
-        });
-    }
-    &rendered
-        .as_ref()
-        .expect("assistant rendering was cached")
-        .lines
+    cwd: &Path,
+    streaming: bool,
+    cache: &mut MarkdownRenderCache,
+) -> Vec<HyperlinkLine> {
+    let content_width = usize::from(width.saturating_sub(2).max(1));
+    terminal_hyperlinks::prefix_hyperlink_lines(
+        cache.render(message, content_width, cwd, streaming),
+        Span::from("• ").dim(),
+        Span::from("  "),
+    )
 }
 
 fn background_process_lines(processes: &[BackgroundProcess], width: u16) -> Vec<Line<'static>> {
@@ -3622,6 +3969,7 @@ fn interaction_lines(
 
 fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
     let active = tools.iter().any(|tool| tool.outcome.is_none());
+    let failed = tools.iter().any(|tool| tool.succeeded() == Some(false));
     let started = tools
         .iter()
         .find(|tool| tool.outcome.is_none())
@@ -3629,6 +3977,8 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
         if active {
             activity_marker(started)
+        } else if failed {
+            "•".red().bold()
         } else {
             "•".dim()
         },
@@ -3639,9 +3989,11 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             "Explored".bold()
         },
     ])];
-    let mut details: Vec<(&str, Vec<Span<'static>>)> = Vec::new();
+    let detail_style = Style::default().fg(Color::Cyan);
+    let mut details: Vec<(&str, Style, Vec<Span<'static>>)> = Vec::new();
     let mut read_names = Vec::<String>::new();
-    let flush_reads = |details: &mut Vec<(&str, Vec<Span<'static>>)>, names: &mut Vec<String>| {
+    let flush_reads = |details: &mut Vec<(&str, Style, Vec<Span<'static>>)>,
+                       names: &mut Vec<String>| {
         if names.is_empty() {
             return;
         }
@@ -3652,46 +4004,71 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             }
             spans.push(name.into());
         }
-        details.push(("Read", spans));
+        details.push(("Read", detail_style, spans));
     };
     for tool in tools {
-        let ToolDisplay::Command { parsed, .. } = &tool.display else {
-            continue;
-        };
-        for parsed in parsed {
-            match parsed {
-                ParsedCommand::Read { name, .. } => {
-                    if !read_names.contains(name) {
-                        read_names.push(name.clone());
+        match &tool.display {
+            ToolDisplay::Command { parsed, .. } => {
+                for parsed in parsed {
+                    match parsed {
+                        ParsedCommand::Read { name, .. } => {
+                            if !read_names.contains(name) {
+                                read_names.push(name.clone());
+                            }
+                        }
+                        ParsedCommand::ListFiles { cmd, path } => {
+                            flush_reads(&mut details, &mut read_names);
+                            details.push((
+                                "List",
+                                detail_style,
+                                vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
+                            ));
+                        }
+                        ParsedCommand::Search { cmd, query, path } => {
+                            flush_reads(&mut details, &mut read_names);
+                            let spans = match (query, path) {
+                                (Some(query), Some(path)) => {
+                                    vec![query.clone().into(), " in ".dim(), path.clone().into()]
+                                }
+                                (Some(query), None) => vec![query.clone().into()],
+                                _ => vec![cmd.clone().into()],
+                            };
+                            details.push(("Search", detail_style, spans));
+                        }
+                        ParsedCommand::Unknown { .. } => {}
                     }
                 }
-                ParsedCommand::ListFiles { cmd, path } => {
-                    flush_reads(&mut details, &mut read_names);
+            }
+            ToolDisplay::WebSearch(activities) => {
+                flush_reads(&mut details, &mut read_names);
+                for activity in activities {
+                    let spans = if activity.detail.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![Span::from(activity.detail.clone())]
+                    };
+                    details.push((activity.verb, detail_style, spans));
+                }
+                if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
                     details.push((
-                        "List",
-                        vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
+                        "Error",
+                        Style::default().fg(Color::Red),
+                        vec![Span::from(first_display_line(error)).red()],
                     ));
                 }
-                ParsedCommand::Search { cmd, query, path } => {
-                    flush_reads(&mut details, &mut read_names);
-                    let spans = match (query, path) {
-                        (Some(query), Some(path)) => {
-                            vec![query.clone().into(), " in ".dim(), path.clone().into()]
-                        }
-                        (Some(query), None) => vec![query.clone().into()],
-                        _ => vec![cmd.clone().into()],
-                    };
-                    details.push(("Search", spans));
-                }
-                ParsedCommand::Unknown { .. } => {}
             }
+            _ => {}
         }
     }
     flush_reads(&mut details, &mut read_names);
     let detail_width = width.saturating_sub(4).max(1);
     let mut wrapped_details = Vec::new();
-    for (title, spans) in details {
-        let title = format!("{title} ");
+    for (title, title_style, spans) in details {
+        let title = if spans.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title} ")
+        };
         let title_width = UnicodeWidthStr::width(title.as_str()) as u16;
         let wrapped = wrap_styled_line(
             &Line::from(spans),
@@ -3699,7 +4076,7 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
         );
         for (index, mut row) in wrapped.into_iter().enumerate() {
             let mut spans = vec![if index == 0 {
-                Span::from(title.clone()).cyan()
+                Span::styled(title.clone(), title_style)
             } else {
                 Span::from(" ".repeat(usize::from(title_width)))
             }];
@@ -3734,84 +4111,6 @@ fn view_image_lines(outcome: Option<&ToolOutcome>, path: &str, width: u16) -> Ve
             ),
         ],
         Some(Err(error)) => failed_tool_lines("Failed to view image", error, width),
-    }
-}
-
-fn web_search_lines(
-    tool: &ToolEntry,
-    action: &codex_protocol::models::WebSearchAction,
-    width: u16,
-) -> Vec<Line<'static>> {
-    if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
-        return failed_tool_lines("Failed to search the web", error, width);
-    }
-
-    let completed = tool.outcome.is_some();
-    let detail = if completed {
-        web_search_action_detail(action)
-    } else {
-        String::new()
-    };
-    let mut content = vec![
-        Span::from(if completed {
-            "Searched the web"
-        } else {
-            "Searching the web"
-        })
-        .bold(),
-    ];
-    if !detail.is_empty() {
-        content.push(" for ".into());
-        content.push(Span::from(detail));
-    }
-    let wrapped = wrap_styled_line(&Line::from(content), width.saturating_sub(2).max(1));
-    let bullet = if completed {
-        "•".dim()
-    } else {
-        activity_marker(Some(tool.started_at))
-    };
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            let mut spans = if index == 0 {
-                vec![bullet.clone(), " ".into()]
-            } else {
-                vec!["  ".into()]
-            };
-            spans.append(&mut line.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-
-fn web_search_action_detail(action: &codex_protocol::models::WebSearchAction) -> String {
-    use codex_protocol::models::WebSearchAction;
-
-    match action {
-        WebSearchAction::Search { query, queries } => query
-            .clone()
-            .filter(|query| !query.is_empty())
-            .unwrap_or_else(|| {
-                let first = queries
-                    .as_ref()
-                    .and_then(|queries| queries.first())
-                    .cloned()
-                    .unwrap_or_default();
-                if queries.as_ref().is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
-                    format!("{first} ...")
-                } else {
-                    first
-                }
-            }),
-        WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
-        WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
-            (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
-            (Some(pattern), None) => format!("'{pattern}'"),
-            (None, Some(url)) => url.clone(),
-            (None, None) => String::new(),
-        },
-        WebSearchAction::Other => String::new(),
     }
 }
 
@@ -3940,26 +4239,6 @@ fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     rows
 }
 
-fn prefix_styled_lines(
-    lines: Vec<Line<'static>>,
-    initial: &'static str,
-    subsequent: &'static str,
-) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            let mut spans = vec![if index == 0 {
-                Span::from(initial).dim()
-            } else {
-                Span::from(subsequent)
-            }];
-            spans.append(&mut line.spans);
-            Line::from(spans).style(line.style)
-        })
-        .collect()
-}
-
 fn prefix_lines(
     output: &mut Vec<Line<'static>>,
     lines: Vec<Line<'static>>,
@@ -3978,15 +4257,15 @@ fn prefix_lines(
 }
 
 fn append_history_cell(
-    mut cell: Vec<Line<'static>>,
-    output: &mut Vec<Line<'static>>,
+    mut cell: Vec<HyperlinkLine>,
+    output: &mut Vec<HyperlinkLine>,
     emitted: &mut bool,
 ) {
     if cell.is_empty() {
         return;
     }
     if *emitted {
-        output.push(Line::default());
+        output.push(HyperlinkLine::default());
     } else {
         *emitted = true;
     }
@@ -4007,11 +4286,11 @@ fn line_count_spans(added: usize, removed: Option<usize>) -> Vec<Span<'static>> 
     ]
 }
 
-fn rendered_line_count(lines: &[Line<'static>], width: u16) -> u16 {
+fn rendered_line_count(lines: &[HyperlinkLine], width: u16) -> u16 {
     if lines.is_empty() {
         return 0;
     }
-    Paragraph::new(Text::from(lines.to_vec()))
+    Paragraph::new(Text::from(terminal_hyperlinks::visible_lines_ref(lines)))
         .wrap(Wrap { trim: false })
         .line_count(width.max(1))
         .try_into()
@@ -4057,7 +4336,7 @@ fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
     shimmer_spans_at(
         text,
         started.elapsed(),
-        TERMINAL_COLORS.get().copied(),
+        palette::terminal_colors(),
         supports_true_color(),
     )
 }
@@ -4150,11 +4429,13 @@ fn editor_line(
     text: &str,
     paste_ranges: &[std::ops::Range<usize>],
     skill_ranges: &[std::ops::Range<usize>],
+    image_ranges: &[std::ops::Range<usize>],
     history_search_ranges: &[std::ops::Range<usize>],
 ) -> Line<'static> {
     let mut highlights = paste_ranges
         .iter()
         .chain(skill_ranges)
+        .chain(image_ranges)
         .chain(history_search_ranges)
         .cloned()
         .collect::<Vec<_>>();
@@ -4189,14 +4470,15 @@ fn editor_line(
 }
 
 fn format_context_usage(tokens: Option<u64>) -> String {
+    let context_window_k = EFFECTIVE_CONTEXT_WINDOW / 1_000;
     let Some(tokens) = tokens else {
-        return "? of 353K".to_string();
+        return format!("? of {context_window_k}K");
     };
     let percent = (tokens as f64 / EFFECTIVE_CONTEXT_WINDOW as f64 * 100.0).clamp(0.0, 100.0);
     if percent > 0.0 && percent < 1.0 {
-        format!("{percent:.1}% of 353K")
+        format!("{percent:.1}% of {context_window_k}K")
     } else {
-        format!("{percent:.0}% of 353K")
+        format!("{percent:.0}% of {context_window_k}K")
     }
 }
 
@@ -4213,22 +4495,41 @@ fn format_elapsed(seconds: u64) -> String {
     }
 }
 
+fn shortcut_reference_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from("Keyboard shortcuts").bold(),
+        Line::default(),
+        shortcut_line("Enter", "submit prompt"),
+        shortcut_line("Enter while working", "steer after current model step"),
+        shortcut_line("Tab while working", "queue a follow-up turn"),
+        shortcut_line("Alt+Up / Shift+Left", "edit last queued follow-up"),
+        shortcut_line("Option+Left / Right", "jump by word"),
+        shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
+        shortcut_line("@", "find and insert a file path"),
+        shortcut_line("$", "mention an installed skill"),
+        shortcut_line("Esc", "interrupt active turn"),
+        shortcut_line("Up / Down", "restore prompt history"),
+        shortcut_line(
+            "Ctrl+R / Ctrl+S",
+            "search prompt history backward / forward",
+        ),
+        shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
+        shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
+        shortcut_line("Ctrl+C", "clear draft, interrupt work, or exit when idle"),
+    ]
+}
+
+fn shortcuts_height(width: u16) -> u16 {
+    measure_text_height(&shortcut_reference_lines(), width.saturating_sub(4))
+        .saturating_add(menu_surface_padding_height())
+        .saturating_add(1)
+}
+
 fn shortcut_line(key: &'static str, description: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::from(format!("{key:<22}")),
         Span::from(description).dim(),
     ])
-}
-
-fn centered(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
-    let width = preferred_width.min(area.width.saturating_sub(2)).max(1);
-    let height = preferred_height.min(area.height.saturating_sub(2)).max(1);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
@@ -4272,13 +4573,7 @@ fn line_width(line: &Line<'_>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::AUTO_COMPACT_TOKEN_LIMIT;
-    use crate::context::ContextKind;
-    use crate::context::ContextSection;
-    use crate::skills::SkillCatalog;
-    use crate::skills::SkillMention;
-    use codex_file_search::FileMatch;
-    use codex_file_search::MatchType;
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
@@ -4286,6 +4581,20 @@ mod tests {
 
     fn prompt(text: impl Into<String>) -> UserPrompt {
         UserPrompt::text(text)
+    }
+
+    #[test]
+    fn review_completion_submits_the_explicit_review_command() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/rev");
+
+        let Action::Submit(prompt) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("review completion should submit a turn");
+        };
+        assert_eq!(prompt.text_without_image_placeholders(), "/review");
     }
 
     fn completed_message(text: impl Into<String>) -> AgentEvent {
@@ -4297,10 +4606,10 @@ mod tests {
 
     #[test]
     fn context_usage_matches_the_preserved_contract() {
-        assert_eq!(format_context_usage(None), "? of 353K");
-        assert_eq!(format_context_usage(Some(1_000)), "0.3% of 353K");
-        assert_eq!(format_context_usage(Some(70_680)), "20% of 353K");
-        assert_eq!(format_context_usage(Some(u64::MAX)), "100% of 353K");
+        assert_eq!(format_context_usage(None), "? of 258K");
+        assert_eq!(format_context_usage(Some(1_000)), "0.4% of 258K");
+        assert_eq!(format_context_usage(Some(51_680)), "20% of 258K");
+        assert_eq!(format_context_usage(Some(u64::MAX)), "100% of 258K");
     }
 
     #[test]
@@ -4310,10 +4619,10 @@ mod tests {
             name: "pi".to_string(),
             branch: Some("main".to_string()),
         };
-        view.context_tokens = Some(70_680);
+        view.context_tokens = Some(51_680);
         assert_eq!(
             plain(&view.status_line(80)),
-            "gpt-5.6-sol max │ pi / main │ 20% of 353K"
+            "gpt-5.6-sol max │ pi / main │ 20% of 258K"
         );
     }
 
@@ -4340,361 +4649,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_completion_after_words_binds_and_keeps_only_the_selected_occurrence_cyan() {
-        let root = std::env::temp_dir().join(format!("bettercodex-view-skill-{}", Uuid::new_v4()));
-        let cwd = root.join("repo");
-        let skill_directory = cwd.join(".bcodex/skills/manifest");
-        std::fs::create_dir_all(cwd.join(".git")).unwrap();
-        std::fs::create_dir_all(&skill_directory).unwrap();
-        let skill_path = skill_directory.join("SKILL.md");
-        std::fs::write(
-            &skill_path,
-            "---\nname: manifest\ndescription: Write a routing manifest\n---\n\nFollow the manifest workflow.\n",
-        )
-        .unwrap();
-        let catalog = SkillCatalog::load(&cwd);
-        let mut view = View::with_skills(&cwd, catalog.skills().to_vec());
-        view.welcome_pending = false;
-        view.editor.set_text("manual $manifest then $mani");
-
-        assert_eq!(view.handle_terminal_event(Event::FocusGained), Action::None);
-        assert!(view.skill_popup.is_active());
-        let popup_height = view.desired_height(80, 24);
-        let backend = TestBackend::new(80, popup_height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let popup_buffer = terminal.backend().buffer();
-        let popup = render_buffer(popup_buffer);
-        let popup_y = popup
-            .lines()
-            .position(|line| line.contains("[Skill]"))
-            .unwrap() as u16;
-        assert_eq!(popup_buffer[(2, popup_y)].fg, Color::Cyan);
-        assert!(popup_buffer[(2, popup_y)].modifier.contains(Modifier::BOLD));
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        let completed = "manual $manifest then $manifest ";
-        let selected_start = "manual $manifest then ".len();
-        let selected_range = selected_start..selected_start + "$manifest".len();
-        assert_eq!(view.editor.text(), completed);
-        assert_eq!(
-            view.editor.skill_ranges().as_slice(),
-            std::slice::from_ref(&selected_range)
-        );
-
-        let composer_height = view.desired_height(80, 24);
-        let backend = TestBackend::new(80, composer_height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let composer_buffer = terminal.backend().buffer();
-        let composer = render_buffer(composer_buffer);
-        let composer_y = composer
-            .lines()
-            .position(|line| line.contains(completed.trim_end()))
-            .unwrap() as u16;
-        let row = composer.lines().nth(usize::from(composer_y)).unwrap();
-        let first = row.find("$manifest").unwrap() as u16;
-        let second = row.rfind("$manifest").unwrap() as u16;
-        assert_ne!(composer_buffer[(first, composer_y)].fg, Color::Cyan);
-        assert_eq!(composer_buffer[(second, composer_y)].fg, Color::Cyan);
-
-        let prompt = match view.handle_terminal_event(Event::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ))) {
-            Action::Submit(prompt) => prompt,
-            action => panic!("expected submitted skill prompt, got {action:?}"),
-        };
-        assert_eq!(prompt.as_str(), completed);
-        assert_eq!(
-            prompt.skill_mentions(),
-            [SkillMention::new(
-                SkillSelection::new("manifest", skill_path.canonicalize().unwrap()),
-                selected_range,
-            )]
-        );
-
-        let mut restored = View::with_skills(&cwd, catalog.skills().to_vec());
-        restored.queue_follow_up(prompt.clone());
-        restored.restore_pending_input_to_composer();
-        assert_eq!(restored.editor.take_prompt(), prompt);
-
-        let narrow_cyan = user_message_lines(&prompt, 8, Style::default())
-            .iter()
-            .flat_map(|line| &line.spans)
-            .filter(|span| span.style.fg == Some(Color::Cyan))
-            .map(|span| span.content.as_ref())
-            .collect::<Vec<_>>()
-            .concat();
-        assert_eq!(narrow_cyan, "$manifest");
-
-        view.start_turn(prompt);
-        let history = view.take_pending_history_lines(80);
-        let prompt_line = history
-            .iter()
-            .find(|line| plain(line).contains(completed.trim_end()))
-            .unwrap();
-        let cyan_mentions = prompt_line
-            .spans
-            .iter()
-            .filter(|span| span.style.fg == Some(Color::Cyan))
-            .map(|span| span.content.as_ref())
-            .collect::<Vec<_>>();
-        assert_eq!(cyan_mentions, ["$manifest"]);
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn busy_status_keeps_the_upper_gap_and_joins_the_footer_to_the_composer() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn("test");
-        let _ = view.take_pending_history_lines(60);
-
-        let height = view.desired_height(60, 24);
-        assert_eq!(height, 7);
-        let backend = TestBackend::new(60, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
-        let rows = rendered.lines().collect::<Vec<_>>();
-        let status_y = rows
-            .iter()
-            .position(|row| row.contains("Working ("))
-            .unwrap() as u16;
-        assert_eq!(buffer[(0, status_y)].symbol(), "•");
-        assert!(rows[usize::from(status_y)].contains("• Working ("));
-        assert!(rows[usize::from(status_y)].contains("• esc to interrupt)"));
-        assert!(
-            !rendered
-                .chars()
-                .any(|character| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character))
-        );
-
-        let composer_background = view.user_message_style.bg.unwrap();
-        let composer_y = (0..height)
-            .find(|&y| buffer[(0, y)].bg == composer_background)
-            .unwrap();
-        let composer_bottom = (0..height)
-            .rfind(|&y| buffer[(0, y)].bg == composer_background)
-            .unwrap()
-            .saturating_add(1);
-        let prompt_y = (composer_y..composer_bottom)
-            .find(|&y| buffer[(0, y)].symbol() == "›")
-            .unwrap();
-        let footer_y = rows.iter().position(|row| row.contains(MODEL)).unwrap() as u16;
-
-        assert_eq!(
-            composer_y.saturating_sub(status_y.saturating_add(1)),
-            ACTIVITY_COMPOSER_GAP,
-            "{rendered}"
-        );
-        assert_eq!(
-            footer_y.saturating_sub(composer_bottom),
-            COMPOSER_FOOTER_GAP,
-            "{rendered}"
-        );
-        assert_eq!(
-            (
-                buffer[(0, status_y)].symbol(),
-                buffer[(0, prompt_y)].symbol(),
-                buffer[(0, footer_y)].symbol(),
-            ),
-            ("•", "›", "g"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn completed_work_turn_renders_the_codex_worked_for_separator() {
-        const WIDTH: u16 = 80;
-
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn("test");
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "call-1".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "true"})),
-        });
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "call-1".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": ""})),
-            duration: Duration::from_millis(10),
-        });
-        view.handle_agent_event(AgentEvent::ModelMessageDelta("Done.".to_string()));
-        view.handle_agent_event(completed_message("Done."));
-        view.working_since = Some(Instant::now() - Duration::from_secs(125));
-        view.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
-
-        let height = view.desired_height(WIDTH, 30);
-        let backend = TestBackend::new(WIDTH, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
-        let rows = rendered.lines().collect::<Vec<_>>();
-        let separator_y = rows
-            .iter()
-            .position(|row| row.contains("Worked for"))
-            .expect("rendered worked-for separator") as u16;
-        let label = "─ Worked for 2m 05s ─";
-        assert_eq!(
-            rows[usize::from(separator_y)],
-            format!(
-                "{label}{}",
-                "─".repeat(usize::from(WIDTH) - UnicodeWidthStr::width(label))
-            )
-        );
-        assert!((0..WIDTH).all(|x| buffer[(x, separator_y)].modifier.contains(Modifier::DIM)));
-    }
-
-    #[test]
-    fn completed_assistant_table_renders_as_a_width_aware_grid() {
-        const WIDTH: u16 = 80;
-        let answer = "| Time | Component | Value observed | Result |\n\
-                      | ---: | --- | --- | --- |\n\
-                      | -10 ms | API handling R1 | Reads `legacy` once | R1 stays in `legacy` mode |\n\
-                      | +20 ms | Producer creating J1 | Cache is still `legacy` | J1 receives `mode=legacy` |";
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn("render a table");
-        view.handle_agent_event(AgentEvent::ModelMessageDelta(answer.to_string()));
-        view.handle_agent_event(completed_message(answer));
-        view.finish_turn(Ok(SubmitOutcome::Completed(answer.to_string())));
-
-        let height = view.desired_height(WIDTH, 30);
-        let backend = TestBackend::new(WIDTH, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-
-        assert!(
-            rendered.contains("Time") && rendered.contains("Result"),
-            "{rendered}"
-        );
-        assert!(rendered.contains('━'), "{rendered}");
-        assert!(rendered.contains('─'), "{rendered}");
-        assert!(!rendered.contains("Time │ Component"), "{rendered}");
-    }
-
-    #[test]
-    fn commentary_completion_does_not_claim_the_turns_final_answer() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn("test phases");
-        view.handle_agent_event(AgentEvent::ModelMessageCompleted(AssistantMessage {
-            text: "Still working.".to_string(),
-            phase: Some(MessagePhase::Commentary),
-        }));
-
-        assert!(!view.terminal_assistant_received_this_turn);
-        view.finish_turn(Ok(SubmitOutcome::Completed("Finished.".to_string())));
-
-        let assistant_phases = view
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                TranscriptEntry::Assistant { phase, .. } => Some(phase.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            assistant_phases,
-            [
-                Some(MessagePhase::Commentary),
-                Some(MessagePhase::FinalAnswer),
-            ]
-        );
-        let rendered = view
-            .take_pending_history_lines(80)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("Still working."), "{rendered}");
-        assert!(rendered.contains("Finished."), "{rendered}");
-    }
-
-    #[test]
-    fn worked_for_separator_matches_codex_visibility_and_clipping() {
-        assert_eq!(
-            plain(&final_message_separator_lines(Some(60), 24)[0]),
-            "─".repeat(24)
-        );
-        assert_eq!(
-            plain(&final_message_separator_lines(Some(61), 24)[0]),
-            "─ Worked for 1m 01s ────"
-        );
-        assert_eq!(
-            plain(&final_message_separator_lines(Some(61), 8)[0]),
-            "─ Worked"
-        );
-
-        let mut conversational = View::new(Path::new("/tmp/bettercodex"));
-        conversational.welcome_pending = false;
-        conversational.start_turn("test");
-        conversational.working_since = Some(Instant::now() - Duration::from_secs(125));
-        conversational.finish_turn(Ok(SubmitOutcome::Completed("Done.".to_string())));
-        assert!(
-            conversational
-                .take_pending_history_lines(80)
-                .iter()
-                .all(|line| !plain(line).contains("Worked for"))
-        );
-    }
-
-    #[test]
-    fn streamed_reasoning_sections_drive_the_rendered_activity_heading() {
-        fn render(view: &mut View) -> String {
-            let height = view.desired_height(72, 24);
-            let backend = TestBackend::new(72, height);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|frame| view.render(frame)).unwrap();
-            render_buffer(terminal.backend().buffer())
-        }
-
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn("test");
-        let _ = view.take_pending_history_lines(72);
-
-        view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
-        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
-            "**Inspecting".to_string(),
-        ));
-        assert!(render(&mut view).contains("• Working ("));
-
-        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
-            " the request**\n\nI am reading the relevant code.".to_string(),
-        ));
-        let first_section = render(&mut view);
-        assert!(first_section.contains("• Inspecting the request ("));
-        assert!(!first_section.contains("I am reading the relevant code"));
-
-        view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
-        view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
-            "**Running validation**".to_string(),
-        ));
-        let second_section = render(&mut view);
-        assert!(second_section.contains("• Running validation ("));
-        assert!(!second_section.contains("Inspecting the request"));
-
-        view.set_interrupting();
-        assert!(render(&mut view).contains("• Interrupting ("));
-    }
-
-    #[test]
     fn shimmer_uses_the_terminal_palette_for_its_sweep() {
         let colors = TerminalColors {
             foreground: (220, 220, 220),
@@ -4710,910 +4664,6 @@ mod tests {
                 .iter()
                 .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
         );
-    }
-
-    #[test]
-    fn quit_aliases_share_one_completion_row_and_q_dispatches_it() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        for character in "/q".chars() {
-            assert_eq!(
-                view.handle_terminal_event(Event::Key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                ))),
-                Action::None
-            );
-        }
-
-        let height = view.desired_height(60, 24);
-        assert_eq!(height, 5);
-        let backend = TestBackend::new(60, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
-        let rows = rendered.lines().collect::<Vec<_>>();
-        let composer_y = rows.iter().position(|row| row.contains("/q")).unwrap();
-        let command_y = rows
-            .iter()
-            .position(|row| row.contains("/quit, /exit  leave bettercodex"))
-            .unwrap();
-        assert!(command_y > composer_y, "{rendered}");
-        assert_eq!(buffer[(2, composer_y as u16)].symbol(), "/");
-        assert_eq!(buffer[(2, command_y as u16)].symbol(), "/");
-        assert_eq!(buffer[(9, command_y as u16)].fg, Color::Cyan);
-        assert!(
-            buffer[(2, command_y as u16)]
-                .modifier
-                .contains(Modifier::BOLD)
-        );
-        assert!(!rendered.contains("Commands"), "{rendered}");
-        assert!(!rendered.contains('┌'), "{rendered}");
-        assert!(!rendered.contains("gpt-5.6-sol"), "{rendered}");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::Quit
-        );
-        assert!(view.editor.is_empty());
-    }
-
-    #[test]
-    fn exit_alias_filters_and_completes_the_shared_quit_command() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.editor.set_text("/ex");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert_eq!(view.editor.text(), "/exit");
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::Quit
-        );
-    }
-
-    #[test]
-    fn q_remains_a_quit_alias_after_completion_is_dismissed() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.editor.set_text("/q");
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::Quit
-        );
-    }
-
-    #[test]
-    fn enter_dispatches_the_selected_slash_command_from_a_partial_name() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        for character in "/too".chars() {
-            assert_eq!(
-                view.handle_terminal_event(Event::Key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                ))),
-                Action::None
-            );
-        }
-
-        let height = view.desired_height(60, 24);
-        let backend = TestBackend::new(60, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("/tools  inspect the active tool catalogue"));
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        assert!(view.editor.is_empty());
-        assert!(view.entries.is_empty());
-        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Tools(_))));
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE,))),
-            Action::None
-        );
-        assert_eq!(view.editor.text(), "/tools");
-    }
-
-    #[test]
-    fn compact_command_runs_as_an_interruptible_task_and_reports_completion() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.editor.set_text("/comp");
-
-        let height = view.desired_height(80, 24);
-        let backend = TestBackend::new(80, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(
-            rendered
-                .contains("/compact  summarize conversation to prevent hitting the context limit"),
-            "{rendered}"
-        );
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::Compact
-        );
-        assert!(view.editor.is_empty());
-        assert!(view.entries.is_empty(), "the command is not a model prompt");
-
-        view.start_compaction();
-        let height = view.desired_height(80, 24);
-        let backend = TestBackend::new(80, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("Compacting ("), "{rendered}");
-        assert!(rendered.contains("esc to interrupt"), "{rendered}");
-
-        view.finish_compaction(Ok(CompactionOutcome::Completed));
-        let history = view
-            .take_pending_history_lines(80)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(history.contains("Context compacted"), "{history}");
-        assert!(!view.is_busy());
-    }
-
-    #[test]
-    fn compact_command_is_not_sent_to_the_model_during_an_active_task() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.start_turn("working");
-        view.editor.set_text("/compact");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        let rendered = view
-            .take_pending_history_lines(80)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            rendered.contains("'/compact' is disabled while a task is in progress."),
-            "{rendered}"
-        );
-        assert!(!view.entries.iter().any(|entry| {
-            matches!(entry, TranscriptEntry::User(prompt) if prompt.as_str() == "/compact")
-        }));
-    }
-
-    #[test]
-    fn resume_slash_command_opens_the_picker_and_accepts_an_explicit_id() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        for character in "/res".chars() {
-            assert_eq!(
-                view.handle_terminal_event(Event::Key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                ))),
-                Action::None
-            );
-        }
-
-        let height = view.desired_height(72, 24);
-        let backend = TestBackend::new(72, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(
-            rendered.contains("/resume  resume a saved session"),
-            "{rendered}"
-        );
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::OpenResumePicker
-        );
-
-        let id = Uuid::new_v4();
-        view.editor.set_text(format!("/resume {id}"));
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::ResumeSession(id)
-        );
-    }
-
-    #[test]
-    fn resume_is_not_sent_to_the_model_or_switched_during_an_active_turn() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.start_turn("working");
-        view.editor.set_text("/resume not-a-session");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        let height = view.desired_height(80, 24);
-        let backend = TestBackend::new(80, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(
-            rendered.contains("Interrupt the active turn before resuming another session"),
-            "{rendered}"
-        );
-        assert!(!view.entries.iter().any(|entry| {
-            matches!(entry, TranscriptEntry::User(prompt) if prompt.as_str() == "/resume not-a-session")
-        }));
-    }
-
-    #[test]
-    fn switching_sessions_replays_saved_transcript_and_reseeds_prompt_recall() {
-        let mut view = View::new(Path::new("/tmp/old-session"));
-        view.welcome_pending = false;
-        view.add_notice("old transcript");
-        view.show_resume_picker(Uuid::new_v4());
-
-        view.switch_session(
-            Path::new("/tmp/resumed-session"),
-            Some(42_000),
-            [
-                SessionTranscriptItem::User {
-                    text: "saved question".to_string(),
-                    image_count: 1,
-                },
-                SessionTranscriptItem::Assistant {
-                    text: "Saved **answer**".to_string(),
-                    phase: Some(MessagePhase::FinalAnswer),
-                },
-            ],
-            ["resumed prompt".to_string()],
-            Vec::new(),
-        );
-
-        assert_eq!(view.cwd, Path::new("/tmp/resumed-session"));
-        assert_eq!(view.entries.len(), 2);
-        assert!(view.overlay.is_none());
-        assert_eq!(view.context_tokens, Some(42_000));
-        assert!(view.take_clear_request());
-        let history = view
-            .take_pending_history_lines(80)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .into_iter()
-                    .map(|span| span.content.into_owned())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(history.contains("saved question"), "{history}");
-        assert!(history.contains("Image attachment"), "{history}");
-        assert!(history.contains("Saved answer"), "{history}");
-        assert!(!history.contains("old transcript"), "{history}");
-        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
-        assert_eq!(view.editor.text(), "resumed prompt");
-    }
-
-    #[test]
-    fn resume_overlay_renders_and_dispatches_the_selected_saved_session() {
-        let current = Uuid::new_v4();
-        let target = Uuid::new_v4();
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.show_resume_picker(current);
-        view.set_resume_sessions(vec![crate::rollout::SessionSummary {
-            id: target,
-            cwd: PathBuf::from("/tmp/bettercodex"),
-            created_at_unix_ms: 1,
-            updated_at_unix_ms: 1,
-            preview: Some("Continue the saved work".to_string()),
-        }]);
-
-        let height = view.desired_height(88, 24);
-        assert_eq!(height, 24);
-        let backend = TestBackend::new(88, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("Resume a previous session"), "{rendered}");
-        assert!(rendered.contains("Continue the saved work"), "{rendered}");
-        assert!(rendered.contains("Sort: [Updated] Created"), "{rendered}");
-        assert!(!rendered.contains('┌'), "{rendered}");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::ResumeSession(target)
-        );
-    }
-
-    #[test]
-    fn tab_submits_when_idle_and_queues_a_follow_up_while_busy() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.editor.set_text("submit while idle");
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
-            )),
-            Action::Submit(prompt("submit while idle"))
-        );
-        assert!(view.editor.is_empty());
-
-        view.busy = true;
-        view.editor.set_text("queue while busy");
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
-            )),
-            Action::Queue(prompt("queue while busy"))
-        );
-        assert!(view.editor.is_empty());
-
-        let session_id = Uuid::new_v4();
-        view.editor.set_text(format!("/resume {session_id}"));
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert_eq!(view.editor.text(), format!("/resume {session_id}"));
-        assert!(view.entries.iter().any(|entry| {
-            matches!(entry, TranscriptEntry::Notice(notice) if notice.contains("cannot be queued"))
-        }));
-    }
-
-    #[test]
-    fn queued_follow_up_can_be_pulled_back_ahead_of_the_current_draft() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.queue_follow_up(prompt("first queued"));
-        view.queue_follow_up(prompt("second queued"));
-        view.editor.set_text("current draft");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT,))),
-            Action::None
-        );
-        assert_eq!(view.editor.text(), "second queued\n\ncurrent draft");
-        assert_eq!(view.pending_input.follow_up_count(), 1);
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Left,
-                KeyModifiers::SHIFT,
-            ))),
-            Action::None
-        );
-        assert_eq!(
-            view.editor.text(),
-            "first queued\n\nsecond queued\n\ncurrent draft"
-        );
-        assert_eq!(view.pending_input.follow_up_count(), 0);
-    }
-
-    #[test]
-    fn pending_steer_stays_in_the_preview_until_the_agent_commits_it() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn("initial prompt");
-        let (handle, _control) = crate::agent::TurnControl::channel();
-        let id = handle
-            .steer(crate::input::UserInput::text("change direction"))
-            .unwrap();
-        view.add_pending_steer(id, prompt("change direction"));
-
-        let height = view.desired_height(88, 30);
-        let backend = TestBackend::new(88, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(
-            rendered.contains("Steering after the current model step"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("change direction"), "{rendered}");
-        assert_eq!(view.pending_input.steer_count(), 1);
-        assert!(!view.entries.iter().any(
-            |entry| matches!(entry, TranscriptEntry::User(prompt) if prompt.as_str() == "change direction")
-        ));
-        let tiny_backend = TestBackend::new(2, 1);
-        let mut tiny_terminal = Terminal::new(tiny_backend).unwrap();
-        tiny_terminal.draw(|frame| view.render(frame)).unwrap();
-
-        view.handle_agent_event(AgentEvent::SteeringCommitted(id));
-
-        assert_eq!(view.pending_input.steer_count(), 0);
-        assert!(view.entries.iter().any(
-            |entry| matches!(entry, TranscriptEntry::User(prompt) if prompt.as_str() == "change direction")
-        ));
-    }
-
-    #[test]
-    fn interrupted_pending_input_is_restored_before_the_existing_draft() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        let (handle, _control) = crate::agent::TurnControl::channel();
-        let id = handle
-            .steer(crate::input::UserInput::text("pending steer"))
-            .unwrap();
-        view.add_pending_steer(id, prompt("pending steer"));
-        view.queue_follow_up(prompt("queued follow-up"));
-        view.editor.set_text("current draft");
-
-        view.restore_pending_input_to_composer();
-
-        assert_eq!(
-            view.editor.text(),
-            "pending steer\n\nqueued follow-up\n\ncurrent draft"
-        );
-        assert_eq!(view.pending_input.steer_count(), 0);
-        assert_eq!(view.pending_input.follow_up_count(), 0);
-    }
-
-    #[test]
-    fn up_and_down_cycle_seeded_history_including_key_repeats() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.seed_prompt_history([
-            "older\nmultiline prompt".to_string(),
-            "newer\nmultiline prompt".to_string(),
-        ]);
-
-        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
-        assert_eq!(view.editor.text(), "newer\nmultiline prompt");
-        view.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Up,
-            KeyModifiers::NONE,
-            KeyEventKind::Repeat,
-        )));
-        assert_eq!(view.editor.text(), "older\nmultiline prompt");
-        view.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Down,
-            KeyModifiers::NONE,
-            KeyEventKind::Repeat,
-        )));
-        assert_eq!(view.editor.text(), "newer\nmultiline prompt");
-        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
-        assert!(view.editor.is_empty());
-    }
-
-    #[test]
-    fn option_word_navigation_accepts_arrow_and_meta_key_encodings() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.editor.set_text("alpha.beta gamma");
-
-        view.handle_terminal_event(Event::Key(KeyEvent::new(
-            KeyCode::Char('b'),
-            KeyModifiers::ALT,
-        )));
-        assert_eq!(view.editor.cursor(), 11);
-        view.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Char('b'),
-            KeyModifiers::ALT,
-            KeyEventKind::Repeat,
-        )));
-        assert_eq!(view.editor.cursor(), 6);
-        view.handle_terminal_event(Event::Key(KeyEvent::new(
-            KeyCode::Char('f'),
-            KeyModifiers::ALT,
-        )));
-        assert_eq!(view.editor.cursor(), 10);
-        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
-        assert_eq!(view.editor.cursor(), 6);
-        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
-        assert_eq!(view.editor.cursor(), 10);
-        assert_eq!(view.editor.text(), "alpha.beta gamma");
-    }
-
-    #[test]
-    fn option_backspace_deletes_the_previous_word_for_terminal_encodings_and_repeats() {
-        let events = [
-            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
-            KeyEvent::new_with_kind(KeyCode::Backspace, KeyModifiers::ALT, KeyEventKind::Repeat),
-            KeyEvent::new(
-                KeyCode::Char('h'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-            ),
-        ];
-
-        for event in events {
-            let mut view = View::new(Path::new("/tmp/bettercodex"));
-            view.editor.set_text("hello world");
-
-            assert_eq!(view.handle_terminal_event(Event::Key(event)), Action::None);
-            assert_eq!(view.editor.text(), "hello ");
-            assert_eq!(view.editor.cursor(), "hello ".len());
-        }
-
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.editor.set_text("hello world");
-        view.handle_terminal_event(Event::Key(KeyEvent::new(
-            KeyCode::Backspace,
-            KeyModifiers::NONE,
-        )));
-        assert_eq!(view.editor.text(), "hello worl");
-    }
-
-    #[test]
-    fn file_search_renders_fuzzy_results_and_inserts_the_selected_path() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        for character in "@vie".chars() {
-            assert_eq!(
-                view.handle_terminal_event(Event::Key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                ))),
-                Action::None
-            );
-        }
-        assert_eq!(view.file_search_query(), "vie");
-        view.handle_file_search_update(FileSearchUpdate::Matches {
-            query: "vie".to_string(),
-            matches: vec![
-                FileMatch {
-                    score: 100,
-                    path: PathBuf::from("src/tui/view.rs"),
-                    match_type: MatchType::File,
-                    root: PathBuf::from("/tmp/bettercodex"),
-                    indices: Some(vec![8, 9, 10]),
-                },
-                FileMatch {
-                    score: 90,
-                    path: PathBuf::from("src/view_model.rs"),
-                    match_type: MatchType::File,
-                    root: PathBuf::from("/tmp/bettercodex"),
-                    indices: Some(vec![4, 5, 6]),
-                },
-            ],
-        });
-
-        let height = view.desired_height(60, 24);
-        assert_eq!(height, 8);
-        let backend = TestBackend::new(60, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
-        let selected_y = rendered
-            .lines()
-            .position(|line| line.contains("> view.rs  src/tui/"))
-            .expect("selected file row") as u16;
-        assert!(rendered.contains("view_model.rs  src/"), "{rendered}");
-        assert!(
-            rendered.contains("enter insert · esc close · ↑/↓ select"),
-            "{rendered}"
-        );
-        assert_eq!(buffer[(0, selected_y)].symbol(), ">");
-        assert_eq!(buffer[(2, selected_y)].fg, Color::Cyan);
-        assert!(buffer[(2, selected_y)].modifier.contains(Modifier::BOLD));
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Down,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert_eq!(view.editor.text(), "src/view_model.rs ");
-        assert_eq!(view.file_search_query(), "");
-    }
-
-    #[test]
-    fn file_search_quotes_paths_with_spaces_and_escape_only_closes_the_popup() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        for character in "@design".chars() {
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Char(character),
-                KeyModifiers::NONE,
-            )));
-        }
-        view.handle_file_search_update(FileSearchUpdate::Matches {
-            query: "design".to_string(),
-            matches: vec![FileMatch {
-                score: 100,
-                path: PathBuf::from("docs/design note.md"),
-                match_type: MatchType::File,
-                root: PathBuf::from("/tmp/bettercodex"),
-                indices: Some(vec![5, 6, 7, 8, 9, 10]),
-            }],
-        });
-        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
-        assert_eq!(view.editor.text(), "\"docs/design note.md\" ");
-
-        view.editor.set_text("@");
-        view.file_search
-            .sync(view.editor.text(), view.editor.cursor());
-        let height = view.desired_height(52, 20);
-        let backend = TestBackend::new(52, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("type to search files"), "{rendered}");
-
-        view.busy = true;
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert!(view.busy);
-        assert!(!view.file_search.is_active());
-    }
-
-    #[test]
-    fn recalled_at_prompts_keep_up_and_down_bound_to_history() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        let _ = view.desired_height(80, 24);
-        view.editor.remember("inspect @one.rs");
-        view.editor.remember("inspect @two.rs");
-
-        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
-        assert_eq!(view.editor.text(), "inspect @two.rs");
-        assert!(!view.file_search.is_active());
-
-        view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
-        assert_eq!(view.editor.text(), "inspect @one.rs");
-        assert!(!view.file_search.is_active());
-
-        view.handle_terminal_event(Event::Key(KeyEvent::new(
-            KeyCode::Char('!'),
-            KeyModifiers::NONE,
-        )));
-        assert!(view.file_search.is_active());
-        assert_eq!(view.file_search_query(), "one.rs!");
-    }
-
-    #[test]
-    fn context_command_opens_and_closes_the_rendered_window() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        for character in "/context".chars() {
-            assert_eq!(
-                view.handle_terminal_event(Event::Key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                ))),
-                Action::None
-            );
-        }
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::ShowContext
-        );
-        assert!(view.overlay.is_none());
-
-        view.show_context(ContextSnapshot {
-            used_tokens: 70_680,
-            context_window: EFFECTIVE_CONTEXT_WINDOW,
-            compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
-            measured: true,
-            sections: vec![ContextSection {
-                kind: ContextKind::UserMessages,
-                tokens: 70_680,
-                items: 4,
-            }],
-        });
-        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Context(_))));
-        assert_eq!(view.desired_height(92, 30), 16);
-
-        let backend = TestBackend::new(92, 16);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("Context"), "{rendered}");
-        assert!(rendered.contains("70.7K / 353.4K tokens"), "{rendered}");
-        assert!(rendered.contains("User messages"), "{rendered}");
-        assert!(rendered.contains("Auto-compact reserve"), "{rendered}");
-
-        view.handle_agent_event(AgentEvent::ContextUpdated(ContextSnapshot {
-            used_tokens: 106_020,
-            context_window: EFFECTIVE_CONTEXT_WINDOW,
-            compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
-            measured: true,
-            sections: vec![ContextSection {
-                kind: ContextKind::AssistantMessages,
-                tokens: 106_020,
-                items: 6,
-            }],
-        }));
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("106K / 353.4K tokens"), "{rendered}");
-        assert!(rendered.contains("Assistant messages"), "{rendered}");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert!(view.overlay.is_none());
-    }
-
-    #[test]
-    fn skills_command_renders_an_empty_manager_and_closes_without_model_input() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.editor.set_text("/ski");
-
-        let height = view.desired_height(88, 30);
-        let backend = TestBackend::new(88, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(
-            rendered.contains("/skills  manage installed skills and invocation policy"),
-            "{rendered}"
-        );
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        assert!(view.editor.is_empty());
-        assert!(view.entries.is_empty());
-        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Skills(_))));
-        let manager_height = match view.overlay.as_ref() {
-            Some(Overlay::Skills(skills)) => skills.preferred_height(&view.skills),
-            _ => panic!("expected skills overlay"),
-        };
-        assert_eq!(view.desired_height(88, 30), manager_height);
-
-        let backend = TestBackend::new(88, manager_height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("No skills installed."), "{rendered}");
-        assert!(rendered.contains("BCODEX_HOME"), "{rendered}");
-        assert!(rendered.contains("i implicit"), "{rendered}");
-        assert!(!rendered.contains(MODEL), "{rendered}");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert!(view.overlay.is_none());
-    }
-
-    #[test]
-    fn skills_command_is_not_opened_while_a_task_is_active() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.start_turn("working");
-        view.editor.set_text("/skills");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        assert!(view.overlay.is_none());
-        let rendered = view
-            .take_pending_history_lines(80)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            rendered.contains("'/skills' is disabled while a task is in progress."),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn tools_command_opens_and_closes_the_rendered_catalogue() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        for character in "/tools".chars() {
-            assert_eq!(
-                view.handle_terminal_event(Event::Key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                ))),
-                Action::None
-            );
-        }
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        assert!(matches!(view.overlay.as_ref(), Some(Overlay::Tools(_))));
-        let catalogue_height = match view.overlay.as_ref() {
-            Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
-            _ => panic!("expected tools overlay"),
-        };
-        assert_eq!(view.desired_height(88, 30), catalogue_height);
-
-        let backend = TestBackend::new(88, catalogue_height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let rendered = render_buffer(terminal.backend().buffer());
-        assert!(rendered.contains("Request tools"), "{rendered}");
-        assert!(rendered.contains("Inside exec"), "{rendered}");
-        assert!(rendered.contains("apply_patch"), "{rendered}");
-        assert!(
-            rendered.contains("9 tools · ~2.8K prompt tokens"),
-            "{rendered}"
-        );
-        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "┌");
-        assert!(!rendered.contains("available"), "{rendered}");
-        assert!(!rendered.contains("Code Mode"), "{rendered}");
-        assert!(!rendered.contains("function"), "{rendered}");
-        assert!(!rendered.contains(MODEL), "{rendered}");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
-            )),
-            Action::None
-        );
-        assert!(view.overlay.is_none());
-        assert_eq!(view.desired_height(88, 30), 5);
     }
 
     #[test]
@@ -5663,7 +4713,8 @@ mod tests {
     #[test]
     fn user_message_and_composer_share_codex_background() {
         let style = user_message_style_for(Some((31, 31, 31)));
-        let lines = user_message_lines(&prompt("test"), 40, style);
+        let prompt = prompt("test");
+        let lines = user_message_lines(&DisplayedUserPrompt::from_prompt(&prompt), 40, style);
         assert_eq!(lines.len(), 3);
         assert_eq!(plain(&lines[1]), "› test");
         assert_eq!(lines[0].style.bg, style.bg);
@@ -5720,69 +4771,6 @@ mod tests {
         assert!(rendered.contains("• Ran cargo test"));
         assert!(rendered.contains("  └ 21 passed"));
         assert!(!rendered.contains("exec ·"));
-    }
-
-    #[test]
-    fn papercut_tool_reports_the_repository_log_without_dumping_json() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:papercut".to_string(),
-            name: "log_papercut".to_string(),
-            input: Some(json!({
-                "message": "A diagnostic command was missing; document the replacement."
-            })),
-        });
-        assert_eq!(
-            view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
-            ["• Logging papercut"]
-        );
-
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:papercut".to_string(),
-            output: Ok(json!({"path": "PAPERCUTS.md"})),
-            duration: Duration::from_millis(2),
-        });
-        assert_eq!(
-            view.take_pending_history_lines(80)
-                .iter()
-                .map(plain)
-                .collect::<Vec<_>>(),
-            ["• Logged papercut to PAPERCUTS.md"]
-        );
-    }
-
-    #[test]
-    fn web_search_uses_codex_activity_cell_and_hides_the_tool_payload() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:web".to_string(),
-            name: "web.run".to_string(),
-            input: Some(json!({
-                "search_query": [{"q": "OpenAI Codex GitHub official repository"}],
-            })),
-        });
-
-        assert_eq!(
-            view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
-            ["• Searching the web"]
-        );
-
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:web".to_string(),
-            output: Ok(json!(
-                "opaque search result that must remain model-facing only"
-            )),
-            duration: Duration::from_millis(50),
-        });
-        assert_eq!(
-            view.take_pending_history_lines(80)
-                .iter()
-                .map(plain)
-                .collect::<Vec<_>>(),
-            ["• Searched the web for OpenAI Codex GitHub official repository"]
-        );
     }
 
     #[test]
@@ -5846,49 +4834,6 @@ mod tests {
         assert!(rendered.contains("• Explored"), "{rendered}");
         assert!(rendered.contains("Read main.rs"), "{rendered}");
         assert!(!rendered.contains("fn main"), "{rendered}");
-    }
-
-    #[test]
-    fn reasoning_between_read_commands_stays_in_one_codex_explored_cell() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        for (index, (call_id, command)) in [
-            ("cell:one", "cat src/main.rs"),
-            ("cell:two", "cat src/api.rs"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            view.handle_agent_event(AgentEvent::ToolStarted {
-                call_id: call_id.to_string(),
-                name: "exec_command".to_string(),
-                input: Some(json!({"cmd": command})),
-            });
-            view.handle_agent_event(AgentEvent::ToolCompleted {
-                call_id: call_id.to_string(),
-                output: Ok(json!({"exit_code": 0, "output": "ignored\n"})),
-                duration: Duration::from_millis(10),
-            });
-            assert!(view.take_pending_history_lines(80).is_empty());
-            if index == 0 {
-                view.handle_agent_event(AgentEvent::ModelResponseCompleted);
-                view.handle_agent_event(AgentEvent::ReasoningSummarySectionStarted);
-                view.handle_agent_event(AgentEvent::ReasoningSummaryDelta(
-                    "**Inspecting more code**".to_string(),
-                ));
-                assert!(view.take_pending_history_lines(80).is_empty());
-            }
-        }
-        view.handle_agent_event(AgentEvent::ModelMessageDelta("done".to_string()));
-        let rendered = view
-            .take_pending_history_lines(80)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(rendered.matches("• Explored").count(), 1, "{rendered}");
-        assert!(rendered.contains("main.rs"), "{rendered}");
-        assert!(rendered.contains("api.rs"), "{rendered}");
     }
 
     #[test]
@@ -5981,173 +4926,6 @@ mod tests {
     }
 
     #[test]
-    fn large_deleted_files_render_a_bounded_explicit_preview() {
-        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("large.txt");
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(u64::try_from(MAX_PATCH_PREVIEW_SOURCE_BYTES).unwrap() + 1)
-            .unwrap();
-
-        let patch = PatchDisplay::parse(
-            "*** Begin Patch\n*** Delete File: large.txt\n*** End Patch",
-            &root,
-        );
-        let rendered = patch
-            .display_lines(
-                Some(&ToolOutcome {
-                    output: Ok(json!("Done!")),
-                }),
-                80,
-                user_message_style_for(Some((31, 31, 31))),
-            )
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::remove_dir_all(&root).unwrap();
-
-        assert!(
-            rendered.contains("• Deleted large.txt (+0 -?)"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("deleted-file preview omitted (2097153 bytes)"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn large_updated_files_mark_patch_relative_line_numbers() {
-        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("large.txt");
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(u64::try_from(MAX_PATCH_PREVIEW_SOURCE_BYTES).unwrap() + 1)
-            .unwrap();
-
-        let patch = PatchDisplay::parse(
-            "*** Begin Patch\n*** Update File: large.txt\n@@\n-old\n+new\n*** End Patch",
-            &root,
-        );
-        let rendered = patch
-            .display_lines(
-                Some(&ToolOutcome {
-                    output: Ok(json!("Done!")),
-                }),
-                100,
-                user_message_style_for(Some((31, 31, 31))),
-            )
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::remove_dir_all(&root).unwrap();
-
-        assert!(
-            rendered.contains(
-                "source preview omitted (2097153 bytes); line numbers are patch-relative"
-            ),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn updated_file_reads_share_one_global_preview_budget() {
-        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let file_bytes = MAX_PATCH_PREVIEW_SOURCE_BYTES / 2 + 1;
-        for path in [root.join("first.txt"), root.join("second.txt")] {
-            let file = std::fs::File::create(path).unwrap();
-            file.set_len(u64::try_from(file_bytes).unwrap()).unwrap();
-        }
-
-        let patch = PatchDisplay::parse(
-            "*** Begin Patch\n*** Update File: first.txt\n@@\n-old\n+new\n*** Update File: second.txt\n@@\n-old\n+new\n*** End Patch",
-            &root,
-        );
-        let rendered = patch
-            .display_lines(
-                Some(&ToolOutcome {
-                    output: Ok(json!("Done!")),
-                }),
-                100,
-                user_message_style_for(Some((31, 31, 31))),
-            )
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::remove_dir_all(&root).unwrap();
-
-        assert_eq!(rendered.matches("source preview omitted").count(), 1);
-        assert!(
-            rendered.contains(&format!("source preview omitted ({file_bytes} bytes)")),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn deleted_file_preview_caps_rows_without_losing_the_line_count() {
-        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let total_rows = MAX_PATCH_PREVIEW_ROWS + 5;
-        std::fs::write(
-            root.join("many-lines.txt"),
-            (1..=total_rows)
-                .map(|line| format!("line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .unwrap();
-
-        let patch = PatchDisplay::parse(
-            "*** Begin Patch\n*** Delete File: many-lines.txt\n*** End Patch",
-            &root,
-        );
-        let lines = patch.display_lines(
-            Some(&ToolOutcome {
-                output: Ok(json!("Done!")),
-            }),
-            80,
-            user_message_style_for(Some((31, 31, 31))),
-        );
-        let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
-        std::fs::remove_dir_all(&root).unwrap();
-
-        assert_eq!(patch.files[0].rows.len(), MAX_PATCH_PREVIEW_ROWS);
-        assert!(
-            rendered.contains(&format!("(+0 -{total_rows})")),
-            "{rendered}"
-        );
-        assert!(rendered.contains("… 5 diff rows omitted …"), "{rendered}");
-    }
-
-    #[test]
-    fn generated_patch_rows_are_bounded_before_rendering() {
-        let long_line = "x".repeat(MAX_PATCH_PREVIEW_ROW_BYTES * 2);
-        let patch = PatchDisplay::parse(
-            &format!("*** Begin Patch\n*** Add File: long.txt\n+{long_line}\n*** End Patch"),
-            Path::new("/tmp"),
-        );
-        let rendered = patch
-            .display_lines(
-                Some(&ToolOutcome {
-                    output: Ok(json!("Done!")),
-                }),
-                80,
-                user_message_style_for(Some((31, 31, 31))),
-            )
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains('…'), "{rendered}");
-        assert!(rendered.len() < long_line.len());
-    }
-
-    #[test]
     fn composer_supports_multiline_editing_and_submission() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         for character in "first".chars() {
@@ -6179,86 +4957,6 @@ mod tests {
     }
 
     #[test]
-    fn large_terminal_paste_renders_compact_and_submits_full_content() {
-        const WIDTH: u16 = 80;
-
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        let paste = "x".repeat(1_001);
-        let placeholder = "[Pasted Content 1001 chars]";
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Paste(paste.clone())),
-            Action::None
-        );
-        assert_eq!(view.editor.text(), placeholder);
-        assert_eq!(view.desired_height(WIDTH, 24), 5);
-
-        let backend = TestBackend::new(WIDTH, 5);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
-        let placeholder_y = rendered
-            .lines()
-            .position(|line| line.contains(placeholder))
-            .expect("rendered compact paste") as u16;
-        assert!(
-            (2..2 + placeholder.len() as u16).all(|x| buffer[(x, placeholder_y)].fg == Color::Cyan),
-            "{rendered}"
-        );
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::Submit(prompt(paste))
-        );
-        assert!(view.editor.is_empty());
-    }
-
-    #[test]
-    fn composer_grows_to_available_height_before_scrolling() {
-        const WIDTH: u16 = 40;
-        let input = (1..=12)
-            .map(|row| format!("row-{row:02}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.editor.set_text(input);
-
-        let expanded_height = view.desired_height(WIDTH, 30);
-        assert_eq!(expanded_height, 16);
-        let backend = TestBackend::new(WIDTH, expanded_height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let expanded = render_buffer(terminal.backend().buffer());
-        assert!(expanded.contains("row-01"), "{expanded}");
-        assert!(expanded.contains("row-12"), "{expanded}");
-
-        let clipped_height = view.desired_height(WIDTH, 8);
-        assert_eq!(clipped_height, 8);
-        let backend = TestBackend::new(WIDTH, clipped_height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let at_end = render_buffer(terminal.backend().buffer());
-        assert!(!at_end.contains("row-01"), "{at_end}");
-        assert!(at_end.contains("row-12"), "{at_end}");
-
-        for _ in 0..11 {
-            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
-        }
-        let backend = TestBackend::new(WIDTH, clipped_height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let at_start = render_buffer(terminal.backend().buffer());
-        assert!(at_start.contains("row-01"), "{at_start}");
-        assert!(!at_start.contains("row-12"), "{at_start}");
-    }
-
-    #[test]
     fn rendering_survives_tiny_terminal_sizes() {
         for (width, height) in [(1, 1), (2, 3), (4, 4), (7, 6), (20, 8)] {
             let mut view = View::new(Path::new("/tmp/bettercodex"));
@@ -6269,8 +4967,32 @@ mod tests {
         }
     }
 
-    fn plain(line: &Line<'_>) -> String {
-        line.spans
+    trait PlainLine {
+        fn line(&self) -> &Line<'_>;
+    }
+
+    impl PlainLine for Line<'_> {
+        fn line(&self) -> &Line<'_> {
+            self
+        }
+    }
+
+    impl PlainLine for HyperlinkLine {
+        fn line(&self) -> &Line<'_> {
+            &self.line
+        }
+    }
+
+    impl<T: PlainLine + ?Sized> PlainLine for &T {
+        fn line(&self) -> &Line<'_> {
+            (*self).line()
+        }
+    }
+
+    fn plain<T: PlainLine>(value: &T) -> String {
+        value
+            .line()
+            .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
