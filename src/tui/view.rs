@@ -101,6 +101,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "run a task-specific evaluator and improvement loop",
     },
     SlashCommand {
+        name: "review",
+        aliases: &[],
+        description: "thoroughly review and refactor a specified target",
+    },
+    SlashCommand {
         name: "clear",
         aliases: &[],
         description: "start a fresh session",
@@ -4576,6 +4581,20 @@ mod tests {
 
     fn prompt(text: impl Into<String>) -> UserPrompt {
         UserPrompt::text(text)
+    }
+
+    #[test]
+    fn review_completion_submits_the_explicit_review_command() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/rev");
+
+        let Action::Submit(prompt) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("review completion should submit a turn");
+        };
+        assert_eq!(prompt.text_without_image_placeholders(), "/review");
     }
 
     fn completed_message(text: impl Into<String>) -> AgentEvent {

@@ -45,5 +45,11 @@ The default runs one evaluator session followed by three fresh working
 sessions; see [`docs/slash_commands.md`](docs/slash_commands.md#quality-loop)
 for counts, progress, restoration, and repository-local evidence.
 
+For an active engineering review and evidence-backed refactoring, use
+`/review <target>` in the TUI or invoke `$review <target>` in any prompt. The
+workflow develops a deep understanding of the target, applies explicit quality
+criteria, and acts on clear net improvements; see
+[`docs/slash_commands.md`](docs/slash_commands.md#engineering-review).
+
 See [`docs/install.md`](docs/install.md) for supported platforms, migration from
 the retired `bcodex update` command, and the full source-build workflow.

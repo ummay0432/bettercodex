@@ -35,6 +35,10 @@ const APPROXIMATE_BYTES_PER_TOKEN: u64 = 4;
 const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
 const MAX_SKILLS_CONTEXT_BYTES: usize = 39_000;
 
+fn is_reserved_system_skill_name(name: &str) -> bool {
+    matches!(name, "loop" | "review")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SkillScope {
     System,
@@ -270,14 +274,17 @@ impl SkillCatalog {
                 }
                 match load_skill(&canonical, root.scope) {
                     Ok((mut skill, metadata_warning)) => {
-                        if skill.name == "loop" && skill.scope != SkillScope::System {
+                        if is_reserved_system_skill_name(&skill.name)
+                            && skill.scope != SkillScope::System
+                        {
                             warnings.push(format!(
-                                "Skipped reserved skill name `loop` at {}",
+                                "Skipped reserved skill name `{}` at {}",
+                                skill.name,
                                 canonical.display()
                             ));
                             continue;
                         }
-                        if skill.name == "loop" {
+                        if is_reserved_system_skill_name(&skill.name) {
                             skill.enabled = true;
                             skill.allow_implicit_invocation = false;
                         }
@@ -485,7 +492,7 @@ impl SkillCatalog {
             }
         };
         for skill in &mut self.skills {
-            if skill.name == "loop" {
+            if is_reserved_system_skill_name(&skill.name) {
                 skill.enabled = true;
                 skill.allow_implicit_invocation = false;
                 continue;
@@ -519,6 +526,10 @@ fn settings_file_display() -> String {
 
 pub(crate) fn is_mention_name_byte(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':')
+}
+
+pub(crate) fn explicitly_invokes_review(text: &str) -> bool {
+    extract_mentions(text).plain_names.contains("review")
 }
 
 fn discovery_roots_with_home(
@@ -1044,6 +1055,15 @@ fn extract_mentions(text: &str) -> Mentions<'_> {
     let bytes = text.as_bytes();
     let mut plain_names = HashSet::new();
     let mut paths = HashSet::new();
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("/review")
+        && rest
+            .as_bytes()
+            .first()
+            .is_none_or(|byte| !is_mention_name_byte(*byte))
+    {
+        plain_names.insert("review");
+    }
     let mut index = 0_usize;
     while index < bytes.len() {
         if bytes[index] == b'['
@@ -1126,3 +1146,7 @@ fn is_common_environment_variable(name: &str) -> bool {
             | "XDG_CONFIG_HOME"
     )
 }
+
+#[cfg(test)]
+#[path = "skills_review_tests.rs"]
+mod review_tests;

@@ -6,6 +6,36 @@ bettercodex adds `/tmux`, which immediately moves the current live TUI into a
 new detachable `c1`, `c2`, … tmux session. It remains available while an agent
 turn is running and does not restart or interrupt that turn.
 
+## Engineering review
+
+Use `/review <target>` in the TUI to run bettercodex's active engineering
+review on a specified product or system:
+
+```text
+/review the auto-updating logic
+/review recovery after an interrupted WebSocket response
+```
+
+The explicit `$review` skill starts the same workflow in interactive and
+non-interactive prompts and can target any repository scope:
+
+```text
+$review the authentication changes
+$review src/tui for avoidable redraw work
+```
+
+This is intentionally not a read-only review. It first develops a deep
+understanding of the target, then evaluates whether the affected system can be
+simpler, faster, more resource-efficient, or easier to maintain. When
+repository evidence supports a clear net improvement, the agent refactors as
+deeply as needed and removes everything made obsolete. When the target already
+meets those standards, it leaves the implementation unchanged and explains the
+evidence for that conclusion.
+
+Review requests submitted during another turn queue as the next task instead of
+steering the active implementation. The skill is explicit-only: bettercodex
+does not start this workflow unless the operator writes `$review` or `/review`.
+
 ## Quality loop
 
 Use `/loop <task>` in the TUI when a task should get a task-specific evaluator
