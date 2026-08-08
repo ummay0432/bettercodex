@@ -33,31 +33,27 @@ class InstallScriptTest(unittest.TestCase):
     def test_readme_exposes_the_canonical_copyable_install_command(self) -> None:
         self.assertIn(f"```sh\n{INSTALL_COMMAND}\n```", README)
 
-    def test_one_line_bootstrap_fetches_the_canonical_installer_and_cleans_it(self) -> None:
+    def test_one_line_bootstrap_fetches_and_runs_the_canonical_installer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "fake-bin"
             fake_bin.mkdir()
-            temporary = root / "temporary"
-            temporary.mkdir()
             marker = root / "installer-ran"
             write_executable(
                 fake_bin / "curl",
                 "#!/bin/sh\n"
-                "for argument do url=\"$argument\"; done\n"
-                "case \"$url\" in\n"
-                "  'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh')\n"
-                "    printf '%s\\n' '#!/bin/sh' "
-                "'printf canonical >\"$BCODEX_TEST_BOOTSTRAP_MARKER\"' ;;\n"
-                "  *) exit 2 ;;\n"
-                "esac\n",
+                "[ \"$#\" -eq 2 ] && [ \"$1\" = '-fsSL' ] && "
+                "[ \"$2\" = "
+                "'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh' ] "
+                "|| exit 2\n"
+                "printf '%s\\n' '#!/bin/sh' "
+                "'printf canonical >\"$BCODEX_TEST_BOOTSTRAP_MARKER\"'\n",
             )
             environment = os.environ.copy()
             environment.update(
                 {
                     "BCODEX_TEST_BOOTSTRAP_MARKER": str(marker),
                     "PATH": f"{fake_bin}:/usr/bin:/bin",
-                    "TMPDIR": str(temporary),
                 }
             )
 
@@ -71,93 +67,6 @@ class InstallScriptTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(marker.read_text(encoding="utf-8"), "canonical")
-            self.assertEqual(list(temporary.iterdir()), [])
-
-    def test_failed_bootstrap_fetch_does_not_run_or_retain_partial_script(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            fake_bin = root / "fake-bin"
-            fake_bin.mkdir()
-            temporary = root / "temporary"
-            temporary.mkdir()
-            write_executable(
-                fake_bin / "curl",
-                "#!/bin/sh\nprintf '%s\\n' '#!/bin/sh' 'exit 0'; exit 7\n",
-            )
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "PATH": f"{fake_bin}:/usr/bin:/bin",
-                    "TMPDIR": str(temporary),
-                }
-            )
-
-            result = subprocess.run(
-                ["/bin/sh", "-c", INSTALL_COMMAND],
-                check=False,
-                capture_output=True,
-                env=environment,
-                text=True,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("could not fetch the public installer", result.stderr)
-            self.assertEqual(list(temporary.iterdir()), [])
-
-    def test_bootstrap_rejects_an_invalid_downloaded_installer(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            fake_bin = root / "fake-bin"
-            fake_bin.mkdir()
-            temporary = root / "temporary"
-            temporary.mkdir()
-            write_executable(fake_bin / "curl", "#!/bin/sh\nprintf 'not a shell script\\n'\n")
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "PATH": f"{fake_bin}:/usr/bin:/bin",
-                    "TMPDIR": str(temporary),
-                }
-            )
-
-            result = subprocess.run(
-                ["/bin/sh", "-c", INSTALL_COMMAND],
-                check=False,
-                capture_output=True,
-                env=environment,
-                text=True,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("GitHub returned an invalid installer", result.stderr)
-            self.assertEqual(list(temporary.iterdir()), [])
-
-    def test_bootstrap_reports_missing_curl_without_creating_a_temp_file(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            fake_bin = root / "empty-bin"
-            fake_bin.mkdir()
-            temporary = root / "temporary"
-            temporary.mkdir()
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "PATH": str(fake_bin),
-                    "TMPDIR": str(temporary),
-                }
-            )
-
-            result = subprocess.run(
-                ["/bin/sh", "-c", INSTALL_COMMAND],
-                check=False,
-                capture_output=True,
-                env=environment,
-                text=True,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("curl is required", result.stderr)
-            self.assertEqual(list(temporary.iterdir()), [])
 
     def test_install_and_update_reuse_downloads_and_compiled_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

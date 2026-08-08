@@ -13,7 +13,7 @@ repositories where you accept that trust model.
 On macOS 12+ or Linux with glibc 2.31+, copy and run this command:
 
 ```sh
-( set -eu; command -v curl >/dev/null 2>&1 || { printf '%s\n' 'bettercodex installer: curl is required' >&2; exit 1; }; bcodex_bootstrap="$(mktemp)"; trap 'rm -f "$bcodex_bootstrap"' 0; trap 'exit 1' 1 2 15; if ! curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --connect-timeout 10 --max-time 30 --max-filesize 1048576 --user-agent bettercodex https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh >"$bcodex_bootstrap"; then printf '%s\n' 'bettercodex installer: could not fetch the public installer' >&2; exit 1; fi; [ "$(sed -n '1p' "$bcodex_bootstrap")" = '#!/bin/sh' ] || { printf '%s\n' 'bettercodex installer: GitHub returned an invalid installer' >&2; exit 1; }; /bin/sh "$bcodex_bootstrap" )
+curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
 ```
 
 [`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt) contains the same one-line command.
