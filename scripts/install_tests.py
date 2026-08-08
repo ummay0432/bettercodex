@@ -1003,7 +1003,7 @@ def run_installer(
                 fi
                 emit_file "$BCODEX_TEST_PREBUILT_ASSET" 200
                 ;;
-              "https://api.github.com/repos/$BCODEX_TEST_REPOSITORY/commits/main")
+              "https://api.github.com/repos/$BCODEX_TEST_REPOSITORY/git/ref/heads/main")
                 count=0
                 if [ -f "$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE" ]; then
                   count="$(sed -n '1p' "$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE")"
@@ -1026,7 +1026,8 @@ def run_installer(
                 else
                   revision="$BCODEX_TEST_NEXT_COMMIT"
                 fi
-                printf '{\\n  "sha": "%s"\\n}\\n' "$revision"
+                printf '{"ref":"refs/heads/main","object":{"sha":"%s","type":"commit"}}\\n' \
+                  "$revision"
                 ;;
               "https://codeload.github.com/$BCODEX_TEST_REPOSITORY/tar.gz/"*)
                 count=0

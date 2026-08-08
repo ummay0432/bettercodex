@@ -384,13 +384,26 @@ resolve_main_commit() {
     if github_response="$(
       github_get \
         "$MAX_METADATA_BYTES" \
-        "$GITHUB_API_ROOT/repos/$repository/commits/main" 2>/dev/null
+        "$GITHUB_API_ROOT/repos/$repository/git/ref/heads/main" 2>/dev/null
     )"; then
-      github_commit="$(
-        printf '%s\n' "$github_response" |
-          sed -n 's/^[[:space:]]*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' |
-          sed -n '1p'
+      github_compact="$(printf '%s\n' "$github_response" | tr -d '[:space:]')"
+      github_object="$(
+        printf '%s\n' "$github_compact" |
+          sed -n 's/^.*"object":{\([^}]*\)}.*$/\1/p'
       )"
+      github_commit=""
+      case "$github_compact" in
+        *'"ref":"refs/heads/main"'*)
+          case "$github_object" in
+            *'"type":"commit"'*)
+              github_commit="$(
+                printf '%s\n' "$github_object" |
+                  sed -n 's/^.*"sha":"\([0-9a-fA-F]\{40\}\)".*$/\1/p'
+              )"
+              ;;
+          esac
+          ;;
+      esac
       if is_source_revision "$github_commit"; then
         printf '%s\n' "$github_commit"
         return 0

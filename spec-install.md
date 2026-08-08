@@ -382,8 +382,9 @@ user can rerun after installing those prerequisites.
 
 The fallback downloads the immutable released source revision, uses `Cargo.lock`
 and `rust-toolchain.toml`, and runs the existing binary and resource smoke tests.
-It may resolve public `main` only when bootstrapping a repository that has no
-release at all.
+It may resolve the public `refs/heads/main` commit through GitHub's bounded Git
+reference response only when bootstrapping a repository that has no release at
+all.
 
 Fallback builds retain one compatible compiled-dependency generation at:
 
