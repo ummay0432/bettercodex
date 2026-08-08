@@ -52,7 +52,7 @@ use crossterm::event::Event;
 use crossterm::event::EventStream;
 use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use notifications::Notifier;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -720,7 +720,7 @@ impl Runtime {
     }
 
     fn start_operator_command(&mut self, command: String) {
-        let call_id = format!("operator:{}", Uuid::new_v4());
+        let call_id = format!("operator:{}", crate::new_uuid());
         self.view.start_operator_command(call_id.clone(), &command);
         let processes = self.processes.clone();
         let updates = self.operator_command_updates_tx.clone();

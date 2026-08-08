@@ -1,7 +1,6 @@
 use super::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use uuid::Uuid;
 
 struct TemporaryDirectory {
     path: PathBuf,
@@ -9,7 +8,7 @@ struct TemporaryDirectory {
 
 impl TemporaryDirectory {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("bettercodex-{label}-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("bettercodex-{label}-{}", crate::new_uuid()));
         fs::create_dir_all(&path).unwrap();
         Self { path }
     }

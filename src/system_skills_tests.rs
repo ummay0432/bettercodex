@@ -1,7 +1,6 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
-use uuid::Uuid;
 
 struct TestDirectory(PathBuf);
 
@@ -10,7 +9,7 @@ impl TestDirectory {
         let path = std::env::temp_dir().join(format!(
             "bettercodex-{label}-{}-{}",
             std::process::id(),
-            Uuid::new_v4()
+            crate::new_uuid()
         ));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)

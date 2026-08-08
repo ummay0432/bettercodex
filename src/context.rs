@@ -296,7 +296,7 @@ impl Conversation {
         let context_metrics = ContextMetrics::from_history(&history, &world_state);
         Ok(Self {
             history,
-            history_lineage: Uuid::new_v4(),
+            history_lineage: crate::new_uuid(),
             context_metrics,
             usage: None,
             usage_history_estimate: None,
@@ -317,7 +317,7 @@ impl Conversation {
         let context_metrics = ContextMetrics::from_history(&history, &frozen.world_state);
         Ok(Self {
             history,
-            history_lineage: Uuid::new_v4(),
+            history_lineage: crate::new_uuid(),
             context_metrics,
             usage: None,
             usage_history_estimate: None,
@@ -345,7 +345,7 @@ impl Conversation {
         let context_metrics = ContextMetrics::from_history(&history, &world_state);
         let mut conversation = Self {
             history,
-            history_lineage: Uuid::new_v4(),
+            history_lineage: crate::new_uuid(),
             context_metrics,
             usage,
             usage_history_estimate,
@@ -377,7 +377,7 @@ impl Conversation {
         }
         Ok(Self {
             history: self.history.clone(),
-            history_lineage: Uuid::new_v4(),
+            history_lineage: crate::new_uuid(),
             context_metrics: self.context_metrics.clone(),
             usage: self.usage.clone(),
             usage_history_estimate: self.usage_history_estimate,
@@ -474,7 +474,7 @@ impl Conversation {
             .replace_compacted_history(&history, response_usage.as_ref())?;
         self.context_metrics = context_metrics;
         self.history = history;
-        self.history_lineage = Uuid::new_v4();
+        self.history_lineage = crate::new_uuid();
         self.usage = None;
         self.usage_history_estimate = None;
         self.server_reasoning_included = false;
@@ -677,7 +677,7 @@ impl Conversation {
             .replace_history(&normalized, HistoryReplacement::Normalization)?;
         self.context_metrics = ContextMetrics::from_history(&normalized, &self.world_state);
         self.history = normalized;
-        self.history_lineage = Uuid::new_v4();
+        self.history_lineage = crate::new_uuid();
         Ok(true)
     }
 
@@ -730,7 +730,7 @@ impl Conversation {
             .replace_history(&refreshed, HistoryReplacement::ContextRefresh)?;
         self.context_metrics = ContextMetrics::from_history(&refreshed, &world_state);
         self.history = refreshed;
-        self.history_lineage = Uuid::new_v4();
+        self.history_lineage = crate::new_uuid();
         self.world_state = world_state;
         Ok(())
     }

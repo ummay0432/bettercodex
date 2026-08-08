@@ -489,11 +489,10 @@ mod tests {
     use super::*;
     use base64::Engine;
     use std::path::PathBuf;
-    use uuid::Uuid;
 
     fn temporary_directory(label: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("bettercodex-exec-{label}-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("bettercodex-exec-{label}-{}", crate::new_uuid()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }

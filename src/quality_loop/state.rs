@@ -102,7 +102,7 @@ impl LoopRun {
         let loops = prepare_loop_directories(worktree.root())?;
         let mut lock = acquire_lock(&loops)?;
         recover_incomplete_runs(worktree, &loops)?;
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = crate::new_uuid().to_string();
         let root = loops.join(&run_id);
         create_new_private_directory(&root)?;
         let initialized = (|| -> Result<RunState> {
@@ -808,7 +808,7 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| anyhow!("path has no parent"))?;
-    let temporary = parent.join(format!(".loop-write-{}", Uuid::new_v4()));
+    let temporary = parent.join(format!(".loop-write-{}", crate::new_uuid()));
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .create_new(true)

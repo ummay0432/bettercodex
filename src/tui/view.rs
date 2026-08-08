@@ -4959,7 +4959,7 @@ mod tests {
 
     #[test]
     fn patch_hunk_rows_use_source_line_numbers() {
-        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", crate::new_uuid()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("sample.txt");
         std::fs::write(

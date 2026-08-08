@@ -15,7 +15,6 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use uuid::Uuid;
 
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: usize) -> Result<Option<T>> {
     let mut file = match File::open(path) {
@@ -132,6 +131,6 @@ fn companion_path(path: &Path, suffix: &str) -> Result<PathBuf> {
 fn temporary_path(path: &Path) -> Result<PathBuf> {
     companion_path(
         path,
-        &format!(".tmp-{}-{}", std::process::id(), Uuid::new_v4()),
+        &format!(".tmp-{}-{}", std::process::id(), crate::new_uuid()),
     )
 }

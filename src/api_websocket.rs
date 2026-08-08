@@ -1,7 +1,7 @@
 use super::ApiError;
 use super::ApiResult;
-use futures::SinkExt;
-use futures::StreamExt;
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use std::time::Duration;
