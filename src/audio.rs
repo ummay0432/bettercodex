@@ -3,10 +3,6 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use lru::LruCache;
-use sha1::Digest;
-use sha1::Sha1;
-use std::hash::Hash;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::sync::LazyLock;
@@ -15,9 +11,9 @@ use symphonia::core::formats::TrackType;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use tokio::sync::Mutex;
-use tokio::sync::MutexGuard;
 
+use crate::cache::BlockingLruCache;
+use crate::cache::sha1_digest;
 use crate::truncation::approx_token_count;
 
 const AUDIO_TOKEN_ESTIMATE_CACHE_SIZE: usize = 32;
@@ -101,53 +97,6 @@ fn canonical_audio_mime(mime: &str) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-struct BlockingLruCache<K, V> {
-    inner: Mutex<LruCache<K, V>>,
-}
-
-impl<K, V> BlockingLruCache<K, V>
-where
-    K: Eq + Hash,
-{
-    fn new(capacity: NonZeroUsize) -> Self {
-        Self {
-            inner: Mutex::new(LruCache::new(capacity)),
-        }
-    }
-
-    fn get_or_insert_with(&self, key: K, value: impl FnOnce() -> V) -> V
-    where
-        V: Clone,
-    {
-        if let Some(mut guard) = lock_if_runtime(&self.inner) {
-            if let Some(value) = guard.get(&key) {
-                return value.clone();
-            }
-            let value = value();
-            guard.put(key, value.clone());
-            return value;
-        }
-        value()
-    }
-}
-
-fn lock_if_runtime<K, V>(cache: &Mutex<LruCache<K, V>>) -> Option<MutexGuard<'_, LruCache<K, V>>>
-where
-    K: Eq + Hash,
-{
-    tokio::runtime::Handle::try_current().ok()?;
-    Some(tokio::task::block_in_place(|| cache.blocking_lock()))
-}
-
-fn sha1_digest(bytes: &[u8]) -> [u8; 20] {
-    let mut hasher = Sha1::new();
-    hasher.update(bytes);
-    let result = hasher.finalize();
-    let mut output = [0; 20];
-    output.copy_from_slice(&result);
-    output
 }
 
 #[cfg(test)]

@@ -6,12 +6,11 @@
 //! the exec runtime, then validates and prepares any image the JavaScript
 //! program chooses to return before inserting the outer tool result into history.
 
+use crate::image::ImageProcessingError;
+use crate::image::PromptImageResizeLimits;
+use crate::image::load_data_url_for_prompt;
 use crate::protocol::FunctionCallOutputContentItem;
 use crate::protocol::ImageDetail;
-use codex_utils_image::ImageProcessingError;
-use codex_utils_image::PromptImageMode;
-use codex_utils_image::PromptImageResizeLimits;
-use codex_utils_image::load_data_url_for_prompt;
 
 const IMAGE_PROCESSING_ERROR_PLACEHOLDER: &str =
     "image content omitted because it could not be processed";
@@ -77,8 +76,8 @@ fn prepare_image(
         Some(ImageDetail::Original) => ORIGINAL_DETAIL_LIMITS,
         Some(ImageDetail::Low) => return Err(ImagePreparationError::UnsupportedLowDetail),
     };
-    let image = load_data_url_for_prompt(image_url, PromptImageMode::ResizeWithLimits(limits))
-        .map_err(ImagePreparationError::Processing)?;
+    let image =
+        load_data_url_for_prompt(image_url, limits).map_err(ImagePreparationError::Processing)?;
     *image_url = image.into_data_url();
     Ok(())
 }
