@@ -14,6 +14,8 @@ use crate::protocol::FunctionCallOutputContentItem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TruncationPolicy {
+    // Retained from the upstream policy API; current production callers use token budgets.
+    #[allow(dead_code)]
     Bytes(usize),
     Tokens(usize),
 }
@@ -199,6 +201,8 @@ pub(crate) fn truncate_function_output_items_with_policy(
     out
 }
 
+// Retained from the upstream helper surface and covered by the port's parity tests.
+#[allow(dead_code)]
 pub(crate) fn approx_tokens_from_byte_count_i64(bytes: i64) -> i64 {
     if bytes <= 0 {
         return 0;

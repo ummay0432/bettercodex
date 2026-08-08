@@ -3,7 +3,7 @@ use super::drain_completed_agent_events;
 use super::view::View;
 use crate::assistant_message::AssistantMessage;
 use crate::events::AgentEvent;
-use codex_protocol::models::MessagePhase;
+use crate::protocol::MessagePhase;
 use std::path::Path;
 use tokio::sync::mpsc::unbounded_channel;
 
