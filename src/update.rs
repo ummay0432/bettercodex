@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::process::Command as AsyncProcessCommand;
 
 const DEFAULT_REPOSITORY: &str = "ummay0432/bettercodex";
+const GITHUB_HOST: &str = "github.com";
 const INSTALLER_PATH: &str = "scripts/install.sh";
 const MAX_INSTALLER_BYTES: usize = 1024 * 1024;
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,7 +92,7 @@ async fn check_for_source_update_with(
     let endpoint = format!("repos/{repository}/commits/main");
     let mut command = AsyncProcessCommand::new(gh_program);
     command
-        .args(["api", &endpoint, "--jq", ".sha"])
+        .args(["api", "--hostname", GITHUB_HOST, &endpoint, "--jq", ".sha"])
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .kill_on_drop(true);
@@ -179,7 +180,7 @@ fn resolve_source_revision(gh_program: &OsStr, repository: &str) -> Result<Strin
     validate_repository(repository)?;
     let endpoint = format!("repos/{repository}/commits/main");
     let output = ProcessCommand::new(gh_program)
-        .args(["api", &endpoint, "--jq", ".sha"])
+        .args(["api", "--hostname", GITHUB_HOST, &endpoint, "--jq", ".sha"])
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .output()
@@ -210,6 +211,8 @@ fn fetch_installer(
     let output = ProcessCommand::new(gh_program)
         .args([
             "api",
+            "--hostname",
+            GITHUB_HOST,
             "-H",
             "Accept: application/vnd.github.raw+json",
             &endpoint,

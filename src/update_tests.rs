@@ -64,7 +64,7 @@ async fn authenticated_revision_lookup_reports_both_exact_commits() {
     let latest = "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD";
     let gh = TemporaryProgram::new(&format!(
         "#!/bin/sh\n\
-         test \"$*\" = \"api repos/owner/private/commits/main --jq .sha\" || exit 2\n\
+         test \"$*\" = \"api --hostname github.com repos/owner/private/commits/main --jq .sha\" || exit 2\n\
          printf '%s\\n' '{latest}'\n"
     ));
 
@@ -166,8 +166,8 @@ fn updater_resolves_main_and_fetches_the_installer_from_that_revision() {
     let gh = TemporaryProgram::new(&format!(
         "#!/bin/sh\n\
          case \"$*\" in\n\
-           'api repos/owner/private/commits/main --jq .sha') printf '%s\\n' '{revision}' ;;\n\
-           'api -H Accept: application/vnd.github.raw+json repos/owner/private/contents/scripts/install.sh?ref={revision}') printf '%s\\n' '#!/bin/sh' 'exit 0' ;;\n\
+           'api --hostname github.com repos/owner/private/commits/main --jq .sha') printf '%s\\n' '{revision}' ;;\n\
+           'api --hostname github.com -H Accept: application/vnd.github.raw+json repos/owner/private/contents/scripts/install.sh?ref={revision}') printf '%s\\n' '#!/bin/sh' 'exit 0' ;;\n\
            *) exit 2 ;;\n\
          esac\n"
     ));

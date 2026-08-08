@@ -17,14 +17,30 @@ Windows is not supported.
 ## Install with a minimal retained footprint
 
 Install an authenticated [GitHub CLI](https://cli.github.com/), `curl`, a native
-C toolchain, and Rust through [rustup](https://rustup.rs/). Then copy and run the
-repository's one-line [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt).
+C toolchain, and Rust through [rustup](https://rustup.rs/). On a new Mac,
+install Xcode or Apple's
+[Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/)
+first:
+
+```sh
+xcode-select --install
+gh auth login --hostname github.com
+```
+
+The GitHub account must have access to the private repository. Then copy and
+run the repository's one-line
+[`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt). Its preflight reports missing
+GitHub CLI or authentication before creating a temporary file.
 
 The one-line bootstrap always fetches the canonical `scripts/install.sh` from
 private `main`. That installer resolves `main` to a 40-character commit ID,
 downloads GitHub's source archive for that exact commit, and uses the checked-in
 lockfile and pinned Rust toolchain for a release build. This avoids a Homebrew
-or system Cargo earlier on `PATH` silently selecting a different compiler.
+or system Cargo earlier on `PATH` silently selecting a different compiler. An
+already-installed matching Rust toolchain is reused. If that exact toolchain is
+missing, rustup downloads its minimal profile inside the temporary install tree
+instead of adding another persistent toolchain.
+
 Source, Cargo's dependency cache, the compilation target, compiler scratch
 space, and verified V8 downloads all live under one temporary install tree.
 
@@ -36,15 +52,17 @@ source and target and retries the newer commit, up to three attempts. Only a
 candidate matching the final check is renamed over `bcodex`; the rename is in
 the destination directory, and the staged and installed bytes are compared with
 the verified build. A failed build, copy, or smoke test leaves the existing
-binary untouched.
+binary untouched. Transient GitHub revision and source-download failures are
+also retried three times; partial archives are discarded between attempts.
 
 An exit trap removes the complete temporary install tree after success, build
 failure, `SIGHUP`, `SIGINT`, or `SIGTERM`. A lock records the tree so the next
 install can remove it after an untrappable crash or `SIGKILL`. Only the binary
 under `$HOME/.local/bin`, a small shell-profile PATH entry when needed, and
-BetterCodex user data remain from the BetterCodex build. Rustup's selected Rust
-toolchain and the native toolchain are intentionally retained because other
-software may share them.
+BetterCodex user data remain from the BetterCodex build. The prerequisite
+rustup installation, any matching toolchain that existed before the install,
+and the native compiler are left alone because other software may share them.
+An installer-only pinned toolchain is removed with the temporary tree.
 
 The source build still needs several gigabytes of free temporary space while it
 runs. Eliminating the retained cache means a later update normally downloads
@@ -59,6 +77,10 @@ sign in and launch BetterCodex from a project directory:
 bcodex login
 bcodex
 ```
+
+If another `bcodex` earlier on `PATH` would still launch an older binary, the
+installer reports its path, prepends the managed install directory for future
+terminals, and prints the `export PATH=...` command for the current terminal.
 
 Use an existing Codex ChatGPT credential at
 `${CODEX_HOME:-$HOME/.codex}/auth.json`, or sign in through `bcodex login`.
@@ -108,8 +130,9 @@ Current installs and updates automatically remove the retired updater's
 do this before compiling so the old multi-gigabyte target cannot crowd out the
 temporary replacement build. They do not remove credentials, sessions,
 settings, a development checkout's `rusty-v8-*` cache, Rust toolchains, or
-native compiler tools. Cache paths that are symbolic links are left untouched
-rather than followed.
+native compiler tools that existed before the install. A missing pinned Rust
+toolchain created solely for an install is temporary. Cache paths that are
+symbolic links are left untouched rather than followed.
 
 Embedded system skills are checked on launch independently of the source
 revision marker. BetterCodex verifies every expected file's bytes and private

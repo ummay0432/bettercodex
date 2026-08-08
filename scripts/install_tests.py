@@ -38,10 +38,14 @@ class InstallScriptTest(unittest.TestCase):
             write_executable(
                 fake_bin / "gh",
                 "#!/bin/sh\n"
-                "test \"$*\" = \"api -H Accept: application/vnd.github.raw+json "
-                "repos/ummay0432/bettercodex/contents/scripts/install.sh\" || exit 2\n"
-                "printf '%s\\n' '#!/bin/sh' "
-                "'printf canonical >\"$BCODEX_TEST_BOOTSTRAP_MARKER\"'\n",
+                "case \"$*\" in\n"
+                "  'auth status --active --hostname github.com') exit 0 ;;\n"
+                "  'api --hostname github.com -H Accept: application/vnd.github.raw+json "
+                "repos/ummay0432/bettercodex/contents/scripts/install.sh')\n"
+                "    printf '%s\\n' '#!/bin/sh' "
+                "'printf canonical >\"$BCODEX_TEST_BOOTSTRAP_MARKER\"' ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
             )
             environment = os.environ.copy()
             environment.update(
@@ -73,7 +77,12 @@ class InstallScriptTest(unittest.TestCase):
             temporary.mkdir()
             write_executable(
                 fake_bin / "gh",
-                "#!/bin/sh\nprintf '%s\\n' '#!/bin/sh' 'exit 0'\nexit 7\n",
+                "#!/bin/sh\n"
+                "case \"$1:$2\" in\n"
+                "  auth:status) exit 0 ;;\n"
+                "  api:--hostname) printf '%s\\n' '#!/bin/sh' 'exit 0'; exit 7 ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
             )
             environment = os.environ.copy()
             environment.update(
@@ -92,6 +101,62 @@ class InstallScriptTest(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not fetch the private installer", result.stderr)
+            self.assertEqual(list(temporary.iterdir()), [])
+
+    def test_bootstrap_reports_missing_github_auth_before_creating_a_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            temporary = root / "temporary"
+            temporary.mkdir()
+            write_executable(fake_bin / "gh", "#!/bin/sh\nexit 1\n")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "TMPDIR": str(temporary),
+                }
+            )
+
+            result = subprocess.run(
+                ["/bin/sh", "-c", INSTALL_COMMAND],
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("gh auth login --hostname github.com", result.stderr)
+            self.assertEqual(list(temporary.iterdir()), [])
+
+    def test_bootstrap_reports_a_missing_github_cli_without_creating_a_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "empty-bin"
+            fake_bin.mkdir()
+            temporary = root / "temporary"
+            temporary.mkdir()
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": str(fake_bin),
+                    "TMPDIR": str(temporary),
+                }
+            )
+
+            result = subprocess.run(
+                ["/bin/sh", "-c", INSTALL_COMMAND],
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("GitHub CLI is required", result.stderr)
             self.assertEqual(list(temporary.iterdir()), [])
 
     def test_install_and_update_leave_no_source_or_build_cache(self) -> None:
@@ -113,7 +178,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertIn("Installed bcodex", first.stdout)
             self.assertIn("Updated bcodex", second.stdout)
-            self.assertIn("Removed the temporary source", second.stdout)
+            self.assertIn("Removed the disposable install tree", second.stdout)
             installed = root / "install" / "bin" / "bcodex"
             self.assertEqual(run_binary(installed, "--version"), f"bcodex {VERSION}\n")
             self.assertEqual(run_binary(installed, "--internal-source-revision"), f"{COMMIT}\n")
@@ -240,16 +305,89 @@ class InstallScriptTest(unittest.TestCase):
             self.assertTrue((root / "install" / "bin" / "bcodex").is_file())
             assert_no_installer_residue(self, root)
 
-    def test_missing_pinned_rust_toolchain_is_installed_once(self) -> None:
+    def test_missing_pinned_rust_toolchain_is_installed_only_in_the_temp_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
 
             result = run_installer(root, toolchain_installed=False)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            rustup_calls = (root / "rustup.log").read_text(encoding="utf-8")
-            self.assertIn("toolchain install 1.95.0 --profile minimal", rustup_calls)
-            self.assertTrue((root / "toolchain-installed").is_file())
+            rustup_calls = (root / "rustup.log").read_text(encoding="utf-8").splitlines()
+            install_home, install_arguments = next(
+                call.split("|", 1)
+                for call in rustup_calls
+                if "toolchain install" in call
+            )
+            self.assertEqual(
+                install_arguments,
+                "toolchain install 1.95.0 --profile minimal",
+            )
+            self.assertIn("bettercodex-install.", install_home)
+            self.assertTrue(install_home.endswith("/rustup-home"))
+            self.assertFalse(Path(install_home).exists())
+            self.assertIn("disposable install tree", result.stdout)
+            assert_no_installer_residue(self, root)
+
+    def test_transient_github_failures_retry_without_mixing_partial_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, main_failures=2, archive_failures=2)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("GitHub request failed; retrying (2/3)", result.stderr)
+            self.assertIn("GitHub source download failed; retrying (3/3)", result.stderr)
+            self.assertEqual(
+                (root / "main-request-count").read_text(encoding="utf-8").strip(),
+                "4",
+            )
+            self.assertEqual(
+                (root / "archive-request-count").read_text(encoding="utf-8").strip(),
+                "3",
+            )
+            self.assertEqual(
+                run_binary(root / "install" / "bin" / "bcodex", "--internal-source-revision"),
+                f"{COMMIT}\n",
+            )
+            assert_no_installer_residue(self, root)
+
+    def test_exhausted_github_retries_preserve_the_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(root, main_failures=3)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not resolve the current BetterCodex main commit", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+            self.assertFalse((root / "build.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_fresh_macos_without_command_line_tools_gets_the_exact_remedy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, system="Darwin", machine="arm64", compiler_works=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("xcode-select --install", result.stderr)
+            self.assertFalse((root / "build.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_an_older_bcodex_earlier_on_path_is_reported_and_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, shadowed_binary=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            shadow = root / "fake-bin" / "bcodex"
+            installed = root / "install" / "bin" / "bcodex"
+            self.assertIn(f"{shadow} currently shadows", result.stderr)
+            profile = (root / "home" / ".profile").read_text(encoding="utf-8")
+            self.assertIn(f"export PATH='{installed.parent}':\"$PATH\"", profile)
+            self.assertIn("For this terminal: export PATH=", result.stdout)
             assert_no_installer_residue(self, root)
 
     def test_retired_cache_cleanup_never_follows_a_symlink(self) -> None:
@@ -354,8 +492,11 @@ def run_installer(
     system: str = "Linux",
     machine: str = "x86_64",
     authenticated: bool = True,
+    archive_failures: int = 0,
     build_success: bool = True,
+    compiler_works: bool = True,
     embedded_revision: str | None = None,
+    main_failures: int = 0,
     smoke_success: bool = True,
     next_commit: str = COMMIT,
     home_enabled: bool = True,
@@ -363,6 +504,7 @@ def run_installer(
     shell: str = "/bin/sh",
     cleanup_success: bool = True,
     advancing_main: bool = False,
+    shadowed_binary: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     root.mkdir(parents=True, exist_ok=True)
     fake_bin = root / "fake-bin"
@@ -393,31 +535,45 @@ def run_installer(
             """\
             #!/bin/sh
             printf '%s\\n' "$*" >>"$BCODEX_TEST_GH_LOG"
-            case "$1:$2" in
-              auth:status)
+            case "$*" in
+              'auth status --active --hostname github.com')
                 [ "$BCODEX_TEST_AUTHENTICATED" = "1" ]
                 ;;
-              api:repos/$BCODEX_TEST_REPOSITORY/commits/main)
+              "api --hostname github.com repos/$BCODEX_TEST_REPOSITORY/commits/main --jq .sha")
                 count=0
-                if [ -f "$BCODEX_TEST_COMMIT_COUNT_FILE" ]; then
-                  count="$(sed -n '1p' "$BCODEX_TEST_COMMIT_COUNT_FILE")"
+                if [ -f "$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE" ]; then
+                  count="$(sed -n '1p' "$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE")"
                 fi
                 count=$((count + 1))
-                printf '%s\\n' "$count" >"$BCODEX_TEST_COMMIT_COUNT_FILE"
+                printf '%s\\n' "$count" >"$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE"
+                if [ "$count" -le "$BCODEX_TEST_MAIN_FAILURES" ]; then
+                  exit 75
+                fi
+                success_count=$((count - BCODEX_TEST_MAIN_FAILURES))
                 if [ "$BCODEX_TEST_ADVANCING_MAIN" = 1 ]; then
-                  case "$count" in
+                  case "$success_count" in
                     1) printf '%s\\n' "$BCODEX_TEST_COMMIT" ;;
                     2 | 3) printf '%s\\n' "$BCODEX_TEST_NEXT_COMMIT" ;;
                     4 | 5) printf '%040d\\n' 0 | tr 0 c ;;
                     *) printf '%040d\\n' 0 | tr 0 d ;;
                   esac
-                elif [ "$count" -eq 1 ]; then
+                elif [ "$success_count" -eq 1 ]; then
                   printf '%s\\n' "$BCODEX_TEST_COMMIT"
                 else
                   printf '%s\\n' "$BCODEX_TEST_NEXT_COMMIT"
                 fi
                 ;;
-              api:repos/$BCODEX_TEST_REPOSITORY/tarball/*)
+              "api --hostname github.com repos/$BCODEX_TEST_REPOSITORY/tarball/"*)
+                count=0
+                if [ -f "$BCODEX_TEST_ARCHIVE_REQUEST_COUNT_FILE" ]; then
+                  count="$(sed -n '1p' "$BCODEX_TEST_ARCHIVE_REQUEST_COUNT_FILE")"
+                fi
+                count=$((count + 1))
+                printf '%s\\n' "$count" >"$BCODEX_TEST_ARCHIVE_REQUEST_COUNT_FILE"
+                if [ "$count" -le "$BCODEX_TEST_ARCHIVE_FAILURES" ]; then
+                  printf 'partial archive'
+                  exit 75
+                fi
                 cat "$BCODEX_TEST_SOURCE_ARCHIVE"
                 ;;
               *) exit 2 ;;
@@ -425,8 +581,18 @@ def run_installer(
             """
         ),
     )
-    for command in ("cargo", "cc", "curl", "rustc"):
+    for command in ("cargo", "curl", "rustc"):
         write_executable(fake_bin / command, "#!/bin/sh\nexit 0\n")
+    write_executable(
+        fake_bin / "cc",
+        "#!/bin/sh\n[ \"$BCODEX_TEST_COMPILER_WORKS\" = 1 ]\n",
+    )
+    write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+    if shadowed_binary:
+        write_executable(
+            fake_bin / "bcodex",
+            "#!/bin/sh\nprintf 'bcodex 0.0.1\\n'\n",
+        )
     write_executable(
         fake_bin / "rm",
         "#!/bin/sh\n"
@@ -440,17 +606,28 @@ def run_installer(
     write_executable(
         fake_bin / "rustup",
         "#!/bin/sh\n"
-        "printf '%s\\n' \"$*\" >>\"$BCODEX_TEST_RUSTUP_LOG\"\n"
+        "printf '%s|%s\\n' \"${RUSTUP_HOME:-<default>}\" \"$*\" "
+        ">>\"$BCODEX_TEST_RUSTUP_LOG\"\n"
         "case \"$1:$4\" in\n"
-        "  toolchain:--profile) : >\"$BCODEX_TEST_TOOLCHAIN_STATE\" ;;\n"
+        "  toolchain:--profile)\n"
+        "    [ -n \"${RUSTUP_HOME:-}\" ] || exit 4\n"
+        "    mkdir -p \"$RUSTUP_HOME\"\n"
+        "    : >\"$RUSTUP_HOME/toolchain-installed\"\n"
+        "    ;;\n"
         "  which:cargo)\n"
-        "    [ \"$BCODEX_TEST_TOOLCHAIN_INSTALLED\" = 1 ] || "
-        "[ -f \"$BCODEX_TEST_TOOLCHAIN_STATE\" ] || exit 3\n"
+        "    if [ -n \"${RUSTUP_HOME:-}\" ]; then\n"
+        "      [ -f \"$RUSTUP_HOME/toolchain-installed\" ] || exit 3\n"
+        "    else\n"
+        "      [ \"$BCODEX_TEST_TOOLCHAIN_INSTALLED\" = 1 ] || exit 3\n"
+        "    fi\n"
         "    printf '%s\\n' \"$BCODEX_TEST_FAKE_BIN/cargo\"\n"
         "    ;;\n"
         "  which:rustc)\n"
-        "    [ \"$BCODEX_TEST_TOOLCHAIN_INSTALLED\" = 1 ] || "
-        "[ -f \"$BCODEX_TEST_TOOLCHAIN_STATE\" ] || exit 3\n"
+        "    if [ -n \"${RUSTUP_HOME:-}\" ]; then\n"
+        "      [ -f \"$RUSTUP_HOME/toolchain-installed\" ] || exit 3\n"
+        "    else\n"
+        "      [ \"$BCODEX_TEST_TOOLCHAIN_INSTALLED\" = 1 ] || exit 3\n"
+        "    fi\n"
         "    printf '%s\\n' \"$BCODEX_TEST_FAKE_BIN/rustc\"\n"
         "    ;;\n"
         "  *) exit 2 ;;\n"
@@ -472,6 +649,7 @@ def run_installer(
         "RUSTC_WORKSPACE_WRAPPER",
         "RUSTC_WRAPPER",
         "RUSTFLAGS",
+        "RUSTUP_HOME",
         "RUSTUP_TOOLCHAIN",
         "RUSTY_V8_ARCHIVE",
         "RUSTY_V8_SRC_BINDING_PATH",
@@ -483,23 +661,28 @@ def run_installer(
         {
             "BCODEX_INSTALL_DIR": str(install_dir),
             "BCODEX_TEST_ADVANCING_MAIN": "1" if advancing_main else "0",
+            "BCODEX_TEST_ARCHIVE_FAILURES": str(archive_failures),
+            "BCODEX_TEST_ARCHIVE_REQUEST_COUNT_FILE": str(
+                root / "archive-request-count"
+            ),
             "BCODEX_TEST_AUTHENTICATED": "1" if authenticated else "0",
             "BCODEX_TEST_BUILD_LOG": str(root / "build.log"),
             "BCODEX_TEST_BUILD_SUCCESS": "1" if build_success else "0",
             "BCODEX_TEST_BUILT_VERSION": VERSION,
             "BCODEX_TEST_COMMIT": COMMIT,
-            "BCODEX_TEST_COMMIT_COUNT_FILE": str(root / "commit-count"),
             "BCODEX_TEST_CLEANUP_SUCCESS": "1" if cleanup_success else "0",
+            "BCODEX_TEST_COMPILER_WORKS": "1" if compiler_works else "0",
             "BCODEX_TEST_EMBEDDED_REVISION": embedded_revision or "",
             "BCODEX_TEST_FAKE_BIN": str(fake_bin),
             "BCODEX_TEST_GH_LOG": str(root / "gh.log"),
+            "BCODEX_TEST_MAIN_FAILURES": str(main_failures),
+            "BCODEX_TEST_MAIN_REQUEST_COUNT_FILE": str(root / "main-request-count"),
             "BCODEX_TEST_NEXT_COMMIT": next_commit,
             "BCODEX_TEST_REPOSITORY": "ummay0432/bettercodex",
             "BCODEX_TEST_RUSTUP_LOG": str(root / "rustup.log"),
             "BCODEX_TEST_SMOKE_SUCCESS": "1" if smoke_success else "0",
             "BCODEX_TEST_SOURCE_ARCHIVE": str(archive),
             "BCODEX_TEST_TOOLCHAIN_INSTALLED": "1" if toolchain_installed else "0",
-            "BCODEX_TEST_TOOLCHAIN_STATE": str(root / "toolchain-installed"),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "SHELL": shell,
             "TMPDIR": str(temporary),

@@ -7,6 +7,8 @@
 set -eu
 
 DEFAULT_REPOSITORY="ummay0432/bettercodex"
+GITHUB_HOST="github.com"
+MAX_GITHUB_ATTEMPTS=3
 MAX_SOURCE_ATTEMPTS=3
 
 tmp_dir=""
@@ -33,7 +35,8 @@ Usage: install.sh
 
 Resolves private BetterCodex main to an immutable commit, compiles that source
 for this Mac or Linux computer, verifies the result, and atomically installs it.
-All source, Cargo, V8, and compilation caches created by the install are removed.
+All source, Cargo, V8, compilation caches, and any installer-only Rust
+toolchain created by the install are removed.
 
 Environment:
   BCODEX_INSTALL_DIR  Binary directory (default: \$HOME/.local/bin).
@@ -159,17 +162,6 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
 }
 
-require_command awk
-require_command cc
-require_command cmp
-require_command curl
-require_command dirname
-require_command gh
-require_command grep
-require_command mktemp
-require_command rustup
-require_command sed
-require_command tar
 require_command uname
 
 case "$(uname -s)" in
@@ -184,9 +176,31 @@ case "$(uname -m)" in
   *) fail "unsupported architecture: $(uname -m)" ;;
 esac
 
+require_command awk
+require_command cmp
+require_command curl
+require_command dirname
+require_command grep
+require_command mktemp
+require_command sed
+require_command tar
+
+if ! command -v gh >/dev/null 2>&1; then
+  fail "GitHub CLI is required; install it from https://cli.github.com/ and retry"
+fi
+if ! command -v rustup >/dev/null 2>&1; then
+  fail "rustup is required; install Rust from https://rustup.rs/ and retry"
+fi
+if ! command -v cc >/dev/null 2>&1 || ! cc --version >/dev/null 2>&1; then
+  if [ "$os" = "macOS" ]; then
+    fail "Xcode Command Line Tools are required; run 'xcode-select --install', finish the installation, and retry"
+  fi
+  fail "a working native C compiler is required; install your system's C build tools and retry"
+fi
+
 export GH_PROMPT_DISABLED=1
-if ! gh auth status --active --hostname github.com >/dev/null 2>&1; then
-  fail "GitHub CLI is not signed in; run 'gh auth login' and retry"
+if ! gh auth status --active --hostname "$GITHUB_HOST" >/dev/null 2>&1; then
+  fail "GitHub CLI is not signed in to $GITHUB_HOST; run 'gh auth login --hostname $GITHUB_HOST' and retry"
 fi
 
 mkdir -p "$bin_dir"
@@ -263,7 +277,44 @@ cleanup_retired_updater_cache() {
 cleanup_retired_updater_cache
 
 resolve_main_commit() {
-  gh api "repos/$repository/commits/main" --jq .sha 2>/dev/null
+  github_attempt=1
+  while [ "$github_attempt" -le "$MAX_GITHUB_ATTEMPTS" ]; do
+    if github_commit="$(
+      gh api --hostname "$GITHUB_HOST" "repos/$repository/commits/main" --jq .sha 2>/dev/null
+    )"; then
+      printf '%s\n' "$github_commit"
+      return 0
+    fi
+    if [ "$github_attempt" -lt "$MAX_GITHUB_ATTEMPTS" ]; then
+      warn "GitHub request failed; retrying ($((github_attempt + 1))/$MAX_GITHUB_ATTEMPTS)"
+      sleep "$github_attempt"
+    fi
+    github_attempt=$((github_attempt + 1))
+  done
+  return 1
+}
+
+download_source_archive() {
+  archive_destination="$1"
+  archive_revision="$2"
+  archive_partial="$archive_destination.partial"
+  github_attempt=1
+  while [ "$github_attempt" -le "$MAX_GITHUB_ATTEMPTS" ]; do
+    rm -f "$archive_partial"
+    if gh api --hostname "$GITHUB_HOST" \
+      "repos/$repository/tarball/$archive_revision" >"$archive_partial" &&
+      [ -s "$archive_partial" ]; then
+      mv "$archive_partial" "$archive_destination"
+      return 0
+    fi
+    if [ "$github_attempt" -lt "$MAX_GITHUB_ATTEMPTS" ]; then
+      warn "GitHub source download failed; retrying ($((github_attempt + 1))/$MAX_GITHUB_ATTEMPTS)"
+      sleep "$github_attempt"
+    fi
+    github_attempt=$((github_attempt + 1))
+  done
+  rm -f "$archive_partial"
+  return 1
 }
 
 is_source_revision() {
@@ -306,8 +357,8 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
 
   step "Installing BetterCodex main $short_commit for $os $arch"
   step "Downloading the immutable source snapshot"
-  if ! gh api "repos/$repository/tarball/$resolved_commit" >"$archive_path"; then
-    fail "could not download BetterCodex source commit $resolved_commit"
+  if ! download_source_archive "$archive_path" "$resolved_commit"; then
+    fail "could not download BetterCodex source commit $resolved_commit; confirm the active GitHub account can access $repository"
   fi
   [ -s "$archive_path" ] || fail "downloaded source archive is empty"
   if ! tar -xzf "$archive_path" -C "$source_dir" --strip-components=1; then
@@ -336,11 +387,21 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
     [ -x "$cargo_program" ] && [ -x "$rustc_program" ]; then
     :
   else
-    rustup toolchain install "$rust_toolchain" --profile minimal ||
-      fail "could not install the pinned Rust $rust_toolchain toolchain"
-    cargo_program="$(rustup which --toolchain "$rust_toolchain" cargo)" ||
+    temporary_rustup_home="$tmp_dir/rustup-home"
+    mkdir -p "$temporary_rustup_home"
+    step "Downloading missing Rust $rust_toolchain into the disposable install tree"
+    RUSTUP_HOME="$temporary_rustup_home" \
+      rustup toolchain install "$rust_toolchain" --profile minimal ||
+      fail "could not download the pinned Rust $rust_toolchain toolchain"
+    cargo_program="$(
+      RUSTUP_HOME="$temporary_rustup_home" \
+        rustup which --toolchain "$rust_toolchain" cargo
+    )" ||
       fail "could not locate Cargo for Rust $rust_toolchain"
-    rustc_program="$(rustup which --toolchain "$rust_toolchain" rustc)" ||
+    rustc_program="$(
+      RUSTUP_HOME="$temporary_rustup_home" \
+        rustup which --toolchain "$rust_toolchain" rustc
+    )" ||
       fail "could not locate rustc for Rust $rust_toolchain"
   fi
   [ -x "$cargo_program" ] || fail "pinned Cargo executable is unavailable"
@@ -462,10 +523,16 @@ pick_profile() {
 
 path_action="already"
 path_profile=""
+path_needs_refresh=0
 configure_path() {
-  case ":$PATH:" in
-    *":$bin_dir:"*) return ;;
-  esac
+  visible_bcodex="$(command -v bcodex 2>/dev/null || true)"
+  if [ "$visible_bcodex" = "$bin_path" ]; then
+    return
+  fi
+  path_needs_refresh=1
+  if [ -n "$visible_bcodex" ]; then
+    warn "$visible_bcodex currently shadows the installed command at $bin_path"
+  fi
 
   if [ -z "${HOME:-}" ]; then
     path_action="unavailable"
@@ -534,14 +601,19 @@ if [ "$existing_install" -eq 1 ]; then
 else
   step "Installed bcodex $installed_version ($short_installed) at $bin_path"
 fi
-step "Removed the temporary source, Cargo cache, V8 downloads, and build output"
+step "Removed the disposable install tree: source, Cargo cache, V8 downloads, optional Rust toolchain, and build output"
 
 case "$path_action" in
   added | updated)
     step "PATH was configured in $path_profile; open a new terminal"
     step "For this terminal: export PATH=\"$bin_dir:\$PATH\""
     ;;
-  configured) step "PATH is configured in $path_profile" ;;
+  configured)
+    step "PATH is configured in $path_profile"
+    if [ "$path_needs_refresh" -eq 1 ]; then
+      step "For this terminal: export PATH=\"$bin_dir:\$PATH\""
+    fi
+    ;;
   unavailable) step "Add $bin_dir to PATH in your shell profile" ;;
 esac
 
