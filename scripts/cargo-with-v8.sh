@@ -15,7 +15,7 @@ fail() {
   exit 1
 }
 
-script_dir="$(CDPATH= cd -P "$(dirname "$0")" && pwd)"
+script_dir="$(CDPATH='' cd -P "$(dirname "$0")" && pwd)"
 repository_root="$(dirname "$script_dir")"
 cargo_command="${CARGO:-cargo}"
 locked_v8_version="$(

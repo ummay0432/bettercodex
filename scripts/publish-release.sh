@@ -67,7 +67,7 @@ if ! printf '%s\n' "$zstd_version" | awk -F. '
   fail "zstd 1.5.7 or newer is required for compact release assets"
 fi
 
-script_dir="$(CDPATH= cd -P "$(dirname "$0")" && pwd)"
+script_dir="$(CDPATH='' cd -P "$(dirname "$0")" && pwd)"
 repository_root="$(dirname "$script_dir")"
 cd "$repository_root"
 
@@ -173,7 +173,9 @@ verify_uploaded_digest() {
   uploaded_name="$(basename "$uploaded_asset")"
   uploaded_expected="sha256:$(sha256_file "$uploaded_asset")"
   uploaded_actual="$(
-    gh api "repos/$repository/releases/tags/$release_tag" \
+    gh release view "$release_tag" \
+      --repo "$repository" \
+      --json assets \
       --jq ".assets[] | select(.name == \"$uploaded_name\") | .digest"
   )" || fail "could not inspect uploaded release asset $uploaded_name"
   [ "$uploaded_actual" = "$uploaded_expected" ] ||

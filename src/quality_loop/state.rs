@@ -922,7 +922,6 @@ pub(crate) fn verify_runtime_state(state: &RunState) -> Result<()> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
     use std::process::Command;
 
     struct Fixture {
@@ -1085,15 +1084,20 @@ mod tests {
     #[test]
     fn failed_initialization_removes_the_undurable_run() {
         let fixture = Fixture::new();
-        let invalid_path = fixture
-            .root
-            .join(OsString::from_vec(b"invalid-\xff".to_vec()));
-        std::fs::write(&invalid_path, b"invalid path\n").unwrap();
+        let unsupported_path = fixture.root.join("tracked.txt");
+        std::fs::remove_file(&unsupported_path).unwrap();
+        assert!(
+            Command::new("mkfifo")
+                .arg(&unsupported_path)
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let error = LoopRun::create(&fixture.worktree, &Fixture::invocation(), &[], &[])
             .err()
-            .expect("non-UTF-8 repository state must fail initialization");
-        assert!(format!("{error:#}").contains("non-UTF-8"));
+            .expect("unsupported repository state must fail initialization");
+        assert!(format!("{error:#}").contains("unsupported filesystem object"));
         let loops = fixture.root.join(".bcodex/loops");
         let entries = std::fs::read_dir(&loops)
             .unwrap()
@@ -1107,7 +1111,8 @@ mod tests {
             0
         );
 
-        std::fs::remove_file(invalid_path).unwrap();
+        std::fs::remove_file(&unsupported_path).unwrap();
+        std::fs::write(unsupported_path, "incumbent\n").unwrap();
         let mut run = fixture.create_run();
         run.update(|state| state.phase = RunPhase::Completed)
             .unwrap();

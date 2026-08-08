@@ -483,12 +483,13 @@ resolve_latest_release() {
     sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
       "$release_metadata"
   } | sed -n '1p')"
+  # Use portable basic regular expressions; BSD sed does not support GNU's \|.
   release_draft="$({
-    sed -n 's/^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' \
+    sed -n 's/^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\).*/\1/p' \
       "$release_metadata"
   } | sed -n '1p')"
   release_prerelease="$({
-    sed -n 's/^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' \
+    sed -n 's/^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\).*/\1/p' \
       "$release_metadata"
   } | sed -n '1p')"
   [ "$release_draft" = false ] && [ "$release_prerelease" = false ] || return 1
