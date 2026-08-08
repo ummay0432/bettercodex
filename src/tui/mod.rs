@@ -491,10 +491,12 @@ impl Runtime {
             }
         };
 
-        let worker_handoff = self
-            .worker_handoff
-            .as_mut()
-            .expect("the interactive supervisor was checked before tmux setup");
+        let Some(worker_handoff) = self.worker_handoff.as_mut() else {
+            self.view.tmux_handoff_failed(
+                "Could not move this session into tmux: the interactive supervisor stopped during setup",
+            );
+            return;
+        };
         match session.migrate_to_tmux(prepared, worker_handoff) {
             Ok(session_name) => {
                 self.worker_handoff = None;
@@ -581,15 +583,13 @@ impl Runtime {
                     self.processes.stop_all_background_processes();
                     self.processes = processes;
                     self.context_snapshot = agent.context_snapshot();
+                    let skills = agent.skills().to_vec();
+                    let skill_warnings = agent.skill_warnings().to_vec();
                     self.agent = Some(agent);
                     self.prompt_history = Some(prompt_history);
                     self.view.clear();
-                    let agent = self
-                        .agent
-                        .as_ref()
-                        .expect("a cleared runtime owns its replacement agent");
-                    self.view.set_skills(agent.skills().to_vec());
-                    for warning in agent.skill_warnings() {
+                    self.view.set_skills(skills);
+                    for warning in skill_warnings {
                         self.view.add_notice(format!("Skill warning: {warning}"));
                     }
                 }
@@ -636,20 +636,22 @@ impl Runtime {
             Action::EnterTmux => unreachable!("tmux handoffs are handled by the event loop"),
             Action::Logout => unreachable!("logout is handled by the event loop"),
             Action::UpdateSkill { path, update } => {
-                let result = self
+                let agent = self
                     .agent
                     .as_mut()
-                    .context("skills can only be changed while the agent is idle")?
-                    .update_skill(&path, update);
+                    .context("skills can only be changed while the agent is idle")?;
+                let result = agent.update_skill(&path, update).map(|()| {
+                    (
+                        agent.context_snapshot(),
+                        agent.context_tokens(),
+                        agent.skills().to_vec(),
+                    )
+                });
                 match result {
-                    Ok(()) => {
-                        let agent = self
-                            .agent
-                            .as_ref()
-                            .expect("an idle runtime owns its updated agent");
-                        self.context_snapshot = agent.context_snapshot();
-                        self.view.set_context_tokens(agent.context_tokens());
-                        self.view.set_skills(agent.skills().to_vec());
+                    Ok((context_snapshot, context_tokens, skills)) => {
+                        self.context_snapshot = context_snapshot;
+                        self.view.set_context_tokens(context_tokens);
+                        self.view.set_skills(skills);
                     }
                     Err(error) => self
                         .view
@@ -770,7 +772,7 @@ impl Runtime {
         let session_id = self
             .agent
             .as_ref()
-            .expect("an idle runtime always owns its agent")
+            .context("the active agent is unavailable")?
             .session_id();
         Uuid::parse_str(session_id).context("the active bettercodex session ID is invalid")
     }
@@ -820,10 +822,11 @@ impl Runtime {
                 return;
             }
         };
-        let mut agent = self
-            .agent
-            .take()
-            .expect("an idle runtime always owns its agent");
+        let Some(mut agent) = self.agent.take() else {
+            self.view
+                .add_notice("Could not start turn: the active agent is unavailable".to_string());
+            return;
+        };
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = if invocation.is_some() {
             crate::agent::TurnControl::non_steerable_channel()
@@ -855,10 +858,12 @@ impl Runtime {
     }
 
     fn start_compaction(&mut self) {
-        let mut agent = self
-            .agent
-            .take()
-            .expect("an idle runtime always owns its agent");
+        let Some(mut agent) = self.agent.take() else {
+            self.view.add_notice(
+                "Could not compact conversation: the active agent is unavailable".to_string(),
+            );
+            return;
+        };
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::non_steerable_channel();
         self.view.start_compaction();

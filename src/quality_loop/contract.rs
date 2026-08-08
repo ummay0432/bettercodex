@@ -745,8 +745,7 @@ fn validate_check_identity(
 }
 
 fn validate_loop_name(name: &str) -> Result<()> {
-    let words = name.split_whitespace().collect::<Vec<_>>();
-    if !(1..=2).contains(&words.len())
+    if !(1..=2).contains(&name.split_whitespace().count())
         || name.chars().any(char::is_control)
         || name.contains('│')
         || UnicodeWidthStr::width(name) > 32

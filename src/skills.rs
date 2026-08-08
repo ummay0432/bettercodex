@@ -900,7 +900,8 @@ fn read_skill_prompt(path: &Path) -> Result<(String, bool)> {
         Err(error) if error.error_len().is_none() => {
             bytes.truncate(error.valid_up_to());
             Ok((
-                String::from_utf8(bytes).expect("validated UTF-8 prefix"),
+                String::from_utf8(bytes)
+                    .context("failed to retain the valid UTF-8 skill prefix")?,
                 true,
             ))
         }

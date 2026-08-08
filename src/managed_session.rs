@@ -1157,7 +1157,7 @@ fn sync_terminal_size(
     let size = terminal_size(terminal_fd)?;
     if last_size
         .as_ref()
-        .is_some_and(|previous| winsize_eq(previous, &size))
+        .is_some_and(|previous| winsize_eq(*previous, size))
     {
         return Ok(());
     }
@@ -1170,7 +1170,7 @@ fn sync_terminal_size(
     Ok(())
 }
 
-fn winsize_eq(left: &libc::winsize, right: &libc::winsize) -> bool {
+fn winsize_eq(left: libc::winsize, right: libc::winsize) -> bool {
     left.ws_row == right.ws_row
         && left.ws_col == right.ws_col
         && left.ws_xpixel == right.ws_xpixel

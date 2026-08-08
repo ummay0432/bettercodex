@@ -594,10 +594,14 @@ fn commands_schema() -> Value {
         })
         .into_generator()
         .into_root_schema_for::<SearchCommands>();
-    let Value::Object(mut schema) =
-        serde_json::to_value(schema).expect("web search command schema should serialize")
-    else {
-        unreachable!("web search command schema must be an object");
+    let mut schema = match serde_json::to_value(schema) {
+        Ok(Value::Object(schema)) => schema,
+        Ok(_) | Err(_) => {
+            return serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+            });
+        }
     };
 
     let mut tool_schema = Map::new();

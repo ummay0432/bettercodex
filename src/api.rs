@@ -848,15 +848,16 @@ impl ApiClient {
                                     let expected_len = baseline_length
                                         .and_then(|len| len.checked_add(appended_items?))
                                         .and_then(|len| len.checked_add(trailing_items));
-                                    (cursor
+                                    if cursor
                                         .includes_response_after(*previous_cursor, *response_items)
-                                        && expected_len == Some(current_input.len()))
-                                    .then(|| {
-                                        (
-                                            baseline.response_id.clone(),
-                                            baseline_length.expect("expected length was validated"),
-                                        )
-                                    })
+                                        && expected_len == Some(current_input.len())
+                                    {
+                                        baseline_length.map(|baseline_length| {
+                                            (baseline.response_id.clone(), baseline_length)
+                                        })
+                                    } else {
+                                        None
+                                    }
                                 }
                                 RequestInputIdentity::Exact => None,
                             },

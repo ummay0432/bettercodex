@@ -111,7 +111,7 @@ static CATALOGUE_INSPECTION: LazyLock<CatalogueInspection> = LazyLock::new(|| {
             let name = specification
                 .get("name")
                 .and_then(Value::as_str)
-                .expect("request tool specifications always have a name");
+                .unwrap_or("<unnamed>");
             CatalogueTool {
                 name: name.to_string(),
                 route: CatalogueRoute::Request,
@@ -128,12 +128,7 @@ static CATALOGUE_INSPECTION: LazyLock<CatalogueInspection> = LazyLock::new(|| {
         "role": "developer",
         "tools": specifications,
     });
-    let request_bytes = u64::try_from(
-        serde_json::to_vec(&item)
-            .expect("the fixed tool catalogue is JSON serializable")
-            .len(),
-    )
-    .unwrap_or(u64::MAX);
+    let request_bytes = u64::try_from(item.to_string().len()).unwrap_or(u64::MAX);
     CatalogueInspection {
         tools,
         metrics: CatalogueMetrics {

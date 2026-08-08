@@ -103,11 +103,12 @@ impl FileSearchManager {
             updates: self.updates.clone(),
             session_token: state.session_token,
         });
+        let limit = NonZeroUsize::new(MAX_POPUP_ROWS)
+            .ok_or_else(|| anyhow::anyhow!("the file-search result limit must be nonzero"))?;
         let session = crate::file_search::create_session(
             vec![self.search_root.clone()],
             FileSearchOptions {
-                limit: NonZeroUsize::new(MAX_POPUP_ROWS)
-                    .expect("the file-search result limit is nonzero"),
+                limit,
                 compute_indices: true,
                 ..FileSearchOptions::default()
             },

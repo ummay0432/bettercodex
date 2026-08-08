@@ -2270,15 +2270,16 @@ impl View {
         }
         if activity_height > 0 {
             let line = if self.busy {
-                self.working_line()
+                Some(self.working_line())
             } else {
                 self.standalone_background_process_line(area.width)
-                    .expect("an idle activity surface requires background processes")
             };
-            frame.render_widget(
-                Paragraph::new(truncate_line(line, usize::from(activity_area.width))),
-                activity_area,
-            );
+            if let Some(line) = line {
+                frame.render_widget(
+                    Paragraph::new(truncate_line(line, usize::from(activity_area.width))),
+                    activity_area,
+                );
+            }
         }
         if let Some(progress) = &self.loop_progress
             && !loop_area.is_empty()
@@ -2642,7 +2643,7 @@ impl View {
             || self
                 .deferred_interactions
                 .values()
-                .any(|tool| tool.is_empty_interaction())
+                .any(ToolEntry::is_empty_interaction)
     }
 }
 

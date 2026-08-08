@@ -79,7 +79,9 @@ tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungsteni
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 
 [lints.clippy]
+await_holding_invalid_type = "deny"
 await_holding_lock = "deny"
+expect_used = "deny"
 identity_op = "deny"
 manual_clamp = "deny"
 manual_filter = "deny"

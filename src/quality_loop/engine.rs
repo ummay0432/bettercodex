@@ -261,7 +261,7 @@ async fn execute_phases<R: PhaseRunner>(
     let evaluator_workspace = run.root().join("evaluator/workspace");
     let phase_prompt = evaluator_prompt(run, worktree, &evaluator_workspace)?;
     let control_before = immutable_control_digest(run.root(), None)?;
-    let setup = runner
+    let Some(setup) = runner
         .run(
             worktree.root(),
             run,
@@ -270,13 +270,12 @@ async fn execute_phases<R: PhaseRunner>(
             &phase_prompt,
             control,
         )
-        .await?;
-    if setup.is_none() {
+        .await?
+    else {
         worktree.restore(run.root(), original)?;
         run.update(|state| state.phase = RunPhase::Interrupted)?;
         return Ok(interrupted_setup_summary(original));
-    }
-    let setup = setup.expect("checked phase output");
+    };
     verify_control_digest(run.root(), None, &control_before)?;
     run.write_json(
         "evaluator/session.json",

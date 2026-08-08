@@ -16,10 +16,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 const ACCESS_TOKEN_ENV: &str = "CODEX_ACCESS_TOKEN";
@@ -31,6 +32,7 @@ const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 const MAX_REFRESH_ERROR_BODY_BYTES: usize = 8_000;
 const MAX_REFRESH_ERROR_BODY_CHARS: usize = 2_000;
 
+#[derive(Clone)]
 pub(crate) struct Auth {
     access_token: String,
     refresh_token: Option<String>,
@@ -42,7 +44,12 @@ pub(crate) struct Auth {
 
 #[derive(Clone)]
 pub(crate) struct SharedAuth {
-    inner: Arc<Mutex<Auth>>,
+    inner: Arc<SharedAuthInner>,
+}
+
+struct SharedAuthInner {
+    auth: RwLock<Auth>,
+    refresh_lock: Semaphore,
 }
 
 pub(crate) struct AuthSnapshot {
@@ -50,6 +57,7 @@ pub(crate) struct AuthSnapshot {
     pub(crate) account_id: Option<reqwest::header::HeaderValue>,
 }
 
+#[derive(Clone)]
 struct StoredAuth {
     path: PathBuf,
     document: Value,
@@ -126,12 +134,15 @@ impl Auth {
         })
     }
 
-    pub(crate) async fn refresh_if_needed(&mut self, client: &reqwest::Client) -> Result<()> {
+    fn refresh_needed(&self) -> Result<bool> {
         let now = unix_timestamp()?;
-        if self
+        Ok(self
             .expires_at
-            .is_some_and(|expires_at| expires_at <= now + REFRESH_WINDOW.as_secs())
-        {
+            .is_some_and(|expires_at| expires_at <= now + REFRESH_WINDOW.as_secs()))
+    }
+
+    pub(crate) async fn refresh_if_needed(&mut self, client: &reqwest::Client) -> Result<()> {
+        if self.refresh_needed()? {
             self.refresh(client).await?;
         }
         Ok(())
@@ -290,7 +301,10 @@ fn read_auth_document(path: &Path) -> Result<Value> {
 impl SharedAuth {
     pub(crate) fn new(auth: Auth) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(auth)),
+            inner: Arc::new(SharedAuthInner {
+                auth: RwLock::new(auth),
+                refresh_lock: Semaphore::new(1),
+            }),
         }
     }
 
@@ -298,18 +312,50 @@ impl SharedAuth {
         &self,
         client: &reqwest::Client,
     ) -> Result<AuthSnapshot> {
-        let mut auth = self.inner.lock().await;
-        auth.refresh_if_needed(client).await?;
-        auth.snapshot()
+        self.refresh_snapshot(client, false).await
     }
 
     pub(crate) async fn force_refreshed_snapshot(
         &self,
         client: &reqwest::Client,
     ) -> Result<AuthSnapshot> {
-        let mut auth = self.inner.lock().await;
-        auth.force_refresh(client).await?;
-        auth.snapshot()
+        self.refresh_snapshot(client, true).await
+    }
+
+    async fn refresh_snapshot(
+        &self,
+        client: &reqwest::Client,
+        force: bool,
+    ) -> Result<AuthSnapshot> {
+        let _refresh_guard = self
+            .inner
+            .refresh_lock
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("ChatGPT credential refresh coordinator closed"))?;
+        let mut auth = {
+            let auth = self
+                .inner
+                .auth
+                .read()
+                .map_err(|_| anyhow!("ChatGPT credential cache lock was poisoned"))?;
+            if !force && !auth.refresh_needed()? {
+                return auth.snapshot();
+            }
+            auth.clone()
+        };
+        if force {
+            auth.force_refresh(client).await?;
+        } else {
+            auth.refresh_if_needed(client).await?;
+        }
+        let snapshot = auth.snapshot();
+        *self
+            .inner
+            .auth
+            .write()
+            .map_err(|_| anyhow!("ChatGPT credential cache lock was poisoned"))? = auth;
+        snapshot
     }
 }
 

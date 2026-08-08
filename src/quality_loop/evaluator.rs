@@ -186,13 +186,17 @@ pub(crate) fn apply_structured_artifact(
     let checks = artifact
         .get("checks")
         .and_then(Value::as_object)
-        .expect("validated phase evidence has check results");
+        .ok_or_else(|| anyhow!("validated phase evidence lost its check results"))?;
     for check in &contract.machine_checks {
         let value = checks
             .get(&check.id)
-            .expect("validated phase evidence has every machine check");
-        let claimed =
-            judgment_passed(value).expect("validated machine evidence has a boolean verdict");
+            .ok_or_else(|| anyhow!("validated phase evidence lost check `{}`", check.id))?;
+        let claimed = judgment_passed(value).ok_or_else(|| {
+            anyhow!(
+                "validated machine evidence lost the verdict for `{}`",
+                check.id
+            )
+        })?;
         let observed = report
             .checks
             .get(&check.id)
@@ -207,14 +211,18 @@ pub(crate) fn apply_structured_artifact(
     for check in &contract.model_checks {
         let value = checks
             .get(&check.id)
-            .expect("validated phase evidence has every model check");
-        let passed =
-            judgment_passed(value).expect("validated model evidence has a boolean verdict");
+            .ok_or_else(|| anyhow!("validated phase evidence lost model check `{}`", check.id))?;
+        let passed = judgment_passed(value).ok_or_else(|| {
+            anyhow!(
+                "validated model evidence lost the verdict for `{}`",
+                check.id
+            )
+        })?;
         let artifacts = value
             .as_object()
             .and_then(|value| value.get("artifacts"))
             .and_then(Value::as_array)
-            .expect("validated model evidence has artifacts");
+            .ok_or_else(|| anyhow!("validated model evidence lost artifacts for `{}`", check.id))?;
         report.checks.insert(
             check.id.clone(),
             CheckReport {
@@ -456,7 +464,10 @@ async fn run_command(
     worktree_root: &Path,
     cancellation: &CancellationToken,
 ) -> Result<Option<(i32, Vec<u8>, Vec<u8>, bool)>> {
-    let program = check.argv.first().expect("validated non-empty argv");
+    let program = check
+        .argv
+        .first()
+        .ok_or_else(|| anyhow!("evaluator check `{}` has no command", check.id))?;
     let cwd = worktree_root.join(&check.cwd);
     let mut environment = std::env::vars().collect::<HashMap<_, _>>();
     for (name, value) in &check.env {
@@ -539,7 +550,7 @@ fn extract(check: &MachineCheck, stdout: &[u8], passed: bool) -> Result<CheckVal
                 .extract
                 .json_pointer
                 .as_deref()
-                .expect("validated JSON pointer");
+                .ok_or_else(|| anyhow!("check `{}` has no JSON pointer", check.id))?;
             let number = value
                 .pointer(pointer)
                 .and_then(Value::as_f64)

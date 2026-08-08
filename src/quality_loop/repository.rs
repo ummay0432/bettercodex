@@ -944,7 +944,13 @@ fn collect_directory(root: &Path, directory: &Path, output: &mut BTreeSet<String
         let path = entry.path();
         let relative = path
             .strip_prefix(root)
-            .expect("walked path remains under worktree")
+            .with_context(|| {
+                format!(
+                    "walked path {} escaped worktree {}",
+                    path.display(),
+                    root.display()
+                )
+            })?
             .to_str()
             .ok_or_else(|| anyhow!("quality loop cannot preserve a non-UTF-8 path"))?
             .to_string();

@@ -76,7 +76,12 @@ pub(crate) fn opaque_compaction_item(items: &[Value]) -> Result<Value, String> {
             items.len()
         ));
     }
-    let compaction = compaction.expect("the count proves a compaction item exists");
+    let compaction = compaction.ok_or_else(|| {
+        format!(
+            "remote compaction v2 expected exactly one compaction output item, got {count} from {} output items",
+            items.len()
+        )
+    })?;
     if compaction
         .get("encrypted_content")
         .and_then(Value::as_str)
