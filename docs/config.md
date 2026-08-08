@@ -1,15 +1,19 @@
 # Configuration
 
-For basic configuration instructions, see [this documentation](https://developers.openai.com/codex/config-basic).
+BetterCodex deliberately has no general configuration framework. Its model,
+reasoning effort, context limits, provider, and runtime behavior are fixed by
+the project. Upstream Codex `config.toml`, profiles, managed requirements, MCP,
+provider, and lifecycle-hook settings do not apply.
 
-For advanced configuration instructions, see [this documentation](https://developers.openai.com/codex/config-advanced).
+The supported path overrides are:
 
-For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
+- `CODEX_HOME` for the shared Codex credential and prompt-history directory;
+- `BCODEX_HOME` for BetterCodex sessions, skills, and state; and
+- `BCODEX_INSTALL_DIR` for the installer-managed binary directory.
 
-## Lifecycle hooks
+Set `BCODEX_SKIP_UPDATE_CHECK=1` to disable the failure-silent background
+release check. These environment variables are narrow operational overrides,
+not a general settings system.
 
-Admins can set top-level `allow_managed_hooks_only = true` in
-`requirements.toml` to ignore user, project, and session hook configs while
-still allowing managed hooks from requirements and managed config layers. This
-setting is only supported in `requirements.toml`; putting it in `config.toml`
-does not enable managed-hooks-only mode.
+The official [Codex configuration documentation](https://developers.openai.com/codex/config-basic)
+describes upstream Codex, not BetterCodex.

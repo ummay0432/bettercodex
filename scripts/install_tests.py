@@ -18,6 +18,7 @@ INSTALL_SCRIPT = Path(__file__).with_name("install.sh")
 INSTALL_COMMAND = INSTALL_SCRIPT.parent.parent.joinpath("INSTALL_COMMAND.txt").read_text(
     encoding="utf-8"
 ).strip()
+README = INSTALL_SCRIPT.parent.parent.joinpath("README.md").read_text(encoding="utf-8")
 CARGO_MANIFEST = INSTALL_SCRIPT.parent.parent / "Cargo.toml"
 VERSION = next(
     line.removeprefix('version = "').removesuffix('"')
@@ -29,6 +30,9 @@ NEXT_COMMIT = "b" * 40
 
 
 class InstallScriptTest(unittest.TestCase):
+    def test_readme_exposes_the_canonical_copyable_install_command(self) -> None:
+        self.assertIn(f"```sh\n{INSTALL_COMMAND}\n```", README)
+
     def test_one_line_bootstrap_fetches_the_canonical_installer_and_cleans_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

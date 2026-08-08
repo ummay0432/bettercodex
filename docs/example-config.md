@@ -1,3 +1,4 @@
 # Sample configuration
 
-For a sample configuration file, see [this documentation](https://developers.openai.com/codex/config-sample).
+BetterCodex has no configuration file, so there is no sample configuration.
+See [Configuration](config.md) for the few supported environment overrides.

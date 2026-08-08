@@ -6,6 +6,12 @@ Cargo workflow for development and exceptional source fallback. There is no
 Node workspace, npm package, Bazel build, GitHub Actions release build, or
 GitHub Packages dependency.
 
+The repository is public before its first complete four-platform native release
+has been published. Until that release is available, the same installer uses
+the documented source fallback and requires rustup, a native C toolchain,
+several gigabytes of free space, and more time. It automatically selects native
+assets once a compatible complete release exists.
+
 ## Supported systems
 
 | Operating system | Architectures |
@@ -15,7 +21,7 @@ GitHub Packages dependency.
 
 Windows is not supported.
 
-## Install a native release
+## Run the installer
 
 Copy and run the repository's one-line
 [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt). It fetches the installer over

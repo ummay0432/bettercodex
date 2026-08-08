@@ -4,6 +4,8 @@ version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "A deliberately small GPT-5.6 Sol coding-agent harness"
+repository = "https://github.com/ummay0432/bettercodex"
+readme = "README.md"
 default-run = "bcodex"
 
 [[bin]]

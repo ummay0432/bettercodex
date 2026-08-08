@@ -1,19 +1,35 @@
 # bettercodex
 
 bettercodex is a focused public port of the OpenAI Codex CLI for people who
-want a more proactive coding agent.
+want a more proactive coding agent. It is an unofficial community project, not
+an OpenAI product.
+
+BetterCodex runs commands and applies patches with your user account's full
+permissions. It does not provide Codex's sandbox. Use it only on machines and
+repositories where you accept that trust model.
 
 ## Install
 
-Copy and run the one-line [`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt). It
-resolves the latest complete BetterCodex release, downloads the roughly 22 MB
-compressed executable for this Mac or Linux computer, verifies its checksum,
-version, source revision, V8 runtime, and embedded resources, then atomically
-installs it. The normal path needs `curl` but no npm, GitHub login, Rust,
-compiler, or local source build.
+On macOS 12+ or Linux with glibc 2.31+, copy and run this command:
 
-Then open a new terminal, sign in with your own ChatGPT account, and launch
-bettercodex from a project directory:
+```sh
+( set -eu; command -v curl >/dev/null 2>&1 || { printf '%s\n' 'bettercodex installer: curl is required' >&2; exit 1; }; bcodex_bootstrap="$(mktemp)"; trap 'rm -f "$bcodex_bootstrap"' 0; trap 'exit 1' 1 2 15; if ! curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --connect-timeout 10 --max-time 30 --max-filesize 1048576 --user-agent bettercodex https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh >"$bcodex_bootstrap"; then printf '%s\n' 'bettercodex installer: could not fetch the public installer' >&2; exit 1; fi; [ "$(sed -n '1p' "$bcodex_bootstrap")" = '#!/bin/sh' ] || { printf '%s\n' 'bettercodex installer: GitHub returned an invalid installer' >&2; exit 1; }; /bin/sh "$bcodex_bootstrap" )
+```
+
+[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt) contains the same one-line command.
+When a compatible native release exists, it downloads the roughly 22 MB
+compressed executable, verifies its checksum, version, source revision, V8
+runtime, and embedded resources, then atomically installs it. That path needs
+`curl` but no npm, GitHub login, Rust, compiler, or local source build.
+
+The first complete four-platform native release has not been published yet.
+Until it is, the installer clearly enters its source fallback, which requires
+[rustup](https://rustup.rs/), a native C toolchain, several gigabytes of free
+space, and more time. The same command automatically starts using native assets
+after the release is available.
+
+Then open a new terminal, sign in with a ChatGPT account that has Codex access,
+and launch bettercodex from a project directory:
 
 ```sh
 bcodex login
