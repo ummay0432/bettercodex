@@ -103,56 +103,70 @@ impl LoopRun {
         let mut lock = acquire_lock(&loops)?;
         recover_incomplete_runs(worktree, &loops)?;
         let run_id = Uuid::new_v4().to_string();
-        write_lock_metadata(&mut lock, &run_id)?;
         let root = loops.join(&run_id);
         create_new_private_directory(&root)?;
-        for directory in [
-            "evaluator/workspace",
-            "iterations",
-            "snapshots",
-            "blobs",
-            "sessions",
-        ] {
-            create_private_directory(&root.join(directory))?;
-        }
+        let initialized = (|| -> Result<RunState> {
+            write_lock_metadata(&mut lock, &run_id)?;
+            for directory in [
+                "evaluator/workspace",
+                "iterations",
+                "snapshots",
+                "blobs",
+                "sessions",
+            ] {
+                create_private_directory(&root.join(directory))?;
+            }
 
-        let starting = worktree.capture(&root, &[])?;
-        let snapshot_path = worktree.save_snapshot(&root, &starting)?;
-        let snapshot_relative = relative_run_path(&root, &snapshot_path)?;
-        let task = FrozenTaskRecord {
-            invocation,
-            operator_inputs,
-            frozen_context,
+            let starting = worktree.capture(&root, &[])?;
+            let snapshot_path = worktree.save_snapshot(&root, &starting)?;
+            let snapshot_relative = relative_run_path(&root, &snapshot_path)?;
+            let task = FrozenTaskRecord {
+                invocation,
+                operator_inputs,
+                frozen_context,
+            };
+            atomic_json(&root.join("task.json"), &task)?;
+            write_new_private(
+                &root.join("results.tsv"),
+                b"iteration\tstate\tresult\tstatus\tdescription\tevidence\n",
+            )?;
+            let state = RunState {
+                protocol_version: LOOP_PROTOCOL_VERSION,
+                contract_version: CONTRACT_VERSION,
+                run_id,
+                model: crate::MODEL.to_string(),
+                reasoning_effort: "max".to_string(),
+                build_identity: build_identity(),
+                evaluator_prompt_identity: digest(EVALUATOR_PROMPT.as_bytes()),
+                worker_prompt_identity: digest(WORKER_PROMPT.as_bytes()),
+                contract_prompt_identity: digest(CONTRACT_PROMPT.as_bytes()),
+                requested_iterations: invocation.iterations,
+                phase: RunPhase::Setup,
+                active_iteration: None,
+                active_candidate_snapshot: None,
+                prepared_iteration: None,
+                display_name: "Quality loop".to_string(),
+                starting_snapshot: snapshot_relative.clone(),
+                incumbent_snapshot: snapshot_relative,
+                baseline_result: None,
+                final_result: None,
+                blocker: None,
+            };
+            atomic_json(&root.join("state.json"), &state)?;
+            sync_directory(&root)?;
+            Ok(state)
+        })();
+        let state = match initialized {
+            Ok(state) => state,
+            Err(error) => {
+                if let Err(cleanup_error) = discard_incomplete_run(&mut lock, &root) {
+                    return Err(anyhow!(
+                        "{error:#}; failed to discard incomplete loop run: {cleanup_error:#}"
+                    ));
+                }
+                return Err(error);
+            }
         };
-        atomic_json(&root.join("task.json"), &task)?;
-        write_new_private(
-            &root.join("results.tsv"),
-            b"iteration\tstate\tresult\tstatus\tdescription\tevidence\n",
-        )?;
-        let state = RunState {
-            protocol_version: LOOP_PROTOCOL_VERSION,
-            contract_version: CONTRACT_VERSION,
-            run_id,
-            model: crate::MODEL.to_string(),
-            reasoning_effort: "max".to_string(),
-            build_identity: build_identity(),
-            evaluator_prompt_identity: digest(EVALUATOR_PROMPT.as_bytes()),
-            worker_prompt_identity: digest(WORKER_PROMPT.as_bytes()),
-            contract_prompt_identity: digest(CONTRACT_PROMPT.as_bytes()),
-            requested_iterations: invocation.iterations,
-            phase: RunPhase::Setup,
-            active_iteration: None,
-            active_candidate_snapshot: None,
-            prepared_iteration: None,
-            display_name: "Quality loop".to_string(),
-            starting_snapshot: snapshot_relative.clone(),
-            incumbent_snapshot: snapshot_relative,
-            baseline_result: None,
-            final_result: None,
-            blocker: None,
-        };
-        atomic_json(&root.join("state.json"), &state)?;
-        sync_directory(&root)?;
         Ok(Self { root, lock, state })
     }
 
@@ -610,6 +624,18 @@ fn write_lock_metadata(file: &mut File, run_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn discard_incomplete_run(lock: &mut File, root: &Path) -> Result<()> {
+    std::fs::remove_dir_all(root)
+        .with_context(|| format!("failed to remove {}", root.display()))?;
+    sync_directory(
+        root.parent()
+            .ok_or_else(|| anyhow!("loop run directory has no parent"))?,
+    )?;
+    lock.set_len(0)?;
+    lock.sync_all()?;
+    Ok(())
+}
+
 fn resolve_existing_file(root: &Path, value: &str, under: &Path) -> Result<PathBuf> {
     validate_relative(value)?;
     let path = root.join(value);
@@ -877,6 +903,8 @@ pub(crate) fn verify_runtime_state(state: &RunState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     use std::process::Command;
 
     struct Fixture {
@@ -984,6 +1012,37 @@ mod tests {
         assert_ne!(second.root(), first_root);
         second
             .update(|state| state.phase = RunPhase::Completed)
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_initialization_removes_the_undurable_run() {
+        let fixture = Fixture::new();
+        let invalid_path = fixture
+            .root
+            .join(OsString::from_vec(b"invalid-\xff".to_vec()));
+        std::fs::write(&invalid_path, b"invalid path\n").unwrap();
+
+        let error = LoopRun::create(&fixture.worktree, &Fixture::invocation(), &[], &[])
+            .err()
+            .expect("non-UTF-8 repository state must fail initialization");
+        assert!(format!("{error:#}").contains("non-UTF-8"));
+        let loops = fixture.root.join(".bcodex/loops");
+        let entries = std::fs::read_dir(&loops)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![OsString::from("worktree.lock")]);
+        assert_eq!(
+            std::fs::metadata(loops.join("worktree.lock"))
+                .unwrap()
+                .len(),
+            0
+        );
+
+        std::fs::remove_file(invalid_path).unwrap();
+        let mut run = fixture.create_run();
+        run.update(|state| state.phase = RunPhase::Completed)
             .unwrap();
     }
 
