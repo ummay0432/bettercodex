@@ -111,4 +111,4 @@ just clippy -- -D warnings
 ```
 
 See [the development workflow](../progressive_disclosure/development.md) for
-the complete contribution and worktree procedure.
+the complete contribution procedure.
