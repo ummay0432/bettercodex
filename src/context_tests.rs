@@ -1525,11 +1525,11 @@ fn resumed_prompt_history_contains_user_inputs_but_not_context_notices() {
 fn frozen_loop_context_replays_only_verbatim_operator_items_and_invocation_time_world_state() {
     let (root, cwd) = temporary_repository("frozen-loop");
     std::fs::write(cwd.join("AGENTS.md"), "frozen repository instruction").unwrap();
-    let skill = cwd.join(".bcodex/skills/review/SKILL.md");
+    let skill = cwd.join(".bcodex/skills/audit/SKILL.md");
     std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
     std::fs::write(
         &skill,
-        "---\nname: review\ndescription: Review the candidate\n---\n\nFROZEN SKILL BODY\n",
+        "---\nname: audit\ndescription: Review the candidate\n---\n\nFROZEN SKILL BODY\n",
     )
     .unwrap();
     let first = json!({
@@ -1550,7 +1550,7 @@ fn frozen_loop_context_replays_only_verbatim_operator_items_and_invocation_time_
             message: first.clone(),
             prompt_text: "first operator message".to_string(),
             selected_skills: vec![crate::skills::SkillSelection::new(
-                "review",
+                "audit",
                 skill.canonicalize().unwrap(),
             )],
             skill_context: Vec::new(),
