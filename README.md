@@ -7,16 +7,10 @@ group of trusted operators.
 
 Repository access is the invite gate. After accepting an invitation, sign in
 with the [GitHub CLI](https://cli.github.com/), then install `curl`, Rust through
-rustup, and a native C toolchain. Clone the single Cargo package into a stable
-local path and install it:
-
-```sh
-bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
-mkdir -p "$(dirname "$bcodex_source")" &&
-gh repo clone ummay0432/bettercodex "$bcodex_source" &&
-"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
-  --path "$bcodex_source" --force --root "$HOME/.local"
-```
+rustup, and a native C toolchain. Copy and run the one-line
+[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt). It builds from an isolated shallow
+clone and automatically removes the clone, Cargo dependency cache, V8 download,
+and compilation artifacts afterward.
 
 Then open a new terminal, sign in with your own ChatGPT account, and launch
 bettercodex from a project directory:
@@ -26,18 +20,10 @@ bcodex login
 bcodex
 ```
 
-To update the installed binary later, fast-forward that checkout and reinstall
-the same package:
-
-```sh
-bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
-git -C "$bcodex_source" pull --ff-only &&
-"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
-  --path "$bcodex_source" --force --root "$HOME/.local"
-```
-
-[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt) combines first install and later
-updates into one copyable, idempotent command.
+Rerun [`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt) to update. Each run builds
+from scratch so another device retains no BetterCodex source checkout or
+multi-gigabyte build cache. The installed binary, its small installation
+metadata, and the required Rust and native toolchains remain.
 
 For a task that merits evaluator-backed iteration, use `/loop <task>` in the
 TUI or include `$loop` anywhere in an interactive or non-interactive prompt.
@@ -51,5 +37,6 @@ workflow develops a deep understanding of the target, applies explicit quality
 criteria, and acts on clear net improvements; see
 [`docs/slash_commands.md`](docs/slash_commands.md#engineering-review).
 
-See [`docs/install.md`](docs/install.md) for supported platforms, migration from
-the retired `bcodex update` command, and the full source-build workflow.
+See [`docs/install.md`](docs/install.md) for supported platforms, temporary disk
+requirements, migration from the retired `bcodex update` command, and the full
+source-build workflow.

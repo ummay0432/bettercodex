@@ -14,19 +14,24 @@ workspace, or Node workspace.
 
 Windows is not supported.
 
-## Install from source
+## Install with a minimal retained footprint
 
 Install an authenticated [GitHub CLI](https://cli.github.com/), `curl`, a native
-C toolchain, and Rust through [rustup](https://rustup.rs/). Then clone the
-private repository into a stable local path and install the package:
+C toolchain, and Rust through [rustup](https://rustup.rs/). Then copy and run the
+repository's one-line [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt).
 
-```sh
-bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
-mkdir -p "$(dirname "$bcodex_source")" &&
-gh repo clone ummay0432/bettercodex "$bcodex_source" &&
-"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
-  --path "$bcodex_source" --force --root "$HOME/.local"
-```
+The command shallow-clones the current private source into a temporary
+directory. Cargo's dependency cache, compilation target, and verified V8
+downloads are isolated under the same directory. An exit trap removes the
+entire directory after a successful install, a build failure, or an
+interruption. Only the binary under `$HOME/.local/bin`, its small Cargo
+installation metadata, and BetterCodex user data remain from the BetterCodex
+build. Rustup's selected Rust toolchain and the native toolchain are not removed
+because other software may share them.
+
+The source build still needs several gigabytes of free temporary space while it
+runs. Eliminating the retained cache means every later install downloads and
+compiles from scratch.
 
 Open a new terminal if `$HOME/.local/bin` was not already on `PATH`, then
 sign in and launch BetterCodex from a project directory:
@@ -42,20 +47,11 @@ BetterCodex settings and saved sessions stay under `$HOME/.bcodex`.
 
 ## Updating
 
-Bettercodex does not carry a separate updater or release-packaging system. Pull
-the retained source checkout forward and reinstall the same Cargo package:
-
-```sh
-bcodex_source="${XDG_DATA_HOME:-$HOME/.local/share}/bettercodex/source"
-git -C "$bcodex_source" pull --ff-only &&
-"$bcodex_source/scripts/cargo-with-v8.sh" install --locked \
-  --path "$bcodex_source" --force --root "$HOME/.local"
-```
-
-`git pull --ff-only` stops instead of merging when the checkout has diverged;
-the chained Cargo wrapper therefore installs only the requested revision.
-The one-line [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) performs either the
-first clone or this update against the same checkout.
+Bettercodex does not carry a separate updater or release-packaging system.
+Fetch current source and reinstall by rerunning
+[`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt). Each run uses a fresh shallow
+clone, so an update cannot merge local source changes or reuse stale build
+output.
 
 ## Migrating from the retired updater
 
@@ -78,9 +74,9 @@ rm -rf "$retired_cache/build" "$retired_cache/tmp"
 ```
 
 Those directories contain only the retired updater's downloaded source and
-build artifacts; they do not contain credentials, settings, or sessions. Keep
-the sibling `rusty-v8-*` directory: the current Cargo wrapper verifies and
-reuses those official OpenAI Codex artifacts.
+build artifacts; they do not contain credentials, settings, or sessions. The
+minimal installer uses its own temporary V8 directory. A sibling `rusty-v8-*`
+directory is needed only when a retained development checkout reuses it.
 
 For a development checkout elsewhere on disk, use that clean `main` checkout
 instead of cloning another copy:
@@ -108,8 +104,9 @@ default `rusty_v8` release, so the wrapper follows current upstream Codex: it
 downloads the matching archive and generated binding from the
 `rusty-v8-v150.4.0` OpenAI Codex release, verifies their pinned SHA-256 digests,
 caches them under `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`, and then runs
-Cargo with both required overrides. Explicit paired overrides and
-`V8_FROM_SOURCE=1` remain authoritative.
+Cargo with both required overrides. The minimal installer points that cache at
+its temporary directory; retained development checkouts use the persistent
+default. Explicit paired overrides and `V8_FROM_SOURCE=1` remain authoritative.
 
 ## Development checks
 
