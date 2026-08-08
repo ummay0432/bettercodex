@@ -1,6 +1,6 @@
 # BetterCodex installation and update specification
 
-Status: proposed
+Status: implemented; production release qualification and rollout pending
 
 This document defines the target installation and update system for
 BetterCodex. The primary user path distributes verified native binaries. A
@@ -28,13 +28,13 @@ It must compile zero Cargo packages.
 
 The pre-optimization Linux x86-64 `bcodex` executable is 67,385,384 bytes and
 compresses to 25,392,260 bytes with `gzip -9` or 19,482,024 bytes with
-single-threaded `zstd -19`. The first size-optimized distribution candidate is
-53,381,160 bytes raw, 21,960,015 bytes in gzip, and 17,581,630 bytes in
-single-threaded `zstd --ultra -22`. A real raw-prefix patch from that installed
-predecessor is 8,771,401 bytes. These are observations, not fixed format
-limits, but they establish the expected order of magnitude. The roughly 2.5 GB
-seen during a source update is
-predominantly locally generated compiler output, not network download volume.
+single-threaded `zstd -19`. The final reviewed size-optimized distribution
+candidate is 52,951,080 bytes raw, 21,542,242 bytes in gzip, and 17,163,521
+bytes in single-threaded `zstd --ultra -22`. A real raw-prefix patch from that
+installed predecessor is 8,358,062 bytes. These are observations, not fixed
+format limits, but they establish the expected order of magnitude. The roughly
+2.5 GB seen during a source update is predominantly locally generated compiler
+output, not network download volume.
 
 ## Why the installed Codex executable cannot be reused
 
@@ -59,8 +59,8 @@ Codex package.
 
 ## Why the Cargo package count is not the user payload
 
-The dependency audit found 462 entries in `Cargo.lock`, roughly 305 packages in
-the normal Linux runtime graph, and 359 when all supported targets are
+The dependency audit found 463 entries in `Cargo.lock`, roughly 306 packages in
+the normal Linux runtime graph, and 360 when all supported targets are
 considered. Every direct Cargo dependency is referenced by retained source or
 build behavior. The largest transitive groups implement HTTPS, async I/O,
 websockets, V8, terminal rendering, clipboard access, image handling, and audio
@@ -173,6 +173,22 @@ The build must set:
 BCODEX_SOURCE_REVISION=<tag's full source revision>
 ```
 
+Published executables use the dedicated `distribution` Cargo profile: stripped
+symbols, one codegen unit, fat LTO, and `opt-level = "z"`. A controlled
+comparison found `"z"` 643,072 bytes smaller than `"s"`; the extra link time is
+paid only on the maintainer host.
+
+The 10,822,192-byte ICU data set is compressed during the build to a
+3,355,399-byte raw LZMA2 payload with a 16 MiB dictionary. The executable
+restores it lazily, verifies its compiled-in SHA-256, and retains it only in
+memory once V8 is needed. This is 456,664 payload bytes smaller than the tested
+zstd encoding, while a pure-Rust decoder avoids a system-library dependency.
+The release's outer zstd stream and update patches remain zstd because that
+decoder was already required and reconstructs an executable in tens of
+milliseconds. Panic abort is deliberately not used: the in-process code
+runtime relies on panic recovery to turn callback and V8-thread failures into
+contained tool errors.
+
 The resulting executable must satisfy all of the following before upload:
 
 - `bcodex --version` exactly matches the package version;
@@ -181,6 +197,8 @@ The resulting executable must satisfy all of the following before upload:
   directory;
 - every embedded system resource materializes and verifies;
 - the executable is stripped of unnecessary release symbols;
+- Rust and native source paths are remapped and the resulting bytes contain
+  none of the maintainer's checkout, temporary, toolchain, or home paths;
 - both full compressed assets reproduce the executable byte for byte and match
   their checksum files;
 - any predecessor patch reproduces the executable byte for byte against the
@@ -495,7 +513,7 @@ The prebuilt path is complete when all of the following are true:
 - users do not need Rust, Cargo, a C compiler, npm, Homebrew, or GitHub CLI;
 - an unchanged installation exits after one bounded release lookup;
 - a changed `bcodex update` downloads one native compressed delta when
-  available, otherwise one full zstd executable expected to be roughly 18 MB,
+  available, otherwise one full zstd executable expected to be roughly 17 MB,
   with no separate checksum request;
 - a first install downloads one gzip executable and its checksum, expected to
   total roughly 22 MB;

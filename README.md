@@ -23,7 +23,7 @@ bcodex
 Installed builds compare their embedded source revision with the latest
 published release after the TUI renders. When an update is available, run
 `bcodex update` in another terminal. It streams a compact patch from the
-installed revision when available, otherwise a roughly 18 MB full native
+installed revision when available, otherwise a roughly 17 MB full native
 update, and atomically installs the verified executable. It compiles zero Cargo
 packages, never enters source fallback, and retains no Rust build cache. A
 bounded source build exists only in the bootstrap installer when no compatible

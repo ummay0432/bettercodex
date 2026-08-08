@@ -14,6 +14,7 @@ GITHUB_RELEASE_ROOT="https://github.com"
 MAX_GITHUB_ATTEMPTS=3
 MAX_RELEASE_ATTEMPTS=3
 MAX_SOURCE_ATTEMPTS=3
+MAX_METADATA_BYTES=1048576
 MAX_ASSET_BYTES=134217728
 MAX_BINARY_BLOCKS=262144
 RELEASE_TAG_PREFIX="bcodex-v"
@@ -301,9 +302,10 @@ github_get() {
     --location \
     --connect-timeout 10 \
     --max-time 120 \
+    --max-filesize "$1" \
     --user-agent bettercodex \
     --header 'Accept: application/vnd.github+json' \
-    "$1"
+    "$2"
 }
 
 # Download one public GitHub response while preserving the distinction between
@@ -380,7 +382,9 @@ resolve_main_commit() {
   github_attempt=1
   while [ "$github_attempt" -le "$MAX_GITHUB_ATTEMPTS" ]; do
     if github_response="$(
-      github_get "$GITHUB_API_ROOT/repos/$repository/commits/main" 2>/dev/null
+      github_get \
+        "$MAX_METADATA_BYTES" \
+        "$GITHUB_API_ROOT/repos/$repository/commits/main" 2>/dev/null
     )"; then
       github_commit="$(
         printf '%s\n' "$github_response" |
@@ -409,6 +413,7 @@ download_source_archive() {
   while [ "$github_attempt" -le "$MAX_GITHUB_ATTEMPTS" ]; do
     rm -f "$archive_partial"
     if github_get \
+      "$MAX_ASSET_BYTES" \
       "$GITHUB_ARCHIVE_ROOT/$repository/tar.gz/$archive_revision" >"$archive_partial" &&
       [ -s "$archive_partial" ]; then
       mv "$archive_partial" "$archive_destination"

@@ -10,6 +10,8 @@ set -eu
 DEFAULT_REPOSITORY="ummay0432/bettercodex"
 GLIBC_MAX_MAJOR=2
 GLIBC_MAX_MINOR=31
+MAX_ASSET_BYTES=134217728
+MAX_BINARY_BLOCKS=262144
 
 fail() {
   printf 'bettercodex release: %s\n' "$1" >&2
@@ -51,7 +53,7 @@ case "$output_dir" in
   *) fail "OUTPUT_DIRECTORY must be an absolute path" ;;
 esac
 
-for required_command in awk basename cmp cp curl dirname git grep gzip mktemp rustup sed wc zstd; do
+for required_command in awk basename cmp cp curl dirname git grep gzip mktemp rustup sed tr wc zstd; do
   command -v "$required_command" >/dev/null 2>&1 ||
     fail "$required_command is required"
 done
@@ -104,6 +106,17 @@ cargo_program="$(rustup which --toolchain "$toolchain" cargo)" ||
 rustc_program="$(rustup which --toolchain "$toolchain" rustc)" ||
   fail "the pinned rustc toolchain is unavailable"
 toolchain_bin="$(dirname "$cargo_program")"
+rust_sysroot="$("$rustc_program" --print sysroot)" ||
+  fail "could not resolve the pinned Rust sysroot"
+case "$rust_sysroot" in
+  /*) ;;
+  *) fail "the pinned Rust sysroot must be an absolute path" ;;
+esac
+cargo_home="${CARGO_HOME:-${HOME:-}/.cargo}"
+case "$cargo_home" in
+  /*) ;;
+  *) fail "Cargo home must be an absolute path" ;;
+esac
 host_target="$("$rustc_program" -vV | sed -n 's/^host: //p')"
 case "$host_target" in
   x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu)
@@ -183,7 +196,7 @@ download_optional() {
       --location \
       --connect-timeout 10 \
       --max-time 300 \
-      --max-filesize 134217728 \
+      --max-filesize "$MAX_ASSET_BYTES" \
       --retry 2 \
       --retry-delay 1 \
       --retry-connrefused \
@@ -238,6 +251,48 @@ artifact_dir="$temporary_root/artifacts"
 mkdir -p "$compiler_tmp" "$smoke_root/home" "$smoke_root/codex-home" \
   "$smoke_root/bcodex-home" "$smoke_root/workspace" "$artifact_dir"
 
+# Cargo otherwise embeds absolute dependency, checkout, and toolchain paths in
+# stripped Rust executables. Keep release assets reproducible and free of build-
+# host identities even when a trusted checkout lives below a personal home.
+unit_separator="$(printf '\037')"
+release_rustflags=""
+release_cflags=""
+append_path_remap() {
+  remap_source="$1"
+  remap_destination="$2"
+  case "$remap_source" in
+    *"$unit_separator"*) fail "release build path contains the Cargo flag separator" ;;
+    *=*) fail "release build path contains an unsupported equals sign" ;;
+  esac
+  remap_flag="--remap-path-prefix=$remap_source=$remap_destination"
+  if [ -n "$release_rustflags" ]; then
+    release_rustflags="$release_rustflags$unit_separator$remap_flag"
+  else
+    release_rustflags="$remap_flag"
+  fi
+  if printf '%s' "$remap_source" | grep -q '[[:space:]]'; then
+    fail "release build paths containing whitespace cannot be remapped for native dependencies"
+  fi
+  # Native build scripts do not consume rustc's remap flag. Prepend the more
+  # specific mappings so C/C++ __FILE__ strings are canonical too.
+  c_remap_flag="-ffile-prefix-map=$remap_source=$remap_destination"
+  if [ -n "$release_cflags" ]; then
+    release_cflags="$c_remap_flag $release_cflags"
+  else
+    release_cflags="$c_remap_flag"
+  fi
+}
+case "${HOME:-}" in
+  "" | /) ;;
+  *) append_path_remap "$HOME" /home ;;
+esac
+append_path_remap "$cargo_home" /cargo
+append_path_remap "$rust_sysroot" /rust
+append_path_remap "$temporary_root" /build
+# rustc applies the last matching remap, so keep the checkout-specific mapping
+# after the broader home mapping.
+append_path_remap "$repository_root" /src
+
 previous_revision=""
 previous_version=""
 previous_binary="$temporary_root/previous-bcodex"
@@ -284,10 +339,22 @@ if download_optional \
         fail "could not download previous release asset $previous_asset_name"
       fi
       verify_checksum "$previous_asset" "$previous_checksum"
-      case "$previous_format" in
-        zst) zstd -q -d -c "$previous_asset" >"$previous_binary" ;;
-        gz) gzip -dc "$previous_asset" >"$previous_binary" ;;
+      if ! (
+        ulimit -f "$MAX_BINARY_BLOCKS"
+        case "$previous_format" in
+          zst) zstd -q -d -c "$previous_asset" ;;
+          gz) gzip -dc "$previous_asset" ;;
+        esac >"$previous_binary"
+      ); then
+        fail "previous release asset $previous_asset_name could not be decompressed"
+      fi
+      previous_size="$(wc -c <"$previous_binary" | awk '{ print $1 }')"
+      case "$previous_size" in
+        "" | *[!0-9]*) fail "could not determine the previous release binary size" ;;
       esac
+      if [ "$previous_size" -le 0 ] || [ "$previous_size" -gt "$MAX_ASSET_BYTES" ]; then
+        fail "previous release binary is empty or exceeds $MAX_ASSET_BYTES bytes"
+      fi
       previous_found=1
       break
     else
@@ -310,18 +377,26 @@ else
 fi
 
 printf '==> Building BetterCodex %s (%s) for %s\n' "$version" "$(printf '%.12s' "$revision")" "$host_target"
+target_environment="$(printf '%s' "$host_target" | tr '-' '_')"
+target_environment_upper="$(printf '%s' "$target_environment" | tr '[:lower:]' '[:upper:]')"
 if [ "$host_os" = macos ]; then
   MACOSX_DEPLOYMENT_TARGET=12.0
   export MACOSX_DEPLOYMENT_TARGET
 fi
 if ! (
   unset CARGO_BUILD_BUILD_DIR CARGO_BUILD_TARGET CARGO_BUILD_TARGET_DIR \
-    CARGO_ENCODED_RUSTFLAGS CARGO_INCREMENTAL CARGO_INSTALL_ROOT RUSTC_WRAPPER \
-    RUSTC_WORKSPACE_WRAPPER RUSTFLAGS RUSTUP_TOOLCHAIN
+    CARGO_ENCODED_RUSTFLAGS CARGO_INCREMENTAL CARGO_INSTALL_ROOT CFLAGS \
+    CPPFLAGS CXXFLAGS LDFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER \
+    RUSTFLAGS RUSTUP_TOOLCHAIN \
+    "CFLAGS_$target_environment" "CFLAGS_$target_environment_upper" \
+    "CXXFLAGS_$target_environment" "CXXFLAGS_$target_environment_upper"
   BCODEX_SOURCE_REVISION="$revision" \
     CARGO="$cargo_program" \
+    CARGO_ENCODED_RUSTFLAGS="$release_rustflags" \
     CARGO_INCREMENTAL=0 \
     CARGO_TARGET_DIR="$target_dir" \
+    CFLAGS="$release_cflags" \
+    CXXFLAGS="$release_cflags" \
     PATH="$toolchain_bin:$PATH" \
     RUSTC="$rustc_program" \
     TEMP="$compiler_tmp" \
@@ -334,10 +409,34 @@ fi
 
 binary="$target_dir/distribution/bcodex"
 [ -f "$binary" ] && [ -x "$binary" ] || fail "release build produced no bcodex executable"
+binary_size="$(wc -c <"$binary" | awk '{ print $1 }')"
+case "$binary_size" in
+  "" | *[!0-9]*) fail "could not determine the release binary size" ;;
+esac
+if [ "$binary_size" -le 0 ] || [ "$binary_size" -gt "$MAX_ASSET_BYTES" ]; then
+  fail "release binary is empty or exceeds $MAX_ASSET_BYTES bytes"
+fi
 [ "$("$binary" --version 2>/dev/null || true)" = "bcodex $version" ] ||
   fail "release binary reported the wrong version"
 [ "$("$binary" --internal-source-revision 2>/dev/null || true)" = "$revision" ] ||
   fail "release binary reported the wrong source revision"
+
+reject_embedded_private_path() {
+  private_path="$1"
+  private_label="$2"
+  [ -n "$private_path" ] && [ "$private_path" != / ] || return 0
+  if LC_ALL=C grep -aF "$private_path" "$binary" >/dev/null 2>&1; then
+    fail "release binary retained the build host's $private_label"
+  else
+    scan_status=$?
+    [ "$scan_status" -eq 1 ] || fail "could not scan the release binary for $private_label"
+  fi
+}
+reject_embedded_private_path "$repository_root" "checkout path"
+reject_embedded_private_path "$temporary_root" "temporary path"
+reject_embedded_private_path "$rust_sysroot" "Rust toolchain path"
+reject_embedded_private_path "$cargo_home" "Cargo home path"
+reject_embedded_private_path "${HOME:-}" "home path"
 smoke_output="$(
   cd "$smoke_root/workspace"
   HOME="$smoke_root/home" \

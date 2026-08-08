@@ -24,6 +24,7 @@ ignore = "0.4.23"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 libc = "0.2"
 lru = "0.18.2"
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std"] }
 memchr = "2"
 nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
 percent-encoding = "2.3"
@@ -63,7 +64,8 @@ zstd = { version = "0.13", default-features = false }
 
 [build-dependencies]
 deno_core_icudata = "0.77.0"
-zstd = { version = "0.13", default-features = false }
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["encoder", "std"] }
+sha2 = "0.10"
 
 [profile.dev]
 # Keep line tables/backtraces while avoiding expensive full variable debug info

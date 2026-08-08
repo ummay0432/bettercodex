@@ -81,9 +81,11 @@ fn accepts_only_full_source_revisions_and_safe_repository_names() {
 async fn published_release_lookup_reports_both_exact_commits() {
     let current = "1111111111111111111111111111111111111111";
     let latest = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let target = install::native_target(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+    let digest = "a".repeat(64);
     let curl = TemporaryProgram::new(&format!(
         "#!/bin/sh\n\
-         printf '{{\"tag_name\":\"bcodex-v0.1.2-%s\",\"draft\":false,\"prerelease\":false}}\\n' '{latest}'\n"
+         printf '%s\\n' '{{\"tag_name\":\"bcodex-v0.1.2-{latest}\",\"draft\":false,\"prerelease\":false,\"assets\":[{{\"name\":\"bcodex-{target}.zst\",\"size\":123,\"digest\":\"sha256:{digest}\"}}]}}'\n"
     ));
 
     assert_eq!(
@@ -118,6 +120,7 @@ async fn failed_malformed_and_timed_out_release_lookups_are_silent() {
         "#!/bin/sh\nexit 1\n",
         "#!/bin/sh\nprintf '{\"tag_name\":\"not-a-release\",\"draft\":false,\"prerelease\":false}\\n'\n",
         "#!/bin/sh\nprintf '{\"tag_name\":\"bcodex-v0.1.2-1111111111111111111111111111111111111111\",\"draft\":true,\"prerelease\":false}\\n'\n",
+        "#!/bin/sh\nprintf '{\"tag_name\":\"bcodex-v0.1.2-2222222222222222222222222222222222222222\",\"draft\":false,\"prerelease\":false,\"assets\":[]}\\n'\n",
     ] {
         let curl = TemporaryProgram::new(program);
         assert_eq!(

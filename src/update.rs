@@ -158,7 +158,9 @@ async fn check_for_release_update_with(
         return None;
     }
     let release = parse_github_release(&output.stdout).ok()?;
-    if release.revision.eq_ignore_ascii_case(current_revision) {
+    if release.revision.eq_ignore_ascii_case(current_revision)
+        || !install::has_native_full_asset(&release)
+    {
         return None;
     }
     Some(AvailableUpdate::new(current_revision, &release.revision))

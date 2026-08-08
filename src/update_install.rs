@@ -199,7 +199,7 @@ fn download_candidate_with_retries(
     unreachable!("the bounded BetterCodex asset retry loop always returns")
 }
 
-fn native_target(os: &str, architecture: &str) -> Result<&'static str> {
+pub(super) fn native_target(os: &str, architecture: &str) -> Result<&'static str> {
     match (os, architecture) {
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
@@ -208,6 +208,17 @@ fn native_target(os: &str, architecture: &str) -> Result<&'static str> {
         ("linux" | "macos", _) => bail!("unsupported architecture: {architecture}"),
         _ => bail!("only macOS and Linux are supported"),
     }
+}
+
+pub(super) fn has_native_full_asset(release: &PublishedRelease) -> bool {
+    let Ok(target) = native_target(std::env::consts::OS, std::env::consts::ARCH) else {
+        return false;
+    };
+    let name = format!("bcodex-{target}.zst");
+    matches!(
+        unique_asset(release, &name),
+        Ok(Some(asset)) if asset.validate().is_ok()
+    )
 }
 
 fn unique_asset<'a>(
@@ -990,7 +1001,11 @@ mod tests {
             &curl,
             format!(
                 "#!/bin/sh\n\
-                 for argument do url=\"$argument\"; done\n\
+                 url_count=0\n\
+                 for argument do\n\
+                   case \"$argument\" in https://*) url=\"$argument\"; url_count=$((url_count + 1)) ;; esac\n\
+                 done\n\
+                 [ \"$url_count\" -eq 1 ] || exit 9\n\
                  printf '%s\\n' \"$url\" >'{}'\n\
                  attempts=0\n\
                  [ ! -f '{}' ] || attempts=\"$(/bin/cat '{}')\"\n\
@@ -1079,6 +1094,8 @@ mod tests {
 
     #[test]
     fn cache_cleanup_never_follows_a_linked_root() {
+        assert!(cleanup_source_updater_caches_at(Path::new("relative-cache")).is_err());
+
         let root = TemporaryDirectory::new();
         let outside = root.path.join("outside");
         let linked_cache = root.path.join("linked-cache");

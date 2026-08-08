@@ -150,6 +150,7 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "lru",
+ "lzma-rust2",
  "memchr",
  "nucleo",
  "percent-encoding",
@@ -1700,6 +1701,12 @@ checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
  "hashbrown 0.17.1",
 ]
+
+[[package]]
+name = "lzma-rust2"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "243cb2271683c2855cad62142cbf38199db439b1b1e1ccdd5a011342894dd7cc"
 
 [[package]]
 name = "mac_address"

@@ -88,9 +88,9 @@ a stage beside the installed executable. It verifies GitHub's exact asset size
 and SHA-256 while streaming, caps decompressed output, and then checks the
 candidate's version, source revision, V8 runtime, and embedded resources before
 an atomic replacement. It does not download a shell script or checksum file,
-and it never invokes Cargo or source fallback. The first optimized Linux x86-64
-build is about 18 MB as a full update; its patch from the current installed
-binary is about 9 MB.
+and it never invokes Cargo or source fallback. The reviewed Linux x86-64 build
+is about 17.2 MB as a full update; its migration patch from the current
+installed binary is about 8.4 MB.
 
 The running TUI keeps using its old in-memory code until restarted; new
 processes use the atomically replaced binary. Failed background checks stay
@@ -186,12 +186,13 @@ scripts/publish-release.sh --upload
 
 The command uses a disposable Cargo target, the pinned toolchain, the
 size-focused `distribution` profile, and the full embedded revision. It runs
-the install smoke test, enforces the Linux glibc compatibility floor, verifies
-macOS signatures when present, and creates portable gzip plus smaller zstd
-assets and their SHA-256 files. If a previous release exists, it also verifies
-that target's old binary and creates a byte-exact raw-prefix patch for compact
-updates. It uploads only to an existing draft. Publishing that draft remains a
-separate manual action after all four targets have been inspected. See
+the install smoke test, remaps and rejects private build-host paths, enforces the
+Linux glibc compatibility floor, verifies macOS signatures when present, and
+creates portable gzip plus smaller zstd assets and their SHA-256 files. If a
+previous release exists, it also verifies that target's old binary and creates
+a byte-exact raw-prefix patch for compact updates. It uploads only to an
+existing draft. Publishing that draft remains a separate manual action after
+all four targets have been inspected. See
 [`spec-install.md`](../spec-install.md) for the complete release contract.
 
 ## Build without installing
