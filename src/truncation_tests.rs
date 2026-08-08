@@ -22,10 +22,7 @@ fn truncate_tokens_less_than_placeholder_returns_placeholder() {
 fn truncate_tokens_under_limit_returns_original() {
     let content = "example output";
 
-    assert_eq!(
-        content,
-        formatted_truncate_text(content, 10),
-    );
+    assert_eq!(content, formatted_truncate_text(content, 10),);
 }
 
 #[test]

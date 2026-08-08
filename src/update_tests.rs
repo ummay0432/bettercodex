@@ -78,7 +78,7 @@ fn accepts_only_full_source_revisions_and_safe_repository_names() {
 }
 
 #[tokio::test]
-async fn published_release_lookup_reports_both_exact_commits() {
+async fn published_release_lookup_respects_revisions_and_package_versions() {
     let current = "1111111111111111111111111111111111111111";
     let latest = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
     let target = install::native_target(std::env::consts::OS, std::env::consts::ARCH).unwrap();

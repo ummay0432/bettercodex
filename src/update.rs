@@ -1,8 +1,9 @@
 //! Published-release checks and the local update command.
 //!
-//! Installed builds compare their embedded source revision with the latest
-//! complete GitHub Release after the TUI renders. The explicit command streams
-//! one verified zstd release asset directly into an atomic replacement.
+//! Installed builds compare their package version and embedded source revision
+//! with the latest complete GitHub Release after the TUI renders. The explicit
+//! command streams one verified zstd release asset directly into an atomic
+//! replacement.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -222,10 +223,16 @@ fn is_package_version(version: &str) -> bool {
 
 fn package_version(version: &str) -> Option<[u64; 3]> {
     let mut components = version.split('.');
+    let parse_component = |component: &str| -> Option<u64> {
+        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        component.parse().ok()
+    };
     let version = [
-        components.next()?.parse().ok()?,
-        components.next()?.parse().ok()?,
-        components.next()?.parse().ok()?,
+        parse_component(components.next()?)?,
+        parse_component(components.next()?)?,
+        parse_component(components.next()?)?,
     ];
     components.next().is_none().then_some(version)
 }
