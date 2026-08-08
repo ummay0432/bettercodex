@@ -17,6 +17,11 @@ for the following success criteria:
 - Could it be more resource-efficient?
 - Could it be easier to understand, extend, and maintain?
 
+Conduct rigorous web research into current authoritative documentation to
+uncover improvements to the target beyond what your built-in knowledge alone
+would surface. Use what you find to re-evaluate every success criterion; do not
+let your knowledge cutoff or initial assumptions limit the review.
+
 If any answer is yes and repository evidence supports a clear net improvement,
 take action. Refactor the affected system as deeply as needed. Remove everything
 the improved design makes obsolete.
