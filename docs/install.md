@@ -14,7 +14,7 @@ workspace, or Node workspace.
 
 Windows is not supported.
 
-## Install with a minimal retained footprint
+## Install with a small retained footprint
 
 Install an authenticated [GitHub CLI](https://cli.github.com/), `curl`, a native
 C toolchain, and Rust through [rustup](https://rustup.rs/). On a new Mac,
@@ -41,8 +41,10 @@ already-installed matching Rust toolchain is reused. If that exact toolchain is
 missing, rustup downloads its minimal profile inside the temporary install tree
 instead of adding another persistent toolchain.
 
-Source, Cargo's dependency cache, the compilation target, compiler scratch
-space, and verified V8 downloads all live under one temporary install tree.
+Source, the compilation target, and compiler scratch space live under one
+temporary install tree. Cargo dependency downloads and checksum-verified V8
+artifacts live under `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`, so later
+updates reuse unchanged inputs without reusing compiled output.
 
 Before replacement, the candidate binary must report the expected package
 version and embedded source commit, initialize V8, and materialize every
@@ -57,18 +59,19 @@ also retried three times; partial archives are discarded between attempts.
 
 An exit trap removes the complete temporary install tree after success, build
 failure, `SIGHUP`, `SIGINT`, or `SIGTERM`. A lock records the tree so the next
-install can remove it after an untrappable crash or `SIGKILL`. Only the binary
-under `$HOME/.local/bin`, a small shell-profile PATH entry when needed, and
-BetterCodex user data remain from the BetterCodex build. The prerequisite
-rustup installation, any matching toolchain that existed before the install,
-and the native compiler are left alone because other software may share them.
-An installer-only pinned toolchain is removed with the temporary tree.
+install can remove it after an untrappable crash or `SIGKILL`. The installed
+binary, a small shell-profile PATH entry when needed, BetterCodex user data, and
+the dependency download cache remain. The prerequisite rustup installation,
+any matching toolchain that existed before the install, and the native compiler
+are left alone because other software may share them. An installer-only pinned
+toolchain is removed with the temporary tree.
 
 The source build still needs several gigabytes of free temporary space while it
-runs. Eliminating the retained cache means a later update normally downloads
-dependencies and compiles from scratch. Retries within one installer process
-may reuse that process's temporary dependency and V8 downloads, but never an
-older compilation target; the entire tree is removed at the end.
+runs because every update compiles into a fresh target. Cargo automatically
+ages unused registry and Git entries out of its global cache; BetterCodex never
+retains an older compilation target. If neither `XDG_CACHE_HOME` nor `HOME` is
+available, the installer falls back to temporary dependency downloads and
+reports that they cannot be reused.
 
 Open a new terminal if `$HOME/.local/bin` was not already on `PATH`, then
 sign in and launch BetterCodex from a project directory:
@@ -114,7 +117,9 @@ background checks stay silent and are retried on the next launch; set
 update path for the default `$HOME/.local/bin` installation.
 
 Each update uses a fresh immutable source archive, so it cannot merge local
-source changes or reuse stale build output.
+source changes or reuse stale build output. The lockfile identifies exact Cargo
+registry versions and Git commits; only those downloaded inputs and the
+hash-checked V8 pair are reused.
 
 ### What other devices can see
 
@@ -131,11 +136,12 @@ check is a new update, not silent drift, and is detected on the next launch.
 Current installs and updates automatically remove the retired updater's
 `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex/build` and `tmp` directories. They
 do this before compiling so the old multi-gigabyte target cannot crowd out the
-temporary replacement build. They do not remove credentials, sessions,
-settings, a development checkout's `rusty-v8-*` cache, Rust toolchains, or
-native compiler tools that existed before the install. A missing pinned Rust
-toolchain created solely for an install is temporary. Cache paths that are
-symbolic links are left untouched rather than followed.
+temporary replacement build. The sibling `cargo` dependency cache and
+`rusty-v8-*` artifact directories are retained and reused. They do not remove
+credentials, sessions, settings, Rust toolchains, or native compiler tools that
+existed before the install. A missing pinned Rust toolchain created solely for
+an install is temporary. Retired cache paths that are symbolic links are left
+untouched rather than followed.
 
 Embedded system skills are checked on launch independently of the source
 revision marker. BetterCodex verifies every expected file's bytes and private
@@ -150,8 +156,8 @@ beside `.system`, not inside that reserved directory.
 An installed 0.1.2-era binary may still show `Update available` and advertise
 `bcodex update`. That executable compares its embedded source commit with
 private `main`, so any later commit triggers the notice even though both builds
-report version 0.1.2. Some older executables embed the retired persistent-cache
-installer and cannot migrate across its removal by updating themselves.
+report version 0.1.2. Some older executables embed the retired persistent-build-
+cache installer and cannot migrate across its removal by updating themselves.
 
 Run [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) once to install current
 source. Existing ChatGPT credentials, Bettercodex settings, and saved sessions
@@ -188,9 +194,11 @@ default `rusty_v8` release, so the wrapper follows current upstream Codex: it
 downloads the matching archive and generated binding from the
 `rusty-v8-v150.4.0` OpenAI Codex release, verifies their pinned SHA-256 digests,
 caches them under `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`, and then runs
-Cargo with both required overrides. The minimal installer points that cache at
-its temporary directory; retained development checkouts use the persistent
-default. Explicit paired overrides and `V8_FROM_SOURCE=1` remain authoritative.
+Cargo with both required overrides. Installs, updates, and development checkouts
+share that persistent V8 cache. The installer keeps its Cargo dependency cache
+in the sibling `cargo` directory while keeping its compilation target
+disposable. Explicit paired overrides and `V8_FROM_SOURCE=1` remain
+authoritative.
 
 ## Development checks
 

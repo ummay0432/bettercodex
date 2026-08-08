@@ -11,8 +11,9 @@ rustup, and a native C toolchain. Copy and run the one-line
 [`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt). It downloads one immutable source
 commit, verifies the resulting binary and embedded resources, rechecks private
 `main`, and atomically installs only a matching build. It automatically removes
-the source, Cargo dependency cache, V8 download, and compilation artifacts
-after success, failure, or interruption.
+the source and compilation artifacts after success, failure, or interruption,
+while retaining Cargo dependency downloads and verified V8 artifacts for the
+next update.
 
 Then open a new terminal, sign in with your own ChatGPT account, and launch
 bettercodex from a project directory:
@@ -25,10 +26,10 @@ bcodex
 Installed builds check their embedded source revision against private `main`
 after the TUI renders. When an update is available, run `bcodex update` in
 another terminal. It uses the same temporary source-build flow as
-[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt), so each update builds from scratch
-and retains no BetterCodex source checkout or multi-gigabyte build cache. The
-installed binary, a small shell-profile PATH entry when needed, and the required
-Rust and native toolchains remain.
+[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt), so each update gets a fresh source
+tree and compilation target without redownloading unchanged Cargo dependencies
+or V8 artifacts. It retains no BetterCodex source checkout or multi-gigabyte
+build cache.
 
 Only commits pushed to the private repository's `main` branch are distributable;
 uncommitted, unpushed, and other-branch development work is not visible to

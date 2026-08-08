@@ -3,7 +3,8 @@
 //! Installed builds compare their embedded source revision with private `main`
 //! after the TUI renders. The explicit command fetches the current installer,
 //! mirroring upstream Codex's standalone update path, and that installer builds
-//! one immutable source commit in disposable Cargo and V8 directories.
+//! one immutable source commit with disposable build output and a reusable
+//! dependency download cache.
 
 use anyhow::Context;
 use anyhow::Result;

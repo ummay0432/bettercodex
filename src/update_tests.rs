@@ -218,6 +218,7 @@ fn legacy_cleanup_removes_only_retired_directories() {
     let root = &temporary.path;
     fs::create_dir_all(root.join("build/target/release")).unwrap();
     fs::create_dir_all(root.join("tmp/source")).unwrap();
+    fs::create_dir_all(root.join("cargo/git/db")).unwrap();
     fs::create_dir_all(root.join("rusty-v8-150.4.0-host")).unwrap();
     fs::write(root.join("keep"), "operator data").unwrap();
 
@@ -225,6 +226,7 @@ fn legacy_cleanup_removes_only_retired_directories() {
 
     assert!(!root.join("build").exists());
     assert!(!root.join("tmp").exists());
+    assert!(root.join("cargo/git/db").is_dir());
     assert!(root.join("rusty-v8-150.4.0-host").is_dir());
     assert_eq!(
         fs::read_to_string(root.join("keep")).unwrap(),

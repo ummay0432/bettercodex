@@ -1,8 +1,9 @@
 #!/bin/sh
 
-# Install the current integrated BetterCodex source without retaining source,
-# dependency, V8, or compilation caches. This script is also fetched and run by
-# `bcodex update`, following upstream Codex's standalone-updater pattern.
+# Install the current integrated BetterCodex source with a reusable dependency
+# download cache but no retained source or compilation output. This script is
+# also fetched and run by `bcodex update`, following upstream Codex's
+# standalone-updater pattern.
 
 set -eu
 
@@ -35,8 +36,9 @@ Usage: install.sh
 
 Resolves private BetterCodex main to an immutable commit, compiles that source
 for this Mac or Linux computer, verifies the result, and atomically installs it.
-All source, Cargo, V8, compilation caches, and any installer-only Rust
-toolchain created by the install are removed.
+Source, compiler scratch space, compilation output, and any installer-only Rust
+toolchain created by the install are removed. Cargo dependency downloads and
+verified V8 artifacts are reused from the BetterCodex cache.
 
 Environment:
   BCODEX_INSTALL_DIR  Binary directory (default: \$HOME/.local/bin).
@@ -252,16 +254,21 @@ acquire_install_lock() {
 
 acquire_install_lock
 
-cleanup_retired_updater_cache() {
-  legacy_cache_root=""
-  if [ -n "${XDG_CACHE_HOME:-}" ]; then
-    legacy_cache_root="$XDG_CACHE_HOME/bettercodex"
-  elif [ -n "${HOME:-}" ]; then
-    legacy_cache_root="$HOME/.cache/bettercodex"
-  fi
-  [ -n "$legacy_cache_root" ] || return
+cache_base=""
+if [ -n "${XDG_CACHE_HOME:-}" ]; then
+  cache_base="$XDG_CACHE_HOME"
+elif [ -n "${HOME:-}" ]; then
+  cache_base="$HOME/.cache"
+fi
+cache_root=""
+if [ -n "$cache_base" ]; then
+  cache_root="$cache_base/bettercodex"
+fi
 
-  for legacy_path in "$legacy_cache_root/build" "$legacy_cache_root/tmp"; do
+cleanup_retired_updater_cache() {
+  [ -n "$cache_root" ] || return 0
+
+  for legacy_path in "$cache_root/build" "$cache_root/tmp"; do
     if [ -L "$legacy_path" ]; then
       warn "not removing retired cache symlink $legacy_path"
     elif [ -d "$legacy_path" ]; then
@@ -273,7 +280,7 @@ cleanup_retired_updater_cache() {
 
 # Free space held by the retired updater before this source build needs its
 # several-gigabyte temporary target. Only the old updater's build and source
-# directories are in scope; retained development V8 caches stay untouched.
+# directories are in scope; reusable dependency downloads stay untouched.
 cleanup_retired_updater_cache
 
 resolve_main_commit() {
@@ -329,6 +336,13 @@ printf '%s\n' "$tmp_dir" >"$lock_dir/tmp"
 printf '%s\n' "$install_temp_parent" >"$lock_dir/tmp-parent"
 cargo_home="$tmp_dir/cargo-home"
 v8_cache_home="$tmp_dir/cache"
+if [ -n "$cache_root" ]; then
+  cargo_home="$cache_root/cargo"
+  v8_cache_home="$cache_base"
+  step "Using dependency download cache at $cache_root"
+else
+  warn "HOME and XDG_CACHE_HOME are unset; dependency downloads cannot be reused"
+fi
 mkdir -p "$cargo_home" "$v8_cache_home"
 
 existing_install=0
@@ -626,7 +640,11 @@ if [ "$existing_install" -eq 1 ]; then
 else
   step "Installed bcodex $installed_version ($short_installed) at $bin_path"
 fi
-step "Removed the disposable install tree: source, Cargo cache, V8 downloads, optional Rust toolchain, and build output"
+if [ -n "$cache_root" ]; then
+  step "Removed the disposable source and build output; retained dependency downloads at $cache_root"
+else
+  step "Removed the disposable install tree: source, dependency downloads, optional Rust toolchain, and build output"
+fi
 
 case "$path_action" in
   added | updated)

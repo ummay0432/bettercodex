@@ -159,7 +159,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn("GitHub CLI is required", result.stderr)
             self.assertEqual(list(temporary.iterdir()), [])
 
-    def test_install_and_update_leave_no_source_or_build_cache(self) -> None:
+    def test_install_and_update_reuse_downloads_without_retaining_build_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "friend's better codex"
             legacy = root / "cache" / "bettercodex"
@@ -178,7 +178,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertIn("Installed bcodex", first.stdout)
             self.assertIn("Updated bcodex", second.stdout)
-            self.assertIn("Removed the disposable install tree", second.stdout)
+            self.assertIn("retained dependency downloads", second.stdout)
             installed = root / "install" / "bin" / "bcodex"
             self.assertEqual(run_binary(installed, "--version"), f"bcodex {VERSION}\n")
             self.assertEqual(run_binary(installed, "--internal-source-revision"), f"{COMMIT}\n")
@@ -197,15 +197,24 @@ class InstallScriptTest(unittest.TestCase):
 
             builds = (root / "build.log").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(builds), 2)
+            expected_cargo_home = legacy / "cargo"
+            expected_cache_home = root / "cache"
             for build in builds:
                 revision, cargo_home, target, cache_home, compiler_tmp, arguments = build.split(
                     "|", 5
                 )
                 self.assertEqual(revision, COMMIT)
                 self.assertEqual(arguments, "build --release --locked --bin bcodex")
-                for disposable_path in (cargo_home, target, cache_home, compiler_tmp):
+                self.assertEqual(Path(cargo_home), expected_cargo_home)
+                self.assertEqual(Path(cache_home), expected_cache_home)
+                for disposable_path in (target, compiler_tmp):
                     self.assertIn("bettercodex-install.", disposable_path)
                     self.assertFalse(Path(disposable_path).exists())
+            self.assertTrue(expected_cargo_home.is_dir())
+            self.assertEqual(
+                (root / "download.log").read_text(encoding="utf-8").splitlines(),
+                ["cargo", "v8"],
+            )
             assert_no_installer_residue(self, root)
 
     def test_retries_with_a_fresh_target_when_main_advances(self) -> None:
@@ -303,6 +312,34 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn("Add ", result.stdout)
             self.assertIn(" to PATH in your shell profile", result.stdout)
             self.assertTrue((root / "install" / "bin" / "bcodex").is_file())
+            assert_no_installer_residue(self, root)
+
+    def test_home_cache_is_used_when_xdg_cache_home_is_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, xdg_cache_enabled=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            build = (root / "build.log").read_text(encoding="utf-8").strip().split("|")
+            self.assertEqual(
+                Path(build[1]), root / "home" / ".cache" / "bettercodex" / "cargo"
+            )
+            self.assertEqual(Path(build[3]), root / "home" / ".cache")
+            assert_no_installer_residue(self, root)
+
+    def test_missing_cache_environment_uses_disposable_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, home_enabled=False, xdg_cache_enabled=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("dependency downloads cannot be reused", result.stderr)
+            build = (root / "build.log").read_text(encoding="utf-8").strip().split("|")
+            for disposable_path in (build[1], build[3]):
+                self.assertIn("bettercodex-install.", disposable_path)
+                self.assertFalse(Path(disposable_path).exists())
             assert_no_installer_residue(self, root)
 
     def test_missing_pinned_rust_toolchain_is_installed_only_in_the_temp_tree(self) -> None:
@@ -553,6 +590,7 @@ def run_installer(
     cleanup_success: bool = True,
     advancing_main: bool = False,
     shadowed_binary: bool = False,
+    xdg_cache_enabled: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     root.mkdir(parents=True, exist_ok=True)
     fake_bin = root / "fake-bin"
@@ -720,6 +758,7 @@ def run_installer(
             "BCODEX_TEST_COMMIT": COMMIT,
             "BCODEX_TEST_CLEANUP_SUCCESS": "1" if cleanup_success else "0",
             "BCODEX_TEST_COMPILER_WORKS": "1" if compiler_works else "0",
+            "BCODEX_TEST_DOWNLOAD_LOG": str(root / "download.log"),
             "BCODEX_TEST_EMBEDDED_REVISION": embedded_revision or "",
             "BCODEX_TEST_FAKE_BIN": str(fake_bin),
             "BCODEX_TEST_GH_LOG": str(root / "gh.log"),
@@ -734,9 +773,10 @@ def run_installer(
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "SHELL": shell,
             "TMPDIR": str(temporary),
-            "XDG_CACHE_HOME": str(root / "cache"),
         }
     )
+    if xdg_cache_enabled:
+        environment["XDG_CACHE_HOME"] = str(root / "cache")
     if home_enabled:
         environment["HOME"] = str(home)
     else:
@@ -761,6 +801,18 @@ def create_source_archive(root: Path) -> Path:
         "scripts/cargo-with-v8.sh": textwrap.dedent(
             """\
             #!/bin/sh
+            cargo_download="$CARGO_HOME/git/dependency-download"
+            if [ ! -f "$cargo_download" ]; then
+              mkdir -p "$(dirname "$cargo_download")"
+              printf '%s\\n' cargo >>"$BCODEX_TEST_DOWNLOAD_LOG"
+              : >"$cargo_download"
+            fi
+            v8_download="$XDG_CACHE_HOME/bettercodex/rusty-v8-fixture/artifact"
+            if [ ! -f "$v8_download" ]; then
+              mkdir -p "$(dirname "$v8_download")"
+              printf '%s\\n' v8 >>"$BCODEX_TEST_DOWNLOAD_LOG"
+              : >"$v8_download"
+            fi
             printf '%s|%s|%s|%s|%s|%s\\n' \
               "$BCODEX_SOURCE_REVISION" "$CARGO_HOME" "$CARGO_TARGET_DIR" \
               "$XDG_CACHE_HOME" "$TMPDIR" "$*" >>"$BCODEX_TEST_BUILD_LOG"

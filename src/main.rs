@@ -566,7 +566,7 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Build and install current private BetterCodex main\n\nUsage:\n  bcodex update\n\nThe updater first removes retired updater build caches and resolves main to an exact commit. If the embedded source commit already matches, it exits without rebuilding. Otherwise it fetches the current installer, compiles locked source in disposable Cargo, compiler, and V8 directories, smoke-tests the result, atomically replaces the running installation only if main still matches, and removes all temporary build artifacts afterward."
+        "Build and install current private BetterCodex main\n\nUsage:\n  bcodex update\n\nThe updater first removes retired updater build caches and resolves main to an exact commit. If the embedded source commit already matches, it exits without rebuilding. Otherwise it fetches the current installer, reuses cached Cargo dependencies and verified V8 downloads, compiles locked source with disposable source, compiler, and target directories, smoke-tests the result, atomically replaces the running installation only if main still matches, and removes all temporary build artifacts afterward."
     ))
 }
 
