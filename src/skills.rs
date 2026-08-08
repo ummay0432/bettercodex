@@ -286,6 +286,8 @@ impl SkillCatalog {
                         }
                         if is_reserved_system_skill_name(&skill.name) {
                             skill.enabled = true;
+                        }
+                        if skill.name == "loop" {
                             skill.allow_implicit_invocation = false;
                         }
                         skills.push(skill);
@@ -494,7 +496,9 @@ impl SkillCatalog {
         for skill in &mut self.skills {
             if is_reserved_system_skill_name(&skill.name) {
                 skill.enabled = true;
-                skill.allow_implicit_invocation = false;
+                if skill.name == "loop" {
+                    skill.allow_implicit_invocation = false;
+                }
                 continue;
             }
             let Some(settings) = settings.skills.get(&skill.path) else {

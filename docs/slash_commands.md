@@ -16,8 +16,8 @@ review on a specified product or system:
 /review recovery after an interrupted WebSocket response
 ```
 
-The explicit `$review` skill starts the same workflow in interactive and
-non-interactive prompts and can target any repository scope:
+`$review` explicitly starts the same workflow in interactive and non-interactive
+prompts and can target any repository scope:
 
 ```text
 $review the authentication changes
@@ -32,9 +32,11 @@ deeply as needed and removes everything made obsolete. When the target already
 meets those standards, it leaves the implementation unchanged and explains the
 evidence for that conclusion.
 
-Review requests submitted during another turn queue as the next task instead of
-steering the active implementation. The skill is explicit-only: bettercodex
-does not start this workflow unless the operator writes `$review` or `/review`.
+Explicit review requests submitted during another turn queue as the next task
+instead of steering the active implementation. The agent may also invoke the
+skill proactively during implementation work when its engineering-review
+criteria match the task; `$review` or `/review` is not required. A plain
+read-only review request does not authorize edits.
 
 ## Quality loop
 

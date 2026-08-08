@@ -10,7 +10,7 @@ fn text_of(item: &Value) -> &str {
 }
 
 #[test]
-fn review_skill_is_reserved_explicit_only_and_injected_from_both_entry_points() {
+fn review_skill_is_reserved_proactive_and_injected_from_both_entry_points() {
     let root = std::env::temp_dir().join(format!(
         "bettercodex-review-skill-{}-{}",
         std::process::id(),
@@ -36,7 +36,7 @@ fn review_skill_is_reserved_explicit_only_and_injected_from_both_entry_points() 
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].scope, SkillScope::System);
     assert!(reviews[0].is_enabled());
-    assert!(!reviews[0].allows_implicit_invocation());
+    assert!(reviews[0].allows_implicit_invocation());
     assert_eq!(reviews[0].display_name(), "Engineering Review");
     assert_eq!(
         reviews[0].display_description(),
@@ -49,7 +49,7 @@ fn review_skill_is_reserved_explicit_only_and_injected_from_both_entry_points() 
             .any(|warning| warning.contains("reserved skill name `review`"))
     );
     assert!(
-        !text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
+        text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
             .contains("- review:")
     );
 

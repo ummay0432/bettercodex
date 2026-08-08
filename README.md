@@ -44,7 +44,8 @@ for counts, progress, restoration, and repository-local evidence.
 For an active engineering review and evidence-backed refactoring, use
 `/review <target>` in the TUI or invoke `$review <target>` in any prompt. The
 workflow develops a deep understanding of the target, applies explicit quality
-criteria, and acts on clear net improvements; see
+criteria, and acts on clear net improvements. The agent can also select this
+workflow proactively during implementation work; see
 [`docs/slash_commands.md`](docs/slash_commands.md#engineering-review).
 
 See [`docs/install.md`](docs/install.md) for supported platforms, temporary disk

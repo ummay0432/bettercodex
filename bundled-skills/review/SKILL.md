@@ -1,6 +1,6 @@
 ---
 name: review
-description: "Autonomously review, repair, and refactor a user-specified part of the system. Invoke only with `$review` or `/review`; this is an implementation workflow, not a read-only review."
+description: "Proactively review, repair, and refactor a user-specified part of a software system during implementation work. Invoke whenever a thorough engineering audit could improve correctness, simplicity, performance, resource efficiency, or maintainability; `$review` or `/review` is not required. Do not use for read-only requests."
 ---
 
 # Review
