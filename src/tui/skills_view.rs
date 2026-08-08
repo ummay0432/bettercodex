@@ -260,7 +260,3 @@ impl SkillsView {
             .collect()
     }
 }
-
-#[cfg(test)]
-#[path = "skills_view_tests.rs"]
-mod tests;

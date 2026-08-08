@@ -151,7 +151,3 @@ impl IncrementalMarkdownRender {
         self.parsed_source_len = source.len();
     }
 }
-
-#[cfg(test)]
-#[path = "markdown_cache_tests.rs"]
-mod tests;

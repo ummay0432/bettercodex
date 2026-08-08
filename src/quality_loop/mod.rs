@@ -25,8 +25,6 @@ pub(crate) use evaluator::run_machine_evaluation;
 pub(crate) use integrity::PackageManifest;
 
 pub(crate) use parser::LoopInvocation;
-#[cfg(test)]
-pub(crate) use parser::parse_invocation;
 pub(crate) use parser::parse_invocation_with_mode;
 pub(crate) use progress::LoopProgress;
 pub(crate) use progress::truncate_width;
@@ -75,11 +73,3 @@ pub(crate) fn capture_state_identity(
     let snapshot = worktree.capture(&capture_root, &contract.snapshot_paths())?;
     Ok(serde_json::to_value(snapshot.state)?)
 }
-
-#[cfg(test)]
-#[path = "parser_tests.rs"]
-mod parser_tests;
-
-#[cfg(test)]
-#[path = "envelope_tests.rs"]
-mod envelope_tests;

@@ -71,22 +71,6 @@ impl Auth {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn refreshable_for_test(
-        access_token: impl Into<String>,
-        refresh_token: impl Into<String>,
-        refresh_url: impl Into<String>,
-    ) -> Self {
-        Self {
-            access_token: access_token.into(),
-            refresh_token: Some(refresh_token.into()),
-            account_id: Some("test-account".to_string()),
-            expires_at: None,
-            refresh_url: Cow::Owned(refresh_url.into()),
-            storage: None,
-        }
-    }
-
     pub(crate) fn load() -> Result<Self> {
         if let Ok(access_token) = std::env::var(ACCESS_TOKEN_ENV)
             && !access_token.trim().is_empty()

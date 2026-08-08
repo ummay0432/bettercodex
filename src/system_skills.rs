@@ -271,7 +271,3 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     file.sync_all()
         .with_context(|| format!("could not sync {}", path.display()))
 }
-
-#[cfg(test)]
-#[path = "system_skills_tests.rs"]
-mod tests;

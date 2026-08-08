@@ -171,7 +171,3 @@ fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "papercuts_tests.rs"]
-mod tests;

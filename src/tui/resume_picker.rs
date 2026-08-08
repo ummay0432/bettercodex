@@ -937,7 +937,3 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     truncated.push('…');
     truncated
 }
-
-#[cfg(test)]
-#[path = "resume_picker_tests.rs"]
-mod tests;

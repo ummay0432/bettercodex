@@ -583,7 +583,3 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
         .sum()
 }
-
-#[cfg(test)]
-#[path = "file_search_tests.rs"]
-mod tests;

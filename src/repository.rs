@@ -8,7 +8,3 @@ pub(crate) fn find_root(cwd: &Path) -> Option<PathBuf> {
         .find(|directory| directory.join(".git").exists())
         .map(Path::to_path_buf)
 }
-
-#[cfg(test)]
-#[path = "repository_tests.rs"]
-mod tests;

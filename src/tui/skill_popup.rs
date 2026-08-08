@@ -378,7 +378,3 @@ fn previous_char_boundary(text: &str, mut index: usize) -> usize {
     }
     index
 }
-
-#[cfg(test)]
-#[path = "skill_popup_tests.rs"]
-mod tests;

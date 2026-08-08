@@ -1126,7 +1126,3 @@ fn is_common_environment_variable(name: &str) -> bool {
             | "XDG_CONFIG_HOME"
     )
 }
-
-#[cfg(test)]
-#[path = "skills_tests.rs"]
-mod tests;

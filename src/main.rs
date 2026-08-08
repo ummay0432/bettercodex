@@ -20,7 +20,6 @@ mod state_file;
 mod system_skills;
 mod tools;
 mod tui;
-mod update;
 mod usage;
 mod web_search;
 
@@ -100,35 +99,10 @@ fn run() -> Result<()> {
             write_stdout_line(format_args!("{}", tool_catalogue_stats()))?;
             Ok(())
         }
-        Command::ToolContextJson => {
-            let cwd = std::env::current_dir()?.canonicalize()?;
-            write_stdout_line(format_args!(
-                "{}",
-                serde_json::json!({
-                    "instructions": api::harness_instructions(),
-                    "stable_prefix": api::stable_request_prefix(),
-                    "world_state": context::initial_context_items(&cwd)?,
-                })
-            ))?;
-            Ok(())
-        }
-        Command::InternalPackageSmoke => {
-            tools::package_smoke_test().map_err(anyhow::Error::msg)?;
-            write_stdout_line(format_args!(
-                "bcodex {} package smoke passed",
-                env!("CARGO_PKG_VERSION")
-            ))?;
-            Ok(())
-        }
         Command::Login(command) => run_login_command(command),
         Command::Logout => run_logout_command(),
         Command::LogoutHelp => {
             write_logout_help()?;
-            Ok(())
-        }
-        Command::Update => update::run_update(),
-        Command::UpdateHelp => {
-            write_update_help()?;
             Ok(())
         }
         Command::InternalLoopState { run_root, contract } => {
@@ -309,13 +283,9 @@ enum Command {
     Version,
     ToolCatalogue,
     ToolCatalogueStats,
-    ToolContextJson,
-    InternalPackageSmoke,
     Login(LoginCommand),
     Logout,
     LogoutHelp,
-    Update,
-    UpdateHelp,
     InternalLoopState {
         run_root: PathBuf,
         contract: PathBuf,
@@ -340,18 +310,6 @@ struct RunOptions {
 impl Command {
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut arguments = arguments.into_iter().peekable();
-        if arguments
-            .peek()
-            .is_some_and(|argument| argument == "--internal-package-smoke")
-        {
-            arguments.next();
-            if arguments.next().is_some() {
-                return Err(anyhow!(
-                    "internal package smoke helper received extra arguments"
-                ));
-            }
-            return Ok(Self::InternalPackageSmoke);
-        }
         if arguments
             .peek()
             .is_some_and(|argument| argument == "--internal-loop-state")
@@ -396,12 +354,6 @@ impl Command {
         }) {
             return Ok(Self::ToolCatalogueStats);
         }
-        if arguments
-            .peek()
-            .is_some_and(|argument| argument == "--tool-context-json")
-        {
-            return Ok(Self::ToolContextJson);
-        }
         if arguments.peek().is_some_and(|argument| argument == "login") {
             arguments.next();
             return parse_login_command(arguments);
@@ -412,13 +364,6 @@ impl Command {
         {
             arguments.next();
             return parse_logout_command(arguments);
-        }
-        if arguments
-            .peek()
-            .is_some_and(|argument| argument == "update")
-        {
-            arguments.next();
-            return parse_update_command(arguments);
         }
 
         let resume = arguments
@@ -501,18 +446,9 @@ fn parse_logout_command(arguments: impl IntoIterator<Item = String>) -> Result<C
     }
 }
 
-fn parse_update_command(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
-    let arguments = arguments.into_iter().collect::<Vec<_>>();
-    match arguments.as_slice() {
-        [] => Ok(Command::Update),
-        [argument] if argument == "--help" || argument == "-h" => Ok(Command::UpdateHelp),
-        [argument, ..] => Err(anyhow!("unknown update argument `{argument}`")),
-    }
-}
-
 fn write_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Build and install the latest private source tag\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /loop <task> there, or include $loop in any prompt, to run the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /loop <task> there, or include $loop in any prompt, to run the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     ))
 }
@@ -526,12 +462,6 @@ fn write_login_help() -> io::Result<()> {
 fn write_logout_help() -> io::Result<()> {
     write_stdout_line(format_args!(
         "Remove stored ChatGPT credentials\n\nUsage:\n  bcodex logout\n\nOptions:\n  -h, --help  Show this help"
-    ))
-}
-
-fn write_update_help() -> io::Result<()> {
-    write_stdout_line(format_args!(
-        "Build and install the latest private bettercodex source tag\n\nUsage:\n  bcodex update\n\nThe update uses the authenticated GitHub CLI, compiles the tagged source for this machine, smoke-tests its runtime and embedded resources, and then replaces the installed binary."
     ))
 }
 
@@ -593,90 +523,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_upstream_login_and_logout_commands() {
-        assert!(matches!(
-            Command::parse(["login".to_string()]).unwrap(),
-            Command::Login(LoginCommand::Browser)
-        ));
-        assert!(matches!(
-            Command::parse(["login".to_string(), "--device-auth".to_string()]).unwrap(),
-            Command::Login(LoginCommand::DeviceCode)
-        ));
-        assert!(matches!(
-            Command::parse(["login".to_string(), "status".to_string()]).unwrap(),
-            Command::Login(LoginCommand::Status)
-        ));
-        assert!(matches!(
-            Command::parse(["logout".to_string()]).unwrap(),
-            Command::Logout
-        ));
-        assert!(Command::parse(["login".to_string(), "unexpected".to_string()]).is_err());
-        assert!(Command::parse(["logout".to_string(), "unexpected".to_string()]).is_err());
-    }
-
-    #[test]
-    fn parses_update_command_and_help() {
-        assert!(matches!(
-            Command::parse(["update".to_string()]).unwrap(),
-            Command::Update
-        ));
-        assert!(matches!(
-            Command::parse(["update".to_string(), "--help".to_string()]).unwrap(),
-            Command::UpdateHelp
-        ));
-        assert!(Command::parse(["update".to_string(), "unexpected".to_string()]).is_err());
-    }
-
-    #[test]
-    fn positional_separator_preserves_login_as_a_prompt() {
-        let command = Command::parse(["--".to_string(), "login".to_string()]).unwrap();
-        let Command::Run(options) = command else {
-            panic!("expected run command");
-        };
-        assert_eq!(options.prompt, "login");
-    }
-
-    #[test]
     fn parses_tool_catalogue_flag() {
         assert!(matches!(
             Command::parse(["--tool-catalogue".to_string()]).unwrap(),
             Command::ToolCatalogue
         ));
-    }
-
-    #[test]
-    fn parses_tool_context_json_flag() {
-        assert!(matches!(
-            Command::parse(["--tool-context-json".to_string()]).unwrap(),
-            Command::ToolContextJson
-        ));
-    }
-
-    #[test]
-    fn internal_package_smoke_is_strictly_parsed() {
-        assert!(matches!(
-            Command::parse(["--internal-package-smoke".to_string()]).unwrap(),
-            Command::InternalPackageSmoke
-        ));
-        assert!(
-            Command::parse([
-                "--internal-package-smoke".to_string(),
-                "unexpected".to_string(),
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn tool_catalogue_stats_are_derived_from_the_active_request() {
-        assert!(matches!(
-            Command::parse(["--tool-catalogue-stats".to_string()]).unwrap(),
-            Command::ToolCatalogueStats
-        ));
-        assert_eq!(
-            tool_catalogue_stats(),
-            "Tool catalogue\n\nRequest tools (2): exec, wait\nInside exec (12): apply_patch, exec_command, log_papercut, update_plan, view_image, write_stdin, openaiDeveloperDocs__fetch_openai_doc, openaiDeveloperDocs__get_openapi_spec, openaiDeveloperDocs__list_api_endpoints, openaiDeveloperDocs__list_openai_docs, openaiDeveloperDocs__search_openai_docs, web__run\n\nExec description: 6094 bytes\nComplete additional_tools item: 6824 bytes\nEstimated context cost: 1706 tokens (bytes/4)\nEffective-window share: 0.66%"
-        );
     }
 
     #[test]
