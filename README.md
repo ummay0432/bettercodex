@@ -8,9 +8,10 @@ group of trusted operators.
 Repository access is the invite gate. After accepting an invitation, sign in
 with the [GitHub CLI](https://cli.github.com/), then install `curl`, Rust through
 rustup, and a native C toolchain. Copy and run the one-line
-[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt). It builds from an isolated shallow
-clone and automatically removes the clone, Cargo dependency cache, V8 download,
-and compilation artifacts afterward.
+[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt). It downloads one immutable source
+snapshot, builds entirely in a temporary directory, and automatically removes
+the source, Cargo dependency cache, V8 download, and compilation artifacts
+afterward.
 
 Then open a new terminal, sign in with your own ChatGPT account, and launch
 bettercodex from a project directory:
@@ -20,10 +21,13 @@ bcodex login
 bcodex
 ```
 
-Rerun [`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt) to update. Each run builds
-from scratch so another device retains no BetterCodex source checkout or
-multi-gigabyte build cache. The installed binary, its small installation
-metadata, and the required Rust and native toolchains remain.
+Installed builds check their embedded source revision against private `main`
+after the TUI renders. When an update is available, run `bcodex update` in
+another terminal. It uses the same temporary source-build flow as
+[`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt), so each update builds from scratch
+and retains no BetterCodex source checkout or multi-gigabyte build cache. The
+installed binary, a small shell-profile PATH entry when needed, and the required
+Rust and native toolchains remain.
 
 For a task that merits evaluator-backed iteration, use `/loop <task>` in the
 TUI or include `$loop` anywhere in an interactive or non-interactive prompt.
@@ -38,5 +42,5 @@ criteria, and acts on clear net improvements; see
 [`docs/slash_commands.md`](docs/slash_commands.md#engineering-review).
 
 See [`docs/install.md`](docs/install.md) for supported platforms, temporary disk
-requirements, migration from the retired `bcodex update` command, and the full
-source-build workflow.
+requirements, migration from older installers, and the full source-build
+workflow.

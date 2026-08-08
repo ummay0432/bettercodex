@@ -54,6 +54,29 @@ fn rollout_replays_replacements_usage_and_turn_state() {
 }
 
 #[test]
+fn appended_records_are_visible_while_the_rollout_is_open() {
+    let root = temporary_directory("rollout-flush");
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let item = json!({"type": "message", "role": "user", "content": []});
+
+    rollout
+        .append_history(std::slice::from_ref(&item))
+        .unwrap();
+
+    let journal = std::fs::read_to_string(&rollout.path).unwrap();
+    let record: RolloutRecord = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+    match record {
+        RolloutRecord::HistoryAppend { items } => assert_eq!(items, vec![item]),
+        other => panic!("expected a history append, got {other:?}"),
+    }
+
+    drop(rollout);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn latest_resume_is_scoped_to_the_canonical_working_directory() {
     let root = temporary_directory("rollout-latest");
     let first_cwd = root.join("first");

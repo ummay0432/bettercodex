@@ -20,6 +20,7 @@ mod state_file;
 mod system_skills;
 mod tools;
 mod tui;
+mod update;
 mod usage;
 mod web_search;
 
@@ -99,10 +100,33 @@ fn run() -> Result<()> {
             write_stdout_line(format_args!("{}", tool_catalogue_stats()))?;
             Ok(())
         }
+        Command::InternalInstallSmoke => {
+            tools::package_smoke_test().map_err(anyhow::Error::msg)?;
+            let home = paths::bettercodex_home().ok_or_else(|| {
+                anyhow!("install smoke test requires BCODEX_HOME or HOME to be set")
+            })?;
+            system_skills::install(&home)?;
+            write_stdout_line(format_args!(
+                "bcodex {} install smoke passed",
+                env!("CARGO_PKG_VERSION")
+            ))?;
+            Ok(())
+        }
+        Command::InternalSourceRevision => {
+            let revision = update::source_revision()
+                .ok_or_else(|| anyhow!("this build has no embedded source revision"))?;
+            write_stdout_line(format_args!("{revision}"))?;
+            Ok(())
+        }
         Command::Login(command) => run_login_command(command),
         Command::Logout => run_logout_command(),
         Command::LogoutHelp => {
             write_logout_help()?;
+            Ok(())
+        }
+        Command::Update => update::run_update(),
+        Command::UpdateHelp => {
+            write_update_help()?;
             Ok(())
         }
         Command::InternalLoopState { run_root, contract } => {
@@ -283,9 +307,13 @@ enum Command {
     Version,
     ToolCatalogue,
     ToolCatalogueStats,
+    InternalInstallSmoke,
+    InternalSourceRevision,
     Login(LoginCommand),
     Logout,
     LogoutHelp,
+    Update,
+    UpdateHelp,
     InternalLoopState {
         run_root: PathBuf,
         contract: PathBuf,
@@ -310,6 +338,30 @@ struct RunOptions {
 impl Command {
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut arguments = arguments.into_iter().peekable();
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--internal-install-smoke")
+        {
+            arguments.next();
+            if arguments.next().is_some() {
+                return Err(anyhow!(
+                    "internal install smoke helper received extra arguments"
+                ));
+            }
+            return Ok(Self::InternalInstallSmoke);
+        }
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--internal-source-revision")
+        {
+            arguments.next();
+            if arguments.next().is_some() {
+                return Err(anyhow!(
+                    "internal source revision helper received extra arguments"
+                ));
+            }
+            return Ok(Self::InternalSourceRevision);
+        }
         if arguments
             .peek()
             .is_some_and(|argument| argument == "--internal-loop-state")
@@ -364,6 +416,13 @@ impl Command {
         {
             arguments.next();
             return parse_logout_command(arguments);
+        }
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "update")
+        {
+            arguments.next();
+            return parse_update_command(arguments);
         }
 
         let resume = arguments
@@ -446,9 +505,18 @@ fn parse_logout_command(arguments: impl IntoIterator<Item = String>) -> Result<C
     }
 }
 
+fn parse_update_command(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(Command::Update),
+        [argument] if argument == "--help" || argument == "-h" => Ok(Command::UpdateHelp),
+        [argument, ..] => Err(anyhow!("unknown update argument `{argument}`")),
+    }
+}
+
 fn write_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring. Use /loop <task> or $loop for the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Build and install current private main\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring. Use /loop <task> or $loop for the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     ))
 }
@@ -462,6 +530,12 @@ fn write_login_help() -> io::Result<()> {
 fn write_logout_help() -> io::Result<()> {
     write_stdout_line(format_args!(
         "Remove stored ChatGPT credentials\n\nUsage:\n  bcodex logout\n\nOptions:\n  -h, --help  Show this help"
+    ))
+}
+
+fn write_update_help() -> io::Result<()> {
+    write_stdout_line(format_args!(
+        "Build and install current private BetterCodex main\n\nUsage:\n  bcodex update\n\nThe updater fetches the current installer, resolves main to an exact commit, compiles locked source in temporary Cargo and V8 directories, smoke-tests the result, atomically replaces the running installation only if main still matches, and removes all temporary build artifacts afterward."
     ))
 }
 
@@ -520,6 +594,44 @@ mod tests {
     #[test]
     fn rejects_unknown_options() {
         assert!(Command::parse(["--model".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_update_command_and_help() {
+        assert!(matches!(
+            Command::parse(["update".to_string()]).unwrap(),
+            Command::Update
+        ));
+        assert!(matches!(
+            Command::parse(["update".to_string(), "--help".to_string()]).unwrap(),
+            Command::UpdateHelp
+        ));
+        assert!(Command::parse(["update".to_string(), "unexpected".to_string()]).is_err());
+
+        let command = Command::parse(["--".to_string(), "update".to_string()]).unwrap();
+        let Command::Run(options) = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.prompt, "update");
+    }
+
+    #[test]
+    fn internal_install_verification_commands_are_strictly_parsed() {
+        assert!(matches!(
+            Command::parse(["--internal-install-smoke".to_string()]).unwrap(),
+            Command::InternalInstallSmoke
+        ));
+        assert!(matches!(
+            Command::parse(["--internal-source-revision".to_string()]).unwrap(),
+            Command::InternalSourceRevision
+        ));
+        assert!(
+            Command::parse([
+                "--internal-source-revision".to_string(),
+                "unexpected".to_string(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

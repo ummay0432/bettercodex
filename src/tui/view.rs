@@ -40,6 +40,9 @@ use crate::skills::Skill;
 use crate::skills::SkillSelection;
 use crate::skills::SkillUpdate;
 use crate::tools::BackgroundProcess;
+use crate::tui::render::line_utils::line_to_static;
+use crate::tui::wrapping::word_wrap_line;
+use crate::update::AvailableUpdate;
 use codex_ansi_escape::ansi_escape_line;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::parse_command::ParsedCommand;
@@ -285,6 +288,7 @@ enum TranscriptEntry {
         sealed: bool,
     },
     Notice(String),
+    UpdateAvailable(AvailableUpdate),
     Error(String),
     Diff(String),
     Processes(Vec<BackgroundProcess>),
@@ -580,6 +584,15 @@ impl View {
 
     pub(super) fn add_notice(&mut self, notice: impl Into<String>) {
         self.entries.push(TranscriptEntry::Notice(notice.into()));
+    }
+
+    pub(super) fn add_update_available(&mut self, update: AvailableUpdate) {
+        let insertion = self.entries[self.committed_entries..]
+            .iter()
+            .position(|entry| !entry.is_finalized())
+            .map_or(self.entries.len(), |offset| self.committed_entries + offset);
+        self.entries
+            .insert(insertion, TranscriptEntry::UpdateAvailable(update));
     }
 
     pub(super) fn take_clear_request(&mut self) -> bool {
@@ -1683,6 +1696,7 @@ impl View {
                 TranscriptEntry::Tool(_)
                 | TranscriptEntry::Exploration { .. }
                 | TranscriptEntry::Notice(_)
+                | TranscriptEntry::UpdateAvailable(_)
                 | TranscriptEntry::Error(_)
                 | TranscriptEntry::Diff(_)
                 | TranscriptEntry::Processes(_)
@@ -2711,6 +2725,7 @@ impl TranscriptEntry {
         match self {
             Self::User(_)
             | Self::Notice(_)
+            | Self::UpdateAvailable(_)
             | Self::Error(_)
             | Self::Diff(_)
             | Self::Processes(_)
@@ -2793,6 +2808,7 @@ impl TranscriptEntry {
                 Span::from("• ").dim(),
                 Span::from(message.clone()).dim(),
             ])],
+            Self::UpdateAvailable(update) => update_available_lines(update, width),
             Self::Error(message) => vec![Line::from(vec![
                 Span::styled("■ ", Style::default().fg(Color::Red)),
                 Span::styled(message.clone(), Style::default().fg(Color::Red)),
@@ -3611,6 +3627,40 @@ fn welcome_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
         .map(|line| truncate_line(line, maximum_content_width))
         .collect::<Vec<_>>();
     with_card_border(content)
+}
+
+fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec<Line<'static>> {
+    if available_width < 5 {
+        return Vec::new();
+    }
+    let content_width = usize::from(available_width.saturating_sub(4)).min(60);
+    let warning = Style::default().fg(Color::Yellow);
+    let source = [
+        Line::from(Span::styled(
+            "Update available",
+            warning.add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::from("Run ").dim(),
+            Span::styled("bcodex update", Style::default().fg(Color::Cyan)),
+            Span::from(" in another terminal.").dim(),
+        ]),
+        Line::from(vec![
+            Span::from("main: ").dim(),
+            Span::from(update.current_short_revision().to_string()).dim(),
+            Span::from(" → ").dim(),
+            Span::from(update.latest_short_revision().to_string()).dim(),
+        ]),
+    ];
+    let mut content = Vec::new();
+    for line in &source {
+        content.extend(
+            word_wrap_line(line, content_width.max(1))
+                .iter()
+                .map(line_to_static),
+        );
+    }
+    with_card_border_style(content, warning)
 }
 
 fn with_card_border(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
@@ -4646,6 +4696,24 @@ mod tests {
         assert!(!rendered.contains("Ask bettercodex to do anything"));
         assert!(rendered.lines().any(|line| line.trim() == "›"));
         assert!(rendered.contains("gpt-5.6-sol max"));
+    }
+
+    #[test]
+    fn update_available_card_renders_the_update_command() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.add_update_available(AvailableUpdate::test_fixture());
+        let height = view.desired_height(60, 16);
+        let backend = TestBackend::new(60, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+
+        assert!(rendered.contains("Update available"), "{rendered}");
+        assert!(rendered.contains("bcodex update"), "{rendered}");
+        assert!(rendered.contains("in another terminal"), "{rendered}");
+        assert!(rendered.contains("111111111111"), "{rendered}");
+        assert!(rendered.contains("222222222222"), "{rendered}");
     }
 
     #[test]
