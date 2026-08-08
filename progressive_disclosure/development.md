@@ -64,11 +64,16 @@ Changes to `scripts/dev.py` must also pass its dependency-free unit tests:
 python3 -m unittest -v scripts.dev_tests
 ```
 
-Changes to the private release installer or its asset contract must pass:
+Changes to the private source installer or its local-build contract must pass:
 
 ```sh
 python3 -m unittest -v scripts.install_tests
 ```
+
+The installer builds immutable tagged source through `./scripts/dev.py
+package-build`; keep that command usable from a source archive without a Git
+checkout. Bettercodex does not publish prebuilt binaries or use hosted release
+builds.
 
 Changes to the matched live-evaluation runner must pass its offline protocol
 tests as well:
@@ -82,7 +87,8 @@ Rust process by PID to make the lock disappear.
 
 Feature worktrees must smoke-test their isolated release binary before
 integration. Build it with `./scripts/dev.py cargo build --release`; the helper
-prints the target directory containing `release/bcodex`.
+prints the target directory containing `release/bcodex`. Run that binary with
+`--internal-package-smoke` when package/runtime behavior changed.
 
 After committing and integrating the work into local `main`, install the
 canonical binary:

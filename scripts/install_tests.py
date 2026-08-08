@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
 import os
 from pathlib import Path
@@ -20,10 +19,11 @@ VERSION = next(
     for line in CARGO_MANIFEST.read_text(encoding="utf-8").splitlines()
     if line.startswith('version = "')
 )
+COMMIT = "a" * 40
 
 
 class InstallScriptTest(unittest.TestCase):
-    def test_installs_latest_linux_release_and_configures_path_once(self) -> None:
+    def test_installs_latest_tag_and_reuses_the_build_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             first = run_installer(root)
@@ -34,7 +34,6 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn("Installed bcodex", first.stdout)
             self.assertIn("Updated bcodex", second.stdout)
             self.assertIn("Restart bettercodex", second.stdout)
-            self.assertNotIn("bcodex login", second.stdout)
             installed = root / "install" / "bin" / "bcodex"
             self.assertEqual(
                 subprocess.run(
@@ -47,21 +46,46 @@ class InstallScriptTest(unittest.TestCase):
             )
             profile = (root / "home" / ".profile").read_text(encoding="utf-8")
             self.assertEqual(profile.count("# >>> bettercodex installer >>>"), 1)
+
             requests = (root / "gh.log").read_text(encoding="utf-8")
-            self.assertIn("release view --repo ummay0432/bettercodex", requests)
             self.assertIn(
-                "--pattern bcodex-x86_64-unknown-linux-gnu.tar.gz", requests
+                "api repos/ummay0432/bettercodex/tags?per_page=100 --paginate",
+                requests,
+            )
+            self.assertIn(f"api repos/ummay0432/bettercodex/commits/v{VERSION}", requests)
+            self.assertIn(f"api repos/ummay0432/bettercodex/tarball/{COMMIT}", requests)
+            builds = (root / "build.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(builds), 2)
+            self.assertTrue(
+                all(str(root / "build cache" / "target") in build for build in builds)
+            )
+            binary_calls = (root / "binary.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(binary_calls.count("--internal-package-smoke"), 2)
+            self.assertEqual(binary_calls.count("--tool-context-json"), 2)
+
+    def test_latest_tag_is_selected_by_semantic_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = run_installer(
+                root,
+                built_version="1.10.0",
+                source_version="1.10.0",
+                tags="v1.2.99\nv1.10.0\nv1.9.100\nv2.0.0-beta.1",
             )
 
-    def test_selects_every_native_asset_and_accepts_bare_version(self) -> None:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            requests = (root / "gh.log").read_text(encoding="utf-8")
+            self.assertIn("commits/v1.10.0", requests)
+
+    def test_accepts_explicit_versions_on_every_supported_native_host(self) -> None:
         platforms = (
-            ("Darwin", "arm64", "aarch64-apple-darwin"),
-            ("Darwin", "x86_64", "x86_64-apple-darwin"),
-            ("Linux", "aarch64", "aarch64-unknown-linux-gnu"),
-            ("Linux", "x86_64", "x86_64-unknown-linux-gnu"),
+            ("Darwin", "arm64", "darwin aarch64"),
+            ("Darwin", "x86_64", "darwin x86_64"),
+            ("Linux", "aarch64", "linux aarch64"),
+            ("Linux", "x86_64", "linux x86_64"),
         )
-        for system, machine, target in platforms:
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+        for system, machine, label in platforms:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 result = run_installer(
                     root,
@@ -71,22 +95,68 @@ class InstallScriptTest(unittest.TestCase):
                 )
 
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"for {label}", result.stdout)
                 requests = (root / "gh.log").read_text(encoding="utf-8")
-                self.assertIn(f"release view v{VERSION}", requests)
-                self.assertIn(f"--pattern bcodex-{target}.tar.gz", requests)
+                self.assertNotIn("tags?per_page", requests)
+                self.assertIn(
+                    f"api repos/ummay0432/bettercodex/commits/v{VERSION}", requests
+                )
 
-    def test_rejects_checksum_mismatch_without_replacing_existing_binary(self) -> None:
+    def test_failed_build_does_not_replace_an_existing_binary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            installed = root / "install" / "bin" / "bcodex"
-            installed.parent.mkdir(parents=True)
-            installed.write_text("existing binary\n", encoding="utf-8")
+            installed = existing_binary(root)
 
-            result = run_installer(root, valid_checksum=False)
+            result = run_installer(root, build_success=False)
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("failed SHA-256 verification", result.stderr)
+            self.assertIn("local bettercodex compilation failed", result.stderr)
             self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+
+    def test_wrong_built_version_does_not_replace_an_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(root, built_version="9.9.9")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"did not report bcodex {VERSION}", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+
+    def test_failed_runtime_smoke_does_not_replace_an_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(root, runtime_smoke_success=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("V8 and ICU runtime smoke test", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+
+    def test_failed_resource_smoke_does_not_replace_an_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(root, resource_smoke_success=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("embedded-resource smoke test", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+
+    def test_tag_and_manifest_version_must_match_before_building(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, source_version="9.9.9")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                f"source tag v{VERSION} contains package version 9.9.9", result.stderr
+            )
+            self.assertFalse((root / "build.log").exists())
 
     def test_reports_missing_github_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -102,7 +172,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("accept the repository invitation", result.stderr)
 
-    def test_handles_spaces_and_apostrophes_in_install_path(self) -> None:
+    def test_handles_spaces_and_apostrophes_in_install_and_build_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "friend's better codex"
             result = run_installer(root)
@@ -122,15 +192,21 @@ class InstallScriptTest(unittest.TestCase):
             profile = (root / "home" / ".profile").read_text(encoding="utf-8")
             self.assertIn(f"export PATH='{escaped}':\"$PATH\"", profile)
 
-    def test_rejects_unsupported_architecture_before_download(self) -> None:
+    def test_rejects_unsupported_architecture_before_source_download(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = run_installer(root, machine="riscv64")
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("unsupported architecture: riscv64", result.stderr)
-            requests = (root / "gh.log").read_text(encoding="utf-8")
-            self.assertNotIn("release download", requests)
+            self.assertFalse((root / "gh.log").exists())
+
+
+def existing_binary(root: Path) -> Path:
+    installed = root / "install" / "bin" / "bcodex"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("existing binary\n", encoding="utf-8")
+    return installed
 
 
 def run_installer(
@@ -141,17 +217,21 @@ def run_installer(
     arguments: tuple[str, ...] = (),
     authenticated: bool = True,
     repository_access: bool = True,
-    valid_checksum: bool = True,
+    build_success: bool = True,
+    built_version: str = VERSION,
+    source_version: str = VERSION,
+    runtime_smoke_success: bool = True,
+    resource_smoke_success: bool = True,
+    tags: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    root.mkdir(exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     fake_bin = root / "fake-bin"
     fake_bin.mkdir(exist_ok=True)
     home = root / "home"
     home.mkdir(exist_ok=True)
     install_dir = root / "install" / "bin"
-    archive, manifest = create_release_assets(
-        root, system=system, machine=machine, valid_checksum=valid_checksum
-    )
+    build_dir = root / "build cache"
+    archive = create_source_archive(root, source_version)
 
     write_executable(
         fake_bin / "uname",
@@ -175,24 +255,24 @@ def run_installer(
               auth:status)
                 [ "$BCODEX_TEST_AUTHENTICATED" = "1" ]
                 ;;
-              api:repos/*)
-                [ "$BCODEX_TEST_REPOSITORY_ACCESS" = "1" ]
-                ;;
-              release:view)
-                printf 'v%s\\n' "$BCODEX_TEST_VERSION"
-                ;;
-              release:download)
-                destination=""
-                previous=""
-                for argument in "$@"; do
-                  if [ "$previous" = "--dir" ]; then
-                    destination="$argument"
-                  fi
-                  previous="$argument"
-                done
-                [ -n "$destination" ] || exit 2
-                cp "$BCODEX_TEST_ARCHIVE" "$destination/$(basename "$BCODEX_TEST_ARCHIVE")"
-                cp "$BCODEX_TEST_MANIFEST" "$destination/SHA256SUMS"
+              api:*)
+                case "$2" in
+                  "repos/$BCODEX_TEST_REPOSITORY")
+                    [ "$BCODEX_TEST_REPOSITORY_ACCESS" = "1" ]
+                    ;;
+                  "repos/$BCODEX_TEST_REPOSITORY/tags?per_page=100")
+                    printf '%s\\n' "$BCODEX_TEST_TAGS"
+                    ;;
+                  repos/$BCODEX_TEST_REPOSITORY/commits/*)
+                    printf '%s\\n' "$BCODEX_TEST_COMMIT"
+                    ;;
+                  repos/$BCODEX_TEST_REPOSITORY/tarball/*)
+                    cat "$BCODEX_TEST_SOURCE_ARCHIVE"
+                    ;;
+                  *)
+                    exit 2
+                    ;;
+                esac
                 ;;
               *)
                 exit 2
@@ -201,19 +281,83 @@ def run_installer(
             """
         ),
     )
+    write_executable(
+        fake_bin / "python3",
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            printf '%s\\n' "$*" >>"$BCODEX_TEST_BUILD_LOG"
+            [ "$BCODEX_TEST_BUILD_SUCCESS" = "1" ] || exit 9
+            target=""
+            while [ "$#" -gt 0 ]; do
+              if [ "$1" = "--target-dir" ]; then
+                shift
+                target="$1"
+              fi
+              shift
+            done
+            [ -n "$target" ] || exit 10
+            mkdir -p "$target/release"
+            {
+              printf '%s\\n' '#!/bin/sh'
+              printf 'version=%s\\n' "$BCODEX_TEST_BUILT_VERSION"
+              printf 'runtime_smoke=%s\\n' "$BCODEX_TEST_RUNTIME_SMOKE"
+              printf 'resource_smoke=%s\\n' "$BCODEX_TEST_RESOURCE_SMOKE"
+              printf '%s\\n' 'if [ -n "${BCODEX_TEST_BINARY_LOG:-}" ]; then'
+              printf '%s\\n' '  printf "%s\\n" "$*" >>"$BCODEX_TEST_BINARY_LOG"'
+              printf '%s\\n' 'fi'
+              printf '%s\\n' 'case "${1:-}" in'
+              printf '%s\\n' '  --version) printf "bcodex %s\\n" "$version" ;;'
+              printf '%s\\n' '  --internal-package-smoke)'
+              printf '%s\\n' '    [ "$runtime_smoke" = 1 ] || exit 11'
+              printf '%s\\n' '    printf "bcodex %s package smoke passed\\n" "$version"'
+              printf '%s\\n' '    ;;'
+              printf '%s\\n' '  --tool-context-json)'
+              printf '%s\\n' '    [ "$resource_smoke" = 1 ] || exit 12'
+              printf '%s\\n' '    mkdir -p "$BCODEX_HOME/skills/.system/loop/references"'
+              printf '%s\\n' '    mkdir -p "$BCODEX_HOME/skills/.system/openai-docs/scripts"'
+              printf '%s\\n' '    printf "fixture\\n" >"$BCODEX_HOME/skills/.system/loop/references/evals-manifest.md"'
+              printf '%s\\n' '    printf "fixture\\n" >"$BCODEX_HOME/skills/.system/openai-docs/SKILL.md"'
+              printf '%s\\n' '    printf "fixture\\n" >"$BCODEX_HOME/skills/.system/openai-docs/scripts/resolve-latest-model-info.cjs"'
+              printf '%s\\n' '    printf "{\\\"tool\\\":\\\"openaiDeveloperDocs__search_openai_docs\\\"}\\n"'
+              printf '%s\\n' '    ;;'
+              printf '%s\\n' '  *) exit 13 ;;'
+              printf '%s\\n' 'esac'
+            } >"$target/release/bcodex"
+            chmod 0755 "$target/release/bcodex"
+            """
+        ),
+    )
+    for command in ("cargo", "cc", "rustc", "rustup"):
+        write_executable(fake_bin / command, "#!/bin/sh\nexit 0\n")
 
     environment = os.environ.copy()
-    for name in ("BCODEX_RELEASE", "BCODEX_REPOSITORY"):
+    for name in (
+        "BCODEX_BUILD_DIR",
+        "BCODEX_INSTALL_DIR",
+        "BCODEX_RELEASE",
+        "BCODEX_REPOSITORY",
+        "XDG_CACHE_HOME",
+    ):
         environment.pop(name, None)
     environment.update(
         {
+            "BCODEX_BUILD_DIR": str(build_dir),
             "BCODEX_INSTALL_DIR": str(install_dir),
-            "BCODEX_TEST_ARCHIVE": str(archive),
             "BCODEX_TEST_AUTHENTICATED": "1" if authenticated else "0",
+            "BCODEX_TEST_BUILD_LOG": str(root / "build.log"),
+            "BCODEX_TEST_BUILD_SUCCESS": "1" if build_success else "0",
+            "BCODEX_TEST_BUILT_VERSION": built_version,
+            "BCODEX_TEST_BINARY_LOG": str(root / "binary.log"),
+            "BCODEX_TEST_COMMIT": COMMIT,
             "BCODEX_TEST_GH_LOG": str(root / "gh.log"),
-            "BCODEX_TEST_MANIFEST": str(manifest),
+            "BCODEX_TEST_REPOSITORY": "ummay0432/bettercodex",
             "BCODEX_TEST_REPOSITORY_ACCESS": "1" if repository_access else "0",
-            "BCODEX_TEST_VERSION": VERSION,
+            "BCODEX_TEST_RESOURCE_SMOKE": "1" if resource_smoke_success else "0",
+            "BCODEX_TEST_RUNTIME_SMOKE": "1" if runtime_smoke_success else "0",
+            "BCODEX_TEST_SOURCE_ARCHIVE": str(archive),
+            "BCODEX_TEST_TAGS": tags
+            or f"v0.0.9\ninvalid\nv{VERSION}\nv0.1.0-beta.1",
             "HOME": str(home),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "SHELL": "/bin/sh",
@@ -228,30 +372,21 @@ def run_installer(
     )
 
 
-def create_release_assets(
-    root: Path, *, system: str, machine: str, valid_checksum: bool
-) -> tuple[Path, Path]:
-    if system == "Darwin":
-        architecture = "aarch64" if machine in {"arm64", "aarch64"} else "x86_64"
-        target = f"{architecture}-apple-darwin"
-    else:
-        architecture = "aarch64" if machine in {"arm64", "aarch64"} else "x86_64"
-        target = f"{architecture}-unknown-linux-gnu"
-
-    archive = root / f"bcodex-{target}.tar.gz"
-    executable = f"#!/bin/sh\nprintf 'bcodex {VERSION}\\n'\n".encode()
+def create_source_archive(root: Path, version: str) -> Path:
+    archive = root / "source.tar.gz"
+    prefix = f"ummay0432-bettercodex-{COMMIT[:7]}"
+    files = {
+        "Cargo.toml": f'[package]\nname = "bettercodex"\nversion = "{version}"\n',
+        "scripts/dev.py": "#!/usr/bin/env python3\n",
+    }
     with tarfile.open(archive, "w:gz") as package:
-        entry = tarfile.TarInfo("bcodex")
-        entry.mode = 0o755
-        entry.size = len(executable)
-        package.addfile(entry, io.BytesIO(executable))
-
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    if not valid_checksum:
-        digest = "0" * 64
-    manifest = root / "fixture-SHA256SUMS"
-    manifest.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
-    return archive, manifest
+        for relative, contents in files.items():
+            encoded = contents.encode()
+            entry = tarfile.TarInfo(f"{prefix}/{relative}")
+            entry.mode = 0o755 if relative.endswith(".py") else 0o644
+            entry.size = len(encoded)
+            package.addfile(entry, io.BytesIO(encoded))
+    return archive
 
 
 def write_executable(path: Path, contents: str) -> None:

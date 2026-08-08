@@ -413,6 +413,52 @@ def install_source_snapshot(
     )
 
 
+def build_release_snapshot(
+    source: Path,
+    target: Path,
+    environment: dict[str, str],
+) -> Path:
+    target.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "cargo",
+            "clean",
+            "--release",
+            "--package",
+            "bettercodex",
+            "--target-dir",
+            os.fspath(target),
+        ],
+        cwd=source,
+        env=environment,
+        check=True,
+    )
+    subprocess.run(
+        ["cargo", "build", "--release", "--locked"],
+        cwd=source,
+        env=environment,
+        check=True,
+    )
+    binary = target / "release" / "bcodex"
+    if not binary.is_file():
+        raise RuntimeError(f"Cargo did not produce {binary}")
+    return binary
+
+
+def command_package_build(arguments: argparse.Namespace) -> int:
+    target = arguments.target_dir.expanduser().resolve()
+    environment = os.environ.copy()
+    environment["CARGO_TARGET_DIR"] = os.fspath(target)
+    environment.setdefault("CARGO_INCREMENTAL", "0")
+    configure_v8_environment(environment)
+
+    print(f"Building tagged bettercodex source into {target}")
+    binary = build_release_snapshot(REPOSITORY, target, environment)
+    subprocess.run([binary, "--version"], check=True)
+    print(binary)
+    return 0
+
+
 def command_install(arguments: argparse.Namespace) -> int:
     worktree = repository_root()
     primary = main_worktree_root()
@@ -752,6 +798,13 @@ def parser() -> argparse.ArgumentParser:
     cargo = commands.add_parser("cargo", help="run Cargo with a safe per-worktree target")
     cargo.add_argument("cargo_arguments", nargs=argparse.REMAINDER)
     cargo.set_defaults(function=command_cargo)
+
+    package_build = commands.add_parser(
+        "package-build",
+        help="build an immutable source snapshot for the private installer",
+    )
+    package_build.add_argument("--target-dir", type=Path, required=True)
+    package_build.set_defaults(function=command_package_build)
 
     install = commands.add_parser(
         "install", help="install a serialized snapshot of committed local main"

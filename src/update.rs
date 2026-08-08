@@ -1,11 +1,11 @@
-//! Lazy release checks and the self-update command.
+//! Lazy tag checks and the self-update command.
 //!
 //! The one-shot, failure-silent background check follows Pi's startup behavior
 //! (`packages/coding-agent/src/utils/version-check.ts` and
 //! `modes/interactive/interactive-mode.ts` at
 //! `e47b8e37a6211ebd0b2942fa87059d64f81eec02`). Bettercodex adapts the lookup
-//! to its authenticated private GitHub Releases and reuses its checked-in,
-//! checksum-verifying installer for the explicit update command.
+//! to authenticated private repository tags and reuses its checked-in,
+//! source-building installer for the explicit update command.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -29,9 +29,9 @@ pub(crate) struct AvailableUpdate {
     pub(crate) latest_version: String,
 }
 
-/// Checks once for a newer private release after the TUI has rendered.
+/// Checks once for a newer private source tag after the TUI has rendered.
 ///
-/// Development builds stay offline by default. Installed release builds can
+/// Development builds stay offline by default. Installed builds can
 /// opt out by setting `BCODEX_SKIP_UPDATE_CHECK`.
 pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
     if cfg!(debug_assertions) || std::env::var_os("BCODEX_SKIP_UPDATE_CHECK").is_some() {
@@ -55,10 +55,9 @@ async fn check_for_update_with(
     timeout: Duration,
 ) -> Option<AvailableUpdate> {
     let mut command = AsyncProcessCommand::new(gh_program);
+    let endpoint = format!("repos/{repository}/tags?per_page=100");
     command
-        .args([
-            "release", "view", "--repo", repository, "--json", "tagName", "--jq", ".tagName",
-        ])
+        .args(["api", &endpoint, "--paginate", "--jq", ".[].name"])
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .kill_on_drop(true);
@@ -69,8 +68,15 @@ async fn check_for_update_with(
     if !output.status.success() {
         return None;
     }
-    let latest_tag = std::str::from_utf8(&output.stdout).ok()?.trim();
-    let latest_version = latest_tag.strip_prefix('v')?;
+    let tags = std::str::from_utf8(&output.stdout).ok()?;
+    let latest_version = tags
+        .lines()
+        .filter_map(|tag| {
+            let version = tag.strip_prefix('v')?;
+            Some((parse_stable_version(version)?, version))
+        })
+        .max_by_key(|(parsed, _)| *parsed)?
+        .1;
     is_newer(latest_version, current_version)?.then(|| AvailableUpdate {
         current_version: current_version.to_string(),
         latest_version: latest_version.to_string(),

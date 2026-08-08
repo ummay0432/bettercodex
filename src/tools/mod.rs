@@ -13,7 +13,7 @@ const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
 pub(crate) use catalogue::CatalogueMetrics;
 pub(crate) use catalogue::CatalogueRoute;
 pub(crate) use catalogue::CatalogueTool;
-pub(crate) use code_runtime::release_smoke_test;
+pub(crate) use code_runtime::package_smoke_test;
 pub(crate) use exec_runtime::ToolRuntime;
 pub(crate) use executor::BackgroundProcess;
 pub(crate) use executor::ProcessManager;

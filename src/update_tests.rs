@@ -41,31 +41,31 @@ fn compares_only_stable_three_component_versions() {
 }
 
 #[tokio::test]
-async fn authenticated_release_lookup_returns_only_a_newer_version() {
+async fn authenticated_tag_lookup_returns_only_the_newest_stable_version() {
     let gh = TemporaryProgram::new(
         "#!/bin/sh\n\
-         test \"$*\" = \"release view --repo owner/private --json tagName --jq .tagName\" || exit 2\n\
-         printf 'v1.2.3\\n'\n",
+         test \"$*\" = \"api repos/owner/private/tags?per_page=100 --paginate --jq .[].name\" || exit 2\n\
+         printf 'v1.2.2\\nv2.0.0-beta.1\\nv1.10.0\\nv1.2.3\\ninvalid\\n'\n",
     );
 
     assert_eq!(
         check_for_update_with(
             gh.path.as_os_str(),
             "owner/private",
-            "1.2.2",
+            "1.9.9",
             Duration::from_secs(1),
         )
         .await,
         Some(AvailableUpdate {
-            current_version: "1.2.2".to_string(),
-            latest_version: "1.2.3".to_string(),
+            current_version: "1.9.9".to_string(),
+            latest_version: "1.10.0".to_string(),
         })
     );
     assert_eq!(
         check_for_update_with(
             gh.path.as_os_str(),
             "owner/private",
-            "1.2.3",
+            "1.10.0",
             Duration::from_secs(1),
         )
         .await,
@@ -87,7 +87,7 @@ async fn lookup_failures_and_unexpected_tags_are_silent() {
         None
     );
 
-    let invalid = TemporaryProgram::new("#!/bin/sh\nprintf 'release-1.2.3\\n'\n");
+    let invalid = TemporaryProgram::new("#!/bin/sh\nprintf 'release-1.2.3\\nv1.2\\n'\n");
     assert_eq!(
         check_for_update_with(
             invalid.path.as_os_str(),

@@ -1,186 +1,169 @@
 # Installing bettercodex
 
-bettercodex is distributed as private, prebuilt GitHub Release binaries. A
-friend needs repository access, but does not need Rust, npm, or a copy of the
-source tree.
+bettercodex is distributed as tagged source in a private GitHub repository.
+The installer compiles that source natively on each computer. There are no
+prebuilt GitHub Release binaries and no hosted release builds.
 
 ## Supported systems
 
-The release workflow builds native binaries for:
+| Operating system | Architectures |
+| --- | --- |
+| macOS | Apple Silicon and Intel |
+| Linux | ARM64 and x86-64 |
 
-| Operating system | Architectures | Baseline |
-| --- | --- | --- |
-| macOS | Apple Silicon and Intel | macOS 12 or newer |
-| Linux | ARM64 and x86-64 | Ubuntu 22.04 or a compatible newer distribution |
+Windows is not supported.
 
-Windows is not supported. The installer writes `bcodex` to
-`$HOME/.local/bin` and adds that directory to the appropriate shell profile
-when necessary.
+## Prerequisites
 
-## Friend setup
+Each computer needs:
 
-1. The maintainer sends a GitHub repository invitation to a specific account.
-   Accept the email invitation while signed in to that account, or open the
-   [pending invitation page](https://github.com/ummay0432/bettercodex/invitations).
-2. Install the [GitHub CLI](https://github.com/cli/cli#installation), then sign
-   in:
+- access to `ummay0432/bettercodex` through its own GitHub account;
+- the authenticated [GitHub CLI](https://cli.github.com/);
+- Python 3;
+- Cargo and Rust installed through [rustup](https://rustup.rs/); and
+- a native C compiler and the normal development libraries for that operating
+  system.
+
+On macOS, the Xcode Command Line Tools provide the native compiler. On Linux,
+the distribution's C build toolchain, `pkg-config`, and OpenSSL development
+package may be needed. The checked-in `rust-toolchain.toml` selects Rust 1.95.0.
+
+## First install
+
+1. Accept the repository invitation while signed into the invited GitHub
+   account.
+2. Authenticate the GitHub CLI:
 
    ```sh
    gh auth login
    ```
 
-3. Install bettercodex:
+3. Run the installer:
 
    ```sh
    gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | sh
    ```
 
-4. Open a new terminal and sign in with your own ChatGPT account:
+4. Open a new terminal and sign in with the computer owner's ChatGPT account:
 
    ```sh
    bcodex login
    ```
 
-5. Enter a project directory and run:
-
-   ```sh
-   bcodex
-   ```
+5. Enter a project directory and run `bcodex`.
 
 The ChatGPT credential cache stays in `$CODEX_HOME/auth.json`, or
-`$HOME/.codex/auth.json` when `CODEX_HOME` is unset. bettercodex settings and
+`$HOME/.codex/auth.json` when `CODEX_HOME` is unset. Bettercodex settings and
 saved sessions stay under `$HOME/.bcodex`. Both remain local to that computer.
 
-After the interactive TUI renders its first frame, bettercodex checks the latest
-private GitHub Release in the background through the authenticated `gh` CLI.
-Startup does not wait for this request. If a newer stable version exists, the
-TUI shows an update card with the command to run in another terminal:
+## What the installer does
+
+The installer:
+
+1. lists private repository tags and selects the highest stable `vX.Y.Z` tag;
+2. resolves that tag to an exact Git commit and downloads that source snapshot;
+3. requires the package version in `Cargo.toml` to match the tag;
+4. downloads and SHA-256 verifies the pinned sandbox-enabled V8 archive and
+   matching Rust bindings for the local Rust host;
+5. builds the locked source in release mode using a persistent Cargo cache;
+6. requires the result to report the expected `bcodex X.Y.Z`;
+7. starts V8 and ICU, materializes the embedded skills and evaluator manifest,
+   and checks the generated tool context; and
+8. atomically replaces the installed binary only after every prior step passes.
+
+The default binary is `$HOME/.local/bin/bcodex`. The default build cache is
+`$HOME/.cache/bettercodex/build`, or the corresponding location under
+`$XDG_CACHE_HOME`. The first build is substantial. Later updates reuse Cargo,
+Git dependency, and V8 caches, though bettercodex itself is always rebuilt from
+the selected immutable source snapshot.
+
+## Updating
+
+After the TUI renders, an installed release checks private source tags in the
+background. Startup does not wait for the request. When a newer stable tag is
+available, run this in another terminal:
 
 ```sh
 bcodex update
 ```
 
-The command runs the same private release installer used for first-time setup.
-It selects the native release asset, verifies its SHA-256 checksum and reported
-version, and replaces the installed binary atomically. The running TUI keeps
-using its old in-memory version until it is restarted. Failed background checks
-stay silent and are retried on the next launch; set
-`BCODEX_SKIP_UPDATE_CHECK=1` to disable them. Raw pushes to `main` are not
-advertised because they do not have an installable binary—the maintainer must
-publish a matching GitHub Release.
+The running TUI keeps its old in-memory code until it is restarted. Failed
+background checks stay silent and are retried on the next launch; set
+`BCODEX_SKIP_UPDATE_CHECK=1` to disable them.
 
-`bcodex update` defaults to the directory containing the running binary, so an
-installation outside `$HOME/.local/bin` stays in its original location. To
-explicitly install into a different directory:
+Version 0.1.0 embedded the retired prebuilt-release installer. It cannot learn
+the source-build flow retroactively. To move an existing 0.1.0 installation to
+0.1.1, rerun the original installer command once:
 
 ```sh
-BCODEX_INSTALL_DIR="$HOME/bin" bcodex update
+gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | sh
 ```
 
-The original installer command can also update an existing installation.
+After that one-time bootstrap, `bcodex update` uses local source builds.
 
-To install a specific release:
+To install a specific stable tag:
 
 ```sh
 gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | BCODEX_RELEASE=v0.1.1 sh
 ```
 
-To use a different binary directory:
+To use custom binary and build-cache directories:
 
 ```sh
-gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | BCODEX_INSTALL_DIR="$HOME/bin" sh
+gh api -H 'Accept: application/vnd.github.raw+json' repos/ummay0432/bettercodex/contents/scripts/install.sh | \
+  BCODEX_INSTALL_DIR="$HOME/bin" \
+  BCODEX_BUILD_DIR="$HOME/.cache/bettercodex-build" \
+  sh
 ```
+
+`bcodex update` defaults to the directory containing the running binary, so a
+custom installation stays in place. `BCODEX_INSTALL_DIR` can override it.
+
+## What a successful build proves
+
+Rust dependencies, prompts, the installer, system skills, the evaluator
+manifest, V8, and ICU data are compiled or embedded into one executable. A
+successful native build catches missing compile-time components for that
+computer. The installer's post-build smoke test then starts V8 and ICU and
+checks that the embedded resources can be materialized, before replacing the
+old binary.
+
+It does not prove that another operating system or CPU can compile the same
+source. Under this distribution model each device performs that proof itself.
+The installed program still expects host facilities where relevant: network
+access and authenticated `gh` for private updates, `git` for repository work,
+and `tmux` when automatic terminal management is enabled.
 
 ## Privacy boundary
 
-The private repository and its private release assets are the invite gate.
-Each friend authenticates as themselves, so the install command contains no
-shared token to leak. GitHub does not provide a reusable link that lets an
-arbitrary visitor join a private repository: the maintainer must first invite
-each GitHub account, after which the repository's `/invitations` URL lets that
-account accept.
+The private repository is the invite gate. Each operator authenticates as
+themselves, so the install command contains no shared token. Removing a
+collaborator blocks future source downloads, but cannot erase source or binaries
+already downloaded.
 
-This repository is currently owned by a personal GitHub account. GitHub gives
-collaborators on private personal repositories write access and does not offer
-a read-only collaborator role. If friends should only read source and download
-releases, transfer the repository to a GitHub organization and grant them its
-Read role before inviting them.
+This personal GitHub repository gives collaborators write access. If operators
+should have read-only access, transfer it to an organization and grant the Read
+role. Never share GitHub tokens, `$HOME/.codex/auth.json`, or `$HOME/.bcodex`.
 
-Removing a collaborator blocks future source and release downloads. It cannot
-erase binaries or source that the collaborator already downloaded, so this is
-private distribution rather than digital-rights management. Friends should
-never share GitHub tokens, `$HOME/.codex/auth.json`, or `$HOME/.bcodex`
-contents.
+## Maintainer release process
 
-## Maintainer setup
-
-GitHub Actions must be enabled for this private repository. Private-repository
-runner minutes count against the repository owner's GitHub plan, and macOS
-jobs consume more billed minutes than Linux jobs.
-
-Invite a friend to the current personal repository by replacing `FRIEND` with
-their GitHub username:
+The package version and source tag must match. Validate a clean `main` locally,
+including a release build on the maintainer's machine, then push `main` and an
+annotated tag explicitly:
 
 ```sh
-gh api --method PUT repos/ummay0432/bettercodex/collaborators/FRIEND
-```
-
-GitHub emails the targeted invitation. The friend can also accept it at:
-
-```text
-https://github.com/ummay0432/bettercodex/invitations
-```
-
-The URL only works for an account with a pending invitation. Because this is a
-personal repository, accepting grants write access. See GitHub's
-[personal-repository permission levels](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/repository-access-and-collaboration/permission-levels-for-a-personal-account-repository)
-and [organization repository roles](https://docs.github.com/en/organizations/managing-user-access-to-your-organizations-repositories/managing-repository-roles/repository-roles-for-an-organization)
-before choosing between the current trusted-collaborator setup and an
-organization-owned read-only setup.
-
-## Publishing a release
-
-The package version and release tag must match. From a clean, validated `main`
-branch that has already been pushed to `origin`:
-
-```sh
-git tag -a v0.1.1 -m "Release 0.1.1"
+git tag -a v0.1.1 -m "Release bettercodex 0.1.1"
 git push origin refs/tags/v0.1.1:refs/tags/v0.1.1
 ```
 
-The `Release` workflow builds and smoke-tests all four platform binaries,
-creates `SHA256SUMS`, and publishes or repairs the matching private GitHub
-Release. Follow it with:
+The stable tag is the release. Do not move a published tag. There is no GitHub
+Release object or artifact matrix to maintain.
+
+Contributors should build through the checked-in helper so the pinned V8 pair
+is selected and verified correctly:
 
 ```sh
-gh run watch --repo ummay0432/bettercodex
+./scripts/dev.py cargo build --release --locked
 ```
 
-For a later release, update the `version` in `Cargo.toml`, refresh `Cargo.lock`,
-validate the change, merge and push it, then create the matching tag.
-
-## Building from source
-
-Contributors should use the checked-in development helper so the pinned V8
-artifacts are downloaded and verified correctly:
-
-```sh
-./scripts/dev.py cargo build --release
-```
-
-The resulting binary is under the target directory printed by the helper.
-
-The release archive intentionally contains one executable. Rust links the
-crate dependencies into that executable, while bettercodex embeds its prompts,
-installer, system skills, evaluator manifest, V8 runtime, and ICU data at
-compile time. The release workflow runs each native binary with an isolated
-home and working directory to verify that those resources materialize without
-a source checkout, initializes its bundled V8 and ICU runtime, then exercises
-`bcodex update` against the published asset.
-
-A successful local build proves that the source and embedded resources compile
-for that build host. It does not prove another CPU/operating-system artifact was
-built or published; the four-target release workflow provides that evidence.
-The installed program still expects normal host facilities where relevant:
-network access and an authenticated `gh` for private updates, `git` for
-repository work, and `tmux` when automatic terminal management is enabled.
+The helper prints the target directory containing `release/bcodex`.

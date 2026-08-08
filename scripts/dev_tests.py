@@ -134,6 +134,45 @@ class CanonicalInstallTests(unittest.TestCase):
             ],
         )
 
+    def test_package_build_cleans_the_root_and_builds_the_locked_release(self) -> None:
+        source = Path("/source")
+        environment = {"CARGO_TARGET_DIR": "/target"}
+        with tempfile.TemporaryDirectory(prefix="bettercodex-package-build-") as temporary:
+            target = Path(temporary)
+            binary = target / "release" / "bcodex"
+            binary.parent.mkdir()
+            binary.touch()
+
+            with mock.patch.object(dev.subprocess, "run") as run:
+                result = dev.build_release_snapshot(source, target, environment)
+
+        self.assertEqual(result, binary)
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    [
+                        "cargo",
+                        "clean",
+                        "--release",
+                        "--package",
+                        "bettercodex",
+                        "--target-dir",
+                        str(target),
+                    ],
+                    cwd=source,
+                    env=environment,
+                    check=True,
+                ),
+                mock.call(
+                    ["cargo", "build", "--release", "--locked"],
+                    cwd=source,
+                    env=environment,
+                    check=True,
+                ),
+            ],
+        )
+
 
 class SandboxedV8Tests(unittest.TestCase):
     def test_pinned_artifact_version_matches_cargo_lock(self) -> None:

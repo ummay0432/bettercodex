@@ -112,10 +112,10 @@ fn run() -> Result<()> {
             ))?;
             Ok(())
         }
-        Command::InternalReleaseSmoke => {
-            tools::release_smoke_test().map_err(anyhow::Error::msg)?;
+        Command::InternalPackageSmoke => {
+            tools::package_smoke_test().map_err(anyhow::Error::msg)?;
             write_stdout_line(format_args!(
-                "bcodex {} release smoke passed",
+                "bcodex {} package smoke passed",
                 env!("CARGO_PKG_VERSION")
             ))?;
             Ok(())
@@ -310,7 +310,7 @@ enum Command {
     ToolCatalogue,
     ToolCatalogueStats,
     ToolContextJson,
-    InternalReleaseSmoke,
+    InternalPackageSmoke,
     Login(LoginCommand),
     Logout,
     LogoutHelp,
@@ -342,15 +342,15 @@ impl Command {
         let mut arguments = arguments.into_iter().peekable();
         if arguments
             .peek()
-            .is_some_and(|argument| argument == "--internal-release-smoke")
+            .is_some_and(|argument| argument == "--internal-package-smoke")
         {
             arguments.next();
             if arguments.next().is_some() {
                 return Err(anyhow!(
-                    "internal release smoke helper received extra arguments"
+                    "internal package smoke helper received extra arguments"
                 ));
             }
-            return Ok(Self::InternalReleaseSmoke);
+            return Ok(Self::InternalPackageSmoke);
         }
         if arguments
             .peek()
@@ -512,7 +512,7 @@ fn parse_update_command(arguments: impl IntoIterator<Item = String>) -> Result<C
 
 fn write_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest private release\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /loop <task> there, or include $loop in any prompt, to run the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n  bcodex --tool-context-json\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Build and install the latest private source tag\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n      --tool-context-json    Print the rendered request-prefix audit input\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /loop <task> there, or include $loop in any prompt, to run the opt-in evaluator-backed quality loop (three working sessions by default). Run /tmux at any time to move the live session into a detachable c1, c2, … tmux session; macOS agent runs prevent idle sleep. Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION")
     ))
 }
@@ -531,7 +531,7 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Install the latest private bettercodex release\n\nUsage:\n  bcodex update\n\nThe update uses the authenticated GitHub CLI and verifies the release checksum before replacing the installed binary."
+        "Build and install the latest private bettercodex source tag\n\nUsage:\n  bcodex update\n\nThe update uses the authenticated GitHub CLI, compiles the tagged source for this machine, smoke-tests its runtime and embedded resources, and then replaces the installed binary."
     ))
 }
 
@@ -653,14 +653,14 @@ mod tests {
     }
 
     #[test]
-    fn internal_release_smoke_is_strictly_parsed() {
+    fn internal_package_smoke_is_strictly_parsed() {
         assert!(matches!(
-            Command::parse(["--internal-release-smoke".to_string()]).unwrap(),
-            Command::InternalReleaseSmoke
+            Command::parse(["--internal-package-smoke".to_string()]).unwrap(),
+            Command::InternalPackageSmoke
         ));
         assert!(
             Command::parse([
-                "--internal-release-smoke".to_string(),
+                "--internal-package-smoke".to_string(),
                 "unexpected".to_string(),
             ])
             .is_err()
