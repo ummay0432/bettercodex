@@ -331,23 +331,6 @@ fn is_compact_typescript_punctuation(character: char) -> bool {
     matches!(character, '{' | '}' | ':' | ';' | ',' | '|' | '&')
 }
 
-pub(crate) fn nested_tool_name_map() -> Value {
-    Value::Object(
-        core_tools()
-            .iter()
-            .map(|tool| {
-                (
-                    code_runtime::normalize_code_mode_identifier(&tool.name),
-                    json!({
-                        "name": tool.tool_name.name,
-                        "namespace": tool.tool_name.namespace,
-                    }),
-                )
-            })
-            .collect(),
-    )
-}
-
 fn function_tool(
     name: &str,
     description: &str,

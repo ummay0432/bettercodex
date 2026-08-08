@@ -330,6 +330,11 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
             .headers
             .contains("x-openai-internal-codex-responses-lite: true")
     );
+    assert!(
+        request
+            .headers
+            .contains(&format!("x-codex-routing-hint: model={MODEL}"))
+    );
     assert!(request.headers.contains("content-encoding: zstd"));
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["model"], MODEL);
@@ -348,7 +353,7 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
         client_turn_metadata["turn_started_at_unix_ms"],
         1_700_000_000_123_u64
     );
-    assert!(client_turn_metadata.get("code_mode_tool_names").is_some());
+    assert!(client_turn_metadata.get("code_mode_tool_names").is_none());
     let header_turn_metadata: Value = serde_json::from_str(
         request
             .headers
@@ -365,7 +370,7 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
         header_turn_metadata["turn_started_at_unix_ms"],
         client_turn_metadata["turn_started_at_unix_ms"]
     );
-    assert!(header_turn_metadata.get("code_mode_tool_names").is_none());
+    assert_eq!(header_turn_metadata, client_turn_metadata);
     server.join().unwrap();
 }
 

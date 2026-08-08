@@ -63,6 +63,7 @@ const MAX_ERROR_BODY_BYTES: usize = 16_000;
 const REQUEST_COMPRESSION_LEVEL: i32 = 1;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
+const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
@@ -1094,9 +1095,6 @@ impl ApiClient {
             "window_id": self.window_id(),
             "request_kind": request_kind.as_str(),
             "sandbox": "danger-full-access",
-            // Responses Lite requires Codex's protocol key even though
-            // bettercodex has one fixed tool runtime and no mode selector.
-            "code_mode_tool_names": tools::nested_tool_name_map(),
             "turn_started_at_unix_ms": self.turn_started_at_unix_ms,
         });
         if let RequestKind::Compaction(compaction) = request_kind {
@@ -1107,17 +1105,6 @@ impl ApiClient {
                 "phase": compaction.phase(),
                 "strategy": "memento",
             });
-        }
-        metadata
-    }
-
-    fn compatibility_turn_metadata(&self, request_kind: RequestKind) -> Value {
-        let mut metadata = self.turn_metadata(request_kind);
-        if let Some(metadata) = metadata.as_object_mut() {
-            // The complete mapping belongs in request client_metadata. Keeping it
-            // out of the compatibility header matches Codex and bounds headers
-            // independently of the nested catalogue.
-            metadata.remove("code_mode_tool_names");
         }
         metadata
     }
@@ -1150,7 +1137,12 @@ impl ApiClient {
         insert_header(
             &mut headers,
             "x-codex-turn-metadata",
-            &self.compatibility_turn_metadata(request_kind).to_string(),
+            &self.turn_metadata(request_kind).to_string(),
+        )?;
+        insert_header(
+            &mut headers,
+            X_CODEX_ROUTING_HINT,
+            &format!("model={MODEL}"),
         )?;
         insert_header(
             &mut headers,

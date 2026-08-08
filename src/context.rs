@@ -25,7 +25,10 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use uuid::Uuid;
 
-const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 64 * 1024;
+// Match Codex's default aggregate AGENTS.md budget. Besides avoiding needless context pressure,
+// 32 KiB keeps the wrapped repository context below the harness's estimated 10k-token per-item
+// ceiling.
+const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 const MAX_CONTEXT_NOTICE_TEXT_TOKENS: usize = 9_900;
 const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
 const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;

@@ -344,10 +344,6 @@ pub(crate) fn catalogue_metrics() -> CatalogueMetrics {
     catalogue::metrics()
 }
 
-pub(crate) fn nested_tool_name_map() -> Value {
-    catalogue::nested_tool_name_map()
-}
-
 #[cfg(test)]
 #[path = "../tools_tests.rs"]
 mod tests;

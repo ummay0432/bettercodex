@@ -3,12 +3,34 @@ use crate::compaction::InitialContextInjection;
 use crate::input::UserInput;
 use crate::rollout::ResumeSelector;
 
-fn temporary_repository(name: &str) -> (PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "bettercodex-context-{name}-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new(name: &str) -> Self {
+        Self(std::env::temp_dir().join(format!(
+            "bettercodex-context-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )))
+    }
+}
+
+impl std::ops::Deref for TemporaryDirectory {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temporary_repository(name: &str) -> (TemporaryDirectory, PathBuf) {
+    let root = TemporaryDirectory::new(name);
     let cwd = root.join("repo");
     std::fs::create_dir_all(cwd.join(".git")).unwrap();
     (root, cwd)
@@ -85,7 +107,7 @@ fn webp_extended_dimensions_are_included_in_image_budgeting() {
 
 #[test]
 fn project_root_stops_agents_discovery_at_git_boundary() {
-    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", uuid::Uuid::new_v4()));
+    let root = TemporaryDirectory::new("agents-boundary");
     let repository = root.join("repo");
     let nested = repository.join("nested");
     std::fs::create_dir_all(repository.join(".git")).unwrap();
@@ -110,13 +132,11 @@ fn project_root_stops_agents_discovery_at_git_boundary() {
     assert!(context.contains("nested rule"));
     assert!(!context.contains("outside"));
     assert_eq!(context.matches(REPOSITORY_CONTEXT_INSTRUCTION).count(), 1);
-
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn an_existing_override_suppresses_the_same_directory_agents_file() {
-    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", uuid::Uuid::new_v4()));
+    let root = TemporaryDirectory::new("agents-override");
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join("AGENTS.override.md"), "\n").unwrap();
     std::fs::write(root.join("AGENTS.md"), "must not be loaded").unwrap();
@@ -127,13 +147,11 @@ fn an_existing_override_suppresses_the_same_directory_agents_file() {
             .as_deref()
             .is_none_or(|text| !text.contains("must not be loaded"))
     );
-
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn agents_content_is_bounded_before_it_enters_model_history() {
-    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", uuid::Uuid::new_v4()));
+    let root = TemporaryDirectory::new("agents-item-budget");
     std::fs::create_dir_all(root.join(".git")).unwrap();
     let mut contents = "a".repeat(MAX_REPOSITORY_INSTRUCTIONS_BYTES);
     contents.push_str("TAIL_MUST_NOT_BE_VISIBLE");
@@ -143,8 +161,22 @@ fn agents_content_is_bounded_before_it_enters_model_history() {
     assert!(context.contains("[AGENTS.md truncated]"));
     assert!(!context.contains("TAIL_MUST_NOT_BE_VISIBLE"));
     assert!(context.len() < MAX_REPOSITORY_INSTRUCTIONS_BYTES + 1_024);
+}
 
-    std::fs::remove_dir_all(root).unwrap();
+#[test]
+fn agents_content_budget_is_shared_from_repository_root_to_cwd() {
+    let root = TemporaryDirectory::new("agents-aggregate-budget");
+    let nested = root.join("nested");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let root_contents = "r".repeat(MAX_REPOSITORY_INSTRUCTIONS_BYTES - 4);
+    std::fs::write(root.join("AGENTS.md"), &root_contents).unwrap();
+    std::fs::write(nested.join("AGENTS.md"), "ABCD_TAIL_MUST_NOT_BE_VISIBLE").unwrap();
+
+    let context = repository_context(&nested).unwrap().unwrap();
+    assert!(context.contains(&root_contents));
+    assert!(context.contains("ABCD\n[AGENTS.md truncated]"));
+    assert!(!context.contains("TAIL_MUST_NOT_BE_VISIBLE"));
 }
 
 #[test]
@@ -207,8 +239,6 @@ fn compaction_replaces_history_canonically_then_reinjects_world_state() {
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert_eq!(loaded.compaction_count, 1);
     assert_eq!(loaded.history[0], canonical[0]);
-
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -261,7 +291,6 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
     }
 
     drop(conversation);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -298,7 +327,6 @@ fn interrupted_turn_repairs_calls_before_adding_the_notice() {
     );
 
     drop(conversation);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -337,6 +365,4 @@ fn resume_recovers_an_unfinished_turn_and_closes_its_journal_state() {
 
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert!(loaded.unfinished_turn.is_none());
-
-    std::fs::remove_dir_all(root).unwrap();
 }
