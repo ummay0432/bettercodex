@@ -156,18 +156,21 @@ struct OperatorCommandCompletion {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActiveSubmissionRoute {
-    QueueLoop,
+    QueueNextTurn,
     SteerOrdinary,
 }
 
 fn active_submission_route(prompt: &UserPrompt) -> Result<ActiveSubmissionRoute> {
-    let invocation = crate::quality_loop::parse_invocation_with_mode(
-        &prompt.text_without_image_placeholders(),
-        prompt.image_count() > 0,
-        true,
-    )?;
-    Ok(if invocation.is_some() {
-        ActiveSubmissionRoute::QueueLoop
+    let text = prompt.text_without_image_placeholders();
+    let invocation =
+        crate::quality_loop::parse_invocation_with_mode(&text, prompt.image_count() > 0, true)?;
+    let invokes_review = prompt
+        .skill_mentions()
+        .iter()
+        .any(|mention| mention.selection().name() == "review")
+        || crate::skills::explicitly_invokes_review(&text);
+    Ok(if invocation.is_some() || invokes_review {
+        ActiveSubmissionRoute::QueueNextTurn
     } else {
         ActiveSubmissionRoute::SteerOrdinary
     })
@@ -495,7 +498,9 @@ impl Runtime {
                 self.persist_prompt(&prompt.text_without_image_placeholders());
                 if self.turn.is_some() {
                     match active_submission_route(&prompt) {
-                        Ok(ActiveSubmissionRoute::QueueLoop) => self.view.queue_follow_up(prompt),
+                        Ok(ActiveSubmissionRoute::QueueNextTurn) => {
+                            self.view.queue_follow_up(prompt)
+                        }
                         Err(error) => self
                             .view
                             .add_notice(format!("Invalid quality loop request: {error:#}")),

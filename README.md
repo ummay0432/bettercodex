@@ -27,6 +27,12 @@ The default runs one evaluator session followed by three fresh working
 sessions; see [`docs/slash_commands.md`](docs/slash_commands.md#quality-loop)
 for counts, progress, restoration, and repository-local evidence.
 
+For an active engineering review and evidence-backed refactoring, use
+`/review <target>` in the TUI or invoke `$review <target>` in any prompt. The
+workflow develops a deep understanding of the target, applies explicit quality
+criteria, and acts on clear net improvements; see
+[`docs/slash_commands.md`](docs/slash_commands.md#engineering-review).
+
 The installer downloads the newest stable source tag and compiles it for the
 current Mac or Linux machine. Interactive sessions check those private tags in
 the background after the TUI is ready. When an update is available, build and

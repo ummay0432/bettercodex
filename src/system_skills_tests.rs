@@ -13,7 +13,7 @@ fn embedded_system_skill_is_materialized_privately_and_idempotently() {
 
     let installed_root = install(&home).unwrap();
     assert_eq!(installed_root, root(&home));
-    let expected: [(&str, &[u8]); 22] = [
+    let expected: [(&str, &[u8]); 24] = [
         (
             "manifest/SKILL.md",
             include_bytes!("../bundled-skills/manifest/SKILL.md"),
@@ -103,6 +103,14 @@ fn embedded_system_skill_is_materialized_privately_and_idempotently() {
         (
             "papercut/agents/openai.yaml",
             include_bytes!("../bundled-skills/papercut/agents/openai.yaml"),
+        ),
+        (
+            "review/SKILL.md",
+            include_bytes!("../bundled-skills/review/SKILL.md"),
+        ),
+        (
+            "review/agents/openai.yaml",
+            include_bytes!("../bundled-skills/review/agents/openai.yaml"),
         ),
     ];
     for (relative_path, contents) in expected {

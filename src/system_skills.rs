@@ -135,6 +135,14 @@ const EMBEDDED_FILES: &[EmbeddedFile] = &[
         relative_path: "papercut/agents/openai.yaml",
         contents: include_bytes!("../bundled-skills/papercut/agents/openai.yaml"),
     },
+    EmbeddedFile {
+        relative_path: "review/SKILL.md",
+        contents: include_bytes!("../bundled-skills/review/SKILL.md"),
+    },
+    EmbeddedFile {
+        relative_path: "review/agents/openai.yaml",
+        contents: include_bytes!("../bundled-skills/review/agents/openai.yaml"),
+    },
 ];
 
 pub(crate) fn root(home: &Path) -> PathBuf {

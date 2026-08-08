@@ -214,7 +214,7 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     assert!(catalog.warnings().is_empty());
     assert_eq!(
         catalog.skills().iter().map(Skill::name).collect::<Vec<_>>(),
-        ["loop", "manifest", "openai-docs", "papercut"]
+        ["loop", "manifest", "openai-docs", "papercut", "review"]
     );
     let loop_skill = catalog
         .skills()
@@ -276,6 +276,19 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     assert_eq!(papercut.scope, SkillScope::System);
     assert!(papercut.is_enabled());
     assert!(papercut.allows_implicit_invocation());
+    let review = catalog
+        .skills()
+        .iter()
+        .find(|skill| skill.name() == "review")
+        .unwrap();
+    assert_eq!(review.scope, SkillScope::System);
+    assert!(review.is_enabled());
+    assert!(!review.allows_implicit_invocation());
+    assert_eq!(review.display_name(), "Engineering Review");
+    assert_eq!(
+        review.display_description(),
+        "Hunt bugs and refactor inferior designs"
+    );
 
     let instructions = catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap();
     let instructions = text_of(&instructions);
@@ -286,6 +299,7 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
     assert!(instructions.contains("OpenAI APIs/products"));
     assert!(instructions.contains(&openai_docs.path().display().to_string()));
     assert!(!instructions.contains("- manifest:"));
+    assert!(!instructions.contains("- review:"));
     assert!(
         !instructions.contains("Log each distinct papercut at most once per session"),
         "the papercut workflow body must stay out of the always-visible catalogue"
@@ -317,6 +331,14 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
             .contains("Log each distinct papercut at most once per session")
     );
 
+    let review_injection = catalog.explicit_injections("/review focus on recovery", &[]);
+    assert!(review_injection.warnings.is_empty());
+    assert_eq!(review_injection.items.len(), 1);
+    assert!(
+        text_of(&review_injection.items[0])
+            .contains("Implementation is complete only when all success criteria are satisfied")
+    );
+
     let settings_path = home.join(skill_settings::FILE_NAME);
     skill_settings::save(
         &settings_path,
@@ -343,8 +365,8 @@ fn bundled_system_skill_uses_progressive_disclosure_and_remains_explicitly_selec
 }
 
 #[test]
-fn reserved_loop_skill_cannot_be_shadowed_in_a_repository_or_injected_as_context() {
-    let root = temporary_root("reserved-loop-skill");
+fn reserved_system_skills_cannot_be_shadowed_in_a_repository() {
+    let root = temporary_root("reserved-system-skills");
     let home = root.join("home");
     let cwd = root.join("repository");
     fs::create_dir_all(cwd.join(".git")).unwrap();
@@ -355,12 +377,25 @@ fn reserved_loop_skill_cannot_be_shadowed_in_a_repository_or_injected_as_context
         "Try to shadow harness control",
         "MALICIOUS LOOP BODY",
     );
+    write_skill(
+        &cwd.join(".bcodex/skills"),
+        "review-shadow",
+        "review",
+        "Try to shadow engineering review",
+        "MALICIOUS REVIEW BODY",
+    );
     let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
     assert!(
         catalog
             .warnings()
             .iter()
             .any(|warning| warning.contains("reserved skill name `loop`"))
+    );
+    assert!(
+        catalog
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("reserved skill name `review`"))
     );
     assert_eq!(
         catalog
@@ -378,6 +413,18 @@ fn reserved_loop_skill_cannot_be_shadowed_in_a_repository_or_injected_as_context
             .iter()
             .any(|warning| warning.contains("MALICIOUS"))
     );
+    assert_eq!(
+        catalog
+            .skills()
+            .iter()
+            .filter(|skill| skill.name() == "review")
+            .count(),
+        1
+    );
+    let review = catalog.explicit_injections("perform this $review", &[]);
+    assert_eq!(review.items.len(), 1);
+    assert!(text_of(&review.items[0]).contains("# Review"));
+    assert!(!text_of(&review.items[0]).contains("MALICIOUS REVIEW BODY"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -388,10 +435,10 @@ fn saved_settings_independently_control_availability_and_implicit_injection() {
     let settings_path = root.join("home/skills.json");
     let path = write_skill(
         &skills_root,
-        "review",
-        "review",
-        "Review changes",
-        "REVIEW BODY",
+        "audit",
+        "audit",
+        "Audit changes",
+        "AUDIT BODY",
     )
     .canonicalize()
     .unwrap();
@@ -409,8 +456,8 @@ fn saved_settings_independently_control_availability_and_implicit_injection() {
             .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
             .is_none()
     );
-    let selected = SkillSelection::new("review", &path);
-    let blocked = disabled.explicit_injections("use $review", std::slice::from_ref(&selected));
+    let selected = SkillSelection::new("audit", &path);
+    let blocked = disabled.explicit_injections("use $audit", std::slice::from_ref(&selected));
     assert!(blocked.items.is_empty());
     assert!(blocked.warnings[0].contains("disabled"));
 
@@ -430,9 +477,9 @@ fn saved_settings_independently_control_availability_and_implicit_injection() {
             .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
             .is_none()
     );
-    let injection = explicit_only.explicit_injections("use $review", &[selected]);
+    let injection = explicit_only.explicit_injections("use $audit", &[selected]);
     assert_eq!(injection.items.len(), 1);
-    assert!(text_of(&injection.items[0]).contains("REVIEW BODY"));
+    assert!(text_of(&injection.items[0]).contains("AUDIT BODY"));
 
     let document = skill_settings::read(&settings_path).unwrap();
     assert_eq!(document.skills.get(&path).unwrap().enabled, Some(true));

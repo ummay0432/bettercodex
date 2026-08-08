@@ -31,16 +31,26 @@ fn completed_message(text: impl Into<String>) -> AgentEvent {
 }
 
 #[test]
-fn loop_submissions_queue_instead_of_steering_an_active_turn() {
+fn explicit_workflows_queue_instead_of_steering_an_active_turn() {
     assert_eq!(
         active_submission_route(&UserPrompt::text("/loop improve startup"))
             .expect("valid slash loop"),
-        ActiveSubmissionRoute::QueueLoop
+        ActiveSubmissionRoute::QueueNextTurn
     );
     assert_eq!(
         active_submission_route(&UserPrompt::text("improve startup $loop"))
             .expect("valid inline loop"),
-        ActiveSubmissionRoute::QueueLoop
+        ActiveSubmissionRoute::QueueNextTurn
+    );
+    assert_eq!(
+        active_submission_route(&UserPrompt::text("/review focus on recovery"))
+            .expect("valid slash review"),
+        ActiveSubmissionRoute::QueueNextTurn
+    );
+    assert_eq!(
+        active_submission_route(&UserPrompt::text("inspect this $review"))
+            .expect("valid inline review"),
+        ActiveSubmissionRoute::QueueNextTurn
     );
     assert_eq!(
         active_submission_route(&UserPrompt::text("ordinary follow-up")).expect("ordinary prompt"),
