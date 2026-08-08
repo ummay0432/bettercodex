@@ -69,7 +69,9 @@ Source is authoritative; recheck it before changing or relying on this map.
   `prompts/system.md` is the harness's developer-level contract, not OpenAI's
   root or system layer.
 - `src/context.rs` sends labeled `<repository_context>` from `AGENTS.md` as a
-  user message and labeled `<environment_context>` as a developer message.
+  user message, with a harness-authored instruction above the file contents
+  that conflicting `AGENTS.md` instructions cannot override the System prompt.
+  It sends labeled `<environment_context>` as a developer message.
 - `src/skills.rs` sends only bounded skill metadata in a user
   `<available_skills>` message. Harness-owned skill framework policy lives in
   `prompts/system.md`; selected full `SKILL.md` bodies are separate user
