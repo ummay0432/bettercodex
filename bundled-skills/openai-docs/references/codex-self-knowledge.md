@@ -19,10 +19,8 @@ node <skill-dir>/scripts/fetch-codex-manual.mjs
 The helper automatically chooses the first usable cache location in this order:
 
 1. `$TMPDIR/openai-docs-cache`
-2. `%TEMP%\openai-docs-cache`
-3. `%TMP%\openai-docs-cache`
-4. `/private/tmp/openai-docs-cache`
-5. `/tmp/openai-docs-cache`
+2. `/private/tmp/openai-docs-cache`
+3. `/tmp/openai-docs-cache`
 
 Use an explicit override only when the allowed cache must be selected manually:
 
@@ -30,7 +28,7 @@ Use an explicit override only when the allowed cache must be selected manually:
 node <skill-dir>/scripts/fetch-codex-manual.mjs --cache-dir <cache-dir>
 ```
 
-On Windows, `%TEMP%` and `%TMP%` are discovered automatically; `$env:TEMP\openai-docs-cache` is a typical PowerShell override. The helper handles configured HTTP(S) proxies and falls back to `curl` when needed. Do not require a POSIX-only environment prefix or an unnecessary cache override.
+The helper handles configured HTTP(S) proxies and falls back to `curl` when needed. Do not require an unnecessary cache override.
 
 The helper verifies the current source and returns a manual path, outline path, freshness status, and heading outline. Use that outline to locate relevant headings and line ranges, then read or search only the returned manual and outline paths. Do not inspect unrelated repositories, caches, source trees, or local state to establish a public Codex product claim.
 

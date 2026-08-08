@@ -109,8 +109,6 @@ const tempFilePath = (cacheDir, suffix) =>
 const requestManualWithCurl = async (url, { cacheDir, method, timeoutMs }) => {
   const headerPath = tempFilePath(cacheDir, ".headers");
   const bodyPath = tempFilePath(cacheDir, ".body");
-  const curlNames =
-    process.platform === "win32" ? ["curl.exe", "curl"] : ["curl"];
   const args = [
     "--silent",
     "--show-error",
@@ -132,35 +130,29 @@ const requestManualWithCurl = async (url, { cacheDir, method, timeoutMs }) => {
   }
   args.push(url);
 
-  let lastError;
-  for (const curlName of curlNames) {
-    try {
-      await execFileAsync(curlName, args, { windowsHide: true });
-      const [rawHeaders, body] = await Promise.all([
-        readFile(headerPath, "utf8"),
-        readFile(bodyPath, "utf8"),
-      ]);
-      const { headers, status } = parseCurlHeaders(rawHeaders);
-      return makeResponse({ body, headers, status });
-    } catch (error) {
-      lastError = error;
-      if (error?.code !== "ENOENT") break;
-    } finally {
-      await Promise.all([
-        rm(headerPath, { force: true }),
-        rm(bodyPath, { force: true }),
-      ]);
+  try {
+    await execFileAsync("curl", args);
+    const [rawHeaders, body] = await Promise.all([
+      readFile(headerPath, "utf8"),
+      readFile(bodyPath, "utf8"),
+    ]);
+    const { headers, status } = parseCurlHeaders(rawHeaders);
+    return makeResponse({ body, headers, status });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new ManualFetchError("curl is unavailable in this environment.", {
+        cause: error,
+      });
     }
-  }
-
-  if (lastError?.code === "ENOENT") {
-    throw new ManualFetchError("curl is unavailable in this environment.", {
-      cause: lastError,
+    throw new ManualFetchError(`${method} ${url} could not be fetched.`, {
+      cause: error,
     });
+  } finally {
+    await Promise.all([
+      rm(headerPath, { force: true }),
+      rm(bodyPath, { force: true }),
+    ]);
   }
-  throw new ManualFetchError(`${method} ${url} could not be fetched.`, {
-    cause: lastError,
-  });
 };
 
 const requestManualWithFetch = async (url, { method, timeoutMs }) => {
@@ -269,16 +261,11 @@ const defaultCacheDirCandidates = () => {
     candidates.push(candidate);
   };
 
-  [process.env.TMPDIR, process.env.TEMP, process.env.TMP].forEach((baseDir) => {
-    if (baseDir) {
-      pushCandidate(path.join(baseDir, DEFAULT_CACHE_DIR_NAME));
-    }
-  });
-
-  if (process.platform !== "win32") {
-    pushCandidate(`/private/tmp/${DEFAULT_CACHE_DIR_NAME}`);
-    pushCandidate(`/tmp/${DEFAULT_CACHE_DIR_NAME}`);
+  if (process.env.TMPDIR) {
+    pushCandidate(path.join(process.env.TMPDIR, DEFAULT_CACHE_DIR_NAME));
   }
+  pushCandidate(`/private/tmp/${DEFAULT_CACHE_DIR_NAME}`);
+  pushCandidate(`/tmp/${DEFAULT_CACHE_DIR_NAME}`);
 
   return candidates;
 };
@@ -546,9 +533,6 @@ const envProxyHint = () => {
   }
   if (typeof fetch !== "function") {
     return "Hint: native fetch is unavailable in this Node runtime. Install `curl` or use a newer Node version to fetch the manual.";
-  }
-  if (process.platform === "win32") {
-    return "Hint: on Windows, pass a cache dir under `%TEMP%` or `%TMP%`.";
   }
   return null;
 };

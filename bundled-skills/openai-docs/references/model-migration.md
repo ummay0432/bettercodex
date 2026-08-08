@@ -5,25 +5,17 @@ Use this route for model upgrades, migration planning, model-specific prompting,
 ## Choose the target before loading more context
 
 - **Explicit model target:** Preserve the user's exact requested target, including an explicitly requested GPT-4.1 or GPT-5.4 migration. Do not run the latest-model resolver and do not substitute a newer model. Search for and fetch current guidance for that exact model. A GPT-5.4 migration must not load GPT-5.6 guidance or references.
-- **Unspecified, latest, current, or default target:** Search for and fetch `https://developers.openai.com/api/docs/guides/latest-model` first. Use the corresponding `latest-model.md` metadata only when dynamic migration resolution is needed, then run the platform-specific resolver below and preserve its returned model and exact guide URLs.
+- **Unspecified, latest, current, or default target:** Search for and fetch `https://developers.openai.com/api/docs/guides/latest-model` first. Use the corresponding `latest-model.md` metadata only when dynamic migration resolution is needed, then run the resolver below and preserve its returned model and exact guide URLs.
 - **Latest/current/default prompting:** Follow the dynamic-target route, then use the returned prompting guide. Do not run the resolver for explicitly named-model prompting.
 - **Pure model selection:** Use `references/model-selection.md` instead. Do not run the resolver.
 
-For POSIX shells, invoke the resolver through `sh`, without assuming an executable bit:
+Invoke the resolver through `sh`, without assuming an executable bit:
 
 ```sh
 sh <skill-dir>/scripts/resolve-latest-model-info
 ```
 
-On Windows, use the CommonJS entry point with Node.js 18 or newer:
-
-```text
-node <skill-dir>\scripts\resolve-latest-model-info.cjs
-```
-
-If the Windows Node runtime is unavailable and `load_workspace_dependencies` is callable, use its returned runtime and retry once. Do not execute the extensionless POSIX wrapper directly on Windows.
-
-Do not suppress or redirect resolver stdout. Success requires JSON with nonempty `model`, `migrationGuideUrl`, and `promptingGuideUrl` fields. If the command fails or any required field is missing, retry the platform-specific command once, then fall back to current official documentation and finally disclosed bundled references.
+Do not suppress or redirect resolver stdout. Success requires JSON with nonempty `model`, `migrationGuideUrl`, and `promptingGuideUrl` fields. If the command fails or any required field is missing, retry the resolver command once, then fall back to current official documentation and finally disclosed bundled references.
 
 ## Retrieve only the guidance this request needs
 
