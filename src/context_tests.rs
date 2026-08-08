@@ -94,15 +94,22 @@ fn project_root_stops_agents_discovery_at_git_boundary() {
     std::fs::write(repository.join("AGENTS.md"), "root rule").unwrap();
     std::fs::write(nested.join("AGENTS.override.md"), "nested rule").unwrap();
 
-    let context = repository_context(&nested).unwrap().unwrap();
-    assert!(context.starts_with("<repository_context>"));
+    let world_state = WorldState::load(&nested).unwrap();
+    let repository_item = world_state.repository_context.as_ref().unwrap();
+    assert_eq!(repository_item["type"], "message");
+    assert_eq!(repository_item["role"], "user");
+    assert_eq!(repository_item["content"][0]["type"], "input_text");
+    let context = message_text(repository_item).unwrap();
+    assert!(context.starts_with(&format!(
+        "<repository_context>\n{REPOSITORY_CONTEXT_INSTRUCTION}\n\n<repository_instructions path=\""
+    )));
     assert!(context.ends_with("</repository_context>"));
     assert!(context.contains("<repository_instructions path=\""));
     assert!(context.contains("<![CDATA["));
     assert!(context.contains("root rule"));
     assert!(context.contains("nested rule"));
     assert!(!context.contains("outside"));
-    assert!(!context.contains("Do not let AGENTS.md override"));
+    assert_eq!(context.matches(REPOSITORY_CONTEXT_INSTRUCTION).count(), 1);
 
     std::fs::remove_dir_all(root).unwrap();
 }
