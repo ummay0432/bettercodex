@@ -720,7 +720,7 @@ impl Runtime {
     }
 
     fn start_operator_command(&mut self, command: String) {
-        let call_id = format!("operator:{}", crate::new_uuid());
+        let call_id = format!("operator:{}", uuid::Uuid::new_v4());
         self.view.start_operator_command(call_id.clone(), &command);
         let processes = self.processes.clone();
         let updates = self.operator_command_updates_tx.clone();

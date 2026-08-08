@@ -357,7 +357,7 @@ impl ProcessManager {
             .lock()
             .map_err(|_| anyhow!("process ID table lock was poisoned"))?;
         loop {
-            let bytes = *crate::new_uuid().as_bytes();
+            let bytes = *uuid::Uuid::new_v4().as_bytes();
             let random = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let candidate = 1_000 + (random % 99_000) as i32;
             if store.reserved_session_ids.insert(candidate) {
@@ -578,7 +578,7 @@ fn bounded_duration(
 }
 
 fn chunk_id() -> String {
-    crate::new_uuid().simple().to_string()[..6].to_string()
+    uuid::Uuid::new_v4().simple().to_string()[..6].to_string()
 }
 
 fn truncate_output(

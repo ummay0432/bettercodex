@@ -365,7 +365,7 @@ impl Worktree {
             index: git.index_digest.clone(),
         };
         Ok(RepositorySnapshot {
-            id: crate::new_uuid().to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
             state,
             entries,
             included_specs: included_specs.to_vec(),
@@ -1544,7 +1544,7 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let parent = path.parent().ok_or_else(|| anyhow!("path has no parent"))?;
     std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".loop-write-{}", crate::new_uuid()));
+    let temporary = parent.join(format!(".loop-write-{}", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .create_new(true)

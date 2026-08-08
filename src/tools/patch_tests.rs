@@ -12,7 +12,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("bettercodex-patch-{}", crate::new_uuid()));
+        let path = std::env::temp_dir().join(format!("bettercodex-patch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }

@@ -9,7 +9,7 @@ impl TestDirectory {
         let path = std::env::temp_dir().join(format!(
             "bettercodex-{label}-{}-{}",
             std::process::id(),
-            crate::new_uuid()
+            uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)

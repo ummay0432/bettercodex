@@ -131,6 +131,6 @@ fn companion_path(path: &Path, suffix: &str) -> Result<PathBuf> {
 fn temporary_path(path: &Path) -> Result<PathBuf> {
     companion_path(
         path,
-        &format!(".tmp-{}-{}", std::process::id(), crate::new_uuid()),
+        &format!(".tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4()),
     )
 }

@@ -13,7 +13,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(contents: &[u8]) -> Self {
-        let root = std::env::temp_dir().join(format!("bcodex-snapshot-test-{}", crate::new_uuid()));
+        let root =
+            std::env::temp_dir().join(format!("bcodex-snapshot-test-{}", uuid::Uuid::new_v4()));
         let repository = root.join("repository");
         let run_root = root.join("run");
         std::fs::create_dir_all(&repository).expect("create repository fixture");

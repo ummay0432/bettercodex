@@ -403,7 +403,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "bettercodex-image-{}-{}.png",
             std::process::id(),
-            crate::new_uuid()
+            uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
 
@@ -429,7 +429,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "bettercodex-image-{}-{}.bin",
             std::process::id(),
-            crate::new_uuid()
+            uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"not an image").unwrap();
         let error = UserInput::from_paths("inspect", std::slice::from_ref(&path), ImageDetail::Low)

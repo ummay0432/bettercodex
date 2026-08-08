@@ -8,7 +8,8 @@ struct TemporaryDirectory {
 
 impl TemporaryDirectory {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("bettercodex-{label}-{}", crate::new_uuid()));
+        let path =
+            std::env::temp_dir().join(format!("bettercodex-{label}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         Self { path }
     }

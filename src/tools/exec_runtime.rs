@@ -492,7 +492,7 @@ mod tests {
 
     fn temporary_directory(label: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("bettercodex-exec-{label}-{}", crate::new_uuid()));
+            std::env::temp_dir().join(format!("bettercodex-exec-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }

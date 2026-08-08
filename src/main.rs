@@ -62,22 +62,6 @@ use uuid::Uuid;
 
 const MODEL: &str = "gpt-5.6-sol";
 
-/// Generates an RFC 9562 version-4 UUID from the process RNG already used by
-/// BetterCodex, avoiding a second OS-randomness backend in `uuid`.
-pub(crate) fn new_uuid() -> Uuid {
-    uuid::Builder::from_random_bytes(rand::random()).into_uuid()
-}
-
-#[cfg(test)]
-#[test]
-fn generated_uuid_has_random_version_and_rfc4122_variant() {
-    let first = new_uuid();
-    let second = new_uuid();
-    assert_ne!(first, second);
-    assert_eq!(first.get_version(), Some(uuid::Version::Random));
-    assert_eq!(first.get_variant(), uuid::Variant::RFC4122);
-}
-
 fn main() {
     if let Err(error) = run() {
         if is_broken_pipe(&error) {
@@ -606,7 +590,7 @@ mod tests {
 
     #[test]
     fn parses_resume_images_and_detail() {
-        let id = crate::new_uuid();
+        let id = uuid::Uuid::new_v4();
         let command = Command::parse([
             "resume".to_string(),
             id.to_string(),
@@ -679,7 +663,7 @@ mod tests {
 
     #[test]
     fn only_the_first_resume_positional_can_select_a_session() {
-        let id = crate::new_uuid();
+        let id = uuid::Uuid::new_v4();
         let command =
             Command::parse(["resume".to_string(), "compare".to_string(), id.to_string()]).unwrap();
         let Command::Resume { selector, options } = command else {

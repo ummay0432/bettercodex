@@ -5,7 +5,7 @@ fn temporary_directory(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "bettercodex-{name}-{}-{}",
         std::process::id(),
-        crate::new_uuid()
+        uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&path).expect("create temporary directory");
     path

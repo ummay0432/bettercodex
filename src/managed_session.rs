@@ -660,7 +660,7 @@ impl RelayEndpoint {
         let directory = std::env::temp_dir().join(format!(
             "{RELAY_DIRECTORY_PREFIX}{}-{}",
             std::process::id(),
-            crate::new_uuid()
+            uuid::Uuid::new_v4()
         ));
         let mut builder = DirBuilder::new();
         builder.mode(0o700);

@@ -461,7 +461,7 @@ impl ApiClient {
             installation_id: identity.installation_id.clone(),
             session_id: identity.session_id.clone(),
             thread_id: identity.thread_id.clone(),
-            turn_id: crate::new_uuid().to_string(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
             turn_started_at_unix_ms: unix_timestamp_millis(),
             turn_state: None,
             window: compaction_count,
@@ -476,7 +476,7 @@ impl ApiClient {
     }
 
     pub(crate) fn begin_turn(&mut self) -> &str {
-        self.turn_id = crate::new_uuid().to_string();
+        self.turn_id = uuid::Uuid::new_v4().to_string();
         self.turn_started_at_unix_ms = unix_timestamp_millis();
         self.turn_state = None;
         &self.turn_id
