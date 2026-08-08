@@ -1,6 +1,6 @@
 [package]
 name = "bettercodex"
-version = "0.1.3"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "A deliberately small GPT-5.6 Sol coding-agent harness"
@@ -80,15 +80,6 @@ strip = true
 # Match upstream's balance between parallel release code generation, runtime
 # performance, and binary size.
 codegen-units = 4
-
-# Published binaries favor the user's disk and download footprint. The extra
-# link time is paid once by the maintainer; installs and updates never compile
-# this profile on the user's machine.
-[profile.distribution]
-inherits = "release"
-codegen-units = 1
-lto = "fat"
-opt-level = "z"
 
 [patch.crates-io]
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }

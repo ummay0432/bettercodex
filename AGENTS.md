@@ -19,6 +19,8 @@ bettercodex is a focused port of [OpenAI Codex](https://github.com/openai/codex)
 
 Do not invent Cargo, build, packaging, release, or test infrastructure; mirror current upstream Codex for retained workflows unless an explicit bettercodex requirement makes a deviation necessary.
 
+Installed bettercodex builds track public `main` by exact source revision; never use package versions, tags, or GitHub Releases to decide update freshness.
+
 ## Start here
 
 This file is the universal context layer. Before working, open only the matching

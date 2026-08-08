@@ -38,6 +38,12 @@ impl TemporaryProgram {
     }
 }
 
+fn main_response(revision: &str) -> String {
+    format!(
+        "{{\"ref\":\"refs/heads/main\",\"object\":{{\"sha\":\"{revision}\",\"type\":\"commit\"}}}}"
+    )
+}
+
 #[test]
 fn accepts_only_full_source_revisions_and_safe_repository_names() {
     assert!(is_source_revision(
@@ -52,97 +58,76 @@ fn accepts_only_full_source_revisions_and_safe_repository_names() {
     assert!(!is_source_revision(
         "111111111111111111111111111111111111111g"
     ));
-    assert!(validate_repository("owner/private.repo").is_ok());
+    assert!(validate_repository("owner/public.repo").is_ok());
     assert!(validate_repository("owner").is_err());
     assert!(validate_repository("owner/repo/extra").is_err());
     assert!(validate_repository("owner/repo?ref=other").is_err());
+}
 
-    let revision = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+#[test]
+fn accepts_only_the_main_commit_ref_response() {
+    let revision = "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD";
     assert_eq!(
-        parse_release_tag(&format!("bcodex-v0.1.2-{revision}")).unwrap(),
-        PublishedRelease {
-            tag: format!("bcodex-v0.1.2-{revision}"),
-            version: "0.1.2".to_string(),
-            revision: revision.to_string(),
-            assets: Vec::new(),
-        }
+        parse_github_main_revision(main_response(revision).as_bytes()).unwrap(),
+        revision.to_ascii_lowercase()
     );
-    for tag in [
-        "bcodex-v0.1-abcdefabcdefabcdefabcdefabcdefabcdefabcd",
-        "bcodex-v0.1.2-not-a-revision",
-        "other-v0.1.2-abcdefabcdefabcdefabcdefabcdefabcdefabcd",
-        "bcodex-v0.1.2-ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD",
+    for response in [
+        "{}",
+        "{\"ref\":\"refs/heads/other\",\"object\":{\"sha\":\"1111111111111111111111111111111111111111\",\"type\":\"commit\"}}",
+        "{\"ref\":\"refs/heads/main\",\"object\":{\"sha\":\"1111111111111111111111111111111111111111\",\"type\":\"tag\"}}",
+        "{\"ref\":\"refs/heads/main\",\"object\":{\"sha\":\"not-a-commit\",\"type\":\"commit\"}}",
     ] {
-        assert!(parse_release_tag(tag).is_err(), "accepted {tag}");
+        assert!(parse_github_main_revision(response.as_bytes()).is_err());
     }
 }
 
 #[tokio::test]
-async fn published_release_lookup_respects_revisions_and_package_versions() {
+async fn public_main_lookup_reports_both_exact_revisions() {
     let current = "1111111111111111111111111111111111111111";
-    let latest = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
-    let target = install::native_target(std::env::consts::OS, std::env::consts::ARCH).unwrap();
-    let digest = "a".repeat(64);
+    let latest = "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD";
     let curl = TemporaryProgram::new(&format!(
-        "#!/bin/sh\n\
-         printf '%s\\n' '{{\"tag_name\":\"bcodex-v0.1.2-{latest}\",\"draft\":false,\"prerelease\":false,\"assets\":[{{\"name\":\"bcodex-{target}.zst\",\"size\":123,\"digest\":\"sha256:{digest}\"}}]}}'\n"
+        "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+        main_response(latest)
     ));
 
     assert_eq!(
-        check_for_release_update_with(
+        check_for_source_update_with(
             curl.path.as_os_str(),
             "owner/project",
             current,
-            "0.1.2",
             Duration::from_secs(1),
         )
         .await,
         Some(AvailableUpdate {
             current_revision: current.to_string(),
-            latest_revision: latest.to_string(),
+            latest_revision: latest.to_ascii_lowercase(),
         })
     );
     assert_eq!(
-        check_for_release_update_with(
+        check_for_source_update_with(
             curl.path.as_os_str(),
             "owner/project",
             latest,
-            "0.1.2",
             Duration::from_secs(1),
         )
         .await,
         None
     );
-    assert_eq!(
-        check_for_release_update_with(
-            curl.path.as_os_str(),
-            "owner/project",
-            current,
-            "0.1.3",
-            Duration::from_secs(1),
-        )
-        .await,
-        None,
-        "an older published package must not downgrade a newer local build"
-    );
 }
 
 #[tokio::test]
-async fn failed_malformed_and_timed_out_release_lookups_are_silent() {
+async fn failed_malformed_and_timed_out_main_lookups_are_silent() {
     let revision = "1111111111111111111111111111111111111111";
     for program in [
         "#!/bin/sh\nexit 1\n",
-        "#!/bin/sh\nprintf '{\"tag_name\":\"not-a-release\",\"draft\":false,\"prerelease\":false}\\n'\n",
-        "#!/bin/sh\nprintf '{\"tag_name\":\"bcodex-v0.1.2-1111111111111111111111111111111111111111\",\"draft\":true,\"prerelease\":false}\\n'\n",
-        "#!/bin/sh\nprintf '{\"tag_name\":\"bcodex-v0.1.2-2222222222222222222222222222222222222222\",\"draft\":false,\"prerelease\":false,\"assets\":[]}\\n'\n",
+        "#!/bin/sh\nprintf '{\"ref\":\"refs/heads/main\"}\\n'\n",
     ] {
         let curl = TemporaryProgram::new(program);
         assert_eq!(
-            check_for_release_update_with(
+            check_for_source_update_with(
                 curl.path.as_os_str(),
                 "owner/project",
                 revision,
-                "0.1.2",
                 Duration::from_secs(1),
             )
             .await,
@@ -152,22 +137,20 @@ async fn failed_malformed_and_timed_out_release_lookups_are_silent() {
 
     let slow = TemporaryProgram::new("#!/bin/sh\nsleep 2\n");
     assert_eq!(
-        check_for_release_update_with(
+        check_for_source_update_with(
             slow.path.as_os_str(),
             "owner/project",
             revision,
-            "0.1.2",
             Duration::from_millis(20),
         )
         .await,
         None
     );
     assert_eq!(
-        check_for_release_update_with(
+        check_for_source_update_with(
             slow.path.as_os_str(),
             "invalid repository",
             revision,
-            "0.1.2",
             Duration::from_secs(1),
         )
         .await,
@@ -200,10 +183,9 @@ fn updater_targets_the_running_binary_directory_unless_configured() {
 }
 
 #[test]
-fn updater_resolves_the_latest_release_with_asset_digests() {
+fn updater_resolves_main_and_fetches_that_revisions_installer() {
     let revision = "2222222222222222222222222222222222222222";
-    let tag = format!("bcodex-v0.1.2-{revision}");
-    let digest = "a".repeat(64);
+    let response = main_response(revision);
     let curl = TemporaryProgram::new(&format!(
         "#!/bin/sh\n\
          compressed=0\n\
@@ -215,33 +197,66 @@ fn updater_resolves_the_latest_release_with_asset_digests() {
          done\n\
          [ \"$compressed\" = 1 ] || exit 3\n\
          case \"$url\" in\n\
-           'https://api.github.com/repos/owner/project/releases/latest') printf '%s\\n' '{{\"tag_name\":\"{tag}\",\"draft\":false,\"prerelease\":false,\"assets\":[{{\"name\":\"bcodex-x86_64-unknown-linux-gnu.zst\",\"size\":123,\"digest\":\"sha256:{digest}\"}}]}}' ;;\n\
+           'https://api.github.com/repos/owner/project/git/ref/heads/main') printf '%s\\n' '{response}' ;;\n\
+           'https://raw.githubusercontent.com/owner/project/{revision}/scripts/install.sh') printf '%s\\n' '#!/bin/sh' 'exit 0' ;;\n\
            *) exit 2 ;;\n\
          esac\n"
     ));
 
     assert_eq!(
-        resolve_published_release(curl.path.as_os_str(), "owner/project").unwrap(),
-        PublishedRelease {
-            tag,
-            version: "0.1.2".to_string(),
-            revision: revision.to_string(),
-            assets: vec![ReleaseAsset {
-                name: "bcodex-x86_64-unknown-linux-gnu.zst".to_string(),
-                size: 123,
-                sha256: digest,
-            }],
-        }
+        resolve_main_revision(curl.path.as_os_str(), "owner/project").unwrap(),
+        revision
     );
+    assert_eq!(
+        fetch_installer(
+            curl.path.as_os_str(),
+            "owner/project",
+            revision,
+            MAX_INSTALLER_BYTES,
+        )
+        .unwrap(),
+        b"#!/bin/sh\nexit 0\n"
+    );
+    assert!(fetch_installer(curl.path.as_os_str(), "owner/project", revision, 8).is_err());
 }
 
 #[test]
-fn release_metadata_without_a_github_digest_cannot_be_installed() {
+fn updater_passes_only_the_pinned_source_install_contract() {
     let revision = "2222222222222222222222222222222222222222";
-    let response = format!(
-        "{{\"tag_name\":\"bcodex-v0.1.2-{revision}\",\"draft\":false,\"prerelease\":false,\"assets\":[{{\"name\":\"bcodex-x86_64-unknown-linux-gnu.zst\",\"size\":123,\"digest\":null}}]}}"
+    run_installer_script(
+        b"test \"$BCODEX_INSTALL_DIR\" = '/tmp/custom bettercodex'\n\
+          test \"$BCODEX_REPOSITORY\" = owner/project\n\
+          test \"$BCODEX_INSTALL_REVISION\" = 2222222222222222222222222222222222222222\n\
+          test -z \"${BCODEX_INSTALL_RELEASE_TAG:-}\"\n\
+          test -z \"${BCODEX_INSTALL_VERSION:-}\"\n",
+        OsStr::new("/bin/sh"),
+        Path::new("/tmp/custom bettercodex"),
+        "owner/project",
+        revision,
+    )
+    .unwrap();
+    assert!(
+        run_installer_script(
+            b"exit 7\n",
+            OsStr::new("/bin/sh"),
+            Path::new("/tmp/custom bettercodex"),
+            "owner/project",
+            revision,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exit status: 7")
     );
-    let release = parse_github_release(response.as_bytes()).unwrap();
-    assert_eq!(release.assets[0].sha256, "");
-    assert!(release.assets[0].validate().is_err());
+    assert!(
+        run_installer_script(
+            b"exit 0\n",
+            OsStr::new("/bin/sh"),
+            Path::new("/tmp/custom bettercodex"),
+            "owner/project",
+            "not-a-revision",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("invalid source revision")
+    );
 }

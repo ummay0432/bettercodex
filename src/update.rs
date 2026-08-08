@@ -1,9 +1,9 @@
-//! Published-release checks and the local update command.
+//! Public-main revision checks and the local source update command.
 //!
-//! Installed builds compare their package version and embedded source revision
-//! with the latest complete GitHub Release after the TUI renders. The explicit
-//! command streams one verified zstd release asset directly into an atomic
-//! replacement.
+//! Installed builds compare their embedded source revision with public `main`
+//! after the TUI renders. The explicit command pins that exact commit, fetches
+//! the installer from the same immutable revision, and lets the installer build,
+//! verify, and atomically replace the running command.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -20,9 +20,12 @@ use tokio::process::Command as AsyncProcessCommand;
 
 const DEFAULT_REPOSITORY: &str = "ummay0432/bettercodex";
 const GITHUB_API_ROOT: &str = "https://api.github.com";
+const GITHUB_RAW_ROOT: &str = "https://raw.githubusercontent.com";
+const INSTALLER_PATH: &str = "scripts/install.sh";
+const MAX_INSTALLER_BYTES: usize = 1024 * 1024;
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const INSTALL_DIR_ENV: &str = "BCODEX_INSTALL_DIR";
-const RELEASE_TAG_PREFIX: &str = "bcodex-v";
+const INSTALL_REVISION_ENV: &str = "BCODEX_INSTALL_REVISION";
 
 const CURL_ARGUMENTS: &[&str] = &[
     "--proto",
@@ -51,34 +54,17 @@ const CURL_ARGUMENTS: &[&str] = &[
 ];
 
 #[derive(Deserialize)]
-struct GitHubReleaseResponse {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    #[serde(default)]
-    assets: Vec<GitHubReleaseAssetResponse>,
+struct GitHubRefResponse {
+    #[serde(rename = "ref")]
+    reference: String,
+    object: GitHubRefObjectResponse,
 }
 
 #[derive(Deserialize)]
-struct GitHubReleaseAssetResponse {
-    name: String,
-    size: u64,
-    digest: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ReleaseAsset {
-    name: String,
-    size: u64,
-    sha256: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PublishedRelease {
-    tag: String,
-    version: String,
-    revision: String,
-    assets: Vec<ReleaseAsset>,
+struct GitHubRefObjectResponse {
+    sha: String,
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,7 +98,7 @@ impl AvailableUpdate {
     }
 }
 
-/// Checks once for a different published release after the TUI renders.
+/// Checks once for a different public `main` revision after the TUI renders.
 ///
 /// Development builds stay offline. Installed builds can opt out by setting
 /// `BCODEX_SKIP_UPDATE_CHECK`. Failures stay silent and are retried on the next
@@ -123,11 +109,10 @@ pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
     }
     let current_revision = source_revision()?;
     let repository = configured_repository().ok()?;
-    check_for_release_update_with(
+    check_for_source_update_with(
         OsStr::new("curl"),
         &repository,
         current_revision,
-        env!("CARGO_PKG_VERSION"),
         UPDATE_CHECK_TIMEOUT,
     )
     .await
@@ -137,17 +122,16 @@ pub(crate) fn source_revision() -> Option<&'static str> {
     option_env!("BCODEX_SOURCE_REVISION").filter(|revision| is_source_revision(revision))
 }
 
-async fn check_for_release_update_with(
+async fn check_for_source_update_with(
     curl_program: &OsStr,
     repository: &str,
     current_revision: &str,
-    current_version: &str,
     timeout: Duration,
 ) -> Option<AvailableUpdate> {
     if !is_source_revision(current_revision) || validate_repository(repository).is_err() {
         return None;
     }
-    let url = latest_release_api_url(repository);
+    let url = main_ref_api_url(repository);
     let mut command = AsyncProcessCommand::new(curl_program);
     command
         .args(CURL_ARGUMENTS)
@@ -161,87 +145,31 @@ async fn check_for_release_update_with(
     if !output.status.success() {
         return None;
     }
-    let release = parse_github_release(&output.stdout).ok()?;
-    if release.revision.eq_ignore_ascii_case(current_revision)
-        || package_version_precedes(&release.version, current_version)
-        || !install::has_native_full_asset(&release)
-    {
+    let latest_revision = parse_github_main_revision(&output.stdout).ok()?;
+    if latest_revision.eq_ignore_ascii_case(current_revision) {
         return None;
     }
-    Some(AvailableUpdate::new(current_revision, &release.revision))
+    Some(AvailableUpdate::new(current_revision, &latest_revision))
 }
 
-fn latest_release_api_url(repository: &str) -> String {
-    format!("{GITHUB_API_ROOT}/repos/{repository}/releases/latest")
+fn main_ref_api_url(repository: &str) -> String {
+    format!("{GITHUB_API_ROOT}/repos/{repository}/git/ref/heads/main")
 }
 
-fn parse_github_release(response: &[u8]) -> Result<PublishedRelease> {
-    let response: GitHubReleaseResponse = serde_json::from_slice(response)
-        .context("GitHub returned an invalid bettercodex release response")?;
-    if response.draft || response.prerelease {
-        bail!("GitHub returned an unpublished bettercodex release");
-    }
-    let mut release = parse_release_tag(&response.tag_name)?;
-    release.assets = response
-        .assets
-        .into_iter()
-        .map(|asset| ReleaseAsset {
-            name: asset.name,
-            size: asset.size,
-            sha256: asset
-                .digest
-                .and_then(|digest| digest.strip_prefix("sha256:").map(str::to_string))
-                .unwrap_or_default(),
-        })
-        .collect();
-    Ok(release)
+fn installer_url(repository: &str, revision: &str) -> String {
+    format!("{GITHUB_RAW_ROOT}/{repository}/{revision}/{INSTALLER_PATH}")
 }
 
-fn parse_release_tag(tag: &str) -> Result<PublishedRelease> {
-    let release = tag
-        .strip_prefix(RELEASE_TAG_PREFIX)
-        .context("GitHub returned an invalid bettercodex release tag")?;
-    let (version, revision) = release
-        .rsplit_once('-')
-        .context("GitHub returned an invalid bettercodex release tag")?;
-    if !is_package_version(version)
-        || !is_source_revision(revision)
-        || revision.bytes().any(|byte| byte.is_ascii_uppercase())
+fn parse_github_main_revision(response: &[u8]) -> Result<String> {
+    let response: GitHubRefResponse = serde_json::from_slice(response)
+        .context("GitHub returned an invalid bettercodex main response")?;
+    if response.reference != "refs/heads/main"
+        || response.object.kind != "commit"
+        || !is_source_revision(&response.object.sha)
     {
-        bail!("GitHub returned an invalid bettercodex release tag");
+        bail!("GitHub returned an invalid bettercodex main revision");
     }
-    Ok(PublishedRelease {
-        tag: tag.to_string(),
-        version: version.to_string(),
-        revision: revision.to_string(),
-        assets: Vec::new(),
-    })
-}
-
-fn is_package_version(version: &str) -> bool {
-    package_version(version).is_some()
-}
-
-fn package_version(version: &str) -> Option<[u64; 3]> {
-    let mut components = version.split('.');
-    let parse_component = |component: &str| -> Option<u64> {
-        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        component.parse().ok()
-    };
-    let version = [
-        parse_component(components.next()?)?,
-        parse_component(components.next()?)?,
-        parse_component(components.next()?)?,
-    ];
-    components.next().is_none().then_some(version)
-}
-
-fn package_version_precedes(candidate: &str, current: &str) -> bool {
-    package_version(candidate)
-        .zip(package_version(current))
-        .is_some_and(|(candidate, current)| candidate < current)
+    Ok(response.object.sha.to_ascii_lowercase())
 }
 
 fn is_source_revision(revision: &str) -> bool {
@@ -280,28 +208,16 @@ fn is_repository_name_byte(byte: u8) -> bool {
 
 pub(crate) fn run_update() -> Result<()> {
     let current_revision = source_revision().context(
-        "this build has no embedded source revision; install bettercodex with INSTALL_COMMAND.txt before using `bcodex update`",
+        "this build has no embedded source revision; run INSTALL_COMMAND.txt before using `bcodex update`",
     )?;
     let repository = configured_repository()?;
-    let release = resolve_published_release(OsStr::new("curl"), &repository)?;
-    if release.revision.eq_ignore_ascii_case(current_revision) {
+    let latest_revision = resolve_main_revision(OsStr::new("curl"), &repository)?;
+    if latest_revision.eq_ignore_ascii_case(current_revision) {
         let mut output = std::io::stdout().lock();
         writeln!(
             output,
-            "The latest published bettercodex release is already installed at {}.",
+            "bettercodex is already current with main at {}.",
             short_revision(current_revision)
-        )?;
-        return Ok(());
-    }
-    if package_version_precedes(&release.version, env!("CARGO_PKG_VERSION")) {
-        let mut output = std::io::stdout().lock();
-        writeln!(
-            output,
-            "This bettercodex {} build ({}) is newer than the latest published {} release ({}); no downgrade was installed.",
-            env!("CARGO_PKG_VERSION"),
-            short_revision(current_revision),
-            release.version,
-            short_revision(&release.revision)
         )?;
         return Ok(());
     }
@@ -310,29 +226,63 @@ pub(crate) fn run_update() -> Result<()> {
         std::env::current_exe().context("could not locate the running bettercodex binary")?;
     let configured_dir = std::env::var_os(INSTALL_DIR_ENV);
     let install_dir = update_install_dir(&executable, configured_dir.as_deref())?;
-    install::install_release(
+    let installer = fetch_installer(
         OsStr::new("curl"),
         &repository,
-        &release,
-        current_revision,
-        &executable,
+        &latest_revision,
+        MAX_INSTALLER_BYTES,
+    )?;
+    run_installer_script(
+        &installer,
+        OsStr::new("/bin/sh"),
         &install_dir,
+        &repository,
+        &latest_revision,
     )
 }
 
-fn resolve_published_release(curl_program: &OsStr, repository: &str) -> Result<PublishedRelease> {
+fn resolve_main_revision(curl_program: &OsStr, repository: &str) -> Result<String> {
     validate_repository(repository)?;
-    let url = latest_release_api_url(repository);
+    let url = main_ref_api_url(repository);
     let output = ProcessCommand::new(curl_program)
         .args(CURL_ARGUMENTS)
         .args(["--header", "Accept: application/vnd.github+json", &url])
         .stdin(Stdio::null())
         .output()
-        .context("could not query the latest bettercodex release")?;
+        .context("could not query the current bettercodex main revision")?;
     if !output.status.success() {
-        bail!("GitHub could not resolve the latest bettercodex release");
+        bail!("GitHub could not resolve bettercodex main");
     }
-    parse_github_release(&output.stdout)
+    parse_github_main_revision(&output.stdout)
+}
+
+fn fetch_installer(
+    curl_program: &OsStr,
+    repository: &str,
+    revision: &str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>> {
+    validate_repository(repository)?;
+    if !is_source_revision(revision) {
+        bail!("cannot fetch the installer from an invalid source revision");
+    }
+    let url = installer_url(repository, revision);
+    let output = ProcessCommand::new(curl_program)
+        .args(CURL_ARGUMENTS)
+        .arg(&url)
+        .stdin(Stdio::null())
+        .output()
+        .context("could not fetch the current bettercodex installer")?;
+    if !output.status.success() {
+        bail!("GitHub could not fetch the current bettercodex installer");
+    }
+    if output.stdout.is_empty() || output.stdout.len() > maximum_bytes {
+        bail!("GitHub returned an empty or oversized bettercodex installer");
+    }
+    if !output.stdout.starts_with(b"#!/bin/sh\n") {
+        bail!("GitHub returned an invalid bettercodex installer");
+    }
+    Ok(output.stdout)
 }
 
 fn update_install_dir(executable: &Path, configured: Option<&OsStr>) -> Result<PathBuf> {
@@ -350,8 +300,44 @@ fn update_install_dir(executable: &Path, configured: Option<&OsStr>) -> Result<P
         .context("could not locate the running bettercodex binary directory")
 }
 
-#[path = "update_install.rs"]
-mod install;
+fn run_installer_script(
+    script: &[u8],
+    shell: &OsStr,
+    install_dir: &Path,
+    repository: &str,
+    revision: &str,
+) -> Result<()> {
+    if !is_source_revision(revision) {
+        bail!("cannot run the installer for an invalid source revision");
+    }
+    let mut child = ProcessCommand::new(shell)
+        .arg("-s")
+        .env(INSTALL_DIR_ENV, install_dir)
+        .env(INSTALL_REVISION_ENV, revision)
+        .env("BCODEX_REPOSITORY", repository)
+        .env_remove("BCODEX_INSTALL_RELEASE_TAG")
+        .env_remove("BCODEX_INSTALL_VERSION")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("could not start the bettercodex installer")?;
+    let write_result = child
+        .stdin
+        .take()
+        .context("could not open the bettercodex installer input")?
+        .write_all(script);
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).context("could not send the bettercodex installer to the shell");
+    }
+    let status = child
+        .wait()
+        .context("could not wait for the bettercodex installer")?;
+    if !status.success() {
+        bail!("bettercodex installer exited with {status}");
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 #[path = "update_tests.rs"]

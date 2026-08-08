@@ -34,6 +34,10 @@ The runtime is one Cargo package and one `bcodex` binary. It contains the
 inference loop and terminal UI for one operator. Commands and patches run with
 the invoking user's permissions; bettercodex does not sandbox them.
 
+The public installation channel is the exact current commit on public `main`.
+The installer and updater build that pinned source revision locally; Cargo
+versions are display metadata and never gate whether an update is available.
+
 Live tool detail and the active background-terminal summary occupy dedicated
 rows between the task status and the composer. bettercodex never folds either
 surface into the busy status line.

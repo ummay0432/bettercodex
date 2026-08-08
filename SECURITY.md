@@ -12,7 +12,6 @@ impact, and a minimal reproduction. Remove credentials and unrelated private
 data. If a real credential may have been exposed, revoke or rotate it before
 reporting the incident.
 
-Security fixes are supported for the latest published release and current
-`main`. bettercodex is maintained independently from OpenAI; reports about the
-upstream Codex product or OpenAI services should use OpenAI's own reporting
-channels.
+Security fixes are supported for current public `main`. bettercodex is
+maintained independently from OpenAI; reports about the upstream Codex product
+or OpenAI services should use OpenAI's own reporting channels.
