@@ -227,7 +227,12 @@ async fn spawned_pty_processes_receive_a_capable_terminal_type() {
 
     let snapshot = session.snapshot().unwrap();
     assert_eq!(snapshot.exit_code, Some(0));
-    assert_eq!(snapshot.output, "xterm-256color");
+    // PTY shutdown can expose a trailing terminal line ending even though the command itself does
+    // not print one. The contract under test is the terminal type inherited by the child.
+    assert_eq!(
+        snapshot.output.trim_end_matches(['\r', '\n']),
+        "xterm-256color"
+    );
 }
 
 #[tokio::test]
