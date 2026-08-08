@@ -92,6 +92,7 @@ const MAX_PATCH_PREVIEW_ROW_BYTES: usize = 2 * 1024;
 const ACTIVITY_COMPOSER_GAP: u16 = 1;
 const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
+const STATUS_DETAIL_PREFIX: &str = "  └ ";
 const LOOP_LINE_HEIGHT: u16 = 1;
 const LOOP_INDENT: &str = "  ";
 const LOOP_SEPARATOR: &str = " · ";
@@ -2100,7 +2101,7 @@ impl View {
             .max(1)
             .saturating_add(2);
         let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
-        let activity_height = u16::from(self.has_activity_surface(width));
+        let activity_height = self.activity_height(width);
         let loop_height = LOOP_LINE_HEIGHT.saturating_mul(u16::from(self.loop_progress.is_some()));
         let activity_composer_height = if activity_height > 0 {
             ACTIVITY_COMPOSER_GAP.max(loop_height)
@@ -2167,9 +2168,8 @@ impl View {
         let trailing_height =
             requested_trailing_height.min(area.height.saturating_sub(minimum_composer_height));
         let height_above_trailing = area.height.saturating_sub(trailing_height);
-        let has_activity_surface = self.has_activity_surface(area.width);
-        let requested_activity_height = u16::from(has_activity_surface);
-        let requested_activity_composer_height = if has_activity_surface {
+        let requested_activity_height = self.activity_height(area.width);
+        let requested_activity_composer_height = if requested_activity_height > 0 {
             ACTIVITY_COMPOSER_GAP.max(requested_loop_height)
         } else {
             requested_loop_height
@@ -2262,17 +2262,10 @@ impl View {
             );
         }
         if activity_height > 0 {
-            let line = if self.busy {
-                Some(self.working_line())
-            } else {
-                self.standalone_background_process_line(area.width)
-            };
-            if let Some(line) = line {
-                frame.render_widget(
-                    Paragraph::new(truncate_line(line, usize::from(activity_area.width))),
-                    activity_area,
-                );
-            }
+            frame.render_widget(
+                Paragraph::new(self.activity_lines(activity_area.width)),
+                activity_area,
+            );
         }
         if let Some(progress) = &self.loop_progress
             && !loop_area.is_empty()
@@ -2588,11 +2581,12 @@ impl View {
             .working_since
             .map(|started| started.elapsed())
             .unwrap_or_default();
+        let waiting_for_background_terminal = self.waiting_for_background_terminal();
         let heading = if self.interrupting.is_some() {
             "Interrupting"
         } else if self.status_detail.as_deref() == Some("Compacting conversation") {
             "Compacting"
-        } else if self.waiting_for_background_terminal() {
+        } else if waiting_for_background_terminal {
             "Waiting for background terminal"
         } else {
             self.reasoning_status.heading().unwrap_or("Working")
@@ -2606,10 +2600,11 @@ impl View {
             )
             .dim(),
         );
-        if let Some(detail) = self
-            .status_detail
-            .as_deref()
-            .filter(|detail| *detail != "Compacting conversation")
+        if !waiting_for_background_terminal
+            && let Some(detail) = self
+                .status_detail
+                .as_deref()
+                .filter(|detail| *detail != "Compacting conversation")
         {
             spans.push(Span::from(" · ").dim());
             spans.push(Span::from(detail.to_string()).dim());
@@ -2751,8 +2746,47 @@ fn styled_loop_fields(fields: &[&str], indent: &str, first_is_name: bool) -> Lin
 }
 
 impl View {
-    fn has_activity_surface(&self, width: u16) -> bool {
-        self.busy || (width >= 4 && !self.background_processes.is_empty())
+    fn activity_height(&self, width: u16) -> u16 {
+        if self.busy {
+            STATUS_LINE_HEIGHT
+                .saturating_add(u16::from(self.waiting_status_detail_line(width).is_some()))
+        } else {
+            u16::from(self.standalone_background_process_line(width).is_some())
+        }
+    }
+
+    fn activity_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if !self.busy {
+            return self
+                .standalone_background_process_line(width)
+                .map(|line| truncate_line(line, usize::from(width)))
+                .into_iter()
+                .collect();
+        }
+
+        let mut lines = vec![truncate_line(self.working_line(), usize::from(width))];
+        lines.extend(self.waiting_status_detail_line(width));
+        lines
+    }
+
+    fn waiting_status_detail_line(&self, width: u16) -> Option<Line<'static>> {
+        if !self.waiting_for_background_terminal() {
+            return None;
+        }
+        let detail = self.status_detail.as_deref()?.trim();
+        if detail.is_empty() {
+            return None;
+        }
+        let detail = first_display_line(&markdown::sanitize(detail));
+        if detail.is_empty() {
+            return None;
+        }
+        // Match Codex's one-row unified-exec details surface: the command belongs below the
+        // waiting header, where it cannot displace the elapsed time or interrupt affordance.
+        Some(truncate_line(
+            Line::from(vec![STATUS_DETAIL_PREFIX.dim(), detail.dim()]),
+            usize::from(width),
+        ))
     }
 
     fn background_process_summary(&self) -> Option<String> {
@@ -4971,6 +5005,78 @@ mod tests {
 
         view.handle_agent_event(AgentEvent::LoopProgressCleared);
         assert_eq!(view.desired_height(60, 24), height);
+    }
+
+    #[test]
+    fn background_wait_command_uses_a_detail_row_between_status_and_composer() {
+        const WIDTH: u16 = 48;
+        const COMMAND: &str = "cargo test -p bettercodex -- --exact some::very::long::test::name";
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        let _ = view.take_pending_history_lines(WIDTH, 24);
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:start".to_string(),
+            name: "exec_command".to_string(),
+            input: Some(json!({"cmd": COMMAND})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:start".to_string(),
+            output: Ok(json!({"session_id": 42, "output": ""})),
+            duration: Duration::from_millis(10),
+        });
+        let _ = view.take_pending_history_lines(WIDTH, 24);
+        let height_without_wait = view.desired_height(WIDTH, 24);
+
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:wait".to_string(),
+            name: "write_stdin".to_string(),
+            input: Some(json!({"session_id": 42})),
+        });
+
+        let height = view.desired_height(WIDTH, 24);
+        assert_eq!(height, height_without_wait + 1);
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let status_y = rows
+            .iter()
+            .position(|row| row.contains("Waiting for background terminal"))
+            .expect("rendered wait status") as u16;
+        let detail_y = rows
+            .iter()
+            .position(|row| row.contains("└ cargo test -p bettercodex"))
+            .expect("rendered command detail") as u16;
+        let composer_background = view.user_message_style.bg.unwrap();
+        let composer_y = (0..height)
+            .find(|&y| buffer[(0, y)].bg == composer_background)
+            .expect("rendered composer");
+        let composer_bottom = (0..height)
+            .rfind(|&y| buffer[(0, y)].bg == composer_background)
+            .expect("rendered composer")
+            .saturating_add(1);
+        let footer_y = rows
+            .iter()
+            .position(|row| row.contains(MODEL))
+            .expect("rendered footer") as u16;
+
+        assert!(
+            !rows[usize::from(status_y)].contains("cargo test"),
+            "{rendered}"
+        );
+        assert_eq!(detail_y, status_y + 1, "{rendered}");
+        assert_eq!(
+            composer_y,
+            detail_y + 1 + ACTIVITY_COMPOSER_GAP,
+            "{rendered}"
+        );
+        assert_eq!(footer_y, composer_bottom, "{rendered}");
+        assert_eq!(rendered.matches("cargo test").count(), 1, "{rendered}");
+        assert!(rows[usize::from(detail_y)].contains('…'), "{rendered}");
     }
 
     #[test]
