@@ -15,9 +15,9 @@ use crate::http_client::backoff;
 use crate::http_client::bounded_error_body;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
+use crate::time::unix_timestamp_millis;
 use crate::tools;
 use crate::tools::ToolCall;
-use crate::time::unix_timestamp_millis;
 use crate::usage::TokenUsage;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
@@ -1233,12 +1233,8 @@ impl ApiClient {
                 attempt = attempt.saturating_add(1);
                 continue;
             }
-            let body = bounded_error_body(
-                response,
-                MAX_ERROR_BODY_BYTES,
-                MAX_ERROR_BODY_CHARS,
-            )
-            .await;
+            let body =
+                bounded_error_body(response, MAX_ERROR_BODY_BYTES, MAX_ERROR_BODY_CHARS).await;
             let message = format!("Responses request failed with {status}: {body}");
             if status == StatusCode::TOO_MANY_REQUESTS || transport_retryable {
                 return Err(ApiError::retryable_after(message, retry_after));

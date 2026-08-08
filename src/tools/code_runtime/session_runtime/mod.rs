@@ -94,7 +94,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn observe(
         &self,
         cell_id: &CellId,
@@ -136,6 +136,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             .map_err(|error| actor_error(cell_id, error))
     }
 
+    #[cfg(test)]
     pub(crate) async fn shutdown(&self) -> Result<(), Error> {
         self.begin_shutdown();
         // Taking the registry lock ensures every cell that passed the shutdown

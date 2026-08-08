@@ -94,10 +94,7 @@ mod tests {
 
     #[test]
     fn escapes_xml_attributes_and_text() {
-        assert_eq!(
-            escape_xml("<&>\"'"),
-            "&lt;&amp;&gt;&quot;&apos;"
-        );
+        assert_eq!(escape_xml("<&>\"'"), "&lt;&amp;&gt;&quot;&apos;");
         assert_eq!(escape_xml_text("<&>\"'"), "&lt;&amp;&gt;\"'");
     }
 

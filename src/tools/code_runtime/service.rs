@@ -3,21 +3,24 @@ use std::time::Duration;
 
 use crate::tools::code_runtime::CellId;
 use crate::tools::code_runtime::CodeModeNestedToolCall;
-use crate::tools::code_runtime::CodeModeSession;
 use crate::tools::code_runtime::CodeModeSessionDelegate;
 use crate::tools::code_runtime::CodeModeSessionResultFuture;
 use crate::tools::code_runtime::CodeModeToolKind;
 use crate::tools::code_runtime::DEFAULT_EXEC_YIELD_TIME_MS;
 use crate::tools::code_runtime::ExecuteRequest;
+#[cfg(test)]
 use crate::tools::code_runtime::ExecuteToPendingOutcome;
 use crate::tools::code_runtime::FunctionCallOutputContentItem;
 use crate::tools::code_runtime::ImageDetail;
+#[cfg(test)]
 use crate::tools::code_runtime::NoopCodeModeSessionDelegate;
 use crate::tools::code_runtime::RuntimeResponse;
 use crate::tools::code_runtime::StartedCell;
 use crate::tools::code_runtime::WaitOutcome;
 use crate::tools::code_runtime::WaitRequest;
+#[cfg(test)]
 use crate::tools::code_runtime::WaitToPendingOutcome;
+#[cfg(test)]
 use crate::tools::code_runtime::WaitToPendingRequest;
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
@@ -43,6 +46,7 @@ pub struct InProcessCodeModeSession {
 }
 
 impl InProcessCodeModeSession {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::with_delegate(Arc::new(NoopCodeModeSessionDelegate))
     }
@@ -77,7 +81,7 @@ impl InProcessCodeModeSession {
         Ok(StartedCell::from_result_receiver(cell_id, response_rx))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub async fn execute_to_pending(
         &self,
         request: ExecuteRequest,
@@ -145,7 +149,7 @@ impl InProcessCodeModeSession {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub async fn wait_to_pending(
         &self,
         request: WaitToPendingRequest,
@@ -169,6 +173,7 @@ impl InProcessCodeModeSession {
         }
     }
 
+    #[cfg(test)]
     pub async fn shutdown(&self) -> Result<(), String> {
         self.runtime
             .shutdown()
@@ -177,30 +182,10 @@ impl InProcessCodeModeSession {
     }
 }
 
+#[cfg(test)]
 impl Default for InProcessCodeModeSession {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl CodeModeSession for InProcessCodeModeSession {
-    fn execute<'a>(
-        &'a self,
-        request: ExecuteRequest,
-    ) -> CodeModeSessionResultFuture<'a, StartedCell> {
-        Box::pin(InProcessCodeModeSession::execute(self, request))
-    }
-
-    fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        Box::pin(InProcessCodeModeSession::wait(self, request))
-    }
-
-    fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        Box::pin(InProcessCodeModeSession::terminate(self, cell_id))
-    }
-
-    fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
-        Box::pin(InProcessCodeModeSession::shutdown(self))
     }
 }
 
@@ -287,7 +272,7 @@ fn protocol_cell_id(cell_id: &runtime::CellId) -> CellId {
     CellId::new(cell_id.as_str().to_string())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn pending_outcome(
     cell_id: &CellId,
     event: runtime::CellEvent,

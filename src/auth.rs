@@ -1,9 +1,9 @@
+use crate::http_client::bounded_error_body;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use crate::http_client::bounded_error_body;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;

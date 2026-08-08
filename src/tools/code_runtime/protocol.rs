@@ -65,6 +65,7 @@ pub(crate) struct WaitRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg(test)]
 pub(crate) struct WaitToPendingRequest {
     pub(crate) cell_id: CellId,
 }
@@ -76,6 +77,7 @@ pub(crate) enum WaitOutcome {
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[cfg(test)]
 pub(crate) enum ExecuteToPendingOutcome {
     Pending {
         cell_id: CellId,
@@ -86,6 +88,7 @@ pub(crate) enum ExecuteToPendingOutcome {
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[cfg(test)]
 pub(crate) enum WaitToPendingOutcome {
     LiveCell(ExecuteToPendingOutcome),
     MissingCell(RuntimeResponse),
@@ -200,8 +203,10 @@ pub(crate) trait CodeModeSessionDelegate: Send + Sync {
     fn cell_closed(&self, cell_id: &CellId);
 }
 
+#[cfg(test)]
 pub(crate) struct NoopCodeModeSessionDelegate;
 
+#[cfg(test)]
 impl CodeModeSessionDelegate for NoopCodeModeSessionDelegate {
     fn invoke_tool<'a>(
         &'a self,
@@ -225,17 +230,4 @@ impl CodeModeSessionDelegate for NoopCodeModeSessionDelegate {
     }
 
     fn cell_closed(&self, _cell_id: &CellId) {}
-}
-
-pub(crate) trait CodeModeSession: Send + Sync {
-    fn execute<'a>(
-        &'a self,
-        request: ExecuteRequest,
-    ) -> CodeModeSessionResultFuture<'a, StartedCell>;
-
-    fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
-
-    fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
-
-    fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()>;
 }
