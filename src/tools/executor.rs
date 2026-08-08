@@ -27,7 +27,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::process_session::ProcessMode;
 use super::process_session::ProcessSession;
@@ -358,7 +357,7 @@ impl ProcessManager {
             .lock()
             .map_err(|_| anyhow!("process ID table lock was poisoned"))?;
         loop {
-            let bytes = *Uuid::new_v4().as_bytes();
+            let bytes = *uuid::Uuid::new_v4().as_bytes();
             let random = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let candidate = 1_000 + (random % 99_000) as i32;
             if store.reserved_session_ids.insert(candidate) {
@@ -579,7 +578,7 @@ fn bounded_duration(
 }
 
 fn chunk_id() -> String {
-    Uuid::new_v4().simple().to_string()[..6].to_string()
+    uuid::Uuid::new_v4().simple().to_string()[..6].to_string()
 }
 
 fn truncate_output(

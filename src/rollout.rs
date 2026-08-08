@@ -436,8 +436,8 @@ impl Rollout {
 
         let identity = SessionIdentity {
             installation_id: installation_id(root)?,
-            session_id: Uuid::new_v4().to_string(),
-            thread_id: Uuid::new_v4().to_string(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: uuid::Uuid::new_v4().to_string(),
         };
         let metadata = SessionMetadata {
             version: ROLLOUT_VERSION,
@@ -1099,11 +1099,11 @@ fn installation_id(root: &Path) -> Result<String> {
         return Ok(id.to_string());
     }
 
-    let value = Uuid::new_v4().to_string();
+    let value = uuid::Uuid::new_v4().to_string();
     let temporary = root.join(format!(
         ".{INSTALLATION_ID_FILE}.tmp-{}-{}",
         std::process::id(),
-        Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
     ));
     let mut file = open_private_replace(&temporary)?;
     file.write_all(value.as_bytes())?;

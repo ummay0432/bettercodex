@@ -38,7 +38,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-use uuid::Uuid;
 
 const SESSION_PREFIX: char = 'c';
 const CAFFEINATE: &str = "/usr/bin/caffeinate";
@@ -661,7 +660,7 @@ impl RelayEndpoint {
         let directory = std::env::temp_dir().join(format!(
             "{RELAY_DIRECTORY_PREFIX}{}-{}",
             std::process::id(),
-            Uuid::new_v4()
+            uuid::Uuid::new_v4()
         ));
         let mut builder = DirBuilder::new();
         builder.mode(0o700);

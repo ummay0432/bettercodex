@@ -2,7 +2,6 @@ use super::*;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use serde_json::Value;
 use std::fs;
-use uuid::Uuid;
 
 fn text_of(item: &Value) -> &str {
     item.pointer("/content/0/text")
@@ -15,7 +14,7 @@ fn review_skill_is_reserved_explicit_only_and_injected_from_both_entry_points() 
     let root = std::env::temp_dir().join(format!(
         "bettercodex-review-skill-{}-{}",
         std::process::id(),
-        Uuid::new_v4()
+        uuid::Uuid::new_v4()
     ));
     let home = root.join("home");
     let cwd = root.join("repository");

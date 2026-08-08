@@ -7,7 +7,7 @@ fn temporary_repository(name: &str) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!(
         "bettercodex-context-{name}-{}-{}",
         std::process::id(),
-        Uuid::new_v4()
+        uuid::Uuid::new_v4()
     ));
     let cwd = root.join("repo");
     std::fs::create_dir_all(cwd.join(".git")).unwrap();
@@ -85,7 +85,7 @@ fn webp_extended_dimensions_are_included_in_image_budgeting() {
 
 #[test]
 fn project_root_stops_agents_discovery_at_git_boundary() {
-    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", uuid::Uuid::new_v4()));
     let repository = root.join("repo");
     let nested = repository.join("nested");
     std::fs::create_dir_all(repository.join(".git")).unwrap();
@@ -116,7 +116,7 @@ fn project_root_stops_agents_discovery_at_git_boundary() {
 
 #[test]
 fn an_existing_override_suppresses_the_same_directory_agents_file() {
-    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join("AGENTS.override.md"), "\n").unwrap();
     std::fs::write(root.join("AGENTS.md"), "must not be loaded").unwrap();
@@ -133,7 +133,7 @@ fn an_existing_override_suppresses_the_same_directory_agents_file() {
 
 #[test]
 fn agents_content_is_bounded_before_it_enters_model_history() {
-    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("bettercodex-agents-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join(".git")).unwrap();
     let mut contents = "a".repeat(MAX_REPOSITORY_INSTRUCTIONS_BYTES);
     contents.push_str("TAIL_MUST_NOT_BE_VISIBLE");

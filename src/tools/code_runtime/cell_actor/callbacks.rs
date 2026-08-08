@@ -1,7 +1,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use futures::FutureExt;
+use futures_util::FutureExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 

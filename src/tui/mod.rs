@@ -55,7 +55,7 @@ use crossterm::event::Event;
 use crossterm::event::EventStream;
 use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use notifications::Notifier;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -87,6 +87,12 @@ const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
 const MAX_READY_AGENT_EVENTS: usize = 4_096;
 
+pub(crate) struct Startup(terminal::TerminalStartup);
+
+pub(crate) fn begin_startup() -> Result<Startup> {
+    terminal::TerminalStartup::begin().map(Startup)
+}
+
 enum TurnCompletion {
     Submission(Result<SubmitOutcome>),
     Compaction(Result<CompactionOutcome>),
@@ -106,9 +112,10 @@ pub(crate) async fn run(
     agent: Agent,
     cwd: PathBuf,
     worker_handoff: Option<crate::managed_session::WorkerHandoff>,
+    startup: Startup,
 ) -> Result<()> {
     let mut runtime = Runtime::new(agent, cwd, worker_handoff)?;
-    let mut session = terminal::TerminalSession::enter()?;
+    let mut session = startup.0.enter()?;
     runtime
         .view
         .set_terminal_colors(session.default_foreground(), session.default_background());
@@ -722,7 +729,7 @@ impl Runtime {
     }
 
     fn start_operator_command(&mut self, command: String) {
-        let call_id = format!("operator:{}", Uuid::new_v4());
+        let call_id = format!("operator:{}", uuid::Uuid::new_v4());
         self.view.start_operator_command(call_id.clone(), &command);
         let processes = self.processes.clone();
         let updates = self.operator_command_updates_tx.clone();

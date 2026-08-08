@@ -393,7 +393,7 @@ fn build_authorize_url(redirect_uri: &str, pkce: &PkceCodes, state: &str) -> Str
         ("originator", originator()),
     ]
     .into_iter()
-    .map(|(key, value)| format!("{key}={}", urlencoding::encode(&value)))
+    .map(|(key, value)| format!("{key}={}", crate::url_encoding::encode(&value)))
     .collect::<Vec<_>>()
     .join("&");
     format!("{DEFAULT_ISSUER}/oauth/authorize?{query}")
@@ -515,10 +515,10 @@ async fn exchange_code_for_tokens(
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
-            urlencoding::encode(code),
-            urlencoding::encode(redirect_uri),
-            urlencoding::encode(CLIENT_ID),
-            urlencoding::encode(&pkce.code_verifier)
+            crate::url_encoding::encode(code),
+            crate::url_encoding::encode(redirect_uri),
+            crate::url_encoding::encode(CLIENT_ID),
+            crate::url_encoding::encode(&pkce.code_verifier)
         ))
         .send()
         .await
@@ -552,11 +552,11 @@ async fn obtain_api_key(id_token: &str) -> io::Result<String> {
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type={}&client_id={}&requested_token={}&subject_token={}&subject_token_type={}",
-            urlencoding::encode("urn:ietf:params:oauth:grant-type:token-exchange"),
-            urlencoding::encode(CLIENT_ID),
-            urlencoding::encode("openai-api-key"),
-            urlencoding::encode(id_token),
-            urlencoding::encode("urn:ietf:params:oauth:token-type:id_token")
+            crate::url_encoding::encode("urn:ietf:params:oauth:grant-type:token-exchange"),
+            crate::url_encoding::encode(CLIENT_ID),
+            crate::url_encoding::encode("openai-api-key"),
+            crate::url_encoding::encode(id_token),
+            crate::url_encoding::encode("urn:ietf:params:oauth:token-type:id_token")
         ))
         .send()
         .await
@@ -664,7 +664,7 @@ fn compose_success_url(port: u16, tokens: &SuccessTokens) -> String {
         ("platform_url", "https://platform.openai.com"),
     ]
     .into_iter()
-    .map(|(key, value)| format!("{key}={}", urlencoding::encode(value)))
+    .map(|(key, value)| format!("{key}={}", crate::url_encoding::encode(value)))
     .collect::<Vec<_>>()
     .join("&");
     format!("http://localhost:{port}/success?{parameters}")

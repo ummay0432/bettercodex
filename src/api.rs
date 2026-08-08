@@ -39,7 +39,6 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
-use uuid::Uuid;
 
 #[path = "api_websocket.rs"]
 mod websocket;
@@ -462,7 +461,7 @@ impl ApiClient {
             installation_id: identity.installation_id.clone(),
             session_id: identity.session_id.clone(),
             thread_id: identity.thread_id.clone(),
-            turn_id: Uuid::new_v4().to_string(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
             turn_started_at_unix_ms: unix_timestamp_millis(),
             turn_state: None,
             window: compaction_count,
@@ -477,7 +476,7 @@ impl ApiClient {
     }
 
     pub(crate) fn begin_turn(&mut self) -> &str {
-        self.turn_id = Uuid::new_v4().to_string();
+        self.turn_id = uuid::Uuid::new_v4().to_string();
         self.turn_started_at_unix_ms = unix_timestamp_millis();
         self.turn_state = None;
         &self.turn_id

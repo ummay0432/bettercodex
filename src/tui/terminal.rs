@@ -64,55 +64,71 @@ pub(super) struct AppTerminal<B: Backend = CrosstermBackend<Stdout>> {
     viewport_top: u16,
 }
 
+pub(super) struct TerminalStartup {
+    probe: Option<PendingStartupProbe>,
+    restore_on_drop: bool,
+}
+
 pub(super) struct TerminalSession {
     terminal: AppTerminal,
     default_foreground: Option<(u8, u8, u8)>,
     default_background: Option<(u8, u8, u8)>,
 }
 
-impl TerminalSession {
-    pub(super) fn enter() -> Result<Self> {
+impl TerminalStartup {
+    pub(super) fn begin() -> Result<Self> {
         install_panic_hook();
         initialize_terminal_modes()?;
-        let mut output = stdout();
-        let result = (|| -> Result<Self> {
-            let probe = startup_probe(STARTUP_PROBE_TIMEOUT).unwrap_or_default();
-            let screen_size = crossterm::terminal::size()
-                .map(|(width, height)| Size::new(width, height))
-                .context("failed to read terminal size")?;
-            output
-                .write_all(CLEAR_VISIBLE_TERMINAL)
-                .context("failed to clear the terminal before startup")?;
-            output
-                .flush()
-                .context("failed to flush the startup clear")?;
-
-            let viewport_area = Rect::new(0, 0, screen_size.width, 1);
-            let terminal = Terminal::with_options(
-                CrosstermBackend::new(output),
-                TerminalOptions {
-                    viewport: Viewport::Fixed(viewport_area),
-                },
-            )
-            .context("failed to create inline terminal renderer")?;
-
-            Ok(Self {
-                terminal: AppTerminal {
-                    terminal,
-                    viewport_area,
-                    screen_size,
-                    viewport_top: 0,
-                },
-                default_foreground: probe.foreground,
-                default_background: probe.background,
-            })
-        })();
-        if result.is_err() {
-            let _ = restore();
-        }
-        result
+        // Start Codex's terminal-color query immediately so its bounded wait overlaps agent setup.
+        Ok(Self {
+            probe: PendingStartupProbe::begin(STARTUP_PROBE_TIMEOUT).ok(),
+            restore_on_drop: true,
+        })
     }
 
+    pub(super) fn enter(mut self) -> Result<TerminalSession> {
+        let mut output = stdout();
+
+        let probe = self
+            .probe
+            .take()
+            .and_then(|probe| probe.finish().ok())
+            .unwrap_or_default();
+        let screen_size = crossterm::terminal::size()
+            .map(|(width, height)| Size::new(width, height))
+            .context("failed to read terminal size")?;
+        output
+            .write_all(CLEAR_VISIBLE_TERMINAL)
+            .context("failed to clear the terminal before startup")?;
+        output
+            .flush()
+            .context("failed to flush the startup clear")?;
+
+        let viewport_area = Rect::new(0, 0, screen_size.width, 1);
+        let terminal = Terminal::with_options(
+            CrosstermBackend::new(output),
+            TerminalOptions {
+                viewport: Viewport::Fixed(viewport_area),
+            },
+        )
+        .context("failed to create inline terminal renderer")?;
+
+        let session = TerminalSession {
+            terminal: AppTerminal {
+                terminal,
+                viewport_area,
+                screen_size,
+                viewport_top: 0,
+            },
+            default_foreground: probe.foreground,
+            default_background: probe.background,
+        };
+        self.restore_on_drop = false;
+        Ok(session)
+    }
+}
+
+impl TerminalSession {
     pub(super) fn terminal_mut(&mut self) -> &mut AppTerminal {
         &mut self.terminal
     }
@@ -132,6 +148,14 @@ impl TerminalSession {
     ) -> Result<String> {
         supervisor.transfer(&prepared)?;
         Ok(prepared.commit())
+    }
+}
+
+impl Drop for TerminalStartup {
+    fn drop(&mut self) {
+        if self.restore_on_drop {
+            let _ = restore();
+        }
     }
 }
 
@@ -428,23 +452,41 @@ struct StartupProbe {
     background: Option<(u8, u8, u8)>,
 }
 
-fn startup_probe(timeout: Duration) -> io::Result<StartupProbe> {
-    let mut tty = ProbeTty::open()?;
-    tty.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")?;
-    let deadline = Instant::now() + timeout;
-    let mut bytes = Vec::new();
-    loop {
-        tty.read_available(&mut bytes)?;
-        let probe = StartupProbe {
-            foreground: parse_osc_color(&bytes, 10),
-            background: parse_osc_color(&bytes, 11),
-        };
-        if probe.foreground.is_some() && probe.background.is_some() {
-            return Ok(probe);
-        }
-        let now = Instant::now();
-        if now >= deadline || !tty.poll_readable(deadline.saturating_duration_since(now))? {
-            return Ok(probe);
+struct PendingStartupProbe {
+    tty: ProbeTty,
+    deadline: Instant,
+    bytes: Vec<u8>,
+}
+
+impl PendingStartupProbe {
+    fn begin(timeout: Duration) -> io::Result<Self> {
+        let mut tty = ProbeTty::open()?;
+        tty.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")?;
+        Ok(Self {
+            tty,
+            deadline: Instant::now() + timeout,
+            bytes: Vec::new(),
+        })
+    }
+
+    fn finish(mut self) -> io::Result<StartupProbe> {
+        loop {
+            self.tty.read_available(&mut self.bytes)?;
+            let probe = StartupProbe {
+                foreground: parse_osc_color(&self.bytes, 10),
+                background: parse_osc_color(&self.bytes, 11),
+            };
+            if probe.foreground.is_some() && probe.background.is_some() {
+                return Ok(probe);
+            }
+            let now = Instant::now();
+            if now >= self.deadline
+                || !self
+                    .tty
+                    .poll_readable(self.deadline.saturating_duration_since(now))?
+            {
+                return Ok(probe);
+            }
         }
     }
 }

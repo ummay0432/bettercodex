@@ -11,8 +11,7 @@ pub(super) fn table_separator_style() -> Style {
     else {
         return Style::default().dim();
     };
-    if !supports_color::on_cached(supports_color::Stream::Stdout).is_some_and(|level| level.has_16m)
-    {
+    if !crate::terminal_color::stdout_supports_truecolor() {
         return Style::default().dim();
     }
 

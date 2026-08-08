@@ -21,6 +21,7 @@ use syntect::parsing::Scope;
 use syntect::parsing::SyntaxReference;
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use two_face::re_exports::syntect;
 use two_face::theme::EmbeddedThemeName;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();

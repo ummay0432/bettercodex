@@ -39,6 +39,7 @@
 //! body rows, or even 3-char-wide columns cannot fit, body rows render as
 //! key/value records.
 
+use crate::paths::home_dir;
 use crate::text::normalize_markdown_hash_location_suffix;
 use crate::tui::markdown_style::table_separator_style;
 use crate::tui::markdown_text_merge::DecodedTextMerge;
@@ -56,7 +57,6 @@ use crate::tui::width::display_width;
 use crate::tui::wrapping::RtOptions;
 use crate::tui::wrapping::adaptive_wrap_line;
 use crate::tui::wrapping::word_wrap_line;
-use dirs::home_dir;
 use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::CowStr;
@@ -2149,7 +2149,7 @@ fn parse_local_link_target(dest_url: &str) -> Option<(String, Option<String>)> {
     }
 
     let decoded_path_text =
-        urlencoding::decode(path_text).unwrap_or(std::borrow::Cow::Borrowed(path_text));
+        crate::url_encoding::decode(path_text).unwrap_or(std::borrow::Cow::Borrowed(path_text));
     Some((expand_local_link_path(&decoded_path_text), location_suffix))
 }
 

@@ -4442,7 +4442,7 @@ fn shimmer_spans_at(
 }
 
 fn supports_true_color() -> bool {
-    supports_color::on_cached(supports_color::Stream::Stdout).is_some_and(|level| level.has_16m)
+    crate::terminal_color::stdout_supports_truecolor()
 }
 
 fn blend(foreground: (u8, u8, u8), background: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
