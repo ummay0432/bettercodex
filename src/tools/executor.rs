@@ -254,7 +254,14 @@ impl ProcessManager {
                     ));
                 }
             } else {
-                session.write(arguments.chars.into_bytes()).await?;
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        session.kill();
+                        self.remove_session(arguments.session_id)?;
+                        return Err(anyhow!("write_stdin was interrupted"));
+                    }
+                    result = session.write(arguments.chars.into_bytes()) => result?,
+                }
                 // Codex gives the process a brief chance to react before the
                 // response collection window starts.
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -691,6 +698,78 @@ mod tests {
             error.to_string(),
             "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open",
         );
+    }
+
+    #[tokio::test]
+    async fn non_tty_interrupt_reports_conventional_signal_exit_code() {
+        let cwd = std::env::current_dir().unwrap();
+        let manager = ProcessManager::new(cwd);
+        let started = manager
+            .exec_command(
+                json!({
+                    "cmd": "printf ready; exec sleep 30",
+                    "yield_time_ms": 250,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let session_id = started["session_id"].as_i64().unwrap() as i32;
+
+        let completed = manager
+            .write_stdin(
+                json!({
+                    "session_id": session_id,
+                    "chars": "\u{3}",
+                    "yield_time_ms": 1000,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(completed["exit_code"], 130);
+        assert!(completed.get("session_id").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tty_input_backpressure_does_not_block_write_stdin() {
+        let cwd = std::env::current_dir().unwrap();
+        let manager = ProcessManager::new(cwd);
+        let started = manager
+            .exec_command(
+                json!({
+                    "cmd": "stty -echo; printf ready; sleep 30",
+                    "login": false,
+                    "shell": "/bin/sh",
+                    "tty": true,
+                    "yield_time_ms": 250,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let session_id = started["session_id"].as_i64().unwrap() as i32;
+        let input = "x".repeat(256 * 1024);
+
+        let polled = tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.write_stdin(
+                json!({
+                    "session_id": session_id,
+                    "chars": input,
+                    "yield_time_ms": 250,
+                }),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("write_stdin blocked on the child's full PTY input buffer")
+        .unwrap();
+
+        assert_eq!(polled["session_id"], session_id);
+        assert_eq!(manager.stop_all_background_processes(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]

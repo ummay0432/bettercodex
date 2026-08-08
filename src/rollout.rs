@@ -404,17 +404,13 @@ impl Rollout {
                     self.path.display()
                 )
             })?;
-            self.file.sync_data().with_context(|| {
-                format!(
-                    "failed to persist the restored session journal {}",
-                    self.path.display()
-                )
-            })?;
             return Err(error).with_context(|| format!("failed to append {}", self.path.display()));
         }
-        self.file
-            .sync_data()
-            .with_context(|| format!("failed to persist {}", self.path.display()))
+        // `BufWriter::flush` above completes the JSONL record and reports write errors. Do not
+        // force every record through `sync_data`: that blocks the agent on durable storage even
+        // though process-crash recovery only needs complete records in the filesystem cache.
+        // `load_rollout` repairs an interrupted final record before the journal is appended again.
+        Ok(())
     }
 }
 

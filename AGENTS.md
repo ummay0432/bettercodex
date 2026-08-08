@@ -11,7 +11,9 @@ freedom to be proactive.
 
 Do not use emojis, except for Codex's established checkmark status marker.
 
-Do not leave Rust build trash behind.
+Rust builds and tests must clean up every temporary file, fixture, cache, and
+compiled artifact they create, including on failure; remove any remainder
+before finishing.
 
 bettercodex is a focused port of [OpenAI Codex](https://github.com/openai/codex), not an independent implementation. For every retained behavior Codex already implements, inspect and port the current upstream source before editing; unexplained reimplementation or drift is forbidden unless [`product-direction.md`](progressive_disclosure/product-direction.md) explicitly requires the departure.
 

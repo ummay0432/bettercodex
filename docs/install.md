@@ -20,12 +20,13 @@ Install an authenticated [GitHub CLI](https://cli.github.com/), `curl`, a native
 C toolchain, and Rust through [rustup](https://rustup.rs/). Then copy and run the
 repository's one-line [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt).
 
-The command shallow-clones the current private source into a temporary
+The command downloads the current installer, which resolves private `main` to
+an exact commit and downloads that immutable source snapshot into a temporary
 directory. Cargo's dependency cache, compilation target, and verified V8
 downloads are isolated under the same directory. An exit trap removes the
 entire directory after a successful install, a build failure, or an
-interruption. Only the binary under `$HOME/.local/bin`, its small Cargo
-installation metadata, and BetterCodex user data remain from the BetterCodex
+interruption. Only the binary under `$HOME/.local/bin`, a small shell-profile
+PATH entry when needed, and BetterCodex user data remain from the BetterCodex
 build. Rustup's selected Rust toolchain and the native toolchain are not removed
 because other software may share them.
 
@@ -47,25 +48,40 @@ BetterCodex settings and saved sessions stay under `$HOME/.bcodex`.
 
 ## Updating
 
-Bettercodex does not carry a separate updater or release-packaging system.
-Fetch current source and reinstall by rerunning
-[`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt). Each run uses a fresh shallow
-clone, so an update cannot merge local source changes or reuse stale build
-output.
+The installer embeds its exact source revision in the binary. After the TUI
+renders its first frame, an installed release compares that revision with the
+current private `main` commit in a failure-silent background check. When they
+differ, the TUI shows `Update available` and the command to run in another
+terminal:
 
-## Migrating from the retired updater
+```sh
+bcodex update
+```
+
+The command fetches the installer from the exact current `main` revision, runs
+the same self-cleaning source installation, and targets the directory containing
+the running binary. The running TUI keeps using its old in-memory code until
+restarted. Failed background checks stay silent and are retried on the next
+launch; set `BCODEX_SKIP_UPDATE_CHECK=1` to disable them. Rerunning
+[`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) remains an equivalent manual
+update path for the default `$HOME/.local/bin` installation.
+
+Each update uses a fresh immutable source archive, so it cannot merge local
+source changes or reuse stale build output.
+
+## Migrating from an older updater
 
 An installed 0.1.2-era binary may still show `Update available` and advertise
 `bcodex update`. That executable compares its embedded source commit with
 private `main`, so any later commit triggers the notice even though both builds
-report version 0.1.2. The updater itself was subsequently removed with the
-private packaging scripts; an old executable cannot migrate across that removal
-by updating itself.
+report version 0.1.2. Some older executables embed the retired persistent-cache
+installer and cannot migrate across its removal by updating themselves.
 
 Run [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) once to install current
-source through Cargo. Existing ChatGPT credentials, Bettercodex settings, and
-saved sessions are unaffected. After the newly installed binary launches, the
-retired updater's build target and temporary source cache can be removed:
+source. Existing ChatGPT credentials, Bettercodex settings, and saved sessions
+are unaffected. The newly installed binary restores
+`bcodex update` with the self-cleaning installer. After it launches, the retired
+updater's build target and temporary source cache can be removed:
 
 ```sh
 retired_cache="${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex"

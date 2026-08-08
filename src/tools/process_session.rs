@@ -11,19 +11,25 @@ use portable_pty::PtySize;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 const PROCESS_READ_BUFFER_BYTES: usize = 64 * 1024;
+const PROCESS_STDIN_QUEUE_CAPACITY: usize = 8;
 pub(super) const RETAINED_HEAD_BYTES: usize = 512 * 1024;
 pub(super) const RETAINED_TAIL_BYTES: usize = 512 * 1024;
 const UNIFIED_EXEC_ENV: [(&str, &str); 9] = [
@@ -52,8 +58,8 @@ pub(super) enum ShellStartup {
 
 pub(super) struct ProcessSession {
     state: Mutex<ProcessState>,
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    writer: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     notify: Notify,
     interaction: Arc<AsyncMutex<()>>,
     mode: ProcessMode,
@@ -75,8 +81,8 @@ impl ProcessSession {
     }
 
     pub(super) fn new(
-        writer: Option<Box<dyn Write + Send>>,
-        killer: Box<dyn ChildKiller + Send + Sync>,
+        writer: Option<mpsc::Sender<Vec<u8>>>,
+        killer: Option<Box<dyn ChildKiller + Send + Sync>>,
         readers: usize,
         mode: ProcessMode,
         process_group_id: Option<i32>,
@@ -173,26 +179,13 @@ impl ProcessSession {
             .writer
             .lock()
             .map_err(|_| anyhow!("process stdin lock was poisoned"))?
-            .take()
+            .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("stdin is closed"))?;
-        let result = tokio::task::spawn_blocking(move || {
-            let mut writer = writer;
-            writer.write_all(&bytes)?;
-            writer.flush()?;
-            Ok::<_, std::io::Error>(writer)
-        })
-        .await
-        .context("stdin writer task failed")?;
-        match result {
-            Ok(writer) => {
-                *self
-                    .writer
-                    .lock()
-                    .map_err(|_| anyhow!("process stdin lock was poisoned"))? = Some(writer);
-                Ok(())
-            }
-            Err(error) => Err(error).context("failed to write process stdin"),
-        }
+        writer
+            .send(bytes)
+            .await
+            .map_err(|_| anyhow!("stdin is closed"))
     }
 
     pub(super) fn interrupt(&self) -> Result<()> {
@@ -211,10 +204,12 @@ impl ProcessSession {
         {
             return;
         }
-        if self.signal_process_group(libc::SIGKILL) {
-            return;
-        }
-        if let Ok(mut killer) = self.killer.lock() {
+        let _ = self.signal_process_group(libc::SIGKILL);
+        // PTY children also retain a direct killer. Current Codex invokes it even after the group
+        // signal in case the cached process-group identifier became stale.
+        if let Ok(mut killer) = self.killer.lock()
+            && let Some(killer) = killer.as_mut()
+        {
             let _ = killer.kill();
         }
     }
@@ -231,7 +226,12 @@ impl ProcessSession {
         };
         // Both launch paths create a new process group whose leader is the spawned shell, matching
         // Codex's whole-command signals.
-        unsafe { libc::kill(-process_group_id, signal) == 0 }
+        #[cfg(target_os = "macos")]
+        if matches!(self.mode, ProcessMode::Piped) && signal == libc::SIGKILL {
+            return signal_process_group_with_member_fallback(process_group_id, signal)
+                .unwrap_or(false);
+        }
+        signal_process_group_id(process_group_id, signal).unwrap_or(false)
     }
 
     pub(super) fn snapshot(&self) -> Result<ProcessSnapshot> {
@@ -393,8 +393,7 @@ fn spawn_piped(
     cwd: &Path,
 ) -> Result<Arc<ProcessSession>> {
     let (program, arguments) = shell_command(shell, shell_startup, command);
-    let mut process = std::process::Command::new(program);
-    use std::os::unix::process::CommandExt;
+    let mut process = tokio::process::Command::new(program);
     process
         .args(arguments)
         .current_dir(cwd)
@@ -409,20 +408,16 @@ fn spawn_piped(
         .with_context(|| format!("failed to start command in {}", cwd.display()))?;
     let stdout = child.stdout.take().context("failed to capture stdout")?;
     let stderr = child.stderr.take().context("failed to capture stderr")?;
-    let process_group_id = i32::try_from(child.id()).ok();
-    let killer = child.clone_killer();
-    let session = ProcessSession::new(None, killer, 2, ProcessMode::Piped, process_group_id);
-    spawn_reader(Arc::clone(&session), stdout, "stdout");
-    spawn_reader(Arc::clone(&session), stderr, "stderr");
+    let process_group_id = child.id().and_then(|id| i32::try_from(id).ok());
+    let session = ProcessSession::new(None, None, 2, ProcessMode::Piped, process_group_id);
+    spawn_async_reader(Arc::clone(&session), stdout, "stdout");
+    spawn_async_reader(Arc::clone(&session), stderr, "stderr");
     let waiter = Arc::clone(&session);
-    std::thread::spawn(move || match child.wait() {
-        Ok(status) => waiter.exited(
-            status
-                .code()
-                .unwrap_or_else(|| if status.success() { 0 } else { 1 }),
-            None,
-        ),
-        Err(error) => waiter.exited(1, Some(format!("failed to wait for command: {error}"))),
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) => waiter.exited(exit_code_from_status(status), None),
+            Err(error) => waiter.exited(-1, Some(format!("failed to wait for command: {error}"))),
+        }
     });
     Ok(session)
 }
@@ -466,17 +461,43 @@ fn spawn_pty(
         .context("failed to capture PTY input")?;
     let process_group_id = child.process_id().and_then(|id| i32::try_from(id).ok());
     let killer = child.clone_killer();
-    let session = ProcessSession::new(Some(writer), killer, 1, ProcessMode::Pty, process_group_id);
-    spawn_reader(Arc::clone(&session), reader, "PTY");
+    let writer = spawn_writer(writer);
+    let session = ProcessSession::new(
+        Some(writer),
+        Some(killer),
+        1,
+        ProcessMode::Pty,
+        process_group_id,
+    );
+    spawn_blocking_reader(Arc::clone(&session), reader, "PTY");
     let waiter = Arc::clone(&session);
     std::thread::spawn(move || match child.wait() {
         Ok(status) => waiter.exited(status.exit_code() as i32, None),
-        Err(error) => waiter.exited(1, Some(format!("failed to wait for PTY command: {error}"))),
+        Err(error) => waiter.exited(-1, Some(format!("failed to wait for PTY command: {error}"))),
     });
     Ok(session)
 }
 
-fn spawn_reader(
+fn spawn_async_reader(
+    session: Arc<ProcessSession>,
+    mut reader: impl AsyncRead + Unpin + Send + 'static,
+    label: &'static str,
+) {
+    tokio::spawn(async move {
+        let mut buffer = vec![0_u8; PROCESS_READ_BUFFER_BYTES];
+        let error = loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => break None,
+                Ok(read) => session.append(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => break Some(format!("failed to read {label}: {error}")),
+            }
+        };
+        session.reader_finished(error);
+    });
+}
+
+fn spawn_blocking_reader(
     session: Arc<ProcessSession>,
     mut reader: impl Read + Send + 'static,
     label: &'static str,
@@ -496,6 +517,139 @@ fn spawn_reader(
         };
         session.reader_finished(error);
     });
+}
+
+fn spawn_writer(writer: Box<dyn Write + Send>) -> mpsc::Sender<Vec<u8>> {
+    let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(PROCESS_STDIN_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(bytes) = receiver.recv().await {
+            let result = tokio::task::spawn_blocking(move || {
+                writer.write_all(&bytes)?;
+                writer.flush()?;
+                Ok::<_, std::io::Error>(writer)
+            })
+            .await;
+            match result {
+                Ok(Ok(returned_writer)) => writer = returned_writer,
+                Ok(Err(_)) | Err(_) => return,
+            }
+        }
+    });
+    sender
+}
+
+fn exit_code_from_status(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(-1)
+}
+
+fn signal_process_group_id(process_group_id: i32, signal: i32) -> std::io::Result<bool> {
+    let result = unsafe { libc::killpg(process_group_id, signal) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "macos")]
+fn signal_process_id(process_id: libc::pid_t, signal: i32) -> std::io::Result<bool> {
+    if unsafe { libc::kill(process_id, signal) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "macos")]
+fn signal_process_group_with_member_fallback(
+    process_group_id: i32,
+    signal: i32,
+) -> std::io::Result<bool> {
+    if process_group_id <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid process group ID",
+        ));
+    }
+    match signal_process_group_id(process_group_id, signal) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        result => return result,
+    }
+
+    let mut process_ids: Vec<libc::pid_t> = vec![0; 16];
+    loop {
+        let buffer_size = libc::c_int::try_from(std::mem::size_of_val(process_ids.as_slice()))
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "process group is too large",
+                )
+            })?;
+        let count = unsafe {
+            libc::proc_listpgrppids(
+                process_group_id,
+                process_ids.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let count = count as usize;
+        if count < process_ids.len() {
+            process_ids.truncate(count);
+            break;
+        }
+        let capacity = process_ids.len().checked_mul(2).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process group is too large",
+            )
+        })?;
+        process_ids.resize(capacity, 0);
+    }
+    // Signal descendants first so an exiting leader cannot orphan work before it is terminated.
+    process_ids.sort_unstable_by_key(|process_id| *process_id == process_group_id);
+
+    let mut signalled = false;
+    let mut first_error = None;
+    for process_id in process_ids {
+        if process_id <= 0 {
+            continue;
+        }
+        let current_group_id = unsafe { libc::getpgid(process_id) };
+        if current_group_id == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
+                first_error = Some(error);
+            }
+            continue;
+        }
+        if current_group_id != process_group_id {
+            continue;
+        }
+        match signal_process_id(process_id, signal) {
+            Ok(delivered) => signalled |= delivered,
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+
+    if signalled {
+        Ok(true)
+    } else {
+        first_error.map_or(Ok(false), Err)
+    }
 }
 
 pub(super) fn shell_command(
