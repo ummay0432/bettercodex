@@ -101,3 +101,41 @@ pub(crate) fn truncate_width(value: &str, width: usize) -> String {
     output.push('…');
     output
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_model_derived_fragments_before_terminal_output() {
+        let progress = LoopProgress::new(
+            "\u{1b}[31mShopify │ speed extra",
+            "2/3\nignored",
+            Some(12),
+            Some(4),
+            "kept\r\n│ \u{1b}[32m18% faster",
+        );
+        assert_eq!(progress.name, "[31mShopify speed");
+        assert_eq!(progress.phase, "2/3 ignored");
+        assert_eq!(progress.pulse, "kept [32m18% faster");
+        let line = progress.stderr_line();
+        assert!(!line.contains('\u{1b}'));
+        assert_eq!(line.matches('│').count(), 2);
+        assert!(!line.contains("+12"));
+    }
+
+    #[test]
+    fn truncation_uses_display_width_without_splitting_graphemes() {
+        assert_eq!(truncate_width("Shopify speed", 8), "Shopify…");
+        assert_eq!(truncate_width("e\u{301}clair", 3), "e\u{301}c…");
+        assert!(UnicodeWidthStr::width(truncate_width("界面速度", 5).as_str()) <= 5);
+        assert_eq!(truncate_width("abc", 0), "");
+    }
+
+    #[test]
+    fn invalid_or_overlong_name_falls_back_or_is_bounded() {
+        assert_eq!(normalize_name(" \n │ \t"), "Quality loop");
+        let name = normalize_name("one two three four");
+        assert_eq!(name, "one two");
+        assert!(UnicodeWidthStr::width(name.as_str()) <= MAX_NAME_WIDTH);
+    }
+}

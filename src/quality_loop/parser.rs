@@ -53,6 +53,11 @@ enum CountError {
     Overflow,
 }
 
+#[cfg(test)]
+pub(crate) fn parse_invocation(text: &str, has_attachment: bool) -> Result<Option<LoopInvocation>> {
+    parse_invocation_with_mode(text, has_attachment, true)
+}
+
 pub(crate) fn parse_invocation_with_mode(
     text: &str,
     has_attachment: bool,

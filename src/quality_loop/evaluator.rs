@@ -6,18 +6,17 @@ use crate::quality_loop::EvaluatorContract;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_utils_pty::SpawnedProcess;
+use codex_utils_pty::spawn_pipe_process_no_stdin;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const MAX_CHECK_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -54,7 +53,7 @@ pub(crate) enum ImprovementDecision {
 }
 
 enum CommandTermination {
-    Status(std::process::ExitStatus),
+    Status(i32),
     TimedOut,
     Cancelled,
 }
@@ -170,11 +169,79 @@ pub(crate) fn compare_reports(
     }
 }
 
+pub(crate) fn validate_structured_artifact(
+    contract: &EvaluatorContract,
+    artifact_path: &Path,
+    expected_state: &str,
+) -> Result<()> {
+    load_structured_artifact(contract, artifact_path, expected_state).map(|_| ())
+}
+
 pub(crate) fn apply_structured_artifact(
     contract: &EvaluatorContract,
     report: &mut EvaluationReport,
     artifact_path: &Path,
 ) -> Result<()> {
+    let artifact = load_structured_artifact(contract, artifact_path, &report.state)?;
+    let checks = artifact
+        .get("checks")
+        .and_then(Value::as_object)
+        .expect("validated phase evidence has check results");
+    for check in &contract.machine_checks {
+        let value = checks
+            .get(&check.id)
+            .expect("validated phase evidence has every machine check");
+        let claimed = judgment_passed(value)
+            .expect("validated machine evidence has a boolean verdict");
+        let observed = report
+            .checks
+            .get(&check.id)
+            .ok_or_else(|| anyhow!("harness result omitted machine check `{}`", check.id))?;
+        if observed.passed != claimed {
+            return Err(anyhow!(
+                "phase evidence contradicts harness result for `{}`",
+                check.id
+            ));
+        }
+    }
+    for check in &contract.model_checks {
+        let value = checks
+            .get(&check.id)
+            .expect("validated phase evidence has every model check");
+        let passed =
+            judgment_passed(value).expect("validated model evidence has a boolean verdict");
+        let artifacts = value
+            .as_object()
+            .and_then(|value| value.get("artifacts"))
+            .and_then(Value::as_array)
+            .expect("validated model evidence has artifacts");
+        report.checks.insert(
+            check.id.clone(),
+            CheckReport {
+                passed,
+                values: vec![CheckValue::Pass(passed)],
+                evidence: artifacts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            },
+        );
+    }
+    report.accepted = contract
+        .acceptance
+        .required_check_ids
+        .iter()
+        .all(|id| report.checks.get(id).is_some_and(|check| check.passed));
+    report.decisive = decisive_result(contract, &report.checks, report.accepted);
+    Ok(())
+}
+
+fn load_structured_artifact(
+    contract: &EvaluatorContract,
+    artifact_path: &Path,
+    expected_state: &str,
+) -> Result<Value> {
     let metadata = std::fs::symlink_metadata(artifact_path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(anyhow!("phase evidence must be a regular JSON file"));
@@ -188,10 +255,9 @@ pub(crate) fn apply_structured_artifact(
         .get("state")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("phase evidence omitted its state identity"))?;
-    if state != report.state {
+    if state != expected_state {
         return Err(anyhow!(
-            "phase evidence is bound to stale state `{state}` instead of `{}`",
-            report.state
+            "phase evidence is bound to stale state `{state}` instead of `{expected_state}`"
         ));
     }
     let checks = artifact
@@ -217,24 +283,14 @@ pub(crate) fn apply_structured_artifact(
         let value = checks
             .get(&check.id)
             .ok_or_else(|| anyhow!("phase evidence omitted check `{}`", check.id))?;
-        let claimed = judgment_passed(value)
+        judgment_passed(value)
             .ok_or_else(|| anyhow!("machine check `{}` omitted a boolean verdict", check.id))?;
-        if report
-            .checks
-            .get(&check.id)
-            .is_some_and(|observed| observed.passed != claimed)
-        {
-            return Err(anyhow!(
-                "phase evidence contradicts harness result for `{}`",
-                check.id
-            ));
-        }
     }
     for check in &contract.model_checks {
         let value = checks
             .get(&check.id)
             .ok_or_else(|| anyhow!("phase evidence omitted model check `{}`", check.id))?;
-        let passed = judgment_passed(value)
+        judgment_passed(value)
             .ok_or_else(|| anyhow!("model check `{}` omitted a boolean verdict", check.id))?;
         let artifacts = value
             .as_object()
@@ -286,26 +342,8 @@ pub(crate) fn apply_structured_artifact(
                 ));
             }
         }
-        report.checks.insert(
-            check.id.clone(),
-            CheckReport {
-                passed,
-                values: vec![CheckValue::Pass(passed)],
-                evidence: artifacts
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect(),
-            },
-        );
     }
-    report.accepted = contract
-        .acceptance
-        .required_check_ids
-        .iter()
-        .all(|id| report.checks.get(id).is_some_and(|check| check.passed));
-    report.decisive = decisive_result(contract, &report.checks, report.accepted);
-    Ok(())
+    Ok(artifact)
 }
 
 fn judgment_passed(value: &Value) -> Option<bool> {
@@ -370,9 +408,7 @@ async fn run_check(
         let log_path = evidence_directory.join(&log_name);
         let log = format!(
             "status: {}\nstdout-bytes: {}\nstderr-bytes: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n",
-            status
-                .code()
-                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            status,
             stdout.len(),
             stderr.len(),
             String::from_utf8_lossy(&stdout),
@@ -380,9 +416,7 @@ async fn run_check(
         );
         super::state::atomic_private_write(&log_path, log.as_bytes())?;
         evidence.push(log_name);
-        let expected = status
-            .code()
-            .is_some_and(|code| check.expected_exit_codes.contains(&code));
+        let expected = check.expected_exit_codes.contains(&status);
         if exceeded {
             passed = false;
             values.push(CheckValue::Text(
@@ -421,59 +455,44 @@ async fn run_command(
     check: &MachineCheck,
     worktree_root: &Path,
     cancellation: &CancellationToken,
-) -> Result<Option<(std::process::ExitStatus, Vec<u8>, Vec<u8>, bool)>> {
+) -> Result<Option<(i32, Vec<u8>, Vec<u8>, bool)>> {
     let program = check.argv.first().expect("validated non-empty argv");
     let cwd = worktree_root.join(&check.cwd);
-    let mut command = Command::new(program);
-    command
-        .args(&check.argv[1..])
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut environment = std::env::vars().collect::<HashMap<_, _>>();
     for (name, value) in &check.env {
-        command.env(name, value);
+        environment.insert(name.clone(), value.clone());
     }
-    unsafe {
-        command.as_std_mut().pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-    let mut child = command
-        .spawn()
+    let SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        mut exit_rx,
+    } = spawn_pipe_process_no_stdin(program, &check.argv[1..], &cwd, &environment, &None, &[])
+        .await
         .with_context(|| format!("failed to start evaluator check `{}`", check.id))?;
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow!("evaluator process has no ID"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("check stdout missing"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("check stderr missing"))?;
-    let stdout_task = tokio::spawn(read_bounded(stdout));
-    let stderr_task = tokio::spawn(read_bounded(stderr));
+    let stdout_task = tokio::spawn(read_bounded(stdout_rx));
+    let stderr_task = tokio::spawn(read_bounded(stderr_rx));
     let timer = tokio::time::sleep(Duration::from_secs(check.timeout_seconds));
     tokio::pin!(timer);
     let termination = tokio::select! {
-        status = child.wait() => CommandTermination::Status(status?),
+        status = &mut exit_rx => CommandTermination::Status(status.unwrap_or(-1)),
         _ = &mut timer => CommandTermination::TimedOut,
         _ = cancellation.cancelled() => CommandTermination::Cancelled,
     };
     let timed_out = matches!(termination, CommandTermination::TimedOut);
     let cancelled = matches!(termination, CommandTermination::Cancelled);
+    // The root process can exit while descendants retain the output pipes or continue mutating
+    // the worktree. The pinned upstream process runtime retains the process-group identity after
+    // root exit, so this always terminates the entire owned group before evidence is consumed.
+    session.request_terminate();
     let status = match termination {
         CommandTermination::Status(status) => status,
         CommandTermination::TimedOut | CommandTermination::Cancelled => {
-            terminate_process_group(pid).await;
-            child.wait().await?
+            tokio::time::timeout(Duration::from_secs(2), &mut exit_rx)
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .unwrap_or(-1)
         }
     };
     let (stdout, stdout_exceeded) = stdout_task.await??;
@@ -489,31 +508,16 @@ async fn run_command(
     )))
 }
 
-async fn read_bounded(mut reader: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bool)> {
+async fn read_bounded(mut receiver: mpsc::Receiver<Vec<u8>>) -> Result<(Vec<u8>, bool)> {
     let mut kept = Vec::new();
     let mut exceeded = false;
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
+    while let Some(buffer) = receiver.recv().await {
+        let read = buffer.len();
         let remaining = MAX_CHECK_OUTPUT_BYTES.saturating_sub(kept.len());
         kept.extend_from_slice(&buffer[..read.min(remaining)]);
         exceeded |= read > remaining;
     }
     Ok((kept, exceeded))
-}
-
-async fn terminate_process_group(pid: u32) {
-    let group = -(pid as i32);
-    unsafe {
-        libc::kill(group, libc::SIGTERM);
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    unsafe {
-        libc::kill(group, libc::SIGKILL);
-    }
 }
 
 fn extract(check: &MachineCheck, stdout: &[u8], passed: bool) -> Result<CheckValue> {
@@ -644,4 +648,495 @@ fn create_private_directory(path: &Path) -> Result<()> {
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quality_loop::EvaluatorContract;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "bettercodex-loop-evaluator-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("candidate.txt"), "10\n").unwrap();
+            Self { root }
+        }
+
+        fn script(&self, name: &str, source: &str) -> PathBuf {
+            let path = self.root.join(name);
+            std::fs::write(&path, source).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn contract(root: &Path, program: &Path, repeats: u8) -> EvaluatorContract {
+        let contract: EvaluatorContract = serde_json::from_value(json!({
+            "version": 1,
+            "loop_name": "Metric speed",
+            "promises": [{
+                "id": "metric",
+                "class": "improvement",
+                "statement": "the measured value increases",
+                "failure_mode": "the value ties or decreases",
+                "method": "local metric command",
+                "required_evidence": ["numeric output"]
+            }],
+            "candidate_paths": ["candidate.txt"],
+            "fixed_constraints": ["local only"],
+            "integrity_paths": [],
+            "scratch_paths": [],
+            "machine_checks": [{
+                "id": "metric-check",
+                "promise_ids": ["metric"],
+                "argv": [program],
+                "cwd": ".",
+                "env": {},
+                "input_paths": [{"root": "worktree", "path": "candidate.txt"}],
+                "fixture_paths": [],
+                "timeout_seconds": 2,
+                "resource_budget": "one process",
+                "side_effects": "none",
+                "approval": "none",
+                "expected_exit_codes": [0],
+                "extract": {"kind": "json_number", "json_pointer": "/value"},
+                "baseline_repeats": repeats
+            }],
+            "discrimination_checks": [{
+                "linked_check_id": "metric-check",
+                "check": {
+                    "id": "metric-known-failure",
+                    "promise_ids": ["metric"],
+                    "argv": [program],
+                    "cwd": ".",
+                    "env": {},
+                    "input_paths": [{"root": "worktree", "path": "candidate.txt"}],
+                    "fixture_paths": [{
+                        "root": "evaluator",
+                        "path": "evaluator/workspace/known-failure.txt"
+                    }],
+                    "timeout_seconds": 2,
+                    "resource_budget": "one process",
+                    "side_effects": "none",
+                    "approval": "none",
+                    "expected_exit_codes": [0],
+                    "extract": {"kind": "pass"},
+                    "baseline_repeats": 1
+                }
+            }],
+            "model_checks": [],
+            "acceptance": {"required_check_ids": ["metric-check"]},
+            "comparison": {
+                "kind": "metric",
+                "check_id": "metric-check",
+                "direction": "higher",
+                "minimum_delta": 2.0,
+                "tolerance": 0.5,
+                "ties": "discard",
+                "inconclusive": "discard"
+            },
+            "environment": ["fixture"],
+            "uncovered": ["none"],
+            "known_loopholes": ["none"]
+        }))
+        .unwrap();
+        contract.validate(root).unwrap();
+        contract
+    }
+
+    #[tokio::test]
+    async fn harness_runs_repeats_extracts_metrics_and_writes_bounded_evidence() {
+        let fixture = Fixture::new();
+        let script = fixture.script(
+            "metric.sh",
+            "#!/bin/sh\nprintf '{\"value\": %s}\\n' \"$(cat candidate.txt)\"\n",
+        );
+        let contract = contract(&fixture.root, &script, 2);
+        let evidence = fixture.root.join("evidence");
+        let report = run_machine_evaluation(
+            &contract,
+            &fixture.root,
+            "state-1",
+            &evidence,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(report.accepted);
+        assert_eq!(report.decisive, "metric-check=10");
+        assert_eq!(report.checks["metric-check"].values.len(), 2);
+        assert!(evidence.join("metric-check-1.log").is_file());
+        assert!(evidence.join("metric-check-2.log").is_file());
+    }
+
+    #[tokio::test]
+    async fn harness_reproduces_frozen_known_failure_discrimination() {
+        let fixture = Fixture::new();
+        let known_failure = fixture.root.join("evaluator/workspace/known-failure.txt");
+        std::fs::create_dir_all(known_failure.parent().unwrap()).unwrap();
+        std::fs::write(&known_failure, "known failure\n").unwrap();
+        let script = fixture.script(
+            "metric.sh",
+            "#!/bin/sh\nif [ \"$1\" = --probe ]; then\n  grep -qx 'known failure' \"$2\"\n  exit\nfi\nprintf '{\"value\": %s}\\n' \"$(cat candidate.txt)\"\n",
+        );
+        let mut contract = contract(&fixture.root, &script, 1);
+        contract.discrimination_checks[0].check.argv = vec![
+            script.display().to_string(),
+            "--probe".to_string(),
+            known_failure.display().to_string(),
+        ];
+        contract.validate(&fixture.root).unwrap();
+
+        let reports = run_discrimination_checks(
+            &contract,
+            &fixture.root,
+            &fixture.root.join("discrimination-pass"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(reports["metric-known-failure"].passed);
+
+        std::fs::write(&known_failure, "healthy fixture\n").unwrap();
+        let reports = run_discrimination_checks(
+            &contract,
+            &fixture.root,
+            &fixture.root.join("discrimination-fail"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!reports["metric-known-failure"].passed);
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_is_a_failed_check_instead_of_a_harness_crash() {
+        let fixture = Fixture::new();
+        let script = fixture.script("fail.sh", "#!/bin/sh\nexit 7\n");
+        let contract = contract(&fixture.root, &script, 1);
+        let report = run_machine_evaluation(
+            &contract,
+            &fixture.root,
+            "state-1",
+            &fixture.root.join("evidence"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!report.accepted);
+        assert!(!report.checks["metric-check"].passed);
+    }
+
+    #[tokio::test]
+    async fn timeout_terminates_the_phase_process_group_and_fails_closed() {
+        let fixture = Fixture::new();
+        let marker = fixture.root.join("late-marker");
+        let script = fixture.script(
+            "timeout.sh",
+            &format!(
+                "#!/bin/sh\n(sleep 3; printf late > '{}') &\nwait\n",
+                marker.display()
+            ),
+        );
+        let mut contract = contract(&fixture.root, &script, 1);
+        contract.machine_checks[0].timeout_seconds = 1;
+        let report = run_machine_evaluation(
+            &contract,
+            &fixture.root,
+            "state-1",
+            &fixture.root.join("evidence"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!report.accepted);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_root_exit_still_terminates_background_descendants() {
+        let fixture = Fixture::new();
+        let child_record = fixture.root.join("child.pid");
+        let script = fixture.script(
+            "background.sh",
+            &format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nprintf '{{\"value\": 10}}\\n'\n",
+                child_record.display()
+            ),
+        );
+        let contract = contract(&fixture.root, &script, 1);
+        let evaluation = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_machine_evaluation(
+                &contract,
+                &fixture.root,
+                "state-1",
+                &fixture.root.join("evidence"),
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+        let child = std::fs::read_to_string(&child_record)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        if evaluation.is_err() {
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+            }
+        }
+        let report = evaluation
+            .expect("evaluator hung on a descendant retaining its output pipes")
+            .unwrap()
+            .unwrap();
+        assert!(report.accepted);
+
+        let exited = tokio::time::timeout(Duration::from_secs(2), async {
+            while process_exists(child) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !exited {
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+            }
+        }
+        assert!(exited, "background evaluator descendant survived cleanup");
+    }
+
+    fn process_exists(process_id: libc::pid_t) -> bool {
+        if unsafe { libc::kill(process_id, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn structured_artifact_must_match_state_check_set_and_machine_truth() {
+        let fixture = Fixture::new();
+        let script = fixture.script("metric.sh", "#!/bin/sh\nprintf '{\"value\":10}'\n");
+        let contract = contract(&fixture.root, &script, 1);
+        let mut report = EvaluationReport {
+            state: "candidate-state".to_string(),
+            accepted: true,
+            decisive: "metric-check=10".to_string(),
+            checks: BTreeMap::from([(
+                "metric-check".to_string(),
+                CheckReport {
+                    passed: true,
+                    values: vec![CheckValue::Number(10.0)],
+                    evidence: vec!["metric.log".to_string()],
+                },
+            )]),
+        };
+        let artifact = fixture.root.join("artifact.json");
+
+        std::fs::write(
+            &artifact,
+            serde_json::to_vec(&json!({
+                "state": "stale",
+                "checks": {"metric-check": {"passed": true}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(apply_structured_artifact(&contract, &mut report, &artifact).is_err());
+
+        std::fs::write(
+            &artifact,
+            serde_json::to_vec(&json!({
+                "state": "candidate-state",
+                "checks": {"metric-check": {"passed": false}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(apply_structured_artifact(&contract, &mut report, &artifact).is_err());
+
+        std::fs::write(
+            &artifact,
+            serde_json::to_vec(&json!({
+                "state": "candidate-state",
+                "checks": {
+                    "metric-check": {"passed": true},
+                    "invented": {"passed": true}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(apply_structured_artifact(&contract, &mut report, &artifact).is_err());
+    }
+
+    #[test]
+    fn metric_comparison_applies_acceptance_delta_tolerance_and_inconclusive_rules() {
+        let fixture = Fixture::new();
+        let script = fixture.script("metric.sh", "#!/bin/sh\nprintf '{\"value\":10}'\n");
+        let contract = contract(&fixture.root, &script, 1);
+        let report = |value: Option<f64>, accepted| EvaluationReport {
+            state: "state".to_string(),
+            accepted,
+            decisive: "result".to_string(),
+            checks: BTreeMap::from([(
+                "metric-check".to_string(),
+                CheckReport {
+                    passed: accepted,
+                    values: value.into_iter().map(CheckValue::Number).collect(),
+                    evidence: Vec::new(),
+                },
+            )]),
+        };
+        assert!(matches!(
+            compare_reports(
+                &contract,
+                &report(Some(10.0), true),
+                &report(Some(12.0), true)
+            ),
+            ImprovementDecision::Better(_)
+        ));
+        assert!(matches!(
+            compare_reports(
+                &contract,
+                &report(Some(10.0), true),
+                &report(Some(10.4), true)
+            ),
+            ImprovementDecision::NotBetter(_)
+        ));
+        assert!(matches!(
+            compare_reports(&contract, &report(Some(10.0), true), &report(None, true)),
+            ImprovementDecision::Inconclusive(_)
+        ));
+        assert!(matches!(
+            compare_reports(
+                &contract,
+                &report(Some(10.0), true),
+                &report(Some(20.0), false)
+            ),
+            ImprovementDecision::NotBetter(_)
+        ));
+    }
+
+    #[test]
+    fn calibrated_pairwise_artifacts_require_both_position_orders() {
+        let fixture = Fixture::new();
+        let script = fixture.script("metric.sh", "#!/bin/sh\nprintf '{\"value\":10}'\n");
+        let base = contract(&fixture.root, &script, 1);
+        let mut value = serde_json::to_value(base).unwrap();
+        value["model_checks"] = json!([{
+            "id": "quality-judge",
+            "promise_ids": ["metric"],
+            "kind": "pairwise",
+            "rubric_path": "evaluator/workspace/rubric.md",
+            "required_artifacts": ["candidate and incumbent evidence"],
+            "calibration_paths": [
+                "evaluator/workspace/calibration-pass.json",
+                "evaluator/workspace/calibration-fail.json"
+            ],
+            "output_shape": "two-order boolean pairwise result",
+            "hard_gate": false
+        }]);
+        value["comparison"] = json!({
+            "kind": "pairwise",
+            "check_id": "quality-judge",
+            "direction": null,
+            "minimum_delta": 0.0,
+            "tolerance": 0.0,
+            "ties": "discard",
+            "inconclusive": "discard"
+        });
+        let contract: EvaluatorContract = serde_json::from_value(value).unwrap();
+        contract.validate(&fixture.root).unwrap();
+        let mut candidate = EvaluationReport {
+            state: "candidate".to_string(),
+            accepted: true,
+            decisive: "metric-check=10".to_string(),
+            checks: BTreeMap::from([(
+                "metric-check".to_string(),
+                CheckReport {
+                    passed: true,
+                    values: vec![CheckValue::Number(10.0)],
+                    evidence: Vec::new(),
+                },
+            )]),
+        };
+        let artifact = fixture.root.join("pairwise.json");
+        let write = |orders: Value| {
+            std::fs::write(
+                &artifact,
+                serde_json::to_vec(&json!({
+                    "state": "candidate",
+                    "checks": {
+                        "metric-check": {"passed": true},
+                        "quality-judge": {
+                            "passed": true,
+                            "artifacts": ["candidate.json and incumbent.json"],
+                            "calibration_passed": true,
+                            "orders": orders,
+                            "consistent": true
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write(json!(["candidate_first"]));
+        assert!(apply_structured_artifact(&contract, &mut candidate, &artifact).is_err());
+        write(json!(["candidate_first", "incumbent_first"]));
+        apply_structured_artifact(&contract, &mut candidate, &artifact).unwrap();
+        assert!(matches!(
+            compare_reports(&contract, &candidate.clone(), &candidate),
+            ImprovementDecision::Better(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_numeric_output_is_an_inconclusive_failed_check() {
+        let fixture = Fixture::new();
+        let script = fixture.script("invalid-json.sh", "#!/bin/sh\nprintf not-json\n");
+        let contract = contract(&fixture.root, &script, 1);
+        let report = run_machine_evaluation(
+            &contract,
+            &fixture.root,
+            "state-1",
+            &fixture.root.join("evidence"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!report.accepted);
+        assert!(metric_value(&report, "metric-check").is_none());
+        assert!(matches!(
+            compare_reports(&contract, &report, &report),
+            ImprovementDecision::NotBetter(_)
+        ));
+    }
 }

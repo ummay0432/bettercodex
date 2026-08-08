@@ -15,6 +15,7 @@ use super::compare_reports;
 use super::contract::ArtifactRoot;
 use super::contract::ComparisonKind;
 use super::contract::SideEffects;
+use super::evaluator::validate_structured_artifact;
 use super::parse_setup_envelope;
 use super::parse_worker_envelope;
 use super::run_discrimination_checks;
@@ -839,7 +840,9 @@ async fn resolve_iteration(
             .text_diff_counts(run.root(), starting, &candidate)
             .ok(),
     );
-    if let Err(error) = validate_evidence_state(&evidence_path, &candidate.state.digest) {
+    if let Err(error) =
+        validate_structured_artifact(contract, &evidence_path, &candidate.state.digest)
+    {
         restore_iteration_snapshot(worktree, run, incumbent)?;
         let resolved = crash(format!("invalid worker evidence: {error:#}"));
         publish_iteration(
@@ -872,29 +875,6 @@ async fn resolve_iteration(
                 "unsupported BLOCKED verdict: {}",
                 envelope.description
             ))
-        };
-        publish_iteration(
-            run,
-            iteration,
-            evidence_relative,
-            &resolved,
-            Some(&worker),
-            Some((&candidate, &delta, &envelope)),
-        )?;
-        return Ok(resolved);
-    }
-
-    if envelope.verdict == WorkerVerdict::Discard {
-        restore_iteration_snapshot(worktree, run, incumbent)?;
-        let resolved = ResolvedIteration {
-            incumbent_state: incumbent.state.digest.clone(),
-            status: "discard".to_string(),
-            pulse: "restored",
-            result: "worker discarded candidate".to_string(),
-            description: envelope.description.clone(),
-            unvalidated: envelope.unvalidated.clone(),
-            snapshot: incumbent.clone(),
-            report: None,
         };
         publish_iteration(
             run,
@@ -1003,6 +983,28 @@ async fn resolve_iteration(
         Ok(decision) => decision,
         Err(error) => ImprovementDecision::Inconclusive(format!("validation failed: {error:#}")),
     };
+    if envelope.verdict == WorkerVerdict::Discard {
+        restore_iteration_snapshot(worktree, run, incumbent)?;
+        let resolved = ResolvedIteration {
+            incumbent_state: incumbent.state.digest.clone(),
+            status: "discard".to_string(),
+            pulse: "restored",
+            result: candidate_report.decisive.clone(),
+            description: envelope.description.clone(),
+            unvalidated: envelope.unvalidated.clone(),
+            snapshot: incumbent.clone(),
+            report: Some(candidate_report),
+        };
+        publish_iteration(
+            run,
+            iteration,
+            evidence_relative,
+            &resolved,
+            Some(&worker),
+            Some((&candidate, &delta, &envelope)),
+        )?;
+        return Ok(resolved);
+    }
     let keep = !delta.is_empty() && matches!(decision, ImprovementDecision::Better(_));
     let decision_text = match &decision {
         ImprovementDecision::Better(reason)
@@ -1248,7 +1250,7 @@ fn worker_prompt(
     let executable =
         std::env::current_exe().context("failed to locate the running bettercodex binary")?;
     Ok(format!(
-        "{}\n\n# Harness-owned loop locations\n\nFrozen contract: `{}`\nBaseline and experiment ledger: `{}` and `{}`\nWritable evidence directory for this iteration: `{}`\nIncumbent state record: `{}`\nCandidate state identity argv: `{:?}`\n\nThe state command is the literal argument vector shown above: run it after restoring evaluator scratch and before writing evidence, then copy its JSON `digest` into the artifact's `state` field. The `EVIDENCE` field must name a regular JSON file under that evidence directory using a run-relative path. It must contain that current candidate `state` identity and a `checks` object naming every frozen check. Each machine result may include `passed`; each model result must include boolean `passed` and concrete `artifacts`. Run the frozen checks and bind the artifact to the candidate state before returning the terminal envelope.",
+        "{}\n\n# Harness-owned loop locations\n\nFrozen contract: `{}`\nBaseline and experiment ledger: `{}` and `{}`\nWritable evidence directory for this iteration: `{}`\nIncumbent state record: `{}`\nCandidate state identity argv: `{:?}`\n\nThe state command is the literal argument vector shown above: run it after restoring evaluator scratch and before writing evidence, then copy its JSON `digest` into the artifact's `state` field. The `EVIDENCE` field must name a regular JSON file under that evidence directory using a run-relative path. It must contain that current candidate `state` identity and a `checks` object naming every frozen check. Each machine and model result must include boolean `passed`; each model result must also include concrete `artifacts`. Run the frozen checks and bind the artifact to the candidate state before returning the terminal envelope.",
         prompt.trim(),
         contract_path.display(),
         run.root().join("baseline/evaluation.json").display(),
@@ -1292,25 +1294,6 @@ fn validate_contract_artifacts(
         .filter(|artifact| artifact.root == ArtifactRoot::Evaluator)
     {
         run.resolve_existing_file(&artifact.path, workspace)?;
-    }
-    Ok(())
-}
-
-fn validate_evidence_state(path: &Path, expected: &str) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.len() > 16 * 1024 * 1024 {
-        return Err(anyhow!("worker evidence exceeds the evidence size limit"));
-    }
-    let value: Value = serde_json::from_slice(&std::fs::read(path)?)
-        .context("worker evidence is not valid JSON")?;
-    let state = value
-        .get("state")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("worker evidence omitted its state identity"))?;
-    if state != expected {
-        return Err(anyhow!(
-            "worker evidence names stale state `{state}` instead of `{expected}`"
-        ));
     }
     Ok(())
 }
@@ -1562,4 +1545,598 @@ fn format_final(run: &LoopRun, summary: &LoopSummary) -> String {
         blind_spots,
         unvalidated,
     )
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quality_loop::LoopInvocation;
+    use crate::rollout::OperatorInputRecord;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use std::collections::VecDeque;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use uuid::Uuid;
+
+    #[derive(Clone, Copy)]
+    enum ScriptedAction {
+        Keep(i32),
+        Discard(i32),
+        DiscardWithoutChecks(i32),
+        KeepWithoutChange,
+        Crash(i32),
+        InvalidBlocked,
+        ValidBlocked,
+        TamperEvaluator,
+        TamperControl,
+        Interrupt(i32),
+    }
+
+    struct CapturedPhase {
+        name: String,
+        prompt: String,
+        context: Vec<Value>,
+        session_id: String,
+    }
+
+    struct ScriptedRunner {
+        actions: VecDeque<ScriptedAction>,
+        captured: Vec<CapturedPhase>,
+    }
+
+    impl ScriptedRunner {
+        fn new(actions: impl IntoIterator<Item = ScriptedAction>) -> Self {
+            Self {
+                actions: actions.into_iter().collect(),
+                captured: Vec::new(),
+            }
+        }
+
+        fn setup(&mut self, cwd: &Path, run: &LoopRun, session_id: &str) -> Result<PhaseOutput> {
+            let workspace = run.root().join("evaluator/workspace");
+            let script = workspace.join("metric.sh");
+            let known_failure = workspace.join("known-failure.txt");
+            std::fs::write(&known_failure, "known failure\n")?;
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nif [ \"$1\" = --known-failure ]; then\n  [ \"$(cat \"$2\")\" = \"known failure\" ] || exit 1\n  exit 0\nfi\nmkdir -p scratch\nprintf check > scratch/check.log\nvalue=$(cat candidate.txt)\nif [ \"$value\" = 77 ]; then printf illegal > evaluator-side-effect.txt; fi\nprintf '{\"value\": %s}\\n' \"$value\"\n",
+            )?;
+            let mut permissions = std::fs::metadata(&script)?.permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&script, permissions)?;
+            std::fs::write(
+                workspace.join("RATIONALE.md"),
+                "# Metric evaluator\n\nThe local numeric check measures the candidate directly.\n",
+            )?;
+            let contract = json!({
+                "version": 1,
+                "loop_name": "Metric speed",
+                "promises": [{
+                    "id": "metric",
+                    "class": "improvement",
+                    "statement": "the candidate metric increases",
+                    "failure_mode": "the metric ties or decreases",
+                    "method": "local numeric check",
+                    "required_evidence": ["numeric result"]
+                }],
+                "candidate_paths": ["candidate.txt"],
+                "fixed_constraints": ["preserve operator work"],
+                "integrity_paths": [],
+                "scratch_paths": ["scratch/**"],
+                "machine_checks": [{
+                    "id": "metric-check",
+                    "promise_ids": ["metric"],
+                    "argv": [script],
+                    "cwd": ".",
+                    "env": {},
+                    "input_paths": [{"root": "worktree", "path": "candidate.txt"}],
+                    "fixture_paths": [],
+                    "timeout_seconds": 5,
+                    "resource_budget": "one local process",
+                    "side_effects": "declared_scratch",
+                    "approval": "none",
+                    "expected_exit_codes": [0],
+                    "extract": {"kind": "json_number", "json_pointer": "/value"},
+                    "baseline_repeats": 1
+                }],
+                "discrimination_checks": [{
+                    "linked_check_id": "metric-check",
+                    "check": {
+                        "id": "metric-known-failure",
+                        "promise_ids": ["metric"],
+                        "argv": [script, "--known-failure", known_failure],
+                        "cwd": ".",
+                        "env": {},
+                        "input_paths": [{"root": "worktree", "path": "candidate.txt"}],
+                        "fixture_paths": [{
+                            "root": "evaluator",
+                            "path": "evaluator/workspace/known-failure.txt"
+                        }],
+                        "timeout_seconds": 5,
+                        "resource_budget": "one local process",
+                        "side_effects": "none",
+                        "approval": "none",
+                        "expected_exit_codes": [0],
+                        "extract": {"kind": "pass"},
+                        "baseline_repeats": 1
+                    }
+                }],
+                "model_checks": [],
+                "acceptance": {"required_check_ids": ["metric-check"]},
+                "comparison": {
+                    "kind": "metric",
+                    "check_id": "metric-check",
+                    "direction": "higher",
+                    "minimum_delta": 1.0,
+                    "tolerance": 0.0,
+                    "ties": "discard",
+                    "inconclusive": "discard"
+                },
+                "environment": ["test fixture"],
+                "uncovered": ["subjective qualities"],
+                "known_loopholes": ["none"]
+            });
+            std::fs::write(
+                workspace.join("contract.json"),
+                serde_json::to_vec_pretty(&contract)?,
+            )?;
+            let starting: Value =
+                serde_json::from_slice(&std::fs::read(run.root().join("starting-state.json"))?)?;
+            std::fs::write(
+                workspace.join("baseline.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "state": starting["digest"],
+                    "checks": {"metric-check": {"passed": true, "artifacts": []}}
+                }))?,
+            )?;
+            std::fs::write(cwd.join("setup-leak.txt"), "must be restored\n")?;
+            Ok(PhaseOutput {
+                response: "SETUP: READY\nCONTRACT: evaluator/workspace/contract.json\nBASELINE: evaluator/workspace/baseline.json\nBLOCKER: none".to_string(),
+                session_id: session_id.to_string(),
+                usage: None,
+                duration_ms: 1,
+            })
+        }
+
+        fn worker(
+            &mut self,
+            cwd: &Path,
+            run: &LoopRun,
+            name: &str,
+            session_id: &str,
+            control: &TurnControl,
+        ) -> Result<Option<PhaseOutput>> {
+            let action = self
+                .actions
+                .pop_front()
+                .ok_or_else(|| anyhow!("script omitted an iteration action"))?;
+            let iteration = name
+                .strip_prefix("worker-")
+                .ok_or_else(|| anyhow!("invalid scripted worker name"))?
+                .parse::<usize>()?;
+            let (verdict, description, unvalidated, blocker) = match action {
+                ScriptedAction::Keep(value) => {
+                    std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
+                    ("KEEP", "raised the candidate metric", "none", None)
+                }
+                ScriptedAction::Discard(value) => {
+                    std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
+                    (
+                        "DISCARD",
+                        "declined the provisional candidate",
+                        "none",
+                        None,
+                    )
+                }
+                ScriptedAction::DiscardWithoutChecks(value) => {
+                    std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
+                    (
+                        "DISCARD",
+                        "omitted the frozen check results",
+                        "none",
+                        None,
+                    )
+                }
+                ScriptedAction::KeepWithoutChange => {
+                    ("KEEP", "claimed an unchanged candidate", "none", None)
+                }
+                ScriptedAction::Crash(value) => {
+                    std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
+                    return Err(anyhow!("scripted worker crash"));
+                }
+                ScriptedAction::InvalidBlocked => {
+                    ("BLOCKED", "the task is already finished", "none", None)
+                }
+                ScriptedAction::ValidBlocked => (
+                    "BLOCKED",
+                    "a required prerequisite is unavailable",
+                    "the fixture lacks the prerequisite",
+                    Some(json!({
+                        "kind": "missing_prerequisite",
+                        "detail": "the fixture lacks the required local prerequisite",
+                        "evidence": ["fixture preflight reported the missing prerequisite"]
+                    })),
+                ),
+                ScriptedAction::TamperEvaluator => {
+                    std::fs::write(
+                        run.root().join("evaluator/workspace/RATIONALE.md"),
+                        "weakened ruler\n",
+                    )?;
+                    ("KEEP", "tampered with the evaluator", "none", None)
+                }
+                ScriptedAction::TamperControl => {
+                    std::fs::write(run.root().join("baseline/evaluation.json"), b"{}\n")?;
+                    ("KEEP", "tampered with prior evidence", "none", None)
+                }
+                ScriptedAction::Interrupt(value) => {
+                    std::fs::write(cwd.join("candidate.txt"), format!("{value}\n"))?;
+                    control.cancellation().cancel();
+                    return Ok(None);
+                }
+            };
+            let contract = run.root().join("evaluator/workspace/contract.json");
+            let state = crate::quality_loop::capture_state_identity(cwd, run.root(), &contract)?;
+            let evidence_relative = format!("iterations/{iteration}/worker.json");
+            let mut evidence = if matches!(action, ScriptedAction::DiscardWithoutChecks(_)) {
+                json!({"state": state["digest"]})
+            } else {
+                json!({
+                    "state": state["digest"],
+                    "checks": {"metric-check": {"passed": true}}
+                })
+            };
+            if let Some(blocker) = blocker {
+                evidence["blocker"] = blocker;
+            }
+            std::fs::write(
+                run.root().join(&evidence_relative),
+                serde_json::to_vec_pretty(&evidence)?,
+            )?;
+            Ok(Some(PhaseOutput {
+                response: format!(
+                    "VERDICT: {verdict}\nDESCRIPTION: {description}\nEVIDENCE: {evidence_relative}\nUNVALIDATED: {unvalidated}"
+                ),
+                session_id: session_id.to_string(),
+                usage: None,
+                duration_ms: 1,
+            }))
+        }
+    }
+
+    impl PhaseRunner for ScriptedRunner {
+        fn run<'a>(
+            &'a mut self,
+            cwd: &'a Path,
+            run: &'a LoopRun,
+            frozen: &'a FrozenLoopContext,
+            name: &'a str,
+            prompt: &'a str,
+            parent_control: &'a TurnControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<PhaseOutput>>> + Send + 'a>> {
+            Box::pin(async move {
+                let session_id = Uuid::new_v4().to_string();
+                self.captured.push(CapturedPhase {
+                    name: name.to_string(),
+                    prompt: prompt.to_string(),
+                    context: frozen.context_items().to_vec(),
+                    session_id: session_id.clone(),
+                });
+                if name == "setup" {
+                    self.setup(cwd, run, &session_id).map(Some)
+                } else {
+                    self.worker(cwd, run, name, &session_id, parent_control)
+                }
+            })
+        }
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        worktree: super::super::Worktree,
+        frozen: FrozenLoopContext,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("bettercodex-loop-engine-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            git(&root, &["init", "-q"]);
+            git(&root, &["config", "user.name", "Loop Test"]);
+            git(&root, &["config", "user.email", "loop@example.invalid"]);
+            std::fs::write(root.join("candidate.txt"), "10\n").unwrap();
+            std::fs::write(root.join("operator.txt"), "committed\n").unwrap();
+            std::fs::write(root.join("AGENTS.md"), "Frozen loop instruction.\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-qm", "base"]);
+            std::fs::write(root.join("operator.txt"), "dirty operator work\n").unwrap();
+            let record = OperatorInputRecord {
+                message: json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "improve the metric $loop"}]
+                }),
+                prompt_text: "improve the metric $loop".to_string(),
+                selected_skills: Vec::new(),
+                skill_context: Vec::new(),
+            };
+            let (frozen, warnings) = FrozenLoopContext::capture(&root, &[record]).unwrap();
+            assert!(warnings.is_empty());
+            let worktree = super::super::Worktree::discover(&root).unwrap();
+            Self {
+                root,
+                worktree,
+                frozen,
+            }
+        }
+
+        async fn run(
+            &self,
+            actions: Vec<ScriptedAction>,
+        ) -> (LoopRun, LoopSummary, ScriptedRunner, Vec<AgentEvent>) {
+            let invocation = LoopInvocation {
+                iterations: actions.len(),
+                triggers: Vec::new(),
+                counts: Vec::new(),
+            };
+            let mut run = LoopRun::create(
+                &self.worktree,
+                &invocation,
+                self.frozen.operator_inputs(),
+                self.frozen.context_items(),
+            )
+            .unwrap();
+            let original = load_snapshot(&run, &run.state.starting_snapshot).unwrap();
+            run.write_json("starting-state.json", &original.state)
+                .unwrap();
+            let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_handle, control) = TurnControl::non_steerable_channel();
+            let mut runner = ScriptedRunner::new(actions);
+            let summary = execute_phases(
+                &self.worktree,
+                &self.frozen,
+                &mut run,
+                &original,
+                &events_tx,
+                &control,
+                &mut runner,
+            )
+            .await
+            .unwrap();
+            drop(events_tx);
+            let mut events = Vec::new();
+            while let Ok(event) = events_rx.try_recv() {
+                events.push(event);
+            }
+            (run, summary, runner, events)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_loop_runs_one_evaluator_and_the_exact_sequential_worker_count() {
+        let fixture = Fixture::new();
+        let (run, summary, runner, events) = fixture
+            .run(vec![
+                ScriptedAction::Keep(12),
+                ScriptedAction::Keep(11),
+                ScriptedAction::Crash(99),
+            ])
+            .await;
+        assert_eq!(
+            (
+                summary.counts.kept,
+                summary.counts.discarded,
+                summary.counts.crashed
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("candidate.txt")).unwrap(),
+            "12\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("operator.txt")).unwrap(),
+            "dirty operator work\n"
+        );
+        assert!(!fixture.root.join("setup-leak.txt").exists());
+        assert!(!fixture.root.join("scratch").exists());
+        assert_eq!(
+            runner
+                .captured
+                .iter()
+                .map(|phase| phase.name.as_str())
+                .collect::<Vec<_>>(),
+            ["setup", "worker-1", "worker-2", "worker-3"]
+        );
+        assert_eq!(
+            runner
+                .captured
+                .iter()
+                .map(|phase| phase.session_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        assert!(
+            runner.captured[0]
+                .prompt
+                .contains("# Build the task evaluator")
+        );
+        assert!(runner.captured[1].prompt.contains("# Beat the incumbent"));
+        assert!(
+            runner
+                .captured
+                .iter()
+                .all(|phase| phase.context == runner.captured[0].context)
+        );
+        let ledger = std::fs::read_to_string(run.root().join("results.tsv")).unwrap();
+        assert_eq!(ledger.lines().count(), 5);
+        assert!(ledger.contains("\tkeep\t"));
+        assert!(ledger.contains("\tdiscard\t"));
+        assert!(ledger.contains("\tcrash\t"));
+        let attempt: Value = serde_json::from_slice(
+            &std::fs::read(run.root().join("iterations/1/resolved.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempt["session_duration_ms"], 1);
+        assert!(attempt["usage"].is_null());
+        assert!(
+            attempt["session_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(
+            std::fs::read_dir(run.root().join("sessions"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::LoopProgress(progress)
+                if progress.phase == "1/3" && progress.additions == Some(1) && progress.deletions == Some(1)
+        )));
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn worker_verdicts_cannot_bypass_harness_comparison_or_exact_count() {
+        let fixture = Fixture::new();
+        let (run, summary, runner, _) = fixture
+            .run(vec![
+                ScriptedAction::Discard(30),
+                ScriptedAction::KeepWithoutChange,
+                ScriptedAction::InvalidBlocked,
+                ScriptedAction::Keep(13),
+            ])
+            .await;
+        assert_eq!(summary.counts.kept, 1);
+        assert_eq!(summary.counts.discarded, 2);
+        assert_eq!(summary.counts.crashed, 1);
+        assert_eq!(runner.captured.len(), 5);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("candidate.txt")).unwrap(),
+            "13\n"
+        );
+        let ledger = std::fs::read_to_string(run.root().join("results.tsv")).unwrap();
+        assert!(
+            ledger.contains("\tmetric-check=30\tdiscard\tdeclined the provisional candidate\t")
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_requires_complete_frozen_check_evidence_and_does_not_stop_the_loop() {
+        let fixture = Fixture::new();
+        let (_run, summary, runner, _) = fixture
+            .run(vec![
+                ScriptedAction::DiscardWithoutChecks(30),
+                ScriptedAction::Keep(15),
+            ])
+            .await;
+        assert_eq!(summary.counts.crashed, 1);
+        assert_eq!(summary.counts.kept, 1);
+        assert_eq!(runner.captured.len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("candidate.txt")).unwrap(),
+            "15\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_blocker_stops_later_workers_but_evaluator_tampering_blocks_first() {
+        let fixture = Fixture::new();
+        let (_run, summary, runner, _) = fixture
+            .run(vec![ScriptedAction::ValidBlocked, ScriptedAction::Keep(20)])
+            .await;
+        assert_eq!(summary.counts.blocked, 1);
+        assert_eq!(runner.captured.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("candidate.txt")).unwrap(),
+            "10\n"
+        );
+
+        let second = Fixture::new();
+        let (_run, summary, runner, _) = second
+            .run(vec![
+                ScriptedAction::TamperEvaluator,
+                ScriptedAction::Keep(20),
+            ])
+            .await;
+        assert_eq!(summary.counts.blocked, 1);
+        assert_eq!(runner.captured.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(second.root.join("candidate.txt")).unwrap(),
+            "10\n"
+        );
+
+        let third = Fixture::new();
+        let (_run, summary, runner, _) = third
+            .run(vec![
+                ScriptedAction::TamperControl,
+                ScriptedAction::Keep(20),
+            ])
+            .await;
+        assert_eq!(summary.counts.blocked, 1);
+        assert_eq!(runner.captured.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(third.root.join("candidate.txt")).unwrap(),
+            "10\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_check_side_effects_block_without_retaining_the_candidate() {
+        let fixture = Fixture::new();
+        let (_run, summary, runner, _) = fixture
+            .run(vec![ScriptedAction::Keep(77), ScriptedAction::Keep(20)])
+            .await;
+        assert_eq!(summary.counts.blocked, 1);
+        assert_eq!(summary.counts.kept, 0);
+        assert_eq!(runner.captured.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("candidate.txt")).unwrap(),
+            "10\n"
+        );
+        assert!(!fixture.root.join("evaluator-side-effect.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn interruption_restores_the_incumbent_and_starts_no_later_worker() {
+        let fixture = Fixture::new();
+        let (run, summary, runner, _) = fixture
+            .run(vec![
+                ScriptedAction::Interrupt(50),
+                ScriptedAction::Keep(60),
+            ])
+            .await;
+        assert!(summary.interrupted);
+        assert_eq!(summary.counts.interrupted, 1);
+        assert_eq!(runner.captured.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("candidate.txt")).unwrap(),
+            "10\n"
+        );
+        let ledger = std::fs::read_to_string(run.root().join("results.tsv")).unwrap();
+        assert!(ledger.contains("\tinterrupted\t"));
+    }
 }
