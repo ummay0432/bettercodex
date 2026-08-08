@@ -81,6 +81,56 @@ class CanonicalInstallTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "dirty"):
             dev.validate_install_caller(self.repository.path, main)
 
+    def test_source_revision_environment_requires_an_exact_git_revision(self) -> None:
+        original = {"CARGO_TARGET_DIR": "/target"}
+        revision = "A" * 40
+
+        configured = dev.environment_with_source_revision(original, revision)
+
+        self.assertEqual(original, {"CARGO_TARGET_DIR": "/target"})
+        self.assertEqual(
+            configured,
+            {
+                "CARGO_TARGET_DIR": "/target",
+                dev.SOURCE_REVISION_ENV: revision.lower(),
+            },
+        )
+        for invalid in ("", "abc", "g" * 40, "a" * 39, "a" * 41):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                RuntimeError, "exact 40-digit Git revision"
+            ):
+                dev.environment_with_source_revision(original, invalid)
+
+    def test_package_revision_prefers_the_installer_environment(self) -> None:
+        revision = "c" * 40
+        with mock.patch.object(dev.subprocess, "run") as run:
+            self.assertEqual(
+                dev.package_source_revision({dev.SOURCE_REVISION_ENV: revision}), revision
+            )
+        run.assert_not_called()
+
+    def test_package_revision_bridges_the_version_tag_for_the_old_installer(self) -> None:
+        revision = "d" * 40
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"{revision}\n"
+        )
+        with mock.patch.object(dev.subprocess, "run", return_value=completed) as run:
+            resolved = dev.package_source_revision({})
+
+        self.assertEqual(resolved, revision)
+        run.assert_called_once_with(
+            [
+                "gh",
+                "api",
+                f"repos/{dev.DEFAULT_REPOSITORY}/commits/v{dev.locked_package_version('bettercodex')}",
+                "--jq",
+                ".sha",
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+
     def test_committed_snapshot_excludes_worktree_changes(self) -> None:
         commit = self.repository.run("rev-parse", "HEAD")
         (self.repository.path / "tracked.txt").write_text("dirty\n")

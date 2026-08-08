@@ -3616,7 +3616,7 @@ fn welcome_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
     with_card_border(content)
 }
 
-fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec<Line<'static>> {
+fn update_available_lines(_update: &AvailableUpdate, available_width: u16) -> Vec<Line<'static>> {
     if available_width < 5 {
         return Vec::new();
     }
@@ -3628,17 +3628,10 @@ fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec
             warning.add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::from("bettercodex ").dim(),
-            Span::from(update.current_version.clone()).dim(),
-            Span::from(" -> ").dim(),
-            Span::from(update.latest_version.clone()).dim(),
+            Span::from("Run ").dim(),
+            Span::styled("bcodex update", Style::default().fg(Color::Cyan)),
+            Span::from(" in another terminal.").dim(),
         ]),
-        Line::default(),
-        Line::from("Run in another terminal:").dim(),
-        Line::from(Span::styled(
-            "bcodex update",
-            Style::default().fg(Color::Cyan),
-        )),
     ];
     let mut content = Vec::new();
     for line in &source {

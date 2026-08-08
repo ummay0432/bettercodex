@@ -41,7 +41,39 @@ fn compares_only_stable_three_component_versions() {
 }
 
 #[tokio::test]
-async fn authenticated_tag_lookup_returns_only_the_newest_stable_version() {
+async fn authenticated_revision_lookup_detects_a_different_main_commit() {
+    let current = "1111111111111111111111111111111111111111";
+    let latest = "2222222222222222222222222222222222222222";
+    let gh = TemporaryProgram::new(&format!(
+        "#!/bin/sh\n\
+         test \"$*\" = \"api repos/owner/private/commits/main --jq .sha\" || exit 2\n\
+         printf '%s\\n' '{latest}'\n"
+    ));
+
+    assert_eq!(
+        check_for_source_update_with(
+            gh.path.as_os_str(),
+            "owner/private",
+            current,
+            Duration::from_secs(1),
+        )
+        .await,
+        Some(AvailableUpdate)
+    );
+    assert_eq!(
+        check_for_source_update_with(
+            gh.path.as_os_str(),
+            "owner/private",
+            latest,
+            Duration::from_secs(1),
+        )
+        .await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn authenticated_tag_fallback_returns_only_the_newest_stable_version() {
     let gh = TemporaryProgram::new(
         "#!/bin/sh\n\
          test \"$*\" = \"api repos/owner/private/tags?per_page=100 --paginate --jq .[].name\" || exit 2\n\
@@ -49,20 +81,17 @@ async fn authenticated_tag_lookup_returns_only_the_newest_stable_version() {
     );
 
     assert_eq!(
-        check_for_update_with(
+        check_for_release_update_with(
             gh.path.as_os_str(),
             "owner/private",
             "1.9.9",
             Duration::from_secs(1),
         )
         .await,
-        Some(AvailableUpdate {
-            current_version: "1.9.9".to_string(),
-            latest_version: "1.10.0".to_string(),
-        })
+        Some(AvailableUpdate)
     );
     assert_eq!(
-        check_for_update_with(
+        check_for_release_update_with(
             gh.path.as_os_str(),
             "owner/private",
             "1.10.0",
@@ -77,7 +106,7 @@ async fn authenticated_tag_lookup_returns_only_the_newest_stable_version() {
 async fn lookup_failures_and_unexpected_tags_are_silent() {
     let failure = TemporaryProgram::new("#!/bin/sh\nexit 1\n");
     assert_eq!(
-        check_for_update_with(
+        check_for_release_update_with(
             failure.path.as_os_str(),
             "owner/private",
             "1.2.2",
@@ -89,10 +118,48 @@ async fn lookup_failures_and_unexpected_tags_are_silent() {
 
     let invalid = TemporaryProgram::new("#!/bin/sh\nprintf 'release-1.2.3\\nv1.2\\n'\n");
     assert_eq!(
-        check_for_update_with(
+        check_for_release_update_with(
             invalid.path.as_os_str(),
             "owner/private",
             "1.2.2",
+            Duration::from_secs(1),
+        )
+        .await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn malformed_and_failed_revision_lookups_are_silent() {
+    let failure = TemporaryProgram::new("#!/bin/sh\nexit 1\n");
+    let revision = "1111111111111111111111111111111111111111";
+    assert_eq!(
+        check_for_source_update_with(
+            failure.path.as_os_str(),
+            "owner/private",
+            revision,
+            Duration::from_secs(1),
+        )
+        .await,
+        None
+    );
+
+    let malformed = TemporaryProgram::new("#!/bin/sh\nprintf 'not-a-commit\\n'\n");
+    assert_eq!(
+        check_for_source_update_with(
+            malformed.path.as_os_str(),
+            "owner/private",
+            revision,
+            Duration::from_secs(1),
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        check_for_source_update_with(
+            malformed.path.as_os_str(),
+            "owner/private",
+            "invalid-current-revision",
             Duration::from_secs(1),
         )
         .await,

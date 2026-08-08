@@ -34,6 +34,8 @@ CANONICAL_BRANCH = "refs/heads/main"
 CANONICAL_REMOTE_BRANCH = "refs/remotes/origin/main"
 INSTALL_LOCK_FILE = ".bettercodex-install.lock"
 MAX_INSTALL_ATTEMPTS = 3
+SOURCE_REVISION_ENV = "BCODEX_SOURCE_REVISION"
+DEFAULT_REPOSITORY = "ummay0432/bettercodex"
 V8_VERSION = "150.4.0"
 V8_PROFILE = "ptrcomp_sandbox_release"
 V8_RELEASE = f"https://github.com/openai/codex/releases/download/rusty-v8-v{V8_VERSION}"
@@ -94,6 +96,49 @@ def is_ancestor(ancestor: str, descendant: str, cwd: Path) -> bool:
         ).returncode
         == 0
     )
+
+
+def environment_with_source_revision(
+    environment: dict[str, str], revision: str
+) -> dict[str, str]:
+    if re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+        raise RuntimeError(f"{SOURCE_REVISION_ENV} must be an exact 40-digit Git revision")
+    configured = environment.copy()
+    configured[SOURCE_REVISION_ENV] = revision.lower()
+    return configured
+
+
+def package_source_revision(
+    environment: dict[str, str], source: Path = REPOSITORY
+) -> str:
+    configured = environment.get(SOURCE_REVISION_ENV)
+    if configured is not None:
+        return environment_with_source_revision(environment, configured)[SOURCE_REVISION_ENV]
+
+    # Version 0.1.1's embedded installer predates the source-revision environment contract. Its
+    # last update resolves a stable tag before invoking this helper, so recover that immutable
+    # revision from the matching package-version tag. Current installers always take the direct
+    # environment path above and make no extra request here.
+    version = next(
+        (
+            line.removeprefix('version = "').removesuffix('"')
+            for line in (source / "Cargo.toml").read_text(encoding="utf-8").splitlines()
+            if line.startswith('version = "')
+        ),
+        None,
+    )
+    if version is None:
+        raise RuntimeError("Cargo.toml has no bettercodex package version")
+    repository = environment.get("BCODEX_REPOSITORY", DEFAULT_REPOSITORY)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repository}/commits/v{version}", "--jq", ".sha"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    return environment_with_source_revision(environment, result.stdout.strip())[
+        SOURCE_REVISION_ENV
+    ]
 
 
 def repository_root() -> Path:
@@ -450,9 +495,11 @@ def command_package_build(arguments: argparse.Namespace) -> int:
     environment = os.environ.copy()
     environment["CARGO_TARGET_DIR"] = os.fspath(target)
     environment.setdefault("CARGO_INCREMENTAL", "0")
+    revision = package_source_revision(environment)
+    environment = environment_with_source_revision(environment, revision)
     configure_v8_environment(environment)
 
-    print(f"Building tagged bettercodex source into {target}")
+    print(f"Building bettercodex source {revision[:12]} into {target}")
     binary = build_release_snapshot(REPOSITORY, target, environment)
     subprocess.run([binary, "--version"], check=True)
     print(binary)
@@ -474,13 +521,24 @@ def command_install(arguments: argparse.Namespace) -> int:
             commit = canonical_main_commit(primary)
             validate_install_caller(worktree, commit)
             print(f"Installing committed main {commit[:12]} into {install_root}")
+            build_environment = environment_with_source_revision(environment, commit)
             with committed_source_snapshot(primary, commit) as source:
-                install_source_snapshot(source, target, install_root, environment)
+                install_source_snapshot(source, target, install_root, build_environment)
 
             latest = canonical_main_commit(primary)
             if latest == commit:
                 binary = install_root / "bin" / "bcodex"
                 subprocess.run([binary, "--version"], check=True)
+                embedded = subprocess.run(
+                    [binary, "--internal-source-revision"],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                ).stdout.strip()
+                if embedded != commit:
+                    raise RuntimeError(
+                        f"installed bettercodex embedded source {embedded or 'unknown'}, expected {commit}"
+                    )
                 print(f"Installed canonical bettercodex {commit[:12]} at {binary}")
                 return 0
             print(

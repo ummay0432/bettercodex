@@ -27,10 +27,11 @@ The default runs one evaluator session followed by three fresh working
 sessions; see [`docs/slash_commands.md`](docs/slash_commands.md#quality-loop)
 for counts, progress, restoration, and repository-local evidence.
 
-The installer downloads the newest stable source tag and compiles it for the
-current Mac or Linux machine. Interactive sessions check those private tags in
-the background after the TUI is ready. When an update is available, build and
-install it from another terminal:
+The installer resolves the current integrated `main` revision and compiles that
+immutable source snapshot for the current Mac or Linux machine. The revision is
+embedded in the binary. Interactive sessions compare it with private `main` in
+the background after the TUI is ready, so updates do not depend on version
+bumps or release tags. When an update is available, run:
 
 ```sh
 bcodex update

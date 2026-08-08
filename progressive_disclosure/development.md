@@ -70,10 +70,12 @@ Changes to the private source installer or its local-build contract must pass:
 python3 -m unittest -v scripts.install_tests
 ```
 
-The installer builds immutable tagged source through `./scripts/dev.py
-package-build`; keep that command usable from a source archive without a Git
-checkout. Bettercodex does not publish prebuilt binaries or use hosted release
-builds.
+The installer resolves integrated `main` (or an explicitly requested stable
+tag) to an immutable commit and builds its source through `./scripts/dev.py
+package-build`. It passes the exact 40-digit commit in
+`BCODEX_SOURCE_REVISION`; keep that command usable from a source archive without
+a Git checkout. Bettercodex does not publish prebuilt binaries or use hosted
+release builds.
 
 Changes to the matched live-evaluation runner must pass its offline protocol
 tests as well:
