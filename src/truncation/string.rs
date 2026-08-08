@@ -52,16 +52,16 @@ fn truncate_with_byte_estimate(s: &str, max_bytes: usize) -> String {
     assemble_truncated_output(left, right, &marker)
 }
 
-pub(super) fn approx_token_count(text: &str) -> usize {
+pub(crate) fn approx_token_count(text: &str) -> usize {
     let len = text.len();
     len.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1)) / APPROX_BYTES_PER_TOKEN
 }
 
-pub(super) fn approx_bytes_for_tokens(tokens: usize) -> usize {
+pub(crate) fn approx_bytes_for_tokens(tokens: usize) -> usize {
     tokens.saturating_mul(APPROX_BYTES_PER_TOKEN)
 }
 
-pub(super) fn approx_tokens_from_byte_count(bytes: usize) -> u64 {
+pub(crate) fn approx_tokens_from_byte_count(bytes: usize) -> u64 {
     let bytes_u64 = bytes as u64;
     bytes_u64.saturating_add((APPROX_BYTES_PER_TOKEN as u64).saturating_sub(1))
         / (APPROX_BYTES_PER_TOKEN as u64)
