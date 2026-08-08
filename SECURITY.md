@@ -7,12 +7,12 @@ Use GitHub's private vulnerability reporting form:
 
 <https://github.com/ummay0432/bettercodex/security/advisories/new>
 
-Include the affected BetterCodex version or source revision, operating system,
+Include the affected bettercodex version or source revision, operating system,
 impact, and a minimal reproduction. Remove credentials and unrelated private
 data. If a real credential may have been exposed, revoke or rotate it before
 reporting the incident.
 
 Security fixes are supported for the latest published release and current
-`main`. BetterCodex is maintained independently from OpenAI; reports about the
+`main`. bettercodex is maintained independently from OpenAI; reports about the
 upstream Codex product or OpenAI services should use OpenAI's own reporting
 channels.

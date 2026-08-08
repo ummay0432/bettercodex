@@ -6,7 +6,7 @@ system, architecture, `bcodex --version` output, expected behavior, and the
 smallest safe reproduction you can provide. Never include credentials or
 private session data.
 
-BetterCodex is a focused downstream port maintained separately from OpenAI
+bettercodex is a focused downstream port maintained separately from OpenAI
 Codex. External code contributions are currently accepted by prior agreement
 only. Open an issue before investing in a pull request so scope and the upstream
 baseline can be agreed first.
@@ -24,7 +24,7 @@ just install
 ```
 
 Retained Codex behavior should be ported from current upstream source rather
-than reimplemented. Keep BetterCodex's fixed product boundaries in
+than reimplemented. Keep bettercodex's fixed product boundaries in
 [`progressive_disclosure/product-direction.md`](../progressive_disclosure/product-direction.md)
 and follow the complete workflow in
 [`progressive_disclosure/development.md`](../progressive_disclosure/development.md).

@@ -1,7 +1,7 @@
 //! Bounded-output adapter around Codex's unified pipe and PTY process runtime.
 //!
 //! Spawning, signalling, stdin backpressure, and child reaping come from `codex-utils-pty` at
-//! `3aae5d885bac39c1262491aa3fd100dfd8b3919f`; this module retains BetterCodex's compact polling
+//! `3aae5d885bac39c1262491aa3fd100dfd8b3919f`; this module retains bettercodex's compact polling
 //! state and model-visible output chunks.
 
 use crate::shell_command::shell_detect::DetectedShell;
@@ -441,7 +441,6 @@ pub(super) fn shell_command(
             arguments.push(command.to_string());
             arguments
         }
-        ShellType::Cmd => vec!["/c".to_string(), command.to_string()],
     };
     (shell.shell_path.clone(), arguments)
 }

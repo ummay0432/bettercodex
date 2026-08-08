@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Adapted from OpenAI Codex's setup-rusty-v8 action and package V8 resolver.
-# Bettercodex runs code mode in-process, so every Cargo build needs the
+# bettercodex runs code mode in-process, so every Cargo build needs the
 # sandbox-enabled archive and generated binding published by OpenAI Codex.
 
 set -eu

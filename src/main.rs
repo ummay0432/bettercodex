@@ -212,17 +212,23 @@ fn run_agent_command(
     let interactive_tui =
         interactive_terminal && options.prompt.is_empty() && options.images.is_empty();
     let worker_handoff = managed_session::enter_agent_process(arguments, interactive_tui)?;
+    // Resolve signed-out and malformed credential states before terminal startup emits any
+    // capability queries. Signed-out interactive launches continue into the onboarding UI.
+    let tui_login_status = interactive_tui.then(login::status).transpose()?;
     let tui_startup = interactive_tui.then(tui::begin_startup).transpose()?;
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
-        // BetterCodex serves one operator and moves blocking work off the async pool. Two workers
+        // bettercodex serves one operator and moves blocking work off the async pool. Two workers
         // retain scheduler redundancy without eagerly creating one startup thread per CPU.
         runtime.worker_threads(2);
     }
-    runtime
-        .enable_all()
-        .build()?
-        .block_on(run_agent(options, resume, worker_handoff, tui_startup))
+    runtime.enable_all().build()?.block_on(run_agent(
+        options,
+        resume,
+        worker_handoff,
+        tui_startup,
+        tui_login_status,
+    ))
 }
 
 async fn run_agent(
@@ -230,6 +236,7 @@ async fn run_agent(
     resume: Option<ResumeSelector>,
     worker_handoff: Option<managed_session::WorkerHandoff>,
     tui_startup: Option<tui::Startup>,
+    tui_login_status: Option<login::LoginStatus>,
 ) -> Result<()> {
     let input = if !options.prompt.is_empty() || !options.images.is_empty() {
         Some(UserInput::from_paths(
@@ -241,23 +248,26 @@ async fn run_agent(
         None
     };
     let requested_cwd = std::env::current_dir()?;
-    let mut agent = match resume {
-        Some(selector) => Agent::resume(&requested_cwd, selector)?,
-        None => Agent::new(&requested_cwd)?,
-    };
-    let cwd = agent.cwd().to_path_buf();
-    if let Some(input) = input {
-        let answer = submit_cli_input(&mut agent, input).await?;
-        write_stdout_line(format_args!("{answer}"))?;
-        return Ok(());
-    }
-
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if input.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         let startup = match tui_startup {
             Some(startup) => startup,
             None => tui::begin_startup()?,
         };
-        return tui::run(agent, cwd, worker_handoff, startup).await;
+        let login_status = match tui_login_status {
+            Some(status) => status,
+            None => login::status()?,
+        };
+        return tui::run(requested_cwd, resume, worker_handoff, startup, login_status).await;
+    }
+
+    let mut agent = match resume {
+        Some(selector) => Agent::resume(&requested_cwd, selector)?,
+        None => Agent::new(&requested_cwd)?,
+    };
+    if let Some(input) = input {
+        let answer = submit_cli_input(&mut agent, input).await?;
+        write_stdout_line(format_args!("{answer}"))?;
+        return Ok(());
     }
 
     run_line_mode(&mut agent).await
@@ -561,7 +571,7 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Install the latest published BetterCodex release\n\nUsage:\n  bcodex update\n\nThe updater resolves the latest complete release. If its source revision is already installed, it exits immediately. Otherwise it streams a compact patch from the installed revision when available, falling back to the full native update asset. It verifies the download, smoke-tests V8 and every embedded resource, and atomically replaces the installed command. This command never invokes a shell, Rust toolchain, C compiler, Cargo build, or source fallback."
+        "Install the latest published bettercodex release\n\nUsage:\n  bcodex update\n\nThe updater resolves the latest complete release. If its source revision is already installed, it exits immediately. Otherwise it streams a compact patch from the installed revision when available, falling back to the full native update asset. It verifies the download, smoke-tests V8 and every embedded resource, and atomically replaces the installed command. This command never invokes a shell, Rust toolchain, C compiler, Cargo build, or source fallback."
     ))
 }
 

@@ -129,9 +129,7 @@ impl PromptHistory {
 }
 
 fn history_path() -> Result<PathBuf> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    let codex_home = crate::paths::codex_home()
         .ok_or_else(|| anyhow!("cannot locate prompt history: HOME is not set"))?;
     Ok(codex_home.join(HISTORY_FILENAME))
 }

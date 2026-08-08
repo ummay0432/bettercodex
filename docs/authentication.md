@@ -1,7 +1,9 @@
 # Authentication
 
 bettercodex uses ChatGPT authentication and shares Codex's file-backed credential
-cache. Sign in with the browser flow:
+cache. On the first interactive launch, `bcodex` presents browser and device-code
+sign-in choices before starting the session. You can also start the browser flow
+directly:
 
 ```sh
 bcodex login

@@ -12,7 +12,6 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
-#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -365,15 +364,10 @@ impl SharedAuth {
     }
 }
 
-pub(crate) fn codex_home() -> Result<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .ok_or_else(|| anyhow!("cannot locate Codex credentials: HOME is not set"))
-}
-
 pub(crate) fn auth_file_path() -> Result<PathBuf> {
-    Ok(codex_home()?.join("auth.json"))
+    Ok(crate::paths::codex_home()
+        .ok_or_else(|| anyhow!("cannot locate Codex credentials: HOME is not set"))?
+        .join("auth.json"))
 }
 
 pub(crate) fn save_login_tokens(
@@ -473,7 +467,6 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
-        #[cfg(unix)]
         options.mode(0o600);
         let mut file = options.open(&temp).with_context(|| {
             format!(

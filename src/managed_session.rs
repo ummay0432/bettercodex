@@ -635,7 +635,7 @@ fn linux_process_executable(pid: u32) -> PathBuf {
     Path::new("/proc").join(pid.to_string()).join("exe")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn relay_executable() -> Result<PathBuf> {
     std::env::current_exe().context("failed to locate the bcodex executable")
 }
@@ -890,17 +890,17 @@ fn configure_socket_send(stream: &UnixStream) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn configure_socket_send(_stream: &UnixStream) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const fn send_message_flags() -> libc::c_int {
     libc::MSG_NOSIGNAL
 }
 
-#[cfg(not(any(target_os = "android", target_os = "linux")))]
+#[cfg(target_os = "macos")]
 const fn send_message_flags() -> libc::c_int {
     0
 }
@@ -978,18 +978,18 @@ unsafe fn cmsg_contains_one_fd(header: *mut libc::cmsghdr) -> bool {
     unsafe { (*header).cmsg_len == libc::CMSG_LEN(SCM_FD_BYTES) }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 unsafe fn cmsg_contains_one_fd(header: *mut libc::cmsghdr) -> bool {
     // SAFETY: callers validate that header points into the recvmsg control buffer.
     unsafe { (*header).cmsg_len == libc::CMSG_LEN(SCM_FD_BYTES) as usize }
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const fn receive_message_flags() -> libc::c_int {
     libc::MSG_CMSG_CLOEXEC
 }
 
-#[cfg(not(any(target_os = "android", target_os = "linux")))]
+#[cfg(target_os = "macos")]
 const fn receive_message_flags() -> libc::c_int {
     0
 }

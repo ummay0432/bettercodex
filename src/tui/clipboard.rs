@@ -17,12 +17,10 @@ pub(super) fn copy_to_clipboard(text: &str) -> Result<Option<ClipboardLease>, St
             ssh: std::env::var_os("SSH_TTY").is_some()
                 || std::env::var_os("SSH_CONNECTION").is_some(),
             tmux: crate::managed_session::is_tmux_active(),
-            wsl: is_wsl(),
         },
         tmux_copy,
         osc52_copy,
         native_copy,
-        wsl_copy,
     )
 }
 
@@ -35,7 +33,6 @@ pub(super) struct ClipboardLease {
 struct CopyEnvironment {
     ssh: bool,
     tmux: bool,
-    wsl: bool,
 }
 
 fn copy_to_clipboard_with(
@@ -44,7 +41,6 @@ fn copy_to_clipboard_with(
     tmux_copy: impl Fn(&str) -> Result<(), String>,
     osc52_copy: impl Fn(&str) -> Result<(), String>,
     native_copy: impl Fn(&str) -> Result<Option<ClipboardLease>, String>,
-    wsl_copy: impl Fn(&str) -> Result<(), String>,
 ) -> Result<Option<ClipboardLease>, String> {
     let terminal_copy = |text: &str| {
         if environment.tmux {
@@ -72,17 +68,11 @@ fn copy_to_clipboard_with(
 
     match native_copy(text) {
         Ok(lease) => Ok(lease),
-        Err(native_error) if environment.wsl => match wsl_copy(text) {
-            Ok(()) => Ok(None),
-            Err(wsl_error) => terminal_copy(text).map(|()| None).map_err(|terminal_error| {
-                format!(
-                    "native clipboard: {native_error}; WSL fallback: {wsl_error}; terminal fallback: {terminal_error}"
-                )
+        Err(native_error) => terminal_copy(text)
+            .map(|()| None)
+            .map_err(|terminal_error| {
+                format!("native clipboard: {native_error}; terminal fallback: {terminal_error}")
             }),
-        },
-        Err(native_error) => terminal_copy(text).map(|()| None).map_err(|terminal_error| {
-            format!("native clipboard: {native_error}; terminal fallback: {terminal_error}")
-        }),
     }
 }
 
@@ -148,18 +138,6 @@ fn osc52_sequence(text: &str, tmux: bool) -> Result<String, String> {
     }
 }
 
-fn wsl_copy(text: &str) -> Result<(), String> {
-    pipe_to_command(
-        "powershell.exe",
-        &[
-            "-NoProfile",
-            "-Command",
-            "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; $text = [Console]::In.ReadToEnd(); Set-Clipboard -Value $text",
-        ],
-        text,
-    )
-}
-
 fn pipe_to_command(program: &str, arguments: &[&str], text: &str) -> Result<(), String> {
     let mut child = Command::new(program)
         .args(arguments)
@@ -212,18 +190,6 @@ fn write_and_flush(writer: &mut impl Write, bytes: &[u8]) -> Result<(), String> 
     writer
         .flush()
         .map_err(|error| format!("failed to flush OSC 52: {error}"))
-}
-
-#[cfg(target_os = "linux")]
-fn is_wsl() -> bool {
-    std::env::var_os("WSL_INTEROP").is_some()
-        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
-}
-
-#[cfg(target_os = "macos")]
-fn is_wsl() -> bool {
-    false
 }
 
 #[cfg(target_os = "macos")]
@@ -300,7 +266,6 @@ mod tests {
             CopyEnvironment {
                 ssh: true,
                 tmux: false,
-                wsl: false,
             },
             |_| Ok(()),
             |_| Ok(()),
@@ -308,7 +273,6 @@ mod tests {
                 native_calls.set(native_calls.get() + 1);
                 Err("unexpected".to_string())
             },
-            |_| Ok(()),
         );
         assert!(result.unwrap().is_none());
         assert_eq!(native_calls.get(), 0);
@@ -321,12 +285,10 @@ mod tests {
             CopyEnvironment {
                 ssh: false,
                 tmux: false,
-                wsl: false,
             },
             |_| Ok(()),
             |_| Ok(()),
             |_| Err("native unavailable".to_string()),
-            |_| Ok(()),
         );
         assert!(result.unwrap().is_none());
     }

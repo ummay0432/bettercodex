@@ -313,6 +313,7 @@ github_get() {
 github_download_once() {
   download_url="$1"
   download_destination="$2"
+  download_max_bytes="$3"
   download_partial="$download_destination.partial"
   rm -f "$download_partial"
   if ! download_status="$(
@@ -325,7 +326,7 @@ github_download_once() {
       --compressed \
       --connect-timeout 10 \
       --max-time 120 \
-      --max-filesize "$MAX_ASSET_BYTES" \
+      --max-filesize "$download_max_bytes" \
       --user-agent bettercodex \
       --header 'Accept: application/vnd.github+json' \
       --output "$download_partial" \
@@ -359,9 +360,10 @@ download_release_file() {
   release_url="$1"
   release_destination="$2"
   release_label="$3"
+  release_max_bytes="${4:-$MAX_ASSET_BYTES}"
   github_attempt=1
   while [ "$github_attempt" -le "$MAX_GITHUB_ATTEMPTS" ]; do
-    if github_download_once "$release_url" "$release_destination"; then
+    if github_download_once "$release_url" "$release_destination" "$release_max_bytes"; then
       return 0
     else
       download_result=$?
@@ -615,7 +617,8 @@ resolve_latest_release() {
   if download_release_file \
     "$GITHUB_API_ROOT/repos/$repository/releases/latest" \
     "$release_metadata" \
-    "GitHub release metadata"; then
+    "GitHub release metadata" \
+    "$MAX_METADATA_BYTES"; then
     :
   else
     return $?

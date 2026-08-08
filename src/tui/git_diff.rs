@@ -78,13 +78,10 @@ async fn get_git_diff_with_program(cwd: PathBuf, program: OsString) -> Result<St
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
     {
-        #[cfg(unix)]
         let path = {
             use std::os::unix::ffi::OsStringExt;
             OsString::from_vec(path.to_vec())
         };
-        #[cfg(not(unix))]
-        let path = OsString::from(String::from_utf8_lossy(path).into_owned());
         let arguments = vec![
             OsString::from("diff"),
             OsString::from("--no-textconv"),

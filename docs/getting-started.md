@@ -1,6 +1,6 @@
 # Getting started with bettercodex
 
-Install BetterCodex with the copyable command in the
+Install bettercodex with the copyable command in the
 [README](../README.md#install), then open a new terminal. Sign in with a ChatGPT
 account that has Codex access:
 
@@ -15,7 +15,7 @@ bcodex
 ```
 
 Remote and headless machines can use `bcodex login --device-auth`; see
-[Authentication](authentication.md) for the complete flow. BetterCodex runs
+[Authentication](authentication.md) for the complete flow. bettercodex runs
 commands with your user account's permissions and does not sandbox them; read
 [Sandbox and permissions](sandbox.md) before using it on sensitive systems.
 

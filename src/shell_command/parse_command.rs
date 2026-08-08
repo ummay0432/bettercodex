@@ -985,18 +985,6 @@ mod tests {
     }
 
     #[test]
-    fn shorten_path_on_windows() {
-        assert_parsed(
-            &shlex_split_safe(r#"cat "pkg\src\main.rs""#),
-            vec![ParsedCommand::Read {
-                cmd: r#"cat "pkg\\src\\main.rs""#.to_string(),
-                name: "main.rs".to_string(),
-                path: PathBuf::from(r#"pkg\src\main.rs"#),
-            }],
-        );
-    }
-
-    #[test]
     fn head_with_no_space() {
         assert_parsed(
             &shlex_split_safe("bash -lc 'head -n50 Cargo.toml'"),
@@ -1236,16 +1224,6 @@ mod tests {
     }
 
     #[test]
-    fn powershell_command_is_stripped() {
-        assert_parsed(
-            &vec_str(&["powershell", "-Command", "Get-ChildItem"]),
-            vec![ParsedCommand::Unknown {
-                cmd: "Get-ChildItem".to_string(),
-            }],
-        );
-    }
-
-    #[test]
     fn pwsh_with_noprofile_and_c_alias_is_stripped() {
         assert_parsed(
             &vec_str(&["pwsh", "-NoProfile", "-c", "Write-Host hi"]),
@@ -1257,14 +1235,8 @@ mod tests {
 
     #[test]
     fn powershell_with_path_is_stripped() {
-        let command = if cfg!(windows) {
-            "C:\\windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-        } else {
-            "/usr/local/bin/powershell.exe"
-        };
-
         assert_parsed(
-            &vec_str(&[command, "-NoProfile", "-c", "Write-Host hi"]),
+            &vec_str(&["/usr/local/bin/pwsh", "-NoProfile", "-c", "Write-Host hi"]),
             vec![ParsedCommand::Unknown {
                 cmd: "Write-Host hi".to_string(),
             }],
@@ -1519,9 +1491,7 @@ fn trim_at_connector(tokens: &[String]) -> Vec<String> {
 /// - foo/src/ -> foo
 /// - packages/app/node_modules/ -> app
 fn short_display_path(path: &str) -> String {
-    // Normalize separators and drop any trailing slash for display.
-    let normalized = path.replace('\\', "/");
-    let trimmed = normalized.trim_end_matches('/');
+    let trimmed = path.trim_end_matches('/');
     let mut parts = trimmed.split('/').rev().filter(|p| {
         !p.is_empty() && *p != "build" && *p != "dist" && *p != "node_modules" && *p != "src"
     });
@@ -1749,12 +1719,7 @@ fn cd_target(args: &[String]) -> Option<String> {
 
 /// Returns whether a command token has an explicit path shape.
 pub fn is_pathish(s: &str) -> bool {
-    s == "."
-        || s == ".."
-        || s.starts_with("./")
-        || s.starts_with("../")
-        || s.contains('/')
-        || s.contains('\\')
+    s == "." || s == ".." || s.starts_with("./") || s.starts_with("../") || s.contains('/')
 }
 
 fn parse_fd_query_and_path(tail: &[String]) -> (Option<String>, Option<String>) {
@@ -2503,29 +2468,6 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
     }
 }
 
-fn is_abs_like(path: &str) -> bool {
-    if std::path::Path::new(path).is_absolute() {
-        return true;
-    }
-    let mut chars = path.chars();
-    match (chars.next(), chars.next(), chars.next()) {
-        // Windows drive path like C:\
-        (Some(d), Some(':'), Some('\\')) if d.is_ascii_alphabetic() => return true,
-        // UNC path like \\server\share
-        (Some('\\'), Some('\\'), _) => return true,
-        _ => {}
-    }
-    false
-}
-
 fn join_paths(base: &str, rel: &str) -> String {
-    if is_abs_like(rel) {
-        return rel.to_string();
-    }
-    if base.is_empty() {
-        return rel.to_string();
-    }
-    let mut buf = PathBuf::from(base);
-    buf.push(rel);
-    buf.to_string_lossy().to_string()
+    PathBuf::from(base).join(rel).to_string_lossy().into_owned()
 }

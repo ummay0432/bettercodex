@@ -103,7 +103,7 @@ candidate's version, source revision, V8 runtime, and embedded resources before
 an atomic replacement. It does not download a shell script or checksum file,
 and it never invokes Cargo or source fallback. The reviewed Linux x86-64 build
 is about 17.2 MB as a full update; the measured predecessor patch for the
-reviewed build was about 2.4 MB.
+reviewed build was about 2.7 MB.
 
 The running TUI keeps using its old in-memory code until restarted; new
 processes use the atomically replaced binary. Failed background checks stay

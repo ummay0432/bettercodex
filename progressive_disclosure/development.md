@@ -1,7 +1,7 @@
 # bettercodex development workflows
 
 Read this before changing Rust, tests, performance, or installation behavior.
-Bettercodex follows Codex's Cargo and `just` workflow, reduced to the one
+bettercodex follows Codex's Cargo and `just` workflow, reduced to the one
 retained Rust package. It does not carry Codex's Bazel, Node, release-packaging,
 or Windows machinery.
 
@@ -25,7 +25,7 @@ Build or run the binary through the checked-in Cargo wrapper:
 
 The wrapper downloads and verifies the sandbox-enabled V8 archive and generated
 binding published by upstream Codex, then delegates every argument to Cargo.
-Use it for commands that build Bettercodex; formatting and dependency-only
+Use it for commands that build bettercodex; formatting and dependency-only
 commands can invoke Cargo directly.
 
 Use the matching upstream-style recipes for routine development:
@@ -54,7 +54,7 @@ already expresses.
 
 - Test affected behavior rather than implementation details or static values.
 - Keep tests ported with retained upstream behavior.
-- Add BetterCodex-only tests only for a deliberate product departure or a
+- Add bettercodex-only tests only for a deliberate product departure or a
   regression that cannot be covered by an existing test.
 - Use sibling `*_tests.rs` modules for new test modules.
 - Do not put manual benchmarks behind `#[test]`; add a real benchmark target

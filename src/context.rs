@@ -1083,7 +1083,7 @@ fn repository_context(cwd: &Path) -> Result<Option<String>> {
         .canonicalize()
         .with_context(|| format!("failed to resolve working directory {}", cwd.display()))?;
     let mut candidates = Vec::new();
-    if let Some(codex_home) = codex_home()
+    if let Some(codex_home) = crate::paths::codex_home()
         && let Some(path) = first_instruction_file(&codex_home)?
     {
         candidates.push(path);
@@ -1168,12 +1168,6 @@ fn read_instruction_file(path: &Path, limit: usize) -> Result<(Vec<u8>, bool)> {
         .with_context(|| format!("failed to read instructions from {}", path.display()))?;
     let truncated = length > bytes.len() as u64;
     Ok((bytes, truncated))
-}
-
-fn codex_home() -> Option<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
 }
 
 pub(crate) fn estimated_tokens(items: &[Value]) -> u64 {

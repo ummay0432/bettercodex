@@ -96,16 +96,6 @@ impl Command for SetWindowTitle {
     fn write_ansi(&self, output: &mut impl fmt::Write) -> fmt::Result {
         write!(output, "\x1b]0;{}\x07", self.0)
     }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::other("OSC terminal titles require ANSI output"))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
 }
 
 fn sanitize_terminal_title(title: &str) -> String {

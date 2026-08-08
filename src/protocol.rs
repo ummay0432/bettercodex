@@ -1,4 +1,4 @@
-//! Focused Codex wire and UI types used by BetterCodex.
+//! Focused Codex wire and UI types used by bettercodex.
 //!
 //! Ported from OpenAI Codex commit
 //! `1669c2403f793d0230065397dfc25f52b844244e`,

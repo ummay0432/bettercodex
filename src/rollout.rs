@@ -25,9 +25,7 @@ use std::io::Write;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::os::fd::AsRawFd;
-#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1085,9 +1083,7 @@ fn read_metadata(path: &Path) -> Result<Option<SessionMetadata>> {
 }
 
 fn state_root() -> Result<PathBuf> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    let codex_home = crate::paths::codex_home()
         .ok_or_else(|| anyhow!("cannot locate bettercodex state: HOME is not set"))?;
     Ok(codex_home.join(STATE_DIRECTORY))
 }
@@ -1130,7 +1126,6 @@ fn installation_id(root: &Path) -> Result<String> {
 fn prepare_private_directory(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .with_context(|| format!("failed to create state directory {}", path.display()))?;
-    #[cfg(unix)]
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to protect state directory {}", path.display()))?;
     Ok(())
@@ -1142,12 +1137,10 @@ fn open_private_append(path: &Path, create_new: bool) -> Result<File> {
     if create_new {
         options.create_new(true);
     }
-    #[cfg(unix)]
     options.mode(0o600);
     let file = options
         .open(path)
         .with_context(|| format!("failed to open session journal {}", path.display()))?;
-    #[cfg(unix)]
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
@@ -1172,7 +1165,6 @@ fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
 fn open_private_replace(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
     options.mode(0o600);
     options
         .open(path)

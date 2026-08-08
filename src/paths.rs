@@ -13,7 +13,6 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .or_else(passwd_home_dir)
 }
 
-#[cfg(unix)]
 fn passwd_home_dir() -> Option<PathBuf> {
     use std::ffi::CStr;
     use std::ffi::OsString;
@@ -61,13 +60,14 @@ fn passwd_home_dir() -> Option<PathBuf> {
     }
 }
 
-#[cfg(not(unix))]
-fn passwd_home_dir() -> Option<PathBuf> {
-    None
-}
-
 pub(crate) fn bettercodex_home() -> Option<PathBuf> {
     std::env::var_os("BCODEX_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bcodex")))
+        .or_else(|| home_dir().map(|home| home.join(".bcodex")))
+}
+
+pub(crate) fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".codex")))
 }

@@ -8,8 +8,7 @@ const POWERSHELL_FLAGS: &[&str] = &["-nologo", "-noprofile", "-command", "-c"];
 /// Extract the PowerShell script body from an invocation such as:
 ///
 /// - ["pwsh", "-NoProfile", "-Command", "Get-ChildItem -Recurse | Select-String foo"]
-/// - ["powershell.exe", "-Command", "Write-Host hi"]
-/// - ["powershell", "-NoLogo", "-NoProfile", "-Command", "...script..."]
+/// - ["pwsh", "-NoLogo", "-NoProfile", "-Command", "...script..."]
 ///
 /// Returns (`shell`, `script`) when the first arg is a PowerShell executable and a
 /// `-Command` (or `-c`) flag is present followed by a script string.

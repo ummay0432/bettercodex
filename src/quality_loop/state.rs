@@ -1,4 +1,7 @@
+use crate::quality_loop::CONTRACT_PROMPT;
+use crate::quality_loop::EVALUATOR_PROMPT;
 use crate::quality_loop::LoopInvocation;
+use crate::quality_loop::WORKER_PROMPT;
 use crate::quality_loop::Worktree;
 use crate::rollout::OperatorInputRecord;
 use anyhow::Context;
@@ -24,10 +27,6 @@ use uuid::Uuid;
 pub(crate) const LOOP_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const CONTRACT_VERSION: u32 = 1;
 const RUNTIME_DIRECTORY: &str = "runtime";
-
-const EVALUATOR_PROMPT: &str = include_str!("../../prompts/loop-evaluator.md");
-const WORKER_PROMPT: &str = include_str!("../../prompts/loop-worker.md");
-const CONTRACT_PROMPT: &str = include_str!("../../prompts/loop-contract.md");
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -898,7 +897,7 @@ fn build_identity() -> String {
     format!(
         "bettercodex-{}-{}",
         env!("CARGO_PKG_VERSION"),
-        option_env!("BETTERCODEX_BUILD_REVISION").unwrap_or("source")
+        crate::update::source_revision().unwrap_or("source")
     )
 }
 

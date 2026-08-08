@@ -1,7 +1,7 @@
 //! Focused prompt-image preparation retained from OpenAI Codex commit
 //! 1669c2403f793d0230065397dfc25f52b844244e.
 //!
-//! BetterCodex receives tool images as data URLs, so the upstream utility's
+//! bettercodex receives tool images as data URLs, so the upstream utility's
 //! file-reading and path-based MIME guessing APIs are intentionally omitted.
 
 use crate::cache::BlockingLruCache;

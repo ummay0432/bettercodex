@@ -1,7 +1,7 @@
 //! Focused HTTP behavior retained from OpenAI Codex commit
 //! 1669c2403f793d0230065397dfc25f52b844244e.
 //!
-//! BetterCodex needs Codex's retry curve, Cloudflare-only ChatGPT cookie jar,
+//! bettercodex needs Codex's retry curve, Cloudflare-only ChatGPT cookie jar,
 //! and custom enterprise CA handling. The route-aware proxy, telemetry,
 //! request abstraction, and provider systems are deliberately not retained.
 

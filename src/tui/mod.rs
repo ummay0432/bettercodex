@@ -5,6 +5,7 @@ mod context_window;
 mod editor;
 mod file_search;
 mod git_diff;
+mod login_screen;
 mod markdown;
 mod markdown_cache;
 mod markdown_render;
@@ -65,6 +66,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::pending;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -113,19 +115,45 @@ impl TurnCompletion {
 }
 
 pub(crate) async fn run(
-    agent: Agent,
-    cwd: PathBuf,
+    requested_cwd: PathBuf,
+    resume: Option<ResumeSelector>,
     worker_handoff: Option<crate::managed_session::WorkerHandoff>,
     startup: Startup,
+    login_status: crate::login::LoginStatus,
 ) -> Result<()> {
-    let mut runtime = Runtime::new(agent, cwd, worker_handoff)?;
-    let mut session = startup.0.enter()?;
+    let (mut runtime, mut session) = if login_status == crate::login::LoginStatus::NotLoggedIn {
+        let mut session = startup.0.enter()?;
+        palette::set_terminal_colors(session.default_foreground(), session.default_background());
+        if matches!(
+            login_screen::run(&mut session).await?,
+            login_screen::LoginScreenOutcome::Exit
+        ) {
+            drop(session);
+            return Ok(());
+        }
+        session.terminal_mut().clear_screen()?;
+        let agent = load_agent(&requested_cwd, resume)?;
+        let cwd = agent.cwd().to_path_buf();
+        (Runtime::new(agent, cwd, worker_handoff)?, session)
+    } else {
+        let agent = load_agent(&requested_cwd, resume)?;
+        let cwd = agent.cwd().to_path_buf();
+        let runtime = Runtime::new(agent, cwd, worker_handoff)?;
+        (runtime, startup.0.enter()?)
+    };
     runtime
         .view
         .set_terminal_colors(session.default_foreground(), session.default_background());
     let result = runtime.event_loop(&mut session).await;
     drop(session);
     result
+}
+
+fn load_agent(requested_cwd: &Path, resume: Option<ResumeSelector>) -> Result<Agent> {
+    match resume {
+        Some(selector) => Agent::resume(requested_cwd, selector),
+        None => Agent::new(requested_cwd),
+    }
 }
 
 struct Runtime {

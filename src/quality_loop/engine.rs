@@ -1,3 +1,5 @@
+use super::CONTRACT_PROMPT;
+use super::EVALUATOR_PROMPT;
 use super::EvaluationReport;
 use super::ImprovementDecision;
 use super::LoopInvocation;
@@ -8,6 +10,7 @@ use super::PathSpec;
 use super::RepositorySnapshot;
 use super::RunPhase;
 use super::SetupVerdict;
+use super::WORKER_PROMPT;
 use super::WorkerEnvelope;
 use super::WorkerVerdict;
 use super::apply_structured_artifact;
@@ -48,10 +51,6 @@ use std::pin::Pin;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
-
-const EVALUATOR_PROMPT: &str = include_str!("../../prompts/loop-evaluator.md");
-const WORKER_PROMPT: &str = include_str!("../../prompts/loop-worker.md");
-const CONTRACT_PROMPT: &str = include_str!("../../prompts/loop-contract.md");
 
 #[derive(Default)]
 struct OutcomeCounts {

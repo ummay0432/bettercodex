@@ -1,7 +1,7 @@
 //! Fixed ChatGPT browser, device-code, status, and logout flows.
 //!
 //! This is a focused port of OpenAI Codex login behavior at commit
-//! 1669c2403f793d0230065397dfc25f52b844244e. BetterCodex always uses the
+//! 1669c2403f793d0230065397dfc25f52b844244e. bettercodex always uses the
 //! ChatGPT issuer and the file credential store, so configurable providers,
 //! keyrings, telemetry, model-provider metadata, and proxy routing are omitted.
 
@@ -60,6 +60,18 @@ pub(crate) enum LoginMode {
     DeviceCode,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LoginInstructions {
+    Browser {
+        auth_url: String,
+        actual_port: u16,
+    },
+    DeviceCode {
+        verification_url: String,
+        user_code: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoginStatus {
     ChatGpt,
@@ -68,23 +80,31 @@ pub(crate) enum LoginStatus {
 }
 
 pub(crate) async fn login(mode: LoginMode) -> Result<()> {
-    clear_existing_auth().await;
-    match mode {
-        LoginMode::Browser => {
-            let server = run_login_server().context("failed to start the login server")?;
+    let attempt = start_login(mode).await?;
+    match attempt.instructions() {
+        LoginInstructions::Browser {
+            auth_url,
+            actual_port,
+        } => {
             eprintln!(
-                "Starting local login server on http://localhost:{}.\nIf your browser did not open, navigate to this URL to authenticate:\n\n{}\n\nOn a remote or headless machine? Use `bcodex login --device-auth` instead.",
-                server.actual_port, server.auth_url
+                "Starting local login server on http://localhost:{actual_port}.\nIf your browser did not open, navigate to this URL to authenticate:\n\n{auth_url}\n\nOn a remote or headless machine? Use `bcodex login --device-auth` instead."
             );
-            server
-                .block_until_done()
-                .await
-                .context("ChatGPT login was not completed")
         }
-        LoginMode::DeviceCode => run_device_code_login()
-            .await
-            .context("device code login was not completed"),
+        LoginInstructions::DeviceCode {
+            verification_url,
+            user_code,
+        } => print_device_code_prompt(&verification_url, &user_code),
     }
+    attempt.complete().await
+}
+
+pub(crate) async fn login_with_updates(
+    mode: LoginMode,
+    updates: tokio::sync::mpsc::UnboundedSender<LoginInstructions>,
+) -> Result<()> {
+    let attempt = start_login(mode).await?;
+    let _ = updates.send(attempt.instructions());
+    attempt.complete().await
 }
 
 pub(crate) fn status() -> Result<LoginStatus> {
@@ -136,14 +156,67 @@ fn remove_auth_file(path: &Path) -> io::Result<bool> {
 struct LoginServer {
     auth_url: String,
     actual_port: u16,
+    server: Arc<Server>,
     task: tokio::task::JoinHandle<io::Result<()>>,
 }
 
 impl LoginServer {
-    async fn block_until_done(self) -> io::Result<()> {
-        self.task
+    async fn block_until_done(mut self) -> io::Result<()> {
+        (&mut self.task)
             .await
             .map_err(|error| io::Error::other(format!("login server thread panicked: {error:?}")))?
+    }
+}
+
+impl Drop for LoginServer {
+    fn drop(&mut self) {
+        self.server.unblock();
+        self.task.abort();
+    }
+}
+
+enum LoginAttempt {
+    Browser(LoginServer),
+    DeviceCode(DeviceCode),
+}
+
+impl LoginAttempt {
+    fn instructions(&self) -> LoginInstructions {
+        match self {
+            Self::Browser(server) => LoginInstructions::Browser {
+                auth_url: server.auth_url.clone(),
+                actual_port: server.actual_port,
+            },
+            Self::DeviceCode(device_code) => LoginInstructions::DeviceCode {
+                verification_url: device_code.verification_url.clone(),
+                user_code: device_code.user_code.clone(),
+            },
+        }
+    }
+
+    async fn complete(self) -> Result<()> {
+        match self {
+            Self::Browser(server) => server
+                .block_until_done()
+                .await
+                .context("ChatGPT login was not completed"),
+            Self::DeviceCode(device_code) => complete_device_code_login(device_code)
+                .await
+                .context("device code login was not completed"),
+        }
+    }
+}
+
+async fn start_login(mode: LoginMode) -> Result<LoginAttempt> {
+    clear_existing_auth().await;
+    match mode {
+        LoginMode::Browser => run_login_server()
+            .map(LoginAttempt::Browser)
+            .context("failed to start the login server"),
+        LoginMode::DeviceCode => request_device_code()
+            .await
+            .map(LoginAttempt::DeviceCode)
+            .context("device code login was not completed"),
     }
 }
 
@@ -166,12 +239,13 @@ fn run_login_server() -> io::Result<LoginServer> {
     thread::spawn(move || {
         while let Ok(request) = receiver_server.recv() {
             if let Err(error) = request_tx.blocking_send(request) {
-                eprintln!("Failed to send request to channel: {error}");
+                tracing::warn!("failed to send login request to the async handler: {error}");
                 break;
             }
         }
     });
 
+    let task_server = Arc::clone(&server);
     let task = tokio::spawn(async move {
         let result = loop {
             let Some(request) = request_rx.recv().await else {
@@ -196,13 +270,14 @@ fn run_login_server() -> io::Result<LoginServer> {
                 }
             }
         };
-        server.unblock();
+        task_server.unblock();
         result
     });
 
     Ok(LoginServer {
         auth_url,
         actual_port,
+        server,
         task,
     })
 }
@@ -227,7 +302,7 @@ async fn process_login_request(
     let parsed_url = match url::Url::parse(&format!("http://localhost{raw_url}")) {
         Ok(url) => url,
         Err(error) => {
-            eprintln!("URL parse error: {error}");
+            tracing::warn!("login callback URL parse error: {error}");
             return plain_response("Bad Request", 400);
         }
     };
@@ -248,7 +323,7 @@ async fn process_login_request(
             if let Some(error_code) = parameters.get("error") {
                 let description = parameters.get("error_description").map(String::as_str);
                 let message = oauth_callback_error_message(error_code, description);
-                eprintln!("OAuth callback error: {message}");
+                tracing::warn!("OAuth callback error: {message}");
                 return login_error_response(
                     &message,
                     io::ErrorKind::PermissionDenied,
@@ -273,7 +348,7 @@ async fn process_login_request(
                     };
                     let api_key = obtain_api_key(&tokens.id_token).await.ok();
                     if let Err(error) = persist_tokens(api_key, tokens).await {
-                        eprintln!("Persist error: {error}");
+                        tracing::warn!("failed to persist login credentials: {error}");
                         return login_error_response(
                             "Sign-in completed but credentials could not be saved locally.",
                             io::ErrorKind::Other,
@@ -297,7 +372,7 @@ async fn process_login_request(
                     }
                 }
                 Err(error) => {
-                    eprintln!("Token exchange error: {error}");
+                    tracing::warn!("login token exchange error: {error}");
                     login_error_response(
                         &format!("Token exchange failed: {error}"),
                         io::ErrorKind::Other,
@@ -449,7 +524,7 @@ fn bind_server(port: u16) -> io::Result<Server> {
                 if !cancel_attempted && !using_fallback {
                     cancel_attempted = true;
                     if let Err(error) = send_cancel_request(port) {
-                        eprintln!("Failed to cancel previous login server: {error}");
+                        tracing::warn!("failed to cancel previous login server: {error}");
                     }
                 }
                 thread::sleep(Duration::from_millis(200));
@@ -819,12 +894,6 @@ struct DeviceCodeSuccess {
     authorization_code: String,
     code_challenge: String,
     code_verifier: String,
-}
-
-async fn run_device_code_login() -> io::Result<()> {
-    let device_code = request_device_code().await?;
-    print_device_code_prompt(&device_code.verification_url, &device_code.user_code);
-    complete_device_code_login(device_code).await
 }
 
 async fn request_device_code() -> io::Result<DeviceCode> {

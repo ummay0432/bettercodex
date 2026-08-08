@@ -67,7 +67,6 @@ fn applies_add_update_delete_and_move() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn moving_a_file_preserves_its_executable_mode() {
     use std::os::unix::fs::PermissionsExt;

@@ -2755,7 +2755,7 @@ impl View {
 
         let mut lines = vec![truncate_line(self.working_line(), usize::from(width))];
         lines.extend(self.status_detail_line(width));
-        // BetterCodex deliberately keeps this footer on its own row while busy. Codex folds it
+        // bettercodex deliberately keeps this footer on its own row while busy. Codex folds it
         // into the status header, which hides both surfaces behind the same truncation boundary.
         lines.extend(self.background_process_line(width));
         lines

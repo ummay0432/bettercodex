@@ -90,11 +90,7 @@ impl TerminalStartup {
     pub(super) fn enter(mut self) -> Result<TerminalSession> {
         let mut output = stdout();
 
-        let probe = self
-            .probe
-            .take()
-            .and_then(|probe| probe.finish().ok())
-            .unwrap_or_default();
+        let probe = self.finish_probe();
         let screen_size = crossterm::terminal::size()
             .map(|(width, height)| Size::new(width, height))
             .context("failed to read terminal size")?;
@@ -127,6 +123,13 @@ impl TerminalStartup {
         self.restore_on_drop = false;
         Ok(session)
     }
+
+    fn finish_probe(&mut self) -> StartupProbe {
+        self.probe
+            .take()
+            .and_then(|probe| probe.finish().ok())
+            .unwrap_or_default()
+    }
 }
 
 impl TerminalSession {
@@ -155,6 +158,10 @@ impl TerminalSession {
 impl Drop for TerminalStartup {
     fn drop(&mut self) {
         if self.restore_on_drop {
+            // Keep raw mode active until any OSC replies emitted by the startup probe have been
+            // consumed. Otherwise a fallible setup step can return those replies to the shell as
+            // visible input after terminal restoration.
+            let _ = self.finish_probe();
             let _ = restore();
         }
     }

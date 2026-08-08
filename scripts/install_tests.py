@@ -172,6 +172,19 @@ class InstallScriptTest(unittest.TestCase):
             release_tag = f"bcodex-v{VERSION}-{COMMIT}"
             self.assertIn(f"releases/download/{release_tag}/bcodex-{target}.xz", requests)
             self.assertNotIn(".sha256", requests)
+            self.assertTrue(
+                any(
+                    "--max-filesize 1048576" in request and "releases/latest" in request
+                    for request in requests.splitlines()
+                )
+            )
+            self.assertTrue(
+                any(
+                    "--max-filesize 134217728" in request
+                    and "releases/download" in request
+                    for request in requests.splitlines()
+                )
+            )
             self.assertEqual(
                 (root / "release-request-count").read_text(encoding="utf-8").strip(),
                 "1",

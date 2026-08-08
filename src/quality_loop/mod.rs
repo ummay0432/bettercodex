@@ -8,6 +8,10 @@ mod progress;
 mod repository;
 mod state;
 
+const EVALUATOR_PROMPT: &str = include_str!("../../prompts/loop-evaluator.md");
+const WORKER_PROMPT: &str = include_str!("../../prompts/loop-worker.md");
+const CONTRACT_PROMPT: &str = include_str!("../../prompts/loop-contract.md");
+
 pub(crate) use contract::EvaluatorContract;
 pub(crate) use contract::PathSpec;
 pub(crate) use engine::submit_with_control;
