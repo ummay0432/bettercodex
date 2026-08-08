@@ -24,6 +24,10 @@ mod review_tests;
 mod runtime_tests;
 mod skill_popup;
 mod skills_view;
+mod startup_art;
+#[cfg(test)]
+#[path = "startup_art_tests.rs"]
+mod startup_art_tests;
 mod table_detect;
 mod terminal;
 mod terminal_hyperlinks;
@@ -271,9 +275,10 @@ impl Runtime {
                     terminal.clear_screen()?;
                 }
                 let mut history = if resize_reflow_requested && !clear_requested {
-                    self.view.history_lines_for_resize_reflow(width)
+                    self.view
+                        .history_lines_for_resize_reflow(width, screen_height)
                 } else {
-                    self.view.take_pending_history_lines(width)
+                    self.view.take_pending_history_lines(width, screen_height)
                 };
                 let mut prepared = self.view.prepare(width, screen_height);
                 history.extend(prepared.take_history_lines());

@@ -10,9 +10,10 @@ use tokio::sync::mpsc::unbounded_channel;
 #[test]
 fn completed_turn_drain_renders_events_beyond_the_fairness_batch() {
     const WIDTH: u16 = 80;
+    const HEIGHT: u16 = 24;
     let mut view = View::new(Path::new("/tmp/bettercodex"));
     view.start_turn("render every queued delta");
-    let _ = view.take_pending_history_lines(WIDTH);
+    let _ = view.take_pending_history_lines(WIDTH, HEIGHT);
     let (events, mut ready) = unbounded_channel();
     let mut answer = "x".repeat(MAX_READY_AGENT_EVENTS);
     answer.push_str(" tail-marker");
@@ -35,7 +36,7 @@ fn completed_turn_drain_renders_events_beyond_the_fairness_batch() {
     drain_completed_agent_events(&mut ready, |event| view.handle_agent_event(event));
 
     let rendered = view
-        .take_pending_history_lines(WIDTH)
+        .take_pending_history_lines(WIDTH, HEIGHT)
         .iter()
         .flat_map(|line| line.line.spans.iter())
         .map(|span| span.content.as_ref())

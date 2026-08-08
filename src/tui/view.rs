@@ -21,6 +21,7 @@ use super::resume_picker::ResumePickerAction;
 use super::skill_popup::SkillPopup;
 use super::skills_view::SkillsView;
 use super::skills_view::SkillsViewAction;
+use super::startup_art;
 use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
 use super::tool_catalogue::CatalogueAction;
@@ -1765,12 +1766,20 @@ impl View {
             })
     }
 
-    pub(super) fn take_pending_history_lines(&mut self, width: u16) -> Vec<HyperlinkLine> {
+    pub(super) fn take_pending_history_lines(
+        &mut self,
+        width: u16,
+        screen_height: u16,
+    ) -> Vec<HyperlinkLine> {
         let width = width.max(1);
         let mut lines = Vec::new();
         if self.welcome_pending {
             append_history_cell(
-                terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(&self.cwd, width)),
+                terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(
+                    &self.cwd,
+                    width,
+                    screen_height,
+                )),
                 &mut lines,
                 &mut self.history_emitted,
             );
@@ -1803,7 +1812,11 @@ impl View {
     /// A terminal can reflow the mutable composer into scrollback before crossterm delivers the
     /// resize event. Codex repairs that state by clearing its terminal surface and replaying the
     /// retained transcript at the new width instead of trusting terminal-wrapped rows.
-    pub(super) fn history_lines_for_resize_reflow(&mut self, width: u16) -> Vec<HyperlinkLine> {
+    pub(super) fn history_lines_for_resize_reflow(
+        &mut self,
+        width: u16,
+        screen_height: u16,
+    ) -> Vec<HyperlinkLine> {
         let width = width.max(1);
         for entry in &mut self.entries {
             entry.reset_streamed_history();
@@ -1819,7 +1832,11 @@ impl View {
         let mut lines = Vec::new();
         let mut emitted = false;
         append_history_cell(
-            terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(&self.cwd, width)),
+            terminal_hyperlinks::plain_hyperlink_lines(welcome_lines(
+                &self.cwd,
+                width,
+                screen_height,
+            )),
             &mut lines,
             &mut emitted,
         );
@@ -3585,7 +3602,18 @@ fn command_output(cwd: &Path, arguments: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn welcome_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
+fn welcome_lines(cwd: &Path, available_width: u16, available_height: u16) -> Vec<Line<'static>> {
+    let card = welcome_card_lines(cwd, available_width);
+    let mut artwork = startup_art::lines(available_width, available_height);
+    if artwork.is_empty() || card.is_empty() {
+        return card;
+    }
+    artwork.push(Line::default());
+    artwork.extend(card);
+    artwork
+}
+
+fn welcome_card_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
     if available_width < 4 {
         return Vec::new();
     }
@@ -4634,6 +4662,21 @@ mod tests {
         assert_eq!(prompt.text_without_image_placeholders(), "/review");
     }
 
+    #[test]
+    fn loop_completion_inserts_a_prompt_prefix_without_submitting() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/loo");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "/loop ");
+    }
+
     fn completed_message(text: impl Into<String>) -> AgentEvent {
         AgentEvent::ModelMessageCompleted(AssistantMessage {
             text: text.into(),
@@ -4723,7 +4766,7 @@ mod tests {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.start_turn("test");
-        let _ = view.take_pending_history_lines(60);
+        let _ = view.take_pending_history_lines(60, 24);
         view.handle_agent_event(AgentEvent::LoopProgress(LoopProgress::new(
             "Parser speed",
             "1/3",
@@ -4765,7 +4808,7 @@ mod tests {
     fn initial_viewport_contains_only_the_codex_composer() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         assert_eq!(view.desired_height(88, 24), 5);
-        let history = view.take_pending_history_lines(88);
+        let history = view.take_pending_history_lines(88, 24);
         assert!(
             history
                 .iter()
@@ -4821,7 +4864,7 @@ mod tests {
 
     #[test]
     fn welcome_card_uses_codex_content_width_instead_of_terminal_width() {
-        let lines = welcome_lines(Path::new("/tmp/bettercodex"), 100);
+        let lines = welcome_card_lines(Path::new("/tmp/bettercodex"), 100);
         let widest_content = lines[1..lines.len() - 1]
             .iter()
             .map(line_width)
@@ -4832,18 +4875,48 @@ mod tests {
     }
 
     #[test]
+    fn roomy_welcome_includes_art_and_small_layouts_keep_the_card() {
+        let roomy = welcome_lines(Path::new("/tmp/bettercodex"), 80, 42);
+        let short = welcome_lines(Path::new("/tmp/bettercodex"), 80, 27);
+        let narrow = welcome_lines(Path::new("/tmp/bettercodex"), 29, 42);
+
+        assert!(
+            roomy
+                .iter()
+                .take(usize::from(startup_art::ART_HEIGHT))
+                .flat_map(|line| line.spans.iter())
+                .flat_map(|span| span.content.chars())
+                .any(|character| ('\u{2800}'..='\u{28ff}').contains(&character))
+        );
+        assert_eq!(
+            short.len(),
+            welcome_card_lines(Path::new("/tmp/bettercodex"), 80).len()
+        );
+        assert_eq!(
+            narrow.len(),
+            welcome_card_lines(Path::new("/tmp/bettercodex"), 29).len()
+        );
+        assert!(short.iter().any(|line| plain(line).contains("bettercodex")));
+        assert!(
+            narrow
+                .iter()
+                .any(|line| plain(line).contains("bettercodex"))
+        );
+    }
+
+    #[test]
     fn resize_reflow_rebuilds_finalized_history_from_source() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         assert!(
-            view.take_pending_history_lines(80)
+            view.take_pending_history_lines(80, 24)
                 .iter()
                 .any(|line| plain(line).contains("bettercodex"))
         );
         view.start_turn("a user message that wraps at the narrower width");
-        let _ = view.take_pending_history_lines(80);
+        let _ = view.take_pending_history_lines(80, 24);
         view.handle_agent_event(AgentEvent::ModelMessageDelta("assistant reply".to_string()));
         view.handle_agent_event(completed_message("assistant reply"));
-        let _ = view.take_pending_history_lines(80);
+        let _ = view.take_pending_history_lines(80, 24);
 
         assert_eq!(
             view.handle_terminal_event(Event::Resize(32, 18)),
@@ -4851,7 +4924,7 @@ mod tests {
         );
         assert!(view.take_resize_reflow_request());
         let replay = view
-            .history_lines_for_resize_reflow(32)
+            .history_lines_for_resize_reflow(32, 18)
             .iter()
             .map(plain)
             .collect::<Vec<_>>()
@@ -4889,7 +4962,7 @@ mod tests {
         view.welcome_pending = false;
         view.start_turn("test");
 
-        let lines = view.take_pending_history_lines(40);
+        let lines = view.take_pending_history_lines(40, 24);
         let buffer = crate::tui::terminal::render_history_lines(&lines, 40);
         let background = view.user_message_style.bg.unwrap();
 
@@ -4916,7 +4989,7 @@ mod tests {
             duration: Duration::from_millis(50),
         });
         let rendered = view
-            .take_pending_history_lines(80)
+            .take_pending_history_lines(80, 24)
             .iter()
             .map(plain)
             .collect::<Vec<_>>()
@@ -4951,7 +5024,7 @@ mod tests {
             duration: Duration::from_millis(10),
         });
         let rendered = view
-            .take_pending_history_lines(80)
+            .take_pending_history_lines(80, 24)
             .iter()
             .map(plain)
             .collect::<Vec<_>>()
@@ -4979,7 +5052,7 @@ mod tests {
         });
         view.seal_exploration();
         let rendered = view
-            .take_pending_history_lines(80)
+            .take_pending_history_lines(80, 24)
             .iter()
             .map(plain)
             .collect::<Vec<_>>()
