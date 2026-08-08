@@ -10,11 +10,12 @@ bettercodex is a work in progress port of
 [OpenAI Codex](https://github.com/openai/codex) trying to fix this in the
 harness. The plan is to use hooks, Andrej Karpathy's
 [`autoresearch`](https://github.com/karpathy/autoresearch), and context efficient
-loops to make the agent notice problems, do the work, and clean up after itself.
+looping to make the agent notice problems, do the work, and clean up after
+itself.
 
-Right now, bettercodex has an `autoresearch` inspired quality loop. One session
-builds an evaluator. Fresh sessions then take turns improving the same task. The
-harness keeps better results and throws away regressions.
+Start with the review skill. It does not just tell you what is wrong. It digs
+into a target, fixes the slop it finds, simplifies the code, and removes dead
+code. The agent can also use it on its own while working.
 
 This is early, unofficial, and not an OpenAI product.
 
@@ -40,14 +41,14 @@ bcodex login
 bcodex
 ```
 
-## Quality loop
+## Clean up slop
 
 ```text
-/loop improve startup time
+/review src/tui
 ```
 
-You can also put `$loop` anywhere in a prompt. The default is one evaluator
-session and three fresh work sessions.
+Use `/review <target>` in the TUI or put `$review <target>` in any prompt. Review
+edits the code. Point it at a messy part of the codebase and let it clean it up.
 
 More detail is in the [install docs](docs/install.md) and
 [slash command docs](docs/slash_commands.md).
