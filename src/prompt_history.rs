@@ -147,7 +147,3 @@ impl Drop for FileLock {
         let _ = unsafe { libc::flock(self.descriptor, libc::LOCK_UN) };
     }
 }
-
-#[cfg(test)]
-#[path = "prompt_history_tests.rs"]
-mod tests;

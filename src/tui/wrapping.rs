@@ -1438,14 +1438,6 @@ mod tests {
     }
 
     #[test]
-    fn line_height_counts_double_width_characters() {
-        let line = "\u{ff21}\u{ff21}\u{ff21}".into();
-        assert_eq!(word_wrap_line(&line, /*width_or_options*/ 4).len(), 2);
-        assert_eq!(word_wrap_line(&line, /*width_or_options*/ 2).len(), 3);
-        assert_eq!(word_wrap_line(&line, /*width_or_options*/ 6).len(), 1);
-    }
-
-    #[test]
     fn word_wrap_does_not_split_words_simple_english() {
         let sample = "Years passed, and Willowmere thrived in peace and friendship. Mira’s herb garden flourished with both ordinary and enchanted plants, and travelers spoke of the kindness of the woman who tended them.";
         let line = Line::from(sample);

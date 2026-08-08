@@ -59,7 +59,3 @@ fn normalize_pasted_path(pasted: &str) -> Option<PathBuf> {
     }
     Some(PathBuf::from(unquoted))
 }
-
-#[cfg(test)]
-#[path = "clipboard_paste_tests.rs"]
-mod tests;

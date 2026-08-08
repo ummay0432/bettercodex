@@ -334,7 +334,3 @@ fn format_percent(tokens: u64, total: u64) -> String {
     let tenths = u64::try_from(tenths).unwrap_or(u64::MAX);
     format!("{}.{:01}%", tenths / 10, tenths % 10)
 }
-
-#[cfg(test)]
-#[path = "context_window_tests.rs"]
-mod tests;

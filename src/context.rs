@@ -838,10 +838,6 @@ fn trim_oldest_multimodal_inputs(history: &mut Vec<Value>, minimum_tokens: u64) 
     removed_tokens
 }
 
-pub(crate) fn initial_context_items(cwd: &Path) -> Result<Vec<Value>> {
-    Ok(WorldState::load(cwd)?.items())
-}
-
 impl ContextMetrics {
     fn from_history(history: &[Value], world_state: &WorldState) -> Self {
         let mut metrics = Self::default();

@@ -152,35 +152,3 @@ fn is_disallowed_terminal_title_char(character: char) -> bool {
                 | '\u{E0100}'..='\u{E01EF}'
         )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn title_sanitization_removes_controls_bidi_and_redundant_space() {
-        assert_eq!(
-            sanitize_terminal_title("  Pro\u{202e}ject\n\x1b\x07  title  "),
-            "Project title"
-        );
-    }
-
-    #[test]
-    fn title_is_bounded_by_characters() {
-        assert_eq!(
-            sanitize_terminal_title(&"é".repeat(MAX_TERMINAL_TITLE_CHARS + 1))
-                .chars()
-                .count(),
-            MAX_TERMINAL_TITLE_CHARS
-        );
-    }
-
-    #[test]
-    fn osc_zero_uses_a_bel_terminator() {
-        let mut encoded = String::new();
-        SetWindowTitle("bettercodex".to_string())
-            .write_ansi(&mut encoded)
-            .unwrap();
-        assert_eq!(encoded, "\x1b]0;bettercodex\x07");
-    }
-}

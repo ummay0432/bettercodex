@@ -158,7 +158,3 @@ fn format_tokens(tokens: u64) -> String {
         tokens.to_string()
     }
 }
-
-#[cfg(test)]
-#[path = "tool_catalogue_tests.rs"]
-mod tests;

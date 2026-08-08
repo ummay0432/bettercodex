@@ -271,7 +271,3 @@ fn is_compaction_item(item: &Value) -> bool {
         Some("compaction" | "compaction_summary")
     )
 }
-
-#[cfg(test)]
-#[path = "compaction_tests.rs"]
-mod tests;

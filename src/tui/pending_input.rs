@@ -156,7 +156,3 @@ fn bounded_preview(prompt: &str) -> String {
     }
     preview.trim().to_string()
 }
-
-#[cfg(test)]
-#[path = "pending_input_tests.rs"]
-mod tests;

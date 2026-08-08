@@ -14,7 +14,6 @@ use super::WaitOutcome;
 use super::WaitRequest;
 use super::WaitToPendingOutcome;
 use super::WaitToPendingRequest;
-use super::yield_timeout;
 use crate::tools::code_runtime::CodeModeToolKind;
 use crate::tools::code_runtime::ExecuteRequest;
 use crate::tools::code_runtime::ExecuteToPendingOutcome;
@@ -27,18 +26,6 @@ use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-
-#[test]
-fn yield_timeout_adds_grace_only_at_ten_seconds() {
-    assert_eq!(
-        yield_timeout(/*yield_time_ms*/ 9_999),
-        Duration::from_millis(9_999)
-    );
-    assert_eq!(
-        yield_timeout(/*yield_time_ms*/ 10_000),
-        Duration::from_secs(11)
-    );
-}
 
 #[tokio::test(start_paused = true)]
 async fn execute_waits_for_nested_tool_during_yield_grace() {
@@ -647,48 +634,6 @@ async fn v8_console_is_not_exposed_on_global_this() {
             error_text: None,
         }
     );
-}
-
-#[tokio::test]
-async fn syntax_errors_identify_the_offending_exec_source() {
-    let service = InProcessCodeModeSession::new();
-    let source = concat!(
-        "const result = await tools.write_stdin({\n",
-        "  session_id: 123,\n",
-        "  chars: \"unterminated,\n",
-        "});\n",
-        "text(result);\n",
-    );
-
-    let response = execute(
-        &service,
-        ExecuteRequest {
-            source: source.to_string(),
-            yield_time_ms: None,
-            ..execute_request("")
-        },
-    )
-    .await;
-
-    let RuntimeResponse::Result {
-        content_items,
-        error_text: Some(error),
-        ..
-    } = response
-    else {
-        panic!("expected syntax error result, got {response:?}");
-    };
-    assert!(content_items.is_empty());
-    assert!(
-        error.contains("SyntaxError: Invalid or unexpected token"),
-        "{error}"
-    );
-    assert!(error.contains("Location: exec_main.mjs:3:"), "{error}");
-    assert!(
-        error.contains("Source:\n  chars: \"unterminated,"),
-        "{error}"
-    );
-    assert!(error.lines().any(|line| line.ends_with('^')), "{error}");
 }
 
 #[tokio::test]

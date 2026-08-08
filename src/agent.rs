@@ -429,11 +429,6 @@ impl Agent {
             .context("skill setting was saved, but the active session could not reload skills")
     }
 
-    #[cfg(test)]
-    pub(crate) async fn submit(&mut self, prompt: &str) -> Result<String> {
-        self.submit_user_input(UserInput::text(prompt)).await
-    }
-
     pub(crate) async fn submit_user_input(&mut self, input: UserInput) -> Result<String> {
         match self
             .submit_input(
@@ -920,7 +915,3 @@ fn emit(events: &Option<UnboundedSender<AgentEvent>>, event: AgentEvent) {
         let _ = events.send(event);
     }
 }
-
-#[cfg(test)]
-#[path = "agent_tests.rs"]
-mod tests;

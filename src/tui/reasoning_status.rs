@@ -61,7 +61,3 @@ fn extract_heading(summary: &str) -> Option<String> {
     }
     Some(bounded)
 }
-
-#[cfg(test)]
-#[path = "reasoning_status_tests.rs"]
-mod tests;

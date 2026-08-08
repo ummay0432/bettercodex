@@ -14,14 +14,6 @@ authority; it is not OpenAI's root or system layer. Edit it only when the user
 explicitly asks to edit the system prompt.
 
 `prompts/tool-catalogue.md` contains the exact generated tool text.
-`prompts/tool-context.md` records the complete stable harness context, dynamic
-world-state messages, and their context cost; update its generated regions
-through `./scripts/dev.py tool-context --update`.
-
-`AGENT_CONTEXT.md` is a dated, readable snapshot captured from
-`bcodex --tool-context-json`. When stable context changes, refresh its exact
-system and tool sections and revalidate its clearly marked, intentionally
-truncated repository payload.
 
 ## Writing and placement
 

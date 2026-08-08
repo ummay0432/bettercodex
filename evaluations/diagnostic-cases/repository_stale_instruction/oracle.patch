@@ -1,7 +1,0 @@
-diff --git a/work/decision.txt b/work/decision.txt
-index 9b1b6d3..40562d0 100644
---- a/work/decision.txt
-+++ b/work/decision.txt
-@@ -1 +1 @@
--legacy
-+current-{{NONCE}}

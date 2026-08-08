@@ -15,6 +15,8 @@ Do not leave Rust build trash behind: after integrating Rust work, remove its li
 
 bettercodex is a focused port of [OpenAI Codex](https://github.com/openai/codex), not an independent implementation. For every retained behavior Codex already implements, inspect and port the current upstream source before editing; unexplained reimplementation or drift is forbidden unless [`product-direction.md`](progressive_disclosure/product-direction.md) explicitly requires the departure.
 
+Do not invent Cargo, build, packaging, release, or test infrastructure; mirror current upstream Codex for retained workflows unless an explicit BetterCodex requirement makes a deviation necessary.
+
 ## Start here
 
 This file is the universal context layer. Before working, open only the matching
@@ -35,7 +37,7 @@ task-specific context; do not preload the whole folder:
 - `src/tools/`: the JavaScript exec runtime, nested tool catalogue, command execution, and patch application.
 - `src/skills.rs`, `src/system_skills.rs`, `src/skill_settings.rs`, and `bundled-skills/`: local and embedded skills plus progressive disclosure.
 - `src/tui/`: the Ratatui chat interface and terminal lifecycle.
-- `prompts/`: exact model-facing system and tool context; `prompts/tool-context.md` is the reproducible context audit.
+- `prompts/`: exact model-facing system and tool context.
 
 ## Direct references
 

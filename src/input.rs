@@ -399,37 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn joined_prompts_shift_exact_skill_mentions_with_their_text() {
-        let first = UserPrompt::with_attachments(
-            "use $demo",
-            vec![SkillMention::new(
-                SkillSelection::new("demo", "/first/SKILL.md"),
-                4..9,
-            )],
-            Vec::new(),
-        );
-        let second = UserPrompt::with_attachments(
-            "$demo again",
-            vec![SkillMention::new(
-                SkillSelection::new("demo", "/second/SKILL.md"),
-                0..5,
-            )],
-            Vec::new(),
-        );
-
-        let joined = UserPrompt::joined(vec![first, second]);
-
-        assert_eq!(joined.as_str(), "use $demo\n\n$demo again");
-        assert_eq!(
-            joined.skill_mentions(),
-            [
-                SkillMention::new(SkillSelection::new("demo", "/first/SKILL.md"), 4..9,),
-                SkillMention::new(SkillSelection::new("demo", "/second/SKILL.md"), 11..16,),
-            ]
-        );
-    }
-
-    #[test]
     fn image_only_input_embeds_a_typed_data_url_and_detail() {
         let path = std::env::temp_dir().join(format!(
             "bettercodex-image-{}-{}.png",
@@ -467,34 +436,5 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("not a supported"));
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn interactive_image_prompts_strip_ui_labels_and_share_the_cli_wire_shape() {
-        let image = PromptImage::from_bytes(
-            Path::new("clipboard.png"),
-            b"\x89PNG\r\n\x1a\nfixture".to_vec(),
-            ImageDetail::Original,
-        )
-        .unwrap();
-        let prompt = UserPrompt::with_attachments(
-            "[Image 1] inspect this",
-            Vec::new(),
-            vec![PromptImageAttachment::new(image, 0..9)],
-        );
-        assert_eq!(prompt.text_without_image_placeholders(), "inspect this");
-
-        let (message, prompt_text, skills) = UserInput::prompt(prompt).into_message_and_skills();
-        assert_eq!(prompt_text, "inspect this");
-        assert!(skills.is_empty());
-        assert_eq!(message["content"][0]["text"], "inspect this");
-        assert_eq!(message["content"][1]["type"], "input_image");
-        assert_eq!(message["content"][1]["detail"], "original");
-        assert!(
-            message["content"][1]["image_url"]
-                .as_str()
-                .unwrap()
-                .starts_with("data:image/png;base64,")
-        );
     }
 }

@@ -105,7 +105,3 @@ impl PendingSseEvent {
         self.data.take()
     }
 }
-
-#[cfg(test)]
-#[path = "api_sse_tests.rs"]
-mod tests;

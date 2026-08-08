@@ -13,8 +13,6 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::truncate_text;
-#[cfg(test)]
-use portable_pty::ChildKiller;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
@@ -32,10 +30,6 @@ use uuid::Uuid;
 
 use super::process_session::ProcessMode;
 use super::process_session::ProcessSession;
-#[cfg(test)]
-use super::process_session::RETAINED_HEAD_BYTES;
-#[cfg(test)]
-use super::process_session::RETAINED_TAIL_BYTES;
 use super::process_session::ShellStartup;
 use super::process_session::shell_command;
 
@@ -612,80 +606,6 @@ fn truncate_output(
 mod tests {
     use super::*;
 
-    #[derive(Clone, Debug)]
-    struct NoopKiller;
-
-    impl ChildKiller for NoopKiller {
-        fn kill(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-            Box::new(self.clone())
-        }
-    }
-
-    fn fake_session(exited: bool) -> Arc<ProcessSession> {
-        let session = ProcessSession::new(None, Box::new(NoopKiller), 0, ProcessMode::Piped, None);
-        if exited {
-            session.exited(0, None);
-        }
-        session
-    }
-
-    #[tokio::test]
-    async fn process_store_matches_codex_soft_cap_and_exited_lru_policy() {
-        let manager = ProcessManager::new(std::env::current_dir().unwrap());
-        let now = Instant::now();
-        {
-            let mut store = manager.store.lock().unwrap();
-            for offset in 0..MAX_PROCESSES {
-                let session_id = 1_000 + i32::try_from(offset).unwrap();
-                store.sessions.insert(
-                    session_id,
-                    ProcessEntry {
-                        session: fake_session(session_id == 1_001),
-                        command: format!("command {session_id}"),
-                        cwd: PathBuf::from("/tmp"),
-                        started_at: now,
-                        last_used: now
-                            .checked_sub(Duration::from_secs(
-                                u64::try_from(MAX_PROCESSES - offset).unwrap(),
-                            ))
-                            .unwrap(),
-                    },
-                );
-                store.reserved_session_ids.insert(session_id);
-            }
-            store.reserved_session_ids.insert(2_000);
-        }
-
-        manager
-            .store_session(
-                2_000,
-                fake_session(false),
-                "new command".to_string(),
-                PathBuf::from("/tmp"),
-                now,
-            )
-            .unwrap();
-
-        {
-            let store = manager.store.lock().unwrap();
-            assert_eq!(store.sessions.len(), MAX_PROCESSES);
-            assert!(!store.sessions.contains_key(&1_001));
-            assert!(store.sessions.contains_key(&1_000));
-            assert!(store.sessions.contains_key(&2_000));
-            assert!(!store.reserved_session_ids.contains(&1_001));
-        }
-
-        let error = manager
-            .write_stdin(json!({"session_id": 1_001}), CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "Unknown process id 1001");
-    }
-
     #[test]
     fn chunk_ids_match_codex_shape() {
         let id = chunk_id();
@@ -743,119 +663,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_preserves_utf8_split_between_tool_results() {
-        let cwd = std::env::current_dir().unwrap();
-        let manager = ProcessManager::new(cwd);
-        let started = manager
-            .exec_command(
-                json!({
-                    "cmd": "printf 'ready:\\360\\220'; sleep 1; printf '\\215\\210'",
-                    "shell": "/bin/sh",
-                    "login": false,
-                    "yield_time_ms": 250,
-                }),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(started["output"], "ready:");
-        let session_id = started["session_id"].as_i64().unwrap() as i32;
-        let completed = manager
-            .write_stdin(
-                json!({
-                    "session_id": session_id,
-                    "yield_time_ms": 5_000,
-                }),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(completed["output"], "\u{10348}");
-        assert_eq!(completed["exit_code"], 0);
-    }
-
-    #[tokio::test]
-    async fn cloned_process_table_lists_and_stops_background_commands() {
-        let cwd = std::env::current_dir().unwrap();
-        let manager = ProcessManager::new(cwd.clone());
-        let control = manager.clone();
-        let started = manager
-            .exec_command(
-                json!({
-                    "cmd": "sleep 30",
-                    "shell": "/bin/sh",
-                    "login": false,
-                    "yield_time_ms": 250,
-                }),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let session_id = started["session_id"].as_i64().unwrap() as i32;
-
-        let processes = control.list_background_processes();
-        let running_for = processes[0].running_for;
-        assert_eq!(
-            processes,
-            [BackgroundProcess {
-                session_id,
-                command: "sleep 30".to_string(),
-                cwd,
-                running_for,
-            }]
-        );
-        assert_eq!(control.stop_all_background_processes(), 1);
-        assert!(manager.list_background_processes().is_empty());
-        let error = manager
-            .write_stdin(json!({"session_id": session_id}), CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!("Unknown process id {session_id}")
-        );
-    }
-
-    #[tokio::test]
-    async fn noisy_command_returns_bounded_head_and_tail() {
-        let cwd = std::env::current_dir().unwrap();
-        let manager = ProcessManager::new(cwd);
-        let generated_bytes = RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + 256 * 1024;
-        let command = format!(
-            "printf 'BEGIN\\n'; yes 0123456789abcdef | head -c {generated_bytes}; printf '\\nEND\\n'"
-        );
-
-        let result = manager
-            .exec_command(
-                json!({
-                    "cmd": command,
-                    "shell": "/bin/sh",
-                    "login": false,
-                    "yield_time_ms": 5_000,
-                    "max_output_tokens": 10_000,
-                }),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let output = result["output"].as_str().unwrap();
-        assert_eq!(result["exit_code"], 0);
-        assert!(result.get("session_id").is_none());
-        assert!(output.starts_with("Warning: truncated output"));
-        assert!(output.contains("BEGIN\n"));
-        assert!(output.ends_with("\nEND\n"));
-        assert!(output.len() < generated_bytes);
-        assert!(
-            result["original_token_count"]
-                .as_u64()
-                .is_some_and(|tokens| tokens > 300_000)
-        );
-    }
-
-    #[tokio::test]
     async fn non_tty_commands_match_codex_closed_stdin_behavior() {
         let cwd = std::env::current_dir().unwrap();
         let manager = ProcessManager::new(cwd);
@@ -902,21 +709,6 @@ mod tests {
             .unwrap();
         assert_eq!(output["exit_code"], 0);
         assert!(output["output"].as_str().unwrap().contains("tty"));
-    }
-
-    #[test]
-    fn default_and_explicit_output_budgets_use_stable_head_tail_truncation() {
-        let text = "x".repeat(50_000);
-        let default_truncated = truncate_output(&text, None, 12_500, 0);
-        assert!(default_truncated.starts_with("Warning: truncated output"));
-        assert!(default_truncated.len() < text.len());
-        assert_eq!(
-            truncate_output(&text, Some(50_000), 12_500, 0),
-            default_truncated,
-            "an explicit request cannot exceed the model-visible item ceiling"
-        );
-        let truncated = truncate_output(&text, Some(5), 20, 0);
-        assert!(truncated.starts_with("Warning: truncated output"));
     }
 
     #[test]

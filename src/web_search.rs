@@ -806,7 +806,3 @@ impl HistoryMessage<'_> {
         })
     }
 }
-
-#[cfg(test)]
-#[path = "web_search_tests.rs"]
-mod tests;

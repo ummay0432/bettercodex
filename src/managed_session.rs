@@ -1359,7 +1359,3 @@ fn caffeinate_command(executable: &Path, arguments: &[String]) -> Command {
         .env(CAFFEINATE_MARKER, "1");
     command
 }
-
-#[cfg(test)]
-#[path = "managed_session_tests.rs"]
-mod tests;

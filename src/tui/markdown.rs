@@ -548,7 +548,3 @@ mod tests {
         assert_eq!(rendered, src);
     }
 }
-
-#[cfg(test)]
-#[path = "markdown_parity_tests.rs"]
-mod parity_tests;

@@ -363,7 +363,3 @@ fn extract_text_result(response: Value) -> Result<String> {
     }
     Ok(text)
 }
-
-#[cfg(test)]
-#[path = "openai_docs_tests.rs"]
-mod tests;

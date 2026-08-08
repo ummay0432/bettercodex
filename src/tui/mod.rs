@@ -16,6 +16,9 @@ mod pending_input;
 mod reasoning_status;
 mod render;
 mod resume_picker;
+#[cfg(test)]
+#[path = "review_tests.rs"]
+mod review_tests;
 mod skill_popup;
 mod skills_view;
 mod table_detect;
@@ -41,7 +44,6 @@ use crate::rollout::Rollout;
 use crate::rollout::SessionSummary;
 use crate::rollout::SessionTranscriptItem;
 use crate::tools::ProcessManager;
-use crate::update::AvailableUpdate;
 use anyhow::Context;
 use anyhow::Result;
 use clipboard::ClipboardLease;
@@ -75,7 +77,6 @@ type TurnResult = (Agent, TurnCompletion);
 type TurnTask = JoinHandle<TurnResult>;
 type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
-type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
 const FRAME_INTERVAL: Duration = Duration::from_millis(32);
 const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
@@ -136,8 +137,6 @@ struct Runtime {
     terminal_focused: bool,
     terminal_title: TerminalTitle,
     turn_started_at: Option<Instant>,
-    update_check: Option<UpdateCheckTask>,
-    update_check_started: bool,
     worker_handoff: Option<crate::managed_session::WorkerHandoff>,
     view: View,
 }
@@ -223,8 +222,6 @@ impl Runtime {
             terminal_focused: true,
             terminal_title: TerminalTitle::new(),
             turn_started_at: None,
-            update_check: None,
-            update_check_started: false,
             worker_handoff,
         })
     }
@@ -268,7 +265,6 @@ impl Runtime {
                 terminal.insert_history_lines(history, height)?;
                 terminal.draw(height, |frame| self.view.render_prepared(frame, prepared))?;
                 redraw = false;
-                self.start_update_check_after_startup();
             }
             let animate = self.has_foreground_activity();
 
@@ -320,13 +316,6 @@ impl Runtime {
                         while let Ok(update) = self.file_search_updates.try_recv() {
                             self.view.handle_file_search_update(update);
                         }
-                        redraw = true;
-                    }
-                }
-                completion = receive_update_check(&mut self.update_check) => {
-                    self.update_check = None;
-                    if let Ok(Some(update)) = completion {
-                        self.view.add_update_available(update);
                         redraw = true;
                     }
                 }
@@ -916,14 +905,6 @@ impl Runtime {
             ));
         }
     }
-
-    fn start_update_check_after_startup(&mut self) {
-        if self.update_check_started {
-            return;
-        }
-        self.update_check_started = true;
-        self.update_check = Some(tokio::spawn(crate::update::check_for_update()));
-    }
 }
 
 impl Drop for Runtime {
@@ -934,7 +915,6 @@ impl Drop for Runtime {
         abort_join_task(&mut self.turn);
         abort_join_task(&mut self.session_scan);
         abort_join_task(&mut self.resume_task);
-        abort_join_task(&mut self.update_check);
         for (_, task) in self.operator_command_tasks.drain() {
             task.abort();
         }
@@ -1037,16 +1017,3 @@ async fn receive_resume_completion(
         None => pending().await,
     }
 }
-
-async fn receive_update_check(
-    task: &mut Option<UpdateCheckTask>,
-) -> std::result::Result<Option<AvailableUpdate>, tokio::task::JoinError> {
-    match task {
-        Some(task) => task.await,
-        None => pending().await,
-    }
-}
-
-#[cfg(test)]
-#[path = "runtime_tests.rs"]
-mod tests;

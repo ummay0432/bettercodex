@@ -1148,5 +1148,5 @@ fn is_common_environment_variable(name: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "skills_tests.rs"]
-mod tests;
+#[path = "skills_review_tests.rs"]
+mod review_tests;
