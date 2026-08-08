@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -10,7 +11,6 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::code_runtime::session_runtime::CellEvent;
-use crate::tools::code_runtime::session_runtime::ObserveMode;
 use crate::tools::code_runtime::session_runtime::OutputItem;
 use crate::tools::code_runtime::session_runtime::ToolKind;
 use crate::tools::code_runtime::session_runtime::ToolName;
@@ -76,14 +76,17 @@ impl CellHandle {
         Self { command_tx, state }
     }
 
-    pub(crate) fn observe(&self, mode: ObserveMode) -> CellEventFuture {
+    pub(crate) fn observe(&self, yield_after: Duration) -> CellEventFuture {
         if !self.state.accepting_observations() {
             return closed_event();
         }
         let (response_tx, response_rx) = oneshot::channel();
         if self
             .command_tx
-            .send(CellCommand::Observe { mode, response_tx })
+            .send(CellCommand::Observe {
+                yield_after,
+                response_tx,
+            })
             .is_err()
         {
             return closed_event();
@@ -263,7 +266,6 @@ impl CellState {
 
     pub(crate) fn route_observation(
         &self,
-        mode: ObserveMode,
         response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
     ) -> ObservationDelivery {
         let mut phase = self
@@ -278,30 +280,28 @@ impl CellState {
             CellPhase::Completed {
                 pending_initial_yield_items: Some(content_items),
                 event,
-            } if matches!(mode, ObserveMode::YieldAfter(_)) => {
-                match response_tx.send(Ok(CellEvent::Yielded { content_items })) {
-                    Ok(()) => {
-                        *phase = CellPhase::Completed {
-                            pending_initial_yield_items: None,
-                            event,
-                        };
-                        ObservationDelivery::Buffered
-                    }
-                    Err(Ok(CellEvent::Yielded { content_items })) => {
-                        *phase = CellPhase::Completed {
-                            pending_initial_yield_items: Some(content_items),
-                            event,
-                        };
-                        ObservationDelivery::Buffered
-                    }
-                    Err(Ok(event)) => {
-                        panic!("initial yield delivery returned an unexpected event: {event:?}")
-                    }
-                    Err(Err(error)) => {
-                        panic!("initial yield delivery returned an actor error: {error:?}")
-                    }
+            } => match response_tx.send(Ok(CellEvent::Yielded { content_items })) {
+                Ok(()) => {
+                    *phase = CellPhase::Completed {
+                        pending_initial_yield_items: None,
+                        event,
+                    };
+                    ObservationDelivery::Buffered
                 }
-            }
+                Err(Ok(CellEvent::Yielded { content_items })) => {
+                    *phase = CellPhase::Completed {
+                        pending_initial_yield_items: Some(content_items),
+                        event,
+                    };
+                    ObservationDelivery::Buffered
+                }
+                Err(Ok(event)) => {
+                    panic!("initial yield delivery returned an unexpected event: {event:?}")
+                }
+                Err(Err(error)) => {
+                    panic!("initial yield delivery returned an actor error: {error:?}")
+                }
+            },
             CellPhase::Completed {
                 pending_initial_yield_items,
                 event,
@@ -395,16 +395,6 @@ fn prepend_initial_yield(
                 content_items: pending_initial_yield_items,
             }
         }
-        CellEvent::Pending {
-            mut content_items,
-            pending_tool_call_ids,
-        } => {
-            pending_initial_yield_items.append(&mut content_items);
-            CellEvent::Pending {
-                content_items: pending_initial_yield_items,
-                pending_tool_call_ids,
-            }
-        }
         CellEvent::Completed {
             mut content_items,
             error_text,
@@ -426,7 +416,7 @@ fn prepend_initial_yield(
 
 pub(super) enum CellCommand {
     Observe {
-        mode: ObserveMode,
+        yield_after: Duration,
         response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
     },
 }

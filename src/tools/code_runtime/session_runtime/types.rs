@@ -1,6 +1,5 @@
 use std::fmt;
 use std::future::Future;
-use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
@@ -25,23 +24,11 @@ impl fmt::Display for CellId {
     }
 }
 
-/// Selects the next observable frontier for a running cell.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ObserveMode {
-    YieldAfter(Duration),
-    #[cfg_attr(not(test), allow(dead_code))]
-    PendingFrontier,
-}
-
 /// An observable cell lifecycle event.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CellEvent {
     Yielded {
         content_items: Vec<OutputItem>,
-    },
-    Pending {
-        content_items: Vec<OutputItem>,
-        pending_tool_call_ids: Vec<String>,
     },
     Completed {
         content_items: Vec<OutputItem>,

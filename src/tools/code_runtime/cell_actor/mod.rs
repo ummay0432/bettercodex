@@ -5,6 +5,7 @@ mod types;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -31,14 +32,12 @@ pub(crate) use self::types::CompletionCommit;
 use self::types::CompletionDelivery;
 use self::types::ObservationDelivery;
 use crate::tools::code_runtime::TaskFailureHandler;
-use crate::tools::code_runtime::runtime::PendingRuntimeMode;
 use crate::tools::code_runtime::runtime::RuntimeCommand;
 use crate::tools::code_runtime::runtime::RuntimeControlCommand;
 use crate::tools::code_runtime::runtime::RuntimeEvent;
 use crate::tools::code_runtime::runtime::spawn_runtime;
 use crate::tools::code_runtime::session_runtime::CellEvent;
 use crate::tools::code_runtime::session_runtime::CreateCellRequest as CellRequest;
-use crate::tools::code_runtime::session_runtime::ObserveMode;
 use crate::tools::code_runtime::session_runtime::OutputItem;
 use crate::tools::code_runtime::session_runtime::ToolName as CellToolName;
 
@@ -49,7 +48,7 @@ impl CellActor {
         request: CellRequest,
         stored_values: Arc<HashMap<String, JsonValue>>,
         host: Arc<H>,
-        initial_observe_mode: ObserveMode,
+        initial_yield_after: Duration,
         cell_state: Arc<CellState>,
         task_failure_handler: Option<TaskFailureHandler>,
     ) -> Result<
@@ -67,7 +66,6 @@ impl CellActor {
             stored_values,
             runtime_request(request),
             event_tx,
-            PendingRuntimeMode::PauseUntilResumed,
             task_failure_handler.clone(),
         )?;
         let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
@@ -82,7 +80,7 @@ impl CellActor {
             event_rx,
             command_rx,
             Observer {
-                mode: initial_observe_mode,
+                yield_after: initial_yield_after,
                 response_tx: initial_response_tx,
             },
             task_failure_handler,
@@ -101,7 +99,7 @@ struct CellContext {
 }
 
 struct Observer {
-    mode: ObserveMode,
+    yield_after: Duration,
     response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
 }
 
@@ -122,12 +120,9 @@ async fn run_cell<H: CellHost>(
     let cancellation_token = cell_state.cancellation_token();
     let callback_cancellation_token = cancellation_token.child_token();
     let mut content_items = Vec::new();
-    let mut pending_tool_call_ids = Vec::new();
-    let mut pending_frontier_ready = false;
     let mut observer = Some(initial_observer);
     let mut termination = false;
     let mut runtime_closed = false;
-    let mut runtime_paused = false;
     let mut runtime_failure_reported = false;
     let mut yield_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut notification_tasks = JoinSet::new();
@@ -173,14 +168,17 @@ async fn run_cell<H: CellHost>(
                     None => std::future::pending::<Option<CellCommand>>().await,
                 }
             } => {
-                let Some(CellCommand::Observe { mode, response_tx }) = maybe_command else {
+                let Some(CellCommand::Observe {
+                    yield_after,
+                    response_tx,
+                }) = maybe_command else {
                     cancellation_token.cancel();
                     continue;
                 };
                 if response_tx.is_closed() {
                     continue;
                 }
-                let response_tx = match cell_state.route_observation(mode, response_tx) {
+                let response_tx = match cell_state.route_observation(response_tx) {
                     ObservationDelivery::Running(response_tx) => response_tx,
                     ObservationDelivery::Delivered => break,
                     ObservationDelivery::Buffered | ObservationDelivery::Closed => continue,
@@ -196,42 +194,11 @@ async fn run_cell<H: CellHost>(
                     let _ = response_tx.send(Err(CellError::Busy));
                     continue;
                 }
-                if matches!(mode, ObserveMode::PendingFrontier) && pending_frontier_ready {
-                    pending_frontier_ready = false;
-                    match send_cell_event(
-                        response_tx,
-                        CellEvent::Pending {
-                            content_items: std::mem::take(&mut content_items),
-                            pending_tool_call_ids: std::mem::take(&mut pending_tool_call_ids),
-                        },
-                    ) {
-                        Ok(()) => {}
-                        Err(CellEvent::Pending {
-                            content_items: undelivered_items,
-                            pending_tool_call_ids: undelivered_tool_call_ids,
-                        }) => {
-                            content_items = undelivered_items;
-                            pending_tool_call_ids = undelivered_tool_call_ids;
-                            pending_frontier_ready = true;
-                        }
-                        Err(event) => {
-                            panic!("pending delivery returned an unexpected event: {event:?}")
-                        }
-                    }
-                    continue;
-                }
-                observer = Some(Observer { mode, response_tx });
-                yield_timer = observer.as_ref().and_then(observer_timer);
-                if runtime_paused && matches!(mode, ObserveMode::YieldAfter(_)) {
-                    pending_frontier_ready = false;
-                    pending_tool_call_ids.clear();
-                }
-                resume_for_observation(
-                    mode,
-                    &mut runtime_paused,
-                    &runtime_tx,
-                    &runtime_control_tx,
-                );
+                observer = Some(Observer {
+                    yield_after,
+                    response_tx,
+                });
+                yield_timer = observer.as_ref().map(observer_timer);
             }
             _ = async {
                 if let Some(yield_timer) = yield_timer.as_mut() {
@@ -329,51 +296,14 @@ async fn run_cell<H: CellHost>(
                 };
                 match event {
                     RuntimeEvent::Started => {
-                        yield_timer = observer.as_ref().and_then(observer_timer);
+                        yield_timer = observer.as_ref().map(observer_timer);
                     }
                     RuntimeEvent::Pending => {
-                        runtime_paused = true;
-                        if matches!(
-                            observer.as_ref().map(|observer| observer.mode),
-                            Some(ObserveMode::PendingFrontier)
-                        ) {
-                            yield_timer = None;
-                            pending_frontier_ready = false;
-                            match send_observer_event(
-                                observer.take(),
-                                CellEvent::Pending {
-                                    content_items: std::mem::take(&mut content_items),
-                                    pending_tool_call_ids: std::mem::take(
-                                        &mut pending_tool_call_ids,
-                                    ),
-                                },
-                            ) {
-                                Ok(()) => {}
-                                Err(CellEvent::Pending {
-                                    content_items: undelivered_items,
-                                    pending_tool_call_ids: undelivered_tool_call_ids,
-                                }) => {
-                                    content_items = undelivered_items;
-                                    pending_tool_call_ids = undelivered_tool_call_ids;
-                                    pending_frontier_ready = true;
-                                }
-                                Err(event) => {
-                                    panic!("pending delivery returned an unexpected event: {event:?}")
-                                }
-                            }
-                        } else {
-                            pending_tool_call_ids.clear();
-                            let _ = runtime_control_tx.send(RuntimeControlCommand::Continue);
-                            runtime_paused = false;
-                        }
+                        let _ = runtime_control_tx.send(RuntimeControlCommand::Continue);
                     }
                     RuntimeEvent::ContentItem(item) => content_items.push(output_item(item)),
                     RuntimeEvent::YieldRequested => {
-                        let yield_observer = matches!(
-                            observer.as_ref().map(|observer| observer.mode),
-                            Some(ObserveMode::YieldAfter(_))
-                        );
-                        if yield_observer {
+                        if observer.is_some() {
                             yield_timer = None;
                             restore_undelivered_yield(
                                 send_observer_event(
@@ -397,7 +327,6 @@ async fn run_cell<H: CellHost>(
                         );
                     }
                     RuntimeEvent::ToolCall { id, name, kind, input } => {
-                        pending_tool_call_ids.push(id.clone());
                         spawn_tool(
                             &mut tool_tasks,
                             Arc::clone(&host),
@@ -564,29 +493,8 @@ fn finish_termination(
     }
 }
 
-fn observer_timer(observer: &Observer) -> Option<std::pin::Pin<Box<tokio::time::Sleep>>> {
-    match observer.mode {
-        ObserveMode::YieldAfter(duration) => Some(Box::pin(tokio::time::sleep(duration))),
-        ObserveMode::PendingFrontier => None,
-    }
-}
-
-fn resume_for_observation(
-    mode: ObserveMode,
-    runtime_paused: &mut bool,
-    runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
-    runtime_control_tx: &std::sync::mpsc::Sender<RuntimeControlCommand>,
-) {
-    if *runtime_paused {
-        let control = match mode {
-            ObserveMode::YieldAfter(_) => RuntimeControlCommand::Continue,
-            ObserveMode::PendingFrontier => RuntimeControlCommand::Resume,
-        };
-        let _ = runtime_control_tx.send(control);
-        *runtime_paused = false;
-    } else if matches!(mode, ObserveMode::PendingFrontier) {
-        let _ = runtime_tx.send(RuntimeCommand::ObservePendingFrontier);
-    }
+fn observer_timer(observer: &Observer) -> std::pin::Pin<Box<tokio::time::Sleep>> {
+    Box::pin(tokio::time::sleep(observer.yield_after))
 }
 
 fn begin_termination(

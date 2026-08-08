@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
@@ -18,7 +19,6 @@ pub(crate) use self::types::CreateCellRequest;
 pub(crate) use self::types::Error;
 pub(crate) use self::types::ImageDetail;
 pub(crate) use self::types::NestedToolCall;
-pub(crate) use self::types::ObserveMode;
 pub(crate) use self::types::OutputItem;
 pub(crate) use self::types::SessionRuntimeDelegate;
 pub(crate) use self::types::ToolDefinition;
@@ -79,14 +79,14 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     pub(crate) async fn execute(
         &self,
         request: CreateCellRequest,
-        initial_observe_mode: ObserveMode,
+        initial_yield_after: Duration,
     ) -> Result<StartedCell, Error> {
         if self.inner.shutdown_token.is_cancelled() {
             return Err(Error::ShuttingDown);
         }
         let cell_id = self.allocate_cell_id()?;
         let initial_event = self
-            .start_cell(cell_id.clone(), request, initial_observe_mode)
+            .start_cell(cell_id.clone(), request, initial_yield_after)
             .await?;
         Ok(StartedCell {
             cell_id,
@@ -94,19 +94,10 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) async fn observe(
-        &self,
-        cell_id: &CellId,
-        mode: ObserveMode,
-    ) -> Result<CellEvent, Error> {
-        self.begin_observe(cell_id, mode).await?.event().await
-    }
-
     pub(crate) async fn begin_observe(
         &self,
         cell_id: &CellId,
-        mode: ObserveMode,
+        yield_after: Duration,
     ) -> Result<PendingEvent, Error> {
         let handle = self
             .inner
@@ -117,7 +108,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             .cloned()
             .ok_or_else(|| Error::MissingCell(cell_id.clone()))?;
         Ok(PendingEvent {
-            event: map_actor_event(cell_id.clone(), handle.observe(mode)),
+            event: map_actor_event(cell_id.clone(), handle.observe(yield_after)),
         })
     }
 
@@ -162,7 +153,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         &self,
         cell_id: CellId,
         request: CreateCellRequest,
-        initial_observe_mode: ObserveMode,
+        initial_yield_after: Duration,
     ) -> Result<RuntimeEventFuture, Error> {
         let stored_values = {
             let stored_values = self.inner.stored_values.lock().await;
@@ -184,7 +175,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             request,
             stored_values,
             host,
-            initial_observe_mode,
+            initial_yield_after,
             cell_state,
             self.inner.task_failure_handler.clone(),
         )

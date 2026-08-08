@@ -31,21 +31,12 @@ pub(crate) enum RuntimeCommand {
     ToolResponse { id: String, result: JsonValue },
     ToolError { id: String, error_text: String },
     TimeoutFired { id: u64 },
-    ObservePendingFrontier,
     Terminate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum PendingRuntimeMode {
-    #[cfg(test)]
-    Continue,
-    PauseUntilResumed,
 }
 
 #[derive(Debug)]
 pub(crate) enum RuntimeControlCommand {
     Continue,
-    Resume,
     Terminate,
 }
 
@@ -76,7 +67,6 @@ pub(crate) fn spawn_runtime(
     stored_values: Arc<HashMap<String, JsonValue>>,
     request: ExecuteRequest,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    pending_mode: PendingRuntimeMode,
     task_failure_handler: Option<TaskFailureHandler>,
 ) -> Result<
     (
@@ -113,7 +103,6 @@ pub(crate) fn spawn_runtime(
             event_tx,
             command_rx,
             control_rx,
-            pending_mode,
             isolate_handle_tx,
             runtime_command_tx,
         );
@@ -177,7 +166,6 @@ fn run_runtime(
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     command_rx: std_mpsc::Receiver<RuntimeCommand>,
     control_rx: std_mpsc::Receiver<RuntimeControlCommand>,
-    pending_mode: PendingRuntimeMode,
     isolate_handle_tx: std_mpsc::SyncSender<v8::IsolateHandle>,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
 ) {
@@ -234,9 +222,7 @@ fn run_runtime(
     }
 
     let mut pending_promise = pending_promise;
-    while let Some(command) =
-        next_runtime_command(&event_tx, &command_rx, &control_rx, pending_mode)
-    {
+    while let Some(command) = next_runtime_command(&event_tx, &command_rx, &control_rx) {
         match command {
             RuntimeCommand::Terminate => break,
             RuntimeCommand::ToolResponse { id, result } => {
@@ -261,7 +247,6 @@ fn run_runtime(
                     return;
                 }
             }
-            RuntimeCommand::ObservePendingFrontier => {}
         }
 
         scope.perform_microtask_checkpoint();
@@ -289,25 +274,17 @@ fn next_runtime_command(
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     command_rx: &std_mpsc::Receiver<RuntimeCommand>,
     control_rx: &std_mpsc::Receiver<RuntimeControlCommand>,
-    pending_mode: PendingRuntimeMode,
 ) -> Option<RuntimeCommand> {
-    loop {
-        match command_rx.try_recv() {
-            Ok(command) => return Some(command),
-            Err(std_mpsc::TryRecvError::Disconnected) => return None,
-            Err(std_mpsc::TryRecvError::Empty) => {}
-        }
+    match command_rx.try_recv() {
+        Ok(command) => return Some(command),
+        Err(std_mpsc::TryRecvError::Disconnected) => return None,
+        Err(std_mpsc::TryRecvError::Empty) => {}
+    }
 
-        let _ = event_tx.send(RuntimeEvent::Pending);
-        match pending_mode {
-            #[cfg(test)]
-            PendingRuntimeMode::Continue => return command_rx.recv().ok(),
-            PendingRuntimeMode::PauseUntilResumed => match control_rx.recv().ok()? {
-                RuntimeControlCommand::Continue => return command_rx.recv().ok(),
-                RuntimeControlCommand::Resume => continue,
-                RuntimeControlCommand::Terminate => return Some(RuntimeCommand::Terminate),
-            },
-        }
+    let _ = event_tx.send(RuntimeEvent::Pending);
+    match control_rx.recv().ok()? {
+        RuntimeControlCommand::Continue => command_rx.recv().ok(),
+        RuntimeControlCommand::Terminate => Some(RuntimeCommand::Terminate),
     }
 }
 
@@ -345,7 +322,6 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::ExecuteRequest;
-    use super::PendingRuntimeMode;
     use super::RuntimeCommand;
     use super::RuntimeControlCommand;
     use super::RuntimeEvent;
@@ -422,7 +398,6 @@ mod tests {
             std::sync::Arc::new(HashMap::new()),
             execute_request("while (true) {}"),
             event_tx,
-            PendingRuntimeMode::Continue,
             /*task_failure_handler*/ None,
         )
         .unwrap();
@@ -453,7 +428,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_mode_freezes_runtime_commands_until_resume() {
+    async fn pending_runtime_freezes_commands_until_continued() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (runtime_tx, runtime_control_tx, _runtime_terminate_handle) = spawn_runtime(
             std::sync::Arc::new(HashMap::new()),
@@ -465,7 +440,6 @@ await new Promise(() => {});
 "#,
             ),
             event_tx,
-            PendingRuntimeMode::PauseUntilResumed,
             /*task_failure_handler*/ None,
         )
         .unwrap();
@@ -495,7 +469,7 @@ await new Promise(() => {});
         );
 
         runtime_control_tx
-            .send(RuntimeControlCommand::Resume)
+            .send(RuntimeControlCommand::Continue)
             .unwrap();
 
         let content_event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())

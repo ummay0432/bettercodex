@@ -103,10 +103,6 @@ impl BlockingDelegate {
             events_rx,
         )
     }
-
-    fn release_tool(&self) {
-        self.tool_release.notify_one();
-    }
 }
 
 impl CodeModeSessionDelegate for BlockingDelegate {
@@ -222,54 +218,6 @@ async fn yields_and_resumes() {
             }],
             error_text: None,
         })
-    );
-}
-
-#[tokio::test]
-async fn returns_and_resumes_from_the_pending_frontier() {
-    let (delegate, mut events_rx) = BlockingDelegate::new();
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-
-    assert_eq!(
-        service
-            .execute_to_pending(ExecuteRequest {
-                enabled_tools: vec![blocking_tool()],
-                source: r#"
-await tools.block({});
-text("after");
-"#
-                .to_string(),
-                yield_time_ms: Some(60_000),
-                ..execute_request("")
-            })
-            .await
-            .unwrap(),
-        ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-1".to_string()],
-        }
-    );
-
-    assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
-    delegate.release_tool();
-
-    assert_eq!(
-        service
-            .wait_to_pending(WaitToPendingRequest {
-                cell_id: cell_id("1"),
-            })
-            .await
-            .unwrap(),
-        WaitToPendingOutcome::LiveCell(ExecuteToPendingOutcome::Completed(
-            RuntimeResponse::Result {
-                cell_id: cell_id("1"),
-                content_items: vec![FunctionCallOutputContentItem::InputText {
-                    text: "after".to_string(),
-                }],
-                error_text: None,
-            }
-        ))
     );
 }
 

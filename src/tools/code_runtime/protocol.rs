@@ -64,33 +64,9 @@ pub(crate) struct WaitRequest {
     pub(crate) yield_time_ms: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[cfg(test)]
-pub(crate) struct WaitToPendingRequest {
-    pub(crate) cell_id: CellId,
-}
-
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) enum WaitOutcome {
     LiveCell(RuntimeResponse),
-    MissingCell(RuntimeResponse),
-}
-
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-#[cfg(test)]
-pub(crate) enum ExecuteToPendingOutcome {
-    Pending {
-        cell_id: CellId,
-        content_items: Vec<FunctionCallOutputContentItem>,
-        pending_tool_call_ids: Vec<String>,
-    },
-    Completed(RuntimeResponse),
-}
-
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-#[cfg(test)]
-pub(crate) enum WaitToPendingOutcome {
-    LiveCell(ExecuteToPendingOutcome),
     MissingCell(RuntimeResponse),
 }
 

@@ -75,10 +75,7 @@ async fn reports_cell_actor_panics_to_the_owner() {
         })),
     );
     let started = runtime
-        .execute(
-            execute_request(r#"text("done");"#),
-            ObserveMode::YieldAfter(Duration::from_secs(1)),
-        )
+        .execute(execute_request(r#"text("done");"#), Duration::from_secs(1))
         .await
         .expect("start cell");
     assert_eq!(
@@ -154,7 +151,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
                 enabled_tools: Vec::new(),
                 source: r#"text(String(load("candidate")));"#.to_string(),
             },
-            ObserveMode::YieldAfter(Duration::from_secs(1)),
+            Duration::from_secs(1),
         )
         .await
         .unwrap();
@@ -190,7 +187,7 @@ async fn cell_id_allocation_fails_before_wrapping() {
         runtime
             .execute(
                 execute_request(r#"text("unreachable");"#),
-                ObserveMode::YieldAfter(Duration::from_secs(1)),
+                Duration::from_secs(1),
             )
             .await
             .err(),
@@ -209,7 +206,7 @@ async fn shutdown_rejects_cell_admission_queued_before_the_registry_lock() {
 
     let execution = runtime.execute(
         execute_request("while (true) {}"),
-        ObserveMode::YieldAfter(Duration::from_millis(/*millis*/ 1)),
+        Duration::from_millis(/*millis*/ 1),
     );
     tokio::pin!(execution);
     std::future::poll_fn(|context| match execution.as_mut().poll(context) {
@@ -243,7 +240,7 @@ async fn drop_terminates_cells_when_the_registry_is_locked() {
     let started = runtime
         .execute(
             execute_request("while (true) {}"),
-            ObserveMode::YieldAfter(Duration::from_millis(/*millis*/ 1)),
+            Duration::from_millis(/*millis*/ 1),
         )
         .await
         .unwrap();

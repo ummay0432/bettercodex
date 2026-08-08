@@ -12,12 +12,9 @@ use super::InProcessCodeModeSession;
 use super::RuntimeResponse;
 use super::WaitOutcome;
 use super::WaitRequest;
-use super::WaitToPendingOutcome;
-use super::WaitToPendingRequest;
 use crate::protocol::ToolName;
 use crate::tools::code_runtime::CodeModeToolKind;
 use crate::tools::code_runtime::ExecuteRequest;
-use crate::tools::code_runtime::ExecuteToPendingOutcome;
 use crate::tools::code_runtime::FunctionCallOutputContentItem;
 use crate::tools::code_runtime::NotificationFuture;
 use crate::tools::code_runtime::ToolDefinition;
@@ -61,20 +58,24 @@ async fn execute_waits_for_nested_tool_during_yield_grace() {
 async fn wait_waits_for_nested_tool_during_yield_grace() {
     let delegate = Arc::new(ReleasableToolDelegate::default());
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-    let initial_response = service
-        .execute_to_pending(ExecuteRequest {
+    let started = service
+        .execute(ExecuteRequest {
             enabled_tools: vec![echo_tool()],
             source: r#"await tools.echo({}); text("done");"#.to_string(),
+            yield_time_ms: Some(1),
             ..execute_request("")
         })
         .await
         .unwrap();
+    let initial_response = tokio::spawn(started.initial_response());
+    wait_until_tool_started(&delegate).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    wait_until_finished(&initial_response).await;
     assert_eq!(
-        initial_response,
-        ExecuteToPendingOutcome::Pending {
+        initial_response.await.unwrap().unwrap(),
+        RuntimeResponse::Yielded {
             cell_id: cell_id("1"),
             content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-1".to_string()],
         }
     );
     let response = service
@@ -324,290 +325,6 @@ async fn start_cell_rejects_new_cell_after_shutdown_begins() {
         .unwrap();
 
     assert_eq!(error, "code mode session is shutting down".to_string());
-}
-
-#[tokio::test]
-async fn execute_to_pending_returns_completed_for_synchronous_results() {
-    let service = InProcessCodeModeSession::new();
-
-    let response = service
-        .execute_to_pending(ExecuteRequest {
-            source: r#"text("done");"#.to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response,
-        ExecuteToPendingOutcome::Completed(RuntimeResponse::Result {
-            cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "done".to_string(),
-            }],
-            error_text: None,
-        })
-    );
-}
-
-#[tokio::test]
-async fn execute_to_pending_returns_once_the_runtime_is_quiescent() {
-    let service = InProcessCodeModeSession::new();
-
-    let response = tokio::time::timeout(
-        Duration::from_secs(1),
-        service.execute_to_pending(ExecuteRequest {
-            source: r#"text("before"); await new Promise(() => {});"#.to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    assert_eq!(
-        response,
-        ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "before".to_string(),
-            }],
-            pending_tool_call_ids: Vec::new(),
-        }
-    );
-
-    let termination = service.terminate(cell_id("1")).await.unwrap();
-
-    assert_eq!(
-        termination,
-        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-        })
-    );
-}
-
-#[tokio::test]
-async fn execute_to_pending_identifies_tool_calls_in_paused_frontier() {
-    let service = InProcessCodeModeSession::new();
-
-    let response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"
-await Promise.all([
-  tools.echo({ value: "first" }),
-  tools.echo({ value: "second" }),
-]);
-"#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response,
-        ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-1".to_string(), "tool-2".to_string()],
-        }
-    );
-
-    let termination = service.terminate(cell_id("1")).await.unwrap();
-
-    assert_eq!(
-        termination,
-        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-        })
-    );
-}
-
-#[tokio::test]
-async fn execute_to_pending_excludes_delayed_timeout_tool_calls_until_wait() {
-    let service = InProcessCodeModeSession::new();
-
-    let initial_response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"
-setTimeout(() => {
-  tools.echo({ value: "delayed" });
-}, 1000);
-await Promise.all([
-  tools.echo({ value: "second" }),
-  tools.echo({ value: "third" }),
-]);
-"#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        initial_response,
-        ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-1".to_string(), "tool-2".to_string()],
-        }
-    );
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let resumed_response = tokio::time::timeout(
-        Duration::from_secs(1),
-        service.wait_to_pending(WaitToPendingRequest {
-            cell_id: cell_id("1"),
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    assert_eq!(
-        resumed_response,
-        WaitToPendingOutcome::LiveCell(ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-3".to_string()],
-        })
-    );
-
-    let termination = service.terminate(cell_id("1")).await.unwrap();
-
-    assert_eq!(
-        termination,
-        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-        })
-    );
-}
-
-#[tokio::test]
-async fn wait_to_pending_returns_after_resumed_runtime_becomes_quiescent_again() {
-    let delegate = Arc::new(ReleasableToolDelegate::default());
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-
-    let initial_response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"
-await tools.echo({});
-text("after");
-await new Promise(() => {});
-"#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        initial_response,
-        ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-1".to_string()],
-        }
-    );
-
-    delegate.release_tool();
-
-    let resumed_response = tokio::time::timeout(
-        Duration::from_secs(1),
-        service.wait_to_pending(WaitToPendingRequest {
-            cell_id: cell_id("1"),
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    assert_eq!(
-        resumed_response,
-        WaitToPendingOutcome::LiveCell(ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "after".to_string(),
-            }],
-            pending_tool_call_ids: Vec::new(),
-        })
-    );
-
-    let termination = service.terminate(cell_id("1")).await.unwrap();
-
-    assert_eq!(
-        termination,
-        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-        })
-    );
-}
-
-#[tokio::test]
-async fn wait_to_pending_returns_completed_after_resumed_runtime_finishes() {
-    let delegate = Arc::new(ReleasableToolDelegate::default());
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-
-    let initial_response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"
-await tools.echo({});
-text("done");
-"#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        initial_response,
-        ExecuteToPendingOutcome::Pending {
-            cell_id: cell_id("1"),
-            content_items: Vec::new(),
-            pending_tool_call_ids: vec!["tool-1".to_string()],
-        }
-    );
-
-    delegate.release_tool();
-
-    let resumed_response = tokio::time::timeout(
-        Duration::from_secs(1),
-        service.wait_to_pending(WaitToPendingRequest {
-            cell_id: cell_id("1"),
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    assert_eq!(
-        resumed_response,
-        WaitToPendingOutcome::LiveCell(ExecuteToPendingOutcome::Completed(
-            RuntimeResponse::Result {
-                cell_id: cell_id("1"),
-                content_items: vec![FunctionCallOutputContentItem::InputText {
-                    text: "done".to_string(),
-                }],
-                error_text: None,
-            }
-        ))
-    );
 }
 
 #[tokio::test]
