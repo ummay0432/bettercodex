@@ -72,6 +72,36 @@ struct CachedFile {
     digest: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecoverableHardLink {
+    // Every filesystem alias is inside the snapshot inventory. `leader` is
+    // the stable path used to serialize and later reconstruct the group.
+    identity: FileIdentity,
+    fingerprint: FileFingerprint,
+    leader: String,
+}
+
+#[derive(Debug)]
+struct PendingHardLinkGroup {
+    fingerprint: FileFingerprint,
+    paths: Vec<String>,
+}
+
+struct CaptureContext<'a> {
+    blob_root: &'a Path,
+    total_bytes: u64,
+    previous_cache: &'a SnapshotCacheState,
+    next_cache: &'a mut SnapshotCacheState,
+    captured_hard_links: HashMap<FileIdentity, CachedFile>,
+    prepared_blob_directories: &'a mut HashSet<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileFingerprint {
     device: u64,
@@ -157,6 +187,10 @@ struct Entry {
     mode: u32,
     digest: Option<String>,
     symlink_target: Option<String>,
+    // Present on every member and names the group's lexicographically first
+    // path. External or only partially inventoried groups are never captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hard_link: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -326,37 +360,38 @@ impl Worktree {
                 paths.len()
             ));
         }
-        self.validate_snapshot_size(&paths)?;
-        let mut total_bytes = 0_u64;
+        let hard_links = inventory_hard_links(&self.root, &paths)?;
+        self.validate_snapshot_size(&paths, &hard_links)?;
         let mut entries = BTreeMap::new();
-        for relative in paths {
-            let absolute = self.root.join(&relative);
-            let Some(entry) = capture_entry(
-                &absolute,
-                blob_root,
-                &mut total_bytes,
-                previous_cache,
-                next_cache,
-                prepared_blob_directories,
-            )
-            .with_context(|| format!("failed to capture repository path `{relative}`"))?
+        let mut capture = CaptureContext {
+            blob_root,
+            total_bytes: 0,
+            previous_cache,
+            next_cache,
+            captured_hard_links: HashMap::new(),
+            prepared_blob_directories,
+        };
+        for relative in &paths {
+            let absolute = self.root.join(relative);
+            let Some(entry) =
+                capture_entry(relative, &absolute, hard_links.get(relative), &mut capture)
+                    .with_context(|| format!("failed to capture repository path `{relative}`"))?
             else {
                 continue;
             };
-            if total_bytes > MAX_SNAPSHOT_BYTES {
+            if capture.total_bytes > MAX_SNAPSHOT_BYTES {
                 return Err(anyhow!(
                     "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit while capturing `{relative}`"
                 ));
             }
-            entries.insert(relative, entry);
+            entries.insert(relative.clone(), entry);
         }
-        let git = self.capture_git(
-            blob_root,
-            &mut total_bytes,
-            previous_cache,
-            next_cache,
-            prepared_blob_directories,
-        )?;
+        let git = self.capture_git(&mut capture)?;
+        if inventory_hard_links(&self.root, &paths)? != hard_links {
+            return Err(anyhow!(
+                "hard-link topology changed while the repository snapshot was being captured"
+            ));
+        }
         let digest = canonical_state_digest(&entries, &git)?;
         let state = StateIdentity {
             digest,
@@ -554,51 +589,23 @@ impl Worktree {
     }
 
     pub(crate) fn restore(&self, run_root: &Path, snapshot: &RepositorySnapshot) -> Result<()> {
+        let hard_link_groups = validated_hard_link_groups(&snapshot.entries)?;
         let current = self.capture(run_root, &snapshot.included_specs)?;
         self.restore_git(run_root, &snapshot.git, &current.git)?;
-
-        let mut removals = current
+        let selected = snapshot
             .entries
-            .iter()
-            .filter(|(path, entry)| snapshot.entries.get(*path) != Some(*entry))
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        removals.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
-        for relative in removals {
-            remove_path(&self.root.join(relative))?;
-        }
-
-        let blob_root = run_root.join("blobs");
-        let changed = snapshot
-            .entries
-            .iter()
-            .filter(|(path, entry)| current.entries.get(*path) != Some(*entry))
-            .collect::<Vec<_>>();
-        for (relative, entry) in changed
-            .iter()
-            .copied()
-            .filter(|(_, entry)| entry.kind == EntryKind::Directory)
-        {
-            restore_entry(&self.root.join(relative), entry, &blob_root)?;
-        }
-        for (relative, entry) in changed
-            .iter()
-            .copied()
-            .filter(|(_, entry)| entry.kind != EntryKind::Directory)
-        {
-            restore_entry(&self.root.join(relative), entry, &blob_root)?;
-        }
-        // Directory modes are restored after children so temporary writable
-        // permissions used for materialization cannot leak into the incumbent.
-        for (relative, entry) in changed
-            .into_iter()
-            .filter(|(_, entry)| entry.kind == EntryKind::Directory)
-        {
-            std::fs::set_permissions(
-                self.root.join(relative),
-                std::fs::Permissions::from_mode(entry.mode),
-            )?;
-        }
+            .keys()
+            .chain(current.entries.keys())
+            .cloned()
+            .collect();
+        restore_entries(
+            &self.root,
+            &run_root.join("blobs"),
+            &snapshot.entries,
+            &current.entries,
+            selected,
+            &hard_link_groups,
+        )?;
 
         let restored = self.capture(run_root, &snapshot.included_specs)?;
         if restored.state != snapshot.state || restored.entries != snapshot.entries {
@@ -628,50 +635,26 @@ impl Worktree {
         if paths.is_empty() {
             return Ok(());
         }
+        let hard_link_groups = validated_hard_link_groups(&snapshot.entries)?;
         let current = self.capture(run_root, &snapshot.included_specs)?;
-        let selected = |path: &str| paths.iter().any(|spec| spec.covers(Path::new(path)));
-        let mut removals = current
+        let selected = snapshot
             .entries
-            .iter()
-            .filter(|(path, entry)| selected(path) && snapshot.entries.get(*path) != Some(*entry))
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        removals.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
-        for relative in removals {
-            remove_path(&self.root.join(relative))?;
-        }
-        let blob_root = run_root.join("blobs");
-        let changed = snapshot
-            .entries
-            .iter()
-            .filter(|(path, entry)| selected(path) && current.entries.get(*path) != Some(*entry))
-            .collect::<Vec<_>>();
-        for (relative, entry) in changed
-            .iter()
-            .copied()
-            .filter(|(_, entry)| entry.kind == EntryKind::Directory)
-        {
-            restore_entry(&self.root.join(relative), entry, &blob_root)?;
-        }
-        for (relative, entry) in changed
-            .iter()
-            .copied()
-            .filter(|(_, entry)| entry.kind != EntryKind::Directory)
-        {
-            restore_entry(&self.root.join(relative), entry, &blob_root)?;
-        }
-        for (relative, entry) in changed
-            .into_iter()
-            .filter(|(_, entry)| entry.kind == EntryKind::Directory)
-        {
-            std::fs::set_permissions(
-                self.root.join(relative),
-                std::fs::Permissions::from_mode(entry.mode),
-            )?;
-        }
+            .keys()
+            .chain(current.entries.keys())
+            .filter(|path| paths.iter().any(|spec| spec.covers(Path::new(path))))
+            .cloned()
+            .collect();
+        let selected = restore_entries(
+            &self.root,
+            &run_root.join("blobs"),
+            &snapshot.entries,
+            &current.entries,
+            selected,
+            &hard_link_groups,
+        )?;
         let restored = self.capture(run_root, &snapshot.included_specs)?;
-        for path in snapshot.entries.keys().chain(restored.entries.keys()) {
-            if selected(path) && snapshot.entries.get(path) != restored.entries.get(path) {
+        for path in selected {
+            if snapshot.entries.get(&path) != restored.entries.get(&path) {
                 return Err(anyhow!(
                     "selective repository restoration failed for `{path}`"
                 ));
@@ -748,8 +731,12 @@ impl Worktree {
         Ok(paths)
     }
 
-    fn validate_snapshot_size(&self, paths: &BTreeSet<String>) -> Result<()> {
-        let index_bytes = snapshot_entry_size(&self.index_path)
+    fn validate_snapshot_size(
+        &self,
+        paths: &BTreeSet<String>,
+        hard_links: &HashMap<String, RecoverableHardLink>,
+    ) -> Result<()> {
+        let index_bytes = snapshot_entry_size(&self.index_path, None, true)
             .context("failed to inspect the Git index for the repository snapshot")?;
         let mut total_bytes = index_bytes;
         let mut bytes_by_component = BTreeMap::new();
@@ -757,7 +744,10 @@ impl Worktree {
             bytes_by_component.insert("Git index", index_bytes);
         }
         for relative in paths {
-            let bytes = snapshot_entry_size(&self.root.join(relative))
+            let hard_link = hard_links.get(relative);
+            let count_contents = hard_link.is_none_or(|link| link.leader == *relative);
+            let absolute = self.root.join(relative);
+            let bytes = snapshot_entry_size(&absolute, hard_link, count_contents)
                 .with_context(|| format!("failed to size repository snapshot path `{relative}`"))?;
             total_bytes = total_bytes.saturating_add(bytes);
             let component = relative.split('/').next().unwrap_or(relative);
@@ -776,26 +766,12 @@ impl Worktree {
         ))
     }
 
-    fn capture_git(
-        &self,
-        blob_root: &Path,
-        total_bytes: &mut u64,
-        previous_cache: &SnapshotCacheState,
-        next_cache: &mut SnapshotCacheState,
-        prepared_blob_directories: &mut HashSet<String>,
-    ) -> Result<GitState> {
+    fn capture_git(&self, capture: &mut CaptureContext<'_>) -> Result<GitState> {
         let head = optional_git_text(&self.root, &["rev-parse", "--verify", "HEAD"])?;
         let branch = optional_git_text(&self.root, &["symbolic-ref", "-q", "HEAD"])?;
-        let index_digest = capture_optional_file(
-            &self.index_path,
-            blob_root,
-            total_bytes,
-            previous_cache,
-            next_cache,
-            prepared_blob_directories,
-        )
-        .context("failed to capture the Git index")?;
-        if *total_bytes > MAX_SNAPSHOT_BYTES {
+        let index_digest = capture_optional_file(&self.index_path, capture)
+            .context("failed to capture the Git index")?;
+        if capture.total_bytes > MAX_SNAPSHOT_BYTES {
             return Err(anyhow!(
                 "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
             ));
@@ -966,34 +942,112 @@ fn collect_directory(root: &Path, directory: &Path, output: &mut BTreeSet<String
     Ok(())
 }
 
+fn inventory_hard_links(
+    root: &Path,
+    paths: &BTreeSet<String>,
+) -> Result<HashMap<String, RecoverableHardLink>> {
+    let mut groups = HashMap::<FileIdentity, PendingHardLinkGroup>::new();
+    for relative in paths {
+        let path = root.join(relative);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            ensure_recoverable_link(&path, &metadata, None)?;
+            continue;
+        }
+        if !metadata.is_file() || metadata.nlink() == 1 {
+            continue;
+        }
+        let fingerprint = FileFingerprint::from_metadata(&metadata);
+        let identity = FileIdentity {
+            device: fingerprint.device,
+            inode: fingerprint.inode,
+        };
+        match groups.entry(identity) {
+            std::collections::hash_map::Entry::Occupied(mut group) => {
+                if group.get().fingerprint != fingerprint {
+                    return Err(anyhow!(
+                        "hard-linked worktree object changed while its aliases were inventoried: {}",
+                        path.display()
+                    ));
+                }
+                group.get_mut().paths.push(relative.clone());
+            }
+            std::collections::hash_map::Entry::Vacant(group) => {
+                group.insert(PendingHardLinkGroup {
+                    fingerprint,
+                    paths: vec![relative.clone()],
+                });
+            }
+        }
+    }
+
+    let mut hard_links = HashMap::new();
+    for (identity, mut group) in groups {
+        group.paths.sort();
+        if group.paths.len() as u64 != group.fingerprint.links {
+            let path = root.join(&group.paths[0]);
+            return Err(anyhow!(
+                "hard-linked worktree objects are not safely recoverable because only {} of {} aliases are inside the repository snapshot: {}",
+                group.paths.len(),
+                group.fingerprint.links,
+                path.display()
+            ));
+        }
+        let leader = group.paths[0].clone();
+        for relative in group.paths {
+            hard_links.insert(
+                relative,
+                RecoverableHardLink {
+                    identity,
+                    fingerprint: group.fingerprint,
+                    leader: leader.clone(),
+                },
+            );
+        }
+    }
+    Ok(hard_links)
+}
+
 fn capture_entry(
+    relative: &str,
     path: &Path,
-    blob_root: &Path,
-    total_bytes: &mut u64,
-    previous_cache: &SnapshotCacheState,
-    next_cache: &mut SnapshotCacheState,
-    prepared_blob_directories: &mut HashSet<String>,
+    hard_link: Option<&RecoverableHardLink>,
+    capture: &mut CaptureContext<'_>,
 ) -> Result<Option<Entry>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && hard_link.is_none() => {
+            return Ok(None);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "hard-linked worktree object disappeared while its snapshot was being captured"
+            ));
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
         }
     };
     let mode = metadata.permissions().mode() & 0o7777;
     if metadata.file_type().is_symlink() || metadata.is_file() {
-        ensure_single_link(path, &metadata)?;
+        ensure_recoverable_link(path, &metadata, hard_link)?;
     }
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path)?;
         let bytes = target.into_os_string().into_vec();
-        *total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        capture.total_bytes = capture.total_bytes.saturating_add(bytes.len() as u64);
         return Ok(Some(Entry {
             kind: EntryKind::Symlink,
             mode,
             digest: None,
             symlink_target: Some(STANDARD.encode(bytes)),
+            hard_link: None,
         }));
     }
     if metadata.is_dir() {
@@ -1002,6 +1056,7 @@ fn capture_entry(
             mode,
             digest: None,
             symlink_target: None,
+            hard_link: None,
         }));
     }
     if !metadata.is_file() {
@@ -1010,36 +1065,72 @@ fn capture_entry(
             path.display()
         ));
     }
-    let digest = capture_file(
-        path,
-        &metadata,
-        blob_root,
-        total_bytes,
-        previous_cache,
-        next_cache,
-        prepared_blob_directories,
-    )?;
+    let digest = if let Some(hard_link) = hard_link
+        && hard_link.leader != relative
+    {
+        let captured = capture
+            .captured_hard_links
+            .get(&hard_link.identity)
+            .ok_or_else(|| anyhow!("hard-link leader was not captured before its alias"))?;
+        let fingerprint = FileFingerprint::from_metadata(&metadata);
+        if fingerprint != captured.fingerprint {
+            return Err(anyhow!(
+                "hard-linked worktree object changed while its snapshot was being captured"
+            ));
+        }
+        capture
+            .next_cache
+            .files
+            .insert(path.to_path_buf(), captured.clone());
+        captured.digest.clone()
+    } else {
+        let digest = capture_file(path, &metadata, hard_link, capture)?;
+        if let Some(hard_link) = hard_link {
+            let captured = capture
+                .next_cache
+                .files
+                .get(path)
+                .ok_or_else(|| anyhow!("captured hard-link leader omitted its cache identity"))?
+                .clone();
+            capture
+                .captured_hard_links
+                .insert(hard_link.identity, captured);
+        }
+        digest
+    };
     Ok(Some(Entry {
         kind: EntryKind::File,
         mode,
         digest: Some(digest),
         symlink_target: None,
+        hard_link: hard_link.map(|link| link.leader.clone()),
     }))
 }
 
-fn snapshot_entry_size(path: &Path) -> Result<u64> {
+fn snapshot_entry_size(
+    path: &Path,
+    hard_link: Option<&RecoverableHardLink>,
+    count_contents: bool,
+) -> Result<u64> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && hard_link.is_none() => {
+            return Ok(0);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "hard-linked worktree object disappeared while its snapshot was being sized"
+            ));
+        }
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() || metadata.is_file() {
-        ensure_single_link(path, &metadata)?;
+        ensure_recoverable_link(path, &metadata, hard_link)?;
     }
     if metadata.file_type().is_symlink() {
         return Ok(std::fs::read_link(path)?.into_os_string().into_vec().len() as u64);
     }
-    Ok(if metadata.is_file() {
+    Ok(if metadata.is_file() && count_contents {
         metadata.len()
     } else {
         0
@@ -1049,24 +1140,25 @@ fn snapshot_entry_size(path: &Path) -> Result<u64> {
 fn capture_file(
     path: &Path,
     initial_metadata: &Metadata,
-    blob_root: &Path,
-    total_bytes: &mut u64,
-    previous_cache: &SnapshotCacheState,
-    next_cache: &mut SnapshotCacheState,
-    prepared_blob_directories: &mut HashSet<String>,
+    hard_link: Option<&RecoverableHardLink>,
+    capture: &mut CaptureContext<'_>,
 ) -> Result<String> {
-    ensure_single_link(path, initial_metadata)?;
-    let remaining = MAX_SNAPSHOT_BYTES.saturating_sub(*total_bytes);
+    ensure_recoverable_link(path, initial_metadata, hard_link)?;
+    let remaining = MAX_SNAPSHOT_BYTES.saturating_sub(capture.total_bytes);
     if initial_metadata.len() > remaining {
         return Err(anyhow!(
             "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
         ));
     }
-    *total_bytes = total_bytes.saturating_add(initial_metadata.len());
+    capture.total_bytes = capture.total_bytes.saturating_add(initial_metadata.len());
     let fingerprint = FileFingerprint::from_metadata(initial_metadata);
-    if let Some(digest) =
-        reuse_cached_file(path, fingerprint, blob_root, previous_cache, next_cache)?
-    {
+    if let Some(digest) = reuse_cached_file(
+        path,
+        fingerprint,
+        capture.blob_root,
+        capture.previous_cache,
+        capture.next_cache,
+    )? {
         return Ok(digest);
     }
 
@@ -1098,11 +1190,19 @@ fn capture_file(
     }
 
     let digest = hash_bytes(&bytes);
-    if !next_cache.blobs.contains_key(&digest) {
-        let blob_fingerprint = store_blob(blob_root, &digest, &bytes, prepared_blob_directories)?;
-        next_cache.blobs.insert(digest.clone(), blob_fingerprint);
+    if !capture.next_cache.blobs.contains_key(&digest) {
+        let blob_fingerprint = store_blob(
+            capture.blob_root,
+            &digest,
+            &bytes,
+            capture.prepared_blob_directories,
+        )?;
+        capture
+            .next_cache
+            .blobs
+            .insert(digest.clone(), blob_fingerprint);
     }
-    next_cache.files.insert(
+    capture.next_cache.files.insert(
         path.to_path_buf(),
         CachedFile {
             fingerprint: final_fingerprint,
@@ -1112,35 +1212,31 @@ fn capture_file(
     Ok(digest)
 }
 
-fn ensure_single_link(path: &Path, metadata: &Metadata) -> Result<()> {
-    if metadata.nlink() != 1 {
-        return Err(anyhow!(
+fn ensure_recoverable_link(
+    path: &Path,
+    metadata: &Metadata,
+    hard_link: Option<&RecoverableHardLink>,
+) -> Result<()> {
+    let fingerprint = FileFingerprint::from_metadata(metadata);
+    match hard_link {
+        Some(hard_link) if fingerprint == hard_link.fingerprint => Ok(()),
+        Some(_) => Err(anyhow!(
+            "hard-linked worktree object changed while its snapshot was being captured: {}",
+            path.display()
+        )),
+        None if metadata.nlink() == 1 => Ok(()),
+        None => Err(anyhow!(
             "hard-linked worktree objects are not safely recoverable: {}",
             path.display()
-        ));
+        )),
     }
-    Ok(())
 }
 
-fn capture_optional_file(
-    path: &Path,
-    blob_root: &Path,
-    total_bytes: &mut u64,
-    previous_cache: &SnapshotCacheState,
-    next_cache: &mut SnapshotCacheState,
-    prepared_blob_directories: &mut HashSet<String>,
-) -> Result<Option<String>> {
+fn capture_optional_file(path: &Path, capture: &mut CaptureContext<'_>) -> Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => capture_file(
-            path,
-            &metadata,
-            blob_root,
-            total_bytes,
-            previous_cache,
-            next_cache,
-            prepared_blob_directories,
-        )
-        .map(Some),
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            capture_file(path, &metadata, None, capture).map(Some)
+        }
         Ok(_) => Err(anyhow!(
             "Git state path {} is not a regular file",
             path.display()
@@ -1306,6 +1402,147 @@ fn modified_text_counts(before: &Path, after: &Path) -> Result<(u64, u64)> {
     let added = std::str::from_utf8(added)?.parse::<u64>()?;
     let deleted = std::str::from_utf8(deleted)?.parse::<u64>()?;
     Ok((added, deleted))
+}
+
+fn validated_hard_link_groups(
+    entries: &BTreeMap<String, Entry>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+    for (path, entry) in entries {
+        let Some(leader) = &entry.hard_link else {
+            continue;
+        };
+        if entry.kind != EntryKind::File {
+            return Err(anyhow!(
+                "snapshot hard-link member `{path}` is not a regular file"
+            ));
+        }
+        groups.entry(leader.clone()).or_default().push(path.clone());
+    }
+    for (leader, members) in &groups {
+        if members.len() < 2 {
+            return Err(anyhow!(
+                "snapshot hard-link group `{leader}` has fewer than two members"
+            ));
+        }
+        let leader_entry = entries
+            .get(leader)
+            .ok_or_else(|| anyhow!("snapshot hard-link leader `{leader}` is missing"))?;
+        if leader_entry.hard_link.as_deref() != Some(leader) {
+            return Err(anyhow!(
+                "snapshot hard-link group `{leader}` has an invalid leader"
+            ));
+        }
+        for member in members {
+            let entry = &entries[member];
+            if entry.kind != EntryKind::File
+                || entry.mode != leader_entry.mode
+                || entry.digest != leader_entry.digest
+            {
+                return Err(anyhow!(
+                    "snapshot hard-link member `{member}` disagrees with leader `{leader}`"
+                ));
+            }
+        }
+    }
+    Ok(groups)
+}
+
+fn restore_entries(
+    root: &Path,
+    blob_root: &Path,
+    snapshot: &BTreeMap<String, Entry>,
+    current: &BTreeMap<String, Entry>,
+    mut selected: BTreeSet<String>,
+    hard_link_groups: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeSet<String>> {
+    for members in hard_link_groups.values() {
+        if members.iter().any(|path| selected.contains(path)) {
+            selected.extend(members.iter().cloned());
+        }
+    }
+
+    let mut removals = current
+        .iter()
+        .filter(|(path, entry)| selected.contains(*path) && snapshot.get(*path) != Some(*entry))
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    removals.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+    for relative in removals {
+        remove_path(&root.join(relative))?;
+    }
+
+    let changed = snapshot
+        .iter()
+        .filter(|(path, entry)| selected.contains(*path) && current.get(*path) != Some(*entry))
+        .collect::<Vec<_>>();
+    for (relative, entry) in changed
+        .iter()
+        .copied()
+        .filter(|(_, entry)| entry.kind == EntryKind::Directory)
+    {
+        restore_entry(&root.join(relative), entry, blob_root)?;
+    }
+    for (relative, entry) in changed.iter().copied().filter(|(relative, entry)| {
+        entry.kind != EntryKind::Directory
+            && entry
+                .hard_link
+                .as_deref()
+                .is_none_or(|leader| leader == *relative)
+    }) {
+        restore_entry(&root.join(relative), entry, blob_root)?;
+    }
+    for (relative, entry) in changed.iter().copied().filter(|(relative, entry)| {
+        entry
+            .hard_link
+            .as_deref()
+            .is_some_and(|leader| leader != *relative)
+    }) {
+        restore_hard_link(root, relative, entry)?;
+    }
+    // Directory modes are restored after children so temporary writable
+    // permissions used for materialization cannot leak into the incumbent.
+    for (relative, entry) in changed
+        .into_iter()
+        .filter(|(_, entry)| entry.kind == EntryKind::Directory)
+    {
+        std::fs::set_permissions(
+            root.join(relative),
+            std::fs::Permissions::from_mode(entry.mode),
+        )?;
+    }
+    Ok(selected)
+}
+
+fn restore_hard_link(root: &Path, relative: &str, entry: &Entry) -> Result<()> {
+    let leader = entry
+        .hard_link
+        .as_deref()
+        .ok_or_else(|| anyhow!("hard-link entry omitted its leader"))?;
+    let source = root.join(leader);
+    let source_metadata = std::fs::symlink_metadata(&source)?;
+    if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "snapshot hard-link leader `{leader}` was not restored as a regular file"
+        ));
+    }
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    remove_path(&path)?;
+    std::fs::hard_link(&source, &path)?;
+    let restored = std::fs::symlink_metadata(&path)?;
+    if !restored.is_file()
+        || restored.file_type().is_symlink()
+        || restored.dev() != source_metadata.dev()
+        || restored.ino() != source_metadata.ino()
+    {
+        return Err(anyhow!(
+            "snapshot hard-link member `{relative}` was not linked to `{leader}`"
+        ));
+    }
+    Ok(())
 }
 
 fn restore_entry(path: &Path, entry: &Entry, blob_root: &Path) -> Result<()> {
@@ -1835,23 +2072,80 @@ mod tests {
     }
 
     #[test]
-    fn hard_links_and_escaping_candidate_symlinks_are_not_recoverable_state() {
+    fn internal_cargo_style_hard_links_are_captured_and_restored_exactly() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join(".gitignore"), ".cache/\ntarget/\n").unwrap();
+        let build_directory = fixture.root.join("target/debug/build/anyhow-hash");
+        std::fs::create_dir_all(&build_directory).unwrap();
+        let leader_relative = "target/debug/build/anyhow-hash/build-script-build";
+        let alias_relative = "target/debug/build/anyhow-hash/build_script_build-hash";
+        let leader = fixture.root.join(leader_relative);
+        let alias = fixture.root.join(alias_relative);
+        std::fs::write(&leader, b"operator build cache").unwrap();
+        std::fs::hard_link(&leader, &alias).unwrap();
+
+        let worktree = Worktree::discover(&fixture.root).unwrap();
+        worktree.install_loop_exclude().unwrap();
+        let run_root = fixture.run_root();
+        let captured = worktree.capture(&run_root, &[]).unwrap();
+        assert_eq!(
+            captured.entries[leader_relative].hard_link.as_deref(),
+            Some(leader_relative)
+        );
+        assert_eq!(
+            captured.entries[alias_relative].hard_link.as_deref(),
+            Some(leader_relative)
+        );
+        let snapshot_path = worktree.save_snapshot(&run_root, &captured).unwrap();
+        let before = Worktree::load_snapshot(&snapshot_path).unwrap();
+
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::write(&leader, b"worker leader").unwrap();
+        std::fs::write(&alias, b"worker independent alias").unwrap();
+        worktree.restore(&run_root, &before).unwrap();
+        assert_eq!(std::fs::read(&leader).unwrap(), b"operator build cache");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"operator build cache");
+        let leader_metadata = std::fs::metadata(&leader).unwrap();
+        let alias_metadata = std::fs::metadata(&alias).unwrap();
+        assert_eq!(leader_metadata.dev(), alias_metadata.dev());
+        assert_eq!(leader_metadata.ino(), alias_metadata.ino());
+        assert_eq!(leader_metadata.nlink(), 2);
+
+        std::fs::write(&alias, b"worker shared overwrite").unwrap();
+        worktree
+            .restore_paths(
+                &run_root,
+                &before,
+                &[PathSpec::try_from(alias_relative.to_string()).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(&leader).unwrap(), b"operator build cache");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"operator build cache");
+        assert_eq!(
+            std::fs::metadata(&leader).unwrap().ino(),
+            std::fs::metadata(&alias).unwrap().ino()
+        );
+        assert_eq!(
+            worktree.capture(&run_root, &[]).unwrap().state,
+            before.state
+        );
+    }
+
+    #[test]
+    fn external_hard_links_and_escaping_candidate_symlinks_are_not_recoverable_state() {
         let fixture = Fixture::new();
         let worktree = Worktree::discover(&fixture.root).unwrap();
         worktree.install_loop_exclude().unwrap();
         let run_root = fixture.run_root();
 
-        std::fs::hard_link(
-            fixture.root.join("tracked.txt"),
-            fixture.root.join("hard-link.txt"),
-        )
-        .unwrap();
+        let external_alias = fixture.root.join(".git/hard-link-outside-snapshot");
+        std::fs::hard_link(fixture.root.join("tracked.txt"), &external_alias).unwrap();
         let error = worktree.capture(&run_root, &[]).unwrap_err();
         assert!(
-            format!("{error:#}").contains("hard-linked worktree objects"),
+            format!("{error:#}").contains("only 1 of 2 aliases"),
             "{error:#}"
         );
-        std::fs::remove_file(fixture.root.join("hard-link.txt")).unwrap();
+        std::fs::remove_file(external_alias).unwrap();
 
         let before = worktree.capture(&run_root, &[]).unwrap();
         std::os::unix::fs::symlink("/tmp", fixture.root.join("candidate-link")).unwrap();
