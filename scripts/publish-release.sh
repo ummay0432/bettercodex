@@ -168,6 +168,17 @@ verify_checksum() {
     fail "release asset $verified_name failed checksum verification"
 }
 
+exactly_one_line() {
+  awk '
+    NR == 1 { value = $0; next }
+    { duplicate = 1 }
+    END {
+      if (NR != 1 || duplicate) exit 1
+      print value
+    }
+  '
+}
+
 verify_uploaded_digest() {
   uploaded_asset="$1"
   uploaded_name="$(basename "$uploaded_asset")"
@@ -303,10 +314,13 @@ if download_optional \
   "https://api.github.com/repos/$repository/releases/latest" \
   "$previous_metadata"; then
   previous_tag="$(
-    sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-      "$previous_metadata" |
-      sed -n '1p'
-  )"
+    # GitHub serves compact JSON in production. Split structural object
+    # separators before matching the exact scalar and reject missing or
+    # duplicate tags instead of silently packaging against the wrong release.
+    LC_ALL=C tr ',{}' '\n' <"$previous_metadata" |
+      sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' |
+      exactly_one_line
+  )" || fail "latest published release has invalid metadata"
   case "$previous_tag" in
     bcodex-v*) ;;
     *) fail "latest published release has an invalid BetterCodex tag" ;;
