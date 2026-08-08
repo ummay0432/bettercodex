@@ -117,3 +117,4 @@ unwrap_used = "deny"
 itertools = "0.14"
 pretty_assertions = "1"
 tokio = { version = "1", features = ["test-util"] }
+vt100 = "0.16.2"

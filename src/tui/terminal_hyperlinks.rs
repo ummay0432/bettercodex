@@ -118,13 +118,6 @@ pub(crate) fn visible_lines(lines: Vec<HyperlinkLine>) -> Vec<Line<'static>> {
     lines.into_iter().map(|line| line.line).collect()
 }
 
-pub(crate) fn visible_lines_ref(lines: &[HyperlinkLine]) -> Vec<Line<'_>> {
-    lines
-        .iter()
-        .map(|line| line_to_borrowed(&line.line))
-        .collect()
-}
-
 pub(crate) fn plain_hyperlink_lines(lines: Vec<Line<'static>>) -> Vec<HyperlinkLine> {
     lines.into_iter().map(HyperlinkLine::new).collect()
 }

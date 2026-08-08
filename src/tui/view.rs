@@ -62,7 +62,6 @@ use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use ratatui::text::Text;
 use ratatui::widgets::Block;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
@@ -358,7 +357,7 @@ impl DisplayedUserPrompt {
     }
 }
 
-/// Rows from an in-flight assistant cell that have already moved into terminal scrollback.
+/// Rendered lines from an in-flight assistant cell that have moved into terminal scrollback.
 ///
 /// The source text remains on the transcript entry so resize replay and finalization can rebuild
 /// the canonical Markdown rendering. Only the tail after `lines` remains mutable on screen.
@@ -1990,11 +1989,11 @@ impl View {
             .any(|entry| entry.streamed_history_needs_reflow(width, cwd))
     }
 
-    /// Move the oldest rendered rows of a growing assistant response into real terminal history.
+    /// Move complete rendered lines from a growing assistant response into terminal history.
     ///
-    /// Keeping at least one row live prevents an unterminated final line from being committed while
-    /// it is still changing. In normal terminals the complete composer/status layout leaves a much
-    /// larger mutable tail; only rows that would otherwise be clipped are emitted.
+    /// Capacity is measured in physical terminal rows, including soft wraps, but at least one
+    /// logical line stays live so unterminated code and URLs retain their copy/paste semantics while
+    /// still changing. In normal terminals the composer/status layout leaves a larger mutable tail.
     fn spill_streaming_history(&mut self, width: u16, live_capacity: usize) -> Vec<HyperlinkLine> {
         let history_was_emitted = self.history_emitted;
         let Some(TranscriptEntry::Assistant {
@@ -2016,28 +2015,46 @@ impl View {
             return Vec::new();
         }
 
-        let separator_rows = usize::from(!history.started && history_was_emitted);
-        let remaining_rows = rendered.len().saturating_sub(history.lines.len());
-        let mut rows_to_spill = separator_rows
-            .saturating_add(remaining_rows)
-            .saturating_sub(live_capacity);
-        if rows_to_spill == 0 {
+        let start = history.lines.len();
+        let remaining = &rendered[start..];
+        let spill_separator = !history.started && history_was_emitted;
+        let remaining_rows = remaining
+            .iter()
+            .map(|line| super::terminal::transcript_line_height(line, width))
+            .fold(usize::from(spill_separator), usize::saturating_add);
+        let overflow_rows = remaining_rows.saturating_sub(live_capacity);
+        if overflow_rows == 0 {
             return Vec::new();
         }
 
-        let mut output = Vec::with_capacity(rows_to_spill);
+        // Preserve one complete logical line as the mutable tail. Overwide code and URLs are kept
+        // intact for copy/paste, so spill whole preceding lines until their physical terminal rows
+        // cover the viewport overflow.
+        let mut covered_rows = usize::from(spill_separator);
+        let mut lines_to_spill = 0_usize;
+        for line in remaining.iter().take(remaining.len().saturating_sub(1)) {
+            if covered_rows >= overflow_rows {
+                break;
+            }
+            covered_rows =
+                covered_rows.saturating_add(super::terminal::transcript_line_height(line, width));
+            lines_to_spill += 1;
+        }
+        if !spill_separator && lines_to_spill == 0 {
+            return Vec::new();
+        }
+
+        let mut output = Vec::with_capacity(usize::from(spill_separator) + lines_to_spill);
         if !history.started {
             history.started = true;
             history.width = Some(width);
             self.history_emitted = true;
-            if history_was_emitted {
+            if spill_separator {
                 output.push(HyperlinkLine::default());
-                rows_to_spill = rows_to_spill.saturating_sub(1);
             }
         }
 
-        let start = history.lines.len();
-        let end = start.saturating_add(rows_to_spill).min(rendered.len());
+        let end = start.saturating_add(lines_to_spill).min(rendered.len());
         let newly_emitted = rendered[start..end].to_vec();
         output.extend(newly_emitted.iter().cloned());
         history.lines.extend(newly_emitted);
@@ -2313,14 +2330,8 @@ impl View {
         if lines.is_empty() {
             return;
         }
-        let paragraph = Paragraph::new(Text::from(terminal_hyperlinks::visible_lines_ref(&lines)))
-            .wrap(Wrap { trim: false });
         let overflow = usize::from(active_height).saturating_sub(usize::from(area.height));
-        frame.render_widget(
-            paragraph.scroll((u16::try_from(overflow).unwrap_or(u16::MAX), 0)),
-            area,
-        );
-        terminal_hyperlinks::mark_buffer_hyperlinks(frame.buffer_mut(), area, &lines, overflow);
+        super::terminal::render_transcript_lines(&lines, area, overflow, frame.buffer_mut());
     }
 
     fn render_composer(
@@ -4549,12 +4560,10 @@ fn line_count_spans(added: usize, removed: Option<usize>) -> Vec<Span<'static>> 
 }
 
 fn rendered_line_count(lines: &[HyperlinkLine], width: u16) -> u16 {
-    if lines.is_empty() {
-        return 0;
-    }
-    Paragraph::new(Text::from(terminal_hyperlinks::visible_lines_ref(lines)))
-        .wrap(Wrap { trim: false })
-        .line_count(width.max(1))
+    lines
+        .iter()
+        .map(|line| super::terminal::transcript_line_height(line, width))
+        .fold(0_usize, usize::saturating_add)
         .try_into()
         .unwrap_or(u16::MAX)
 }
@@ -5477,6 +5486,39 @@ mod tests {
                 .and_then(|line| line.style.bg),
             Some(Color::Rgb(33, 58, 43))
         );
+    }
+
+    #[test]
+    fn active_patch_rows_fill_the_viewport_width() {
+        const WIDTH: u16 = 40;
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:patch".to_string(),
+            name: "apply_patch".to_string(),
+            input: Some(json!(
+                "*** Begin Patch\n*** Add File: new.txt\n+alpha\n*** End Patch"
+            )),
+        });
+
+        let height = view.desired_height(WIDTH, 24);
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let patch_row = rendered
+            .lines()
+            .position(|row| row.contains("+alpha"))
+            .expect("active patch row") as u16;
+
+        for column in 0..WIDTH {
+            assert_eq!(
+                buffer[(column, patch_row)].bg,
+                Color::Rgb(33, 58, 43),
+                "column {column} did not retain the patch row background\n{rendered}"
+            );
+        }
     }
 
     #[test]
