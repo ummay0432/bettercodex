@@ -27,6 +27,7 @@ const GITHUB_RELEASE_ROOT: &str = "https://github.com";
 const ASSET_DOWNLOAD_ATTEMPTS: u8 = 3;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ZSTD_WINDOW_LOG: u32 = 27;
+const PATCH_MAX_PERCENT_OF_FULL: u64 = 90;
 const LOCK_FRESHNESS: Duration = Duration::from_secs(30);
 
 const CURL_ASSET_ARGUMENTS: &[&str] = &[
@@ -58,7 +59,7 @@ pub(super) fn install_release(
     let target = native_target(std::env::consts::OS, std::env::consts::ARCH)?;
     fs::create_dir_all(install_dir).with_context(|| {
         format!(
-            "could not create the BetterCodex install directory {}",
+            "could not create the bettercodex install directory {}",
             install_dir.display()
         )
     })?;
@@ -70,16 +71,19 @@ pub(super) fn install_release(
     let full_name = format!("bcodex-{target}.zst");
     let full_asset = unique_asset(release, &full_name)?.with_context(|| {
         format!(
-            "published BetterCodex release {} has no {full_name}",
+            "published bettercodex release {} has no {full_name}",
             release.tag
         )
     })?;
+    full_asset.validate()?;
     let patch_name = format!("bcodex-{target}-from-{current_revision}.patch.zst");
-    let patch_asset = unique_asset(release, &patch_name)?;
+    let patch_asset = unique_asset(release, &patch_name)?.filter(|asset| {
+        asset.validate().is_ok() && patch_is_worthwhile(asset.size, full_asset.size)
+    });
 
     let full_candidate = || {
         eprintln!(
-            "==> Downloading full BetterCodex {} update",
+            "==> Downloading full bettercodex {} update",
             release.version
         );
         download_verified_candidate(
@@ -95,7 +99,7 @@ pub(super) fn install_release(
         match fs::read(current_executable) {
             Ok(current_bytes) if current_bytes.len() as u64 <= MAX_BINARY_BYTES => {
                 eprintln!(
-                    "==> Downloading compact BetterCodex {} update",
+                    "==> Downloading compact bettercodex {} update",
                     release.version
                 );
                 match download_verified_candidate(
@@ -141,12 +145,16 @@ pub(super) fn install_release(
         );
     }
     eprintln!(
-        "==> Updated BetterCodex to {} ({})",
+        "==> Updated bettercodex to {} ({})",
         release.version,
         short_revision(&release.revision)
     );
-    eprintln!("Restart any running BetterCodex session to use the new executable.");
+    eprintln!("Restart any running bettercodex session to use the new executable.");
     Ok(())
+}
+
+fn patch_is_worthwhile(patch_size: u64, full_size: u64) -> bool {
+    u128::from(patch_size) * 100 <= u128::from(full_size) * u128::from(PATCH_MAX_PERCENT_OF_FULL)
 }
 
 fn download_verified_candidate(
@@ -196,7 +204,7 @@ fn download_candidate_with_retries(
             Err(error) => return Err(error),
         }
     }
-    unreachable!("the bounded BetterCodex asset retry loop always returns")
+    unreachable!("the bounded bettercodex asset retry loop always returns")
 }
 
 pub(super) fn native_target(os: &str, architecture: &str) -> Result<&'static str> {
@@ -232,7 +240,7 @@ fn unique_asset<'a>(
     let asset = matches.next();
     if matches.next().is_some() {
         bail!(
-            "published BetterCodex release {} contains duplicate {expected_name} assets",
+            "published bettercodex release {} contains duplicate {expected_name} assets",
             release.tag
         );
     }
@@ -243,7 +251,7 @@ fn reject_unsafe_destination(destination: &Path) -> Result<()> {
     match fs::symlink_metadata(destination) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             bail!(
-                "refusing to replace symlinked BetterCodex executable {}",
+                "refusing to replace symlinked bettercodex executable {}",
                 destination.display()
             )
         }
@@ -254,7 +262,7 @@ fn reject_unsafe_destination(destination: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| {
             format!(
-                "could not inspect the BetterCodex executable {}",
+                "could not inspect the bettercodex executable {}",
                 destination.display()
             )
         }),
@@ -282,14 +290,14 @@ fn download_and_expand(
         .spawn()
         .with_context(|| {
             format!(
-                "could not download BetterCodex release asset {}",
+                "could not download bettercodex release asset {}",
                 asset.name
             )
         })?;
     let stdout = child
         .stdout
         .take()
-        .context("could not read the BetterCodex release download")?;
+        .context("could not read the bettercodex release download")?;
     let stage = StagedBinary::new(install_dir);
     let transfer = expand_zstd(stdout, &stage.path, asset, reference);
     if transfer.is_err() {
@@ -297,10 +305,10 @@ fn download_and_expand(
     }
     let status = child
         .wait()
-        .context("could not wait for the BetterCodex release download")?;
+        .context("could not wait for the bettercodex release download")?;
     transfer?;
     if !status.success() {
-        bail!("BetterCodex release download exited with {status}");
+        bail!("bettercodex release download exited with {status}");
     }
     Ok(stage)
 }
@@ -316,26 +324,26 @@ fn expand_zstd(
         .create_new(true)
         .write(true)
         .open(output_path)
-        .with_context(|| format!("could not stage BetterCodex at {}", output_path.display()))?;
+        .with_context(|| format!("could not stage bettercodex at {}", output_path.display()))?;
     let output = LimitedWriter::new(output, MAX_BINARY_BYTES);
     let (input, mut output, written) = decode_zstd(input, output, reference)
-        .context("BetterCodex release asset could not be decompressed")?;
+        .context("bettercodex release asset could not be decompressed")?;
     output.flush()?;
     if written == 0 {
-        bail!("BetterCodex release asset decompressed to an empty executable");
+        bail!("bettercodex release asset decompressed to an empty executable");
     }
     let input = input.into_inner();
     let (actual_size, actual_digest) = input.finish();
     if actual_size != asset.size {
         bail!(
-            "BetterCodex release asset {} contained {actual_size} bytes, expected {}",
+            "bettercodex release asset {} contained {actual_size} bytes, expected {}",
             asset.name,
             asset.size
         );
     }
     if actual_digest != asset.sha256 {
         bail!(
-            "BetterCodex release asset {} has SHA-256 {actual_digest}, expected {}",
+            "bettercodex release asset {} has SHA-256 {actual_digest}, expected {}",
             asset.name,
             asset.sha256
         );
@@ -414,12 +422,12 @@ impl<R: Read> Read for HashedReader<R> {
         self.bytes_read = self
             .bytes_read
             .checked_add(read as u64)
-            .ok_or_else(|| io::Error::other("BetterCodex release asset size overflowed"))?;
+            .ok_or_else(|| io::Error::other("bettercodex release asset size overflowed"))?;
         self.hasher.update(&buffer[..read]);
         if self.bytes_read > self.expected_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "BetterCodex release asset exceeded its published size",
+                "bettercodex release asset exceeded its published size",
             ));
         }
         Ok(read)
@@ -452,7 +460,7 @@ impl<W: Write> Write for LimitedWriter<W> {
         if buffer.len() as u64 > remaining {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "BetterCodex executable exceeds the update size limit",
+                "bettercodex executable exceeds the update size limit",
             ));
         }
         let written = self.inner.write(buffer)?;
@@ -469,7 +477,7 @@ impl ReleaseAsset {
     pub(super) fn validate(&self) -> Result<()> {
         if self.size == 0 || self.size > MAX_BINARY_BYTES {
             bail!(
-                "published BetterCodex release asset {} has invalid size {}",
+                "published bettercodex release asset {} has invalid size {}",
                 self.name,
                 self.size
             );
@@ -481,7 +489,7 @@ impl ReleaseAsset {
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         {
             bail!(
-                "published BetterCodex release asset {} has no canonical SHA-256 digest",
+                "published bettercodex release asset {} has no canonical SHA-256 digest",
                 self.name
             );
         }
@@ -493,14 +501,14 @@ fn verify_candidate(candidate: &Path, release: &PublishedRelease) -> Result<()> 
     let version = command_line(candidate, "--version")?;
     if version != format!("bcodex {}", release.version) {
         bail!(
-            "downloaded BetterCodex executable reported {version:?}, expected bcodex {}",
+            "downloaded bettercodex executable reported {version:?}, expected bcodex {}",
             release.version
         );
     }
     let revision = command_line(candidate, "--internal-source-revision")?;
     if revision != release.revision {
         bail!(
-            "downloaded BetterCodex executable reported source revision {revision:?}, expected {}",
+            "downloaded bettercodex executable reported source revision {revision:?}, expected {}",
             release.revision
         );
     }
@@ -515,18 +523,18 @@ fn verify_candidate(candidate: &Path, release: &PublishedRelease) -> Result<()> 
         .env("BCODEX_SKIP_UPDATE_CHECK", "1")
         .stdin(Stdio::null())
         .output()
-        .context("downloaded BetterCodex executable could not run its install smoke test")?;
+        .context("downloaded bettercodex executable could not run its install smoke test")?;
     if !output.status.success() {
         bail!(
-            "downloaded BetterCodex executable failed its install smoke test with {}",
+            "downloaded bettercodex executable failed its install smoke test with {}",
             output.status
         );
     }
     let smoke_output = one_line(&output.stdout)
-        .context("downloaded BetterCodex executable returned invalid install smoke output")?;
+        .context("downloaded bettercodex executable returned invalid install smoke output")?;
     let expected = format!("bcodex {} install smoke passed", release.version);
     if smoke_output != expected {
-        bail!("downloaded BetterCodex executable returned {smoke_output:?}, expected {expected:?}");
+        bail!("downloaded bettercodex executable returned {smoke_output:?}, expected {expected:?}");
     }
     Ok(())
 }
@@ -536,15 +544,15 @@ fn command_line(binary: &Path, argument: &str) -> Result<String> {
         .arg(argument)
         .stdin(Stdio::null())
         .output()
-        .with_context(|| format!("downloaded BetterCodex executable could not run {argument}"))?;
+        .with_context(|| format!("downloaded bettercodex executable could not run {argument}"))?;
     if !output.status.success() {
         bail!(
-            "downloaded BetterCodex executable failed {argument} with {}",
+            "downloaded bettercodex executable failed {argument} with {}",
             output.status
         );
     }
     one_line(&output.stdout).with_context(|| {
-        format!("downloaded BetterCodex executable returned invalid {argument} output")
+        format!("downloaded bettercodex executable returned invalid {argument} output")
     })
 }
 
@@ -572,7 +580,7 @@ impl StagedBinary {
     fn install(mut self, destination: &Path) -> Result<()> {
         fs::rename(&self.path, destination).with_context(|| {
             format!(
-                "could not atomically replace BetterCodex at {}",
+                "could not atomically replace bettercodex at {}",
                 destination.display()
             )
         })?;
@@ -582,7 +590,7 @@ impl StagedBinary {
                 .and_then(|directory| directory.sync_all())
                 .with_context(|| {
                     format!(
-                        "could not sync the BetterCodex install directory {}",
+                        "could not sync the bettercodex install directory {}",
                         parent.display()
                     )
                 })?;
@@ -614,13 +622,13 @@ impl InstallLock {
                     {
                         let _ = fs::remove_dir_all(&path);
                         return Err(error)
-                            .context("could not record the BetterCodex update lock owner");
+                            .context("could not record the bettercodex update lock owner");
                     }
                     return Ok(Self { path });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     if lock_is_active(&path)? {
-                        bail!("another BetterCodex install or update is already running");
+                        bail!("another bettercodex install or update is already running");
                     }
                     let stale =
                         install_dir.join(format!(".bcodex-stale-lock.{}", std::process::id()));
@@ -629,21 +637,21 @@ impl InstallLock {
                             if let Err(error) = cleanup_recorded_source_install(&stale) {
                                 let _ = fs::rename(&stale, &path);
                                 return Err(error).context(
-                                    "could not clean the temporary tree from an interrupted BetterCodex source install",
+                                    "could not clean the temporary tree from an interrupted bettercodex source install",
                                 );
                             }
                             fs::remove_dir_all(&stale)
-                                .context("could not remove a stale BetterCodex update lock")?;
+                                .context("could not remove a stale bettercodex update lock")?;
                         }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                         Err(error) => {
                             return Err(error)
-                                .context("could not recover a stale BetterCodex update lock");
+                                .context("could not recover a stale bettercodex update lock");
                         }
                     }
                 }
                 Err(error) => {
-                    return Err(error).context("could not acquire the BetterCodex update lock");
+                    return Err(error).context("could not acquire the bettercodex update lock");
                 }
             }
         }
@@ -788,7 +796,7 @@ fn cleanup_source_updater_caches() -> Result<()> {
 
 fn cleanup_source_updater_caches_at(cache_base: &Path) -> Result<()> {
     if !cache_base.is_absolute() {
-        bail!("refusing to clean a relative BetterCodex cache path");
+        bail!("refusing to clean a relative bettercodex cache path");
     }
     if path_is_symlink(cache_base)? {
         eprintln!(
@@ -929,10 +937,19 @@ mod tests {
     }
 
     #[test]
+    fn uses_only_patches_that_materially_reduce_the_download() {
+        assert!(patch_is_worthwhile(90, 100));
+        assert!(patch_is_worthwhile(9, 10));
+        assert!(!patch_is_worthwhile(91, 100));
+        assert!(!patch_is_worthwhile(1, 0));
+        assert!(!patch_is_worthwhile(u64::MAX, u64::MAX));
+    }
+
+    #[test]
     fn expands_full_and_previous_binary_zstd_assets() {
         let root = TemporaryDirectory::new();
-        let previous = b"#!/bin/sh\nold BetterCodex executable bytes\n";
-        let current = b"#!/bin/sh\nnew BetterCodex executable bytes with a little more data\n";
+        let previous = b"#!/bin/sh\nold bettercodex executable bytes\n";
+        let current = b"#!/bin/sh\nnew bettercodex executable bytes with a little more data\n";
 
         let full = zstd::stream::encode_all(Cursor::new(current), 3).unwrap();
         let full_output = root.path.join("full");

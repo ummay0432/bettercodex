@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Build and verify one native BetterCodex release asset set. By default the
+# Build and verify one native bettercodex release asset set. By default the
 # assets are copied to an explicit output directory. --upload sends them to an
 # already-created draft GitHub Release; this script never creates or publishes
 # a release and never invokes GitHub Actions.
@@ -12,6 +12,7 @@ GLIBC_MAX_MAJOR=2
 GLIBC_MAX_MINOR=31
 MAX_ASSET_BYTES=134217728
 MAX_BINARY_BLOCKS=262144
+PATCH_MAX_PERCENT_OF_FULL=90
 
 fail() {
   printf 'bettercodex release: %s\n' "$1" >&2
@@ -29,10 +30,10 @@ Usage:
   scripts/publish-release.sh --upload
 
 Builds the current tagged revision for this native host, verifies it, and
-creates portable gzip, fast zstd, and (when a previous release exists) compact
-previous-binary update assets plus their .sha256 files. --upload requires an
-existing draft release and an authenticated GitHub CLI; publishing the draft
-remains a separate explicit maintainer action.
+creates portable gzip, smaller XZ bootstrap, fast zstd, and (when worthwhile)
+compact previous-binary update assets plus their .sha256 files. --upload
+requires an existing draft release and an authenticated GitHub CLI; publishing
+the draft remains a separate explicit maintainer action.
 EOF
 }
 
@@ -53,7 +54,7 @@ case "$output_dir" in
   *) fail "OUTPUT_DIRECTORY must be an absolute path" ;;
 esac
 
-for required_command in awk basename cmp cp curl dirname git grep gzip mktemp rustup sed tr wc zstd; do
+for required_command in awk basename cmp cp curl dirname git grep gzip mktemp rustup sed tr wc xz zstd; do
   command -v "$required_command" >/dev/null 2>&1 ||
     fail "$required_command is required"
 done
@@ -207,6 +208,7 @@ download_optional() {
       --silent \
       --show-error \
       --location \
+      --compressed \
       --connect-timeout 10 \
       --max-time 300 \
       --max-filesize "$MAX_ASSET_BYTES" \
@@ -323,7 +325,7 @@ if download_optional \
   )" || fail "latest published release has invalid metadata"
   case "$previous_tag" in
     bcodex-v*) ;;
-    *) fail "latest published release has an invalid BetterCodex tag" ;;
+    *) fail "latest published release has an invalid bettercodex tag" ;;
   esac
   previous_release="${previous_tag#bcodex-v}"
   previous_revision="${previous_release##*-}"
@@ -392,7 +394,7 @@ else
     fail "could not resolve the latest published release for compact update generation"
 fi
 
-printf '==> Building BetterCodex %s (%s) for %s\n' "$version" "$(printf '%.12s' "$revision")" "$host_target"
+printf '==> Building bettercodex %s (%s) for %s\n' "$version" "$(printf '%.12s' "$revision")" "$host_target"
 target_environment="$(printf '%s' "$host_target" | tr '-' '_')"
 target_environment_upper="$(printf '%s' "$target_environment" | tr '[:lower:]' '[:upper:]')"
 if [ "$host_os" = macos ]; then
@@ -494,18 +496,28 @@ fi
 gzip_name="bcodex-$host_target.gz"
 gzip_path="$artifact_dir/$gzip_name"
 gzip_checksum="$gzip_path.sha256"
+xz_name="bcodex-$host_target.xz"
+xz_path="$artifact_dir/$xz_name"
+xz_checksum="$xz_path.sha256"
 zstd_name="bcodex-$host_target.zst"
 zstd_path="$artifact_dir/$zstd_name"
 zstd_checksum="$zstd_path.sha256"
 
 gzip -n -9 -c "$binary" >"$gzip_path"
+# On the reviewed 52.9 MB executable, -7e is only 10.9 KB larger than -9e
+# while reducing the decoder dictionary from 64 MiB to 16 MiB.
+xz -q -T1 -7e --check=crc64 -c "$binary" >"$xz_path"
 zstd -q --ultra -T1 -22 --check -c "$binary" >"$zstd_path"
 write_checksum "$gzip_path" "$gzip_checksum"
+write_checksum "$xz_path" "$xz_checksum"
 write_checksum "$zstd_path" "$zstd_checksum"
 verify_checksum "$gzip_path" "$gzip_checksum"
+verify_checksum "$xz_path" "$xz_checksum"
 verify_checksum "$zstd_path" "$zstd_checksum"
 gzip -dc "$gzip_path" | cmp -s - "$binary" ||
   fail "gzip release asset did not reproduce the release binary"
+xz -dc "$xz_path" | cmp -s - "$binary" ||
+  fail "XZ release asset did not reproduce the release binary"
 zstd -q -d -c "$zstd_path" | cmp -s - "$binary" ||
   fail "zstd release asset did not reproduce the release binary"
 
@@ -523,6 +535,15 @@ if [ -n "$previous_revision" ]; then
   zstd -q -d --patch-from="$previous_binary" -c "$patch_path" |
     cmp -s - "$binary" ||
     fail "compact update did not reproduce the release binary"
+  patch_bytes="$(wc -c <"$patch_path" | awk '{ print $1 }')"
+  zstd_bytes="$(wc -c <"$zstd_path" | awk '{ print $1 }')"
+  if [ "$((patch_bytes * 100))" -gt "$((zstd_bytes * PATCH_MAX_PERCENT_OF_FULL))" ]; then
+    warn "compact update is not at least $((100 - PATCH_MAX_PERCENT_OF_FULL))% smaller than the full zstd asset; omitting it"
+    rm -f "$patch_path" "$patch_checksum"
+    patch_name=""
+    patch_path=""
+    patch_checksum=""
+  fi
 fi
 
 if [ "$upload" -eq 1 ]; then
@@ -534,6 +555,8 @@ if [ "$upload" -eq 1 ]; then
     "$release_tag" \
     "$gzip_path" \
     "$gzip_checksum" \
+    "$xz_path" \
+    "$xz_checksum" \
     "$zstd_path" \
     "$zstd_checksum" \
     --repo "$repository" ||
@@ -546,7 +569,10 @@ if [ "$upload" -eq 1 ]; then
       --repo "$repository" ||
       fail "could not upload $host_target compact update asset"
   fi
-  for uploaded_asset in "$gzip_path" "$gzip_checksum" "$zstd_path" "$zstd_checksum"; do
+  for uploaded_asset in \
+    "$gzip_path" "$gzip_checksum" \
+    "$xz_path" "$xz_checksum" \
+    "$zstd_path" "$zstd_checksum"; do
     verify_uploaded_digest "$uploaded_asset"
   done
   if [ -n "$patch_path" ]; then
@@ -556,7 +582,11 @@ if [ "$upload" -eq 1 ]; then
   printf '==> Uploaded %s release assets to draft %s\n' "$host_target" "$release_tag"
 else
   mkdir -p "$output_dir"
-  cp "$gzip_path" "$gzip_checksum" "$zstd_path" "$zstd_checksum" "$output_dir/"
+  cp \
+    "$gzip_path" "$gzip_checksum" \
+    "$xz_path" "$xz_checksum" \
+    "$zstd_path" "$zstd_checksum" \
+    "$output_dir/"
   if [ -n "$patch_path" ]; then
     cp "$patch_path" "$patch_checksum" "$output_dir/"
   fi
@@ -565,6 +595,7 @@ fi
 
 printf '==> Raw executable bytes %s\n' "$(wc -c <"$binary" | awk '{ print $1 }')"
 printf '==> Gzip bytes %s\n' "$(wc -c <"$gzip_path" | awk '{ print $1 }')"
+printf '==> XZ bytes %s\n' "$(wc -c <"$xz_path" | awk '{ print $1 }')"
 printf '==> Zstd bytes %s\n' "$(wc -c <"$zstd_path" | awk '{ print $1 }')"
 if [ -n "$patch_path" ]; then
   printf '==> Compact update bytes %s\n' "$(wc -c <"$patch_path" | awk '{ print $1 }')"

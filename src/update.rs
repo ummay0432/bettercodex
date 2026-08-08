@@ -32,6 +32,7 @@ const CURL_ARGUMENTS: &[&str] = &[
     "--silent",
     "--show-error",
     "--location",
+    "--compressed",
     "--connect-timeout",
     "10",
     "--max-time",
@@ -176,9 +177,9 @@ fn latest_release_api_url(repository: &str) -> String {
 
 fn parse_github_release(response: &[u8]) -> Result<PublishedRelease> {
     let response: GitHubReleaseResponse = serde_json::from_slice(response)
-        .context("GitHub returned an invalid BetterCodex release response")?;
+        .context("GitHub returned an invalid bettercodex release response")?;
     if response.draft || response.prerelease {
-        bail!("GitHub returned an unpublished BetterCodex release");
+        bail!("GitHub returned an unpublished bettercodex release");
     }
     let mut release = parse_release_tag(&response.tag_name)?;
     release.assets = response
@@ -199,15 +200,15 @@ fn parse_github_release(response: &[u8]) -> Result<PublishedRelease> {
 fn parse_release_tag(tag: &str) -> Result<PublishedRelease> {
     let release = tag
         .strip_prefix(RELEASE_TAG_PREFIX)
-        .context("GitHub returned an invalid BetterCodex release tag")?;
+        .context("GitHub returned an invalid bettercodex release tag")?;
     let (version, revision) = release
         .rsplit_once('-')
-        .context("GitHub returned an invalid BetterCodex release tag")?;
+        .context("GitHub returned an invalid bettercodex release tag")?;
     if !is_package_version(version)
         || !is_source_revision(revision)
         || revision.bytes().any(|byte| byte.is_ascii_uppercase())
     {
-        bail!("GitHub returned an invalid BetterCodex release tag");
+        bail!("GitHub returned an invalid bettercodex release tag");
     }
     Ok(PublishedRelease {
         tag: tag.to_string(),
@@ -279,7 +280,7 @@ fn is_repository_name_byte(byte: u8) -> bool {
 
 pub(crate) fn run_update() -> Result<()> {
     let current_revision = source_revision().context(
-        "this build has no embedded source revision; install BetterCodex with INSTALL_COMMAND.txt before using `bcodex update`",
+        "this build has no embedded source revision; install bettercodex with INSTALL_COMMAND.txt before using `bcodex update`",
     )?;
     let repository = configured_repository()?;
     let release = resolve_published_release(OsStr::new("curl"), &repository)?;
@@ -287,7 +288,7 @@ pub(crate) fn run_update() -> Result<()> {
         let mut output = std::io::stdout().lock();
         writeln!(
             output,
-            "The latest published BetterCodex release is already installed at {}.",
+            "The latest published bettercodex release is already installed at {}.",
             short_revision(current_revision)
         )?;
         return Ok(());
@@ -296,7 +297,7 @@ pub(crate) fn run_update() -> Result<()> {
         let mut output = std::io::stdout().lock();
         writeln!(
             output,
-            "This BetterCodex {} build ({}) is newer than the latest published {} release ({}); no downgrade was installed.",
+            "This bettercodex {} build ({}) is newer than the latest published {} release ({}); no downgrade was installed.",
             env!("CARGO_PKG_VERSION"),
             short_revision(current_revision),
             release.version,
@@ -306,7 +307,7 @@ pub(crate) fn run_update() -> Result<()> {
     }
 
     let executable =
-        std::env::current_exe().context("could not locate the running BetterCodex binary")?;
+        std::env::current_exe().context("could not locate the running bettercodex binary")?;
     let configured_dir = std::env::var_os(INSTALL_DIR_ENV);
     let install_dir = update_install_dir(&executable, configured_dir.as_deref())?;
     install::install_release(
@@ -327,9 +328,9 @@ fn resolve_published_release(curl_program: &OsStr, repository: &str) -> Result<P
         .args(["--header", "Accept: application/vnd.github+json", &url])
         .stdin(Stdio::null())
         .output()
-        .context("could not query the latest BetterCodex release")?;
+        .context("could not query the latest bettercodex release")?;
     if !output.status.success() {
-        bail!("GitHub could not resolve the latest BetterCodex release");
+        bail!("GitHub could not resolve the latest bettercodex release");
     }
     parse_github_release(&output.stdout)
 }
@@ -346,7 +347,7 @@ fn update_install_dir(executable: &Path, configured: Option<&OsStr>) -> Result<P
         .parent()
         .filter(|parent| parent.is_absolute())
         .map(Path::to_path_buf)
-        .context("could not locate the running BetterCodex binary directory")
+        .context("could not locate the running bettercodex binary directory")
 }
 
 #[path = "update_install.rs"]

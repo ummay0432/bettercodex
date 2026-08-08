@@ -34,3 +34,7 @@ Open a new terminal, then run:
 bcodex login
 bcodex
 ```
+
+The installer downloads one verified native asset (about 16 MB with XZ where
+available). Later, `bcodex update` uses a compact delta when worthwhile or a
+roughly 17 MB streamed zstd update; neither path compiles locally.

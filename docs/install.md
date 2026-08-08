@@ -1,6 +1,6 @@
 # Installing and building bettercodex
 
-Bettercodex is one Rust package and one `bcodex` binary. Users install verified
+bettercodex is one Rust package and one `bcodex` binary. Users install verified
 native binaries from GitHub Releases; maintainers retain the upstream-derived
 Cargo workflow for development and exceptional source fallback. There is no
 Node workspace, npm package, Bazel build, GitHub Actions release build, or
@@ -30,29 +30,35 @@ HTTPS without requiring a GitHub account or GitHub CLI login.
 The one-line bootstrap always fetches the canonical `scripts/install.sh` from
 public `main`. The installer resolves the latest complete GitHub Release, maps
 the current operating system and architecture to one of four native targets,
-and downloads `bcodex-<target>.gz` plus its `.sha256` file. The first optimized
-Linux x86-64 release candidate compresses to about 22 MB.
+and uses that response's GitHub-calculated SHA-256 to download one asset. It
+prefers `bcodex-<target>.xz` when the standard XZ tool is available, then zstd
+when available, and keeps `bcodex-<target>.gz` as the portable fallback. On the
+reviewed Linux x86-64 binary those choices are about 16.1 MB, 17.2 MB, and
+21.6 MB respectively. The release metadata response itself is HTTP-compressed.
 
 Before replacement, the installer verifies the compressed bytes, decompresses
 into a stage file beside the destination, and requires the candidate to report
 the release's exact package version and full source revision. It then
 initializes V8 and materializes every embedded system resource in an isolated
-home. A final release lookup prevents an older asset from winning a publication
-race. Only a fully verified stage is atomically renamed over `bcodex`.
+home. The selected tag and assets are immutable, so no second release lookup is
+needed; a newer release published during installation is found by the next
+background check. Only a fully verified stage is atomically renamed over
+`bcodex`.
 
 A failed metadata request, download, digest, decompression, runtime check, copy,
 or smoke test leaves the existing binary untouched. Requests retry three times;
-continuously advancing releases stop after three complete attempts. A lock
-rejects concurrent installs and records temporary state so the next invocation
-can recover files left by an untrappable crash or `SIGKILL`.
+the installer never redownloads a complete valid asset merely because a newer
+release appeared. A lock rejects concurrent installs and records temporary
+state so the next invocation can recover files left by an untrappable crash or
+`SIGKILL`.
 
 The normal retained footprint is the installed executable, a small
-shell-profile PATH entry when needed, and BetterCodex user data. Downloaded
+shell-profile PATH entry when needed, and bettercodex user data. Downloaded
 release files and staging trees are removed on success or failure. Rust, Cargo,
 a native compiler, npm, Homebrew, and GitHub CLI are not required for users.
 
 Open a new terminal if `$HOME/.local/bin` was not already on `PATH`, then
-sign in and launch BetterCodex from a project directory:
+sign in and launch bettercodex from a project directory:
 
 ```sh
 bcodex login
@@ -68,7 +74,7 @@ still succeeds and reports the manual PATH step instead.
 
 Use an existing Codex ChatGPT credential at
 `${CODEX_HOME:-$HOME/.codex}/auth.json`, or sign in through `bcodex login`.
-BetterCodex settings and saved sessions stay under `$HOME/.bcodex`.
+bettercodex settings and saved sessions stay under `$HOME/.bcodex`.
 
 ## Updating
 
@@ -86,8 +92,9 @@ bcodex update
 `bcodex update` resolves that release. If its exact source revision is already
 installed, it exits after one bounded metadata request. Otherwise the running
 binary selects this computer's direct `.zst` asset from the same response. When
-the release includes a patch from the installed revision, it tries that much
-smaller transfer first; any patch failure falls back to the full asset.
+the release includes a valid patch from the installed revision that is at least
+10% smaller than the full transfer, it tries that transfer first; any patch
+failure falls back to the full asset.
 
 The updater streams the compressed bytes through its built-in zstd decoder into
 a stage beside the installed executable. It verifies GitHub's exact asset size
@@ -95,8 +102,8 @@ and SHA-256 while streaming, caps decompressed output, and then checks the
 candidate's version, source revision, V8 runtime, and embedded resources before
 an atomic replacement. It does not download a shell script or checksum file,
 and it never invokes Cargo or source fallback. The reviewed Linux x86-64 build
-is about 17.2 MB as a full update; its migration patch from the current
-installed binary is about 8.4 MB.
+is about 17.2 MB as a full update; the measured predecessor patch for the
+reviewed build was about 2.4 MB.
 
 The running TUI keeps using its old in-memory code until restarted; new
 processes use the atomically replaced binary. Failed background checks stay
@@ -121,10 +128,11 @@ working executable intact and reports the release error.
 The fallback clearly reports that it needs Rust through
 [rustup](https://rustup.rs/), a native C toolchain, and several gigabytes of
 free space. It downloads the immutable released source, uses the checked-in
-lockfile and pinned Rust toolchain, and retains one compatible compiled-
-dependency generation under
+lockfile and pinned Rust toolchain, and builds that once-resolved commit only
+once even if public `main` advances during compilation. It retains one
+compatible compiled-dependency generation under
 `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex/build/<native-target>/target`.
-Source and compiler scratch space remain temporary, and BetterCodex-owned
+Source and compiler scratch space remain temporary, and bettercodex-owned
 outputs are removed after verification. A changed toolchain, manifest,
 lockfile, or V8 wrapper replaces the old generation instead of accumulating
 another one.
@@ -147,7 +155,7 @@ siblings, Rust toolchains, or native compilers. The small `rusty-v8-*` cache is
 retained because development checkouts intentionally share it.
 
 Embedded system skills are checked on launch independently of the source
-revision marker. BetterCodex verifies every expected file's bytes and private
+revision marker. bettercodex verifies every expected file's bytes and private
 permissions and rejects unexpected entries under the reserved
 `$BCODEX_HOME/skills/.system` tree. Missing, edited, permission-drifted, and
 retired files are replaced through a staged directory swap; a previous complete
@@ -159,7 +167,7 @@ beside `.system`, not inside that reserved directory.
 An older binary may compare its embedded source commit directly with `main` and
 may still launch the old source compiler. Run
 [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) once after the first complete
-native release is published. Existing ChatGPT credentials, BetterCodex
+native release is published. Existing ChatGPT credentials, bettercodex
 settings, and saved sessions are unaffected. The release-aware binary then
 tracks only published releases and removes the retired source-build cache after
 a successful native install.
@@ -173,7 +181,7 @@ git pull --ff-only &&
   --root "$HOME/.local"
 ```
 
-Run those commands from the Bettercodex repository root.
+Run those commands from the bettercodex repository root.
 Development builds intentionally have no embedded distribution revision and do
 not perform update checks. Use [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt)
 for an installation that tracks published releases.
@@ -194,16 +202,17 @@ The command uses a disposable Cargo target, the pinned toolchain, the
 size-focused `distribution` profile, and the full embedded revision. It runs
 the install smoke test, remaps and rejects private build-host paths, enforces the
 Linux glibc compatibility floor, verifies macOS signatures when present, and
-creates portable gzip plus smaller zstd assets and their SHA-256 files. If a
-previous release exists, it also verifies that target's old binary and creates
-a byte-exact raw-prefix patch for compact updates. It uploads only to an
-existing draft. Publishing that draft remains a separate manual action after
-all four targets have been inspected. See
+creates portable gzip, smaller XZ bootstrap, and fast zstd update assets plus
+their SHA-256 files. If a previous release exists, it also verifies that
+target's old binary and creates a byte-exact raw-prefix patch when that patch
+saves at least 10% over the full zstd update. It uploads only to an existing
+draft. Publishing that draft remains a separate manual action after all four
+targets have been inspected. See
 [`spec-install.md`](../spec-install.md) for the complete release contract.
 
 ## Build without installing
 
-From any Bettercodex source checkout, build or run the binary through the
+From any bettercodex source checkout, build or run the binary through the
 checked-in Cargo wrapper:
 
 ```sh
@@ -211,7 +220,7 @@ checked-in Cargo wrapper:
 ./scripts/cargo-with-v8.sh run --bin bcodex
 ```
 
-Bettercodex enables V8's in-process sandbox. The matching archive is not in the
+bettercodex enables V8's in-process sandbox. The matching archive is not in the
 default `rusty_v8` release, so the wrapper follows current upstream Codex: it
 downloads the matching archive and generated binding from the
 `rusty-v8-v150.4.0` OpenAI Codex release, verifies their pinned SHA-256 digests,

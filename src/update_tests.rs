@@ -206,7 +206,14 @@ fn updater_resolves_the_latest_release_with_asset_digests() {
     let digest = "a".repeat(64);
     let curl = TemporaryProgram::new(&format!(
         "#!/bin/sh\n\
-         for argument do url=\"$argument\"; done\n\
+         compressed=0\n\
+         for argument do\n\
+           case \"$argument\" in\n\
+             --compressed) compressed=1 ;;\n\
+             https://*) url=\"$argument\" ;;\n\
+           esac\n\
+         done\n\
+         [ \"$compressed\" = 1 ] || exit 3\n\
          case \"$url\" in\n\
            'https://api.github.com/repos/owner/project/releases/latest') printf '%s\\n' '{{\"tag_name\":\"{tag}\",\"draft\":false,\"prerelease\":false,\"assets\":[{{\"name\":\"bcodex-x86_64-unknown-linux-gnu.zst\",\"size\":123,\"digest\":\"sha256:{digest}\"}}]}}' ;;\n\
            *) exit 2 ;;\n\

@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Install a verified native BetterCodex release, falling back to an immutable
+# Install a verified native bettercodex release, falling back to an immutable
 # source build only when no compatible release asset exists. Release-aware
 # binaries update themselves directly; this script remains the bootstrap and
 # migration path for older installations.
@@ -12,8 +12,6 @@ GITHUB_API_ROOT="https://api.github.com"
 GITHUB_ARCHIVE_ROOT="https://codeload.github.com"
 GITHUB_RELEASE_ROOT="https://github.com"
 MAX_GITHUB_ATTEMPTS=3
-MAX_RELEASE_ATTEMPTS=3
-MAX_SOURCE_ATTEMPTS=3
 MAX_METADATA_BYTES=1048576
 MAX_ASSET_BYTES=134217728
 MAX_BINARY_BLOCKS=262144
@@ -44,7 +42,7 @@ usage() {
   cat <<EOF
 Usage: install.sh
 
-Resolves the latest published BetterCodex release, downloads and verifies this
+Resolves the latest published bettercodex release, downloads and verifies this
 computer's native executable, and atomically installs it. Rust and a C compiler
 are needed only when a compatible release asset is unavailable and the installer
 must fall back to a local source build.
@@ -94,7 +92,7 @@ cleanup() {
   if [ "$build_cache_used" -eq 1 ] && [ -n "$target_dir" ]; then
     if ! remove_bettercodex_outputs; then
       cleanup_incomplete=1
-      warn "could not remove BetterCodex-owned compilation output from $target_dir"
+      warn "could not remove bettercodex-owned compilation output from $target_dir"
     fi
   fi
   if [ -n "$staged_binary" ]; then
@@ -205,15 +203,15 @@ require_command awk
 require_command cmp
 require_command curl
 require_command dirname
+require_command fold
 require_command grep
-require_command gzip
 require_command mktemp
 require_command sed
 require_command wc
 
 mkdir -p "$bin_dir"
 if [ -L "$bin_path" ]; then
-  fail "refusing to replace symlinked BetterCodex executable $bin_path"
+  fail "refusing to replace symlinked bettercodex executable $bin_path"
 fi
 if [ -e "$bin_path" ] && [ ! -f "$bin_path" ]; then
   fail "$bin_path exists but is not a regular file"
@@ -228,7 +226,7 @@ acquire_install_lock() {
       "" | *[!0-9]*) ;;
       *)
         if kill -0 "$lock_pid" 2>/dev/null; then
-          fail "another BetterCodex install is already running (process $lock_pid)"
+          fail "another bettercodex install is already running (process $lock_pid)"
         fi
         ;;
     esac
@@ -245,7 +243,7 @@ acquire_install_lock() {
         if ! mv "$stale_lock" "$lock_dir" 2>/dev/null; then
           warn "orphan cleanup record remains at $stale_lock"
         fi
-        fail "could not remove an orphaned BetterCodex install tree"
+        fail "could not remove an orphaned bettercodex install tree"
       fi
       rm -rf "$stale_lock"
       lock_waits=0
@@ -300,6 +298,7 @@ github_get() {
     --silent \
     --show-error \
     --location \
+    --compressed \
     --connect-timeout 10 \
     --max-time 120 \
     --max-filesize "$1" \
@@ -323,6 +322,7 @@ github_download_once() {
       --silent \
       --show-error \
       --location \
+      --compressed \
       --connect-timeout 10 \
       --max-time 120 \
       --max-filesize "$MAX_ASSET_BYTES" \
@@ -480,8 +480,138 @@ exactly_one_line() {
   '
 }
 
+parse_release_metadata() {
+  # Bound awk's record size so compact, single-line JSON remains cheap to
+  # parse on every supported awk. JSON strings cannot contain literal
+  # newlines, so these record boundaries do not change the document.
+  LC_ALL=C fold -b -w 4096 | LC_ALL=C awk '
+    function finish_string(value) {
+      if (object_depth == 1 && key == "tag_name") {
+        print "tag_name\t" value
+      } else if (object_depth == asset_object_depth) {
+        if (key == "name") {
+          asset_name = value
+        } else if (key == "digest") {
+          asset_digest = value
+        }
+      }
+      expecting_value = 0
+      key = ""
+      scalar = ""
+    }
+
+    function finish_scalar(value) {
+      if (object_depth == 1 && (key == "draft" || key == "prerelease")) {
+        print key "\t" value
+      }
+      expecting_value = 0
+      key = ""
+      scalar = ""
+    }
+
+    {
+      for (i = 1; i <= length($0); i++) {
+        char = substr($0, i, 1)
+
+        if (in_string) {
+          if (escaped) {
+            token = token "\\" char
+            escaped = 0
+          } else if (char == "\\") {
+            escaped = 1
+          } else if (char == "\"") {
+            in_string = 0
+            if (string_is_value) {
+              finish_string(token)
+            } else {
+              pending_key = token
+            }
+          } else {
+            token = token char
+          }
+          continue
+        }
+
+        if (expecting_value && scalar != "" &&
+            (char ~ /[[:space:]]/ || char == "," || char == "}" || char == "]")) {
+          finish_scalar(scalar)
+        }
+
+        if (char == "\"") {
+          in_string = 1
+          token = ""
+          escaped = 0
+          string_is_value = expecting_value
+        } else if (char == ":" && pending_key != "") {
+          key = pending_key
+          pending_key = ""
+          expecting_value = 1
+          scalar = ""
+        } else if (char == "{") {
+          object_depth++
+          if (assets_array_depth != 0 &&
+              array_depth == assets_array_depth &&
+              asset_object_depth == 0) {
+            asset_object_depth = object_depth
+            asset_name = ""
+            asset_digest = ""
+          }
+          expecting_value = 0
+          key = ""
+          scalar = ""
+        } else if (char == "}") {
+          if (object_depth == asset_object_depth) {
+            if (asset_name != "") {
+              print "asset\t" asset_name "\t" asset_digest
+            }
+            asset_object_depth = 0
+            asset_name = ""
+            asset_digest = ""
+          }
+          object_depth--
+          expecting_value = 0
+          key = ""
+          pending_key = ""
+          scalar = ""
+        } else if (char == "[") {
+          array_depth++
+          if (expecting_value && key == "assets" && object_depth == 1) {
+            assets_array_depth = array_depth
+          }
+          expecting_value = 0
+          key = ""
+          scalar = ""
+        } else if (char == "]") {
+          if (array_depth == assets_array_depth) {
+            assets_array_depth = 0
+          }
+          array_depth--
+          expecting_value = 0
+          key = ""
+          pending_key = ""
+          scalar = ""
+        } else if (char == ",") {
+          expecting_value = 0
+          key = ""
+          pending_key = ""
+          scalar = ""
+        } else if (expecting_value && char !~ /[[:space:]]/) {
+          scalar = scalar char
+        }
+      }
+    }
+
+    END {
+      if (in_string || object_depth != 0 || array_depth != 0) {
+        exit 1
+      }
+    }
+  '
+}
+
 resolve_latest_release() {
   release_metadata="$tmp_dir/latest-release.json"
+  parsed_metadata="$tmp_dir/latest-release.parsed"
   if download_release_file \
     "$GITHUB_API_ROOT/repos/$repository/releases/latest" \
     "$release_metadata" \
@@ -490,28 +620,55 @@ resolve_latest_release() {
   else
     return $?
   fi
-  # GitHub may return either pretty-printed or compact JSON. Split structural
-  # object separators before matching exact scalar fields; quotes inside JSON
-  # strings are escaped, so release notes cannot masquerade as these keys.
-  # Reject missing or duplicate fields rather than selecting one ambiguously.
+  if ! parse_release_metadata <"$release_metadata" >"$parsed_metadata"; then
+    return 1
+  fi
   release_tag="$(
-    LC_ALL=C tr ',{}' '\n' <"$release_metadata" |
-      sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' |
+    awk -F '\t' '$1 == "tag_name" { print $2 }' "$parsed_metadata" |
       exactly_one_line
   )" || return 1
-  # Use portable basic regular expressions; BSD sed does not support GNU's \|.
   release_draft="$(
-    LC_ALL=C tr ',{}' '\n' <"$release_metadata" |
-      sed -n 's/^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\)[[:space:]]*$/\1/p' |
+    awk -F '\t' '$1 == "draft" { print $2 }' "$parsed_metadata" |
       exactly_one_line
   )" || return 1
   release_prerelease="$(
-    LC_ALL=C tr ',{}' '\n' <"$release_metadata" |
-      sed -n 's/^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\)[[:space:]]*$/\1/p' |
+    awk -F '\t' '$1 == "prerelease" { print $2 }' "$parsed_metadata" |
       exactly_one_line
   )" || return 1
   [ "$release_draft" = false ] && [ "$release_prerelease" = false ] || return 1
-  parse_release_tag "$release_tag"
+  release_descriptor="$(parse_release_tag "$release_tag")" || return 1
+
+  selected_asset=""
+  selected_digest=""
+  for release_format in xz zst gz; do
+    case "$release_format" in
+      xz) command -v xz >/dev/null 2>&1 || continue ;;
+      zst) command -v zstd >/dev/null 2>&1 || continue ;;
+      gz) command -v gzip >/dev/null 2>&1 || continue ;;
+    esac
+    candidate_asset="bcodex-$host_target.$release_format"
+    candidate_count="$(
+      awk -F '\t' -v expected="$candidate_asset" '
+        $1 == "asset" && $2 == expected { count++ }
+        END { print count + 0 }
+      ' "$parsed_metadata"
+    )"
+    case "$candidate_count" in
+      0) continue ;;
+      1) ;;
+      *) return 1 ;;
+    esac
+    candidate_digest="$(
+      awk -F '\t' -v expected="$candidate_asset" \
+        '$1 == "asset" && $2 == expected { print $3 }' "$parsed_metadata"
+    )"
+    printf '%s\n' "$candidate_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
+    selected_asset="$candidate_asset"
+    selected_digest="${candidate_digest#sha256:}"
+    break
+  done
+
+  printf '%s|%s|%s\n' "$release_descriptor" "$selected_asset" "$selected_digest"
 }
 
 requested_revision="${BCODEX_INSTALL_REVISION:-}"
@@ -522,7 +679,7 @@ requested_release_tag="${BCODEX_INSTALL_RELEASE_TAG:-}"
 requested_version="${BCODEX_INSTALL_VERSION:-}"
 if [ -n "$requested_release_tag" ]; then
   if ! requested_release="$(parse_release_tag "$requested_release_tag")"; then
-    fail "BCODEX_INSTALL_RELEASE_TAG is not a canonical BetterCodex release tag"
+    fail "BCODEX_INSTALL_RELEASE_TAG is not a canonical bettercodex release tag"
   fi
   requested_tag_version="$(printf '%s\n' "$requested_release" | awk -F '|' '{ print $2 }')"
   requested_tag_revision="$(printf '%s\n' "$requested_release" | awk -F '|' '{ print $3 }')"
@@ -649,69 +806,93 @@ install_prebuilt_release() {
   prebuilt_tag="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $1 }')"
   prebuilt_version="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $2 }')"
   prebuilt_revision="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $3 }')"
+  descriptor_fields="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print NF }')"
+  asset_name="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $4 }')"
+  expected_sha256="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $5 }')"
   short_prebuilt="$(printf '%.12s' "$prebuilt_revision")"
-  asset_name="bcodex-$host_target.gz"
-  checksum_name="$asset_name.sha256"
+  checksum_name=""
+  checksum_path=""
+  if [ "$descriptor_fields" -eq 3 ]; then
+    # Explicitly pinned legacy installs do not perform a metadata lookup.
+    asset_name="bcodex-$host_target.gz"
+    checksum_name="$asset_name.sha256"
+  elif [ "$descriptor_fields" -eq 5 ]; then
+    [ -n "$asset_name" ] || return 44
+    printf '%s\n' "$expected_sha256" | grep -Eq '^[0-9a-f]{64}$' ||
+      fail "GitHub returned an invalid digest for $asset_name"
+  else
+    fail "bettercodex release metadata had an invalid descriptor"
+  fi
+  case "$asset_name" in
+    "bcodex-$host_target.xz") require_command xz; decompressor=xz ;;
+    "bcodex-$host_target.zst") require_command zstd; decompressor=zstd ;;
+    "bcodex-$host_target.gz") require_command gzip; decompressor=gzip ;;
+    *) fail "GitHub returned an unexpected bettercodex asset name" ;;
+  esac
   release_base="$GITHUB_RELEASE_ROOT/$repository/releases/download/$prebuilt_tag"
   attempt_root="$tmp_dir/prebuilt-$short_prebuilt"
-  checksum_path="$attempt_root/$checksum_name"
+  if [ -n "$checksum_name" ]; then
+    checksum_path="$attempt_root/$checksum_name"
+  fi
   asset_path="$attempt_root/$asset_name"
   smoke_root="$attempt_root/smoke"
   mkdir -p "$attempt_root"
 
-  step "Installing published BetterCodex $prebuilt_version ($short_prebuilt) for $os $arch"
-  if download_release_file \
-    "$release_base/$checksum_name" \
-    "$checksum_path" \
-    "BetterCodex checksum"; then
-    :
-  else
-    prebuilt_result=$?
-    if [ "$prebuilt_result" -eq 44 ]; then
-      return 44
+  step "Installing published bettercodex $prebuilt_version ($short_prebuilt) for $os $arch"
+  if [ -n "$checksum_name" ]; then
+    if download_release_file \
+      "$release_base/$checksum_name" \
+      "$checksum_path" \
+      "bettercodex checksum"; then
+      :
+    else
+      prebuilt_result=$?
+      if [ "$prebuilt_result" -eq 44 ]; then
+        return 44
+      fi
+      fail "could not download the bettercodex checksum for $host_target"
     fi
-    fail "could not download the BetterCodex checksum for $host_target"
+
+    expected_sha256="$(
+      awk -v expected="$asset_name" '
+        NR == 1 && NF == 2 && $2 == expected &&
+          length($1) == 64 && $1 !~ /[^0-9a-f]/ {
+          digest = $1
+          next
+        }
+        { invalid = 1 }
+        END {
+          if (NR != 1 || invalid || digest == "") exit 1
+          print digest
+        }
+      ' "$checksum_path" 2>/dev/null || true
+    )"
+    [ -n "$expected_sha256" ] || fail "GitHub returned an invalid checksum for $asset_name"
   fi
 
-  expected_sha256="$(
-    awk -v expected="$asset_name" '
-      NR == 1 && NF == 2 && $2 == expected &&
-        length($1) == 64 && $1 !~ /[^0-9a-f]/ {
-        digest = $1
-        next
-      }
-      { invalid = 1 }
-      END {
-        if (NR != 1 || invalid || digest == "") exit 1
-        print digest
-      }
-    ' "$checksum_path" 2>/dev/null || true
-  )"
-  [ -n "$expected_sha256" ] || fail "GitHub returned an invalid checksum for $asset_name"
-
-  step "Downloading the native BetterCodex executable"
+  step "Downloading the native bettercodex executable"
   if download_release_file \
     "$release_base/$asset_name" \
     "$asset_path" \
-    "BetterCodex release asset"; then
+    "bettercodex release asset"; then
     :
   else
     prebuilt_result=$?
     if [ "$prebuilt_result" -eq 44 ]; then
       return 44
     fi
-    fail "could not download the BetterCodex release asset for $host_target"
+    fail "could not download the bettercodex release asset for $host_target"
   fi
 
   asset_size="$(wc -c <"$asset_path" | awk '{ print $1 }')"
   case "$asset_size" in
-    "" | *[!0-9]*) fail "could not determine the BetterCodex release asset size" ;;
+    "" | *[!0-9]*) fail "could not determine the bettercodex release asset size" ;;
   esac
   if [ "$asset_size" -le 0 ] || [ "$asset_size" -gt "$MAX_ASSET_BYTES" ]; then
-    fail "BetterCodex release asset is empty or exceeds $MAX_ASSET_BYTES bytes"
+    fail "bettercodex release asset is empty or exceeds $MAX_ASSET_BYTES bytes"
   fi
   if ! actual_sha256="$(file_sha256 "$asset_path")"; then
-    fail "sha256sum, shasum, or openssl is required to verify BetterCodex"
+    fail "sha256sum, shasum, or openssl is required to verify bettercodex"
   fi
   [ "$actual_sha256" = "$expected_sha256" ] ||
     fail "$asset_name has SHA-256 $actual_sha256, expected $expected_sha256"
@@ -720,16 +901,20 @@ install_prebuilt_release() {
   rm -f "$staged_binary"
   if ! (
     ulimit -f "$MAX_BINARY_BLOCKS"
-    gzip -dc "$asset_path" >"$staged_binary"
+    case "$decompressor" in
+      xz) xz -dc "$asset_path" ;;
+      zstd) zstd -q -d -c "$asset_path" ;;
+      gzip) gzip -dc "$asset_path" ;;
+    esac >"$staged_binary"
   ); then
-    fail "BetterCodex release asset could not be decompressed"
+    fail "bettercodex release asset could not be decompressed"
   fi
   staged_size="$(wc -c <"$staged_binary" | awk '{ print $1 }')"
   case "$staged_size" in
-    "" | *[!0-9]*) fail "could not determine the staged BetterCodex size" ;;
+    "" | *[!0-9]*) fail "could not determine the staged bettercodex size" ;;
   esac
   if [ "$staged_size" -le 0 ] || [ "$staged_size" -gt "$MAX_ASSET_BYTES" ]; then
-    fail "staged BetterCodex executable is empty or exceeds $MAX_ASSET_BYTES bytes"
+    fail "staged bettercodex executable is empty or exceeds $MAX_ASSET_BYTES bytes"
   fi
   chmod 0755 "$staged_binary"
   if ! version_output="$("$staged_binary" --version 2>/dev/null)"; then
@@ -800,7 +985,6 @@ if [ -f "$bin_path" ] || [ -L "$bin_path" ]; then
 fi
 
 release_descriptor=""
-fallback_release_tag=""
 fallback_release_version=""
 if [ -n "$requested_release_tag" ]; then
   release_descriptor="$requested_release"
@@ -810,10 +994,10 @@ elif [ -z "$requested_revision" ]; then
   else
     release_result=$?
     if [ "$release_result" -eq 44 ]; then
-      warn "no published BetterCodex release exists yet; using the source fallback"
+      warn "no published bettercodex release exists yet; using the source fallback"
       release_descriptor=""
     else
-      fail "could not resolve the latest published BetterCodex release"
+      fail "could not resolve the latest published bettercodex release"
     fi
   fi
 fi
@@ -821,42 +1005,7 @@ fi
 installed_revision=""
 installed_version=""
 if [ -n "$release_descriptor" ]; then
-  release_attempt=1
-  while [ "$release_attempt" -le "$MAX_RELEASE_ATTEMPTS" ]; do
-    if install_prebuilt_release "$release_descriptor"; then
-      prebuilt_result=0
-    else
-      prebuilt_result=$?
-    fi
-    if [ "$prebuilt_result" -eq 44 ] || [ "$prebuilt_result" -eq 45 ]; then
-      requested_revision="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $3 }')"
-      fallback_release_tag="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $1 }')"
-      fallback_release_version="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $2 }')"
-      warn "no compatible prebuilt asset is available for $host_target"
-      warn "falling back to a local source build; this requires Rust, a C compiler, several gigabytes of disk, and substantially more time"
-      installed_revision=""
-      installed_version=""
-      break
-    fi
-
-    if ! latest_release_descriptor="$(resolve_latest_release)"; then
-      fail "could not verify the latest BetterCodex release after downloading"
-    fi
-    current_release_tag="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $1 }')"
-    latest_release_tag="$(printf '%s\n' "$latest_release_descriptor" | awk -F '|' '{ print $1 }')"
-    if [ "$latest_release_tag" != "$current_release_tag" ]; then
-      rm -f "$staged_binary"
-      staged_binary=""
-      rm -rf "$attempt_root"
-      if [ "$release_attempt" -ge "$MAX_RELEASE_ATTEMPTS" ]; then
-        fail "BetterCodex releases kept advancing during all $MAX_RELEASE_ATTEMPTS install attempts"
-      fi
-      step "A newer BetterCodex release appeared while downloading; retrying"
-      release_descriptor="$latest_release_descriptor"
-      release_attempt=$((release_attempt + 1))
-      continue
-    fi
-
+  if install_prebuilt_release "$release_descriptor"; then
     mv -f "$staged_binary" "$bin_path"
     staged_binary=""
     [ "$("$bin_path" --version 2>/dev/null || true)" = "bcodex $installed_version" ] ||
@@ -867,8 +1016,18 @@ if [ -n "$release_descriptor" ]; then
     if ! remove_source_updater_caches; then
       warn "could not remove every retired source-updater cache"
     fi
-    break
-  done
+  else
+    prebuilt_result=$?
+    if [ "$prebuilt_result" -ne 44 ] && [ "$prebuilt_result" -ne 45 ]; then
+      fail "could not install the published bettercodex executable"
+    fi
+    requested_revision="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $3 }')"
+    fallback_release_version="$(printf '%s\n' "$release_descriptor" | awk -F '|' '{ print $2 }')"
+    warn "no compatible prebuilt asset is available for $host_target"
+    warn "falling back to a local source build; this requires Rust, a C compiler, several gigabytes of disk, and substantially more time"
+    installed_revision=""
+    installed_version=""
+  fi
 fi
 
 if [ -z "$installed_revision" ]; then
@@ -885,30 +1044,28 @@ if [ -z "$installed_revision" ]; then
   fi
   mkdir -p "$cargo_home" "$v8_cache_home"
 
-source_attempt=1
-while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
   if [ -n "$requested_revision" ]; then
     resolved_commit="$requested_revision"
   else
     if ! resolved_commit="$(resolve_main_commit)"; then
-      fail "could not resolve the current BetterCodex main commit"
+      fail "could not resolve the current bettercodex main commit"
     fi
   fi
   is_source_revision "$resolved_commit" ||
-    fail "BetterCodex main did not resolve to a valid commit"
+    fail "bettercodex main did not resolve to a valid commit"
 
   short_commit="$(printf '%.12s' "$resolved_commit")"
-  attempt_root="$tmp_dir/attempt-$source_attempt-$short_commit"
+  attempt_root="$tmp_dir/source-$short_commit"
   archive_path="$attempt_root/source.tar.gz"
   source_dir="$attempt_root/source"
   compiler_tmp="$attempt_root/compiler-tmp"
   smoke_root="$attempt_root/smoke"
   mkdir -p "$source_dir" "$compiler_tmp"
 
-  step "Installing BetterCodex main $short_commit for $os $arch"
+  step "Installing bettercodex main $short_commit for $os $arch"
   step "Downloading the immutable source snapshot"
   if ! download_source_archive "$archive_path" "$resolved_commit"; then
-    fail "could not download public BetterCodex source commit $resolved_commit from $repository"
+    fail "could not download public bettercodex source commit $resolved_commit from $repository"
   fi
   [ -s "$archive_path" ] || fail "downloaded source archive is empty"
   if ! tar -xzf "$archive_path" -C "$source_dir" --strip-components=1; then
@@ -924,7 +1081,7 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
     sed -n 's/^version = "\([^"]*\)"/\1/p' "$source_dir/Cargo.toml" 2>/dev/null |
       sed -n '1p'
   )"
-  [ -n "$expected_version" ] || fail "source commit has no BetterCodex package version"
+  [ -n "$expected_version" ] || fail "source commit has no bettercodex package version"
   if [ -n "$fallback_release_version" ] && [ "$expected_version" != "$fallback_release_version" ]; then
     fail "released source reports version $expected_version, expected $fallback_release_version"
   fi
@@ -962,11 +1119,11 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
   rust_toolchain_bin="$(dirname "$cargo_program")"
 
   prepare_compilation_target
-  remove_bettercodex_outputs || fail "could not remove obsolete BetterCodex output"
+  remove_bettercodex_outputs || fail "could not remove obsolete bettercodex output"
   if [ "$build_cache_used" -eq 1 ]; then
-    step "Compiling BetterCodex $expected_version with cached dependencies"
+    step "Compiling bettercodex $expected_version with cached dependencies"
   else
-    step "Compiling BetterCodex $expected_version in a disposable build directory"
+    step "Compiling bettercodex $expected_version in a disposable build directory"
   fi
   if ! (
     unset \
@@ -1004,7 +1161,7 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
       XDG_CACHE_HOME="$v8_cache_home" \
       ./scripts/cargo-with-v8.sh build --release --locked --bin bcodex
   ); then
-    fail "local BetterCodex compilation failed"
+    fail "local bettercodex compilation failed"
   fi
 
   built_binary="$target_dir/release/bcodex"
@@ -1042,53 +1199,13 @@ while [ "$source_attempt" -le "$MAX_SOURCE_ATTEMPTS" ]; do
   [ "$("$staged_binary" --internal-source-revision 2>/dev/null || true)" = "$resolved_commit" ] ||
     fail "staged binary lost its embedded source revision"
 
-  latest_distribution_tag=""
-  if [ -n "$fallback_release_tag" ]; then
-    if ! latest_distribution="$(resolve_latest_release)"; then
-      fail "could not verify the latest BetterCodex release after building"
-    fi
-    latest_distribution_tag="$(printf '%s\n' "$latest_distribution" | awk -F '|' '{ print $1 }')"
-    latest_version="$(printf '%s\n' "$latest_distribution" | awk -F '|' '{ print $2 }')"
-    latest_commit="$(printf '%s\n' "$latest_distribution" | awk -F '|' '{ print $3 }')"
-  elif ! latest_commit="$(resolve_main_commit)"; then
-    fail "could not verify BetterCodex main after building"
-  fi
-  is_source_revision "$latest_commit" ||
-    fail "BetterCodex main did not resolve to a valid commit after building"
-  if [ "$latest_commit" != "$resolved_commit" ] ||
-    { [ -n "$fallback_release_tag" ] && [ "$latest_distribution_tag" != "$fallback_release_tag" ]; }; then
-    rm -f "$staged_binary"
-    staged_binary=""
-    rm -rf "$attempt_root"
-    if [ "$source_attempt" -ge "$MAX_SOURCE_ATTEMPTS" ]; then
-      if [ -n "$fallback_release_tag" ]; then
-        fail "BetterCodex releases kept advancing during all $MAX_SOURCE_ATTEMPTS build attempts"
-      fi
-      fail "BetterCodex main kept advancing during all $MAX_SOURCE_ATTEMPTS build attempts"
-    fi
-    latest_short="$(printf '%.12s' "$latest_commit")"
-    if [ -n "$fallback_release_tag" ]; then
-      step "A newer release replaced $short_commit with $latest_short while building; retrying with cached dependencies"
-      fallback_release_tag="$latest_distribution_tag"
-      fallback_release_version="$latest_version"
-      requested_revision="$latest_commit"
-    else
-      step "Main advanced from $short_commit to $latest_short while building; retrying with cached dependencies"
-      requested_revision=""
-    fi
-    source_attempt=$((source_attempt + 1))
-    continue
-  fi
-
   mv -f "$staged_binary" "$bin_path"
   staged_binary=""
   installed_revision="$resolved_commit"
   installed_version="$expected_version"
-  break
-done
 fi
 
-[ -n "$installed_revision" ] || fail "no BetterCodex source revision was installed"
+[ -n "$installed_revision" ] || fail "no bettercodex source revision was installed"
 [ "$("$bin_path" --version 2>/dev/null || true)" = "bcodex $installed_version" ] ||
   fail "installed binary did not retain version $installed_version"
 [ "$("$bin_path" --internal-source-revision 2>/dev/null || true)" = "$installed_revision" ] ||
@@ -1097,7 +1214,7 @@ if [ "$install_mode" = source ]; then
   cmp -s "$built_binary" "$bin_path" ||
     fail "installed binary does not exactly match the verified build"
   remove_bettercodex_outputs ||
-    fail "could not remove BetterCodex-owned compilation output after installation"
+    fail "could not remove bettercodex-owned compilation output after installation"
 fi
 
 pick_profile() {
@@ -1141,7 +1258,7 @@ configure_path() {
     fi
     if grep -F "$end_marker" "$path_profile" >/dev/null 2>&1; then
       if [ -L "$path_profile" ]; then
-        warn "not replacing symlinked shell profile $path_profile; update its BetterCodex PATH block manually"
+        warn "not replacing symlinked shell profile $path_profile; update its bettercodex PATH block manually"
         path_action="unavailable"
         return
       fi
@@ -1170,7 +1287,7 @@ configure_path() {
         { print }
         END { if (in_block) exit 1 }
       ' "$path_profile" >"$rewritten_profile"; then
-        warn "could not rewrite the BetterCodex PATH block in $path_profile"
+        warn "could not rewrite the bettercodex PATH block in $path_profile"
         path_action="unavailable"
         return
       fi
@@ -1182,7 +1299,7 @@ configure_path() {
       path_action="updated"
       return
     fi
-    warn "the BetterCodex PATH block in $path_profile is incomplete; update it manually"
+    warn "the bettercodex PATH block in $path_profile is incomplete; update it manually"
     path_action="unavailable"
     return
   fi
@@ -1203,7 +1320,7 @@ configure_path
 
 cd /
 if ! rm -rf "$tmp_dir"; then
-  fail "BetterCodex was installed, but temporary build cleanup failed at $tmp_dir"
+  fail "bettercodex was installed, but temporary build cleanup failed at $tmp_dir"
 fi
 tmp_dir=""
 rm -f "$lock_dir/tmp"
@@ -1211,7 +1328,7 @@ rm -f "$lock_dir/tmp"
 short_installed="$(printf '%.12s' "$installed_revision")"
 if [ "$existing_install" -eq 1 ]; then
   step "Updated bcodex $installed_version ($short_installed) at $bin_path"
-  step "Restart BetterCodex to use the updated binary"
+  step "Restart bettercodex to use the updated binary"
 else
   step "Installed bcodex $installed_version ($short_installed) at $bin_path"
 fi
@@ -1222,7 +1339,7 @@ if [ "$install_mode" = prebuilt ]; then
   fi
 elif [ -n "$cache_root" ]; then
   if [ "$build_cache_used" -eq 1 ]; then
-    step "Removed disposable source and BetterCodex scratch output; retained compiled dependencies at $cache_root/build/$host_target"
+    step "Removed disposable source and bettercodex scratch output; retained compiled dependencies at $cache_root/build/$host_target"
   else
     step "Removed disposable source and build output; retained dependency downloads at $cache_root"
   fi
