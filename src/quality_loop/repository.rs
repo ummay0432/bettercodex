@@ -1248,3 +1248,72 @@ fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod snapshot_benchmark {
+    use super::*;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("bcodex-snapshot-bench-{}", Uuid::new_v4()));
+            std::fs::create_dir(&path).expect("create fixture root");
+            Self(path)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn repeated_snapshot_timing() {
+        let fixture = Fixture::new();
+        let repository = fixture.0.join("repository");
+        let run_root = fixture.0.join("run");
+        std::fs::create_dir(&repository).expect("create repository");
+        let status = Command::new("git")
+            .current_dir(&repository)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("start git init");
+        assert!(status.success());
+        for index in 0_u8..8 {
+            let mut bytes = vec![index; 16 * 1024 * 1024];
+            let last = bytes.len() - 1;
+            bytes[last] = index.wrapping_add(1);
+            std::fs::write(repository.join(format!("payload-{index}")), bytes)
+                .expect("write payload");
+        }
+        let status = Command::new("git")
+            .current_dir(&repository)
+            .args(["add", "."])
+            .status()
+            .expect("start git add");
+        assert!(status.success());
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        let worktree = Worktree::discover(&repository).expect("discover worktree");
+        let started = Instant::now();
+        worktree.capture(&run_root, &[]).expect("warm snapshot");
+        let warm = started.elapsed();
+        let started = Instant::now();
+        worktree
+            .capture(&run_root, &[])
+            .expect("first repeated snapshot");
+        let first = started.elapsed();
+        let started = Instant::now();
+        worktree
+            .capture(&run_root, &[])
+            .expect("second repeated snapshot");
+        let second = started.elapsed();
+        eprintln!("warm={warm:?} first={first:?} second={second:?}");
+    }
+}

@@ -148,8 +148,7 @@ pub(crate) enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phase: Option<MessagePhase>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        internal_chat_message_metadata_passthrough:
-            Option<InternalChatMessageMetadataPassthrough>,
+        internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     },
 }
 

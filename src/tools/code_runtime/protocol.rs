@@ -7,7 +7,6 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -234,15 +233,9 @@ pub(crate) trait CodeModeSession: Send + Sync {
         request: ExecuteRequest,
     ) -> CodeModeSessionResultFuture<'a, StartedCell>;
 
-    fn wait<'a>(
-        &'a self,
-        request: WaitRequest,
-    ) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
+    fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
 
-    fn terminate<'a>(
-        &'a self,
-        cell_id: CellId,
-    ) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
+    fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
 
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()>;
 }

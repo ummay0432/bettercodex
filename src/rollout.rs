@@ -1,10 +1,10 @@
 use crate::MODEL;
+use crate::protocol::MessagePhase;
 use crate::skills::SkillSelection;
 use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_protocol::models::MessagePhase;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;

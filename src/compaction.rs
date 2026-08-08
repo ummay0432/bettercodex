@@ -1,8 +1,8 @@
 use crate::context::estimated_tokens;
 use crate::context::is_contextual_user_message;
-use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::truncate_text;
+use crate::truncation::TruncationPolicy;
+use crate::truncation::approx_token_count;
+use crate::truncation::truncate_text;
 use serde_json::Value;
 use serde_json::json;
 

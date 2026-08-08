@@ -3,12 +3,12 @@
 //! One session walks the working tree while the token is active; query edits reuse that index and
 //! stream ranked matches with the character positions needed for fuzzy highlighting.
 
-use codex_file_search::FileMatch;
-use codex_file_search::FileSearchOptions;
-use codex_file_search::FileSearchSession;
-use codex_file_search::FileSearchSnapshot;
-use codex_file_search::MatchType;
-use codex_file_search::SessionReporter;
+use crate::file_search::FileMatch;
+use crate::file_search::FileSearchOptions;
+use crate::file_search::FileSearchSession;
+use crate::file_search::FileSearchSnapshot;
+use crate::file_search::MatchType;
+use crate::file_search::SessionReporter;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
@@ -103,7 +103,7 @@ impl FileSearchManager {
             updates: self.updates.clone(),
             session_token: state.session_token,
         });
-        let session = codex_file_search::create_session(
+        let session = crate::file_search::create_session(
             vec![self.search_root.clone()],
             FileSearchOptions {
                 limit: NonZeroUsize::new(MAX_POPUP_ROWS)

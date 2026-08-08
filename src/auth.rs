@@ -297,6 +297,27 @@ pub(crate) fn auth_file_path() -> Result<PathBuf> {
     Ok(codex_home()?.join("auth.json"))
 }
 
+pub(crate) fn save_login_tokens(
+    api_key: Option<String>,
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+) -> Result<()> {
+    let account_id = account_id_from_jwt(&id_token);
+    let document = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": api_key,
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "account_id": account_id,
+        },
+        "last_refresh": rfc3339_now()?,
+    });
+    write_private_json(&auth_file_path()?, &document)
+}
+
 fn nonempty_string(value: Option<&Value>) -> Option<&str> {
     value
         .and_then(Value::as_str)
@@ -362,6 +383,8 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("credential path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create credential directory {}", parent.display()))?;
     let temp = parent.join(format!(".auth.json.tmp-{}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(document)?;
     let mut options = OpenOptions::new();

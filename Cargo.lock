@@ -578,42 +578,45 @@ dependencies = [
  "bytes",
  "codex-ansi-escape",
  "codex-client",
- "codex-code-mode-protocol",
- "codex-file-search",
  "codex-http-client",
  "codex-login",
- "codex-protocol",
- "codex-shell-command",
- "codex-utils-audio",
- "codex-utils-fuzzy-match",
  "codex-utils-image",
- "codex-utils-output-truncation",
+ "codex-utils-pty 0.0.0 (git+https://github.com/openai/codex.git?rev=3aae5d885bac39c1262491aa3fd100dfd8b3919f)",
  "codex-utils-rustls-provider",
- "codex-utils-string",
+ "crossbeam-channel",
  "crossterm",
  "deno_core_icudata",
  "dirs",
  "futures",
+ "ignore",
  "itertools 0.14.0",
  "libc",
+ "lru 0.16.4",
  "memchr",
- "portable-pty",
+ "nucleo",
  "pretty_assertions",
  "pulldown-cmark",
+ "rand 0.9.5",
  "ratatui",
  "regex-lite",
  "reqwest",
+ "rustls-pki-types",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha1",
  "sha2 0.10.9",
+ "shlex 1.3.0",
  "supports-color",
+ "symphonia",
  "syntect",
  "textwrap 0.16.2",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "tree-sitter",
+ "tree-sitter-bash",
  "tungstenite",
  "two-face",
  "unicode-segmentation",
@@ -622,6 +625,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "v8",
+ "which 8.0.5",
  "zstd",
 ]
 
@@ -1179,18 +1183,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-code-mode-protocol"
-version = "0.0.0"
-source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
-dependencies = [
- "codex-protocol",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "codex-config"
 version = "0.0.0"
 source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
@@ -1279,21 +1271,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-file-search"
-version = "0.0.0"
-source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
-dependencies = [
- "anyhow",
- "clap",
- "crossbeam-channel",
- "ignore",
- "nucleo",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "codex-file-system"
 version = "0.0.0"
 source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
@@ -1317,7 +1294,7 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
- "codex-utils-pty",
+ "codex-utils-pty 0.0.0 (git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e)",
  "futures",
  "gix",
  "once_cell",
@@ -1539,26 +1516,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-shell-command"
-version = "0.0.0"
-source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
-dependencies = [
- "base64 0.22.1",
- "codex-protocol",
- "codex-utils-absolute-path",
- "libc",
- "once_cell",
- "regex",
- "serde",
- "serde_json",
- "shlex 1.3.0",
- "tree-sitter",
- "tree-sitter-bash",
- "url",
- "which 8.0.5",
-]
-
-[[package]]
 name = "codex-terminal-detection"
 version = "0.0.0"
 source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
@@ -1579,20 +1536,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-utils-audio"
-version = "0.0.0"
-source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
-dependencies = [
- "base64 0.22.1",
- "codex-protocol",
- "codex-utils-cache",
- "codex-utils-string",
- "symphonia",
- "thiserror 2.0.19",
- "tracing",
-]
-
-[[package]]
 name = "codex-utils-cache"
 version = "0.0.0"
 source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
@@ -1601,11 +1544,6 @@ dependencies = [
  "sha1",
  "tokio",
 ]
-
-[[package]]
-name = "codex-utils-fuzzy-match"
-version = "0.0.0"
-source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
 
 [[package]]
 name = "codex-utils-home-dir"
@@ -1627,15 +1565,6 @@ dependencies = [
  "mime_guess",
  "thiserror 2.0.19",
  "tokio",
-]
-
-[[package]]
-name = "codex-utils-output-truncation"
-version = "0.0.0"
-source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
-dependencies = [
- "codex-protocol",
- "codex-utils-string",
 ]
 
 [[package]]
@@ -1667,6 +1596,22 @@ dependencies = [
 name = "codex-utils-pty"
 version = "0.0.0"
 source = "git+https://github.com/openai/codex.git?rev=1669c2403f793d0230065397dfc25f52b844244e#1669c2403f793d0230065397dfc25f52b844244e"
+dependencies = [
+ "anyhow",
+ "filedescriptor",
+ "lazy_static",
+ "libc",
+ "log",
+ "portable-pty",
+ "shared_library",
+ "tokio",
+ "winapi",
+]
+
+[[package]]
+name = "codex-utils-pty"
+version = "0.0.0"
+source = "git+https://github.com/openai/codex.git?rev=3aae5d885bac39c1262491aa3fd100dfd8b3919f#3aae5d885bac39c1262491aa3fd100dfd8b3919f"
 dependencies = [
  "anyhow",
  "filedescriptor",

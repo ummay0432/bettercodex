@@ -8,28 +8,22 @@
 
 use crate::MODEL;
 use crate::auth::SharedAuth;
+use crate::http_client::backoff;
+use crate::protocol::ContentItem;
+use crate::protocol::ImageDetail;
+use crate::protocol::InternalChatMessageMetadataPassthrough;
+use crate::protocol::MessagePhase;
+use crate::protocol::ResponseItem;
+use crate::truncation::TruncationPolicy;
+use crate::truncation::approx_token_count;
+use crate::truncation::formatted_truncate_text;
+use crate::truncation::truncate_text;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_client::EncodedJsonBody;
-use codex_client::HttpTransport;
-use codex_client::Request;
-use codex_client::RequestBody;
-use codex_client::RequestCompression;
-use codex_client::ReqwestTransport;
-use codex_client::RetryOn;
-use codex_client::RetryPolicy;
-use codex_client::TransportError;
-use codex_client::run_with_retry;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::ImageDetail;
-use codex_protocol::models::InternalChatMessageMetadataPassthrough;
-use codex_protocol::models::MessagePhase;
-use codex_protocol::models::ResponseItem;
-use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::formatted_truncate_text;
-use codex_utils_output_truncation::truncate_text;
+use bytes::Bytes;
+use reqwest::StatusCode;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use schemars::JsonSchema;
@@ -38,6 +32,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -401,40 +396,28 @@ impl WebSearchClient {
         }
         let commands = parse_commands(input)?;
         let request = SearchRequest::new(&self.session_id, context.input.as_deref(), &commands);
-        let body = EncodedJsonBody::encode(&request)
-            .context("failed to encode standalone web search request")?;
+        let body = Bytes::from(
+            serde_json::to_vec(&request)
+                .context("failed to encode standalone web search request")?,
+        );
         let mut auth = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(anyhow!("web search cancelled")),
             auth = self.auth.refreshed_snapshot(&self.client) => auth,
         }
         .context("failed to refresh ChatGPT credentials for web search")?;
-        let transport = ReqwestTransport::new(self.client.clone());
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), SEARCH_PATH);
         let mut refreshed_after_unauthorized = false;
         let response = loop {
-            let request = Request {
-                method: reqwest::Method::POST,
-                url: url.clone(),
-                headers: search_headers(&context.turn_metadata, &auth)?,
-                body: Some(RequestBody::EncodedJson(body.clone())),
-                compression: RequestCompression::None,
-                timeout: None,
-            }
-            .into_prepared()
-            .map_err(|error| anyhow!("failed to prepare standalone web search request: {error}"))?;
+            let headers = search_headers(&context.turn_metadata, &auth)?;
             let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(anyhow!("web search cancelled")),
-                response = run_with_retry(
-                    search_retry_policy(),
-                    || request.clone(),
-                    |request, _attempt| transport.execute(request),
-                ) => response,
+                response = send_search_request(&self.client, &url, &headers, body.clone()) => response,
             };
             match result {
-                Err(TransportError::Http { status, .. })
-                    if status.as_u16() == 401 && !refreshed_after_unauthorized =>
+                Err(SearchTransportError::Http { status, .. })
+                    if status == StatusCode::UNAUTHORIZED && !refreshed_after_unauthorized =>
                 {
                     auth = tokio::select! {
                         biased;
@@ -450,7 +433,7 @@ impl WebSearchClient {
             }
         }
         .map_err(|error| anyhow!("standalone web search request failed: {error}"))?;
-        let response: SearchResponse = serde_json::from_slice(&response.body)
+        let response: SearchResponse = serde_json::from_slice(&response)
             .context("failed to decode standalone web search response")?;
         Ok(Value::String(bounded_search_output(response.output)))
     }
@@ -665,15 +648,82 @@ fn search_headers(turn_metadata: &str, auth: &crate::auth::AuthSnapshot) -> Resu
     Ok(headers)
 }
 
-fn search_retry_policy() -> RetryPolicy {
-    RetryPolicy {
-        max_attempts: REQUEST_MAX_RETRIES,
-        base_delay: REQUEST_RETRY_DELAY,
-        retry_on: RetryOn {
-            retry_429: false,
-            retry_5xx: true,
-            retry_transport: true,
-        },
+#[derive(Debug)]
+enum SearchTransportError {
+    Http {
+        status: StatusCode,
+        body: Option<String>,
+    },
+    Timeout,
+    Network(String),
+}
+
+impl SearchTransportError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Http { status, .. } => status.is_server_error(),
+            Self::Timeout | Self::Network(_) => true,
+        }
+    }
+}
+
+impl fmt::Display for SearchTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Http { status, body } => write!(formatter, "http {status}: {body:?}"),
+            Self::Timeout => formatter.write_str("timeout"),
+            Self::Network(error) => write!(formatter, "network error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SearchTransportError {}
+
+async fn send_search_request(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Bytes, SearchTransportError> {
+    for attempt in 0..=REQUEST_MAX_RETRIES {
+        let response = client
+            .post(url)
+            .headers(headers.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.clone())
+            .send()
+            .await;
+        let result = match response {
+            Ok(response) => {
+                let status = response.status();
+                let bytes = response.bytes().await.map_err(map_search_reqwest_error)?;
+                if status.is_success() {
+                    Ok(bytes)
+                } else {
+                    Err(SearchTransportError::Http {
+                        status,
+                        body: String::from_utf8(bytes.to_vec()).ok(),
+                    })
+                }
+            }
+            Err(error) => Err(map_search_reqwest_error(error)),
+        };
+        match result {
+            Ok(response) => return Ok(response),
+            Err(error) if attempt < REQUEST_MAX_RETRIES && error.is_retryable() => {
+                tokio::time::sleep(backoff(REQUEST_RETRY_DELAY, attempt + 1)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the bounded retry loop always returns")
+}
+
+fn map_search_reqwest_error(error: reqwest::Error) -> SearchTransportError {
+    if error.is_timeout() {
+        SearchTransportError::Timeout
+    } else {
+        SearchTransportError::Network(error.to_string())
     }
 }
 

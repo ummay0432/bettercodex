@@ -9,9 +9,10 @@ Repository access is the invite gate. After accepting an invitation, sign in
 with the [GitHub CLI](https://cli.github.com/), then install `curl`, Rust through
 rustup, and a native C toolchain. Copy and run the one-line
 [`INSTALL_COMMAND.txt`](INSTALL_COMMAND.txt). It downloads one immutable source
-snapshot, builds entirely in a temporary directory, and automatically removes
+commit, verifies the resulting binary and embedded resources, rechecks private
+`main`, and atomically installs only a matching build. It automatically removes
 the source, Cargo dependency cache, V8 download, and compilation artifacts
-afterward.
+after success, failure, or interruption.
 
 Then open a new terminal, sign in with your own ChatGPT account, and launch
 bettercodex from a project directory:
@@ -28,6 +29,11 @@ another terminal. It uses the same temporary source-build flow as
 and retains no BetterCodex source checkout or multi-gigabyte build cache. The
 installed binary, a small shell-profile PATH entry when needed, and the required
 Rust and native toolchains remain.
+
+Only commits pushed to the private repository's `main` branch are distributable;
+uncommitted, unpushed, and other-branch development work is not visible to
+another device. Missing or edited embedded system files are integrity-checked
+and atomically repaired when the updated binary launches.
 
 For a task that merits evaluator-backed iteration, use `/loop <task>` in the
 TUI or include `$loop` anywhere in an interactive or non-interactive prompt.

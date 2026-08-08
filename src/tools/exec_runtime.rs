@@ -19,20 +19,20 @@ use super::code_runtime::RuntimeResponse;
 use super::code_runtime::ToolInvocationFuture;
 use super::code_runtime::WaitRequest;
 use super::image_preparation::prepare_tool_output_images;
+use crate::audio::estimate_audio_token_count;
 use crate::events::AgentEvent;
 use crate::openai_docs::OpenAiDocsClient;
+use crate::protocol::DEFAULT_IMAGE_DETAIL;
+use crate::protocol::FunctionCallOutputContentItem;
+use crate::protocol::ImageDetail;
+use crate::truncation::TruncationPolicy;
+use crate::truncation::formatted_truncate_text;
+use crate::truncation::formatted_truncate_text_content_items_with_policy;
+use crate::truncation::truncate_function_output_items_with_policy;
 use crate::web_search::ToolTurnContext;
 use crate::web_search::WebSearchClient;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
-use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::ImageDetail;
-use codex_utils_audio::estimate_audio_token_count;
-use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::formatted_truncate_text;
-use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
-use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
@@ -312,7 +312,7 @@ impl SessionDelegate for RuntimeState {
     }
 }
 
-fn display_tool_name(tool_name: &codex_protocol::ToolName) -> String {
+fn display_tool_name(tool_name: &crate::protocol::ToolName) -> String {
     match tool_name.namespace.as_deref() {
         Some(namespace) => format!("{namespace}.{}", tool_name.name),
         None => tool_name.name.clone(),

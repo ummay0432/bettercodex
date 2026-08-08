@@ -6,8 +6,8 @@
 //! the exec runtime, then validates and prepares any image the JavaScript
 //! program chooses to return before inserting the outer tool result into history.
 
-use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::ImageDetail;
+use crate::protocol::FunctionCallOutputContentItem;
+use crate::protocol::ImageDetail;
 use codex_utils_image::ImageProcessingError;
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::PromptImageResizeLimits;

@@ -1,13 +1,14 @@
-use crate::TruncationPolicy;
-use crate::approx_token_count;
-use crate::approx_tokens_from_byte_count_i64;
-use crate::formatted_truncate_text;
-use crate::formatted_truncate_text_content_items_with_policy;
-use crate::truncate_function_output_items_with_policy;
-use crate::truncate_text;
-use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
-use codex_protocol::models::FunctionCallOutputContentItem;
+use crate::protocol::DEFAULT_IMAGE_DETAIL;
+use crate::protocol::FunctionCallOutputContentItem;
 use pretty_assertions::assert_eq;
+
+use super::TruncationPolicy;
+use super::approx_token_count;
+use super::approx_tokens_from_byte_count_i64;
+use super::formatted_truncate_text;
+use super::formatted_truncate_text_content_items_with_policy;
+use super::truncate_function_output_items_with_policy;
+use super::truncate_text;
 
 #[test]
 fn truncate_bytes_less_than_placeholder_returns_placeholder() {
@@ -373,4 +374,3 @@ fn byte_count_conversion_clamps_non_positive_values() {
     assert_eq!(approx_tokens_from_byte_count_i64(/*bytes*/ 0), 0);
     assert_eq!(approx_tokens_from_byte_count_i64(/*bytes*/ 5), 2);
 }
-

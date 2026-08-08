@@ -220,3 +220,19 @@ fn legacy_cleanup_removes_only_retired_directories() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn legacy_cache_root_requires_absolute_environment_paths() {
+    assert_eq!(
+        legacy_cache_root_from(Some(OsStr::new("/srv/cache")), Some(OsStr::new("/home/me")))
+            .unwrap(),
+        Some(PathBuf::from("/srv/cache/bettercodex"))
+    );
+    assert_eq!(
+        legacy_cache_root_from(Some(OsStr::new("")), Some(OsStr::new("/home/me"))).unwrap(),
+        Some(PathBuf::from("/home/me/.cache/bettercodex"))
+    );
+    assert!(legacy_cache_root_from(Some(OsStr::new("relative")), None).is_err());
+    assert!(legacy_cache_root_from(None, Some(OsStr::new("relative"))).is_err());
+    assert_eq!(legacy_cache_root_from(None, None).unwrap(), None);
+}

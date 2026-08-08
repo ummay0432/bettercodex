@@ -61,9 +61,7 @@ fn appended_records_are_visible_while_the_rollout_is_open() {
     let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
     let item = json!({"type": "message", "role": "user", "content": []});
 
-    rollout
-        .append_history(std::slice::from_ref(&item))
-        .unwrap();
+    rollout.append_history(std::slice::from_ref(&item)).unwrap();
 
     let journal = std::fs::read_to_string(&rollout.path).unwrap();
     let record: RolloutRecord = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
