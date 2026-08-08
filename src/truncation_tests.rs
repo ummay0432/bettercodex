@@ -2,23 +2,11 @@ use crate::protocol::DEFAULT_IMAGE_DETAIL;
 use crate::protocol::FunctionCallOutputContentItem;
 use pretty_assertions::assert_eq;
 
-use super::TruncationPolicy;
 use super::approx_token_count;
-use super::approx_tokens_from_byte_count_i64;
 use super::formatted_truncate_text;
-use super::formatted_truncate_text_content_items_with_policy;
-use super::truncate_function_output_items_with_policy;
+use super::formatted_truncate_text_content_items;
+use super::truncate_function_output_items;
 use super::truncate_text;
-
-#[test]
-fn truncate_bytes_less_than_placeholder_returns_placeholder() {
-    let content = "example output";
-
-    assert_eq!(
-        "Warning: truncated output (original token count: 4)\nTotal output lines: 1\n\n…13 chars truncated…t",
-        formatted_truncate_text(content, TruncationPolicy::Bytes(1)),
-    );
-}
 
 #[test]
 fn truncate_tokens_less_than_placeholder_returns_placeholder() {
@@ -26,7 +14,7 @@ fn truncate_tokens_less_than_placeholder_returns_placeholder() {
 
     assert_eq!(
         "Warning: truncated output (original token count: 4)\nTotal output lines: 1\n\nex…3 tokens truncated…ut",
-        formatted_truncate_text(content, TruncationPolicy::Tokens(1)),
+        formatted_truncate_text(content, 1),
     );
 }
 
@@ -36,17 +24,7 @@ fn truncate_tokens_under_limit_returns_original() {
 
     assert_eq!(
         content,
-        formatted_truncate_text(content, TruncationPolicy::Tokens(10)),
-    );
-}
-
-#[test]
-fn truncate_bytes_under_limit_returns_original() {
-    let content = "example output";
-
-    assert_eq!(
-        content,
-        formatted_truncate_text(content, TruncationPolicy::Bytes(20)),
+        formatted_truncate_text(content, 10),
     );
 }
 
@@ -56,28 +34,7 @@ fn truncate_tokens_over_limit_returns_truncated() {
 
     assert_eq!(
         "Warning: truncated output (original token count: 15)\nTotal output lines: 1\n\nthis is an…10 tokens truncated… truncated",
-        formatted_truncate_text(content, TruncationPolicy::Tokens(5)),
-    );
-}
-
-#[test]
-fn truncate_bytes_over_limit_returns_truncated() {
-    let content = "this is an example of a long output that should be truncated";
-
-    assert_eq!(
-        "Warning: truncated output (original token count: 15)\nTotal output lines: 1\n\nthis is an exam…30 chars truncated…ld be truncated",
-        formatted_truncate_text(content, TruncationPolicy::Bytes(30)),
-    );
-}
-
-#[test]
-fn truncate_bytes_reports_original_line_count_when_truncated() {
-    let content =
-        "this is an example of a long output that should be truncated\nalso some other line";
-
-    assert_eq!(
-        "Warning: truncated output (original token count: 21)\nTotal output lines: 2\n\nthis is an exam…51 chars truncated…some other line",
-        formatted_truncate_text(content, TruncationPolicy::Bytes(30)),
+        formatted_truncate_text(content, 5),
     );
 }
 
@@ -88,15 +45,15 @@ fn truncate_tokens_reports_original_line_count_when_truncated() {
 
     assert_eq!(
         "Warning: truncated output (original token count: 21)\nTotal output lines: 2\n\nthis is an example o…11 tokens truncated…also some other line",
-        formatted_truncate_text(content, TruncationPolicy::Tokens(10)),
+        formatted_truncate_text(content, 10),
     );
 }
 
 #[test]
-fn truncate_middle_bytes_handles_utf8_content() {
+fn truncate_tokens_handles_utf8_content() {
     let s = "😀😀😀😀😀😀😀😀😀😀\nsecond line with text\n";
-    let out = truncate_text(s, TruncationPolicy::Bytes(20));
-    assert_eq!(out, "😀😀…21 chars truncated…with text\n");
+    let out = truncate_text(s, 5);
+    assert_eq!(out, "😀😀…11 tokens truncated…with text\n");
 }
 
 #[test]
@@ -123,8 +80,7 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
         FunctionCallOutputContentItem::InputText { text: t5 },
     ];
 
-    let output =
-        truncate_function_output_items_with_policy(&items, TruncationPolicy::Tokens(limit), |_| 0);
+    let output = truncate_function_output_items(&items, limit, |_| 0);
 
     assert_eq!(output.len(), 5);
 
@@ -165,7 +121,7 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
 }
 
 #[test]
-fn formatted_truncate_text_content_items_with_policy_returns_original_under_limit() {
+fn formatted_truncate_text_content_items_returns_original_under_limit() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "alpha".to_string(),
@@ -178,15 +134,14 @@ fn formatted_truncate_text_content_items_with_policy_returns_original_under_limi
         },
     ];
 
-    let (output, original_token_count) =
-        formatted_truncate_text_content_items_with_policy(&items, TruncationPolicy::Bytes(32));
+    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 8);
 
     assert_eq!(output, items);
     assert_eq!(original_token_count, None);
 }
 
 #[test]
-fn formatted_truncate_text_content_items_with_policy_preserves_empty_leading_text_behavior() {
+fn formatted_truncate_text_content_items_preserves_empty_leading_text_behavior() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: String::new(),
@@ -196,20 +151,19 @@ fn formatted_truncate_text_content_items_with_policy_preserves_empty_leading_tex
         },
     ];
 
-    let (output, original_token_count) =
-        formatted_truncate_text_content_items_with_policy(&items, TruncationPolicy::Bytes(0));
+    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 0);
 
     assert_eq!(
         output,
         vec![FunctionCallOutputContentItem::InputText {
-            text: "Warning: truncated output (original token count: 1)\nTotal output lines: 1\n\n…3 chars truncated…".to_string(),
+            text: "Warning: truncated output (original token count: 1)\nTotal output lines: 1\n\n…1 tokens truncated…".to_string(),
         }]
     );
     assert_eq!(original_token_count, Some(1));
 }
 
 #[test]
-fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_media() {
+fn formatted_truncate_text_content_items_merges_text_and_appends_media() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "abcd".to_string(),
@@ -233,14 +187,13 @@ fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_med
         },
     ];
 
-    let (output, original_token_count) =
-        formatted_truncate_text_content_items_with_policy(&items, TruncationPolicy::Bytes(8));
+    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 2);
 
     assert_eq!(
         output,
         vec![
             FunctionCallOutputContentItem::InputText {
-                text: "Warning: truncated output (original token count: 4)\nTotal output lines: 3\n\nabcd…6 chars truncated…ijkl".to_string(),
+                text: "Warning: truncated output (original token count: 4)\nTotal output lines: 3\n\nabcd…2 tokens truncated…ijkl".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
                 image_url: "img:one".to_string(),
@@ -259,7 +212,7 @@ fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_med
 }
 
 #[test]
-fn formatted_truncate_text_content_items_with_policy_preserves_encrypted_content() {
+fn formatted_truncate_text_content_items_preserves_encrypted_content() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "abcdefgh".to_string(),
@@ -269,14 +222,13 @@ fn formatted_truncate_text_content_items_with_policy_preserves_encrypted_content
         },
     ];
 
-    let (output, original_token_count) =
-        formatted_truncate_text_content_items_with_policy(&items, TruncationPolicy::Bytes(2));
+    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 1);
 
     assert_eq!(
         output,
         vec![
             FunctionCallOutputContentItem::InputText {
-                text: "Warning: truncated output (original token count: 2)\nTotal output lines: 1\n\na…6 chars truncated…h".to_string(),
+                text: "Warning: truncated output (original token count: 2)\nTotal output lines: 1\n\nab…1 tokens truncated…gh".to_string(),
             },
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: "enc_opaque".to_string(),
@@ -287,7 +239,7 @@ fn formatted_truncate_text_content_items_with_policy_preserves_encrypted_content
 }
 
 #[test]
-fn truncate_function_output_items_with_policy_omits_audio_over_budget() {
+fn truncate_function_output_items_omits_audio_over_budget() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "abcdefgh".to_string(),
@@ -300,14 +252,13 @@ fn truncate_function_output_items_with_policy_omits_audio_over_budget() {
         },
     ];
 
-    let output =
-        truncate_function_output_items_with_policy(&items, TruncationPolicy::Bytes(2), |_| 1);
+    let output = truncate_function_output_items(&items, 1, |_| 1);
 
     assert_eq!(
         output,
         vec![
             FunctionCallOutputContentItem::InputText {
-                text: "a…6 chars truncated…h".to_string(),
+                text: "ab…1 tokens truncated…gh".to_string(),
             },
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: "enc_opaque".to_string(),
@@ -320,7 +271,7 @@ fn truncate_function_output_items_with_policy_omits_audio_over_budget() {
 }
 
 #[test]
-fn truncate_function_output_items_with_policy_charges_audio_against_byte_budget() {
+fn truncate_function_output_items_charges_audio_against_token_budget() {
     let audio = FunctionCallOutputContentItem::InputAudio {
         audio_url: "audio:one".to_string(),
     };
@@ -331,22 +282,21 @@ fn truncate_function_output_items_with_policy_charges_audio_against_byte_budget(
         },
     ];
 
-    let output =
-        truncate_function_output_items_with_policy(&items, TruncationPolicy::Bytes(5), |_| 1);
+    let output = truncate_function_output_items(&items, 2, |_| 1);
 
     assert_eq!(
         output,
         vec![
             audio,
             FunctionCallOutputContentItem::InputText {
-                text: truncate_text("abcdefgh", TruncationPolicy::Bytes(1)),
+                text: truncate_text("abcdefgh", 1),
             },
         ]
     );
 }
 
 #[test]
-fn formatted_truncate_text_content_items_with_policy_merges_all_text_for_token_budget() {
+fn formatted_truncate_text_content_items_merges_all_text_for_token_budget() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "abcdefgh".to_string(),
@@ -356,8 +306,7 @@ fn formatted_truncate_text_content_items_with_policy_merges_all_text_for_token_b
         },
     ];
 
-    let (output, original_token_count) =
-        formatted_truncate_text_content_items_with_policy(&items, TruncationPolicy::Tokens(2));
+    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 2);
 
     assert_eq!(
         output,
@@ -366,11 +315,4 @@ fn formatted_truncate_text_content_items_with_policy_merges_all_text_for_token_b
         }]
     );
     assert_eq!(original_token_count, Some(5));
-}
-
-#[test]
-fn byte_count_conversion_clamps_non_positive_values() {
-    assert_eq!(approx_tokens_from_byte_count_i64(/*bytes*/ -1), 0);
-    assert_eq!(approx_tokens_from_byte_count_i64(/*bytes*/ 0), 0);
-    assert_eq!(approx_tokens_from_byte_count_i64(/*bytes*/ 5), 2);
 }
