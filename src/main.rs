@@ -33,11 +33,13 @@ mod skill_settings;
 mod skills;
 mod state_file;
 mod system_skills;
+mod terminal_color;
 mod text;
 mod tools;
 mod truncation;
 mod tui;
 mod update;
+mod url_encoding;
 mod usage;
 mod web_search;
 
@@ -64,6 +66,16 @@ const MODEL: &str = "gpt-5.6-sol";
 /// BetterCodex, avoiding a second OS-randomness backend in `uuid`.
 pub(crate) fn new_uuid() -> Uuid {
     uuid::Builder::from_random_bytes(rand::random()).into_uuid()
+}
+
+#[cfg(test)]
+#[test]
+fn generated_uuid_has_random_version_and_rfc4122_variant() {
+    let first = new_uuid();
+    let second = new_uuid();
+    assert_ne!(first, second);
+    assert_eq!(first.get_version(), Some(uuid::Version::Random));
+    assert_eq!(first.get_variant(), uuid::Variant::RFC4122);
 }
 
 fn main() {
