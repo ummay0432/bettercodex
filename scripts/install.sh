@@ -121,12 +121,20 @@ validate_absolute_path() {
   esac
 }
 
+validate_absolute_path "${HOME:-}" HOME
 validate_absolute_path "$bin_dir" BCODEX_INSTALL_DIR
+if [ -n "${TMPDIR:-}" ]; then
+  validate_absolute_path "$TMPDIR" TMPDIR
+fi
+if [ -n "${XDG_CACHE_HOME:-}" ]; then
+  validate_absolute_path "$XDG_CACHE_HOME" XDG_CACHE_HOME
+fi
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
 }
 
+require_command awk
 require_command awk
 require_command cargo
 require_command cc

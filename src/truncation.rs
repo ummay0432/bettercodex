@@ -1,0 +1,179 @@
+//! Helpers for truncating tool and exec output.\n//!\n//! Ported from OpenAI Codex commit\n//! `1669c2403f793d0230065397dfc25f52b844244e`.\n\nmod string;\n\nuse crate::protocol::FunctionCallOutputContentItem;
+pub(crate) use self::string::approx_bytes_for_tokens;\npub(crate) use self::string::approx_token_count;\npub(crate) use self::string::approx_tokens_from_byte_count;\nuse self::string::truncate_middle_chars;\nuse self::string::truncate_middle_with_token_budget;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) enum TruncationPolicy {\n    Bytes(usize),\n    Tokens(usize),\n}\n\nimpl TruncationPolicy {\n    pub(crate) fn token_budget(&self) -> usize {\n        match self {\n            Self::Bytes(bytes) => usize::try_from(approx_tokens_from_byte_count(*bytes))\n                .unwrap_or(usize::MAX),\n            Self::Tokens(tokens) => *tokens,\n        }\n    }\n\n    pub(crate) fn byte_budget(&self) -> usize {\n        match self {\n            Self::Bytes(bytes) => *bytes,\n            Self::Tokens(tokens) => approx_bytes_for_tokens(*tokens),\n        }\n    }\n}
+
+pub(crate) fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
+    if content.len() <= policy.byte_budget() {
+        return content.to_string();
+    }
+
+    let original_token_count = approx_token_count(content);
+    let total_lines = content.lines().count();
+    let result = truncate_text(content, policy);
+    format!(
+        "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{result}"
+    )
+}
+
+pub(crate) fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
+    match policy {
+        TruncationPolicy::Bytes(bytes) => truncate_middle_chars(content, bytes),
+        TruncationPolicy::Tokens(tokens) => truncate_middle_with_token_budget(content, tokens).0,
+    }
+}
+
+pub(crate) fn formatted_truncate_text_content_items_with_policy(
+    items: &[FunctionCallOutputContentItem],
+    policy: TruncationPolicy,
+) -> (Vec<FunctionCallOutputContentItem>, Option<usize>) {
+    let text_segments = items
+        .iter()
+        .filter_map(|item| match item {
+            FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+            FunctionCallOutputContentItem::InputImage { .. }
+            | FunctionCallOutputContentItem::InputAudio { .. }
+            | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+        })
+        .collect::<Vec<_>>();
+
+    if text_segments.is_empty() {
+        return (items.to_vec(), None);
+    }
+
+    let mut combined = String::new();
+    for text in &text_segments {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(text);
+    }
+
+    if combined.len() <= policy.byte_budget() {
+        return (items.to_vec(), None);
+    }
+
+    let original_token_count = approx_token_count(&combined);
+    let mut out = vec![FunctionCallOutputContentItem::InputText {
+        text: formatted_truncate_text(&combined, policy),
+    }];
+    out.extend(items.iter().filter_map(|item| match item {
+        FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+            Some(FunctionCallOutputContentItem::InputImage {
+                image_url: image_url.clone(),
+                detail: *detail,
+            })
+        }
+        FunctionCallOutputContentItem::InputAudio { audio_url } => {
+            Some(FunctionCallOutputContentItem::InputAudio {
+                audio_url: audio_url.clone(),
+            })
+        }
+        FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
+            Some(FunctionCallOutputContentItem::EncryptedContent {
+                encrypted_content: encrypted_content.clone(),
+            })
+        }
+        FunctionCallOutputContentItem::InputText { .. } => None,
+    }));
+
+    (out, Some(original_token_count))
+}
+
+pub(crate) fn truncate_function_output_items_with_policy(
+    items: &[FunctionCallOutputContentItem],
+    policy: TruncationPolicy,
+    estimate_audio_token_count: impl Fn(&str) -> usize,
+) -> Vec<FunctionCallOutputContentItem> {
+    let mut out: Vec<FunctionCallOutputContentItem> = Vec::with_capacity(items.len());
+    let mut remaining_budget = match policy {
+        TruncationPolicy::Bytes(_) => policy.byte_budget(),
+        TruncationPolicy::Tokens(_) => policy.token_budget(),
+    };
+    let mut omitted_text_items = 0usize;
+    let mut omitted_audio_items = 0usize;
+
+    for item in items {
+        match item {
+            FunctionCallOutputContentItem::InputText { text } => {
+                if remaining_budget == 0 {
+                    omitted_text_items += 1;
+                    continue;
+                }
+
+                let cost = match policy {
+                    TruncationPolicy::Bytes(_) => text.len(),
+                    TruncationPolicy::Tokens(_) => approx_token_count(text),
+                };
+
+                if cost <= remaining_budget {
+                    out.push(FunctionCallOutputContentItem::InputText { text: text.clone() });
+                    remaining_budget = remaining_budget.saturating_sub(cost);
+                } else {
+                    let snippet_policy = match policy {
+                        TruncationPolicy::Bytes(_) => TruncationPolicy::Bytes(remaining_budget),
+                        TruncationPolicy::Tokens(_) => TruncationPolicy::Tokens(remaining_budget),
+                    };
+                    let snippet = truncate_text(text, snippet_policy);
+                    if snippet.is_empty() {
+                        omitted_text_items += 1;
+                    } else {
+                        out.push(FunctionCallOutputContentItem::InputText { text: snippet });
+                    }
+                    remaining_budget = 0;
+                }
+            }
+            FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+                out.push(FunctionCallOutputContentItem::InputImage {
+                    image_url: image_url.clone(),
+                    detail: *detail,
+                });
+            }
+            FunctionCallOutputContentItem::InputAudio { audio_url } => {
+                let token_cost = estimate_audio_token_count(audio_url);
+                let cost = match policy {
+                    TruncationPolicy::Bytes(_) => approx_bytes_for_tokens(token_cost),
+                    TruncationPolicy::Tokens(_) => token_cost,
+                };
+                if cost <= remaining_budget {
+                    out.push(FunctionCallOutputContentItem::InputAudio {
+                        audio_url: audio_url.clone(),
+                    });
+                    remaining_budget = remaining_budget.saturating_sub(cost);
+                } else {
+                    omitted_audio_items += 1;
+                }
+            }
+            FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
+                out.push(FunctionCallOutputContentItem::EncryptedContent {
+                    encrypted_content: encrypted_content.clone(),
+                });
+            }
+        }
+    }
+
+    if omitted_text_items > 0 {
+        out.push(FunctionCallOutputContentItem::InputText {
+            text: format!("[omitted {omitted_text_items} text items ...]"),
+        });
+    }
+    if omitted_audio_items > 0 {
+        out.push(FunctionCallOutputContentItem::InputText {
+            text: format!("[omitted {omitted_audio_items} audio items ...]"),
+        });
+    }
+
+    out
+}
+
+pub(crate) fn approx_tokens_from_byte_count_i64(bytes: i64) -> i64 {
+    if bytes <= 0 {
+        return 0;
+    }
+
+    let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+    i64::try_from(approx_tokens_from_byte_count(bytes)).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]\n#[path = "truncation_tests.rs"]\nmod tests;
+

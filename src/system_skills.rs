@@ -3,6 +3,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use std::collections::BTreeSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -12,6 +13,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -19,6 +21,8 @@ const SKILLS_DIRECTORY: &str = "skills";
 const SYSTEM_DIRECTORY: &str = ".system";
 const MARKER_FILE_NAME: &str = ".bettercodex-system-skills.marker";
 const LOCK_FILE_NAME: &str = ".bettercodex-system-skills.lock";
+const STAGING_DIRECTORY_NAME: &str = ".bettercodex-system-skills.stage";
+const BACKUP_DIRECTORY_NAME: &str = ".bettercodex-system-skills.backup";
 const FINGERPRINT_SALT: &str = "v1";
 
 struct EmbeddedFile {
@@ -183,8 +187,11 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
     }
 
     let destination = root(home);
+    let staging = skills_root.join(STAGING_DIRECTORY_NAME);
+    let backup = skills_root.join(BACKUP_DIRECTORY_NAME);
+    recover_interrupted_install(&skills_root, &destination, &staging, &backup)?;
+
     let expected_fingerprint = embedded_fingerprint();
-    let marker = destination.join(MARKER_FILE_NAME);
     let destination_is_directory = match std::fs::symlink_metadata(&destination) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
         Ok(_) => {
@@ -203,26 +210,15 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
             });
         }
     };
-    if destination_is_directory
-        && std::fs::read_to_string(&marker)
-            .is_ok_and(|contents| contents.trim() == expected_fingerprint)
-    {
+    if destination_is_directory && installation_matches(&destination, &expected_fingerprint)? {
         return Ok(destination);
     }
 
-    if destination_is_directory {
-        std::fs::remove_dir_all(&destination).with_context(|| {
-            format!(
-                "could not replace the system skills directory {}",
-                destination.display()
-            )
-        })?;
-    }
-
     let install_result = (|| -> Result<()> {
-        create_private_directory(&destination)?;
+        remove_work_path(&staging)?;
+        create_private_directory(&staging)?;
         for embedded in EMBEDDED_FILES {
-            let path = destination.join(embedded.relative_path);
+            let path = staging.join(embedded.relative_path);
             let parent = path.parent().ok_or_else(|| {
                 anyhow!(
                     "embedded system skill path has no parent: {}",
@@ -232,13 +228,36 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
             create_private_directory(parent)?;
             write_private_file(&path, embedded.contents)?;
         }
+        let marker = staging.join(MARKER_FILE_NAME);
         write_private_file(&marker, format!("{expected_fingerprint}\n").as_bytes())?;
-        File::open(&destination)?.sync_all()?;
+        File::open(&staging)?.sync_all()?;
+
+        if destination_is_directory {
+            std::fs::rename(&destination, &backup).with_context(|| {
+                format!(
+                    "could not stage the previous system skills directory {}",
+                    destination.display()
+                )
+            })?;
+        }
+        if let Err(error) = std::fs::rename(&staging, &destination) {
+            if destination_is_directory {
+                let _ = std::fs::rename(&backup, &destination);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "could not activate system skills at {}",
+                    destination.display()
+                )
+            });
+        }
+        File::open(&skills_root)?.sync_all()?;
+        remove_work_path(&backup)?;
         File::open(&skills_root)?.sync_all()?;
         Ok(())
     })();
     if install_result.is_err() {
-        let _ = std::fs::remove_dir_all(&destination);
+        let _ = remove_work_path(&staging);
     }
     install_result.with_context(|| {
         format!(
@@ -248,6 +267,162 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
     })?;
 
     Ok(destination)
+}
+
+fn recover_interrupted_install(
+    skills_root: &Path,
+    destination: &Path,
+    staging: &Path,
+    backup: &Path,
+) -> Result<()> {
+    let destination_metadata = std::fs::symlink_metadata(destination);
+    match destination_metadata {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            remove_work_path(backup)?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(backup) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    std::fs::rename(backup, destination).with_context(|| {
+                        format!(
+                            "could not restore interrupted system skills install at {}",
+                            destination.display()
+                        )
+                    })?;
+                    File::open(skills_root)?.sync_all()?;
+                }
+                Ok(_) => {
+                    return Err(anyhow!(
+                        "system skills backup path {} is not a regular directory",
+                        backup.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).with_context(|| {
+                    format!("could not inspect system skills backup {}", backup.display())
+                }),
+            }
+        }
+        Err(error) => return Err(error).with_context(|| {
+            format!(
+                "could not inspect the system skills path {}",
+                destination.display()
+            )
+        }),
+    }
+    remove_work_path(staging)
+}
+
+fn installation_matches(destination: &Path, expected_fingerprint: &str) -> Result<bool> {
+    let marker = destination.join(MARKER_FILE_NAME);
+    if !regular_file_matches(
+        &marker,
+        format!("{expected_fingerprint}\n").as_bytes(),
+    )? {
+        return Ok(false);
+    }
+    for embedded in EMBEDDED_FILES {
+        if !regular_file_matches(&destination.join(embedded.relative_path), embedded.contents)? {
+            return Ok(false);
+        }
+    }
+
+    let mut expected_files = BTreeSet::from([PathBuf::from(MARKER_FILE_NAME)]);
+    let mut expected_directories = BTreeSet::from([PathBuf::new()]);
+    for embedded in EMBEDDED_FILES {
+        let path = PathBuf::from(embedded.relative_path);
+        expected_files.insert(path.clone());
+        let mut parent = path.parent();
+        while let Some(directory) = parent {
+            expected_directories.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+    exact_tree_matches(
+        destination,
+        Path::new(""),
+        &expected_files,
+        &expected_directories,
+    )
+}
+
+fn regular_file_matches(path: &Path, expected: &[u8]) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not inspect {}", path.display()));
+        }
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Ok(false);
+    }
+    std::fs::read(path)
+        .map(|contents| contents == expected)
+        .with_context(|| format!("could not read {}", path.display()))
+}
+
+fn exact_tree_matches(
+    root: &Path,
+    relative: &Path,
+    expected_files: &BTreeSet<PathBuf>,
+    expected_directories: &BTreeSet<PathBuf>,
+) -> Result<bool> {
+    let directory = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&directory)
+        .with_context(|| format!("could not inspect {}", directory.display()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(&directory)
+        .with_context(|| format!("could not read {}", directory.display()))?
+    {
+        let entry = entry.with_context(|| format!("could not read {}", directory.display()))?;
+        let child_relative = relative.join(entry.file_name());
+        let child_metadata = std::fs::symlink_metadata(entry.path())
+            .with_context(|| format!("could not inspect {}", entry.path().display()))?;
+        if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() {
+            if !expected_directories.contains(&child_relative)
+                || !exact_tree_matches(
+                    root,
+                    &child_relative,
+                    expected_files,
+                    expected_directories,
+                )?
+            {
+                return Ok(false);
+            }
+        } else if child_metadata.is_file() && !child_metadata.file_type().is_symlink() {
+            if !expected_files.contains(&child_relative) {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn remove_work_path(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path)
+                .with_context(|| format!("could not remove {}", path.display()))
+        }
+        Ok(_) => std::fs::remove_file(path)
+            .with_context(|| format!("could not remove {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("could not inspect {}", path.display()))
+        }
+    }
 }
 
 fn embedded_fingerprint() -> String {
@@ -279,3 +454,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     file.sync_all()
         .with_context(|| format!("could not sync {}", path.display()))
 }
+
+#[cfg(test)]
+#[path = "system_skills_tests.rs"]
+mod tests;
