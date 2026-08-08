@@ -44,13 +44,24 @@ EOF
 cleanup_recorded_temp() {
   stale_lock="$1"
   recorded_temp="$(sed -n '1p' "$stale_lock/tmp" 2>/dev/null || true)"
-  temp_parent="${TMPDIR:-/tmp}"
-  temp_parent="${temp_parent%/}"
-  [ -n "$temp_parent" ] || temp_parent="/"
-  if [ "$temp_parent" = "/" ]; then
+  recorded_parent="$(sed -n '1p' "$stale_lock/tmp-parent" 2>/dev/null || true)"
+  if [ -z "$recorded_parent" ]; then
+    recorded_parent="${TMPDIR:-/tmp}"
+  fi
+  case "$recorded_parent" in
+    /*) ;;
+    *) return ;;
+  esac
+  case "$recorded_parent" in
+    *'
+'*) return ;;
+  esac
+  recorded_parent="${recorded_parent%/}"
+  [ -n "$recorded_parent" ] || recorded_parent="/"
+  if [ "$recorded_parent" = "/" ]; then
     expected_prefix="/bettercodex-install."
   else
-    expected_prefix="$temp_parent/bettercodex-install."
+    expected_prefix="$recorded_parent/bettercodex-install."
   fi
   case "$recorded_temp" in
     "$expected_prefix"*)
@@ -65,16 +76,28 @@ cleanup_recorded_temp() {
 
 cleanup() {
   set +e
+  cleanup_incomplete=0
   if [ -n "$staged_binary" ]; then
-    rm -f "$staged_binary"
+    if ! rm -f "$staged_binary"; then
+      cleanup_incomplete=1
+      warn "could not remove staged binary $staged_binary"
+    fi
   fi
   if [ -n "$tmp_dir" ]; then
     cd /
-    rm -rf "$tmp_dir"
+    if ! rm -rf "$tmp_dir"; then
+      cleanup_incomplete=1
+      warn "could not remove temporary install tree $tmp_dir"
+    fi
   fi
   if [ "$lock_acquired" -eq 1 ] && [ -n "$lock_dir" ]; then
-    rm -rf "$lock_dir"
+    if [ "$cleanup_incomplete" -eq 0 ]; then
+      rm -rf "$lock_dir" || warn "could not remove installer lock $lock_dir"
+    else
+      warn "retaining installer lock so the next install can retry cleanup"
+    fi
   fi
+  return 0
 }
 
 trap cleanup 0
@@ -193,7 +216,12 @@ acquire_install_lock() {
 
     stale_lock="$bin_dir/.bcodex-stale-lock.$$"
     if mv "$lock_dir" "$stale_lock" 2>/dev/null; then
-      cleanup_recorded_temp "$stale_lock"
+      if ! cleanup_recorded_temp "$stale_lock"; then
+        if ! mv "$stale_lock" "$lock_dir" 2>/dev/null; then
+          warn "orphan cleanup record remains at $stale_lock"
+        fi
+        fail "could not remove an orphaned BetterCodex install tree"
+      fi
       rm -rf "$stale_lock"
       lock_waits=0
     fi
@@ -242,8 +270,12 @@ is_source_revision() {
   printf '%s\n' "$1" | grep -Eq '^[0-9a-fA-F]{40}$'
 }
 
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/bettercodex-install.XXXXXX")"
+install_temp_parent="${TMPDIR:-/tmp}"
+install_temp_parent="${install_temp_parent%/}"
+[ -n "$install_temp_parent" ] || install_temp_parent="/"
+tmp_dir="$(mktemp -d "$install_temp_parent/bettercodex-install.XXXXXX")"
 printf '%s\n' "$tmp_dir" >"$lock_dir/tmp"
+printf '%s\n' "$install_temp_parent" >"$lock_dir/tmp-parent"
 cargo_home="$tmp_dir/cargo-home"
 v8_cache_home="$tmp_dir/cache"
 mkdir -p "$cargo_home" "$v8_cache_home"

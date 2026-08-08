@@ -10,18 +10,24 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
+use std::fs::Metadata;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::SystemTime;
 use uuid::Uuid;
 
 const MAX_SNAPSHOT_FILES: usize = 200_000;
@@ -29,12 +35,92 @@ const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT: usize = 16 * 1024 * 1024;
 const LOOP_STATE_PREFIX: &str = ".bcodex/loops";
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Worktree {
     root: PathBuf,
     git_dir: PathBuf,
     common_git_dir: PathBuf,
     index_path: PathBuf,
+    /// Reuses content identities only within one loop run and only for files
+    /// whose full Git-style stat fingerprint predates a same-filesystem epoch.
+    snapshot_cache: Mutex<SnapshotCache>,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotCache {
+    run_root: Option<PathBuf>,
+    state: SnapshotCacheState,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotCacheState {
+    epoch: Option<CacheEpoch>,
+    files: HashMap<PathBuf, CachedFile>,
+    blobs: HashMap<String, FileFingerprint>,
+    #[cfg(test)]
+    hits: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CacheEpoch {
+    device: u64,
+    timestamp: FileTimestamp,
+}
+
+#[derive(Clone, Debug)]
+struct CachedFile {
+    fingerprint: FileFingerprint,
+    digest: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileFingerprint {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    user: u32,
+    group: u32,
+    size: u64,
+    modified: FileTimestamp,
+    changed: FileTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FileTimestamp {
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+impl FileFingerprint {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            user: metadata.uid(),
+            group: metadata.gid(),
+            size: metadata.size(),
+            modified: FileTimestamp {
+                seconds: metadata.mtime(),
+                nanoseconds: metadata.mtime_nsec(),
+            },
+            changed: FileTimestamp {
+                seconds: metadata.ctime(),
+                nanoseconds: metadata.ctime_nsec(),
+            },
+        }
+    }
+
+    fn is_stable_before(self, epoch: CacheEpoch) -> bool {
+        // As with Git's racy-file defense, equality is deliberately not safe:
+        // a coarse-grained filesystem can report the epoch timestamp for a
+        // same-tick modification whose content changed after the prior read.
+        self.device == epoch.device
+            && self.modified < epoch.timestamp
+            && self.changed < epoch.timestamp
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -122,6 +208,7 @@ impl Worktree {
             git_dir,
             common_git_dir,
             index_path,
+            snapshot_cache: Mutex::new(SnapshotCache::default()),
         })
     }
 
@@ -186,6 +273,53 @@ impl Worktree {
     ) -> Result<RepositorySnapshot> {
         let blob_root = run_root.join("blobs");
         private_dir(&blob_root)?;
+        let mut cache = self
+            .snapshot_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.run_root.as_deref() != Some(run_root) {
+            cache.run_root = Some(run_root.to_path_buf());
+            cache.state = SnapshotCacheState::default();
+        }
+        let previous_cache = std::mem::take(&mut cache.state);
+        let mut next_cache = SnapshotCacheState {
+            files: HashMap::with_capacity(previous_cache.files.len()),
+            blobs: HashMap::with_capacity(previous_cache.blobs.len()),
+            ..SnapshotCacheState::default()
+        };
+        let mut prepared_blob_directories = HashSet::new();
+        let captured = self.capture_repository(
+            included_specs,
+            &blob_root,
+            &previous_cache,
+            &mut next_cache,
+            &mut prepared_blob_directories,
+        );
+        match captured {
+            Ok(snapshot) => {
+                next_cache.epoch = snapshot_cache_epoch(&blob_root);
+                if next_cache.epoch.is_none() {
+                    next_cache.files.clear();
+                    next_cache.blobs.clear();
+                }
+                cache.state = next_cache;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                cache.state = previous_cache;
+                Err(error)
+            }
+        }
+    }
+
+    fn capture_repository(
+        &self,
+        included_specs: &[PathSpec],
+        blob_root: &Path,
+        previous_cache: &SnapshotCacheState,
+        next_cache: &mut SnapshotCacheState,
+        prepared_blob_directories: &mut HashSet<String>,
+    ) -> Result<RepositorySnapshot> {
         let paths = self.inventory_paths(included_specs)?;
         if paths.len() > MAX_SNAPSHOT_FILES {
             return Err(anyhow!(
@@ -198,8 +332,15 @@ impl Worktree {
         let mut entries = BTreeMap::new();
         for relative in paths {
             let absolute = self.root.join(&relative);
-            let Some(entry) = capture_entry(&absolute, &blob_root, &mut total_bytes)
-                .with_context(|| format!("failed to capture repository path `{relative}`"))?
+            let Some(entry) = capture_entry(
+                &absolute,
+                blob_root,
+                &mut total_bytes,
+                previous_cache,
+                next_cache,
+                prepared_blob_directories,
+            )
+            .with_context(|| format!("failed to capture repository path `{relative}`"))?
             else {
                 continue;
             };
@@ -210,7 +351,13 @@ impl Worktree {
             }
             entries.insert(relative, entry);
         }
-        let git = self.capture_git(&blob_root, &mut total_bytes)?;
+        let git = self.capture_git(
+            blob_root,
+            &mut total_bytes,
+            previous_cache,
+            next_cache,
+            prepared_blob_directories,
+        )?;
         let digest = canonical_state_digest(&entries, &git)?;
         let state = StateIdentity {
             digest,
@@ -225,6 +372,15 @@ impl Worktree {
             included_specs: included_specs.to_vec(),
             git,
         })
+    }
+
+    #[cfg(test)]
+    fn snapshot_cache_hits(&self) -> usize {
+        self.snapshot_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+            .hits
     }
 
     pub(crate) fn save_snapshot(
@@ -607,11 +763,25 @@ impl Worktree {
         ))
     }
 
-    fn capture_git(&self, blob_root: &Path, total_bytes: &mut u64) -> Result<GitState> {
+    fn capture_git(
+        &self,
+        blob_root: &Path,
+        total_bytes: &mut u64,
+        previous_cache: &SnapshotCacheState,
+        next_cache: &mut SnapshotCacheState,
+        prepared_blob_directories: &mut HashSet<String>,
+    ) -> Result<GitState> {
         let head = optional_git_text(&self.root, &["rev-parse", "--verify", "HEAD"])?;
         let branch = optional_git_text(&self.root, &["symbolic-ref", "-q", "HEAD"])?;
-        let index_digest = capture_optional_file(&self.index_path, blob_root, total_bytes)
-            .context("failed to capture the Git index")?;
+        let index_digest = capture_optional_file(
+            &self.index_path,
+            blob_root,
+            total_bytes,
+            previous_cache,
+            next_cache,
+            prepared_blob_directories,
+        )
+        .context("failed to capture the Git index")?;
         if *total_bytes > MAX_SNAPSHOT_BYTES {
             return Err(anyhow!(
                 "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
@@ -777,7 +947,14 @@ fn collect_directory(root: &Path, directory: &Path, output: &mut BTreeSet<String
     Ok(())
 }
 
-fn capture_entry(path: &Path, blob_root: &Path, total_bytes: &mut u64) -> Result<Option<Entry>> {
+fn capture_entry(
+    path: &Path,
+    blob_root: &Path,
+    total_bytes: &mut u64,
+    previous_cache: &SnapshotCacheState,
+    next_cache: &mut SnapshotCacheState,
+    prepared_blob_directories: &mut HashSet<String>,
+) -> Result<Option<Entry>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -811,7 +988,15 @@ fn capture_entry(path: &Path, blob_root: &Path, total_bytes: &mut u64) -> Result
             path.display()
         ));
     }
-    let digest = capture_file(path, blob_root, total_bytes)?;
+    let digest = capture_file(
+        path,
+        &metadata,
+        blob_root,
+        total_bytes,
+        previous_cache,
+        next_cache,
+        prepared_blob_directories,
+    )?;
     Ok(Some(Entry {
         kind: EntryKind::File,
         mode,
@@ -836,35 +1021,90 @@ fn snapshot_entry_size(path: &Path) -> Result<u64> {
     })
 }
 
-fn capture_file(path: &Path, blob_root: &Path, total_bytes: &mut u64) -> Result<String> {
-    let file = File::open(path)?;
+fn capture_file(
+    path: &Path,
+    initial_metadata: &Metadata,
+    blob_root: &Path,
+    total_bytes: &mut u64,
+    previous_cache: &SnapshotCacheState,
+    next_cache: &mut SnapshotCacheState,
+    prepared_blob_directories: &mut HashSet<String>,
+) -> Result<String> {
     let remaining = MAX_SNAPSHOT_BYTES.saturating_sub(*total_bytes);
-    if file.metadata()?.len() > remaining {
+    if initial_metadata.len() > remaining {
         return Err(anyhow!(
             "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
         ));
     }
-    let mut bytes = Vec::new();
-    file.take(remaining.saturating_add(1))
+    *total_bytes = total_bytes.saturating_add(initial_metadata.len());
+    let fingerprint = FileFingerprint::from_metadata(initial_metadata);
+    if let Some(digest) =
+        reuse_cached_file(path, fingerprint, blob_root, previous_cache, next_cache)?
+    {
+        return Ok(digest);
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let opened_fingerprint = FileFingerprint::from_metadata(&file.metadata()?);
+    if opened_fingerprint != fingerprint {
+        return Err(anyhow!(
+            "repository file changed while its snapshot was being captured"
+        ));
+    }
+    let capacity = usize::try_from(initial_metadata.len()).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take(remaining.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > remaining {
         return Err(anyhow!(
             "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
         ));
     }
-    *total_bytes = total_bytes.saturating_add(bytes.len() as u64);
-    store_blob(blob_root, &bytes)
+    let final_fingerprint = FileFingerprint::from_metadata(&file.metadata()?);
+    if final_fingerprint != opened_fingerprint || bytes.len() as u64 != final_fingerprint.size {
+        return Err(anyhow!(
+            "repository file changed while its snapshot was being captured"
+        ));
+    }
+
+    let digest = hash_bytes(&bytes);
+    if !next_cache.blobs.contains_key(&digest) {
+        let blob_fingerprint = store_blob(blob_root, &digest, &bytes, prepared_blob_directories)?;
+        next_cache.blobs.insert(digest.clone(), blob_fingerprint);
+    }
+    next_cache.files.insert(
+        path.to_path_buf(),
+        CachedFile {
+            fingerprint: final_fingerprint,
+            digest: digest.clone(),
+        },
+    );
+    Ok(digest)
 }
 
 fn capture_optional_file(
     path: &Path,
     blob_root: &Path,
     total_bytes: &mut u64,
+    previous_cache: &SnapshotCacheState,
+    next_cache: &mut SnapshotCacheState,
+    prepared_blob_directories: &mut HashSet<String>,
 ) -> Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            capture_file(path, blob_root, total_bytes).map(Some)
-        }
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => capture_file(
+            path,
+            &metadata,
+            blob_root,
+            total_bytes,
+            previous_cache,
+            next_cache,
+            prepared_blob_directories,
+        )
+        .map(Some),
         Ok(_) => Err(anyhow!(
             "Git state path {} is not a regular file",
             path.display()
@@ -874,10 +1114,60 @@ fn capture_optional_file(
     }
 }
 
-fn store_blob(root: &Path, bytes: &[u8]) -> Result<String> {
-    let digest = hash_bytes(bytes);
+fn reuse_cached_file(
+    path: &Path,
+    fingerprint: FileFingerprint,
+    blob_root: &Path,
+    previous_cache: &SnapshotCacheState,
+    next_cache: &mut SnapshotCacheState,
+) -> Result<Option<String>> {
+    let Some(epoch) = previous_cache.epoch else {
+        return Ok(None);
+    };
+    let Some(cached) = previous_cache.files.get(path) else {
+        return Ok(None);
+    };
+    if cached.fingerprint != fingerprint || !fingerprint.is_stable_before(epoch) {
+        return Ok(None);
+    }
+    if !next_cache.blobs.contains_key(&cached.digest) {
+        let Some(cached_blob) = previous_cache.blobs.get(&cached.digest) else {
+            return Ok(None);
+        };
+        let run_root = blob_root
+            .parent()
+            .ok_or_else(|| anyhow!("blob root has no parent"))?;
+        let blob = blob_path(run_root, &cached.digest)?;
+        let metadata = match std::fs::symlink_metadata(blob) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let fingerprint = FileFingerprint::from_metadata(&metadata);
+        if &fingerprint != cached_blob || !fingerprint.is_stable_before(epoch) {
+            return Ok(None);
+        }
+        next_cache.blobs.insert(cached.digest.clone(), fingerprint);
+    }
+    next_cache.files.insert(path.to_path_buf(), cached.clone());
+    #[cfg(test)]
+    {
+        next_cache.hits = next_cache.hits.saturating_add(1);
+    }
+    Ok(Some(cached.digest.clone()))
+}
+
+fn store_blob(
+    root: &Path,
+    digest: &str,
+    bytes: &[u8],
+    prepared_directories: &mut HashSet<String>,
+) -> Result<FileFingerprint> {
     let directory = root.join(&digest[..2]);
-    private_dir(&directory)?;
+    if prepared_directories.insert(digest[..2].to_string()) {
+        private_dir(&directory)?;
+    }
     let path = directory.join(&digest[2..]);
     match OpenOptions::new()
         .create_new(true)
@@ -891,13 +1181,25 @@ fn store_blob(root: &Path, bytes: &[u8]) -> Result<String> {
             sync_directory(&directory)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "content-addressed snapshot blob is not a regular file"
+                ));
+            }
             if hash_bytes(&std::fs::read(&path)?) != digest {
                 return Err(anyhow!("content-addressed snapshot blob is corrupt"));
             }
         }
         Err(error) => return Err(error.into()),
     }
-    Ok(digest)
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "content-addressed snapshot blob is not a regular file"
+        ));
+    }
+    Ok(FileFingerprint::from_metadata(&metadata))
 }
 
 fn read_blob(run_root: &Path, digest: &str) -> Result<Vec<u8>> {
@@ -1128,6 +1430,24 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn snapshot_cache_epoch(blob_root: &Path) -> Option<CacheEpoch> {
+    // The blob directory is on the reference filesystem and its timestamps are
+    // not part of the durable snapshot or control digest. Touching it after all
+    // reads yields a filesystem-granularity boundary without leaving a marker.
+    let directory = File::open(blob_root).ok()?;
+    directory
+        .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
+        .ok()?;
+    let metadata = directory.metadata().ok()?;
+    Some(CacheEpoch {
+        device: metadata.dev(),
+        timestamp: FileTimestamp {
+            seconds: metadata.mtime(),
+            nanoseconds: metadata.mtime_nsec(),
+        },
+    })
+}
+
 fn is_loop_state_path(path: &str) -> bool {
     path == LOOP_STATE_PREFIX
         || path
@@ -1250,70 +1570,5 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod snapshot_benchmark {
-    use super::*;
-    use std::time::Duration;
-    use std::time::Instant;
-
-    struct Fixture(PathBuf);
-
-    impl Fixture {
-        fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("bcodex-snapshot-bench-{}", Uuid::new_v4()));
-            std::fs::create_dir(&path).expect("create fixture root");
-            Self(path)
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn repeated_snapshot_timing() {
-        let fixture = Fixture::new();
-        let repository = fixture.0.join("repository");
-        let run_root = fixture.0.join("run");
-        std::fs::create_dir(&repository).expect("create repository");
-        let status = Command::new("git")
-            .current_dir(&repository)
-            .args(["init", "--quiet"])
-            .status()
-            .expect("start git init");
-        assert!(status.success());
-        for index in 0_u8..8 {
-            let mut bytes = vec![index; 16 * 1024 * 1024];
-            let last = bytes.len() - 1;
-            bytes[last] = index.wrapping_add(1);
-            std::fs::write(repository.join(format!("payload-{index}")), bytes)
-                .expect("write payload");
-        }
-        let status = Command::new("git")
-            .current_dir(&repository)
-            .args(["add", "."])
-            .status()
-            .expect("start git add");
-        assert!(status.success());
-        std::thread::sleep(Duration::from_millis(1_100));
-
-        let worktree = Worktree::discover(&repository).expect("discover worktree");
-        let started = Instant::now();
-        worktree.capture(&run_root, &[]).expect("warm snapshot");
-        let warm = started.elapsed();
-        let started = Instant::now();
-        worktree
-            .capture(&run_root, &[])
-            .expect("first repeated snapshot");
-        let first = started.elapsed();
-        let started = Instant::now();
-        worktree
-            .capture(&run_root, &[])
-            .expect("second repeated snapshot");
-        let second = started.elapsed();
-        eprintln!("warm={warm:?} first={first:?} second={second:?}");
-    }
-}
+#[path = "repository_tests.rs"]
+mod tests;
