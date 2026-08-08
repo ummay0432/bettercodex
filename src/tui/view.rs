@@ -2630,10 +2630,6 @@ impl View {
             spans.push(Span::from(" · ").dim());
             spans.push(Span::from(format!("{queued_follow_ups} queued")).dim());
         }
-        if let Some(summary) = self.background_process_summary() {
-            spans.push(Span::from(" · ").dim());
-            spans.push(Span::from(summary).dim());
-        }
         Line::from(spans)
     }
 
@@ -2758,25 +2754,19 @@ fn styled_loop_fields(fields: &[&str], indent: &str, first_is_name: bool) -> Lin
 
 impl View {
     fn activity_height(&self, width: u16) -> u16 {
-        if self.busy {
-            STATUS_LINE_HEIGHT
-                .saturating_add(u16::from(self.waiting_status_detail_line(width).is_some()))
-        } else {
-            u16::from(self.standalone_background_process_line(width).is_some())
-        }
+        u16::try_from(self.activity_lines(width).len()).unwrap_or(u16::MAX)
     }
 
     fn activity_lines(&self, width: u16) -> Vec<Line<'static>> {
         if !self.busy {
-            return self
-                .standalone_background_process_line(width)
-                .map(|line| truncate_line(line, usize::from(width)))
-                .into_iter()
-                .collect();
+            return self.background_process_line(width).into_iter().collect();
         }
 
         let mut lines = vec![truncate_line(self.working_line(), usize::from(width))];
         lines.extend(self.waiting_status_detail_line(width));
+        // BetterCodex deliberately keeps this footer on its own row while busy. Codex folds it
+        // into the status header, which hides both surfaces behind the same truncation boundary.
+        lines.extend(self.background_process_line(width));
         lines
     }
 
@@ -2811,15 +2801,15 @@ impl View {
         ))
     }
 
-    fn standalone_background_process_line(&self, width: u16) -> Option<Line<'static>> {
+    fn background_process_line(&self, width: u16) -> Option<Line<'static>> {
         if width < 4 {
             return None;
         }
         let summary = self.background_process_summary()?;
-        Some(Line::from(vec![
-            Span::from("  ").dim(),
-            Span::from(summary).dim(),
-        ]))
+        Some(truncate_line(
+            Line::from(vec![Span::from("  ").dim(), Span::from(summary).dim()]),
+            usize::from(width),
+        ))
     }
 
     fn status_line(&self, width: u16) -> Line<'static> {
@@ -5014,6 +5004,62 @@ mod tests {
 
         view.handle_agent_event(AgentEvent::LoopProgressCleared);
         assert_eq!(view.desired_height(60, 24), height);
+    }
+
+    #[test]
+    fn busy_background_terminal_uses_a_dedicated_row_between_status_and_composer() {
+        const WIDTH: u16 = 96;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        let _ = view.take_pending_history_lines(WIDTH, 24);
+        view.status_detail = Some("python3 scripts/install_tests.py".to_string());
+        let height_without_background_terminal = view.desired_height(WIDTH, 24);
+
+        assert!(view.set_background_processes(vec![BackgroundProcess {
+            session_id: 42,
+            command: "python3 scripts/install_tests.py".to_string(),
+            cwd: PathBuf::from("/tmp/bettercodex"),
+            running_for: Duration::from_secs(10),
+        }]));
+
+        let height = view.desired_height(WIDTH, 24);
+        assert_eq!(height, height_without_background_terminal + 1);
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = render_buffer(buffer);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let status_y = rows
+            .iter()
+            .position(|row| row.contains("Working (") && row.contains("install_tests.py"))
+            .expect("rendered activity status") as u16;
+        let background_terminal_y = rows
+            .iter()
+            .position(|row| row.contains("1 background terminal running"))
+            .expect("rendered background terminal row") as u16;
+        let composer_background = view.user_message_style.bg.unwrap();
+        let composer_y = (0..height)
+            .find(|&y| buffer[(0, y)].bg == composer_background)
+            .expect("rendered composer");
+
+        assert!(
+            !rows[usize::from(status_y)].contains("background terminal"),
+            "{rendered}"
+        );
+        assert_eq!(background_terminal_y, status_y + 1, "{rendered}");
+        assert_eq!(
+            composer_y,
+            background_terminal_y + 1 + ACTIVITY_COMPOSER_GAP,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("1 background terminal running").count(),
+            1,
+            "{rendered}"
+        );
     }
 
     #[test]

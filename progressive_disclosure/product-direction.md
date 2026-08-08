@@ -34,6 +34,10 @@ The runtime is one Cargo package and one `bcodex` binary. It contains the
 inference loop and terminal UI for one operator. Commands and patches run with
 the invoking user's permissions; bettercodex does not sandbox them.
 
+The active background-terminal summary always occupies its own row between the
+live task status and the composer. Unlike Codex, bettercodex does not fold this
+summary into the busy status line.
+
 Do not add another model, provider, binary, app server, SDK, MCP layer, plugin
 system, configuration framework, build system, or plugin hook unless the user
 gives a concrete bettercodex use for it. Linux and macOS are the targets; do not
