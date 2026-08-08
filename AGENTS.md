@@ -11,6 +11,8 @@ freedom to be proactive.
 
 Do not use emojis, except for Codex's established checkmark status marker.
 
+Do not leave Rust build trash behind: after integrating Rust work, remove its linked worktree and clean its now-inactive Cargo target using the workflow in [`development.md`](progressive_disclosure/development.md).
+
 bettercodex is a focused port of [OpenAI Codex](https://github.com/openai/codex), not an independent implementation. For every retained behavior Codex already implements, inspect and port the current upstream source before editing; unexplained reimplementation or drift is forbidden unless [`product-direction.md`](progressive_disclosure/product-direction.md) explicitly requires the departure.
 
 ## Start here

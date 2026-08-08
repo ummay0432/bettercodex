@@ -198,16 +198,19 @@ impl Worktree {
                 paths.len()
             ));
         }
+        self.validate_snapshot_size(&paths)?;
         let mut total_bytes = 0_u64;
         let mut entries = BTreeMap::new();
         for relative in paths {
             let absolute = self.root.join(&relative);
-            let Some(entry) = capture_entry(&absolute, &blob_root, &mut total_bytes)? else {
+            let Some(entry) = capture_entry(&absolute, &blob_root, &mut total_bytes)
+                .with_context(|| format!("failed to capture repository path `{relative}`"))?
+            else {
                 continue;
             };
             if total_bytes > MAX_SNAPSHOT_BYTES {
                 return Err(anyhow!(
-                    "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
+                    "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit while capturing `{relative}`"
                 ));
             }
             entries.insert(relative, entry);
@@ -581,10 +584,39 @@ impl Worktree {
         Ok(paths)
     }
 
+    fn validate_snapshot_size(&self, paths: &BTreeSet<String>) -> Result<()> {
+        let index_bytes = snapshot_entry_size(&self.index_path)
+            .context("failed to inspect the Git index for the repository snapshot")?;
+        let mut total_bytes = index_bytes;
+        let mut bytes_by_component = BTreeMap::new();
+        if index_bytes > 0 {
+            bytes_by_component.insert("Git index", index_bytes);
+        }
+        for relative in paths {
+            let bytes = snapshot_entry_size(&self.root.join(relative))
+                .with_context(|| format!("failed to size repository snapshot path `{relative}`"))?;
+            total_bytes = total_bytes.saturating_add(bytes);
+            let component = relative.split('/').next().unwrap_or(relative);
+            let component_bytes = bytes_by_component.entry(component).or_insert(0_u64);
+            *component_bytes = component_bytes.saturating_add(bytes);
+        }
+        if total_bytes <= MAX_SNAPSHOT_BYTES {
+            return Ok(());
+        }
+        let (largest, largest_bytes) = bytes_by_component
+            .into_iter()
+            .max_by_key(|(_, bytes)| *bytes)
+            .unwrap_or(("repository metadata", 0));
+        Err(anyhow!(
+            "repository snapshot requires {total_bytes} bytes, exceeding the {MAX_SNAPSHOT_BYTES}-byte safety limit; `{largest}` accounts for {largest_bytes} bytes; remove obsolete ignored build output or move non-candidate data out of the worktree before retrying"
+        ))
+    }
+
     fn capture_git(&self, blob_root: &Path, total_bytes: &mut u64) -> Result<GitState> {
         let head = optional_git_text(&self.root, &["rev-parse", "--verify", "HEAD"])?;
         let branch = optional_git_text(&self.root, &["symbolic-ref", "-q", "HEAD"])?;
-        let index_digest = capture_optional_file(&self.index_path, blob_root, total_bytes)?;
+        let index_digest = capture_optional_file(&self.index_path, blob_root, total_bytes)
+            .context("failed to capture the Git index")?;
         if *total_bytes > MAX_SNAPSHOT_BYTES {
             return Err(anyhow!(
                 "repository snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte safety limit"
@@ -791,6 +823,22 @@ fn capture_entry(path: &Path, blob_root: &Path, total_bytes: &mut u64) -> Result
         digest: Some(digest),
         symlink_target: None,
     }))
+}
+
+fn snapshot_entry_size(path: &Path) -> Result<u64> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(std::fs::read_link(path)?.into_os_string().into_vec().len() as u64);
+    }
+    Ok(if metadata.is_file() {
+        metadata.len()
+    } else {
+        0
+    })
 }
 
 fn capture_file(path: &Path, blob_root: &Path, total_bytes: &mut u64) -> Result<String> {
@@ -1493,6 +1541,46 @@ mod tests {
         let run_root = fixture.run_root();
         let sparse = std::fs::File::create(fixture.root.join("oversized.bin")).unwrap();
         sparse.set_len(MAX_SNAPSHOT_BYTES + 1).unwrap();
-        assert!(worktree.capture(&run_root, &[]).is_err());
+        let error = worktree.capture(&run_root, &[]).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("oversized.bin"), "{message}");
+        assert!(
+            message.contains(&MAX_SNAPSHOT_BYTES.to_string()),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_dir(run_root.join("blobs")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_an_oversized_ignored_aggregate_before_writing_blobs() {
+        let fixture = Fixture::new();
+        let worktree = Worktree::discover(&fixture.root).unwrap();
+        worktree.install_loop_exclude().unwrap();
+        let run_root = fixture.run_root();
+        std::fs::write(fixture.root.join(".gitignore"), ".cache/\ntarget/\n").unwrap();
+        std::fs::create_dir(fixture.root.join("target")).unwrap();
+        for name in ["large-a.bin", "large-b.bin"] {
+            let sparse = std::fs::File::create(fixture.root.join("target").join(name)).unwrap();
+            sparse.set_len(MAX_SNAPSHOT_BYTES / 2 + 1).unwrap();
+        }
+
+        let error = worktree.capture(&run_root, &[]).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("repository snapshot requires"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&MAX_SNAPSHOT_BYTES.to_string()),
+            "{message}"
+        );
+        assert!(message.contains("`target` accounts"), "{message}");
+        assert_eq!(
+            std::fs::read_dir(run_root.join("blobs")).unwrap().count(),
+            0
+        );
     }
 }
