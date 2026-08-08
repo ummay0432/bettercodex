@@ -445,7 +445,7 @@ impl ApiClient {
         base_url: String,
         instructions: String,
     ) -> anyhow::Result<Self> {
-        codex_utils_rustls_provider::ensure_rustls_crypto_provider();
+        crate::http_client::ensure_rustls_crypto_provider();
         let mut default_headers = HeaderMap::new();
         default_headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
         let client = crate::http_client::build_client(

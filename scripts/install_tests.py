@@ -193,12 +193,14 @@ class InstallScriptTest(unittest.TestCase):
             root = Path(directory)
             install_dir = root / "install" / "bin"
             lock = install_dir / ".bcodex-install.lock"
-            orphan = root / "temporary" / "bettercodex-install.orphan"
+            old_temporary = root / "old temporary"
+            orphan = old_temporary / "bettercodex-install.orphan"
             lock.mkdir(parents=True)
             orphan.mkdir(parents=True)
             (orphan / "large-artifact").write_text("orphan", encoding="utf-8")
             (lock / "pid").write_text("999999999\n", encoding="utf-8")
             (lock / "tmp").write_text(f"{orphan}\n", encoding="utf-8")
+            (lock / "tmp-parent").write_text(f"{old_temporary}\n", encoding="utf-8")
             (install_dir / ".bcodex-stage.orphan").write_text("partial binary", encoding="utf-8")
 
             result = run_installer(root)
@@ -209,20 +211,21 @@ class InstallScriptTest(unittest.TestCase):
 
     def test_all_supported_native_hosts_use_the_same_exact_source_flow(self) -> None:
         platforms = (
-            ("Darwin", "arm64", "macOS ARM64"),
-            ("Darwin", "x86_64", "macOS x86-64"),
-            ("Linux", "aarch64", "Linux ARM64"),
-            ("Linux", "x86_64", "Linux x86-64"),
+            ("Darwin", "arm64", "/bin/zsh", ".zprofile", "macOS ARM64"),
+            ("Darwin", "x86_64", "/bin/zsh", ".zprofile", "macOS x86-64"),
+            ("Linux", "aarch64", "/bin/bash", ".bashrc", "Linux ARM64"),
+            ("Linux", "x86_64", "/bin/bash", ".bashrc", "Linux x86-64"),
         )
-        for system, machine, label in platforms:
+        for system, machine, shell, profile, label in platforms:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
 
-                result = run_installer(root, system=system, machine=machine)
+                result = run_installer(root, system=system, machine=machine, shell=shell)
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f"for {label}", result.stdout)
                 self.assertIn(f"tarball/{COMMIT}", (root / "gh.log").read_text(encoding="utf-8"))
+                self.assertTrue((root / "home" / profile).is_file())
                 assert_no_installer_residue(self, root)
 
     def test_explicit_install_directory_works_without_home(self) -> None:
@@ -248,6 +251,78 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn("toolchain install 1.95.0 --profile minimal", rustup_calls)
             self.assertTrue((root / "toolchain-installed").is_file())
             assert_no_installer_residue(self, root)
+
+    def test_retired_cache_cleanup_never_follows_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "operator-cache"
+            outside.mkdir()
+            keep = outside / "keep"
+            keep.write_text("operator data", encoding="utf-8")
+            legacy = root / "cache" / "bettercodex"
+            legacy.mkdir(parents=True)
+            (legacy / "build").symlink_to(outside, target_is_directory=True)
+
+            result = run_installer(root)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("not removing retired cache symlink", result.stderr)
+            self.assertTrue((legacy / "build").is_symlink())
+            self.assertEqual(keep.read_text(encoding="utf-8"), "operator data")
+            assert_no_installer_residue(self, root)
+
+    def test_failed_exit_cleanup_keeps_a_record_for_the_next_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            failed = run_installer(root, build_success=False, cleanup_success=False)
+
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("retaining installer lock", failed.stderr)
+            lock = root / "install" / "bin" / ".bcodex-install.lock"
+            orphan = Path((lock / "tmp").read_text(encoding="utf-8").strip())
+            self.assertTrue(orphan.is_dir())
+
+            recovered = run_installer(root)
+
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertFalse(orphan.exists())
+            assert_no_installer_residue(self, root)
+
+    def test_continuously_advancing_main_stops_after_three_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(root, advancing_main=True, next_commit=NEXT_COMMIT)
+
+            self.assertNotEqual(
+                result.returncode,
+                0,
+                f"{result.stdout}\n{result.stderr}\n{(root / 'gh.log').read_text(encoding='utf-8')}",
+            )
+            self.assertIn("main kept advancing during all 3 build attempts", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+            builds = (root / "build.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                [build.split("|", 1)[0] for build in builds],
+                [COMMIT, NEXT_COMMIT, "c" * 40],
+            )
+            assert_no_installer_residue(self, root)
+
+    def test_active_install_lock_rejects_a_concurrent_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / "install" / "bin" / ".bcodex-install.lock"
+            lock.mkdir(parents=True)
+            (lock / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+            result = run_installer(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("another BetterCodex install is already running", result.stderr)
+            self.assertTrue(lock.is_dir())
+            self.assertFalse((root / "build.log").exists())
 
 
 def existing_binary(root: Path) -> Path:
@@ -285,6 +360,9 @@ def run_installer(
     next_commit: str = COMMIT,
     home_enabled: bool = True,
     toolchain_installed: bool = True,
+    shell: str = "/bin/sh",
+    cleanup_success: bool = True,
+    advancing_main: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     root.mkdir(parents=True, exist_ok=True)
     fake_bin = root / "fake-bin"
@@ -326,7 +404,14 @@ def run_installer(
                 fi
                 count=$((count + 1))
                 printf '%s\\n' "$count" >"$BCODEX_TEST_COMMIT_COUNT_FILE"
-                if [ "$count" -eq 1 ]; then
+                if [ "$BCODEX_TEST_ADVANCING_MAIN" = 1 ]; then
+                  case "$count" in
+                    1) printf '%s\\n' "$BCODEX_TEST_COMMIT" ;;
+                    2 | 3) printf '%s\\n' "$BCODEX_TEST_NEXT_COMMIT" ;;
+                    4 | 5) printf '%040d\\n' 0 | tr 0 c ;;
+                    *) printf '%040d\\n' 0 | tr 0 d ;;
+                  esac
+                elif [ "$count" -eq 1 ]; then
                   printf '%s\\n' "$BCODEX_TEST_COMMIT"
                 else
                   printf '%s\\n' "$BCODEX_TEST_NEXT_COMMIT"
@@ -342,6 +427,16 @@ def run_installer(
     )
     for command in ("cargo", "cc", "curl", "rustc"):
         write_executable(fake_bin / command, "#!/bin/sh\nexit 0\n")
+    write_executable(
+        fake_bin / "rm",
+        "#!/bin/sh\n"
+        "if [ \"$BCODEX_TEST_CLEANUP_SUCCESS\" != 1 ]; then\n"
+        "  for argument in \"$@\"; do\n"
+        "    case \"$argument\" in *bettercodex-install.*) exit 9 ;; esac\n"
+        "  done\n"
+        "fi\n"
+        "exec /bin/rm \"$@\"\n",
+    )
     write_executable(
         fake_bin / "rustup",
         "#!/bin/sh\n"
@@ -387,12 +482,14 @@ def run_installer(
     environment.update(
         {
             "BCODEX_INSTALL_DIR": str(install_dir),
+            "BCODEX_TEST_ADVANCING_MAIN": "1" if advancing_main else "0",
             "BCODEX_TEST_AUTHENTICATED": "1" if authenticated else "0",
             "BCODEX_TEST_BUILD_LOG": str(root / "build.log"),
             "BCODEX_TEST_BUILD_SUCCESS": "1" if build_success else "0",
             "BCODEX_TEST_BUILT_VERSION": VERSION,
             "BCODEX_TEST_COMMIT": COMMIT,
             "BCODEX_TEST_COMMIT_COUNT_FILE": str(root / "commit-count"),
+            "BCODEX_TEST_CLEANUP_SUCCESS": "1" if cleanup_success else "0",
             "BCODEX_TEST_EMBEDDED_REVISION": embedded_revision or "",
             "BCODEX_TEST_FAKE_BIN": str(fake_bin),
             "BCODEX_TEST_GH_LOG": str(root / "gh.log"),
@@ -404,7 +501,7 @@ def run_installer(
             "BCODEX_TEST_TOOLCHAIN_INSTALLED": "1" if toolchain_installed else "0",
             "BCODEX_TEST_TOOLCHAIN_STATE": str(root / "toolchain-installed"),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
-            "SHELL": "/bin/sh",
+            "SHELL": shell,
             "TMPDIR": str(temporary),
             "XDG_CACHE_HOME": str(root / "cache"),
         }

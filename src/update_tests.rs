@@ -3,27 +3,38 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use uuid::Uuid;
 
+struct TemporaryDirectory {
+    path: PathBuf,
+}
+
+impl TemporaryDirectory {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("bettercodex-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 struct TemporaryProgram {
-    root: PathBuf,
+    _root: TemporaryDirectory,
     path: PathBuf,
 }
 
 impl TemporaryProgram {
     fn new(contents: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("bettercodex-update-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("gh");
+        let root = TemporaryDirectory::new("update");
+        let path = root.path.join("gh");
         fs::write(&path, contents).unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
-        Self { root, path }
-    }
-}
-
-impl Drop for TemporaryProgram {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        Self { _root: root, path }
     }
 }
 
@@ -203,13 +214,14 @@ fn updater_passes_the_target_directory_and_repository_to_the_installer() {
 
 #[test]
 fn legacy_cleanup_removes_only_retired_directories() {
-    let root = std::env::temp_dir().join(format!("bettercodex-cache-{}", Uuid::new_v4()));
+    let temporary = TemporaryDirectory::new("cache");
+    let root = &temporary.path;
     fs::create_dir_all(root.join("build/target/release")).unwrap();
     fs::create_dir_all(root.join("tmp/source")).unwrap();
     fs::create_dir_all(root.join("rusty-v8-150.4.0-host")).unwrap();
     fs::write(root.join("keep"), "operator data").unwrap();
 
-    cleanup_legacy_updater_cache_in(&root).unwrap();
+    cleanup_legacy_updater_cache_in(root).unwrap();
 
     assert!(!root.join("build").exists());
     assert!(!root.join("tmp").exists());
@@ -218,7 +230,6 @@ fn legacy_cleanup_removes_only_retired_directories() {
         fs::read_to_string(root.join("keep")).unwrap(),
         "operator data"
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
