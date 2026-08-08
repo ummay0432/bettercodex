@@ -19,7 +19,6 @@ bytes = "1"
 codex-utils-pty = { git = "https://github.com/openai/codex.git", rev = "3aae5d885bac39c1262491aa3fd100dfd8b3919f" }
 crossbeam-channel = "0.5.15"
 crossterm = { version = "0.29.0", default-features = false, features = ["bracketed-paste", "event-stream"] }
-deno_core_icudata = "0.77.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 ignore = "0.4.23"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
@@ -62,6 +61,10 @@ webbrowser = "1.0"
 which = "8"
 zstd = { version = "0.13", default-features = false }
 
+[build-dependencies]
+deno_core_icudata = "0.77.0"
+zstd = { version = "0.13", default-features = false }
+
 [profile.dev]
 # Keep line tables/backtraces while avoiding expensive full variable debug info
 # across local builds and tests.
@@ -73,6 +76,15 @@ strip = true
 # Match upstream's balance between parallel release code generation, runtime
 # performance, and binary size.
 codegen-units = 4
+
+# Published binaries favor the user's disk and download footprint. The extra
+# link time is paid once by the maintainer; installs and updates never compile
+# this profile on the user's machine.
+[profile.distribution]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
 
 [patch.crates-io]
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }

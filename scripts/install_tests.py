@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import gzip
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -218,6 +220,171 @@ class InstallScriptTest(unittest.TestCase):
             )
             assert_no_installer_residue(self, root)
 
+    def test_published_native_release_avoids_every_source_build_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            updater_cache = root / "cache" / "bettercodex"
+            (updater_cache / "build" / "old-target").mkdir(parents=True)
+            (updater_cache / "cargo" / "registry").mkdir(parents=True)
+            (updater_cache / "tmp" / "source").mkdir(parents=True)
+            (updater_cache / "rusty-v8-development-cache").mkdir(parents=True)
+            (updater_cache / "keep").write_text("operator data", encoding="utf-8")
+
+            result = run_installer(root, prebuilt=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Downloading the native BetterCodex executable", result.stdout)
+            self.assertIn("without Rust, Cargo, or local compilation", result.stdout)
+            self.assertNotIn("Compiling BetterCodex", result.stdout)
+            installed = root / "install" / "bin" / "bcodex"
+            self.assertEqual(run_binary(installed, "--version"), f"bcodex {VERSION}\n")
+            self.assertEqual(
+                run_binary(installed, "--internal-source-revision"), f"{COMMIT}\n"
+            )
+            self.assertFalse((root / "build.log").exists())
+            self.assertFalse((root / "rustup.log").exists())
+            self.assertFalse((updater_cache / "build").exists())
+            self.assertFalse((updater_cache / "cargo").exists())
+            self.assertFalse((updater_cache / "tmp").exists())
+            self.assertTrue((updater_cache / "rusty-v8-development-cache").is_dir())
+            self.assertEqual(
+                (updater_cache / "keep").read_text(encoding="utf-8"),
+                "operator data",
+            )
+            requests = (root / "github.log").read_text(encoding="utf-8")
+            target = "x86_64-unknown-linux-gnu"
+            release_tag = f"bcodex-v{VERSION}-{COMMIT}"
+            self.assertIn(f"releases/download/{release_tag}/bcodex-{target}.gz.sha256", requests)
+            self.assertIn(f"releases/download/{release_tag}/bcodex-{target}.gz", requests)
+            self.assertEqual(
+                (root / "release-request-count").read_text(encoding="utf-8").strip(),
+                "2",
+            )
+            assert_no_installer_residue(self, root)
+
+    def test_prebuilt_cleanup_never_follows_a_symlinked_cache_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside-cache"
+            (outside / "build").mkdir(parents=True)
+            keep = outside / "build" / "operator-data"
+            keep.write_text("keep\n", encoding="utf-8")
+            cache_base = root / "cache"
+            cache_base.mkdir()
+            (cache_base / "bettercodex").symlink_to(outside, target_is_directory=True)
+
+            result = run_installer(root, prebuilt=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("not removing symlinked source-updater cache root", result.stderr)
+            self.assertEqual(keep.read_text(encoding="utf-8"), "keep\n")
+            self.assertTrue((cache_base / "bettercodex").is_symlink())
+            assert_no_installer_residue(self, root)
+
+    def test_explicit_release_avoids_the_duplicate_initial_metadata_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(
+                root,
+                prebuilt=True,
+                release_via_environment=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (root / "release-request-count").read_text(encoding="utf-8").strip(),
+                "1",
+            )
+            self.assertFalse((root / "build.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_release_lookup_failure_never_turns_into_an_unexpected_source_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(root, prebuilt=True, release_failures=3)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not resolve the latest published", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+            self.assertFalse((root / "build.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_confirmed_missing_native_asset_uses_the_bounded_source_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(
+                root,
+                prebuilt=True,
+                prebuilt_asset_available=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("no compatible prebuilt asset", result.stderr)
+            self.assertIn("falling back to a local source build", result.stderr)
+            self.assertIn("Compiling BetterCodex", result.stdout)
+            self.assertEqual(
+                run_binary(root / "install" / "bin" / "bcodex", "--internal-source-revision"),
+                f"{COMMIT}\n",
+            )
+            self.assertTrue((root / "build.log").is_file())
+            assert_no_installer_residue(self, root)
+
+    def test_wrong_release_revision_preserves_the_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(
+                root,
+                prebuilt=True,
+                embedded_revision=NEXT_COMMIT,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not embed source revision", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+            self.assertFalse((root / "build.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_corrupt_or_mismatched_release_asset_never_replaces_or_builds(self) -> None:
+        cases = (
+            ({"prebuilt_checksum_valid": False}, "has SHA-256"),
+            ({"prebuilt_corrupt": True}, "could not be decompressed"),
+        )
+        for options, expected_error in cases:
+            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                installed = existing_binary(root)
+
+                result = run_installer(root, prebuilt=True, **options)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+                self.assertFalse((root / "build.log").exists())
+                assert_no_installer_residue(self, root)
+
+    def test_symlinked_destination_is_refused_before_network_or_build_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            install_dir = root / "install" / "bin"
+            install_dir.mkdir(parents=True)
+            outside = root / "outside-binary"
+            outside.write_text("operator data\n", encoding="utf-8")
+            (install_dir / "bcodex").symlink_to(outside)
+
+            result = run_installer(root, prebuilt=True)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("refusing to replace symlinked", result.stderr)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "operator data\n")
+            self.assertFalse((root / "github.log").exists())
+            self.assertFalse((root / "build.log").exists())
+
     def test_retries_with_the_same_dependency_cache_when_main_advances(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -323,6 +490,26 @@ class InstallScriptTest(unittest.TestCase):
                     Path(build[2]),
                     root / "cache" / "bettercodex" / "build" / host_target / "target",
                 )
+                assert_no_installer_residue(self, root)
+
+    def test_all_supported_native_hosts_select_their_prebuilt_asset(self) -> None:
+        platforms = (
+            ("Darwin", "arm64", "aarch64-apple-darwin"),
+            ("Darwin", "x86_64", "x86_64-apple-darwin"),
+            ("Linux", "aarch64", "aarch64-unknown-linux-gnu"),
+            ("Linux", "x86_64", "x86_64-unknown-linux-gnu"),
+        )
+        for system, machine, host_target in platforms:
+            with self.subTest(host_target=host_target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+
+                result = run_installer(root, system=system, machine=machine, prebuilt=True)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                requests = (root / "github.log").read_text(encoding="utf-8")
+                self.assertIn(f"bcodex-{host_target}.gz.sha256", requests)
+                self.assertIn(f"bcodex-{host_target}.gz", requests)
+                self.assertFalse((root / "build.log").exists())
                 assert_no_installer_residue(self, root)
 
     def test_explicit_install_directory_works_without_home(self) -> None:
@@ -669,6 +856,12 @@ def run_installer(
     compiler_works: bool = True,
     embedded_revision: str | None = None,
     install_revision: str | None = None,
+    prebuilt: bool = False,
+    prebuilt_asset_available: bool = True,
+    prebuilt_checksum_valid: bool = True,
+    prebuilt_corrupt: bool = False,
+    release_via_environment: bool = False,
+    release_failures: int = 0,
     main_failures: int = 0,
     smoke_success: bool = True,
     next_commit: str = COMMIT,
@@ -689,6 +882,16 @@ def run_installer(
     temporary = root / "temporary"
     temporary.mkdir(exist_ok=True)
     archive = create_source_archive(root)
+    prebuilt_asset, prebuilt_sha256 = create_prebuilt_asset(
+        root,
+        revision=embedded_revision or COMMIT,
+        smoke_success=smoke_success,
+    )
+    if prebuilt_corrupt:
+        prebuilt_asset.write_bytes(b"not a gzip stream")
+        prebuilt_sha256 = hashlib.sha256(prebuilt_asset.read_bytes()).hexdigest()
+    if not prebuilt_checksum_valid:
+        prebuilt_sha256 = "0" * 64
 
     write_executable(
         fake_bin / "uname",
@@ -709,8 +912,93 @@ def run_installer(
             """\
             #!/bin/sh
             printf '%s\\n' "$*" >>"$BCODEX_TEST_GITHUB_LOG"
-            for argument do url="$argument"; done
+            output=""
+            write_status=0
+            next_output=0
+            next_write=0
+            url=""
+            for argument do
+              if [ "$next_output" = 1 ]; then
+                output="$argument"
+                next_output=0
+                continue
+              fi
+              if [ "$next_write" = 1 ]; then
+                next_write=0
+                continue
+              fi
+              case "$argument" in
+                --output) next_output=1 ;;
+                --write-out) write_status=1; next_write=1 ;;
+                https://*) url="$argument" ;;
+              esac
+            done
+
+            emit_status() {
+              [ "$write_status" = 1 ] && printf '%s' "$1"
+              return 0
+            }
+
+            emit_empty() {
+              [ -z "$output" ] || : >"$output"
+              emit_status "$1"
+            }
+
+            emit_file() {
+              if [ -n "$output" ]; then
+                cat "$1" >"$output"
+              else
+                cat "$1"
+              fi
+              emit_status "$2"
+            }
+
             case "$url" in
+              "https://api.github.com/repos/$BCODEX_TEST_REPOSITORY/releases/latest")
+                count=0
+                if [ -f "$BCODEX_TEST_RELEASE_REQUEST_COUNT_FILE" ]; then
+                  count="$(sed -n '1p' "$BCODEX_TEST_RELEASE_REQUEST_COUNT_FILE")"
+                fi
+                count=$((count + 1))
+                printf '%s\\n' "$count" >"$BCODEX_TEST_RELEASE_REQUEST_COUNT_FILE"
+                if [ "$count" -le "$BCODEX_TEST_RELEASE_FAILURES" ]; then
+                  emit_empty 503
+                  exit 0
+                fi
+                if [ "$BCODEX_TEST_PREBUILT" != 1 ]; then
+                  emit_empty 404
+                  exit 0
+                fi
+                if [ -n "$output" ]; then
+                  printf '{\\n  "tag_name": "%s",\\n  "draft": false,\\n  "prerelease": false\\n}\\n' \
+                    "$BCODEX_TEST_RELEASE_TAG" >"$output"
+                else
+                  printf '{\\n  "tag_name": "%s",\\n  "draft": false,\\n  "prerelease": false\\n}\\n' \
+                    "$BCODEX_TEST_RELEASE_TAG"
+                fi
+                emit_status 200
+                ;;
+              "https://github.com/$BCODEX_TEST_REPOSITORY/releases/download/"*/*.sha256)
+                if [ "$BCODEX_TEST_PREBUILT_ASSET_AVAILABLE" != 1 ]; then
+                  emit_empty 404
+                  exit 0
+                fi
+                asset_name="${url##*/}"
+                asset_name="${asset_name%.sha256}"
+                if [ -n "$output" ]; then
+                  printf '%s  %s\\n' "$BCODEX_TEST_PREBUILT_SHA256" "$asset_name" >"$output"
+                else
+                  printf '%s  %s\\n' "$BCODEX_TEST_PREBUILT_SHA256" "$asset_name"
+                fi
+                emit_status 200
+                ;;
+              "https://github.com/$BCODEX_TEST_REPOSITORY/releases/download/"*/*.gz)
+                if [ "$BCODEX_TEST_PREBUILT_ASSET_AVAILABLE" != 1 ]; then
+                  emit_empty 404
+                  exit 0
+                fi
+                emit_file "$BCODEX_TEST_PREBUILT_ASSET" 200
+                ;;
               "https://api.github.com/repos/$BCODEX_TEST_REPOSITORY/commits/main")
                 count=0
                 if [ -f "$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE" ]; then
@@ -810,7 +1098,9 @@ def run_installer(
     environment = os.environ.copy()
     for name in (
         "BCODEX_INSTALL_DIR",
+        "BCODEX_INSTALL_RELEASE_TAG",
         "BCODEX_INSTALL_REVISION",
+        "BCODEX_INSTALL_VERSION",
         "BCODEX_REPOSITORY",
         "BCODEX_SOURCE_REVISION",
         "CARGO_BUILD_JOBS",
@@ -855,6 +1145,17 @@ def run_installer(
             "BCODEX_TEST_MAIN_FAILURES": str(main_failures),
             "BCODEX_TEST_MAIN_REQUEST_COUNT_FILE": str(root / "main-request-count"),
             "BCODEX_TEST_NEXT_COMMIT": next_commit,
+            "BCODEX_TEST_PREBUILT": "1" if prebuilt else "0",
+            "BCODEX_TEST_PREBUILT_ASSET": str(prebuilt_asset),
+            "BCODEX_TEST_PREBUILT_ASSET_AVAILABLE": (
+                "1" if prebuilt_asset_available else "0"
+            ),
+            "BCODEX_TEST_PREBUILT_SHA256": prebuilt_sha256,
+            "BCODEX_TEST_RELEASE_FAILURES": str(release_failures),
+            "BCODEX_TEST_RELEASE_REQUEST_COUNT_FILE": str(
+                root / "release-request-count"
+            ),
+            "BCODEX_TEST_RELEASE_TAG": f"bcodex-v{VERSION}-{COMMIT}",
             "BCODEX_TEST_REPOSITORY": "ummay0432/bettercodex",
             "BCODEX_TEST_RUSTUP_LOG": str(root / "rustup.log"),
             "BCODEX_TEST_SMOKE_SUCCESS": "1" if smoke_success else "0",
@@ -869,6 +1170,10 @@ def run_installer(
         environment["XDG_CACHE_HOME"] = str(root / "cache")
     if install_revision is not None:
         environment["BCODEX_INSTALL_REVISION"] = install_revision
+    if release_via_environment:
+        environment["BCODEX_INSTALL_RELEASE_TAG"] = f"bcodex-v{VERSION}-{COMMIT}"
+        environment["BCODEX_INSTALL_REVISION"] = COMMIT
+        environment["BCODEX_INSTALL_VERSION"] = VERSION
     if home_enabled:
         environment["HOME"] = str(home)
     else:
@@ -881,6 +1186,35 @@ def run_installer(
         env=environment,
         text=True,
     )
+
+
+def create_prebuilt_asset(
+    root: Path,
+    *,
+    revision: str,
+    smoke_success: bool,
+) -> tuple[Path, str]:
+    binary = textwrap.dedent(
+        f"""\
+        #!/bin/sh
+        version='{VERSION}'
+        source_revision='{revision}'
+        smoke_success={'1' if smoke_success else '0'}
+        case "${{1:-}}" in
+          --version) printf 'bcodex %s\\n' "$version" ;;
+          --internal-source-revision) printf '%s\\n' "$source_revision" ;;
+          --internal-install-smoke)
+            [ "$smoke_success" = 1 ] || exit 12
+            printf 'bcodex %s install smoke passed\\n' "$version"
+            ;;
+          *) exit 13 ;;
+        esac
+        """
+    ).encode()
+    compressed = gzip.compress(binary, compresslevel=9, mtime=0)
+    asset = root / "prebuilt-bcodex.gz"
+    asset.write_bytes(compressed)
+    return asset, hashlib.sha256(compressed).hexdigest()
 
 
 def create_source_archive(root: Path) -> Path:

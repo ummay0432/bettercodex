@@ -9,25 +9,32 @@ local Cargo build exists only as a compatibility fallback.
 ## Outcome
 
 For a supported published target, both a first install and `bcodex update`
-must be a binary download and atomic replacement. The user must not need
-Rust, Cargo, a C compiler, a source checkout, or gigabytes of build space.
+must be a binary download and atomic replacement. The user must not need Rust,
+Cargo, a C compiler, a source checkout, or gigabytes of build space. In
+particular, `bcodex update` itself never invokes a source fallback.
 
 The normal update path must:
 
 1. resolve one published BetterCodex release;
-2. select the native asset;
-3. download roughly one compressed binary;
-4. verify its digest, version, embedded source revision, and runtime resources;
+2. select the exact native delta from the installed revision when one exists,
+   otherwise select the full native update asset;
+3. stream that one asset into a staged executable;
+4. verify its GitHub-reported size and digest, version, embedded source
+   revision, and runtime resources;
 5. atomically replace the installed executable; and
 6. remove the downloaded archive and staging files.
 
 It must compile zero Cargo packages.
 
-The current Linux x86-64 `bcodex` executable is 67,385,384 bytes and compresses
-to 25,392,267 bytes with `gzip -9`. These are observations, not fixed format
-limits, but they establish the expected order of magnitude. The roughly
-2.5 GB seen during a source update is predominantly locally generated compiler
-output, not network download volume.
+The pre-optimization Linux x86-64 `bcodex` executable is 67,385,384 bytes and
+compresses to 25,392,260 bytes with `gzip -9` or 19,482,024 bytes with
+single-threaded `zstd -19`. The first size-optimized distribution candidate is
+53,381,160 bytes raw, 21,960,015 bytes in gzip, and 17,581,630 bytes in
+single-threaded `zstd --ultra -22`. A real raw-prefix patch from that installed
+predecessor is 8,771,401 bytes. These are observations, not fixed format
+limits, but they establish the expected order of magnitude. The roughly 2.5 GB
+seen during a source update is
+predominantly locally generated compiler output, not network download volume.
 
 ## Why the installed Codex executable cannot be reused
 
@@ -50,6 +57,23 @@ Therefore this design mirrors Codex's prebuilt platform packages while shipping
 BetterCodex binaries. It does not depend on, modify, or duplicate an installed
 Codex package.
 
+## Why the Cargo package count is not the user payload
+
+The dependency audit found 462 entries in `Cargo.lock`, roughly 305 packages in
+the normal Linux runtime graph, and 359 when all supported targets are
+considered. Every direct Cargo dependency is referenced by retained source or
+build behavior. The largest transitive groups implement HTTPS, async I/O,
+websockets, V8, terminal rendering, clipboard access, image handling, and audio
+input; deleting them wholesale would delete product behavior rather than dead
+update code.
+
+Cargo's compile count includes transitive libraries, procedural macros, build
+scripts, and host/target variants. Its multi-gigabyte `target` directory is
+uncompressed object code, archives, metadata, and linker scratch space. It is
+not a package bundle that native-release users download. Dead dependency work
+should continue when a retained feature is removed or a crate is demonstrably
+unreferenced, but package-count reduction is not the update architecture.
+
 ## Distribution channel
 
 GitHub Releases is the binary distribution channel. GitHub Actions and GitHub
@@ -71,10 +95,13 @@ user's machine:
 
 ### Release identity
 
-Every release corresponds to one immutable, full Git source revision.
+Every release corresponds to one package version and one immutable, full Git
+source revision. Encoding both in the tag lets the installer verify
+`bcodex --version` without downloading source or trusting a value reported by
+the candidate executable itself.
 
-- Tag: `bcodex-<40-lowercase-hex-source-revision>`
-- Release title: `BetterCodex <12-character-short-revision>`
+- Tag: `bcodex-v<package-version>-<40-lowercase-hex-source-revision>`
+- Release title: `BetterCodex <package-version> (<12-character-short-revision>)`
 - Release type: non-draft and non-prerelease once complete
 - Tag target: exactly the revision encoded in the tag
 
@@ -92,31 +119,48 @@ bad, publish a new source revision and release rather than replacing old bytes.
 
 ## Supported assets
 
-A complete release contains one gzip-compressed executable and one checksum
-file for every supported target:
+A complete release contains a portable bootstrap asset and a faster direct-
+update asset for every supported target:
 
-| System | Rust target | Binary asset |
-| --- | --- | --- |
-| Linux x86-64 | `x86_64-unknown-linux-gnu` | `bcodex-x86_64-unknown-linux-gnu.gz` |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` | `bcodex-aarch64-unknown-linux-gnu.gz` |
-| macOS Intel | `x86_64-apple-darwin` | `bcodex-x86_64-apple-darwin.gz` |
-| macOS Apple Silicon | `aarch64-apple-darwin` | `bcodex-aarch64-apple-darwin.gz` |
+| System | Rust target | Bootstrap asset | Direct-update asset |
+| --- | --- | --- | --- |
+| Linux x86-64 | `x86_64-unknown-linux-gnu` | `bcodex-x86_64-unknown-linux-gnu.gz` | `bcodex-x86_64-unknown-linux-gnu.zst` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | `bcodex-aarch64-unknown-linux-gnu.gz` | `bcodex-aarch64-unknown-linux-gnu.zst` |
+| macOS Intel | `x86_64-apple-darwin` | `bcodex-x86_64-apple-darwin.gz` | `bcodex-x86_64-apple-darwin.zst` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `bcodex-aarch64-apple-darwin.gz` | `bcodex-aarch64-apple-darwin.zst` |
 
-The checksum asset appends `.sha256` to the binary asset name. Its complete
+Each base asset has a checksum file formed by appending `.sha256`. Its complete
 contents are one line in this format:
 
 ```text
 <64-lowercase-hex-sha256>  <binary-asset-name>
 ```
 
-Gzip is selected because it reduces the current binary to about 25 MB and is
-available by default on supported macOS and Linux systems. Requiring npm, xz,
-zstd, a package manager, or another decompressor would make the bootstrap less
-portable.
+Gzip is selected for bootstrap because it reduces the optimized binary to about
+22 MB and is available by default on supported macOS and Linux systems.
+Requiring npm, xz, zstd, a package manager, or another decompressor would make
+first install less portable. Once `bcodex` is installed, its existing Rust
+`zstd` dependency can stream-decompress the smaller direct-update asset without
+an external command or temporary archive.
 
-A release must not be published until all four asset pairs pass their native
-verification. The source fallback is a safety valve, not permission to publish
-chronically incomplete releases.
+When a previous complete release exists, the publisher additionally creates a
+target-specific raw-prefix patch:
+
+```text
+bcodex-<target>-from-<previous-40-character-revision>.patch.zst
+```
+
+and its `.sha256`. The patch is optional optimization data, not a prerequisite
+for a complete release. It must reproduce the new executable byte for byte when
+decoded against the exact previous published executable. The updater selects a
+patch only when its embedded current revision matches the filename, and falls
+back to the full `.zst` after any patch download, decompression, digest, or
+candidate-verification failure.
+
+A release must not be published until all four targets' `.gz`, `.gz.sha256`,
+`.zst`, and `.zst.sha256` base assets pass native verification. The bootstrap
+source fallback is a safety valve, not permission to publish chronically
+incomplete releases.
 
 ## Release build contract
 
@@ -137,7 +181,10 @@ The resulting executable must satisfy all of the following before upload:
   directory;
 - every embedded system resource materializes and verifies;
 - the executable is stripped of unnecessary release symbols;
-- the gzip asset's SHA-256 matches its checksum file; and
+- both full compressed assets reproduce the executable byte for byte and match
+  their checksum files;
+- any predecessor patch reproduces the executable byte for byte against the
+  verified previous release binary; and
 - a clean native test machine can execute the decompressed bytes.
 
 Linux release builds must use a controlled compatibility environment rather
@@ -163,15 +210,17 @@ it is run, but invocation is explicit.
 The publication sequence is:
 
 1. Select a clean candidate commit and run all repository checks.
-2. Create the annotated `bcodex-<revision>` tag at exactly that commit.
+2. Create the annotated `bcodex-v<version>-<revision>` tag at exactly that
+   commit.
 3. Create a draft GitHub Release for the tag.
 4. On each trusted build host, check out the tag and run the native release
    packaging command.
-5. Have that command verify the binary, create the `.gz` and `.sha256` files,
-   and upload only its target's pair to the draft release.
-6. Independently download each pair from the draft or staging output and verify
-   its digest and target-specific smoke-test evidence.
-7. Confirm all four target pairs are present and uniquely named.
+5. Have that command verify the binary, create the target's `.gz`, `.zst`, and
+   checksum files, optionally create the predecessor patch, and upload only
+   that target's assets to the draft release.
+6. Independently download each asset set from the draft or staging output and
+   verify its digest, reconstruction, and target-specific smoke-test evidence.
+7. Confirm all four targets' base assets are present and uniquely named.
 8. Publish the release as a non-prerelease.
 9. Fast-forward or merge public `main` to include the released commit.
 
@@ -187,6 +236,23 @@ The packaging command must refuse:
 
 Uploading with `--clobber` is allowed only while repairing an unpublished draft.
 It is forbidden after publication.
+
+The checked-in host-native command is:
+
+```sh
+scripts/publish-release.sh /absolute/output/directory
+scripts/publish-release.sh --upload
+```
+
+The first form creates an inspected local asset set. The second requires an
+already-created draft release and uploads the current host's set. It refuses a
+dirty checkout, an untagged `HEAD`, a lightweight or mismatched tag, a
+non-draft destination, an unsupported target, a failed smoke test, and a Linux
+binary above the compatibility floor. It resolves the previous published
+release, verifies that target's prior bytes, and emits a compact patch when
+possible. Creating and publishing the draft remain separate explicit `gh
+release` operations so packaging a binary can never make it public
+accidentally.
 
 ## Update discovery
 
@@ -208,12 +274,10 @@ installer, filesystem-cache, Rust, or compiler work.
 ## Prebuilt install and update protocol
 
 The one-line bootstrap fetches the small canonical installer from public
-`main`. The explicit updater fetches the installer from the exact released
-source revision it just resolved and passes both the release tag and revision
-to it. This avoids a duplicate initial metadata lookup and keeps installer
-behavior paired with the release source.
+`main`. It uses only the portable `.gz` asset and adjacent checksum, because a
+new machine cannot be assumed to have a zstd executable.
 
-For the selected release, the installer must:
+For the selected release, the bootstrap installer must:
 
 1. Validate the repository, tag, revision, operating system, and architecture.
 2. Derive the exact target and deterministic asset names.
@@ -243,9 +307,42 @@ The prebuilt path must check only tools it actually needs: `/bin/sh`, `curl`, a
 SHA-256 implementation, `gzip`, and basic POSIX filesystem tools. It must not
 check for or install rustup, Cargo, or a C compiler.
 
+Release-aware binaries do not fetch or execute the shell installer.
+`bcodex update` must:
+
+1. Request the latest published release once and parse its tag and asset
+   metadata with a bounded response size.
+2. Exit immediately if the embedded revision is already current.
+3. Require exactly one full `bcodex-<target>.zst` asset with a nonzero bounded
+   size and canonical GitHub-provided `sha256:` digest.
+4. Prefer exactly one
+   `bcodex-<target>-from-<current-revision>.patch.zst` when present and valid.
+5. Stream `curl` output through a bounded zstd decoder into a newly created
+   stage beside the destination while hashing the compressed bytes. It must not
+   retain the compressed asset on disk.
+6. Require the exact GitHub-reported compressed byte count and SHA-256, cap the
+   decompressed executable at 128 MiB, and cap the zstd window at 27.
+7. For a patch, use the running executable bytes as the raw reference prefix.
+   If those bytes cannot be read, are unexpectedly large, or produce any
+   invalid candidate, discard the stage and retry once with the full asset.
+8. Verify version, full embedded revision, executable mode, and the isolated
+   install smoke test before activation.
+9. Atomically rename the verified stage over `bcodex`, sync the destination
+   directory, release the shared install lock, and remove retired source-update
+   caches.
+
+The direct updater needs only the already-running `bcodex` and `curl`. It does
+not invoke a shell, `gzip`, a checksum utility, Rust, Cargo, a compiler, or the
+source fallback. The one release response supplies both selection metadata and
+GitHub's independently calculated asset size and SHA-256, so a changed update
+performs one metadata request and one successful asset transfer. A release
+published after that lookup is handled by the next background check; the
+selected immutable release remains internally coherent and does not need a
+second race-check request.
+
 ## Source-build fallback
 
-The source path remains available for three cases:
+The bootstrap installer's source path remains available for three cases:
 
 - no BetterCodex release has been published yet;
 - the native asset is genuinely absent for a supported release; or
@@ -253,7 +350,12 @@ The source path remains available for three cases:
   baseline.
 
 A transient metadata or asset download failure must be retried and then
-reported. It must not unexpectedly turn into a multi-gigabyte local build.
+reported. It must not unexpectedly turn into a multi-gigabyte local build. A
+release-aware `bcodex update` with a missing or invalid direct-update asset
+reports the publication error and preserves the current executable; it never
+enters this fallback. A user may explicitly rerun the bootstrap installer after
+reading its source-build warning when compatibility fallback is actually
+needed.
 
 Before fallback, the installer prints a conspicuous explanation that a prebuilt
 asset was unavailable and that the local build requires Rust, a native C
@@ -306,14 +408,18 @@ release asset is temporary and is not retained after a successful update.
 ## Failure and downgrade behavior
 
 - A missing or invalid latest-release response does not modify the install.
-- A missing checksum or asset does not install unverified bytes.
+- A missing bootstrap checksum or required base asset does not install
+  unverified bytes.
 - A checksum mismatch is fatal and must name the expected asset.
 - A staged binary with the wrong source revision is fatal even if its version
   string matches.
-- A runtime compatibility failure may offer or enter the documented source
-  fallback; it never replaces the working executable first.
-- A release published while an update is in progress causes a bounded retry.
-- Continuously changing releases stop after three attempts.
+- A bootstrap runtime compatibility failure may enter the documented source
+  fallback; it never replaces the working executable first. The direct updater
+  reports the failure without compiling.
+- A compact-patch failure retries the same immutable release with its full
+  update asset.
+- A release published during a bootstrap install causes a bounded retry;
+  continuously changing releases stop after three attempts.
 - Automatic downgrade is forbidden. An explicitly requested older tag may be a
   future maintainer feature but is not part of `bcodex update`.
 - Interrupted installs leave a cleanup record so the next invocation can
@@ -325,7 +431,9 @@ GitHub repository write access is already the authority for BetterCodex source
 and installer changes. Release assets use the same authority. TLS authenticates
 downloads; immutable release tags bind them to one source revision; SHA-256
 detects corruption; the embedded revision and install smoke test prevent a
-wrong or incomplete binary from being activated.
+wrong or incomplete binary from being activated. GitHub's release API reports
+an asset's server-calculated `sha256:` digest and exact byte count; the direct
+updater validates both while streaming.
 
 Checksums hosted beside an asset are not a substitute for an independent
 signature if the GitHub account is compromised. A later hardening phase may add
@@ -340,10 +448,9 @@ response and asset sizes, and never evaluates downloaded metadata as shell.
 
 ## Test requirements
 
-Hermetic installer tests must cover:
+Hermetic bootstrap-installer tests must cover:
 
 - all four operating-system and architecture mappings;
-- an already-current release with no binary download;
 - a successful prebuilt first install and update without `cargo`, `rustup`, or
   `cc` on `PATH`;
 - exact release tag, asset URL, checksum URL, and embedded revision propagation;
@@ -361,6 +468,21 @@ Hermetic installer tests must cover:
 - post-prebuilt cleanup of only known source-updater caches; and
 - orphaned lock, stage, and temporary-tree recovery.
 
+Hermetic direct-updater tests must cover:
+
+- an already-current release with no asset download;
+- bounded release metadata and all four native target mappings;
+- exact full and predecessor-patch asset names;
+- full and raw-prefix zstd reconstruction;
+- GitHub size and digest mismatch, truncated input, corrupt frames, excessive
+  windows, and decompression limits;
+- patch failure followed by one full-asset attempt;
+- wrong version, wrong embedded revision, and failed resource smoke test;
+- destination symlink and non-regular-file rejection;
+- preservation of the old executable and cleanup of stages on every failure;
+- active and stale lock handling shared with the bootstrap installer; and
+- proof that no shell, Cargo, compiler, or source path is invoked.
+
 Native release qualification must additionally test each asset on its minimum
 supported operating-system baseline and run the actual compressed download,
 digest, decompression, smoke, and atomic-install path.
@@ -372,8 +494,11 @@ The prebuilt path is complete when all of the following are true:
 - `bcodex update` compiles zero packages for every published supported target;
 - users do not need Rust, Cargo, a C compiler, npm, Homebrew, or GitHub CLI;
 - an unchanged installation exits after one bounded release lookup;
-- a changed installation downloads only the checksum and one native compressed
-  executable, expected to be tens rather than hundreds or thousands of MB;
+- a changed `bcodex update` downloads one native compressed delta when
+  available, otherwise one full zstd executable expected to be roughly 18 MB,
+  with no separate checksum request;
+- a first install downloads one gzip executable and its checksum, expected to
+  total roughly 22 MB;
 - no GitHub Actions workflow or GitHub Packages dependency is introduced;
 - release bytes are tied to an immutable source revision and verified before
   replacement;
@@ -381,24 +506,26 @@ The prebuilt path is complete when all of the following are true:
 - temporary update files are removed on success and recoverable after a crash;
 - old source-build caches can be reclaimed after a successful prebuilt update;
   and
-- source fallback remains correct but is clearly identified as the exceptional
-  slow path.
+- source fallback remains correct but is clearly identified as an exceptional
+  bootstrap-only slow path.
 
 The operational goal on a typical broadband connection is an update measured
-in seconds, dominated by downloading and verifying an approximately 25 MB
-archive. Any normal update that invokes Cargo fails this specification.
+in seconds, dominated by downloading and verifying a compact predecessor patch
+or an approximately 18 MB full update. Any `bcodex update` that invokes Cargo
+fails this specification.
 
 ## Rollout
 
-1. Implement release-aware discovery and the prebuilt installer path behind
-   hermetic tests.
-2. Add the explicit native packaging/upload command; do not add Actions.
+1. Implement release-aware discovery, the prebuilt bootstrap path, and direct
+   zstd/delta updating behind hermetic tests.
+2. Add the explicit native packaging/upload command for both full formats and
+   predecessor patches; do not add Actions.
 3. Qualify Linux binaries against the glibc floor and macOS binaries against
    the deployment target.
 4. Prepare all four assets in a draft release for one candidate revision.
 5. Publish that immutable release and move public `main` to include it.
-6. Use the existing source installer once only where needed to migrate older
-   binaries to release-aware update discovery.
+6. Use the bootstrap installer once where needed to migrate older source-
+   updating binaries to direct release updates.
 7. After the first successful real update on every target, make this document
-   accepted and update `README.md`, `docs/install.md`, CLI help, and migration
-guidance to describe releases as the distribution channel.
+   accepted and confirm `README.md`, `docs/install.md`, CLI help, and migration
+   guidance describe releases as the distribution channel.
