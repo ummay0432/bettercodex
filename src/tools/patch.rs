@@ -365,15 +365,18 @@ enum VirtualFile {
 }
 
 fn missing_file_error() -> std::io::Error {
-    std::io::Error::from_raw_os_error(libc::ENOENT)
+    std::io::Error::new(std::io::ErrorKind::NotFound, "file was not found")
 }
 
 fn directory_error() -> std::io::Error {
-    std::io::Error::from_raw_os_error(libc::EISDIR)
+    std::io::Error::new(std::io::ErrorKind::IsADirectory, "path is a directory")
 }
 
 fn not_directory_error() -> std::io::Error {
-    std::io::Error::from_raw_os_error(libc::ENOTDIR)
+    std::io::Error::new(
+        std::io::ErrorKind::NotADirectory,
+        "path component is not a directory",
+    )
 }
 
 fn parent_error(target: &Path) -> String {

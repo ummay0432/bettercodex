@@ -9,6 +9,8 @@ the least amount of changes possible. This is where bettercodex differs: it lets
 the model stretch its legs and live up to its potential. It gives the model the
 freedom to be proactive.
 
+Always write the project name as `bettercodex`, never `BetterCodex`.
+
 Do not use emojis, except for Codex's established checkmark status marker.
 
 Rust builds and tests must clean up task-owned temporary files, fixtures,

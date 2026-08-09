@@ -1,0 +1,118 @@
+name: windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-windows:
+    name: Native Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      BCODEX_CACHE_DIR: ${{ runner.temp }}\bettercodex-windows-cache
+      CARGO_TARGET_DIR: ${{ runner.temp }}\bettercodex-windows-cache\build\x86_64-pc-windows-msvc\target
+      RUST_BACKTRACE: 1
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Verify Rust and PowerShell formatting and syntax
+        shell: powershell
+        run: |
+          cargo fmt --all -- --check
+          $failed = $false
+          foreach ($script in @('scripts/cargo-with-v8.ps1', 'scripts/install.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -ne 0) {
+              $errors | Format-List | Out-String | Write-Error
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1 -ValidateOnly
+
+      - name: Check all Windows targets
+        shell: powershell
+        run: |
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 check --locked --tests
+
+      - name: Run native Windows tests
+        shell: powershell
+        run: |
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 test --locked --no-fail-fast
+
+      - name: Clippy
+        shell: powershell
+        run: |
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 clippy --locked --all-targets -- -D warnings
+
+      - name: Build and smoke-test the release executable
+        shell: powershell
+        run: |
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 build --release --locked --bin bcodex
+          $smoke = Join-Path $env:RUNNER_TEMP 'bettercodex-release-smoke'
+          New-Item -ItemType Directory -Force -Path "$smoke\profile", "$smoke\local-app-data", "$smoke\codex", "$smoke\bcodex", "$smoke\workspace" | Out-Null
+          $env:USERPROFILE = "$smoke\profile"
+          $env:LOCALAPPDATA = "$smoke\local-app-data"
+          $env:CODEX_HOME = "$smoke\codex"
+          $env:BCODEX_HOME = "$smoke\bcodex"
+          $env:BCODEX_SKIP_UPDATE_CHECK = '1'
+          Push-Location "$smoke\workspace"
+          try {
+            & "$env:CARGO_TARGET_DIR\release\bcodex.exe" --internal-install-smoke
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Test exact-main PowerShell installation and same-revision no-op
+        if: github.event_name != 'pull_request'
+        shell: powershell
+        env:
+          BCODEX_INSTALL_DIR: ${{ runner.temp }}\bettercodex-installed\bin
+          BCODEX_INSTALL_REVISION: ${{ github.sha }}
+          BCODEX_REPOSITORY: ${{ github.repository }}
+        run: |
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1
+          & "$env:BCODEX_INSTALL_DIR\bcodex.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $revision = (& "$env:BCODEX_INSTALL_DIR\bcodex.exe" --internal-source-revision) -join "`n"
+          if ($revision.Trim() -cne $env:BCODEX_INSTALL_REVISION) {
+            throw "installed revision $revision did not match $env:BCODEX_INSTALL_REVISION"
+          }
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1
+
+      - name: Clean task-owned Windows artifacts
+        if: always()
+        shell: powershell
+        run: |
+          Get-Process cargo,rustc -ErrorAction SilentlyContinue | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+          foreach ($owned in @(
+            "$env:RUNNER_TEMP\bettercodex-windows-cache",
+            "$env:RUNNER_TEMP\bettercodex-release-smoke",
+            "$env:RUNNER_TEMP\bettercodex-installed"
+          )) {
+            Remove-Item -LiteralPath $owned -Recurse -Force -ErrorAction SilentlyContinue
+          }

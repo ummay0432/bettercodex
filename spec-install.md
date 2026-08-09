@@ -18,8 +18,9 @@ Releases are outside the update decision.
 - A build installs the source commit selected before its archive download
   begins. The explicit updater fetches its installer from that same commit.
 - No unverified candidate replaces an existing command.
-- The normal path is identical on macOS ARM64, macOS x86-64, Linux ARM64, and
-  Linux x86-64.
+- The source-selection, build-input, staging, smoke, and revision-verification
+  contract is identical on macOS ARM64, macOS x86-64, Linux ARM64, Linux
+  x86-64, and Windows x86-64. Commit mechanics remain target-native.
 
 ## Revision discovery
 
@@ -45,16 +46,19 @@ reported and never interpreted as evidence that the current binary is fresh.
 
 ## Bootstrap installation
 
-The canonical one-line command fetches `scripts/install.sh` from public `main`.
-Unless `BCODEX_INSTALL_REVISION` already supplies a valid full revision, that
+The canonical Unix command fetches `scripts/install.sh`; the native Windows
+command fetches `scripts/install.ps1`. Both come from public `main`. Unless
+`BCODEX_INSTALL_REVISION` already supplies a valid full revision, the selected
 script resolves public `main` once. It downloads only the codeload archive for
 the selected immutable commit and must not consult package registries, tags, or
 GitHub Releases to select a version.
 
 The source build must:
 
-1. Require a checked-in `Cargo.lock`, pinned `rust-toolchain.toml`, executable
-   Cargo/V8 wrapper, rustup, and a working native C compiler.
+1. Require a checked-in `Cargo.lock`, pinned `rust-toolchain.toml`, target-native
+   Cargo/V8 wrapper, rustup, and a working native C compiler. Windows requires
+   the x64 MSVC C++ workload and Windows SDK and may initialize its installed
+   Visual Studio developer environment automatically.
 2. Hash release-relevant source contents and build with `--release --locked
    --bin bcodex`, Cargo incremental compilation enabled, that hash as a tracked
    compiler input, and no source-revision input that would invalidate compiler
@@ -69,23 +73,34 @@ The source build must:
    commit.
 6. Run staged `bcodex --internal-install-smoke` with isolated user and
    application homes, covering V8 startup and every embedded resource.
-7. Atomically rename the verified staged bytes over the destination.
+7. Atomically rename the verified staged bytes over the destination. When a
+   running Windows executable prevents replacement, start a bounded finalizer
+   that holds the exact updater process identity, waits for its exit, rechecks
+   the candidate digest, moves the old executable to an install-owned backup,
+   commits the candidate, verifies it, and restores the backup on failure.
 8. Verify the installed version and revision again before reporting success.
 
-The destination defaults to `$HOME/.local/bin` and may be overridden only with
-an absolute `BCODEX_INSTALL_DIR`. Symlinked destinations are rejected.
+The Unix destination defaults to `$HOME/.local/bin`; the Windows destination
+defaults to `%LOCALAPPDATA%\Programs\bettercodex\bin`. Either may be overridden
+only with an absolute `BCODEX_INSTALL_DIR`. Symlinked destinations, Windows
+junctions, and other reparse-point redirections are rejected.
 
 ## Explicit update
 
 `bcodex update` requires a valid embedded source revision, resolves public
 `main`, and exits successfully when the revisions match. If they differ, it:
 
-1. Fetches `scripts/install.sh` from the resolved commit, not from a moving
-   branch.
-2. Requires a non-empty, bounded response beginning with `#!/bin/sh`.
-3. Runs `/bin/sh -s` with the running binary's directory as
-   `BCODEX_INSTALL_DIR`, the selected commit as `BCODEX_INSTALL_REVISION`, and
-   the validated repository as `BCODEX_REPOSITORY`.
+1. Fetches the target-native `scripts/install.sh` or `scripts/install.ps1` from
+   the resolved commit, not from a moving branch.
+2. Requires a non-empty, bounded response with the target-native shell marker.
+3. On Unix, runs `/bin/sh -s`. On Windows, writes the bounded verified response
+   to a private temporary file and invokes `powershell.exe -NoProfile
+   -ExecutionPolicy Bypass -File`; it does not route PowerShell through
+   `cmd.exe` or interpolate a command string. Both receive the running binary's
+   directory as `BCODEX_INSTALL_DIR`, the selected commit as
+   `BCODEX_INSTALL_REVISION`, and the validated repository as
+   `BCODEX_REPOSITORY`. Windows also receives the updater PID so the installer
+   can bind deferred replacement to that process's start identity.
 4. Lets the installer perform the complete source-build and replacement
    contract above.
 
@@ -105,7 +120,8 @@ not create a notice.
 ## Cache and resource bounds
 
 The installer may retain dependency downloads and one native-target Cargo build
-cache below `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. Cargo owns
+cache below `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex` on Unix or
+`%LOCALAPPDATA%\bettercodex\cache` on Windows. Cargo owns
 fine-grained invalidation for compiler, profile, manifest, lockfile, feature,
 build-script, dependency, and source changes. The installer must not discard the
 target merely because the manifest, lockfile, or wrapper changed. A content hash
@@ -115,8 +131,8 @@ The native cache retains dependency artifacts, the unstamped bettercodex build,
 fingerprints, and incremental bettercodex state. Source archives, extracted
 source, temporary Rust toolchains, compiler scratch, and staged executables are
 disposable. Cleanup must run after success and failure without following
-symlinks. If no cache home exists, all downloads and build output are
-disposable.
+symlinks or reparse points. If no cache home exists, all downloads and build
+output are disposable.
 
 Network payloads and metadata have explicit maximum sizes. Compilation happens
 once for the selected revision even if `main` changes during the build. A later
@@ -130,8 +146,9 @@ launch detects any newer revision.
 - Failed extraction, compilation, embedded-revision verification, runtime smoke
   test, staging, or final verification preserves the installed command.
 - An active install lock rejects concurrent mutation.
-- A stale lock may remove only the temporary tree and stage recorded by the
-  installer, then retries acquisition.
+- A stale transaction may remove only its validated temporary tree, candidate,
+  and backup. On Windows, a missing destination is restored from that
+  transaction's backup before cleanup.
 - PATH setup failure does not invalidate an otherwise verified installation;
   the installer prints the manual action.
 
@@ -145,4 +162,7 @@ same-metadata manifest and lockfile changes, build-input verification,
 revision-marker staging,
 symlink refusal, stale and active locks, atomic preservation on every failed
 verification, moving-`main` behavior, PATH handling, and cleanup with and
-without persistent cache homes.
+without persistent cache homes. Native Windows coverage additionally requires
+PowerShell syntax, V8 checksum, `.exe` staging, reparse refusal, exact-process
+deferred replacement, sharing-violation retry, rollback, release smoke, and
+same-revision no-op tests.

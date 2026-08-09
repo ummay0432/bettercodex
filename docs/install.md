@@ -10,17 +10,32 @@ display metadata; they do not decide whether an installation is current.
 | --- | --- |
 | macOS 12+ | Apple Silicon and Intel |
 | Linux with glibc 2.31+ | ARM64 and x86-64 |
+| Windows 11 | x86-64 |
 
-Windows is not supported. A public install requires `curl`, several gigabytes
-of free space, and network access to GitHub and the official Rust download
-servers. The installer supplies its own [rustup](https://rustup.rs/) and pinned
-Rust toolchain when necessary. If native C/C++ build tools are missing, it
-installs the distribution's development-tool package through `apt-get`, `dnf`,
-`yum`, `zypper`, `pacman`, or `xbps-install`; privilege escalation may request
-the operator's password. On a new Mac it starts Apple's Xcode Command Line
-Tools installer. Finish the macOS system dialog and rerun the command once.
+Native Windows 10 version 1809 or newer has the required ConPTY API but remains
+best effort; use current Windows 11 for the supported experience. WSL runs the
+Linux binary and follows the Linux instructions, not the native Windows flow.
+
+A public install requires several gigabytes of free space and network access to
+GitHub and the official Rust download servers. The installer supplies its own
+[rustup](https://rustup.rs/) and pinned Rust toolchain when necessary. Unix
+installation also requires `curl`. If native C/C++ build tools are missing on
+Linux, the installer installs the distribution's development-tool package;
+privilege escalation may request the operator's password. On a new Mac it
+starts Apple's Xcode Command Line Tools installer. Finish the macOS system
+dialog and rerun the command once.
+
+Native Windows additionally requires PowerShell 5.1 or PowerShell 7, the
+Windows `tar.exe`, and Visual Studio 2022 Build Tools with **Desktop development
+with C++** and a Windows 10 or 11 SDK. Install those prerequisites from
+[Microsoft's C++ Build Tools page](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+before running the source installer. The first local release build can use
+roughly 6–10 GiB for Rust, dependency, V8, and compiled-artifact caches; the
+installed product itself remains one `bcodex.exe`.
 
 ## Install
+
+### macOS and Linux
 
 Run the repository's canonical [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt):
 
@@ -54,6 +69,28 @@ adds a managed PATH block to the appropriate shell profile when necessary and
 reports any older `bcodex` that appears earlier on `PATH`. Set the absolute
 `BCODEX_INSTALL_DIR` environment variable to choose another binary directory.
 
+### Native Windows
+
+In Windows PowerShell 5.1:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.ps1' | iex"
+```
+
+PowerShell 7 users can run the equivalent command with `pwsh`. This invocation
+does not change the machine-wide execution policy. The installer pins public
+`main`, downloads that exact source archive, initializes the installed Visual
+Studio build environment, obtains the pinned Rust toolchain and verified
+sandboxed V8 pair, builds and smoke-tests `bcodex.exe`, then commits only the
+verified candidate.
+
+The default Windows command directory is
+`%LOCALAPPDATA%\Programs\bettercodex\bin`; reusable build state is under
+`%LOCALAPPDATA%\bettercodex\cache`. Set an absolute `BCODEX_INSTALL_DIR` or
+`BCODEX_CACHE_DIR` before invoking the script to override either location. The
+installer updates the current process PATH and the case-insensitive per-user
+PATH without duplicating entries. Open a new terminal after first installation.
+
 After installation, open a new terminal when requested, then run:
 
 ```sh
@@ -82,8 +119,11 @@ that same immutable commit and passes the pinned commit to it, so the script and
 the source snapshot cannot drift apart. The installer reuses cached downloads
 and Cargo's fine-grained compilation state, performs all verification again,
 and atomically replaces the command. A manifest or lockfile edit recompiles
-only affected artifacts; it never erases the whole target first. Restart a
-running TUI to use the new binary.
+only affected artifacts; it never erases the whole target first. On Windows,
+where the running executable cannot be replaced, the verified installer starts
+a bounded PowerShell finalizer. The updater exits, the finalizer verifies that
+exact process identity, replaces `bcodex.exe` with rollback protection, and
+verifies the visible revision. Restart a running TUI to use the new binary.
 
 Update checks do not compare Cargo versions, Git tags, or GitHub Releases. Set
 `BCODEX_SKIP_UPDATE_CHECK=1` to disable the background check. The explicit
@@ -131,6 +171,12 @@ so a later invocation can recover an orphan left by an untrappable crash. Any
 failed download, extraction, build, smoke test, copy, or verification leaves an
 existing installed binary untouched.
 
+On Windows the same checks cover junctions and other reparse points. Candidate,
+backup, and transaction files stay under one uniquely named install-owned
+directory beside `bcodex.exe`; a later invocation recovers only a validated
+transaction record. Bounded retries cover transient sharing violations, while
+permission and reparse failures stop immediately.
+
 Without `HOME` or `XDG_CACHE_HOME`, rustup, the pinned Rust toolchain, dependency
 downloads, and build output stay inside the disposable installation tree and
 are removed afterward.
@@ -144,6 +190,13 @@ Use the checked-in wrapper so the V8 archive and binding match the crate:
 ./scripts/cargo-with-v8.sh run --bin bcodex
 ```
 
+On native Windows, use the target-specific wrapper instead:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 build --locked
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 run --bin bcodex
+```
+
 Development builds intentionally have no embedded distribution revision and do
 not perform update checks. To install a checkout manually:
 
@@ -151,6 +204,10 @@ not perform update checks. To install a checkout manually:
 ./scripts/cargo-with-v8.sh install --locked --path . --force \
   --root "$HOME/.local"
 ```
+
+For a manually built native Windows checkout, use the release executable under
+`target\release\bcodex.exe`; use `scripts/install.ps1` for an installation that
+tracks public `main` and configures PATH.
 
 Use [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt), not a development build,
 for an installation that follows public `main`.
@@ -166,6 +223,10 @@ just test
 just clippy -- -D warnings
 python3 scripts/install_tests.py
 ```
+
+Native Windows validation is defined in [`.github/workflows/windows.yml`](../.github/workflows/windows.yml):
+format and PowerShell syntax checks, `cargo check --tests`, the native test
+suite, Clippy, a release smoke test, and an exact-revision install/no-op cycle.
 
 See [the development workflow](../progressive_disclosure/development.md) for
 the complete contribution procedure.

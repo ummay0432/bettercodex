@@ -234,19 +234,24 @@ fn installation_identity_is_stable_and_state_is_private() {
     let second = Rollout::create_in(&root, &cwd).unwrap();
     assert_eq!(second.identity().installation_id, installation_id);
 
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(
-        std::fs::metadata(first_path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert_eq!(
-        std::fs::metadata(root.join(SESSIONS_DIRECTORY))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(first_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(root.join(SESSIONS_DIRECTORY))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    #[cfg(windows)]
+    assert!(std::fs::metadata(first_path).unwrap().is_file());
 
     drop(second);
     std::fs::remove_dir_all(root).unwrap();
