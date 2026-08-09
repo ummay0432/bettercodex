@@ -46,6 +46,15 @@ function Assert-Equal($Actual, $Expected, [string] $Message) {
     }
 }
 
+function Assert-Eventually([scriptblock] $Condition, [string] $Message) {
+    $Deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ([DateTime]::UtcNow -lt $Deadline) {
+        if (& $Condition) { return }
+        Start-Sleep -Milliseconds 100
+    }
+    throw $Message
+}
+
 function Write-Candidate(
     [string] $Path,
     [string] $ReleaseTag,
@@ -135,6 +144,73 @@ try {
     }
     Assert-True $RollbackFailed 'invalid replacement unexpectedly succeeded'
     Assert-Equal (Get-FileSha256 $Destination) $OldDigest 'failed replacement did not roll back'
+    Assert-True (-not (Test-Path -LiteralPath $Backup)) 'rollback retained its transaction backup'
+
+    $FreshCandidate = Join-Path $TestRoot 'fresh-invalid-candidate.cmd'
+    $FreshDestination = Join-Path $TestRoot 'fresh-installed.cmd'
+    Write-Candidate $FreshCandidate "bcodex-v9.9.9-$('9' * 40)" '9.9.9'
+    $FreshInstallFailed = $false
+    try {
+        Install-Candidate $FreshCandidate $FreshDestination $Tag '1.2.3' $Backup
+    }
+    catch {
+        $FreshInstallFailed = $true
+    }
+    Assert-True $FreshInstallFailed 'invalid fresh installation unexpectedly succeeded'
+    Assert-True (-not (Test-Path -LiteralPath $FreshDestination)) 'failed fresh installation retained its destination'
+
+    $PowerShellPath = (Get-Process -Id $PID).Path
+    $DeferredDestination = Join-Path $TestRoot 'deferred-installed.cmd'
+    $DeferredCandidate = Join-Path $TestRoot 'deferred-candidate.cmd'
+    $DeferredLock = Join-Path $TestRoot 'deferred-install.lock'
+    Write-Candidate $DeferredDestination "bcodex-v1.2.2-$('2' * 40)" '1.2.2'
+    Write-Candidate $DeferredCandidate $Tag '1.2.3'
+    $Waiter = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+        'Start-Sleep -Milliseconds 750'
+    ) -WindowStyle Hidden -PassThru
+    Start-DeferredReplacement `
+        $DeferredCandidate `
+        $DeferredDestination `
+        $Tag `
+        '1.2.3' `
+        (Get-FileSha256 $DeferredCandidate) `
+        $Waiter.Id `
+        $Waiter.StartTime.ToUniversalTime().Ticks `
+        $DeferredLock
+    Assert-Eventually {
+        (-not (Test-Path -LiteralPath $DeferredCandidate)) -and
+        (-not (Test-Path -LiteralPath $DeferredLock))
+    } 'deferred replacement did not finish'
+    Assert-True (Test-BinaryIdentity $DeferredDestination $Tag '1.2.3') 'deferred replacement did not install its candidate'
+    Assert-Equal @(
+        Get-ChildItem -LiteralPath $TestRoot -Filter 'deferred-installed.cmd.backup.*'
+    ).Count 0 'deferred replacement retained a transaction backup'
+
+    $DeferredDigest = Get-FileSha256 $DeferredDestination
+    $DeferredInvalidCandidate = Join-Path $TestRoot 'deferred-invalid-candidate.cmd'
+    Write-Candidate $DeferredInvalidCandidate "bcodex-v9.9.9-$('9' * 40)" '9.9.9'
+    $Waiter = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+        'Start-Sleep -Milliseconds 750'
+    ) -WindowStyle Hidden -PassThru
+    Start-DeferredReplacement `
+        $DeferredInvalidCandidate `
+        $DeferredDestination `
+        $Tag `
+        '1.2.3' `
+        (Get-FileSha256 $DeferredInvalidCandidate) `
+        $Waiter.Id `
+        $Waiter.StartTime.ToUniversalTime().Ticks `
+        $DeferredLock
+    Assert-Eventually {
+        (-not (Test-Path -LiteralPath $DeferredInvalidCandidate)) -and
+        (-not (Test-Path -LiteralPath $DeferredLock))
+    } 'failed deferred replacement did not finish rollback'
+    Assert-Equal (Get-FileSha256 $DeferredDestination) $DeferredDigest 'failed deferred replacement did not roll back'
+    Assert-Equal @(
+        Get-ChildItem -LiteralPath $TestRoot -Filter 'deferred-installed.cmd.backup.*'
+    ).Count 0 'failed deferred replacement retained a transaction backup'
 
     $OriginalLocalAppData = $env:LOCALAPPDATA
     try {

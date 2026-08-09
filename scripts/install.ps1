@@ -272,6 +272,22 @@ function Invoke-WithRetry([scriptblock] $Operation, [string] $Description) {
     Fail "could not $Description"
 }
 
+function Restore-Backup(
+    [string] $Backup,
+    [string] $Destination,
+    [string] $ExpectedSha256
+) {
+    Invoke-WithRetry {
+        [IO.File]::Copy($Backup, $Destination, $true)
+    } 'restore the previous bettercodex binary'
+    if ((Get-FileSha256 $Destination) -cne $ExpectedSha256) {
+        Fail 'restored bettercodex binary does not match the previous installation'
+    }
+    Invoke-WithRetry {
+        [IO.File]::Delete($Backup)
+    } 'remove the bettercodex rollback backup'
+}
+
 function Install-Candidate(
     [string] $Candidate,
     [string] $Destination,
@@ -280,6 +296,7 @@ function Install-Candidate(
     [string] $Backup
 ) {
     $HadDestination = Test-Path -LiteralPath $Destination -PathType Leaf
+    $PreviousSha256 = if ($HadDestination) { Get-FileSha256 $Destination } else { $null }
     try {
         if ($HadDestination) {
             Invoke-WithRetry {
@@ -292,17 +309,36 @@ function Install-Candidate(
         if (-not (Test-BinaryIdentity $Destination $ExpectedTag $ExpectedVersion)) {
             Fail 'installed binary failed final verification'
         }
-        Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $Backup -PathType Leaf) {
+            Invoke-WithRetry {
+                [IO.File]::Delete($Backup)
+            } 'remove the bettercodex rollback backup'
+        }
     }
     catch {
         $Failure = $_
-        if (Test-Path -LiteralPath $Backup -PathType Leaf) {
-            Invoke-WithRetry {
-                [IO.File]::Replace($Backup, $Destination, $null, $true)
-            } 'restore the previous bettercodex binary'
+        try {
+            if (Test-Path -LiteralPath $Backup -PathType Leaf) {
+                Restore-Backup $Backup $Destination $PreviousSha256
+            }
+            elseif (-not $HadDestination) {
+                Invoke-WithRetry {
+                    if (Test-Path -LiteralPath $Destination) {
+                        [IO.File]::Delete($Destination)
+                    }
+                } 'remove the failed bettercodex installation'
+            }
+            elseif ((-not (Test-Path -LiteralPath $Destination -PathType Leaf)) -or
+                (Get-FileSha256 $Destination) -cne $PreviousSha256) {
+                Fail 'replacement failed without a recoverable bettercodex backup'
+            }
         }
-        elseif (-not $HadDestination) {
-            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        catch {
+            $Recovery = if (Test-Path -LiteralPath $Backup -PathType Leaf) {
+                " Previous binary retained at $Backup."
+            }
+            else { '' }
+            throw "installation failed: $($Failure.Exception.Message); rollback failed: $($_.Exception.Message).$Recovery"
         }
         throw $Failure
     }
@@ -330,6 +366,11 @@ function Retry([scriptblock] $Operation) {
         $delay = [Math]::Min($delay * 2, 1000)
     }
 }
+function Restore([string] $Backup, [string] $Destination, [string] $ExpectedSha256) {
+    Retry { [IO.File]::Copy($Backup, $Destination, $true) }
+    if ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExpectedSha256) { throw 'restored bettercodex binary does not match the previous installation' }
+    Retry { [IO.File]::Delete($Backup) }
+}
 $candidate = $env:BCODEX_FINALIZE_CANDIDATE
 $destination = $env:BCODEX_FINALIZE_DESTINATION
 $expectedTag = $env:BCODEX_FINALIZE_TAG
@@ -341,6 +382,7 @@ $lockPath = $env:BCODEX_FINALIZE_LOCK
 $backup = "$destination.backup.$([Guid]::NewGuid().ToString('N'))"
 $lock = $null
 $hadDestination = $false
+$previousSha256 = $null
 try {
     $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
     if ($null -ne $parent -and $parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks -and -not $parent.WaitForExit(300000)) { throw 'timed out waiting for the bettercodex updater process to exit' }
@@ -350,19 +392,33 @@ try {
     if ($null -eq $lock) { throw 'could not acquire the bettercodex install lock' }
     if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedSha256) { throw 'staged bettercodex digest changed before finalization' }
     $hadDestination = Test-Path -LiteralPath $destination -PathType Leaf
-    if ($hadDestination) { Retry { [IO.File]::Replace($candidate, $destination, $backup, $true) } } else { [IO.File]::Move($candidate, $destination) }
+    if ($hadDestination) {
+        $previousSha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        Retry { [IO.File]::Replace($candidate, $destination, $backup, $true) }
+    } else { [IO.File]::Move($candidate, $destination) }
     $tag = (& $destination --internal-release-tag 2>$null) -join "`n"
     $version = (& $destination --version 2>$null) -join "`n"
     if ($tag.Trim() -cne $expectedTag -or $version.Trim() -cne "bcodex $expectedVersion") { throw 'updated bettercodex command failed final verification' }
-    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $backup -PathType Leaf) { Retry { [IO.File]::Delete($backup) } }
     Write-Host "==> Updated bcodex $expectedVersion at $destination"
 } catch {
-    if (Test-Path -LiteralPath $backup -PathType Leaf) { Retry { [IO.File]::Replace($backup, $destination, $null, $true) } } elseif (-not $hadDestination) { Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue }
-    throw
+    $failure = $_
+    try {
+        if (Test-Path -LiteralPath $backup -PathType Leaf) {
+            Restore $backup $destination $previousSha256
+        } elseif (-not $hadDestination) {
+            Retry { if (Test-Path -LiteralPath $destination) { [IO.File]::Delete($destination) } }
+        } elseif ((-not (Test-Path -LiteralPath $destination -PathType Leaf)) -or (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $previousSha256) {
+            throw 'replacement failed without a recoverable bettercodex backup'
+        }
+    } catch {
+        $recovery = if (Test-Path -LiteralPath $backup -PathType Leaf) { " Previous binary retained at $backup." } else { '' }
+        throw "update failed: $($failure.Exception.Message); rollback failed: $($_.Exception.Message).$recovery"
+    }
+    throw $failure
 } finally {
     if ($null -ne $lock) { $lock.Dispose() }
     Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
 }
 '@
@@ -584,7 +640,6 @@ finally {
     if (-not $Deferred) {
         Remove-Item -LiteralPath $Candidate -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
     if (-not $Deferred) {
         Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue
     }
