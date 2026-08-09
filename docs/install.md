@@ -32,10 +32,12 @@ Windows `tar.exe`, and Visual Studio 2022 Build Tools with **Desktop development
 with C++** and a Windows 10 or 11 SDK. Install those prerequisites from
 [Microsoft's C++ Build Tools page](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
 before running the source installer. The first local release build can use
-roughly 6–10 GiB for Rust, dependency, V8, and compiled-artifact caches; the
-installed product itself remains one `bcodex.exe`.
-The installer reports an aggregated per-volume disk preflight before starting
-the long source build.
+roughly 6–10 GiB persistently for Rust, dependency, V8, and compiled-artifact
+caches. For a cold build, the installer reserves 8 GiB of cache headroom,
+2 GiB of temporary-build headroom, and 256 MiB for installation; when those
+paths share a volume, at least 10.25 GiB must be free. The installed product
+itself remains one `bcodex.exe`. The installer aggregates this preflight by
+volume before starting the long source build.
 
 ## Install
 

@@ -395,15 +395,15 @@ $parentTicks = [long]$env:BCODEX_FINALIZE_PARENT_TICKS
 $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
 $root = Split-Path -Parent $manifestPath
 if (-not [string]::Equals($root, (Split-Path -Parent $manifest.candidate), [StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals([string]$manifest.candidate, (Join-Path $root 'candidate.exe'), [StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals([string]$manifest.backup, (Join-Path $root 'backup.exe'), [StringComparison]::OrdinalIgnoreCase)) { throw 'invalid bettercodex finalizer paths' }
-$parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
-if ($null -ne $parent -and $parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks) { $parent.WaitForExit() }
 $lock = $null
 $completed = $false
 try {
-    for ($attempt = 1; $attempt -le 100 -and $null -eq $lock; $attempt++) {
+    for ($attempt = 1; $attempt -le 300 -and $null -eq $lock; $attempt++) {
         try { $lock = New-Object IO.FileStream($manifest.lock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch [IO.IOException] { Start-Sleep -Milliseconds 100 }
     }
     if ($null -eq $lock) { throw 'could not acquire the bettercodex install lock for finalization' }
+    $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+    if ($null -ne $parent -and $parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks) { $parent.WaitForExit() }
     if ((Get-FileHash -LiteralPath $manifest.candidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.sha256) { throw 'staged bettercodex digest changed before finalization' }
     if (Test-Path -LiteralPath $manifest.backup) { Remove-Item -LiteralPath $manifest.backup -Force }
     if (Test-Path -LiteralPath $manifest.destination) { Retry { Move-Item -LiteralPath $manifest.destination -Destination $manifest.backup } }

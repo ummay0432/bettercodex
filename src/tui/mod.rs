@@ -96,6 +96,7 @@ type ResumeTask = JoinHandle<Result<ResumedSession>>;
 type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
 const FRAME_INTERVAL: Duration = Duration::from_millis(32);
 const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(windows)]
 const PASTE_BURST_TICK_INTERVAL: Duration = Duration::from_millis(9);
 const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
 const MAX_READY_AGENT_EVENTS: usize = 4_096;
@@ -286,8 +287,12 @@ impl Runtime {
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut process_ticks = tokio::time::interval(PROCESS_STATUS_INTERVAL);
         process_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        #[cfg(windows)]
         let mut paste_ticks = tokio::time::interval(PASTE_BURST_TICK_INTERVAL);
+        #[cfg(windows)]
         paste_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        #[cfg(not(windows))]
+        let mut paste_ticks = ();
         let mut redraw = true;
 
         loop {
@@ -1108,12 +1113,18 @@ async fn receive_frame_tick(animate: bool, ticks: &mut Interval) {
     }
 }
 
+#[cfg(windows)]
 async fn receive_paste_tick(active: bool, ticks: &mut Interval) {
     if active {
         ticks.tick().await;
     } else {
         pending().await
     }
+}
+
+#[cfg(not(windows))]
+async fn receive_paste_tick(_active: bool, _ticks: &mut ()) {
+    pending().await
 }
 
 async fn receive_agent_event(

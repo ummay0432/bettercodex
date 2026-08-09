@@ -10,6 +10,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::OwnedHandle;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
@@ -21,6 +22,25 @@ use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
 
 const READY_MARKER: &str = "__CODEX_CHILD_READY__";
 const VALUE_MARKER: &str = "__CODEX_CHILD_VALUE__";
+
+struct OwnedTempDirectory(PathBuf);
+
+impl OwnedTempDirectory {
+    fn create(path: PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for OwnedTempDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 struct WindowsShell {
     name: &'static str,
@@ -70,13 +90,14 @@ async fn assert_terminate_kills_descendant(
     python: &str,
     env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    let marker = std::env::temp_dir().join(format!(
+    let fixture = OwnedTempDirectory::create(std::env::temp_dir().join(format!(
         "codex-job-descendant-{backend}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos()
-    ));
+    )))?;
+    let marker = fixture.path().join("survived");
     let child_code = format!(
         "import pathlib,time; print('{READY_MARKER}',flush=True); time.sleep(1); pathlib.Path(bytes.fromhex('{}').decode()).write_text('survived')",
         utf8_hex(&marker.to_string_lossy())
@@ -112,9 +133,6 @@ async fn assert_terminate_kills_descendant(
     );
     tokio::time::sleep(Duration::from_secs(2)).await;
     let survived = marker.exists();
-    if survived {
-        std::fs::remove_file(&marker)?;
-    }
     assert!(!survived, "{backend} descendant survived termination");
     Ok(())
 }
@@ -124,15 +142,15 @@ async fn assert_normal_exit_preserves_descendant(
     python: &str,
     env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    let marker_base = std::env::temp_dir().join(format!(
+    let fixture = OwnedTempDirectory::create(std::env::temp_dir().join(format!(
         "codex-job-natural-exit-{backend}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos()
-    ));
-    let ready_marker = marker_base.with_extension("ready");
-    let survival_marker = marker_base.with_extension("survived");
+    )))?;
+    let ready_marker = fixture.path().join("ready");
+    let survival_marker = fixture.path().join("survived");
     let child_code = format!(
         "import pathlib,time; pathlib.Path(bytes.fromhex('{}').decode()).write_text('ready'); time.sleep(1); pathlib.Path(bytes.fromhex('{}').decode()).write_text('survived')",
         utf8_hex(&ready_marker.to_string_lossy()),
@@ -164,8 +182,6 @@ async fn assert_normal_exit_preserves_descendant(
     drop(session);
 
     let survived = wait_for_path(&survival_marker, Duration::from_secs(10)).await;
-    let _ = std::fs::remove_file(ready_marker);
-    let _ = std::fs::remove_file(survival_marker);
     assert!(survived, "{backend} descendant did not survive normal exit");
     Ok(())
 }

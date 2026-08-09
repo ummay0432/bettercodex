@@ -117,11 +117,17 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          Get-Process cargo,rustc -ErrorAction SilentlyContinue | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+          $rustProcesses = @(Get-Process cargo,rustc -ErrorAction SilentlyContinue)
+          $rustProcesses | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+          $rustStillRunning = @($rustProcesses | Where-Object { -not $_.HasExited }).Count -ne 0
           foreach ($owned in @(
-            "$env:RUNNER_TEMP\bettercodex-windows-cache",
             "$env:RUNNER_TEMP\bettercodex-release-smoke",
             "$env:RUNNER_TEMP\bettercodex-installed"
           )) {
             Remove-Item -LiteralPath $owned -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if ($rustStillRunning) {
+            Write-Warning 'live Cargo or rustc process still references the task-owned build cache; leaving it for runner teardown'
+          } else {
+            Remove-Item -LiteralPath "$env:RUNNER_TEMP\bettercodex-windows-cache" -Recurse -Force -ErrorAction SilentlyContinue
           }

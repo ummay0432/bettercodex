@@ -179,12 +179,33 @@ try {
             (New-Object Text.UTF8Encoding($false))
         )
     }
-    $Parent = Start-TestParent $PowerShellPath 750
+    $Parent = Start-TestParent $PowerShellPath 3000
     $Processes.Add($Parent)
     $ParentTicks = $Parent.StartTime.ToUniversalTime().Ticks
     $Finalizer = Start-DeferredReplacement $Success.Manifest $Parent.Id $ParentTicks $PowerShellPath
     $Processes.Add($Finalizer)
     Assert (Test-Path -LiteralPath $Success.Root) 'finalizer did not wait for the exact parent process'
+    $FinalizerOwnsLock = $false
+    $LockDeadline = [DateTime]::UtcNow.AddSeconds(2)
+    while ([DateTime]::UtcNow -lt $LockDeadline -and -not $Parent.HasExited -and -not $Finalizer.HasExited) {
+        $ProbeLock = $null
+        try {
+            $ProbeLock = New-Object IO.FileStream(
+                (Join-Path $TestRoot '.bcodex-install.lock'),
+                [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None
+            )
+        }
+        catch [IO.IOException] {
+            $FinalizerOwnsLock = $true
+        }
+        finally {
+            if ($null -ne $ProbeLock) { $ProbeLock.Dispose() }
+        }
+        if (-not $FinalizerOwnsLock) { Start-Sleep -Milliseconds 100 }
+    }
+    Assert $FinalizerOwnsLock 'finalizer did not protect its transaction while waiting for the parent'
     Assert ($Parent.WaitForExit(15000)) 'test parent did not exit'
     Assert ($Finalizer.WaitForExit(15000)) 'successful finalizer did not exit'
     Assert ($Finalizer.ExitCode -eq 0) 'successful finalizer returned a failure status'
@@ -194,7 +215,7 @@ try {
     Remove-Item -LiteralPath $Destination -Force
     Copy-Item -LiteralPath $OldFixture -Destination $Destination
     $Failure = New-Transaction $TestRoot $Destination $NewFixture $NewRevision (('0' * 64) -join '')
-    $FailureParent = Start-TestParent $PowerShellPath 300
+    $FailureParent = Start-TestParent $PowerShellPath 1000
     $Processes.Add($FailureParent)
     $FailureTicks = $FailureParent.StartTime.ToUniversalTime().Ticks
     $FailedFinalizer = Start-DeferredReplacement $Failure.Manifest $FailureParent.Id $FailureTicks $PowerShellPath

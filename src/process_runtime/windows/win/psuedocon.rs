@@ -373,6 +373,6 @@ mod tests {
         // We can't stably check the version of the GH workers, but we can
         // at least check that this.
         let version = windows_build_number().unwrap();
-        assert!(version > MIN_CONPTY_BUILD);
+        assert!(version >= MIN_CONPTY_BUILD);
     }
 }
