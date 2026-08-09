@@ -17,6 +17,7 @@ mod login;
 mod managed_session;
 mod openai_docs;
 mod paths;
+mod process_runtime;
 mod prompt_history;
 mod protocol;
 mod quality_loop;

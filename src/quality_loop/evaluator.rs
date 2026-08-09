@@ -2,12 +2,12 @@ use super::contract::ComparisonKind;
 use super::contract::ExtractKind;
 use super::contract::MachineCheck;
 use super::contract::MetricDirection;
+use crate::process_runtime::SpawnedProcess;
+use crate::process_runtime::spawn_pipe_process_no_stdin;
 use crate::quality_loop::EvaluatorContract;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_utils_pty::SpawnedProcess;
-use codex_utils_pty::spawn_pipe_process_no_stdin;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -496,7 +496,7 @@ async fn run_command(
         stdout_rx,
         stderr_rx,
         mut exit_rx,
-    } = spawn_pipe_process_no_stdin(program, &check.argv[1..], &cwd, &environment, &None, &[])
+    } = spawn_pipe_process_no_stdin(program, &check.argv[1..], &cwd, &environment)
         .await
         .with_context(|| format!("failed to start evaluator check `{}`", check.id))?;
     let stdout_task = tokio::spawn(read_bounded(stdout_rx));
@@ -511,8 +511,8 @@ async fn run_command(
     let timed_out = matches!(termination, CommandTermination::TimedOut);
     let cancelled = matches!(termination, CommandTermination::Cancelled);
     // The root process can exit while descendants retain the output pipes or continue mutating
-    // the worktree. The pinned upstream process runtime retains the process-group identity after
-    // root exit, so this always terminates the entire owned group before evidence is consumed.
+    // the worktree. The focused upstream process path retains the process-group identity after root
+    // exit, so this always terminates the entire owned group before evidence is consumed.
     session.request_terminate();
     let status = match termination {
         CommandTermination::Status(status) => status,

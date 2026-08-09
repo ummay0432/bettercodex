@@ -1,20 +1,19 @@
-//! Bounded-output adapter around Codex's unified pipe and PTY process runtime.
+//! Bounded-output adapter around bettercodex's focused process runtime.
 //!
-//! Spawning, signalling, stdin backpressure, and child reaping come from `codex-utils-pty` at
-//! `3aae5d885bac39c1262491aa3fd100dfd8b3919f`; this module retains bettercodex's compact polling
-//! state and model-visible output chunks.
+//! Spawning, signalling, stdin backpressure, and child reaping retain the Unix path from
+//! `codex-utils-pty`; this module adds compact polling state and model-visible output chunks.
 
+use crate::process_runtime::ProcessHandle;
+use crate::process_runtime::ProcessSignal;
+use crate::process_runtime::SpawnedProcess;
+use crate::process_runtime::TerminalSize;
+use crate::process_runtime::spawn_pipe_process_no_stdin;
+use crate::process_runtime::spawn_pty_process;
 use crate::shell_command::shell_detect::DetectedShell;
 use crate::shell_command::shell_detect::ShellType;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_utils_pty::ProcessHandle;
-use codex_utils_pty::ProcessSignal;
-use codex_utils_pty::SpawnedProcess;
-use codex_utils_pty::TerminalSize;
-use codex_utils_pty::spawn_pipe_process_no_stdin;
-use codex_utils_pty::spawn_pty_process;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -92,11 +91,9 @@ impl ProcessSession {
             .to_string(),
         );
         environment.extend(environment_overrides.clone());
-        let arg0 = None;
         let spawned = match mode {
             ProcessMode::Piped => {
-                spawn_pipe_process_no_stdin(program, &arguments, cwd, &environment, &arg0, &[])
-                    .await
+                spawn_pipe_process_no_stdin(program, &arguments, cwd, &environment).await
             }
             ProcessMode::Pty => {
                 spawn_pty_process(
@@ -104,9 +101,7 @@ impl ProcessSession {
                     &arguments,
                     cwd,
                     &environment,
-                    &arg0,
                     TerminalSize { rows: 24, cols: 80 },
-                    &[],
                 )
                 .await
             }

@@ -18,7 +18,6 @@ ansi-to-tui = "8"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 base64 = "0.22.1"
 bytes = "1"
-codex-utils-pty = { git = "https://github.com/openai/codex.git", rev = "3aae5d885bac39c1262491aa3fd100dfd8b3919f" }
 crossbeam-channel = "0.5.15"
 crossterm = { version = "0.29.0", default-features = false, features = ["bracketed-paste", "event-stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
