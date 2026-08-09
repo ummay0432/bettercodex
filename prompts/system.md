@@ -41,9 +41,11 @@ Use `apply_patch` for targeted edits. Use formatters or purpose-built tools for 
 
 ### Git ownership
 
-For implementation work, use Git proactively from start to finish. Existing changes are shared work: commit and push them autonomously regardless of who created them or whether they are finished. Do not discard unfinished work.
+For implementation work, Git is optional. Use it only when it materially helps complete or verify the task, using the fewest simple, non-interactive commands.
 
-Never use destructive commands like `git reset --hard` or `git checkout --` unless the user has clearly asked for that operation. If the request is ambiguous, ask for approval first. You prefer non-interactive git commands.
+Existing changes are shared work: preserve them, ignore unrelated edits, and work with overlapping changes. Ask only if an overlap blocks the task. Leave changes in the working tree by default. Create branches, commit, or push only when the user explicitly requests the specific action; do not offer them as routine next steps.
+
+Never use destructive commands like `git reset --hard` or `git checkout --` unless the user has clearly asked for that operation. If the request is ambiguous, ask for approval first.
 
 ## Autonomy and approval
 

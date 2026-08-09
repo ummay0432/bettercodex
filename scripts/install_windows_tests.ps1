@@ -29,6 +29,7 @@ function Invoke-InstallerFunctions([string] $InstallerPath) {
         'Assert-FreeSpaceBudget',
         'Remove-OwnedTree',
         'Get-BundledRipgrepPackage',
+        'Test-RipgrepVersionLine',
         'Test-InstalledBundledRipgrep',
         'Install-BundledRipgrep',
         'Recover-BundledRipgrepArtifacts',
@@ -109,7 +110,7 @@ use std::env;
 
 fn main() {
     if env::args().nth(1).as_deref() == Some("--version") {
-        println!("ripgrep 15.2.0");
+        println!("ripgrep 15.2.0 (rev e89fff89ac)");
     } else {
         std::process::exit(2);
     }
@@ -183,6 +184,10 @@ Assert ($RipgrepPackage.Size -eq 1789611) 'upstream ripgrep archive size drifted
 Assert ($RipgrepPackage.Digest -ceq '71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5') 'upstream ripgrep digest drifted unexpectedly'
 Assert ($RipgrepPackage.Version -ceq '15.2.0') 'upstream ripgrep version drifted unexpectedly'
 Assert ($RipgrepPackage.MemberPath -ceq 'ripgrep-15.2.0-x86_64-pc-windows-msvc/rg.exe') 'upstream ripgrep member drifted unexpectedly'
+Assert (Test-RipgrepVersionLine 'ripgrep 15.2.0 (rev e89fff89ac)' '15.2.0') 'upstream release version line was rejected'
+Assert (Test-RipgrepVersionLine 'ripgrep 15.2.0' '15.2.0') 'source-build version line was rejected'
+Assert (-not (Test-RipgrepVersionLine 'ripgrep 15.1.0 (rev e89fff89ac)' '15.2.0')) 'wrong ripgrep version was accepted'
+Assert (-not (Test-RipgrepVersionLine 'ripgrep 15.2.0 unexpected' '15.2.0')) 'unexpected ripgrep version suffix was accepted'
 
 Assert (Test-SourceRevision 'ABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD') 'valid revision was rejected'
 Assert (-not (Test-SourceRevision '111111111111111111111111111111111111111g')) 'invalid revision was accepted'

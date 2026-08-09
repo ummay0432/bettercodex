@@ -295,6 +295,14 @@ function Get-BundledRipgrepPackage([string] $ManifestPath, [string] $Platform) {
     }
 }
 
+function Test-RipgrepVersionLine([string] $Line, [string] $Version) {
+    $Match = [regex]::Match(
+        $Line,
+        '^ripgrep ([0-9]+\.[0-9]+\.[0-9]+)(?: \(rev [0-9a-f]{10}\))?$'
+    )
+    return $Match.Success -and $Match.Groups[1].Value -ceq $Version
+}
+
 function Test-InstalledBundledRipgrep(
     [string] $BinDirectory,
     [object] $Package = $null,
@@ -333,10 +341,11 @@ function Test-InstalledBundledRipgrep(
             return $false
         }
         $VersionOutput = @(& $Executable --version 2>$null)
+        $VersionExitCode = $LASTEXITCODE
         $FirstVersionLine = if ($VersionOutput.Count -gt 0) { [string]($VersionOutput[0]) } else { '' }
-        return $LASTEXITCODE -eq 0 -and
+        return $VersionExitCode -eq 0 -and
             $VersionOutput.Count -gt 0 -and
-            $FirstVersionLine -ceq "ripgrep $Version"
+            (Test-RipgrepVersionLine $FirstVersionLine $Version)
     }
     catch {
         return $false
@@ -402,10 +411,12 @@ function Stage-BundledRipgrep(
         Fail "ripgrep archive does not contain $($Package.MemberPath)"
     }
     $VersionOutput = @(& $Candidate --version 2>$null)
+    $VersionExitCode = $LASTEXITCODE
     $FirstVersionLine = if ($VersionOutput.Count -gt 0) { [string]($VersionOutput[0]) } else { '' }
-    if ($LASTEXITCODE -ne 0 -or $VersionOutput.Count -eq 0 -or
-        $FirstVersionLine -cne "ripgrep $($Package.Version)") {
-        Fail "bundled ripgrep candidate did not report ripgrep $($Package.Version)"
+    if ($VersionExitCode -ne 0 -or $VersionOutput.Count -eq 0 -or
+        -not (Test-RipgrepVersionLine $FirstVersionLine ([string]$Package.Version))) {
+        $ObservedVersion = if ($VersionOutput.Count -gt 0) { $FirstVersionLine } else { '<no output>' }
+        Fail "bundled ripgrep candidate did not report ripgrep $($Package.Version) (exit code $VersionExitCode; first line: $ObservedVersion)"
     }
     return [pscustomobject]@{
         Candidate = $Candidate
