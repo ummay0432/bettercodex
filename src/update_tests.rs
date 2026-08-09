@@ -1,47 +1,30 @@
 use super::*;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-
-struct TemporaryDirectory {
-    path: PathBuf,
-}
-
-impl TemporaryDirectory {
-    fn new(label: &str) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("bettercodex-{label}-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-}
-
-impl Drop for TemporaryDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-struct TemporaryProgram {
-    _root: TemporaryDirectory,
-    path: PathBuf,
-}
-
-impl TemporaryProgram {
-    fn new(contents: &str) -> Self {
-        let root = TemporaryDirectory::new("update");
-        let path = root.path.join("curl");
-        fs::write(&path, contents).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).unwrap();
-        Self { _root: root, path }
-    }
-}
 
 fn main_response(revision: &str) -> String {
     format!(
         "{{\"ref\":\"refs/heads/main\",\"object\":{{\"sha\":\"{revision}\",\"type\":\"commit\"}}}}"
     )
+}
+
+fn serve_once(
+    status: u16,
+    body: impl Into<Vec<u8>>,
+    delay: Duration,
+) -> (String, std::thread::JoinHandle<()>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let address = server.server_addr().to_ip().unwrap();
+    let body = body.into();
+    let task = std::thread::spawn(move || {
+        let request = server.recv().unwrap();
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let _ = request.respond(
+            tiny_http::Response::from_data(body).with_status_code(tiny_http::StatusCode(status)),
+        );
+    });
+    (format!("http://{address}"), task)
 }
 
 #[test]
@@ -122,82 +105,57 @@ fn accepts_only_the_main_commit_ref_response() {
 }
 
 #[tokio::test]
-async fn public_main_lookup_reports_both_exact_revisions() {
+async fn bounded_http_lookup_reports_different_revisions_and_ignores_equal_ones() {
     let current = "1111111111111111111111111111111111111111";
     let latest = "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD";
-    let curl = TemporaryProgram::new(&format!(
-        "#!/bin/sh\nprintf '%s\\n' '{}'\n",
-        main_response(latest)
-    ));
-
+    let (url, server) = serve_once(200, main_response(latest), Duration::from_millis(0));
     assert_eq!(
-        check_for_source_update_with(
-            curl.path.as_os_str(),
-            "owner/project",
-            current,
-            Duration::from_secs(1),
-        )
-        .await,
+        check_for_source_update_at(&url, current, Duration::from_secs(1)).await,
         Some(AvailableUpdate {
             current_revision: current.to_string(),
             latest_revision: latest.to_ascii_lowercase(),
         })
     );
+    server.join().unwrap();
+
+    let (url, server) = serve_once(200, main_response(latest), Duration::from_millis(0));
     assert_eq!(
-        check_for_source_update_with(
-            curl.path.as_os_str(),
-            "owner/project",
-            latest,
-            Duration::from_secs(1),
-        )
-        .await,
+        check_for_source_update_at(&url, latest, Duration::from_secs(1)).await,
         None
     );
+    server.join().unwrap();
 }
 
 #[tokio::test]
-async fn failed_malformed_and_timed_out_main_lookups_are_silent() {
+async fn malformed_failed_oversized_and_timed_out_lookups_are_silent() {
     let revision = "1111111111111111111111111111111111111111";
-    for program in [
-        "#!/bin/sh\nexit 1\n",
-        "#!/bin/sh\nprintf '{\"ref\":\"refs/heads/main\"}\\n'\n",
+    for (status, body) in [
+        (500, b"failure".to_vec()),
+        (200, br#"{"ref":"refs/heads/main"}"#.to_vec()),
+        (200, vec![b'x'; MAX_INSTALLER_BYTES + 1]),
     ] {
-        let curl = TemporaryProgram::new(program);
+        let (url, server) = serve_once(status, body, Duration::from_millis(0));
         assert_eq!(
-            check_for_source_update_with(
-                curl.path.as_os_str(),
-                "owner/project",
-                revision,
-                Duration::from_secs(1),
-            )
-            .await,
+            check_for_source_update_at(&url, revision, Duration::from_secs(1)).await,
             None
         );
+        server.join().unwrap();
     }
 
-    let slow = TemporaryProgram::new("#!/bin/sh\nsleep 2\n");
+    let (url, server) = serve_once(200, main_response(revision), Duration::from_millis(100));
     assert_eq!(
-        check_for_source_update_with(
-            slow.path.as_os_str(),
-            "owner/project",
-            revision,
-            Duration::from_millis(20),
-        )
-        .await,
+        check_for_source_update_at(&url, revision, Duration::from_millis(10)).await,
         None
     );
+    server.join().unwrap();
     assert_eq!(
-        check_for_source_update_with(
-            slow.path.as_os_str(),
-            "invalid repository",
-            revision,
-            Duration::from_secs(1),
-        )
-        .await,
+        check_for_source_update_with("invalid repository", revision, Duration::from_millis(10),)
+            .await,
         None
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn updater_targets_the_running_binary_directory_unless_configured() {
     assert_eq!(
@@ -222,54 +180,56 @@ fn updater_targets_the_running_binary_directory_unless_configured() {
     );
 }
 
+#[cfg(windows)]
 #[test]
-fn updater_resolves_main_and_fetches_that_revisions_installer() {
-    let revision = "2222222222222222222222222222222222222222";
-    let response = main_response(revision);
-    let curl = TemporaryProgram::new(&format!(
-        "#!/bin/sh\n\
-         compressed=0\n\
-         for argument do\n\
-           case \"$argument\" in\n\
-             --compressed) compressed=1 ;;\n\
-             https://*) url=\"$argument\" ;;\n\
-           esac\n\
-         done\n\
-         [ \"$compressed\" = 1 ] || exit 3\n\
-         case \"$url\" in\n\
-           'https://api.github.com/repos/owner/project/git/ref/heads/main') printf '%s\\n' '{response}' ;;\n\
-           'https://raw.githubusercontent.com/owner/project/{revision}/scripts/install.sh') printf '%s\\n' '#!/bin/sh' 'exit 0' ;;\n\
-           *) exit 2 ;;\n\
-         esac\n"
-    ));
-
+fn updater_targets_the_running_windows_binary_directory_unless_configured() {
     assert_eq!(
-        resolve_main_revision(curl.path.as_os_str(), "owner/project").unwrap(),
-        revision
+        update_install_dir(Path::new(r"C:\Programs\bettercodex\bcodex.exe"), None).unwrap(),
+        PathBuf::from(r"C:\Programs\bettercodex")
     );
     assert_eq!(
-        fetch_installer(
-            curl.path.as_os_str(),
-            "owner/project",
-            revision,
-            MAX_INSTALLER_BYTES,
+        update_install_dir(
+            Path::new(r"C:\Programs\bettercodex\bcodex.exe"),
+            Some(OsStr::new(r"D:\Custom bettercodex")),
         )
         .unwrap(),
-        b"#!/bin/sh\nexit 0\n"
+        PathBuf::from(r"D:\Custom bettercodex")
     );
-    assert!(fetch_installer(curl.path.as_os_str(), "owner/project", revision, 8).is_err());
+    assert!(
+        update_install_dir(
+            Path::new(r"C:\Programs\bettercodex\bcodex.exe"),
+            Some(OsStr::new("relative")),
+        )
+        .is_err()
+    );
 }
 
+#[test]
+fn updater_selects_the_target_native_installer_at_the_pinned_revision() {
+    let revision = "2222222222222222222222222222222222222222";
+    assert_eq!(
+        installer_url("owner/project", revision),
+        format!(
+            "https://raw.githubusercontent.com/owner/project/{revision}/{}",
+            installer_path()
+        )
+    );
+    #[cfg(unix)]
+    assert_eq!(installer_path(), "scripts/install.sh");
+    #[cfg(windows)]
+    assert_eq!(installer_path(), "scripts/install.ps1");
+}
+
+#[cfg(unix)]
 #[test]
 fn updater_passes_only_the_pinned_source_install_contract() {
     let revision = "2222222222222222222222222222222222222222";
     run_installer_script(
-        b"test \"$BCODEX_INSTALL_DIR\" = '/tmp/custom bettercodex'\n\
+        b"#!/bin/sh\ntest \"$BCODEX_INSTALL_DIR\" = '/tmp/custom bettercodex'\n\
           test \"$BCODEX_REPOSITORY\" = owner/project\n\
           test \"$BCODEX_INSTALL_REVISION\" = 2222222222222222222222222222222222222222\n\
           test -z \"${BCODEX_INSTALL_RELEASE_TAG:-}\"\n\
           test -z \"${BCODEX_INSTALL_VERSION:-}\"\n",
-        OsStr::new("/bin/sh"),
         Path::new("/tmp/custom bettercodex"),
         "owner/project",
         revision,
@@ -277,8 +237,7 @@ fn updater_passes_only_the_pinned_source_install_contract() {
     .unwrap();
     assert!(
         run_installer_script(
-            b"exit 7\n",
-            OsStr::new("/bin/sh"),
+            b"#!/bin/sh\nexit 7\n",
             Path::new("/tmp/custom bettercodex"),
             "owner/project",
             revision,
@@ -289,8 +248,7 @@ fn updater_passes_only_the_pinned_source_install_contract() {
     );
     assert!(
         run_installer_script(
-            b"exit 0\n",
-            OsStr::new("/bin/sh"),
+            b"#!/bin/sh\nexit 0\n",
             Path::new("/tmp/custom bettercodex"),
             "owner/project",
             "not-a-revision",
@@ -299,4 +257,16 @@ fn updater_passes_only_the_pinned_source_install_contract() {
         .to_string()
         .contains("invalid source revision")
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn updater_runs_the_pinned_powershell_installer_from_a_file() {
+    let revision = "2222222222222222222222222222222222222222";
+    let install_dir = std::env::temp_dir().join("bettercodex update test");
+    let script = format!(
+        "#Requires -Version 5.1\nif ($env:BCODEX_INSTALL_DIR -cne '{}') {{ exit 2 }}\nif ($env:BCODEX_REPOSITORY -cne 'owner/project') {{ exit 3 }}\nif ($env:BCODEX_INSTALL_REVISION -cne '{revision}') {{ exit 4 }}\nif (-not $env:BCODEX_UPDATE_PARENT_PID) {{ exit 5 }}\nexit 0\n",
+        install_dir.display()
+    );
+    run_installer_script(script.as_bytes(), &install_dir, "owner/project", revision).unwrap();
 }

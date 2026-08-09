@@ -1156,8 +1156,9 @@ fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
             "saved session {} is already open in another bettercodex process",
             path.display()
         )),
-        Err(std::fs::TryLockError::Error(error)) => Err(error)
-            .with_context(|| format!("failed to lock saved session {}", path.display())),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("failed to lock saved session {}", path.display()))
+        }
     }
 }
 
@@ -1170,7 +1171,10 @@ fn open_private_replace(path: &Path) -> Result<File> {
         .with_context(|| format!("failed to open private file {}", path.display()))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
-        return Err(anyhow!("private path {} is not a regular file", path.display()));
+        return Err(anyhow!(
+            "private path {} is not a regular file",
+            path.display()
+        ));
     }
     crate::platform_fs::protect_file(&file)?;
     Ok(file)

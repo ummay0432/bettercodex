@@ -9,6 +9,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use memchr::memmem;
+use reqwest::Client;
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::fs;
@@ -19,12 +20,10 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::process::Command as AsyncProcessCommand;
 
 const DEFAULT_REPOSITORY: &str = "ummay0432/bettercodex";
 const GITHUB_API_ROOT: &str = "https://api.github.com";
 const GITHUB_RAW_ROOT: &str = "https://raw.githubusercontent.com";
-const INSTALLER_PATH: &str = "scripts/install.sh";
 const MAX_INSTALLER_BYTES: usize = 1024 * 1024;
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const INSTALL_DIR_ENV: &str = "BCODEX_INSTALL_DIR";
@@ -46,32 +45,6 @@ const SOURCE_REVISION_METADATA_LENGTH: usize = SOURCE_REVISION_OFFSET + SOURCE_R
 #[used]
 static SOURCE_REVISION_METADATA: [u8; SOURCE_REVISION_METADATA_LENGTH] =
     *b"\0bettercodex.source-revision.v1=........................................;\0";
-
-const CURL_ARGUMENTS: &[&str] = &[
-    "--proto",
-    "=https",
-    "--tlsv1.2",
-    "--fail",
-    "--silent",
-    "--show-error",
-    "--location",
-    "--compressed",
-    "--connect-timeout",
-    "10",
-    "--max-time",
-    "30",
-    "--max-filesize",
-    "1048576",
-    "--retry",
-    "2",
-    "--retry-delay",
-    "1",
-    "--retry-connrefused",
-    "--user-agent",
-    "bettercodex",
-    "--header",
-    "X-GitHub-Api-Version: 2022-11-28",
-];
 
 #[derive(Deserialize)]
 struct GitHubRefResponse {
@@ -129,13 +102,7 @@ pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
     }
     let current_revision = source_revision()?;
     let repository = configured_repository().ok()?;
-    check_for_source_update_with(
-        OsStr::new("curl"),
-        &repository,
-        current_revision,
-        UPDATE_CHECK_TIMEOUT,
-    )
-    .await
+    check_for_source_update_with(&repository, current_revision, UPDATE_CHECK_TIMEOUT).await
 }
 
 pub(crate) fn source_revision() -> Option<&'static str> {
@@ -196,7 +163,6 @@ fn patch_source_revision(image: &mut [u8], revision: &str) -> Result<()> {
 }
 
 async fn check_for_source_update_with(
-    curl_program: &OsStr,
     repository: &str,
     current_revision: &str,
     timeout: Duration,
@@ -205,20 +171,23 @@ async fn check_for_source_update_with(
         return None;
     }
     let url = main_ref_api_url(repository);
-    let mut command = AsyncProcessCommand::new(curl_program);
-    command
-        .args(CURL_ARGUMENTS)
-        .args(["--header", "Accept: application/vnd.github+json", &url])
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
+    check_for_source_update_at(&url, current_revision, timeout).await
+}
+
+async fn check_for_source_update_at(
+    url: &str,
+    current_revision: &str,
+    timeout: Duration,
+) -> Option<AvailableUpdate> {
+    if !is_source_revision(current_revision) {
+        return None;
+    }
+    let client = update_client(timeout).ok()?;
+    let response = tokio::time::timeout(timeout, fetch_bounded(&client, url, MAX_INSTALLER_BYTES))
         .await
         .ok()?
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let latest_revision = parse_github_main_revision(&output.stdout).ok()?;
+    let latest_revision = parse_github_main_revision(&response).ok()?;
     if latest_revision.eq_ignore_ascii_case(current_revision) {
         return None;
     }
@@ -230,7 +199,64 @@ fn main_ref_api_url(repository: &str) -> String {
 }
 
 fn installer_url(repository: &str, revision: &str) -> String {
-    format!("{GITHUB_RAW_ROOT}/{repository}/{revision}/{INSTALLER_PATH}")
+    format!(
+        "{GITHUB_RAW_ROOT}/{repository}/{revision}/{}",
+        installer_path()
+    )
+}
+
+fn installer_path() -> &'static str {
+    #[cfg(windows)]
+    {
+        "scripts/install.ps1"
+    }
+    #[cfg(unix)]
+    {
+        "scripts/install.sh"
+    }
+}
+
+fn update_client(timeout: Duration) -> Result<Client> {
+    crate::http_client::build_client(
+        Client::builder()
+            .timeout(timeout)
+            .connect_timeout(timeout.min(Duration::from_secs(10)))
+            .user_agent("bettercodex")
+            .redirect(reqwest::redirect::Policy::limited(5)),
+    )
+}
+
+async fn fetch_bounded(client: &Client, url: &str, maximum_bytes: usize) -> Result<Vec<u8>> {
+    let mut response = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .with_context(|| format!("could not download {url}"))?
+        .error_for_status()
+        .with_context(|| format!("GitHub rejected {url}"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_bytes as u64)
+    {
+        bail!("GitHub response exceeded the {maximum_bytes}-byte limit");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("could not read {url}"))?
+    {
+        if chunk.len() > maximum_bytes.saturating_sub(bytes.len()) {
+            bail!("GitHub response exceeded the {maximum_bytes}-byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        bail!("GitHub returned an empty response");
+    }
+    Ok(bytes)
 }
 
 fn parse_github_main_revision(response: &[u8]) -> Result<String> {
@@ -292,7 +318,12 @@ pub(crate) fn run_update() -> Result<()> {
         "this build has no embedded source revision; run INSTALL_COMMAND.txt before using `bcodex update`",
     )?;
     let repository = configured_repository()?;
-    let latest_revision = resolve_main_revision(OsStr::new("curl"), &repository)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("could not start the bettercodex update runtime")?;
+    let client = update_client(Duration::from_secs(30))?;
+    let latest_revision = runtime.block_on(resolve_main_revision(&client, &repository))?;
     if latest_revision.eq_ignore_ascii_case(current_revision) {
         let mut output = std::io::stdout().lock();
         writeln!(
@@ -307,38 +338,24 @@ pub(crate) fn run_update() -> Result<()> {
         std::env::current_exe().context("could not locate the running bettercodex binary")?;
     let configured_dir = std::env::var_os(INSTALL_DIR_ENV);
     let install_dir = update_install_dir(&executable, configured_dir.as_deref())?;
-    let installer = fetch_installer(
-        OsStr::new("curl"),
+    let installer = runtime.block_on(fetch_installer(
+        &client,
         &repository,
         &latest_revision,
         MAX_INSTALLER_BYTES,
-    )?;
-    run_installer_script(
-        &installer,
-        OsStr::new("/bin/sh"),
-        &install_dir,
-        &repository,
-        &latest_revision,
-    )
+    ))?;
+    run_installer_script(&installer, &install_dir, &repository, &latest_revision)
 }
 
-fn resolve_main_revision(curl_program: &OsStr, repository: &str) -> Result<String> {
+async fn resolve_main_revision(client: &Client, repository: &str) -> Result<String> {
     validate_repository(repository)?;
     let url = main_ref_api_url(repository);
-    let output = ProcessCommand::new(curl_program)
-        .args(CURL_ARGUMENTS)
-        .args(["--header", "Accept: application/vnd.github+json", &url])
-        .stdin(Stdio::null())
-        .output()
-        .context("could not query the current bettercodex main revision")?;
-    if !output.status.success() {
-        bail!("GitHub could not resolve bettercodex main");
-    }
-    parse_github_main_revision(&output.stdout)
+    let response = fetch_bounded(client, &url, MAX_INSTALLER_BYTES).await?;
+    parse_github_main_revision(&response)
 }
 
-fn fetch_installer(
-    curl_program: &OsStr,
+async fn fetch_installer(
+    client: &Client,
     repository: &str,
     revision: &str,
     maximum_bytes: usize,
@@ -348,22 +365,23 @@ fn fetch_installer(
         bail!("cannot fetch the installer from an invalid source revision");
     }
     let url = installer_url(repository, revision);
-    let output = ProcessCommand::new(curl_program)
-        .args(CURL_ARGUMENTS)
-        .arg(&url)
-        .stdin(Stdio::null())
-        .output()
-        .context("could not fetch the current bettercodex installer")?;
-    if !output.status.success() {
-        bail!("GitHub could not fetch the current bettercodex installer");
-    }
-    if output.stdout.is_empty() || output.stdout.len() > maximum_bytes {
-        bail!("GitHub returned an empty or oversized bettercodex installer");
-    }
-    if !output.stdout.starts_with(b"#!/bin/sh\n") {
+    let installer = fetch_bounded(client, &url, maximum_bytes).await?;
+    if !valid_installer_prefix(&installer) {
         bail!("GitHub returned an invalid bettercodex installer");
     }
-    Ok(output.stdout)
+    Ok(installer)
+}
+
+fn valid_installer_prefix(script: &[u8]) -> bool {
+    #[cfg(unix)]
+    {
+        script.starts_with(b"#!/bin/sh\n")
+    }
+    #[cfg(windows)]
+    {
+        script.starts_with(b"#Requires -Version 5.1\n")
+            || script.starts_with(b"#Requires -Version 5.1\r\n")
+    }
 }
 
 fn update_install_dir(executable: &Path, configured: Option<&OsStr>) -> Result<PathBuf> {
@@ -383,7 +401,6 @@ fn update_install_dir(executable: &Path, configured: Option<&OsStr>) -> Result<P
 
 fn run_installer_script(
     script: &[u8],
-    shell: &OsStr,
     install_dir: &Path,
     repository: &str,
     revision: &str,
@@ -391,7 +408,11 @@ fn run_installer_script(
     if !is_source_revision(revision) {
         bail!("cannot run the installer for an invalid source revision");
     }
-    let mut child = ProcessCommand::new(shell)
+    if !valid_installer_prefix(script) {
+        bail!("cannot run an invalid bettercodex installer");
+    }
+    #[cfg(unix)]
+    let mut child = ProcessCommand::new("/bin/sh")
         .arg("-s")
         .env(INSTALL_DIR_ENV, install_dir)
         .env(INSTALL_REVISION_ENV, revision)
@@ -401,19 +422,62 @@ fn run_installer_script(
         .stdin(Stdio::piped())
         .spawn()
         .context("could not start the bettercodex installer")?;
-    let write_result = child
-        .stdin
-        .take()
-        .context("could not open the bettercodex installer input")?
-        .write_all(script);
-    if let Err(error) = write_result {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error).context("could not send the bettercodex installer to the shell");
+    #[cfg(windows)]
+    let (mut child, script_path) = {
+        let script_path = std::env::temp_dir().join(format!(
+            "bettercodex-update-{}-{}.ps1",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        crate::platform_fs::configure_private_file(&mut options);
+        let mut file = options
+            .open(&script_path)
+            .with_context(|| format!("could not create update script {}", script_path.display()))?;
+        file.write_all(script)?;
+        file.sync_all()?;
+        drop(file);
+        let child = ProcessCommand::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script_path)
+            .env(INSTALL_DIR_ENV, install_dir)
+            .env(INSTALL_REVISION_ENV, revision)
+            .env("BCODEX_REPOSITORY", repository)
+            .env("BCODEX_UPDATE_PARENT_PID", std::process::id().to_string())
+            .env_remove("BCODEX_INSTALL_RELEASE_TAG")
+            .env_remove("BCODEX_INSTALL_VERSION")
+            .stdin(Stdio::null())
+            .spawn()
+            .context("could not start the bettercodex PowerShell installer")?;
+        (child, script_path)
+    };
+    #[cfg(unix)]
+    {
+        let write_result = child
+            .stdin
+            .take()
+            .context("could not open the bettercodex installer input")?
+            .write_all(script);
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("could not send the bettercodex installer to the shell");
+        }
     }
     let status = child
         .wait()
         .context("could not wait for the bettercodex installer")?;
+    #[cfg(windows)]
+    fs::remove_file(&script_path)
+        .with_context(|| format!("could not remove update script {}", script_path.display()))?;
     if !status.success() {
         bail!("bettercodex installer exited with {status}");
     }

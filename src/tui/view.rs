@@ -14,6 +14,12 @@ use super::markdown;
 use super::markdown_cache::MarkdownRenderCache;
 use super::palette;
 use super::palette::TerminalColors;
+#[cfg(windows)]
+use super::paste_burst::CharDecision;
+#[cfg(windows)]
+use super::paste_burst::FlushResult;
+#[cfg(windows)]
+use super::paste_burst::PasteBurst;
 use super::pending_input::PendingInput;
 use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
@@ -48,12 +54,6 @@ use crate::tools::BackgroundProcess;
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::wrapping::word_wrap_line;
 use crate::update::AvailableUpdate;
-#[cfg(windows)]
-use super::paste_burst::CharDecision;
-#[cfg(windows)]
-use super::paste_burst::FlushResult;
-#[cfg(windows)]
-use super::paste_burst::PasteBurst;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -1355,14 +1355,13 @@ impl View {
             }
 
             if let KeyCode::Char(character) = key.code
-                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 && !character.is_control()
             {
                 if !character.is_ascii() {
-                    if self
-                        .paste_burst
-                        .try_append_char_if_active(character, now)
-                    {
+                    if self.paste_burst.try_append_char_if_active(character, now) {
                         return true;
                     }
                     if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
@@ -1682,7 +1681,7 @@ impl View {
                 let mut bytes = [0; 4];
                 self.editor.insert(character.encode_utf8(&mut bytes));
             }
-            KeyCode::Backspace if alt && !control => self.editor.delete_previous_word(),
+            KeyCode::Backspace if control || alt => self.editor.delete_previous_word(),
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete(),
             KeyCode::Left if control || alt => self.editor.move_word_left(),
@@ -5121,14 +5120,13 @@ fn format_elapsed(seconds: u64) -> String {
 }
 
 fn shortcut_reference_lines() -> Vec<Line<'static>> {
-    vec![
+    let mut lines = vec![
         Line::from("Keyboard shortcuts").bold(),
         Line::default(),
         shortcut_line("Enter", "submit prompt"),
         shortcut_line("Enter while working", "steer after current model step"),
         shortcut_line("Tab while working", "queue a follow-up turn"),
         shortcut_line("Alt+Up / Shift+Left", "edit last queued follow-up"),
-        shortcut_line("Option+Left / Right", "jump by word"),
         shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
         shortcut_line("@", "find and insert a file path"),
         shortcut_line("$", "mention an installed skill"),
@@ -5139,9 +5137,21 @@ fn shortcut_reference_lines() -> Vec<Line<'static>> {
             "search prompt history backward / forward",
         ),
         shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
-        shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
         shortcut_line("Ctrl+C", "clear draft, interrupt work, or exit when idle"),
-    ]
+    ];
+    #[cfg(windows)]
+    lines.extend([
+        shortcut_line("Ctrl+Left / Right", "jump by word (Alt works too)"),
+        shortcut_line("Ctrl+Backspace", "delete previous word (Ctrl+W too)"),
+        shortcut_line("Ctrl+V / Shift+Insert", "terminal-owned clipboard paste"),
+        shortcut_line("Ctrl+C with selection", "terminal-owned selection copy"),
+    ]);
+    #[cfg(not(windows))]
+    lines.extend([
+        shortcut_line("Option+Left / Right", "jump by word"),
+        shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
+    ]);
+    lines
 }
 
 fn shortcuts_height(width: u16) -> u16 {
@@ -6346,6 +6356,41 @@ mod tests {
             panic!("multiline prompt should submit");
         };
         assert_eq!(submission.prompt(), &prompt("first\nsecond"));
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_the_previous_word() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.insert("first second");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL,
+            ))),
+            Action::None
+        );
+
+        assert_eq!(view.editor.text(), "first ");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shortcut_reference_uses_windows_chords() {
+        let rendered = shortcut_reference_lines()
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Ctrl+Left / Right"), "{rendered}");
+        assert!(rendered.contains("Ctrl+Backspace"), "{rendered}");
+        assert!(rendered.contains("Shift+Enter / Ctrl+J"), "{rendered}");
+        assert!(
+            rendered.contains("terminal-owned clipboard paste"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Option+"), "{rendered}");
     }
 
     #[test]

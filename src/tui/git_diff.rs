@@ -203,12 +203,7 @@ impl<'a> GitRunner<'a> {
         let mut command = TokioCommand::new(self.program);
         command
             .current_dir(self.cwd)
-            .args([
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                DISABLE_HOOKS_CONFIG,
-            ])
+            .args(["-c", "core.fsmonitor=false", "-c", DISABLE_HOOKS_CONFIG])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

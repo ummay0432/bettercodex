@@ -36,9 +36,6 @@ pub(crate) fn run_relay_command(_arguments: &[String]) -> Option<Result<()>> {
     None
 }
 
-pub(crate) fn prepare_tmux_session(
-    _cwd: &Path,
-    _size: (u16, u16),
-) -> Result<PreparedTmuxSession> {
+pub(crate) fn prepare_tmux_session(_cwd: &Path, _size: (u16, u16)) -> Result<PreparedTmuxSession> {
     bail!("tmux handoff is unavailable on Windows")
 }

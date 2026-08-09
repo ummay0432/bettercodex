@@ -14,10 +14,7 @@ pub(crate) fn configure_private_file(options: &mut OpenOptions) {
     }
 }
 
-pub(crate) fn configure_private_file_nofollow(
-    options: &mut OpenOptions,
-    nonblocking: bool,
-) {
+pub(crate) fn configure_private_file_nofollow(options: &mut OpenOptions, nonblocking: bool) {
     configure_private_file(options);
     #[cfg(unix)]
     {

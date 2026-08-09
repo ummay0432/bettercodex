@@ -165,10 +165,7 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
 
     let lock_path = skills_root.join(LOCK_FILE_NAME);
     let mut lock_options = OpenOptions::new();
-    lock_options
-        .create(true)
-        .read(true)
-        .write(true);
+    lock_options.create(true).read(true).write(true);
     crate::platform_fs::configure_private_file_nofollow(&mut lock_options, false);
     let lock = lock_options.open(&lock_path).with_context(|| {
         format!(
@@ -176,9 +173,12 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
             lock_path.display()
         )
     })?;
-    let lock_metadata = lock
-        .metadata()
-        .with_context(|| format!("could not inspect system skills lock {}", lock_path.display()))?;
+    let lock_metadata = lock.metadata().with_context(|| {
+        format!(
+            "could not inspect system skills lock {}",
+            lock_path.display()
+        )
+    })?;
     if !lock_metadata.is_file() || crate::platform_fs::is_link(&lock_metadata) {
         return Err(anyhow!(
             "system skills lock {} is not a regular file",
