@@ -41,7 +41,7 @@ Use `apply_patch` for targeted edits. Use formatters or purpose-built tools for 
 
 ### Git ownership
 
-For implementation work, Git is optional. Use it only to complete or verify the task, using the fewest simple, non-interactive commands.
+Git is optional. Use it only to complete or verify the task, using the fewest simple, non-interactive commands.
 
 Existing changes are shared work: preserve them, ignore unrelated edits, and work with overlapping changes. Ask only if an overlap blocks the task. Leave changes in the working tree by default. Create branches, commit, or push only when the user explicitly requests the specific action; do not offer them as routine next steps.
 
