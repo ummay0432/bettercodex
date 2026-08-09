@@ -296,6 +296,8 @@ function Get-BundledRipgrepPackage([string] $ManifestPath, [string] $Platform) {
 }
 
 function Test-RipgrepVersionLine([string] $Line, [string] $Version) {
+    # Release builds append their embedded Git revision; builds made without a
+    # Git checkout report only the semantic version.
     $Match = [regex]::Match(
         $Line,
         '^ripgrep ([0-9]+\.[0-9]+\.[0-9]+)(?: \(rev [0-9a-f]{10}\))?$'
@@ -416,7 +418,10 @@ function Stage-BundledRipgrep(
     if ($VersionExitCode -ne 0 -or $VersionOutput.Count -eq 0 -or
         -not (Test-RipgrepVersionLine $FirstVersionLine ([string]$Package.Version))) {
         $ObservedVersion = if ($VersionOutput.Count -gt 0) { $FirstVersionLine } else { '<no output>' }
-        Fail "bundled ripgrep candidate did not report ripgrep $($Package.Version) (exit code $VersionExitCode; first line: $ObservedVersion)"
+        Fail (
+            "bundled ripgrep candidate did not report ripgrep $($Package.Version) " +
+            "(exit code $VersionExitCode; first line: $ObservedVersion)"
+        )
     }
     return [pscustomobject]@{
         Candidate = $Candidate
