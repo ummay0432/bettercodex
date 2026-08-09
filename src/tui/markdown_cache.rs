@@ -25,7 +25,7 @@ impl MarkdownRenderCache {
         width: usize,
         cwd: &Path,
         streaming: bool,
-    ) -> Vec<HyperlinkLine> {
+    ) -> &[HyperlinkLine] {
         let source_was_replaced = !raw_source.starts_with(&self.raw_source);
         if source_was_replaced {
             self.raw_source.clear();
@@ -62,7 +62,7 @@ impl MarkdownRenderCache {
                 self.canonical = true;
             }
 
-            return self.render.lines.clone();
+            return &self.render.lines;
         }
 
         if self.width != Some(width) {
@@ -74,7 +74,7 @@ impl MarkdownRenderCache {
             self.render.append(&self.sanitized_source, Some(width), cwd);
         }
 
-        self.render.lines.clone()
+        &self.render.lines
     }
 }
 

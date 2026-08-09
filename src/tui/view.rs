@@ -2010,13 +2010,13 @@ impl View {
         if history.started && history.width != Some(width) {
             return Vec::new();
         }
-        let rendered = assistant_lines(text, width, &self.cwd, true, rendered);
-        if history.lines.len() > rendered.len() {
+        let start = history.lines.len();
+        let (rendered_len, remaining) =
+            assistant_lines_after(text, width, &self.cwd, true, rendered, start);
+        if start > rendered_len {
             return Vec::new();
         }
 
-        let start = history.lines.len();
-        let remaining = &rendered[start..];
         let spill_separator = !history.started && history_was_emitted;
         let remaining_rows = remaining
             .iter()
@@ -2054,8 +2054,9 @@ impl View {
             }
         }
 
-        let end = start.saturating_add(lines_to_spill).min(rendered.len());
-        let newly_emitted = rendered[start..end].to_vec();
+        let end = lines_to_spill.min(remaining.len());
+        let mut newly_emitted = remaining;
+        newly_emitted.truncate(end);
         output.extend(newly_emitted.iter().cloned());
         history.lines.extend(newly_emitted);
         output
@@ -2929,9 +2930,14 @@ impl TranscriptEntry {
                 history,
                 ..
             } if history.started && history.width == Some(width) => {
-                let rendered_lines = assistant_lines(text, width, cwd, *streaming, rendered);
-                let start = history.lines.len().min(rendered_lines.len());
-                let output = rendered_lines[start..].to_vec();
+                let (_, output) = assistant_lines_after(
+                    text,
+                    width,
+                    cwd,
+                    *streaming,
+                    rendered,
+                    history.lines.len(),
+                );
                 (output, true)
             }
             _ => (self.display_lines(width, user_style, cwd), false),
@@ -4035,12 +4041,37 @@ fn assistant_lines(
     streaming: bool,
     cache: &mut MarkdownRenderCache,
 ) -> Vec<HyperlinkLine> {
+    assistant_lines_after(message, width, cwd, streaming, cache, 0).1
+}
+
+/// Clone and decorate only the rendered suffix that is still live in the viewport.
+///
+/// The cache retains the complete source-backed rendering for resize and finalization. During a
+/// long stream, however, the prefix before `start` is already in terminal scrollback and must not
+/// be cloned on every repaint.
+fn assistant_lines_after(
+    message: &str,
+    width: u16,
+    cwd: &Path,
+    streaming: bool,
+    cache: &mut MarkdownRenderCache,
+    start: usize,
+) -> (usize, Vec<HyperlinkLine>) {
     let content_width = usize::from(width.saturating_sub(2).max(1));
-    terminal_hyperlinks::prefix_hyperlink_lines(
-        cache.render(message, content_width, cwd, streaming),
-        Span::from("• ").dim(),
+    let rendered = cache.render(message, content_width, cwd, streaming);
+    let rendered_len = rendered.len();
+    let start = start.min(rendered_len);
+    let initial_prefix = if start == 0 {
+        Span::from("• ").dim()
+    } else {
+        Span::from("  ")
+    };
+    let lines = terminal_hyperlinks::prefix_hyperlink_lines(
+        rendered[start..].to_vec(),
+        initial_prefix,
         Span::from("  "),
-    )
+    );
+    (rendered_len, lines)
 }
 
 fn background_process_lines(processes: &[BackgroundProcess], width: u16) -> Vec<Line<'static>> {
@@ -4826,6 +4857,21 @@ mod tests {
     }
 
     #[test]
+    fn assistant_live_suffix_matches_the_full_render() {
+        let source = "first paragraph\n\nsecond paragraph\n\nthird paragraph";
+        let mut cache = MarkdownRenderCache::default();
+        let full = assistant_lines(source, 80, Path::new("/tmp"), true, &mut cache);
+        assert!(full.len() >= 3);
+
+        let start = 2;
+        let (rendered_len, suffix) =
+            assistant_lines_after(source, 80, Path::new("/tmp"), true, &mut cache, start);
+
+        assert_eq!(rendered_len, full.len());
+        assert_eq!(suffix, full[start..]);
+    }
+
+    #[test]
     fn review_completion_submits_the_explicit_review_command() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.editor.set_text("/rev");
@@ -5267,6 +5313,33 @@ mod tests {
         assert!(replay.contains("• assistant reply"), "{replay}");
         assert!(!view.welcome_pending);
         assert_eq!(view.committed_entries, 2);
+    }
+
+    #[test]
+    fn streamed_tail_keeps_continuation_style_without_completion_reflow() {
+        const WIDTH: u16 = 48;
+        const HEIGHT: u16 = 12;
+        let source = (0..80)
+            .map(|index| {
+                format!("paragraph {index} with [documentation](https://example.com/{index})")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        let _ = view.take_pending_history_lines(WIDTH, HEIGHT);
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(source.clone()));
+
+        let prepared = view.prepare(WIDTH, HEIGHT);
+        assert!(!prepared.history_lines.is_empty());
+        let prefix = &prepared.active_lines[0].line.spans[0];
+        assert_eq!(prefix.content.as_ref(), "  ");
+        assert!(!prefix.style.add_modifier.contains(Modifier::DIM));
+
+        view.handle_agent_event(completed_message(source));
+        assert!(!view.streamed_history_needs_reflow(WIDTH));
     }
 
     #[test]
