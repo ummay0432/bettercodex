@@ -49,7 +49,12 @@ mod sse;
 use sse::SseDecoder;
 
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
+const SYSTEM_PROMPT_TEMPLATE: &str = include_str!("../prompts/system.md");
+const PLATFORM_SHELL_GUIDANCE_MARKER: &str = "{{platform_shell_guidance}}";
+#[cfg(not(windows))]
+const PLATFORM_SHELL_GUIDANCE: &str = include_str!("../prompts/system-unix.md");
+#[cfg(windows)]
+const PLATFORM_SHELL_GUIDANCE: &str = include_str!("../prompts/system-windows.md");
 const MAX_HTTP_RETRIES: usize = 4;
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: usize = 2;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
@@ -68,6 +73,8 @@ const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
+static SYSTEM_PROMPT: LazyLock<String> =
+    LazyLock::new(|| render_system_prompt(SYSTEM_PROMPT_TEMPLATE, PLATFORM_SHELL_GUIDANCE));
 static STABLE_INPUT_PREFIX_ITEMS: LazyLock<[Value; 1]> = LazyLock::new(|| {
     [json!({
         "type": "additional_tools",
@@ -1301,7 +1308,19 @@ pub(crate) fn stable_request_prefix() -> [Value; 1] {
 }
 
 pub(crate) fn harness_instructions() -> &'static str {
-    SYSTEM_PROMPT.trim()
+    SYSTEM_PROMPT.as_str()
+}
+
+fn render_system_prompt(template: &str, platform_shell_guidance: &str) -> String {
+    assert_eq!(
+        template.matches(PLATFORM_SHELL_GUIDANCE_MARKER).count(),
+        1,
+        "system prompt must contain exactly one platform shell guidance marker"
+    );
+    template.trim().replace(
+        PLATFORM_SHELL_GUIDANCE_MARKER,
+        platform_shell_guidance.trim(),
+    )
 }
 
 pub(crate) fn estimated_harness_instruction_tokens() -> u64 {

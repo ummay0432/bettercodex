@@ -30,10 +30,9 @@ Omit generic praise, including praise that contrasts a plan with an obviously in
 - Use `rg` for text searches and `rg --files` for file searches; fall back when unavailable.
 - Run independent tool calls in parallel and dependent calls sequentially.
 - Do not add `echo` or `printf` commands solely to separate chained shell output.
-- Treat strings passed to `exec_command` as shell code: backticks and `$()` execute unless safely quoted. Do not interpolate sensitive data in ways that could expose it.
+{{platform_shell_guidance}}
 - Do not block on sleep or wait operations for more than 60 seconds.
 - Use task-specific variable names. Do not repurpose `HOME`, `home`, `CODEX_HOME`, or `BCODEX_HOME`.
-- In zsh, do not name a variable `path`; assigning it mutates `PATH`.
 
 ### File editing
 

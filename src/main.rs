@@ -13,6 +13,7 @@ mod fuzzy_match;
 mod http_client;
 mod image;
 mod input;
+mod install_context;
 mod login;
 mod managed_session;
 mod openai_docs;
@@ -205,6 +206,7 @@ fn run_agent_command(
     options: RunOptions,
     resume: Option<ResumeSelector>,
 ) -> Result<()> {
+    install_context::prepare_runtime_path();
     let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let interactive_tui =
         interactive_terminal && options.prompt.is_empty() && options.images.is_empty();

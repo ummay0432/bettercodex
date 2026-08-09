@@ -67,6 +67,31 @@ fn user_message(text: &str) -> Value {
     })
 }
 
+#[test]
+fn harness_instructions_include_only_the_host_shell_guidance() {
+    let instructions = harness_instructions();
+    assert!(!instructions.contains(PLATFORM_SHELL_GUIDANCE_MARKER));
+    if cfg!(windows) {
+        assert!(instructions.contains("Use native PowerShell syntax and cmdlets"));
+        assert!(instructions.contains("Start-Process"));
+        assert!(!instructions.contains("In zsh, do not name a variable `path`"));
+        assert!(!instructions.contains("backticks and `$()` execute"));
+    } else {
+        assert!(instructions.contains("In zsh, do not name a variable `path`"));
+        assert!(instructions.contains("backticks and `$()` execute"));
+        assert!(!instructions.contains("Use native PowerShell syntax and cmdlets"));
+        assert!(!instructions.contains("Start-Process"));
+    }
+}
+
+#[test]
+fn system_prompt_renderer_replaces_one_platform_fragment() {
+    assert_eq!(
+        render_system_prompt("before\n{{platform_shell_guidance}}\nafter", "- host shell"),
+        "before\n- host shell\nafter"
+    );
+}
+
 fn assistant_item(text: &str) -> Value {
     json!({
         "id": format!("msg_{text}"),

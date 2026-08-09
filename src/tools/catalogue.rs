@@ -28,6 +28,36 @@ SOURCE: /[\s\S]+/"#;
 const EXEC_RUNTIME_GUIDANCE: &str = r#"Input raw JavaScript directly (no JSON, string, or Markdown wrapper) into fresh V8: top-level `await`; no Node.js/filesystem/network/console. Call `await tools.name(args)`; errors reject. Use `Promise.all` for independent calls and await all work. Emit with `text(value)`/`image(item,detail?)`; `notify` is interim; `yield_control` yields while code continues; `store`/`load` persist serializable values across cells; `exit`, `setTimeout`, and `clearTimeout` exist. Optional first line `// @exec:{"yield_time_ms":10000,"max_output_tokens":1000}`; both default 10000."#;
 const TOOL_DEFAULTS: &str = "Defaults: command cwd=turn, shell=user, `login:true`, `tty:false`, yield=10s; stdin yield=.25s after writes/5s polling; outer exec/wait output=10k tokens; nested command output=collected raw unless `max_output_tokens` is set; image detail=`high`. Nested command and non-empty write yields clamp to .25–30s; empty polls to 5–300s; top-level `exec`/`wait` yields are not clamped. Process: `output`+`wall_time_seconds` always; `session_id`=running, `exit_code`=done, `original_token_count`=before truncation, `chunk_id`=output chunk.";
 const WAIT_DESCRIPTION: &str = "Wait on a yielded top-level `exec` cell using its string `cell_id`; process `session_id` values from `exec_command` belong to `tools.write_stdin`. Returns only new output; repeat while active or use `terminate:true` to stop. `yield_time_ms`/`max_tokens` default 10000.";
+#[cfg(not(windows))]
+const EXEC_COMMAND_DESCRIPTION: &str = "Runs shell. Long commands return `session_id` for `write_stdin`; `tty:true` keeps stdin writable.";
+#[cfg(windows)]
+const EXEC_COMMAND_DESCRIPTION: &str = r#"Runs PowerShell by default on native Windows. Long commands return `session_id` for `write_stdin`; `tty:true` keeps stdin writable.
+
+PowerShell equivalents for common Unix commands:
+- show hidden entries: `Get-ChildItem -Force`
+- recursively find by name: `Get-ChildItem -Recurse -Filter *.py`
+- recursively search text without `rg`: `Get-ChildItem -Recurse -File | Select-String -Pattern 'TODO' -CaseSensitive`
+- filter processes: `Get-Process | Where-Object { $_.ProcessName -like '*python*' }`
+- set an environment variable: `$env:FOO='bar'`
+
+Windows safety rules:
+- Do not enumerate paths in PowerShell and pass them to `cmd /c`, batch builtins, or another shell for deletion or moving. Use one shell end-to-end and native PowerShell cmdlets with `-LiteralPath`.
+- Before a recursive delete or move, verify that every resolved absolute target remains within the intended workspace or explicitly named target directory.
+- Use `Start-Process -WindowStyle Hidden` for background helpers or services unless the user explicitly requested a visible interactive window."#;
+
+#[cfg(not(windows))]
+const EXEC_LOGIN_DESCRIPTION: &str =
+    "True runs the shell with -l/-i semantics; false disables them. Defaults to true.";
+#[cfg(windows)]
+const EXEC_LOGIN_DESCRIPTION: &str =
+    "True loads the PowerShell profile; false passes -NoProfile. Defaults to true.";
+
+#[cfg(not(windows))]
+const EXEC_TTY_DESCRIPTION: &str =
+    "True allocates a PTY with TERM=xterm-256color; false or omitted uses plain pipes.";
+#[cfg(windows)]
+const EXEC_TTY_DESCRIPTION: &str =
+    "True allocates a ConPTY terminal; false or omitted uses plain pipes.";
 
 static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
     let mut tools = vec![
@@ -37,7 +67,7 @@ static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
         ),
         function_tool(
             "exec_command",
-            "Runs shell. Long commands return `session_id` for `write_stdin`; `tty:true` keeps stdin writable.",
+            EXEC_COMMAND_DESCRIPTION,
             exec_command_input_schema(),
             Some(unified_exec_output_schema()),
         ),
@@ -406,11 +436,11 @@ fn exec_command_input_schema() -> Value {
             },
             "login": {
                 "type": "boolean",
-                "description": "True runs the shell with -l/-i semantics; false disables them. Defaults to true."
+                "description": EXEC_LOGIN_DESCRIPTION
             },
             "tty": {
                 "type": "boolean",
-                "description": "True allocates a PTY with TERM=xterm-256color; false or omitted uses plain pipes."
+                "description": EXEC_TTY_DESCRIPTION
             },
             "yield_time_ms": {
                 "type": "number",
@@ -619,8 +649,37 @@ mod tests {
         let declarations = text.split_once("```ts\n").unwrap().1;
         assert!(!declarations.contains("//"));
         assert!(!text.contains("exec tool declaration"));
+        if cfg!(windows) {
+            assert!(text.contains("Runs PowerShell by default on native Windows"));
+            assert!(text.contains("Get-ChildItem -Recurse -File | Select-String"));
+        } else {
+            assert!(text.contains("Runs shell. Long commands return"));
+            assert!(!text.contains("PowerShell equivalents for common Unix commands"));
+            assert!(!text.contains("Windows safety rules"));
+        }
     }
 
+    #[test]
+    fn exec_schema_contains_only_host_terminal_semantics() {
+        let exec = core_tools()
+            .iter()
+            .find(|tool| tool.name == "exec_command")
+            .unwrap();
+        let schema = exec.input_schema.as_ref().unwrap().to_string();
+        if cfg!(windows) {
+            assert!(schema.contains("PowerShell profile"));
+            assert!(schema.contains("ConPTY"));
+            assert!(!schema.contains("TERM=xterm-256color"));
+            assert!(!schema.contains("-l/-i semantics"));
+        } else {
+            assert!(schema.contains("TERM=xterm-256color"));
+            assert!(schema.contains("-l/-i semantics"));
+            assert!(!schema.contains("PowerShell profile"));
+            assert!(!schema.contains("ConPTY"));
+        }
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn readable_catalogue_snapshot_matches_the_request() {
         assert_eq!(
