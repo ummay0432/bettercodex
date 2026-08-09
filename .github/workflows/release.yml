@@ -206,12 +206,9 @@ jobs:
         shell: powershell
         run: .\scripts\install_windows_tests.ps1
 
-      - name: Test bettercodex
+      - name: Test bettercodex release and update paths
         shell: powershell
-        env:
-          RUST_MIN_STACK: "8388608"
-          RUST_TEST_THREADS: "1"
-        run: .\scripts\cargo-with-v8.ps1 test --locked --bin bcodex
+        run: .\scripts\cargo-with-v8.ps1 test --locked --bin bcodex update
 
       - name: Build and verify release binary
         shell: powershell
