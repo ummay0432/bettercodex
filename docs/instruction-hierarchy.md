@@ -63,11 +63,12 @@ repository, web page, command result, or skill safe.
 
 Source is authoritative; recheck it before changing or relying on this map.
 
-- `src/api.rs` sends `prompts/system.md` through the top-level `instructions`
-  field and sends the typed `additional_tools` catalogue as a developer item.
-  The Responses API gives both developer authority. Despite its local name,
-  `prompts/system.md` is the harness's developer-level contract, not OpenAI's
-  root or system layer.
+- `src/api.rs` renders `prompts/system.md` with the target's
+  `prompts/system-unix.md` or `prompts/system-windows.md`, sends the result
+  through the top-level `instructions` field, and sends the typed
+  `additional_tools` catalogue as a developer item. The Responses API gives
+  both developer authority. Despite its local name, `prompts/system.md` is the
+  harness's developer-level template, not OpenAI's root or system layer.
 - `src/context.rs` sends labeled `<repository_context>` from `AGENTS.md` as a
   user message, with a harness-authored instruction above the file contents
   that conflicting `AGENTS.md` instructions cannot override the System prompt.

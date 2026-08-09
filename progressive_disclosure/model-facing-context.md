@@ -8,10 +8,11 @@ model-visible errors.
 Do not alter Codex-derived agent-facing context in `prompts/*.md`, tool
 descriptions, or model-visible errors without explicit user permission.
 
-`prompts/system.md` is the active harness contract. `src/api.rs` sends it
-through the Responses API's top-level `instructions` field at developer
-authority; it is not OpenAI's root or system layer. Edit it only when the user
-explicitly asks to edit the system prompt.
+`prompts/system.md` is the active harness template. `src/api.rs` renders it with
+exactly one of `prompts/system-unix.md` or `prompts/system-windows.md`, then sends
+the result through the Responses API's top-level `instructions` field at
+developer authority; it is not OpenAI's root or system layer. Edit these files
+only when the user explicitly asks to edit the system prompt.
 
 `prompts/tool-catalogue.md` contains the exact generated tool text.
 

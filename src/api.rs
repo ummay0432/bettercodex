@@ -51,16 +51,14 @@ use sse::SseDecoder;
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const SYSTEM_PROMPT_TEMPLATE: &str = include_str!("../prompts/system.md");
 const PLATFORM_SHELL_GUIDANCE_MARKER: &str = "{{platform_shell_guidance}}";
-const PLATFORM_SHELL_ENVIRONMENT_GUIDANCE_MARKER: &str = "{{platform_shell_environment_guidance}}";
+#[cfg(any(not(windows), test))]
+const UNIX_PLATFORM_SHELL_GUIDANCE: &str = include_str!("../prompts/system-unix.md");
+#[cfg(any(windows, test))]
+const WINDOWS_PLATFORM_SHELL_GUIDANCE: &str = include_str!("../prompts/system-windows.md");
 #[cfg(not(windows))]
-const PLATFORM_SHELL_GUIDANCE: &str = include_str!("../prompts/system-unix.md");
+const PLATFORM_SHELL_GUIDANCE: &str = UNIX_PLATFORM_SHELL_GUIDANCE;
 #[cfg(windows)]
-const PLATFORM_SHELL_GUIDANCE: &str = include_str!("../prompts/system-windows.md");
-#[cfg(not(windows))]
-const PLATFORM_SHELL_ENVIRONMENT_GUIDANCE: &str =
-    include_str!("../prompts/system-unix-environment.md");
-#[cfg(windows)]
-const PLATFORM_SHELL_ENVIRONMENT_GUIDANCE: &str = "";
+const PLATFORM_SHELL_GUIDANCE: &str = WINDOWS_PLATFORM_SHELL_GUIDANCE;
 const MAX_HTTP_RETRIES: usize = 4;
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: usize = 2;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
@@ -79,13 +77,8 @@ const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
-static SYSTEM_PROMPT: LazyLock<String> = LazyLock::new(|| {
-    render_system_prompt(
-        SYSTEM_PROMPT_TEMPLATE,
-        PLATFORM_SHELL_GUIDANCE,
-        PLATFORM_SHELL_ENVIRONMENT_GUIDANCE,
-    )
-});
+static SYSTEM_PROMPT: LazyLock<String> =
+    LazyLock::new(|| render_system_prompt(SYSTEM_PROMPT_TEMPLATE, PLATFORM_SHELL_GUIDANCE));
 static STABLE_INPUT_PREFIX_ITEMS: LazyLock<[Value; 1]> = LazyLock::new(|| {
     [json!({
         "type": "additional_tools",
@@ -1322,39 +1315,16 @@ pub(crate) fn harness_instructions() -> &'static str {
     SYSTEM_PROMPT.as_str()
 }
 
-fn render_system_prompt(
-    template: &str,
-    platform_shell_guidance: &str,
-    platform_shell_environment_guidance: &str,
-) -> String {
+fn render_system_prompt(template: &str, platform_shell_guidance: &str) -> String {
     assert_eq!(
         template.matches(PLATFORM_SHELL_GUIDANCE_MARKER).count(),
         1,
         "system prompt must contain exactly one platform shell guidance marker"
     );
-    assert_eq!(
-        template
-            .matches(PLATFORM_SHELL_ENVIRONMENT_GUIDANCE_MARKER)
-            .count(),
-        1,
-        "system prompt must contain exactly one platform shell environment guidance marker"
-    );
-    let prompt = template.trim().replace(
+    template.trim().replace(
         PLATFORM_SHELL_GUIDANCE_MARKER,
         platform_shell_guidance.trim(),
-    );
-    let platform_shell_environment_guidance = platform_shell_environment_guidance.trim();
-    if platform_shell_environment_guidance.is_empty() {
-        prompt.replace(
-            &format!("{PLATFORM_SHELL_ENVIRONMENT_GUIDANCE_MARKER}\n"),
-            "",
-        )
-    } else {
-        prompt.replace(
-            PLATFORM_SHELL_ENVIRONMENT_GUIDANCE_MARKER,
-            platform_shell_environment_guidance,
-        )
-    }
+    )
 }
 
 pub(crate) fn estimated_harness_instruction_tokens() -> u64 {

@@ -1,1 +1,2 @@
-- Treat strings passed to `exec_command` as shell code: backticks and `$()` execute unless safely quoted. Do not interpolate sensitive data in ways that could expose it.
+- In `bash`, `zsh`, and `sh`, backticks and `$()` execute unless safely quoted.
+- In zsh, do not name a variable `path`; assigning it mutates `PATH`.

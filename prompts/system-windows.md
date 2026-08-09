@@ -1,1 +1,1 @@
-- Treat strings passed to `exec_command` as PowerShell code unless `shell` explicitly selects another installed shell. Use native PowerShell syntax and cmdlets rather than Bash or Unix syntax, and do not interpolate sensitive data into executable strings.
+- When using PowerShell, use native PowerShell syntax and cmdlets rather than Bash or Unix syntax.

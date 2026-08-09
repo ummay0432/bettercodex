@@ -68,42 +68,49 @@ fn user_message(text: &str) -> Value {
 }
 
 #[test]
-fn harness_instructions_include_only_the_host_shell_guidance() {
-    let instructions = harness_instructions();
-    assert!(!instructions.contains(PLATFORM_SHELL_GUIDANCE_MARKER));
-    assert!(!instructions.contains(PLATFORM_SHELL_ENVIRONMENT_GUIDANCE_MARKER));
-    if cfg!(windows) {
-        assert!(instructions.contains("Use native PowerShell syntax and cmdlets"));
-        assert!(!instructions.contains("In zsh, do not name a variable `path`"));
-        assert!(!instructions.contains("backticks and `$()` execute"));
+fn harness_instructions_match_the_host_platform_prompt() {
+    let platform_shell_guidance = if cfg!(windows) {
+        WINDOWS_PLATFORM_SHELL_GUIDANCE
     } else {
-        assert!(instructions.contains("In zsh, do not name a variable `path`"));
-        assert!(instructions.contains("backticks and `$()` execute"));
-        assert!(!instructions.contains("Use native PowerShell syntax and cmdlets"));
+        UNIX_PLATFORM_SHELL_GUIDANCE
+    };
+    assert_eq!(
+        harness_instructions(),
+        render_system_prompt(SYSTEM_PROMPT_TEMPLATE, platform_shell_guidance)
+    );
+}
+
+#[test]
+fn system_prompt_renderer_keeps_platform_guidance_separate() {
+    let unix_prompt = render_system_prompt(SYSTEM_PROMPT_TEMPLATE, UNIX_PLATFORM_SHELL_GUIDANCE);
+    let windows_prompt =
+        render_system_prompt(SYSTEM_PROMPT_TEMPLATE, WINDOWS_PLATFORM_SHELL_GUIDANCE);
+
+    assert_prompt_has_only_platform_guidance(
+        &unix_prompt,
+        UNIX_PLATFORM_SHELL_GUIDANCE,
+        WINDOWS_PLATFORM_SHELL_GUIDANCE,
+    );
+    assert_prompt_has_only_platform_guidance(
+        &windows_prompt,
+        WINDOWS_PLATFORM_SHELL_GUIDANCE,
+        UNIX_PLATFORM_SHELL_GUIDANCE,
+    );
+}
+
+fn assert_prompt_has_only_platform_guidance(prompt: &str, expected: &str, excluded: &str) {
+    assert!(!prompt.contains(PLATFORM_SHELL_GUIDANCE_MARKER));
+    assert!(prompt.contains(expected.trim()));
+    for excluded_line in excluded.trim().lines() {
+        assert!(!prompt.lines().any(|line| line == excluded_line));
     }
 }
 
 #[test]
 fn system_prompt_renderer_replaces_one_platform_fragment() {
     assert_eq!(
-        render_system_prompt(
-            "before\n{{platform_shell_guidance}}\nmiddle\n{{platform_shell_environment_guidance}}\nafter",
-            "- host shell",
-            "- host environment",
-        ),
-        "before\n- host shell\nmiddle\n- host environment\nafter"
-    );
-}
-
-#[test]
-fn system_prompt_renderer_removes_an_empty_platform_fragment_line() {
-    assert_eq!(
-        render_system_prompt(
-            "before\n{{platform_shell_guidance}}\nmiddle\n{{platform_shell_environment_guidance}}\nafter",
-            "- host shell",
-            "",
-        ),
-        "before\n- host shell\nmiddle\nafter"
+        render_system_prompt("before\n{{platform_shell_guidance}}\nafter", "- host shell"),
+        "before\n- host shell\nafter"
     );
 }
 

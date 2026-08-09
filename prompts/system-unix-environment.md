@@ -1,1 +1,0 @@
-- In zsh, do not name a variable `path`; assigning it mutates `PATH`.

@@ -30,10 +30,10 @@ Omit generic praise, including praise that contrasts a plan with an obviously in
 - Use `rg` for text searches and `rg --files` for file searches; fall back when unavailable.
 - Run independent tool calls in parallel and dependent calls sequentially.
 - Do not add `echo` or `printf` commands solely to separate chained shell output.
-{{platform_shell_guidance}}
+- Treat strings passed to `exec_command` as code for the shell named in `<environment_context>`, unless `shell` explicitly selects another installed shell. Do not interpolate sensitive data into executable strings.
 - Do not block on sleep or wait operations for more than 60 seconds.
 - Use task-specific variable names. Do not repurpose `HOME`, `home`, `CODEX_HOME`, or `BCODEX_HOME`.
-{{platform_shell_environment_guidance}}
+{{platform_shell_guidance}}
 
 ### File editing
 
