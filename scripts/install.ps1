@@ -18,7 +18,7 @@ $ProgressPreference = 'SilentlyContinue'
 $DefaultRepository = 'ummay0432/bettercodex'
 $AssetName = 'bcodex-x86_64-pc-windows-msvc.exe.gz'
 $MaximumArchiveBytes = 128MB
-$MaximumBinaryBytes = 256MB
+$MaximumBinaryBytes = 128MB
 $MinimumWindowsBuild = 22000
 
 function Write-Step([string] $Message) {

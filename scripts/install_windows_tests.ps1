@@ -28,7 +28,7 @@ foreach ($FunctionAst in $Ast.FindAll({
 }
 
 $global:MaximumArchiveBytes = 128MB
-$global:MaximumBinaryBytes = 256MB
+$global:MaximumBinaryBytes = 128MB
 $Revision = '1' * 40
 $Tag = "bcodex-v1.2.3-$Revision"
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) (

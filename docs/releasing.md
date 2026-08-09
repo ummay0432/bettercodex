@@ -25,6 +25,8 @@ release authorization.
   separate Debian binary.
 - Keep the zstd copies of the Unix binaries compatible with immutable 0.1.2
   clients; they are alternate encodings, not additional binaries.
+- Keep every decompressed binary at or below 128 MiB, the limit enforced by
+  both current installers and immutable 0.1.2 clients.
 - GitHub's release API digest is the asset checksum. Do not add checksum,
   manifest, source, or installer assets.
 
