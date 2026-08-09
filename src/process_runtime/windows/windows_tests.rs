@@ -110,18 +110,9 @@ async fn assert_terminate_kills_descendant(
     );
     let args = vec!["-u".to_string(), "-c".to_string(), code];
     let spawned = if backend == "pipe" {
-        spawn_pipe_process_no_stdin(python, &args, Path::new("."), env, /*arg0*/ &None, &[]).await?
+        spawn_pipe_process_no_stdin(python, &args, Path::new("."), env).await?
     } else {
-        spawn_pty_process(
-            python,
-            &args,
-            Path::new("."),
-            env,
-            /*arg0*/ &None,
-            TerminalSize::default(),
-            &[],
-        )
-        .await?
+        spawn_pty_process(python, &args, Path::new("."), env, TerminalSize::default()).await?
     };
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
     wait_for_output_contains(&mut output_rx, READY_MARKER, /*timeout_ms*/ 10_000).await?;
@@ -163,18 +154,9 @@ async fn assert_normal_exit_preserves_descendant(
     );
     let args = vec!["-u".to_string(), "-c".to_string(), code];
     let spawned = if backend == "pipe" {
-        spawn_pipe_process_no_stdin(python, &args, Path::new("."), env, /*arg0*/ &None, &[]).await?
+        spawn_pipe_process_no_stdin(python, &args, Path::new("."), env).await?
     } else {
-        spawn_pty_process(
-            python,
-            &args,
-            Path::new("."),
-            env,
-            /*arg0*/ &None,
-            TerminalSize::default(),
-            &[],
-        )
-        .await?
+        spawn_pty_process(python, &args, Path::new("."), env, TerminalSize::default()).await?
     };
     let (session, output_rx, exit_rx) = combine_spawned_output(spawned);
     let (_, exit_code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 10_000).await;
@@ -349,9 +331,7 @@ async fn conpty_delivers_input_to_foreground_children() -> anyhow::Result<()> {
             &shell.args,
             Path::new("."),
             &env,
-            /*arg0*/ &None,
             TerminalSize::default(),
-            &[],
         )
         .await?;
         let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
@@ -402,9 +382,7 @@ async fn conpty_ctrl_c_interrupts_powershell_foreground_child() -> anyhow::Resul
         &args,
         Path::new("."),
         &env,
-        /*arg0*/ &None,
         TerminalSize::default(),
-        &[],
     )
     .await?;
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);

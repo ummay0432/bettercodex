@@ -1,3 +1,5 @@
+//! Windows pipe process spawning.
+
 use std::collections::HashMap;
 use std::io;
 use std::io::ErrorKind;
@@ -23,71 +25,30 @@ use super::process::ProcessSignal;
 use super::process::SpawnedProcess;
 use super::process::exit_code_from_status;
 
-#[cfg(target_os = "linux")]
-use libc;
-
-#[cfg(windows)]
 enum WindowsChildTerminator {
     Job(Arc<super::win::JobObject>),
     Process(u32),
 }
 
 struct PipeChildTerminator {
-    #[cfg(windows)]
     windows: WindowsChildTerminator,
-    #[cfg(unix)]
-    process_group_id: u32,
 }
 
 impl ChildTerminator for PipeChildTerminator {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
         match signal {
-            ProcessSignal::Interrupt => {
-                #[cfg(unix)]
-                {
-                    super::process_group::interrupt_process_group(self.process_group_id)
-                }
-
-                #[cfg(windows)]
-                {
-                    self.kill()
-                }
-
-                #[cfg(not(any(unix, windows)))]
-                {
-                    Err(super::process::unsupported_signal(signal))
-                }
-            }
+            ProcessSignal::Interrupt => self.kill(),
         }
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            super::process_group::kill_process_group(self.process_group_id)
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            super::process_group::kill_process_group_with_member_fallback(self.process_group_id)
-        }
-
-        #[cfg(windows)]
-        {
-            match &self.windows {
-                WindowsChildTerminator::Job(job) => job.terminate(),
-                WindowsChildTerminator::Process(pid) => kill_process(*pid),
-            }
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            Ok(())
+        match &self.windows {
+            WindowsChildTerminator::Job(job) => job.terminate(),
+            WindowsChildTerminator::Process(pid) => kill_process(*pid),
         }
     }
 }
 
-#[cfg(windows)]
 fn kill_process(pid: u32) -> io::Result<()> {
     unsafe {
         let handle = winapi::um::processthreadsapi::OpenProcess(
@@ -99,9 +60,9 @@ fn kill_process(pid: u32) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         let success = winapi::um::processthreadsapi::TerminateProcess(handle, 1);
-        let err = io::Error::last_os_error();
+        let error = io::Error::last_os_error();
         winapi::um::handleapi::CloseHandle(handle);
-        if success == 0 { Err(err) } else { Ok(()) }
+        if success == 0 { Err(error) } else { Ok(()) }
     }
 }
 
@@ -109,14 +70,14 @@ async fn read_output_stream<R>(mut reader: R, output_tx: mpsc::Sender<Vec<u8>>)
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = vec![0u8; 8_192];
+    let mut buffer = vec![0u8; 8_192];
     loop {
-        match reader.read(&mut buf).await {
+        match reader.read(&mut buffer).await {
             Ok(0) => break,
-            Ok(n) => {
-                let _ = output_tx.send(buf[..n].to_vec()).await;
+            Ok(read) => {
+                let _ = output_tx.send(buffer[..read].to_vec()).await;
             }
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
@@ -124,49 +85,25 @@ where
 
 #[derive(Clone, Copy)]
 enum PipeStdinMode {
+    #[cfg(test)]
     Piped,
     Null,
 }
 
-/// On Windows, process-tree containment is best-effort because Tokio returns
-/// only after the root process starts, so job assignment cannot be atomic.
+/// Process-tree containment is best-effort because Tokio returns only after
+/// the root process starts, so job assignment cannot be atomic.
 async fn spawn_process_with_stdin_mode(
     program: &str,
     args: &[String],
     cwd: &Path,
     env: &HashMap<String, String>,
-    arg0: &Option<String>,
     stdin_mode: PipeStdinMode,
-    inherited_fds: &[i32],
 ) -> Result<SpawnedProcess> {
     if program.is_empty() {
         anyhow::bail!("missing program for pipe spawn");
     }
 
-    #[cfg(not(unix))]
-    let _ = inherited_fds;
-
     let mut command = Command::new(program);
-    #[cfg(unix)]
-    if let Some(arg0) = arg0 {
-        command.arg0(arg0);
-    }
-    #[cfg(target_os = "linux")]
-    let parent_pid = unsafe { libc::getpid() };
-    #[cfg(unix)]
-    let inherited_fds = inherited_fds.to_vec();
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(move || {
-            super::process_group::detach_from_tty()?;
-            #[cfg(target_os = "linux")]
-            super::process_group::set_parent_death_signal(parent_pid)?;
-            super::pty::close_inherited_fds_except(&inherited_fds);
-            Ok(())
-        });
-    }
-    #[cfg(not(unix))]
-    let _ = arg0;
     command.current_dir(cwd);
     command.env_clear();
     for (key, value) in env {
@@ -176,6 +113,7 @@ async fn spawn_process_with_stdin_mode(
         command.arg(arg);
     }
     match stdin_mode {
+        #[cfg(test)]
         PipeStdinMode::Piped => {
             command.stdin(Stdio::piped());
         }
@@ -186,10 +124,8 @@ async fn spawn_process_with_stdin_mode(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    #[cfg(windows)]
     let job = super::win::JobObject::create().map(Arc::new);
     let mut child = command.spawn()?;
-    #[cfg(windows)]
     let windows_terminator = {
         // Accept the small race: a descendant created between spawn and
         // assignment is not guaranteed to join the job and can escape termination.
@@ -205,18 +141,14 @@ async fn spawn_process_with_stdin_mode(
         });
         match assigned_job {
             Ok(job) => WindowsChildTerminator::Job(job),
-            Err(err) => {
+            Err(error) => {
                 log::warn!(
-                    "Windows pipe process tree containment unavailable for pid {pid}: {err}"
+                    "Windows pipe process tree containment unavailable for pid {pid}: {error}"
                 );
                 WindowsChildTerminator::Process(pid)
             }
         }
     };
-    #[cfg(unix)]
-    let process_group_id = child
-        .id()
-        .ok_or_else(|| io::Error::other("missing child pid"))?;
 
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
@@ -271,7 +203,6 @@ async fn spawn_process_with_stdin_mode(
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
-    #[cfg(windows)]
     let wait_job = match &windows_terminator {
         WindowsChildTerminator::Job(job) => Some(Arc::clone(job)),
         WindowsChildTerminator::Process(_) => None,
@@ -279,12 +210,11 @@ async fn spawn_process_with_stdin_mode(
     let wait_handle: JoinHandle<()> = tokio::spawn(async move {
         let code = match child.wait().await {
             Ok(status) => {
-                #[cfg(windows)]
                 if let Some(job) = wait_job
-                    && let Err(err) = job.preserve_descendants()
+                    && let Err(error) = job.preserve_descendants()
                 {
                     log::warn!(
-                        "Windows pipe failed to preserve descendants after root exit: {err}"
+                        "Windows pipe failed to preserve descendants after root exit: {error}"
                     );
                 }
                 exit_code_from_status(status)
@@ -301,10 +231,7 @@ async fn spawn_process_with_stdin_mode(
     let handle = ProcessHandle::new(
         writer_tx,
         Box::new(PipeChildTerminator {
-            #[cfg(windows)]
             windows: windows_terminator,
-            #[cfg(unix)]
-            process_group_id,
         }),
         reader_handle,
         reader_abort_handles,
@@ -313,7 +240,6 @@ async fn spawn_process_with_stdin_mode(
         exit_status,
         exit_code,
         /*pty_handles*/ None,
-        /*resizer*/ None,
     );
 
     Ok(SpawnedProcess {
@@ -324,50 +250,27 @@ async fn spawn_process_with_stdin_mode(
     })
 }
 
-/// Spawn a process using regular pipes and preserve selected inherited file
-/// descriptors across exec on Unix.
+/// Spawn a process with writable stdin for process-runtime tests.
+#[cfg(test)]
 pub async fn spawn_process(
     program: &str,
     args: &[String],
     cwd: &Path,
     env: &HashMap<String, String>,
-    arg0: &Option<String>,
-    inherited_fds: &[i32],
 ) -> Result<SpawnedProcess> {
-    spawn_process_with_stdin_mode(
-        program,
-        args,
-        cwd,
-        env,
-        arg0,
-        PipeStdinMode::Piped,
-        inherited_fds,
-    )
-    .await
+    spawn_process_with_stdin_mode(program, args, cwd, env, PipeStdinMode::Piped).await
 }
 
-/// Spawn a process using regular pipes, close stdin immediately, and preserve
-/// selected inherited file descriptors across exec on Unix.
+/// Spawn a process using regular pipes and close stdin immediately.
 pub async fn spawn_process_no_stdin(
     program: &str,
     args: &[String],
     cwd: &Path,
     env: &HashMap<String, String>,
-    arg0: &Option<String>,
-    inherited_fds: &[i32],
 ) -> Result<SpawnedProcess> {
-    spawn_process_with_stdin_mode(
-        program,
-        args,
-        cwd,
-        env,
-        arg0,
-        PipeStdinMode::Null,
-        inherited_fds,
-    )
-    .await
+    spawn_process_with_stdin_mode(program, args, cwd, env, PipeStdinMode::Null).await
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 #[path = "pipe_tests.rs"]
 mod tests;

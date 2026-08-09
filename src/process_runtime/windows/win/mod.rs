@@ -48,8 +48,6 @@ mod psuedocon;
 
 pub use conpty::ConPtySystem;
 pub use job::JobObject;
-pub use psuedocon::PsuedoCon;
-pub use psuedocon::conpty_supported;
 
 #[derive(Debug)]
 pub struct WinChild {

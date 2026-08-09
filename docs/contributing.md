@@ -36,7 +36,6 @@ just fix
 just fmt
 just test
 just clippy -- -D warnings
-python3 scripts/install_tests.py
 ./scripts/cargo-with-v8.sh build --release --locked
 ```
 

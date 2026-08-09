@@ -4,26 +4,38 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::RawHandle;
 use std::sync::Mutex;
+#[cfg(test)]
 use tokio::process::Child;
+#[cfg(test)]
 use tokio::process::Command;
+#[cfg(test)]
 use winapi::shared::ntdef::NT_SUCCESS;
+#[cfg(test)]
 use winapi::shared::ntdef::NTSTATUS;
 use winapi::um::jobapi2::AssignProcessToJobObject;
 use winapi::um::jobapi2::CreateJobObjectW;
 use winapi::um::jobapi2::SetInformationJobObject;
 use winapi::um::jobapi2::TerminateJobObject;
+#[cfg(test)]
 use winapi::um::processthreadsapi::OpenProcess;
+#[cfg(test)]
 use winapi::um::processthreadsapi::TerminateProcess;
+#[cfg(test)]
 use winapi::um::winbase::CREATE_SUSPENDED;
+#[cfg(test)]
 use winapi::um::winnt::HANDLE;
 use winapi::um::winnt::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
 use winapi::um::winnt::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 use winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
 use winapi::um::winnt::JobObjectExtendedLimitInformation;
+#[cfg(test)]
 use winapi::um::winnt::PROCESS_SET_QUOTA;
+#[cfg(test)]
 use winapi::um::winnt::PROCESS_SUSPEND_RESUME;
+#[cfg(test)]
 use winapi::um::winnt::PROCESS_TERMINATE;
 
+#[cfg(test)]
 #[link(name = "ntdll")]
 unsafe extern "system" {
     fn NtResumeProcess(process_handle: HANDLE) -> NTSTATUS;
@@ -59,6 +71,7 @@ impl JobObject {
     }
 
     /// Creates a Job Object whose owned descendants cannot explicitly break away.
+    #[cfg(test)]
     pub fn create_without_breakaway() -> io::Result<Self> {
         let job = Self::create()?;
         Self::set_limit_flags(&job.handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
@@ -66,6 +79,7 @@ impl JobObject {
     }
 
     /// Captures an owned process handle before its numeric identifier can be reused.
+    #[cfg(test)]
     pub fn open_process_handle(process_id: u32) -> io::Result<std::os::windows::io::OwnedHandle> {
         let handle = unsafe {
             OpenProcess(PROCESS_TERMINATE, /*bInheritHandle*/ 0, process_id)
@@ -78,6 +92,7 @@ impl JobObject {
     }
 
     /// Terminates the exact process identified by a previously captured handle.
+    #[cfg(test)]
     pub fn terminate_process_handle(handle: &std::os::windows::io::OwnedHandle) -> io::Result<()> {
         let terminated = unsafe {
             TerminateProcess(handle.as_raw_handle().cast(), /*uExitCode*/ 1)
@@ -122,6 +137,7 @@ impl JobObject {
     }
 
     /// Prevents a child from running before it can be assigned to this job.
+    #[cfg(test)]
     pub fn prepare_suspended_spawn(&self, command: &mut Command) {
         command.creation_flags(CREATE_SUSPENDED).kill_on_drop(true);
     }
@@ -130,6 +146,7 @@ impl JobObject {
     ///
     /// Nested jobs can reject assignment. Such a child is resumed without
     /// containment so callers can preserve their existing compatibility fallback.
+    #[cfg(test)]
     pub fn assign_and_resume_process(&self, process_id: u32) -> io::Result<bool> {
         let process = unsafe {
             OpenProcess(
@@ -166,6 +183,7 @@ impl JobObject {
     }
 
     /// Starts a process only after assigning it to this Job Object.
+    #[cfg(test)]
     pub fn spawn_contained(&self, command: &mut Command) -> io::Result<Child> {
         self.prepare_suspended_spawn(command);
         let child = command.spawn()?;

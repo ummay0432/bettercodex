@@ -26,11 +26,8 @@ use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
-use schemars::JsonSchema;
-use schemars::r#gen::SchemaSettings;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Map;
 use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
@@ -49,7 +46,13 @@ const SEARCH_PATH: &str = "alpha/search";
 const REQUEST_MAX_RETRIES: u64 = 4;
 const REQUEST_RETRY_DELAY: Duration = Duration::from_millis(200);
 
-static INPUT_SCHEMA: LazyLock<Value> = LazyLock::new(commands_schema);
+static INPUT_SCHEMA: LazyLock<Value> =
+    LazyLock::new(
+        || match serde_json::from_str(include_str!("web_search_schema.json")) {
+            Ok(schema) => schema,
+            Err(error) => panic!("invalid built-in web search schema: {error}"),
+        },
+    );
 
 #[derive(Clone)]
 pub(crate) struct WebSearchClient {
@@ -140,7 +143,7 @@ enum HistoryContent<'a> {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct SearchCommands {
     /// Query the internet search engine for a given list of queries.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,7 +180,7 @@ struct SearchCommands {
     response_length: Option<SearchResponseLength>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SearchQuery {
     /// Search query.
     q: String,
@@ -189,7 +192,7 @@ struct SearchQuery {
     domains: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct OpenOperation {
     /// Reference id or URL to open.
     ref_id: String,
@@ -198,7 +201,7 @@ struct OpenOperation {
     lineno: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ClickOperation {
     /// Reference id containing the numbered link.
     ref_id: String,
@@ -206,7 +209,7 @@ struct ClickOperation {
     id: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FindOperation {
     /// Reference id or URL to search within.
     ref_id: String,
@@ -214,7 +217,7 @@ struct FindOperation {
     pattern: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ScreenshotOperation {
     /// Reference id or URL to screenshot.
     ref_id: String,
@@ -222,7 +225,7 @@ struct ScreenshotOperation {
     pageno: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct FinanceOperation {
     /// Ticker symbol to look up.
     ticker: String,
@@ -233,7 +236,7 @@ struct FinanceOperation {
     market: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum FinanceAssetType {
     Equity,
@@ -242,7 +245,7 @@ enum FinanceAssetType {
     Index,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct WeatherOperation {
     /// Location in "Country, Area, City" format.
     location: String,
@@ -254,7 +257,7 @@ struct WeatherOperation {
     duration: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SportsOperation {
     /// Tool name for sports requests.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -283,13 +286,13 @@ struct SportsOperation {
     locale: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SportsToolName {
     Sports,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SportsFunction {
     Schedule,
@@ -305,7 +308,7 @@ impl SportsFunction {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SportsLeague {
     Nba,
@@ -335,13 +338,13 @@ impl SportsLeague {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct TimeOperation {
     /// UTC offset formatted like "+03:00".
     utc_offset: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SearchResponseLength {
     Short,
@@ -583,40 +586,6 @@ pub(crate) fn activities_for_display(input: Option<Value>) -> Vec<WebActivity> {
         activities.push(WebActivity::new("Browse", String::new()));
     }
     activities
-}
-
-fn commands_schema() -> Value {
-    let schema = SchemaSettings::draft2019_09()
-        .with(|settings| {
-            settings.inline_subschemas = true;
-            settings.option_add_null_type = false;
-        })
-        .into_generator()
-        .into_root_schema_for::<SearchCommands>();
-    let mut schema = match serde_json::to_value(schema) {
-        Ok(Value::Object(schema)) => schema,
-        Ok(_) | Err(_) => {
-            return serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-            });
-        }
-    };
-
-    let mut tool_schema = Map::new();
-    for key in [
-        "properties",
-        "required",
-        "type",
-        "additionalProperties",
-        "$defs",
-        "definitions",
-    ] {
-        if let Some(value) = schema.remove(key) {
-            tool_schema.insert(key.to_string(), value);
-        }
-    }
-    Value::Object(tool_schema)
 }
 
 fn parse_commands(input: Option<Value>) -> Result<SearchCommands> {

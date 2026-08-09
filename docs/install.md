@@ -1,280 +1,141 @@
 # Installing and building bettercodex
 
-bettercodex is one Rust package and one user-facing `bcodex` binary. Public
-installations track the exact current commit on public `main`. Cargo package
-versions are display metadata; they do not decide whether an installation is
-current. Native Windows installs also include upstream Codex's pinned
-`rg.exe` as a private command dependency; it is not a second product command.
+Public bettercodex installations use prebuilt binaries from GitHub Releases.
+They do not download source code or require Rust, Cargo, or native build tools.
 
-## Supported and preview systems
+## Supported systems
 
-| Operating system | Architectures | Status |
+| System | Architecture | Status |
 | --- | --- | --- |
-| macOS 12+ | Apple Silicon and Intel | Supported |
-| Linux with glibc 2.31+ | ARM64 and x86-64 | Supported |
-| Windows 11 | x86-64 | Developer preview |
+| macOS 12 or newer | Apple silicon | Supported |
+| Ubuntu 22.04+ and Debian 12+ | x86-64 | Supported |
+| Windows 11 build 22000+ | x86-64 | Developer preview |
 
-Native Windows 10 version 1809 or newer has the required ConPTY API but remains
-best effort. The native Windows port remains a developer preview until its
-native automated and interactive Windows Terminal/VS Code matrices are
-recorded. WSL runs the Linux binary and follows the Linux instructions, not the
-native Windows flow.
-
-A public install requires several gigabytes of free space and network access to
-GitHub and the official Rust download servers. The installer supplies its own
-[rustup](https://rustup.rs/) and pinned Rust toolchain when necessary. Unix
-installation also requires `curl`. If native C/C++ build tools are missing on
-Linux, the installer installs the distribution's development-tool package;
-privilege escalation may request the operator's password. On a new Mac it
-starts Apple's Xcode Command Line Tools installer. Finish the macOS system
-dialog and rerun the command once.
-
-Native Windows additionally requires PowerShell 5.1 or PowerShell 7, the
-Windows `tar.exe`, and Visual Studio 2022 Build Tools with **Desktop development
-with C++** and a Windows 10 or 11 SDK. Install those prerequisites from
-[Microsoft's C++ Build Tools page](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-before running the source installer. Install Git for Windows for Git-backed
-repository features (for example, `winget install --id Git.Git -e`). Git Bash
-does not become the agent shell; native Windows commands default to PowerShell.
-The first local release build can use
-roughly 6–10 GiB persistently for Rust, dependency, V8, and compiled-artifact
-caches. For a cold build, the installer reserves 8 GiB of cache headroom,
-2 GiB of temporary-build headroom, and 256 MiB for installation; when those
-paths share a volume, at least 10.25 GiB must be free. The installed product
-itself remains one `bcodex.exe`. The installer aggregates this preflight by
-volume before starting the long source build.
+Ubuntu and Debian share the `x86_64-unknown-linux-gnu` release binary. WSL uses
+that Linux binary. Native Windows remains a developer preview until the native
+automated and interactive terminal matrices in
+[`SPEC-WINDOWS.md`](../SPEC-WINDOWS.md) pass.
 
 ## Install
 
-### macOS and Linux
-
-Run the repository's canonical [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt):
+On macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
 ```
 
-The bootstrap downloads `scripts/install.sh` from public `main`. The installer
-then:
-
-1. Resolves `refs/heads/main` once to a full 40-character commit ID.
-2. Downloads the immutable source archive for exactly that commit.
-3. Bootstraps missing native build tools, rustup, and the pinned Rust toolchain.
-   A rustup just installed at `$HOME/.cargo/bin` is detected immediately even
-   when the current shell has not reloaded `PATH`.
-4. Uses the checked-in lockfile and pinned Rust toolchain.
-5. Hashes release-relevant source bytes, then reuses Cargo's native-target cache
-   and incrementally builds only changed bettercodex code and dependencies.
-6. Stamps the exact commit into a staged copy without invalidating reusable
-   compiler output, then reapplies and verifies the required ad-hoc code
-   signature on macOS.
-7. Checks its version and embedded revision, initializes V8, and materializes
-   every embedded system resource in isolated directories.
-8. Atomically renames the verified stage over the installed command.
-
-The selected commit does not change if `main` advances while compilation is in
-progress. The next launch or explicit update discovers the newer commit.
-
-By default, the command is installed at `$HOME/.local/bin/bcodex`. The installer
-adds a managed PATH block to the appropriate shell profile when necessary and
-reports any older `bcodex` that appears earlier on `PATH`. Set the absolute
-`BCODEX_INSTALL_DIR` environment variable to choose another binary directory.
-
-### Native Windows
-
-In Windows PowerShell 5.1:
+On native Windows in PowerShell 5.1 or newer:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.ps1' | iex"
 ```
 
-PowerShell 7 users can run the equivalent command with `pwsh`. This invocation
-does not change the machine-wide execution policy. The installer pins public
-`main`, downloads that exact source archive, initializes the installed Visual
-Studio build environment, obtains the pinned Rust toolchain and verified
-sandboxed V8 pair, builds `bcodex.exe` when needed, smoke-tests it, then commits
-only the verified candidate. It also reads the copied upstream ripgrep package
-manifest, checks the Windows x64 archive's exact size and SHA-256 digest,
-extracts only the declared `rg.exe`, verifies its version, and installs it under
-the private `bcodex-path` directory beside the product command.
-
-The default Windows command directory is
-`%LOCALAPPDATA%\Programs\bettercodex\bin`; reusable build state is under
-`%LOCALAPPDATA%\bettercodex\cache`. Set an absolute `BCODEX_INSTALL_DIR` or
-`BCODEX_CACHE_DIR` before invoking the script to override either location. The
-installer updates the current process PATH and the case-insensitive per-user
-PATH without duplicating entries. Open a new terminal after first installation.
-Only the `bin` directory is persisted there. bettercodex prepends
-`bin\bcodex-path` to its own runtime environment so agent commands can use
-`rg`/`rg --files`; the private helper is not added to the user's PATH.
-On update, the installer first reuses an already available pinned Rust
-toolchain without contacting rustup. If the selected commit has the same
-release-input hash as the cached or currently installed executable, it verifies
-and restamps that executable without starting Rust or MSVC at all; otherwise
-Cargo incrementally rebuilds into the same persistent target.
-
-After installation, open a new terminal when requested, then run:
+Open a new terminal when requested, then run:
 
 ```sh
 bcodex login
 bcodex
 ```
 
-`CODEX_HOME` and `BCODEX_HOME` override the credential and bettercodex state
-directories on every platform. Without overrides, Unix uses `$HOME/.codex` and
-`$HOME/.bcodex`; native Windows uses `%USERPROFILE%\.codex` and
-`%USERPROFILE%\.bcodex`. Installing or updating does not remove either
-directory.
+The Unix installer requires `curl`, `gzip`, and standard POSIX utilities. The
+Windows installer uses built-in PowerShell and .NET functionality. Both select
+the matching asset from the latest published full release, reject unexpected
+sizes or binary identities, run an isolated runtime smoke test, and replace the
+installed command only after verification succeeds. The macOS installer also
+verifies the binary's code signature.
 
-## Update behavior
+The default command locations are:
 
-Distribution builds embed their full source revision. After the TUI renders its
-first frame, bettercodex compares that revision with public `main` in a bounded,
-failure-silent background request. A different commit displays both short
-revision IDs and asks the operator to run:
+- `$HOME/.local/bin/bcodex` on macOS and Linux; and
+- `%LOCALAPPDATA%\Programs\bettercodex\bin\bcodex.exe` on Windows.
+
+Set an absolute `BCODEX_INSTALL_DIR` to choose another directory. The installer
+adds the default directory to the user's `PATH` when needed. It does not remove
+credentials, settings, or sessions.
+
+A successful install leaves one executable plus a `PATH` entry only when one
+was needed. Download archives, staged binaries, smoke-test state, and locks are
+transaction-local and removed. When migrating from the retired source-building
+installer, the installer also removes its recognized compiler, toolchain,
+dependency, and private ripgrep caches. A standalone V8 cache is preserved when
+there is no evidence that the installer owns it, because it may belong to a
+developer checkout.
+
+## Releases and updates
+
+Every published binary embeds a tag of the form
+`bcodex-v<version>-<40-character-source-revision>`. The semantic version decides
+whether a newer full release is available; the revision pins the exact source
+and installer used for that release.
+
+After the TUI renders, a distribution build performs one bounded, failure-silent
+check against GitHub's latest non-draft, non-prerelease release. Set
+`BCODEX_SKIP_UPDATE_CHECK=1` to disable that background check. Development builds
+do not check for updates.
+
+To update a published build, run:
 
 ```sh
 bcodex update
 ```
 
-The explicit command resolves public `main`. If the exact revision is already
-installed, it exits without compiling. Otherwise it fetches the installer from
-that same immutable commit and passes the pinned commit to it, so the script and
-the source snapshot cannot drift apart. The installer reuses cached downloads
-and Cargo's fine-grained compilation state, performs all verification again,
-and atomically replaces the command. A manifest or lockfile edit recompiles
-only affected artifacts; it never erases the whole target first. On Windows,
-where the running executable cannot be replaced, the verified installer starts
-a bounded PowerShell finalizer. The updater exits, the finalizer verifies that
-exact process identity, replaces `bcodex.exe` with rollback protection, and
-verifies the visible revision. Restart a running TUI to use the new binary.
+The updater validates the latest release metadata and target asset, fetches the
+installer from the immutable source revision encoded in that release tag, and
+installs the matching prebuilt binary. It never compiles locally. Unix replaces
+the binary atomically; Windows stages a verified replacement that finishes
+after the running process exits.
 
-Update checks do not compare Cargo versions, Git tags, or GitHub Releases. Set
-`BCODEX_SKIP_UPDATE_CHECK=1` to disable the background check. The explicit
-`bcodex update` command remains available.
+`BCODEX_REPOSITORY` selects another `owner/repository` for development or fork
+testing. `BCODEX_INSTALL_RELEASE_TAG` pins an exact asset and is reserved for the
+updater and release validation.
 
-### Migrating binaries without the current updater
+## State directories
 
-Binaries installed before this policy change cannot discover the current
-updater on their own. Some older builds also parse the word `update` as an
-interactive prompt, so do not probe support by running `bcodex update` and
-waiting to see what happens. Check the command table first, then use the
-canonical installer when support is absent:
-
-```sh
-if bcodex --help 2>&1 | grep -q '^  update '; then
-    bcodex update
-else
-    curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
-fi
-```
-
-The one-time direct install preserves credentials, settings, sessions, and
-reusable dependency caches. Afterward, normal notices and `bcodex update`
-follow public `main` directly.
-
-## Caching and cleanup
-
-When a cache home is available, the installer retains reusable dependency
-downloads and one native-target Cargo cache under
-`${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. If it must supply rustup or the
-pinned toolchain, those stay in the same cache. An existing user toolchain is
-reused when it already provides the pinned Rust release. Cargo fingerprints
-compiler, profile, manifest, lockfile, feature, build-script, dependency, and
-source changes at artifact granularity. The updater also makes a SHA-256 hash
-of the release inputs a compiler input, avoiding Cargo's mtime ambiguity across
-newly extracted source trees. The staged binary must match that hash before it
-can be stamped. The updater preserves Cargo artifacts and enables incremental
-compilation for the bettercodex package; registry dependencies do not gain
-incremental copies. Source archives, extracted source, compiler scratch space,
-and stage files remain disposable.
-
-The installer refuses symlinked destinations and never follows cache symlinks
-while cleaning. A lock rejects concurrent installs and records temporary state
-so a later invocation can recover an orphan left by an untrappable crash. Any
-failed download, extraction, build, smoke test, copy, or verification leaves an
-existing installed binary untouched.
-
-On Windows the same checks cover junctions and other reparse points. Candidate,
-backup, and transaction files stay under one uniquely named install-owned
-directory beside `bcodex.exe`; a later invocation recovers only a validated
-transaction record. Bounded retries cover transient sharing violations, while
-permission and reparse failures stop immediately.
-
-Without `HOME` or `XDG_CACHE_HOME`, rustup, the pinned Rust toolchain, dependency
-downloads, and build output stay inside the disposable installation tree and
-are removed afterward.
+`CODEX_HOME` and `BCODEX_HOME` override credential and bettercodex state
+directories on every platform. Without overrides, they are `$HOME/.codex` and
+`$HOME/.bcodex` on Unix, or `%USERPROFILE%\.codex` and
+`%USERPROFILE%\.bcodex` on Windows.
 
 ## Build from a checkout
 
-Use the checked-in wrapper so the V8 archive and binding match the crate:
+Source compilation is a developer workflow. Use the checked-in wrapper so the
+V8 archive and Rust binding match:
 
 ```sh
 ./scripts/cargo-with-v8.sh build --locked
 ./scripts/cargo-with-v8.sh run --bin bcodex
 ```
 
-On native Windows, use the target-specific wrapper instead:
+On native Windows:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 build --locked
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 run --bin bcodex
 ```
 
-Development builds intentionally have no embedded distribution revision and do
-not perform update checks. To install a checkout manually:
-
-```sh
-./scripts/cargo-with-v8.sh install --locked --path . --force \
-  --root "$HOME/.local"
-```
-
-For a manually built native Windows checkout, use the release executable under
-`target\release\bcodex.exe`; use `scripts/install.ps1` for an installation that
-tracks public `main` and configures PATH.
-
-Use [`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt), not a development build,
-for an installation that follows public `main`.
+Development binaries intentionally have no embedded release tag, so
+`bcodex update` is unavailable for them.
 
 ## Development checks
 
-Install `just` and Cargo Nextest, then run:
+The routine local gate mirrors upstream Codex:
 
 ```sh
 just fix
 just fmt
 just test
 just clippy -- -D warnings
-python3 scripts/install_tests.py
+./scripts/cargo-with-v8.sh build --release --locked
 ```
 
-Run native Windows validation directly on a Windows x64 machine. The commands
-share the checkout's Cargo target and the persistent V8 cache, so each stage
-reuses the previous stage instead of rebuilding dependencies:
+The compact installer suites cover bettercodex's intentional prebuilt-release
+departure:
 
-```powershell
-cargo fmt --all -- --check
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1 -ValidateOnly
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/install_tests.py
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_windows_tests.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 check --locked --tests
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 test --locked --no-fail-fast
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 clippy --locked --all-targets -- -D warnings
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 build --release --locked --bin bcodex
-$smokeHome = Join-Path $env:TEMP ("bettercodex-release-smoke." + [Guid]::NewGuid().ToString('N'))
-$previousHome = $env:BCODEX_HOME
-try {
-    $env:BCODEX_HOME = $smokeHome
-    & .\target\release\bcodex.exe --internal-install-smoke
-    if ($LASTEXITCODE -ne 0) { throw 'release smoke test failed' }
-} finally {
-    if ($null -eq $previousHome) { Remove-Item Env:BCODEX_HOME -ErrorAction SilentlyContinue }
-    else { $env:BCODEX_HOME = $previousHome }
-    Remove-Item -LiteralPath $smokeHome -Recurse -Force -ErrorAction SilentlyContinue
-}
 ```
 
-The Windows status must not be promoted from developer preview until that
-native suite and the primary interactive terminal matrix pass on Windows.
-
+Run the PowerShell suite and the Windows terminal matrix on native Windows.
 See [the development workflow](../progressive_disclosure/development.md) for
-the complete contribution procedure.
+source and artifact rules.

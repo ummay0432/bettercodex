@@ -33,13 +33,12 @@ The context limits intentionally match Codex's `gpt-5.6-sol` model catalog.
 The runtime is one Cargo package and one `bcodex` binary. It contains the
 inference loop and terminal UI for one operator. Commands and patches run with
 the invoking user's permissions; bettercodex does not sandbox them.
-Native Windows source installs may also carry upstream Codex's pinned `rg.exe`
-as a private subprocess dependency under `bcodex-path`. It is not another
-user-facing command and enters only the running agent's process-local `PATH`.
 
-The public installation channel is the exact current commit on public `main`.
-The installer and updater build that pinned source revision locally; Cargo
-versions are display metadata and never gate whether an update is available.
+The public installation channel is the latest user-authorized full release.
+Each release tag combines the Cargo package version with the exact public
+`main` revision, and installers download the matching prebuilt target binary.
+Source compilation is a developer workflow, not an installation or update
+path.
 
 Live tool detail and the active background-terminal summary occupy dedicated
 rows between the task status and the composer. bettercodex never folds either
@@ -47,8 +46,9 @@ surface into the busy status line.
 
 Do not add another model, provider, binary, app server, SDK, MCP layer, plugin
 system, configuration framework, build system, or plugin hook unless the user
-gives a concrete bettercodex use for it. Linux, macOS, and native 64-bit Windows
-11 terminals are supported targets. Windows support must remain target-gated:
+gives a concrete bettercodex use for it. Supported release targets are Apple
+silicon macOS, x86-64 Ubuntu and Debian, and native x86-64 Windows 11. Windows
+support must remain target-gated:
 it must not add Windows-only instructions, tools, or platform prose to the
 model-facing context on other platforms; Unix shell prose must likewise remain
 absent from native Windows context. [`SPEC-WINDOWS.md`](../SPEC-WINDOWS.md)

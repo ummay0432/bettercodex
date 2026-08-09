@@ -13,7 +13,6 @@ mod fuzzy_match;
 mod http_client;
 mod image;
 mod input;
-mod install_context;
 mod login;
 mod managed_session;
 mod openai_docs;
@@ -127,17 +126,12 @@ fn run() -> Result<()> {
             ))?;
             Ok(())
         }
-        Command::InternalSourceRevision => {
-            let revision = update::source_revision()
-                .ok_or_else(|| anyhow!("this build has no embedded source revision"))?;
-            write_stdout_line(format_args!("{revision}"))?;
+        Command::InternalReleaseTag => {
+            let tag = update::release_tag()
+                .ok_or_else(|| anyhow!("this build has no embedded release tag"))?;
+            write_stdout_line(format_args!("{tag}"))?;
             Ok(())
         }
-        Command::InternalInstallStage {
-            destination,
-            revision,
-            build_input_hash,
-        } => update::stage_current_binary(&destination, &revision, &build_input_hash),
         Command::Login(command) => run_login_command(command),
         Command::Logout => run_logout_command(),
         Command::LogoutHelp => {
@@ -206,7 +200,6 @@ fn run_agent_command(
     options: RunOptions,
     resume: Option<ResumeSelector>,
 ) -> Result<()> {
-    install_context::prepare_runtime_path();
     let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let interactive_tui =
         interactive_terminal && options.prompt.is_empty() && options.images.is_empty();
@@ -310,12 +303,7 @@ enum Command {
     ToolCatalogue,
     ToolCatalogueStats,
     InternalInstallSmoke,
-    InternalInstallStage {
-        destination: PathBuf,
-        revision: String,
-        build_input_hash: String,
-    },
-    InternalSourceRevision,
+    InternalReleaseTag,
     Login(LoginCommand),
     Logout,
     LogoutHelp,
@@ -343,31 +331,6 @@ impl Command {
         let mut arguments = arguments.into_iter().peekable();
         if arguments
             .peek()
-            .is_some_and(|argument| argument == "--internal-install-stage")
-        {
-            arguments.next();
-            let destination = arguments
-                .next()
-                .ok_or_else(|| anyhow!("internal install stage helper requires a destination"))?;
-            let revision = arguments
-                .next()
-                .ok_or_else(|| anyhow!("internal install stage helper requires a revision"))?;
-            let build_input_hash = arguments.next().ok_or_else(|| {
-                anyhow!("internal install stage helper requires a build-input hash")
-            })?;
-            if arguments.next().is_some() {
-                return Err(anyhow!(
-                    "internal install stage helper received extra arguments"
-                ));
-            }
-            return Ok(Self::InternalInstallStage {
-                destination: PathBuf::from(destination),
-                revision,
-                build_input_hash,
-            });
-        }
-        if arguments
-            .peek()
             .is_some_and(|argument| argument == "--internal-install-smoke")
         {
             arguments.next();
@@ -380,15 +343,15 @@ impl Command {
         }
         if arguments
             .peek()
-            .is_some_and(|argument| argument == "--internal-source-revision")
+            .is_some_and(|argument| argument == "--internal-release-tag")
         {
             arguments.next();
             if arguments.next().is_some() {
                 return Err(anyhow!(
-                    "internal source revision helper received extra arguments"
+                    "internal release tag helper received extra arguments"
                 ));
             }
-            return Ok(Self::InternalSourceRevision);
+            return Ok(Self::InternalReleaseTag);
         }
         if arguments
             .peek()
@@ -528,7 +491,7 @@ fn write_help() -> io::Result<()> {
         ""
     };
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest public main revision\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest published release\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION"),
     ))
 }
@@ -547,7 +510,7 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Install the latest public bettercodex main revision\n\nUsage:\n  bcodex update\n\nThe updater compares the binary's embedded source revision with public main. If they match, it exits immediately. Otherwise it pins that exact commit and runs the source installer, which reuses Cargo's fine-grained compilation cache, builds only changed artifacts, stamps and smoke-tests the candidate, and atomically replaces the installed command. Package versions do not control update freshness."
+        "Install the latest published bettercodex release\n\nUsage:\n  bcodex update\n\nThe updater compares this binary's embedded release version with GitHub's latest published full release. If already current, it exits immediately. Otherwise it downloads, smoke-tests, and atomically installs the matching prebuilt binary without compiling."
     ))
 }
 
@@ -630,51 +593,16 @@ mod tests {
     #[test]
     fn internal_install_verification_commands_are_strictly_parsed() {
         assert!(matches!(
-            Command::parse([
-                "--internal-install-stage".to_string(),
-                "/tmp/candidate".to_string(),
-                "1".repeat(40),
-                "2".repeat(64),
-            ])
-            .unwrap(),
-            Command::InternalInstallStage {
-                destination,
-                revision,
-                build_input_hash,
-            }
-                if destination.as_path() == std::path::Path::new("/tmp/candidate")
-                    && revision == "1".repeat(40)
-                    && build_input_hash == "2".repeat(64)
-        ));
-        assert!(matches!(
             Command::parse(["--internal-install-smoke".to_string()]).unwrap(),
             Command::InternalInstallSmoke
         ));
         assert!(matches!(
-            Command::parse(["--internal-source-revision".to_string()]).unwrap(),
-            Command::InternalSourceRevision
+            Command::parse(["--internal-release-tag".to_string()]).unwrap(),
+            Command::InternalReleaseTag
         ));
         assert!(
             Command::parse([
-                "--internal-source-revision".to_string(),
-                "unexpected".to_string(),
-            ])
-            .is_err()
-        );
-        assert!(
-            Command::parse([
-                "--internal-install-stage".to_string(),
-                "/tmp/candidate".to_string(),
-                "1".repeat(40),
-            ])
-            .is_err()
-        );
-        assert!(
-            Command::parse([
-                "--internal-install-stage".to_string(),
-                "/tmp/candidate".to_string(),
-                "1".repeat(40),
-                "2".repeat(64),
+                "--internal-release-tag".to_string(),
                 "unexpected".to_string(),
             ])
             .is_err()

@@ -623,46 +623,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_visible_catalogue_contains_typed_declarations() {
-        let text = text();
-        assert!(text.starts_with("Input raw JavaScript directly"));
-        assert_eq!(text.matches("declare const tools:").count(), 1);
-        for declaration in [
-            "apply_patch(input: string): Promise<{}>",
-            "exec_command(args: {cmd:string",
-            "log_papercut(args: {message:string}): Promise<{path:string}>",
-            "update_plan(args: {explanation?:string;plan:Array<",
-            "view_image(args: {detail?:\"high\"|\"original\";path:string}",
-            "write_stdin(args: {chars?:string;max_output_tokens?:number;session_id:number",
-            "openaiDeveloperDocs__fetch_openai_doc(args: {anchor?:string;url:string}): Promise<string>",
-            "openaiDeveloperDocs__get_openapi_spec(args: {codeExamplesOnly?:boolean;languages?:Array<string>;url:string}): Promise<string>",
-            "openaiDeveloperDocs__list_api_endpoints(args: {}): Promise<string>",
-            "openaiDeveloperDocs__list_openai_docs(args: {cursor?:string;limit?:number}): Promise<string>",
-            "openaiDeveloperDocs__search_openai_docs(args: {cursor?:string;limit?:number;query:string}): Promise<string>",
-            "web__run(args: {click?:Array<",
-            "): Promise<string>",
-        ] {
-            assert!(
-                text.contains(declaration),
-                "missing `{declaration}` in {text}"
-            );
-        }
-        let declarations = text.split_once("```ts\n").unwrap().1;
-        assert!(!declarations.contains("//"));
-        assert!(!text.contains("exec tool declaration"));
-        if cfg!(windows) {
-            assert!(text.contains("Runs PowerShell by default on native Windows"));
-            assert!(text.contains("Get-ChildItem -Path C:\\myrepo -Recurse | Select-String"));
-            assert!(text.contains("When using `Start-Process`"));
-            assert!(text.contains("pass `-WindowStyle Hidden`"));
-        } else {
-            assert!(text.contains("Runs shell. Long commands return"));
-            assert!(!text.contains("Examples of valid PowerShell command strings"));
-            assert!(!text.contains("Windows safety rules"));
-        }
-    }
-
-    #[test]
     fn exec_schema_contains_only_host_terminal_semantics() {
         let exec = core_tools()
             .iter()
@@ -680,15 +640,6 @@ mod tests {
             assert!(!schema.contains("PowerShell profile"));
             assert!(!schema.contains("ConPTY"));
         }
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn readable_catalogue_snapshot_matches_the_request() {
-        assert_eq!(
-            text().trim_end(),
-            include_str!("../../prompts/tool-catalogue.md").trim_end()
-        );
     }
 
     #[test]

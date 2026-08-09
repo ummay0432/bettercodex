@@ -1,7 +1,0 @@
-interface:
-  display_name: "Docs Manifest"
-  short_description: "Research official docs, write a MANIFEST.md routing map"
-  default_prompt: "Use $manifest <topic> at <destination directory> to research the official docs and write a routing manifest."
-
-policy:
-  allow_implicit_invocation: false

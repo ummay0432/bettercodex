@@ -22,7 +22,9 @@ bettercodex is a focused port of [OpenAI Codex](https://github.com/openai/codex)
 
 Do not invent Cargo, build, packaging, release, or test infrastructure; mirror current upstream Codex for retained workflows unless an explicit bettercodex requirement makes a deviation necessary.
 
-Installed bettercodex builds track public `main` by exact source revision; never use package versions, tags, or GitHub Releases to decide update freshness.
+Published bettercodex builds are immutable snapshots of a full public `main` revision encoded in the release tag. Update freshness follows the semantic version of the latest published full release; the encoded revision pins its exact source and installer.
+
+Only the user decides when a release is ready; when explicitly asked to prepare or publish one, follow [`docs/releasing.md`](docs/releasing.md) for binary renewal and final publication.
 
 ## Start here
 

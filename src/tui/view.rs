@@ -4046,10 +4046,10 @@ fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec
             Span::from(" in another terminal.").dim(),
         ]),
         Line::from(vec![
-            Span::from("main: ").dim(),
-            Span::from(update.current_short_revision().to_string()).dim(),
+            Span::from("release: ").dim(),
+            Span::from(update.current_version().to_string()).dim(),
             Span::from(" → ").dim(),
-            Span::from(update.latest_short_revision().to_string()).dim(),
+            Span::from(update.latest_version().to_string()).dim(),
         ]),
     ];
     let mut content = Vec::new();
@@ -5306,12 +5306,12 @@ mod tests {
         view.welcome_pending = false;
         view.start_turn("test");
         let _ = view.take_pending_history_lines(WIDTH, 24);
-        view.status_detail = Some("python3 scripts/install_tests.py".to_string());
+        view.status_detail = Some("cargo nextest run".to_string());
         let height_without_background_terminal = view.desired_height(WIDTH, 24);
 
         assert!(view.set_background_processes(vec![BackgroundProcess {
             session_id: 42,
-            command: "python3 scripts/install_tests.py".to_string(),
+            command: "cargo nextest run".to_string(),
             cwd: PathBuf::from("/tmp/bettercodex"),
             running_for: Duration::from_secs(10),
         }]));
@@ -5330,7 +5330,7 @@ mod tests {
             .expect("rendered activity status") as u16;
         let detail_y = rows
             .iter()
-            .position(|row| row.contains("└ python3 scripts/install_tests.py"))
+            .position(|row| row.contains("└ cargo nextest run"))
             .expect("rendered terminal detail row") as u16;
         let background_terminal_y = rows
             .iter()
@@ -5342,7 +5342,7 @@ mod tests {
             .expect("rendered composer");
 
         assert!(
-            !rows[usize::from(status_y)].contains("install_tests.py")
+            !rows[usize::from(status_y)].contains("cargo nextest")
                 && !rows[usize::from(status_y)].contains("background terminal"),
             "{rendered}"
         );
@@ -5354,7 +5354,7 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(
-            rendered.matches("install_tests.py").count(),
+            rendered.matches("cargo nextest run").count(),
             1,
             "{rendered}"
         );
@@ -5473,8 +5473,8 @@ mod tests {
         assert!(rendered.contains("Update available"), "{rendered}");
         assert!(rendered.contains("bcodex update"), "{rendered}");
         assert!(rendered.contains("in another terminal"), "{rendered}");
-        assert!(rendered.contains("111111111111"), "{rendered}");
-        assert!(rendered.contains("222222222222"), "{rendered}");
+        assert!(rendered.contains("0.1.2"), "{rendered}");
+        assert!(rendered.contains("0.1.3"), "{rendered}");
     }
 
     #[test]

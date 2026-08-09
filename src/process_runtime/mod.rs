@@ -21,15 +21,7 @@ pub(crate) async fn spawn_pipe_process_no_stdin(
     cwd: &std::path::Path,
     environment: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<SpawnedProcess> {
-    windows::spawn_pipe_process_no_stdin(
-        program,
-        arguments,
-        cwd,
-        environment,
-        /*arg0*/ &None,
-        &[],
-    )
-    .await
+    windows::spawn_pipe_process_no_stdin(program, arguments, cwd, environment).await
 }
 
 #[cfg(windows)]
@@ -40,14 +32,5 @@ pub(crate) async fn spawn_pty_process(
     environment: &std::collections::HashMap<String, String>,
     size: TerminalSize,
 ) -> anyhow::Result<SpawnedProcess> {
-    windows::spawn_pty_process(
-        program,
-        arguments,
-        cwd,
-        environment,
-        /*arg0*/ &None,
-        size,
-        &[],
-    )
-    .await
+    windows::spawn_pty_process(program, arguments, cwd, environment, size).await
 }

@@ -1,18 +1,20 @@
-//! Public-main revision checks and the local source update command.
+//! Published-release checks and prebuilt-binary updates.
 //!
-//! Installed builds compare their embedded source revision with public `main`
-//! after the TUI renders. The explicit command pins that exact commit, fetches
-//! the installer from the same immutable revision, and lets the installer build,
-//! verify, and atomically replace the running command.
+//! Distribution builds embed their GitHub release tag. After the TUI renders,
+//! they compare its semantic version with the latest published full release.
+//! The explicit update command fetches the installer from that release's
+//! immutable source revision and lets it verify and atomically install the
+//! matching prebuilt binary.
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use memchr::memmem;
 use reqwest::Client;
 use serde::Deserialize;
 use std::ffi::OsStr;
+#[cfg(windows)]
 use std::fs;
+#[cfg(windows)]
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -24,18 +26,21 @@ use std::time::Duration;
 const DEFAULT_REPOSITORY: &str = "ummay0432/bettercodex";
 const GITHUB_API_ROOT: &str = "https://api.github.com";
 const GITHUB_RAW_ROOT: &str = "https://raw.githubusercontent.com";
+const MAX_RELEASE_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_INSTALLER_BYTES: usize = 1024 * 1024;
+const MAX_RELEASE_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const INSTALL_DIR_ENV: &str = "BCODEX_INSTALL_DIR";
-const INSTALL_REVISION_ENV: &str = "BCODEX_INSTALL_REVISION";
-// Cargo tracks option_env! values independently from source mtimes. Feeding it
-// the installer's content hash prevents a relocated archive with colliding
-// mtimes and sizes from reusing a stale package binary.
-const BUILD_INPUT_HASH: Option<&str> = option_env!("BCODEX_BUILD_INPUT_HASH");
-const SOURCE_REVISION_PREFIX: &[u8] = b"\0bettercodex.source-revision.v1=";
-const SOURCE_REVISION_LENGTH: usize = 40;
-const SOURCE_REVISION_OFFSET: usize = SOURCE_REVISION_PREFIX.len();
-const SOURCE_REVISION_METADATA_LENGTH: usize = SOURCE_REVISION_OFFSET + SOURCE_REVISION_LENGTH + 2;
+const INSTALL_RELEASE_TAG_ENV: &str = "BCODEX_INSTALL_RELEASE_TAG";
+const RELEASE_TAG_PREFIX: &str = "bcodex-v";
+const BUILD_RELEASE_TAG: Option<&str> = option_env!("BCODEX_RELEASE_TAG");
+
+#[cfg(target_os = "linux")]
+const RELEASE_ASSET_NAME: &str = "bcodex-x86_64-unknown-linux-gnu.gz";
+#[cfg(target_os = "macos")]
+const RELEASE_ASSET_NAME: &str = "bcodex-aarch64-apple-darwin.gz";
+#[cfg(windows)]
+const RELEASE_ASSET_NAME: &str = "bcodex-x86_64-pc-windows-msvc.exe.gz";
 
 #[cfg(windows)]
 struct TemporaryUpdateScript {
@@ -73,165 +78,114 @@ impl Drop for TemporaryUpdateScript {
     }
 }
 
-// Keep the revision in a uniquely framed, fixed-size data record. Source builds
-// contain the non-hexadecimal placeholder and therefore remain development
-// builds. The installer stamps its selected immutable commit into a staged copy
-// after Cargo finishes, so advancing main does not invalidate an otherwise
-// reusable Rust compilation solely to change 40 metadata bytes.
-#[used]
-static SOURCE_REVISION_METADATA: [u8; SOURCE_REVISION_METADATA_LENGTH] =
-    *b"\0bettercodex.source-revision.v1=........................................;\0";
-
 #[derive(Deserialize)]
-struct GitHubRefResponse {
-    #[serde(rename = "ref")]
-    reference: String,
-    object: GitHubRefObjectResponse,
+struct GitHubReleaseResponse {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<GitHubReleaseAssetResponse>,
 }
 
 #[derive(Deserialize)]
-struct GitHubRefObjectResponse {
-    sha: String,
-    #[serde(rename = "type")]
-    kind: String,
+struct GitHubReleaseAssetResponse {
+    name: String,
+    state: String,
+    size: u64,
+    digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Release {
+    tag: String,
+    version: String,
+    revision: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AvailableUpdate {
-    current_revision: String,
-    latest_revision: String,
+    current_version: String,
+    latest_version: String,
 }
 
 impl AvailableUpdate {
-    fn new(current_revision: &str, latest_revision: &str) -> Self {
+    fn new(current_version: &str, latest_version: &str) -> Self {
         Self {
-            current_revision: current_revision.to_ascii_lowercase(),
-            latest_revision: latest_revision.to_ascii_lowercase(),
+            current_version: current_version.to_string(),
+            latest_version: latest_version.to_string(),
         }
     }
 
-    pub(crate) fn current_short_revision(&self) -> &str {
-        short_revision(&self.current_revision)
+    pub(crate) fn current_version(&self) -> &str {
+        &self.current_version
     }
 
-    pub(crate) fn latest_short_revision(&self) -> &str {
-        short_revision(&self.latest_revision)
+    pub(crate) fn latest_version(&self) -> &str {
+        &self.latest_version
     }
 
     #[cfg(test)]
     pub(crate) fn test_fixture() -> Self {
-        Self::new(
-            "1111111111111111111111111111111111111111",
-            "2222222222222222222222222222222222222222",
-        )
+        Self::new("0.1.2", "0.1.3")
     }
 }
 
-/// Checks once for a different public `main` revision after the TUI renders.
+/// Checks once for a newer published bettercodex release after the TUI renders.
 ///
-/// Development builds stay offline. Installed builds can opt out by setting
+/// Development builds stay offline. Distribution builds can opt out by setting
 /// `BCODEX_SKIP_UPDATE_CHECK`. Failures stay silent and are retried on the next
 /// launch so startup and interactive work never depend on GitHub availability.
 pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
     if cfg!(debug_assertions) || std::env::var_os("BCODEX_SKIP_UPDATE_CHECK").is_some() {
         return None;
     }
-    let current_revision = source_revision()?;
+    let current = current_release()?;
     let repository = configured_repository().ok()?;
-    check_for_source_update_with(&repository, current_revision, UPDATE_CHECK_TIMEOUT).await
+    check_for_release_update_with(&repository, &current, UPDATE_CHECK_TIMEOUT).await
 }
 
-pub(crate) fn source_revision() -> Option<&'static str> {
-    let metadata = std::hint::black_box(&SOURCE_REVISION_METADATA);
-    let revision = std::str::from_utf8(
-        &metadata[SOURCE_REVISION_OFFSET..SOURCE_REVISION_OFFSET + SOURCE_REVISION_LENGTH],
-    )
-    .ok()?;
-    is_source_revision(revision).then_some(revision)
+pub(crate) fn release_tag() -> Option<&'static str> {
+    let tag = BUILD_RELEASE_TAG?;
+    let release = parse_release_tag(tag).ok()?;
+    (release.version == env!("CARGO_PKG_VERSION")).then_some(tag)
 }
 
-pub(crate) fn stage_current_binary(
-    destination: &Path,
-    revision: &str,
-    expected_build_input_hash: &str,
-) -> Result<()> {
-    if !is_source_revision(revision) {
-        bail!("cannot stage a binary with an invalid source revision");
-    }
-    if !is_build_input_hash(expected_build_input_hash) {
-        bail!("cannot stage a binary with an invalid build-input hash");
-    }
-    if build_input_hash() != Some(expected_build_input_hash) {
-        bail!("binary does not match the selected source build inputs");
-    }
-    let executable = std::env::current_exe().context("could not locate the binary being staged")?;
-    let mut image = fs::read(&executable)
-        .with_context(|| format!("could not read binary {}", executable.display()))?;
-    patch_source_revision(&mut image, revision)?;
-
-    let mut staged = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .with_context(|| format!("could not create staged binary {}", destination.display()))?;
-    staged
-        .write_all(&image)
-        .with_context(|| format!("could not write staged binary {}", destination.display()))?;
-    Ok(())
+fn current_release() -> Option<Release> {
+    parse_release_tag(release_tag()?).ok()
 }
 
-fn patch_source_revision(image: &mut [u8], revision: &str) -> Result<()> {
-    if !is_source_revision(revision) {
-        bail!("cannot patch an invalid source revision");
-    }
-    let marker = std::hint::black_box(SOURCE_REVISION_METADATA.as_slice());
-    let mut matches = memmem::find_iter(image, marker);
-    let marker_offset = matches
-        .next()
-        .context("binary has no bettercodex source-revision marker")?;
-    if matches.next().is_some() {
-        bail!("binary has multiple bettercodex source-revision markers");
-    }
-    let revision_offset = marker_offset + SOURCE_REVISION_OFFSET;
-    image[revision_offset..revision_offset + SOURCE_REVISION_LENGTH]
-        .copy_from_slice(revision.as_bytes());
-    Ok(())
-}
-
-async fn check_for_source_update_with(
+async fn check_for_release_update_with(
     repository: &str,
-    current_revision: &str,
+    current: &Release,
     timeout: Duration,
 ) -> Option<AvailableUpdate> {
-    if !is_source_revision(current_revision) || validate_repository(repository).is_err() {
+    if validate_repository(repository).is_err() {
         return None;
     }
-    let url = main_ref_api_url(repository);
-    check_for_source_update_at(&url, current_revision, timeout).await
+    let url = latest_release_api_url(repository);
+    check_for_release_update_at(&url, current, timeout).await
 }
 
-async fn check_for_source_update_at(
+async fn check_for_release_update_at(
     url: &str,
-    current_revision: &str,
+    current: &Release,
     timeout: Duration,
 ) -> Option<AvailableUpdate> {
-    if !is_source_revision(current_revision) {
-        return None;
-    }
     let client = update_client(timeout).ok()?;
-    let response = tokio::time::timeout(timeout, fetch_bounded(&client, url, MAX_INSTALLER_BYTES))
-        .await
-        .ok()?
-        .ok()?;
-    let latest_revision = parse_github_main_revision(&response).ok()?;
-    if latest_revision.eq_ignore_ascii_case(current_revision) {
-        return None;
-    }
-    Some(AvailableUpdate::new(current_revision, &latest_revision))
+    let response = tokio::time::timeout(
+        timeout,
+        fetch_bounded(&client, url, MAX_RELEASE_METADATA_BYTES),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let latest = parse_latest_release(&response).ok()?;
+    is_newer(&latest.version, &current.version)
+        .is_some_and(|newer| newer)
+        .then(|| AvailableUpdate::new(&current.version, &latest.version))
 }
 
-fn main_ref_api_url(repository: &str) -> String {
-    format!("{GITHUB_API_ROOT}/repos/{repository}/git/ref/heads/main")
+fn latest_release_api_url(repository: &str) -> String {
+    format!("{GITHUB_API_ROOT}/repos/{repository}/releases/latest")
 }
 
 fn installer_url(repository: &str, revision: &str) -> String {
@@ -295,32 +249,68 @@ async fn fetch_bounded(client: &Client, url: &str, maximum_bytes: usize) -> Resu
     Ok(bytes)
 }
 
-fn parse_github_main_revision(response: &[u8]) -> Result<String> {
-    let response: GitHubRefResponse = serde_json::from_slice(response)
-        .context("GitHub returned an invalid bettercodex main response")?;
-    if response.reference != "refs/heads/main"
-        || response.object.kind != "commit"
-        || !is_source_revision(&response.object.sha)
-    {
-        bail!("GitHub returned an invalid bettercodex main revision");
+fn parse_latest_release(response: &[u8]) -> Result<Release> {
+    let response: GitHubReleaseResponse = serde_json::from_slice(response)
+        .context("GitHub returned invalid bettercodex release metadata")?;
+    if response.draft || response.prerelease {
+        bail!("GitHub returned a draft or prerelease as the latest full release");
     }
-    Ok(response.object.sha.to_ascii_lowercase())
+    let release = parse_release_tag(&response.tag_name)?;
+    let mut matching_assets = response
+        .assets
+        .iter()
+        .filter(|asset| asset.name == RELEASE_ASSET_NAME);
+    let asset = matching_assets
+        .next()
+        .context("latest bettercodex release has no binary for this platform")?;
+    if matching_assets.next().is_some()
+        || asset.state != "uploaded"
+        || asset.size == 0
+        || asset.size > MAX_RELEASE_ASSET_BYTES
+        || !is_sha256_digest(&asset.digest)
+    {
+        bail!("latest bettercodex release has an invalid binary asset");
+    }
+    Ok(release)
+}
+
+fn parse_release_tag(tag: &str) -> Result<Release> {
+    let remainder = tag
+        .strip_prefix(RELEASE_TAG_PREFIX)
+        .context("bettercodex release tag has an invalid prefix")?;
+    let (version, revision) = remainder
+        .rsplit_once('-')
+        .context("bettercodex release tag has no source revision")?;
+    if parse_version(version).is_none() || !is_source_revision(revision) {
+        bail!("bettercodex release tag is invalid");
+    }
+    Ok(Release {
+        tag: tag.to_string(),
+        version: version.to_string(),
+        revision: revision.to_ascii_lowercase(),
+    })
+}
+
+fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut components = version.split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch = components.next()?.parse().ok()?;
+    components.next().is_none().then_some((major, minor, patch))
+}
+
+fn is_newer(latest: &str, current: &str) -> Option<bool> {
+    Some(parse_version(latest)? > parse_version(current)?)
 }
 
 fn is_source_revision(revision: &str) -> bool {
     revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn build_input_hash() -> Option<&'static str> {
-    BUILD_INPUT_HASH.filter(|hash| is_build_input_hash(hash))
-}
-
-fn is_build_input_hash(hash: &str) -> bool {
-    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn short_revision(revision: &str) -> &str {
-    revision.get(..12).unwrap_or(revision)
+fn is_sha256_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn configured_repository() -> Result<String> {
@@ -350,8 +340,8 @@ fn is_repository_name_byte(byte: u8) -> bool {
 }
 
 pub(crate) fn run_update() -> Result<()> {
-    let current_revision = source_revision().context(
-        "this build has no embedded source revision; run INSTALL_COMMAND.txt before using `bcodex update`",
+    let current = current_release().context(
+        "this is not a published bettercodex build; install a published release before using `bcodex update`",
     )?;
     let repository = configured_repository()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -359,13 +349,13 @@ pub(crate) fn run_update() -> Result<()> {
         .build()
         .context("could not start the bettercodex update runtime")?;
     let client = update_client(Duration::from_secs(30))?;
-    let latest_revision = runtime.block_on(resolve_main_revision(&client, &repository))?;
-    if latest_revision.eq_ignore_ascii_case(current_revision) {
+    let latest = runtime.block_on(resolve_latest_release(&client, &repository))?;
+    if !is_newer(&latest.version, &current.version).unwrap_or(false) {
         let mut output = std::io::stdout().lock();
         writeln!(
             output,
-            "bettercodex is already current with main at {}.",
-            short_revision(current_revision)
+            "bettercodex {} is already the latest published release.",
+            current.version
         )?;
         return Ok(());
     }
@@ -377,17 +367,17 @@ pub(crate) fn run_update() -> Result<()> {
     let installer = runtime.block_on(fetch_installer(
         &client,
         &repository,
-        &latest_revision,
+        &latest.revision,
         MAX_INSTALLER_BYTES,
     ))?;
-    run_installer_script(&installer, &install_dir, &repository, &latest_revision)
+    run_installer_script(&installer, &install_dir, &repository, &latest.tag)
 }
 
-async fn resolve_main_revision(client: &Client, repository: &str) -> Result<String> {
+async fn resolve_latest_release(client: &Client, repository: &str) -> Result<Release> {
     validate_repository(repository)?;
-    let url = main_ref_api_url(repository);
-    let response = fetch_bounded(client, &url, MAX_INSTALLER_BYTES).await?;
-    parse_github_main_revision(&response)
+    let url = latest_release_api_url(repository);
+    let response = fetch_bounded(client, &url, MAX_RELEASE_METADATA_BYTES).await?;
+    parse_latest_release(&response)
 }
 
 async fn fetch_installer(
@@ -439,11 +429,9 @@ fn run_installer_script(
     script: &[u8],
     install_dir: &Path,
     repository: &str,
-    revision: &str,
+    release_tag: &str,
 ) -> Result<()> {
-    if !is_source_revision(revision) {
-        bail!("cannot run the installer for an invalid source revision");
-    }
+    parse_release_tag(release_tag)?;
     if !valid_installer_prefix(script) {
         bail!("cannot run an invalid bettercodex installer");
     }
@@ -451,10 +439,8 @@ fn run_installer_script(
     let mut child = ProcessCommand::new("/bin/sh")
         .arg("-s")
         .env(INSTALL_DIR_ENV, install_dir)
-        .env(INSTALL_REVISION_ENV, revision)
+        .env(INSTALL_RELEASE_TAG_ENV, release_tag)
         .env("BCODEX_REPOSITORY", repository)
-        .env_remove("BCODEX_INSTALL_RELEASE_TAG")
-        .env_remove("BCODEX_INSTALL_VERSION")
         .stdin(Stdio::piped())
         .spawn()
         .context("could not start the bettercodex installer")?;
@@ -471,8 +457,6 @@ fn run_installer_script(
         let mut file = options
             .open(&script_path)
             .with_context(|| format!("could not create update script {}", script_path.display()))?;
-        // Take cleanup ownership only after create_new succeeds. Constructing the guard before
-        // open would let an extremely unlikely name collision delete somebody else's file.
         let script_file = TemporaryUpdateScript::new(script_path);
         file.write_all(script).with_context(|| {
             format!(
@@ -498,11 +482,9 @@ fn run_installer_script(
             ])
             .arg(script_file.path())
             .env(INSTALL_DIR_ENV, install_dir)
-            .env(INSTALL_REVISION_ENV, revision)
+            .env(INSTALL_RELEASE_TAG_ENV, release_tag)
             .env("BCODEX_REPOSITORY", repository)
             .env("BCODEX_UPDATE_PARENT_PID", std::process::id().to_string())
-            .env_remove("BCODEX_INSTALL_RELEASE_TAG")
-            .env_remove("BCODEX_INSTALL_VERSION")
             .stdin(Stdio::null())
             .spawn()
             .context("could not start the bettercodex PowerShell installer")?;

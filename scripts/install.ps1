@@ -2,13 +2,12 @@
 
 <#
 .SYNOPSIS
-Installs one exact public bettercodex main revision from source on Windows.
+Installs the latest published prebuilt bettercodex binary on Windows.
 #>
 
 [CmdletBinding()]
 param(
-    [switch] $Help,
-    [switch] $ValidateOnly
+    [switch] $Help
 )
 
 Set-StrictMode -Version Latest
@@ -17,16 +16,10 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $DefaultRepository = 'ummay0432/bettercodex'
-$GitHubApiRoot = 'https://api.github.com'
-$GitHubArchiveRoot = 'https://codeload.github.com'
-$MaximumMetadataBytes = 1MB
-$MaximumSourceArchiveBytes = 128MB
-$MinimumWindowsBuild = 17763
-$FirstBuildCacheHeadroom = 8GB
-$WarmBuildCacheHeadroom = 2GB
-$ScratchHeadroom = 2GB
-$SourceHeadroom = 512MB
-$InstallHeadroom = 256MB
+$AssetName = 'bcodex-x86_64-pc-windows-msvc.exe.gz'
+$MaximumArchiveBytes = 128MB
+$MaximumBinaryBytes = 256MB
+$MinimumWindowsBuild = 22000
 
 function Write-Step([string] $Message) {
     Write-Host "==> $Message"
@@ -36,155 +29,144 @@ function Fail([string] $Message) {
     throw "bettercodex installer: $Message"
 }
 
-function Get-ProcessEnvironmentSnapshot {
-    $Snapshot = @{}
-    foreach ($Entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) {
-        $Snapshot[[string]$Entry.Key] = [string]$Entry.Value
-    }
-    return $Snapshot
-}
-
-function Restore-ProcessEnvironment([hashtable] $Snapshot) {
-    $CurrentEnvironment = [Environment]::GetEnvironmentVariables('Process')
-    foreach ($Entry in $CurrentEnvironment.GetEnumerator()) {
-        $Name = [string]$Entry.Key
-        if (-not $Snapshot.ContainsKey($Name)) {
-            Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
-        }
-    }
-    foreach ($Name in $Snapshot.Keys) {
-        [Environment]::SetEnvironmentVariable($Name, $Snapshot[$Name], 'Process')
-    }
-}
-
-function Test-SourceRevision([string] $Revision) {
-    return $Revision -cmatch '^[0-9a-fA-F]{40}$'
-}
-
-function Assert-AbsolutePath([string] $Value, [string] $Label) {
-    if ([string]::IsNullOrWhiteSpace($Value) -or -not [IO.Path]::IsPathRooted($Value)) {
-        Fail "$Label must be an absolute path"
-    }
-    if ($Value.IndexOfAny([char[]]@("`r", "`n", [char]0)) -ge 0) {
-        Fail "$Label contains an invalid character"
+function Assert-AbsolutePath([string] $Path, [string] $Name) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) {
+        Fail "$Name must be an absolute path"
     }
 }
 
 function Test-IsReparsePoint([string] $Path) {
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return $false
-    }
-    return ([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    return ((Get-Item -LiteralPath $Path -Force).Attributes -band
+        [IO.FileAttributes]::ReparsePoint) -ne 0
 }
 
-function Assert-NoReparsePath([string] $Path) {
-    $Current = [IO.Path]::GetFullPath($Path)
-    $Existing = New-Object 'System.Collections.Generic.List[string]'
-    while (-not [string]::IsNullOrEmpty($Current)) {
-        if (Test-Path -LiteralPath $Current) {
-            $Existing.Add($Current)
-        }
-        $Parent = Split-Path -Parent $Current
-        if ($Parent -eq $Current) { break }
-        $Current = $Parent
-    }
-    foreach ($Entry in $Existing) {
-        if (Test-IsReparsePoint $Entry) {
-            Fail "refusing installer-owned path through reparse point $Entry"
-        }
-    }
+function Test-ReleaseTag([string] $Tag) {
+    return $Tag -cmatch '^bcodex-v([0-9]+\.[0-9]+\.[0-9]+)-[0-9a-fA-F]{40}$'
 }
 
-function Get-VolumeSpace([string] $Path) {
-    $Probe = [IO.Path]::GetFullPath($Path)
-    while (-not (Test-Path -LiteralPath $Probe)) {
-        $Parent = Split-Path -Parent $Probe
-        if ([string]::IsNullOrEmpty($Parent) -or $Parent -eq $Probe) {
-            Fail "could not find an existing parent for disk-space check at $Path"
-        }
-        $Probe = $Parent
+function Get-ReleaseVersion([string] $Tag) {
+    if ($Tag -cnotmatch '^bcodex-v([0-9]+\.[0-9]+\.[0-9]+)-[0-9a-fA-F]{40}$') {
+        Fail "invalid bettercodex release tag $Tag"
     }
-    $Drive = (Get-Item -LiteralPath $Probe -Force).PSDrive
-    if ($null -eq $Drive -or $null -eq $Drive.Free) {
-        Fail "could not determine free disk space for $Path"
-    }
-    return [pscustomobject]@{
-        Root = [string]$Drive.Root
-        Free = [long]$Drive.Free
-    }
+    return $Matches[1]
 }
 
-function Assert-FreeSpaceBudget([object[]] $Budgets) {
-    $Volumes = @{}
-    foreach ($Budget in $Budgets) {
-        $Volume = Get-VolumeSpace ([string]$Budget.Path)
-        $Key = $Volume.Root.ToLowerInvariant()
-        if (-not $Volumes.ContainsKey($Key)) {
-            $Volumes[$Key] = [pscustomobject]@{
-                Root = $Volume.Root
-                Free = $Volume.Free
-                Required = [long]0
-            }
-        }
-        $Volumes[$Key].Required += [long]$Budget.Bytes
-    }
-    foreach ($Volume in $Volumes.Values) {
-        Write-Step ("Disk preflight: {0:N1} GiB free on {1}; {2:N1} GiB estimated build headroom required" -f
-            ($Volume.Free / 1GB), $Volume.Root, ($Volume.Required / 1GB))
-        if ($Volume.Free -lt $Volume.Required) {
-            Fail ("insufficient disk space on {0}: {1:N1} GiB free, {2:N1} GiB required for this source build" -f
-                $Volume.Root, ($Volume.Free / 1GB), ($Volume.Required / 1GB))
-        }
-    }
+function Get-FileSha256([string] $Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-function Remove-OwnedTree([string] $Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    if (Test-IsReparsePoint $Path) {
-        Remove-Item -LiteralPath $Path -Force
-        return
-    }
-    if (Test-Path -LiteralPath $Path -PathType Container) {
-        foreach ($Child in Get-ChildItem -LiteralPath $Path -Force) {
-            Remove-OwnedTree $Child.FullName
-        }
-        Remove-Item -LiteralPath $Path -Force
-    }
-    else {
-        Remove-Item -LiteralPath $Path -Force
-    }
-}
-
-function Invoke-BoundedDownloadAttempt(
-    [string] $Uri,
-    [string] $Destination,
-    [long] $MaximumBytes
-) {
+function Invoke-Download([string] $Uri, [string] $Destination) {
     Add-Type -AssemblyName System.Net.Http
-    $Partial = "$Destination.partial.$([Guid]::NewGuid().ToString('N'))"
-    $Handler = $null
-    $Client = $null
-    $Response = $null
-    $Input = $null
-    $Output = $null
-    try {
-        $Handler = New-Object Net.Http.HttpClientHandler
-        $Handler.AllowAutoRedirect = $true
-        $Handler.MaxAutomaticRedirections = 5
-        $Client = New-Object Net.Http.HttpClient($Handler)
-        $Client.Timeout = [TimeSpan]::FromMinutes(2)
-        $Client.DefaultRequestHeaders.UserAgent.ParseAdd('bettercodex')
-        $Response = $Client.GetAsync(
-            $Uri,
-            [Net.Http.HttpCompletionOption]::ResponseHeadersRead
-        ).GetAwaiter().GetResult()
-        $Response.EnsureSuccessStatusCode() | Out-Null
-        if ($Response.Content.Headers.ContentLength -gt $MaximumBytes) {
-            Fail "download from $Uri exceeds the $MaximumBytes-byte limit"
+    for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        $Handler = $null
+        $Client = $null
+        $Response = $null
+        $DownloadStream = $null
+        $DestinationStream = $null
+        $Failure = $null
+        try {
+            $Handler = New-Object Net.Http.HttpClientHandler
+            $Handler.AllowAutoRedirect = $true
+            $Handler.MaxAutomaticRedirections = 5
+            $Client = New-Object Net.Http.HttpClient($Handler)
+            $Client.Timeout = [TimeSpan]::FromMinutes(5)
+            $Client.DefaultRequestHeaders.UserAgent.ParseAdd('bettercodex-installer')
+            $Response = $Client.GetAsync(
+                $Uri,
+                [Net.Http.HttpCompletionOption]::ResponseHeadersRead
+            ).GetAwaiter().GetResult()
+            $Response.EnsureSuccessStatusCode() | Out-Null
+            $ContentLength = $Response.Content.Headers.ContentLength
+            if ($null -ne $ContentLength -and $ContentLength -gt $MaximumArchiveBytes) {
+                Fail 'downloaded release asset exceeds the allowed size'
+            }
+            $DownloadStream = $Response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $DestinationStream = New-Object IO.FileStream(
+                $Destination,
+                [IO.FileMode]::CreateNew,
+                [IO.FileAccess]::Write,
+                [IO.FileShare]::None,
+                81920,
+                [IO.FileOptions]::WriteThrough
+            )
+            $Buffer = New-Object byte[] 81920
+            [long] $Total = 0
+            while (($Read = $DownloadStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+                $Total += $Read
+                if ($Total -gt $MaximumArchiveBytes) {
+                    Fail 'downloaded release asset exceeds the allowed size'
+                }
+                $DestinationStream.Write($Buffer, 0, $Read)
+            }
+            if ($Total -eq 0) { Fail 'downloaded release asset is empty' }
+            $DestinationStream.Flush($true)
         }
-        $Input = $Response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        $Output = New-Object IO.FileStream(
-            $Partial,
+        catch {
+            $Failure = $_
+        }
+        finally {
+            if ($null -ne $DestinationStream) { $DestinationStream.Dispose() }
+            if ($null -ne $DownloadStream) { $DownloadStream.Dispose() }
+            if ($null -ne $Response) { $Response.Dispose() }
+            if ($null -ne $Client) { $Client.Dispose() }
+            if ($null -ne $Handler) { $Handler.Dispose() }
+        }
+        if ($null -eq $Failure) { return }
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        if ($Attempt -eq 3) { throw $Failure }
+        Write-Warning "download failed; retrying ($($Attempt + 1)/3)"
+        Start-Sleep -Seconds $Attempt
+    }
+}
+
+function Remove-EmptyDirectory([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    if ($null -eq (Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
+            Select-Object -First 1)) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-ObsoleteCacheDirectory([string] $Path) {
+    if ((Test-Path -LiteralPath $Path -PathType Container) -and
+        -not (Test-IsReparsePoint $Path)) {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-ObsoleteV8Caches([string] $CacheRoot) {
+    foreach ($Directory in Get-ChildItem `
+            -LiteralPath $CacheRoot `
+            -Directory `
+            -Force `
+            -Filter 'rusty-v8-*' `
+            -ErrorAction SilentlyContinue) {
+        if (-not (Test-IsReparsePoint $Directory.FullName)) {
+            Remove-Item -LiteralPath $Directory.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Expand-GzipBinary([string] $Archive, [string] $Destination) {
+    $ArchiveStream = $null
+    $Gzip = $null
+    $DestinationStream = $null
+    try {
+        $ArchiveStream = New-Object IO.FileStream(
+            $Archive,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+        $Gzip = New-Object IO.Compression.GZipStream(
+            $ArchiveStream,
+            [IO.Compression.CompressionMode]::Decompress,
+            $false
+        )
+        $DestinationStream = New-Object IO.FileStream(
+            $Destination,
             [IO.FileMode]::CreateNew,
             [IO.FileAccess]::Write,
             [IO.FileShare]::None,
@@ -193,531 +175,230 @@ function Invoke-BoundedDownloadAttempt(
         )
         $Buffer = New-Object byte[] 81920
         [long] $Total = 0
-        while (($Read = $Input.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+        while (($Read = $Gzip.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
             $Total += $Read
-            if ($Total -gt $MaximumBytes) {
-                Fail "download from $Uri exceeds the $MaximumBytes-byte limit"
+            if ($Total -gt $MaximumBinaryBytes) {
+                Fail 'decompressed bettercodex binary exceeds the allowed size'
             }
-            $Output.Write($Buffer, 0, $Read)
+            $DestinationStream.Write($Buffer, 0, $Read)
         }
-        if ($Total -eq 0) { Fail "download from $Uri was empty" }
-        $Output.Flush($true)
-        $Output.Dispose()
-        $Output = $null
-        $Input.Dispose()
-        $Input = $null
-        $Response.Dispose()
-        $Response = $null
-        Move-Item -LiteralPath $Partial -Destination $Destination -Force
+        if ($Total -eq 0) { Fail 'downloaded bettercodex binary is empty' }
+        $DestinationStream.Flush($true)
     }
     finally {
-        if ($null -ne $Output) { $Output.Dispose() }
-        if ($null -ne $Input) { $Input.Dispose() }
-        if ($null -ne $Response) { $Response.Dispose() }
-        if ($null -ne $Client) { $Client.Dispose() }
-        if ($null -ne $Handler) { $Handler.Dispose() }
-        Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
+        if ($null -ne $DestinationStream) { $DestinationStream.Dispose() }
+        if ($null -ne $Gzip) { $Gzip.Dispose() }
+        if ($null -ne $ArchiveStream) { $ArchiveStream.Dispose() }
     }
 }
 
-function Invoke-BoundedDownload(
-    [string] $Uri,
-    [string] $Destination,
-    [long] $MaximumBytes
+function Get-BinaryReleaseTag([string] $Binary) {
+    try {
+        $Output = (& $Binary --internal-release-tag 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return $Output.Trim()
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-BinaryIdentity(
+    [string] $Binary,
+    [string] $ExpectedTag,
+    [string] $ExpectedVersion
 ) {
-    for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+    if ((Get-BinaryReleaseTag $Binary) -cne $ExpectedTag) { return $false }
+    try {
+        $Version = (& $Binary --version 2>$null) -join "`n"
+        return $LASTEXITCODE -eq 0 -and $Version.Trim() -ceq "bcodex $ExpectedVersion"
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-BinarySmoke([string] $Binary, [string] $ExpectedVersion) {
+    $SmokeRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'bettercodex-smoke.' + [Guid]::NewGuid().ToString('N')
+    )
+    $VariableNames = @(
+        'USERPROFILE', 'LOCALAPPDATA', 'CODEX_HOME', 'BCODEX_HOME',
+        'BCODEX_SKIP_UPDATE_CHECK'
+    )
+    $Previous = @{}
+    foreach ($Name in $VariableNames) {
+        $Previous[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    }
+    try {
+        foreach ($Name in @('profile', 'local-app-data', 'codex-home', 'bcodex-home')) {
+            [void](New-Item -ItemType Directory -Force -Path (Join-Path $SmokeRoot $Name))
+        }
+        $env:USERPROFILE = Join-Path $SmokeRoot 'profile'
+        $env:LOCALAPPDATA = Join-Path $SmokeRoot 'local-app-data'
+        $env:CODEX_HOME = Join-Path $SmokeRoot 'codex-home'
+        $env:BCODEX_HOME = Join-Path $SmokeRoot 'bcodex-home'
+        $env:BCODEX_SKIP_UPDATE_CHECK = '1'
+        $Output = (& $Binary --internal-install-smoke 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or
+            $Output.Trim() -cne "bcodex $ExpectedVersion install smoke passed") {
+            Fail 'downloaded binary failed its runtime smoke test'
+        }
+    }
+    finally {
+        foreach ($Name in $VariableNames) {
+            [Environment]::SetEnvironmentVariable($Name, $Previous[$Name], 'Process')
+        }
+        Remove-Item -LiteralPath $SmokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-WithRetry([scriptblock] $Operation, [string] $Description) {
+    $Delay = 50
+    for ($Attempt = 1; $Attempt -le 10; $Attempt++) {
         try {
-            Invoke-BoundedDownloadAttempt $Uri $Destination $MaximumBytes
+            & $Operation
             return
         }
-        catch {
-            if ($Attempt -eq 3) { throw }
-            Write-Warning "download from $Uri failed; retrying ($($Attempt + 1)/3)"
-            Start-Sleep -Seconds $Attempt
+        catch [IO.IOException] {
+            if ($Attempt -eq 10) { throw }
         }
+        catch [UnauthorizedAccessException] {
+            if ($Attempt -eq 10) { throw }
+        }
+        Start-Sleep -Milliseconds $Delay
+        $Delay = [Math]::Min($Delay * 2, 1000)
     }
+    Fail "could not $Description"
 }
 
-function Get-BundledRipgrepPackage([string] $ManifestPath, [string] $Platform) {
-    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf) -or
-        (Test-IsReparsePoint $ManifestPath)) {
-        Fail "source commit has no safe ripgrep package manifest at $ManifestPath"
-    }
-    try {
-        $ManifestText = [IO.File]::ReadAllText($ManifestPath)
-        $JsonOffset = $ManifestText.IndexOf('{')
-        if ($JsonOffset -lt 0) { Fail 'ripgrep package manifest contains no JSON object' }
-        $Manifest = $ManifestText.Substring($JsonOffset) | ConvertFrom-Json
-    }
-    catch {
-        Fail "could not parse ripgrep package manifest $ManifestPath`: $_"
-    }
-    if ($Manifest.name -cne 'rg' -or $null -eq $Manifest.platforms) {
-        Fail 'ripgrep package manifest has an invalid identity'
-    }
-    $PlatformProperty = $Manifest.platforms.PSObject.Properties[$Platform]
-    if ($null -eq $PlatformProperty) {
-        Fail "ripgrep package manifest does not support $Platform"
-    }
-    $Package = $PlatformProperty.Value
-    $Providers = @($Package.providers)
-    [long] $Size = 0
-    try { $Size = [Convert]::ToInt64($Package.size) }
-    catch { Fail 'ripgrep package manifest has an invalid archive size' }
-    $Digest = [string]$Package.digest
-    $MemberPath = [string]$Package.path
-    if ($Size -le 0 -or $Size -gt 32MB -or
-        [string]$Package.hash -cne 'sha256' -or
-        $Digest -cnotmatch '^[0-9a-f]{64}$' -or
-        [string]$Package.format -cne 'zip' -or
-        $Providers.Count -ne 1) {
-        Fail 'ripgrep package manifest has invalid Windows x64 metadata'
-    }
-    $MemberMatch = [regex]::Match(
-        $MemberPath,
-        '^ripgrep-([0-9]+\.[0-9]+\.[0-9]+)-x86_64-pc-windows-msvc/rg\.exe$'
-    )
-    if (-not $MemberMatch.Success) {
-        Fail 'ripgrep package manifest has an invalid Windows x64 member path'
-    }
-    $Version = $MemberMatch.Groups[1].Value
-    $ExpectedUri = "https://github.com/BurntSushi/ripgrep/releases/download/$Version/ripgrep-$Version-x86_64-pc-windows-msvc.zip"
-    $Uri = [string]$Providers[0].url
-    if ($Uri -cne $ExpectedUri) {
-        Fail 'ripgrep package manifest has an unexpected Windows x64 provider'
-    }
-    return [pscustomobject]@{
-        Size = $Size
-        Digest = $Digest
-        MemberPath = $MemberPath
-        Uri = $Uri
-        Version = $Version
-    }
-}
-
-function Test-RipgrepVersionLine([string] $Line, [string] $Version) {
-    # Release builds append their embedded Git revision; builds made without a
-    # Git checkout report only the semantic version.
-    $Match = [regex]::Match(
-        $Line,
-        '^ripgrep ([0-9]+\.[0-9]+\.[0-9]+)(?: \(rev [0-9a-f]{10}\))?$'
-    )
-    return $Match.Success -and $Match.Groups[1].Value -ceq $Version
-}
-
-function Test-InstalledBundledRipgrep(
-    [string] $BinDirectory,
-    [object] $Package = $null,
-    [string] $SourceRevision = ''
+function Install-Candidate(
+    [string] $Candidate,
+    [string] $Destination,
+    [string] $ExpectedTag,
+    [string] $ExpectedVersion,
+    [string] $Backup
 ) {
-    $PackagePath = Join-Path $BinDirectory 'bcodex-path'
-    $Executable = Join-Path $PackagePath 'rg.exe'
-    $MetadataPath = Join-Path $PackagePath 'rg.json'
-    if ((Test-IsReparsePoint $PackagePath) -or
-        -not (Test-Path -LiteralPath $Executable -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $MetadataPath -PathType Leaf) -or
-        (Test-IsReparsePoint $Executable) -or
-        (Test-IsReparsePoint $MetadataPath)) {
-        return $false
-    }
+    $HadDestination = Test-Path -LiteralPath $Destination -PathType Leaf
     try {
-        $Metadata = [IO.File]::ReadAllText($MetadataPath) | ConvertFrom-Json
-        $ArchiveDigest = [string]$Metadata.archive_sha256
-        $ExecutableDigest = [string]$Metadata.executable_sha256
-        $Version = [string]$Metadata.version
-        $InstalledSourceRevision = [string]$Metadata.source_revision
-        if ($ArchiveDigest -cnotmatch '^[0-9a-f]{64}$' -or
-            $ExecutableDigest -cnotmatch '^[0-9a-f]{64}$' -or
-            $Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
-            $InstalledSourceRevision -cnotmatch '^[0-9a-f]{40}$' -or
-            (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExecutableDigest) {
-            return $false
-        }
-        if ($null -ne $Package -and
-            ($ArchiveDigest -cne [string]$Package.Digest -or
-                $Version -cne [string]$Package.Version)) {
-            return $false
-        }
-        if (-not [string]::IsNullOrEmpty($SourceRevision) -and
-            $InstalledSourceRevision -cne $SourceRevision) {
-            return $false
-        }
-        $VersionOutput = @(& $Executable --version 2>$null)
-        $VersionExitCode = $LASTEXITCODE
-        $FirstVersionLine = if ($VersionOutput.Count -gt 0) { [string]($VersionOutput[0]) } else { '' }
-        return $VersionExitCode -eq 0 -and
-            $VersionOutput.Count -gt 0 -and
-            (Test-RipgrepVersionLine $FirstVersionLine $Version)
-    }
-    catch {
-        return $false
-    }
-}
-
-function Stage-BundledRipgrep(
-    [string] $SourceRoot,
-    [string] $TemporaryRoot,
-    [string] $CacheRoot,
-    [string] $BinDirectory,
-    [string] $SourceRevision
-) {
-    $ManifestPath = Join-Path $SourceRoot 'scripts\codex_package\rg'
-    $Package = Get-BundledRipgrepPackage $ManifestPath 'windows-x86_64'
-    if (Test-InstalledBundledRipgrep $BinDirectory $Package) {
-        return [pscustomobject]@{
-            Candidate = $null
-            ArchiveDigest = $Package.Digest
-            ExecutableDigest = (Get-FileHash -LiteralPath (Join-Path $BinDirectory 'bcodex-path\rg.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
-            SourceRevision = $SourceRevision
-            Version = $Package.Version
-        }
-    }
-
-    $DownloadDirectory = Join-Path $CacheRoot 'downloads\ripgrep'
-    Assert-NoReparsePath $DownloadDirectory
-    [void](New-Item -ItemType Directory -Force -Path $DownloadDirectory)
-    $ArchivePath = Join-Path $DownloadDirectory "$($Package.Digest).zip"
-    $ArchiveValid = (Test-Path -LiteralPath $ArchivePath -PathType Leaf) -and
-        -not (Test-IsReparsePoint $ArchivePath) -and
-        (Get-Item -LiteralPath $ArchivePath).Length -eq $Package.Size -and
-        (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $Package.Digest
-    if (-not $ArchiveValid) {
-        if (Test-Path -LiteralPath $ArchivePath) {
-            Remove-OwnedTree $ArchivePath
-        }
-        Write-Step "Downloading upstream ripgrep $($Package.Version) for Windows x64"
-        Invoke-BoundedDownload $Package.Uri $ArchivePath $Package.Size
-    }
-    if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf) -or
-        (Test-IsReparsePoint $ArchivePath) -or
-        (Get-Item -LiteralPath $ArchivePath).Length -ne $Package.Size -or
-        (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Package.Digest) {
-        Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
-        Fail 'downloaded ripgrep archive failed its pinned size or SHA-256 verification'
-    }
-
-    $ExtractionRoot = Join-Path $TemporaryRoot 'ripgrep'
-    [void](New-Item -ItemType Directory -Path $ExtractionRoot)
-    & tar.exe -xf $ArchivePath -C $ExtractionRoot -- $Package.MemberPath
-    if ($LASTEXITCODE -ne 0) {
-        Fail "ripgrep archive member $($Package.MemberPath) could not be extracted"
-    }
-    foreach ($Item in Get-ChildItem -LiteralPath $ExtractionRoot -Force -Recurse) {
-        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Fail "ripgrep archive contains a reparse point at $($Item.FullName)"
-        }
-    }
-    $Candidate = Join-Path $ExtractionRoot ($Package.MemberPath.Replace('/', '\'))
-    if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf) -or
-        (Test-IsReparsePoint $Candidate)) {
-        Fail "ripgrep archive does not contain $($Package.MemberPath)"
-    }
-    $VersionOutput = @(& $Candidate --version 2>$null)
-    $VersionExitCode = $LASTEXITCODE
-    $FirstVersionLine = if ($VersionOutput.Count -gt 0) { [string]($VersionOutput[0]) } else { '' }
-    if ($VersionExitCode -ne 0 -or $VersionOutput.Count -eq 0 -or
-        -not (Test-RipgrepVersionLine $FirstVersionLine ([string]$Package.Version))) {
-        $ObservedVersion = if ($VersionOutput.Count -gt 0) { $FirstVersionLine } else { '<no output>' }
-        Fail (
-            "bundled ripgrep candidate did not report ripgrep $($Package.Version) " +
-            "(exit code $VersionExitCode; first line: $ObservedVersion)"
-        )
-    }
-    return [pscustomobject]@{
-        Candidate = $Candidate
-        ArchiveDigest = $Package.Digest
-        ExecutableDigest = (Get-FileHash -LiteralPath $Candidate -Algorithm SHA256).Hash.ToLowerInvariant()
-        SourceRevision = $SourceRevision
-        Version = $Package.Version
-    }
-}
-
-function Install-BundledRipgrep([object] $Bundle, [string] $BinDirectory) {
-    $ReplaceExecutable = $null -ne $Bundle.Candidate
-    $PackagePath = Join-Path $BinDirectory 'bcodex-path'
-    Assert-NoReparsePath $PackagePath
-    if ((Test-Path -LiteralPath $PackagePath) -and
-        -not (Test-Path -LiteralPath $PackagePath -PathType Container)) {
-        Fail "$PackagePath exists but is not a directory"
-    }
-    [void](New-Item -ItemType Directory -Force -Path $PackagePath)
-    $Destination = Join-Path $PackagePath 'rg.exe'
-    $MetadataPath = Join-Path $PackagePath 'rg.json'
-    foreach ($ExistingPath in @($Destination, $MetadataPath)) {
-        if ((Test-Path -LiteralPath $ExistingPath) -and
-            (-not (Test-Path -LiteralPath $ExistingPath -PathType Leaf) -or
-                (Test-IsReparsePoint $ExistingPath))) {
-            Fail "refusing unsafe bundled ripgrep path $ExistingPath"
-        }
-    }
-
-    $TransactionId = [Guid]::NewGuid().ToString('N')
-    $Stage = Join-Path $PackagePath ".rg-stage.$TransactionId.exe"
-    $MetadataStage = Join-Path $PackagePath ".rg-stage.$TransactionId.json"
-    $Backup = Join-Path $PackagePath ".rg-backup.$TransactionId.exe"
-    $MetadataBackup = Join-Path $PackagePath ".rg-backup.$TransactionId.json"
-    $PreserveRecovery = $false
-    try {
-        if ($ReplaceExecutable) {
-            Copy-Item -LiteralPath $Bundle.Candidate -Destination $Stage
-            if ((Get-FileHash -LiteralPath $Stage -Algorithm SHA256).Hash.ToLowerInvariant() -cne
-                [string]$Bundle.ExecutableDigest) {
-                Fail 'staged ripgrep executable changed before installation'
-            }
-        }
-        $Metadata = [ordered]@{
-            archive_sha256 = [string]$Bundle.ArchiveDigest
-            executable_sha256 = [string]$Bundle.ExecutableDigest
-            source_revision = [string]$Bundle.SourceRevision
-            version = [string]$Bundle.Version
-        }
-        [IO.File]::WriteAllText(
-            $MetadataStage,
-            ($Metadata | ConvertTo-Json -Compress),
-            (New-Object Text.UTF8Encoding($false))
-        )
-        $InstalledExecutable = $false
-        $InstalledMetadata = $false
-        try {
-            if ($ReplaceExecutable -and (Test-Path -LiteralPath $Destination)) {
-                Invoke-WithRetry { Move-Item -LiteralPath $Destination -Destination $Backup } 'stage the previous bundled ripgrep backup'
-            }
-            if (Test-Path -LiteralPath $MetadataPath) {
-                Invoke-WithRetry { Move-Item -LiteralPath $MetadataPath -Destination $MetadataBackup } 'stage the previous ripgrep metadata backup'
-            }
-            if ($ReplaceExecutable) {
-                Invoke-WithRetry { Move-Item -LiteralPath $Stage -Destination $Destination } 'install bundled rg.exe'
-                $InstalledExecutable = $true
-            }
-            Invoke-WithRetry { Move-Item -LiteralPath $MetadataStage -Destination $MetadataPath } 'install bundled ripgrep metadata'
-            $InstalledMetadata = $true
-            $ExpectedPackage = [pscustomobject]@{
-                Digest = [string]$Bundle.ArchiveDigest
-                Version = [string]$Bundle.Version
-            }
-            if (-not (Test-InstalledBundledRipgrep $BinDirectory $ExpectedPackage ([string]$Bundle.SourceRevision))) {
-                Fail 'installed bundled ripgrep could not be verified'
-            }
-            Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $MetadataBackup -Force -ErrorAction SilentlyContinue
-        }
-        catch {
-            $InstallFailure = $_
-            try {
-                if ($InstalledExecutable) {
-                    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-                }
-                if ($InstalledMetadata) {
-                    Remove-Item -LiteralPath $MetadataPath -Force -ErrorAction SilentlyContinue
-                }
-                if ($ReplaceExecutable -and (Test-Path -LiteralPath $Backup)) {
-                    Invoke-WithRetry { Move-Item -LiteralPath $Backup -Destination $Destination } 'restore the previous bundled ripgrep'
-                }
-                if (Test-Path -LiteralPath $MetadataBackup) {
-                    Invoke-WithRetry { Move-Item -LiteralPath $MetadataBackup -Destination $MetadataPath } 'restore the previous ripgrep metadata'
-                }
-            }
-            catch {
-                $PreserveRecovery = $true
-                throw "bundled ripgrep installation failed and rollback needs recovery in $PackagePath`: $_"
-            }
-            throw $InstallFailure
-        }
-    }
-    finally {
-        Remove-Item -LiteralPath $Stage -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $MetadataStage -Force -ErrorAction SilentlyContinue
-        if (-not $PreserveRecovery) {
-            Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $MetadataBackup -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Recover-BundledRipgrepArtifacts([string] $BinDirectory) {
-    $PackagePath = Join-Path $BinDirectory 'bcodex-path'
-    if (-not (Test-Path -LiteralPath $PackagePath)) { return }
-    Assert-NoReparsePath $PackagePath
-    if (-not (Test-Path -LiteralPath $PackagePath -PathType Container)) {
-        Fail "$PackagePath exists but is not a directory"
-    }
-
-    $Transactions = @{}
-    foreach ($Artifact in Get-ChildItem -LiteralPath $PackagePath -Force -Filter '.rg-*' -ErrorAction SilentlyContinue) {
-        if ($Artifact.Name -cnotmatch '^\.rg-(stage|backup|interrupted)\.([0-9a-f]{32})\.(exe|json)$' -or
-            -not (Test-Path -LiteralPath $Artifact.FullName -PathType Leaf) -or
-            ($Artifact.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Fail "unsafe bundled ripgrep recovery artifact $($Artifact.FullName)"
-        }
-        $Transactions[$Matches[2]] = $true
-    }
-
-    foreach ($TransactionId in $Transactions.Keys) {
-        foreach ($Extension in @('exe', 'json')) {
-            $DestinationName = if ($Extension -ceq 'exe') { 'rg.exe' } else { 'rg.json' }
-            $Destination = Join-Path $PackagePath $DestinationName
-            $Backup = Join-Path $PackagePath ".rg-backup.$TransactionId.$Extension"
-            $Interrupted = Join-Path $PackagePath ".rg-interrupted.$TransactionId.$Extension"
-            if ((Test-Path -LiteralPath $Destination) -and
-                (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
-                    (Test-IsReparsePoint $Destination))) {
-                Fail "unsafe bundled ripgrep destination $Destination"
-            }
-            if (Test-Path -LiteralPath $Backup -PathType Leaf) {
-                if (Test-Path -LiteralPath $Destination) {
-                    Invoke-WithRetry { Move-Item -LiteralPath $Destination -Destination $Interrupted } 'preserve an interrupted ripgrep candidate'
-                }
-                try {
-                    Invoke-WithRetry { Move-Item -LiteralPath $Backup -Destination $Destination } 'restore the previous bundled ripgrep installation'
-                }
-                catch {
-                    if (-not (Test-Path -LiteralPath $Destination) -and
-                        (Test-Path -LiteralPath $Interrupted -PathType Leaf)) {
-                        Invoke-WithRetry { Move-Item -LiteralPath $Interrupted -Destination $Destination } 'restore the interrupted ripgrep destination after recovery failure'
-                    }
-                    throw
-                }
-            }
-            elseif (-not (Test-Path -LiteralPath $Destination) -and
-                (Test-Path -LiteralPath $Interrupted -PathType Leaf)) {
-                Invoke-WithRetry { Move-Item -LiteralPath $Interrupted -Destination $Destination } 'restore an interrupted ripgrep destination'
-            }
-            Remove-Item -LiteralPath $Interrupted -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath (Join-Path $PackagePath ".rg-stage.$TransactionId.$Extension") -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Resolve-MainRevision([string] $Repository) {
-    $Uri = "$GitHubApiRoot/repos/$Repository/git/ref/heads/main"
-    $Temporary = Join-Path ([IO.Path]::GetTempPath()) (
-        'bettercodex-main-' + [Guid]::NewGuid().ToString('N') + '.json'
-    )
-    try {
-        Invoke-BoundedDownload $Uri $Temporary $MaximumMetadataBytes
-        $Response = [IO.File]::ReadAllText($Temporary) | ConvertFrom-Json
-        if ($Response.ref -cne 'refs/heads/main' -or
-            $Response.object.type -cne 'commit' -or
-            -not (Test-SourceRevision ([string]$Response.object.sha))) {
-            Fail 'GitHub returned an invalid bettercodex main revision'
-        }
-        return ([string]$Response.object.sha).ToLowerInvariant()
-    }
-    finally {
-        Remove-Item -LiteralPath $Temporary -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Import-VisualStudioEnvironment {
-    if ((Get-Command cl.exe -ErrorAction SilentlyContinue) -and
-        (Get-Command link.exe -ErrorAction SilentlyContinue)) {
-        return
-    }
-    $InstallerRoot = [Environment]::GetFolderPath('ProgramFilesX86')
-    $VsWhere = Join-Path $InstallerRoot 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (-not (Test-Path -LiteralPath $VsWhere -PathType Leaf)) {
-        Fail 'Microsoft Visual Studio 2022 C++ Build Tools and the Windows SDK are required (https://visualstudio.microsoft.com/visual-cpp-build-tools/)'
-    }
-    $Installation = (& $VsWhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
-    if ([string]::IsNullOrWhiteSpace($Installation)) {
-        Fail 'Visual Studio 2022 is missing the Desktop development with C++ workload and Windows SDK'
-    }
-    $VsDevCmd = Join-Path $Installation 'Common7\Tools\VsDevCmd.bat'
-    if (-not (Test-Path -LiteralPath $VsDevCmd -PathType Leaf)) {
-        Fail "Visual Studio developer environment is unavailable at $VsDevCmd"
-    }
-    $EnvironmentLines = & cmd.exe /d /s /c "`"$VsDevCmd`" -no_logo -arch=x64 -host_arch=x64 >nul && set"
-    if ($LASTEXITCODE -ne 0) {
-        Fail 'Visual Studio C++ build environment could not be initialized'
-    }
-    foreach ($Line in $EnvironmentLines) {
-        if ($Line -match '^([^=][^=]*)=(.*)$') {
-            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
-        }
-    }
-    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue) -or
-        -not (Get-Command link.exe -ErrorAction SilentlyContinue)) {
-        Fail 'Visual Studio initialized without a usable x64 C++ compiler and linker'
-    }
-}
-
-function Find-RustupExecutable(
-    [string] $OriginalCargoHome,
-    [string] $ManagedCargoHome
-) {
-    $Command = Get-Command rustup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $Command) { return [string]$Command.Source }
-
-    $Candidates = New-Object 'System.Collections.Generic.List[string]'
-    if (-not [string]::IsNullOrWhiteSpace($OriginalCargoHome) -and
-        [IO.Path]::IsPathRooted($OriginalCargoHome)) {
-        $Candidates.Add((Join-Path $OriginalCargoHome 'bin\rustup.exe'))
-    }
-    if ($env:USERPROFILE) {
-        $Candidates.Add((Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'))
-    }
-    $Candidates.Add((Join-Path $ManagedCargoHome 'bin\rustup.exe'))
-    foreach ($Candidate in $Candidates) {
-        if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
-    }
-    return $null
-}
-
-function Find-PinnedRustTools([string] $Rustup, [string] $Toolchain) {
-    $Cargo = (& $Rustup which --toolchain $Toolchain cargo 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$Cargo) -or
-        -not (Test-Path -LiteralPath $Cargo -PathType Leaf)) {
-        return $null
-    }
-    $Rustc = (& $Rustup which --toolchain $Toolchain rustc 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$Rustc) -or
-        -not (Test-Path -LiteralPath $Rustc -PathType Leaf)) {
-        return $null
-    }
-    return [pscustomobject]@{ Cargo = [string]$Cargo; Rustc = [string]$Rustc }
-}
-
-function Get-SourceInputHash([string] $SourceRoot) {
-    $Inputs = New-Object 'System.Collections.Generic.List[IO.FileInfo]'
-    foreach ($Relative in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'scripts\cargo-with-v8.ps1', 'src')) {
-        $InputPath = Join-Path $SourceRoot $Relative
-        if (-not (Test-Path -LiteralPath $InputPath)) {
-            Fail "source commit is missing release input $Relative"
-        }
-        if (Test-Path -LiteralPath $InputPath -PathType Container) {
-            foreach ($File in Get-ChildItem -LiteralPath $InputPath -File -Recurse) {
-                $Inputs.Add($File)
-            }
+        if ($HadDestination) {
+            Invoke-WithRetry {
+                [IO.File]::Replace($Candidate, $Destination, $Backup, $true)
+            } 'replace the installed bettercodex binary'
         }
         else {
-            $Inputs.Add((Get-Item -LiteralPath $InputPath))
+            [IO.File]::Move($Candidate, $Destination)
         }
+        if (-not (Test-BinaryIdentity $Destination $ExpectedTag $ExpectedVersion)) {
+            Fail 'installed binary failed final verification'
+        }
+        Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
     }
-    foreach ($Relative in @('.cargo', 'build.rs', 'bundled-skills', 'docs\evals', 'prompts')) {
-        $InputPath = Join-Path $SourceRoot $Relative
-        if (Test-Path -LiteralPath $InputPath -PathType Container) {
-            foreach ($File in Get-ChildItem -LiteralPath $InputPath -File -Recurse) {
-                $Inputs.Add($File)
-            }
+    catch {
+        $Failure = $_
+        if (Test-Path -LiteralPath $Backup -PathType Leaf) {
+            Invoke-WithRetry {
+                [IO.File]::Replace($Backup, $Destination, $null, $true)
+            } 'restore the previous bettercodex binary'
         }
-        elseif (Test-Path -LiteralPath $InputPath -PathType Leaf) {
-            $Inputs.Add((Get-Item -LiteralPath $InputPath))
+        elseif (-not $HadDestination) {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
         }
+        throw $Failure
     }
-    $Lines = foreach ($File in $Inputs) {
-        if (($File.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Fail "source archive contains a reparse point at $($File.FullName)"
-        }
-        $Relative = $File.FullName.Substring($SourceRoot.Length).TrimStart('\').Replace('\', '/')
-        "$(Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash)  $Relative`n"
+}
+
+function Start-DeferredReplacement(
+    [string] $Candidate,
+    [string] $Destination,
+    [string] $ExpectedTag,
+    [string] $ExpectedVersion,
+    [string] $CandidateSha256,
+    [int] $ParentPid,
+    [long] $ParentStartTicks,
+    [string] $LockPath
+) {
+    $Finalizer = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+function Retry([scriptblock] $Operation) {
+    $delay = 50
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try { & $Operation; return } catch [IO.IOException] { if ($attempt -eq 10) { throw } } catch [UnauthorizedAccessException] { if ($attempt -eq 10) { throw } }
+        Start-Sleep -Milliseconds $delay
+        $delay = [Math]::Min($delay * 2, 1000)
     }
-    $Bytes = [Text.Encoding]::UTF8.GetBytes(($Lines | Sort-Object -CaseSensitive) -join '')
-    $Hasher = [Security.Cryptography.SHA256]::Create()
+}
+$candidate = $env:BCODEX_FINALIZE_CANDIDATE
+$destination = $env:BCODEX_FINALIZE_DESTINATION
+$expectedTag = $env:BCODEX_FINALIZE_TAG
+$expectedVersion = $env:BCODEX_FINALIZE_VERSION
+$expectedSha256 = $env:BCODEX_FINALIZE_SHA256
+$parentPid = [int]$env:BCODEX_FINALIZE_PARENT_PID
+$parentTicks = [long]$env:BCODEX_FINALIZE_PARENT_TICKS
+$lockPath = $env:BCODEX_FINALIZE_LOCK
+$backup = "$destination.backup.$([Guid]::NewGuid().ToString('N'))"
+$lock = $null
+$hadDestination = $false
+try {
+    $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+    if ($null -ne $parent -and $parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks -and -not $parent.WaitForExit(300000)) { throw 'timed out waiting for the bettercodex updater process to exit' }
+    for ($attempt = 1; $attempt -le 300 -and $null -eq $lock; $attempt++) {
+        try { $lock = New-Object IO.FileStream($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch [IO.IOException] { Start-Sleep -Milliseconds 100 }
+    }
+    if ($null -eq $lock) { throw 'could not acquire the bettercodex install lock' }
+    if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedSha256) { throw 'staged bettercodex digest changed before finalization' }
+    $hadDestination = Test-Path -LiteralPath $destination -PathType Leaf
+    if ($hadDestination) { Retry { [IO.File]::Replace($candidate, $destination, $backup, $true) } } else { [IO.File]::Move($candidate, $destination) }
+    $tag = (& $destination --internal-release-tag 2>$null) -join "`n"
+    $version = (& $destination --version 2>$null) -join "`n"
+    if ($tag.Trim() -cne $expectedTag -or $version.Trim() -cne "bcodex $expectedVersion") { throw 'updated bettercodex command failed final verification' }
+    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    Write-Host "==> Updated bcodex $expectedVersion at $destination"
+} catch {
+    if (Test-Path -LiteralPath $backup -PathType Leaf) { Retry { [IO.File]::Replace($backup, $destination, $null, $true) } } elseif (-not $hadDestination) { Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue }
+    throw
+} finally {
+    if ($null -ne $lock) { $lock.Dispose() }
+    Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+}
+'@
+    $Encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Finalizer))
+    $Names = @(
+        'BCODEX_FINALIZE_CANDIDATE', 'BCODEX_FINALIZE_DESTINATION',
+        'BCODEX_FINALIZE_TAG', 'BCODEX_FINALIZE_VERSION', 'BCODEX_FINALIZE_SHA256',
+        'BCODEX_FINALIZE_PARENT_PID', 'BCODEX_FINALIZE_PARENT_TICKS',
+        'BCODEX_FINALIZE_LOCK'
+    )
+    $Previous = @{}
+    foreach ($Name in $Names) {
+        $Previous[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    }
     try {
-        return ([BitConverter]::ToString($Hasher.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant()
+        $env:BCODEX_FINALIZE_CANDIDATE = $Candidate
+        $env:BCODEX_FINALIZE_DESTINATION = $Destination
+        $env:BCODEX_FINALIZE_TAG = $ExpectedTag
+        $env:BCODEX_FINALIZE_VERSION = $ExpectedVersion
+        $env:BCODEX_FINALIZE_SHA256 = $CandidateSha256
+        $env:BCODEX_FINALIZE_PARENT_PID = [string]$ParentPid
+        $env:BCODEX_FINALIZE_PARENT_TICKS = [string]$ParentStartTicks
+        $env:BCODEX_FINALIZE_LOCK = $LockPath
+        $PowerShellPath = (Get-Process -Id $PID).Path
+        $Process = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-EncodedCommand', $Encoded
+        ) -WindowStyle Hidden -PassThru
     }
     finally {
-        $Hasher.Dispose()
+        foreach ($Name in $Names) {
+            [Environment]::SetEnvironmentVariable($Name, $Previous[$Name], 'Process')
+        }
+    }
+    if ($null -eq $Process -or $Process.HasExited) {
+        Fail 'could not start the bettercodex update finalizer'
     }
 }
 
@@ -728,7 +409,10 @@ function Prepend-PathEntry([string] $PathValue, [string] $Entry) {
         foreach ($Segment in $PathValue.Split(';')) {
             $Trimmed = $Segment.Trim()
             if (-not [string]::IsNullOrWhiteSpace($Trimmed) -and
-                -not $Trimmed.TrimEnd('\').Equals($Entry.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+                -not $Trimmed.TrimEnd('\').Equals(
+                    $Entry.TrimEnd('\'),
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
                 $Entries.Add($Trimmed)
             }
         }
@@ -742,242 +426,45 @@ function Ensure-CommandPath([string] $BinDirectory) {
         $NewUserPath = Prepend-PathEntry $UserPath $BinDirectory
         if ($NewUserPath -cne $UserPath) {
             [Environment]::SetEnvironmentVariable('Path', $NewUserPath, 'User')
-            Write-Step 'PATH updated for future terminal sessions'
+            Write-Step 'PATH updated for future terminal sessions; open a new terminal'
         }
     }
     catch {
-        Write-Warning "could not update the per-user PATH; add $BinDirectory manually for future terminals: $_"
-    }
-    try {
-        $env:Path = Prepend-PathEntry $env:Path $BinDirectory
-    }
-    catch {
-        Write-Warning "could not update this process's PATH; run $BinDirectory\bcodex.exe directly: $_"
+        Write-Warning "could not update the user PATH; add $BinDirectory manually"
     }
 }
 
-function Invoke-WithRetry([scriptblock] $Operation, [string] $Description) {
-    $Delay = 50
-    for ($Attempt = 1; $Attempt -le 8; $Attempt++) {
-        try {
-            & $Operation
-            return
-        }
-        catch [IO.IOException] {
-            if ($Attempt -eq 8) { throw }
-            Start-Sleep -Milliseconds $Delay
-            $Delay = [Math]::Min($Delay * 2, 1000)
-        }
-        catch [UnauthorizedAccessException] {
-            if ($Attempt -eq 8) { throw }
-            Start-Sleep -Milliseconds $Delay
-            $Delay = [Math]::Min($Delay * 2, 1000)
-        }
-    }
-    Fail "could not $Description"
-}
-
-function Try-StageReusableBinary(
-    [string[]] $Binaries,
-    [string] $Candidate,
-    [string] $Revision,
-    [string] $ExpectedVersion,
-    [string] $BuildInputHash
-) {
-    foreach ($ReusableBinary in $Binaries) {
-        if (-not (Test-Path -LiteralPath $ReusableBinary -PathType Leaf)) { continue }
-
-        $ReusableVersion = $null
-        $VersionExitCode = -1
-        try {
-            $ReusableVersion = (& $ReusableBinary --version 2>$null) -join "`n"
-            $VersionExitCode = $LASTEXITCODE
-        }
-        catch {
-            # A damaged cached executable must not block a valid installed
-            # executable or the source-build fallback.
-        }
-        if ($VersionExitCode -eq 0 -and $ReusableVersion.Trim() -ceq "bcodex $ExpectedVersion") {
-            $StageExitCode = -1
-            try {
-                $null = & $ReusableBinary --internal-install-stage $Candidate $Revision $BuildInputHash 2>$null
-                $StageExitCode = $LASTEXITCODE
-            }
-            catch {
-                # The exact release-input hash is proved by the helper. Any
-                # launch or staging failure falls through to the next source.
-            }
-            if ($StageExitCode -eq 0 -and
-                (Test-Path -LiteralPath $Candidate -PathType Leaf) -and
-                -not (Test-IsReparsePoint $Candidate)) {
-                Write-Step 'Reusing a verified bettercodex executable for unchanged release inputs'
-                return $true
+function Remove-LegacyInstallState([string] $BinDirectory) {
+    $CacheRoot = Join-Path $env:LOCALAPPDATA 'bettercodex\cache'
+    if ((Test-Path -LiteralPath $CacheRoot -PathType Container) -and
+        -not (Test-IsReparsePoint $CacheRoot)) {
+        $LegacySourceInstall = $false
+        foreach ($Name in @('build', 'cargo', 'rustup', 'tmp', 'downloads')) {
+            $Legacy = Join-Path $CacheRoot $Name
+            if ((Test-Path -LiteralPath $Legacy -PathType Container) -and
+                -not (Test-IsReparsePoint $Legacy)) {
+                $LegacySourceInstall = $true
+                Remove-ObsoleteCacheDirectory $Legacy
             }
         }
-
-        if (Test-Path -LiteralPath $Candidate) {
-            Invoke-WithRetry {
-                Remove-OwnedTree $Candidate
-            } 'remove an unusable reusable-binary stage'
-        }
+        if ($LegacySourceInstall) { Remove-ObsoleteV8Caches $CacheRoot }
+        Remove-EmptyDirectory $CacheRoot
     }
-    return $false
-}
-
-function Recover-FinalizerArtifacts([string] $BinDirectory, [string] $Destination) {
-    foreach ($Directory in Get-ChildItem -LiteralPath $BinDirectory -Directory -Force -Filter '.bcodex-finalize.*' -ErrorAction SilentlyContinue) {
-        if ($Directory.Name -cnotmatch '^\.bcodex-finalize\.([0-9a-f]{32})$' -or
-            ($Directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Fail "unsafe bettercodex finalizer artifact $($Directory.FullName)"
-        }
-        $TransactionId = $Matches[1]
-        $ManifestPath = Join-Path $Directory.FullName 'transaction.json'
-        if (-not (Test-Path -LiteralPath $ManifestPath)) {
-            $Artifacts = @(Get-ChildItem -LiteralPath $Directory.FullName -Force)
-            if ($Artifacts.Count -eq 0) {
-                Invoke-WithRetry {
-                    Remove-Item -LiteralPath $Directory.FullName -Force
-                } 'remove the empty completed finalizer transaction'
-                continue
-            }
-            Fail "incomplete bettercodex finalizer record $ManifestPath"
-        }
-        if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf) -or
-            (Test-IsReparsePoint $ManifestPath)) {
-            Fail "incomplete bettercodex finalizer record $ManifestPath"
-        }
-        $Manifest = [IO.File]::ReadAllText($ManifestPath) | ConvertFrom-Json
-        $ExpectedCandidate = Join-Path $Directory.FullName 'candidate.exe'
-        $ExpectedBackup = Join-Path $Directory.FullName 'backup.exe'
-        if ($Manifest.transaction_id -cne $TransactionId -or
-            -not [string]::Equals([string]$Manifest.destination, $Destination, [StringComparison]::OrdinalIgnoreCase) -or
-            -not [string]::Equals([string]$Manifest.candidate, $ExpectedCandidate, [StringComparison]::OrdinalIgnoreCase) -or
-            -not [string]::Equals([string]$Manifest.backup, $ExpectedBackup, [StringComparison]::OrdinalIgnoreCase)) {
-            Fail "invalid bettercodex finalizer record $ManifestPath"
-        }
-        foreach ($Artifact in @($ExpectedCandidate, $ExpectedBackup)) {
-            if ((Test-Path -LiteralPath $Artifact) -and (Test-IsReparsePoint $Artifact)) {
-                Fail "unsafe bettercodex finalizer artifact $Artifact"
-            }
-        }
-        if (Test-Path -LiteralPath $ExpectedBackup -PathType Leaf) {
-            # A retained backup means the previous command was moved but the
-            # transaction did not finish its cleanup. Prefer the known previous
-            # command even if the candidate reached the destination before a
-            # crash; the requested update can then retry normally.
-            $Interrupted = Join-Path $Directory.FullName 'interrupted.exe'
-            if (Test-Path -LiteralPath $Interrupted) {
-                Fail "unsafe bettercodex recovery artifact $Interrupted"
-            }
-            if (Test-Path -LiteralPath $Destination) {
-                Invoke-WithRetry {
-                    Move-Item -LiteralPath $Destination -Destination $Interrupted
-                } 'preserve the interrupted update candidate'
-            }
-            try {
-                Invoke-WithRetry {
-                    Move-Item -LiteralPath $ExpectedBackup -Destination $Destination
-                } 'restore the previous installed binary'
-            }
-            catch {
-                if (-not (Test-Path -LiteralPath $Destination) -and
-                    (Test-Path -LiteralPath $Interrupted -PathType Leaf)) {
-                    Invoke-WithRetry {
-                        Move-Item -LiteralPath $Interrupted -Destination $Destination
-                    } 'restore the interrupted destination after recovery failure'
-                }
-                throw
-            }
-        }
-        Remove-OwnedTree $Directory.FullName
-    }
-}
-
-function Start-DeferredReplacement(
-    [string] $ManifestPath,
-    [int] $ParentPid,
-    [long] $ParentStartTicks,
-    [string] $PowerShellPath
-) {
-    $Finalizer = @'
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-function Retry([scriptblock]$Operation) {
-    $delay = 50
-    for ($attempt = 1; $attempt -le 10; $attempt++) {
-        try { & $Operation; return } catch [IO.IOException] { if ($attempt -eq 10) { throw } } catch [UnauthorizedAccessException] { if ($attempt -eq 10) { throw } }
-        Start-Sleep -Milliseconds $delay
-        $delay = [Math]::Min($delay * 2, 1000)
-    }
-}
-$manifestPath = $env:BCODEX_FINALIZE_MANIFEST
-$parentPid = [int]$env:BCODEX_FINALIZE_PARENT_PID
-$parentTicks = [long]$env:BCODEX_FINALIZE_PARENT_TICKS
-$manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
-$root = Split-Path -Parent $manifestPath
-if (-not [string]::Equals($root, (Split-Path -Parent $manifest.candidate), [StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals([string]$manifest.candidate, (Join-Path $root 'candidate.exe'), [StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals([string]$manifest.backup, (Join-Path $root 'backup.exe'), [StringComparison]::OrdinalIgnoreCase)) { throw 'invalid bettercodex finalizer paths' }
-$lock = $null
-$completed = $false
-try {
-    for ($attempt = 1; $attempt -le 300 -and $null -eq $lock; $attempt++) {
-        try { $lock = New-Object IO.FileStream($manifest.lock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch [IO.IOException] { Start-Sleep -Milliseconds 100 }
-    }
-    if ($null -eq $lock) { throw 'could not acquire the bettercodex install lock for finalization' }
-    $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
-    if ($null -ne $parent -and $parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks -and -not $parent.WaitForExit(300000)) { throw 'timed out waiting for the bettercodex updater process to exit' }
-    if ((Get-FileHash -LiteralPath $manifest.candidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.sha256) { throw 'staged bettercodex digest changed before finalization' }
-    if (Test-Path -LiteralPath $manifest.backup) { Remove-Item -LiteralPath $manifest.backup -Force }
-    if (Test-Path -LiteralPath $manifest.destination) { Retry { Move-Item -LiteralPath $manifest.destination -Destination $manifest.backup } }
-    try {
-        Retry { Move-Item -LiteralPath $manifest.candidate -Destination $manifest.destination }
-        $version = (& $manifest.destination --version 2>$null) -join "`n"
-        $revision = (& $manifest.destination --internal-source-revision 2>$null) -join "`n"
-        if ($version.Trim() -cne "bcodex $($manifest.version)" -or $revision.Trim() -cne $manifest.revision) { throw 'updated bettercodex command failed final verification' }
-        if (Test-Path -LiteralPath $manifest.backup) { Remove-Item -LiteralPath $manifest.backup -Force }
-        $completed = $true
-        Write-Host "==> Updated bcodex $($manifest.version) ($($manifest.revision.Substring(0, 12))) at $($manifest.destination)"
-    } catch {
-        Remove-Item -LiteralPath $manifest.destination -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $manifest.backup) { Retry { Move-Item -LiteralPath $manifest.backup -Destination $manifest.destination } }
-        throw
-    }
-} finally {
-    if ($null -ne $lock) { $lock.Dispose() }
-    if ($completed) {
-        Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $root -Force -ErrorAction SilentlyContinue
-    }
-}
-'@
-    $Bytes = [Text.Encoding]::Unicode.GetBytes($Finalizer)
-    $Encoded = [Convert]::ToBase64String($Bytes)
-    $FinalizeEnvironment = Get-ProcessEnvironmentSnapshot
-    try {
-        $env:BCODEX_FINALIZE_MANIFEST = $ManifestPath
-        $env:BCODEX_FINALIZE_PARENT_PID = [string]$ParentPid
-        $env:BCODEX_FINALIZE_PARENT_TICKS = [string]$ParentStartTicks
-        $Started = Start-Process -FilePath $PowerShellPath -ArgumentList @(
-            '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-            '-EncodedCommand', $Encoded
-        ) -PassThru
-    }
-    finally {
-        Restore-ProcessEnvironment $FinalizeEnvironment
-    }
-    if ($null -eq $Started -or $Started.HasExited) {
-        Fail 'could not start the bettercodex update finalizer'
-    }
-    return $Started
+    $PrivatePath = Join-Path $BinDirectory 'bcodex-path'
+    Remove-ObsoleteCacheDirectory $PrivatePath
 }
 
 if ($Help) {
     @'
 Usage: install.ps1
 
-Resolves the exact source revision at public main, builds and verifies it, and
-installs bcodex.exe. Set BCODEX_INSTALL_DIR to an absolute custom binary
-directory or BCODEX_INSTALL_REVISION to a full immutable commit ID.
+Downloads, verifies, and atomically installs the Windows x64 binary from the
+latest published bettercodex GitHub release. No compilation is performed.
+
+Environment:
+  BCODEX_INSTALL_DIR          Binary directory override.
+  BCODEX_REPOSITORY           GitHub owner/repository override.
+  BCODEX_INSTALL_RELEASE_TAG  Exact release tag used internally by updates.
 '@ | Write-Host
     exit 0
 }
@@ -988,395 +475,117 @@ $Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToS
 if ($Architecture -cne 'X64') { Fail "unsupported Windows architecture: $Architecture" }
 $WindowsBuild = [Environment]::OSVersion.Version.Build
 if ($WindowsBuild -lt $MinimumWindowsBuild) {
-    Fail "Windows build $MinimumWindowsBuild or newer is required"
+    Fail "Windows 11 build $MinimumWindowsBuild or newer is required"
 }
+if (-not $env:LOCALAPPDATA) { Fail 'LOCALAPPDATA is required' }
 
 $Repository = if ($env:BCODEX_REPOSITORY) { $env:BCODEX_REPOSITORY } else { $DefaultRepository }
 if ($Repository -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
     Fail 'BCODEX_REPOSITORY must be an owner/repository name'
 }
-if (-not $env:LOCALAPPDATA) { Fail 'LOCALAPPDATA is required' }
+$ExpectedTag = if ($env:BCODEX_INSTALL_RELEASE_TAG) {
+    $env:BCODEX_INSTALL_RELEASE_TAG
+} else {
+    ''
+}
+if ($ExpectedTag -and -not (Test-ReleaseTag $ExpectedTag)) {
+    Fail 'BCODEX_INSTALL_RELEASE_TAG is invalid'
+}
+
 $BinDirectory = if ($env:BCODEX_INSTALL_DIR) {
     $env:BCODEX_INSTALL_DIR
 } else {
     Join-Path $env:LOCALAPPDATA 'Programs\bettercodex\bin'
 }
-$CacheRoot = if ($env:BCODEX_CACHE_DIR) {
-    $env:BCODEX_CACHE_DIR
-} else {
-    Join-Path $env:LOCALAPPDATA 'bettercodex\cache'
-}
 Assert-AbsolutePath $BinDirectory 'BCODEX_INSTALL_DIR'
-Assert-AbsolutePath $CacheRoot 'BCODEX_CACHE_DIR'
 $BinDirectory = [IO.Path]::GetFullPath($BinDirectory)
-$CacheRoot = [IO.Path]::GetFullPath($CacheRoot)
-Assert-NoReparsePath $BinDirectory
-Assert-NoReparsePath $CacheRoot
-
-if ($ValidateOnly) {
-    Write-Step 'Windows installer validation passed'
-    exit 0
-}
-
 [void](New-Item -ItemType Directory -Force -Path $BinDirectory)
-[void](New-Item -ItemType Directory -Force -Path $CacheRoot)
+if (Test-IsReparsePoint $BinDirectory) { Fail "refusing reparse-point install directory $BinDirectory" }
+
 $Destination = Join-Path $BinDirectory 'bcodex.exe'
 if ((Test-Path -LiteralPath $Destination) -and
-    (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
+    ((-not (Test-Path -LiteralPath $Destination -PathType Leaf)) -or
         (Test-IsReparsePoint $Destination))) {
-    Fail "refusing to replace unsafe bettercodex executable $Destination"
+    Fail "refusing unsafe bettercodex destination $Destination"
 }
 
+$TagPath = if ($ExpectedTag) { "download/$ExpectedTag" } else { 'latest/download' }
+$DownloadUrl = "https://github.com/$Repository/releases/$TagPath/$AssetName"
+$TransactionId = [Guid]::NewGuid().ToString('N')
+$Archive = Join-Path $BinDirectory ".bcodex-download.$TransactionId.gz"
+$Candidate = Join-Path $BinDirectory ".bcodex-stage.$TransactionId.exe"
+$Backup = Join-Path $BinDirectory ".bcodex-backup.$TransactionId.exe"
 $LockPath = Join-Path $BinDirectory '.bcodex-install.lock'
-if (Test-IsReparsePoint $LockPath) { Fail "refusing reparse-point installer lock $LockPath" }
 $Lock = $null
-$TemporaryRoot = $null
-$FinalizeRoot = $null
 $Deferred = $false
-$PreserveFinalizeRoot = $false
+
 try {
     try {
         $Lock = New-Object IO.FileStream(
             $LockPath,
             [IO.FileMode]::OpenOrCreate,
             [IO.FileAccess]::ReadWrite,
-            [IO.FileShare]::None,
-            4096,
-            [IO.FileOptions]::WriteThrough
+            [IO.FileShare]::None
         )
     }
     catch [IO.IOException] {
-        Fail 'another bettercodex install or update is already running'
-    }
-    $Transaction = "pid=$PID`nid=$([Guid]::NewGuid().ToString('N'))`n"
-    $TransactionBytes = [Text.Encoding]::UTF8.GetBytes($Transaction)
-    $Lock.SetLength(0)
-    $Lock.Write($TransactionBytes, 0, $TransactionBytes.Length)
-    $Lock.Flush($true)
-
-    Recover-FinalizerArtifacts $BinDirectory $Destination
-    Recover-BundledRipgrepArtifacts $BinDirectory
-
-    $RequestedRevision = $env:BCODEX_INSTALL_REVISION
-    if ($RequestedRevision -and -not (Test-SourceRevision $RequestedRevision)) {
-        Fail 'BCODEX_INSTALL_REVISION must be a full 40-character commit ID'
-    }
-    $Revision = if ($RequestedRevision) {
-        $RequestedRevision.ToLowerInvariant()
-    } else {
-        Resolve-MainRevision $Repository
+        Fail 'another bettercodex installation is already running'
     }
 
-    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-        $InstalledRevision = (& $Destination --internal-source-revision 2>$null) -join "`n"
-        if ($LASTEXITCODE -eq 0 -and $InstalledRevision.Trim().Equals($Revision, [StringComparison]::OrdinalIgnoreCase)) {
-            if (Test-InstalledBundledRipgrep $BinDirectory $null $Revision) {
-                Write-Step "bettercodex is already current with main at $($Revision.Substring(0, 12))."
-                Ensure-CommandPath $BinDirectory
-                exit 0
-            }
-            Write-Step 'The private bundled ripgrep is missing or invalid; repairing this installation'
-        }
+    Write-Step 'Downloading bettercodex for Windows x86-64'
+    Invoke-Download $DownloadUrl $Archive
+    Expand-GzipBinary $Archive $Candidate
+    Remove-Item -LiteralPath $Archive -Force
+
+    $CandidateTag = Get-BinaryReleaseTag $Candidate
+    if (-not $CandidateTag -or -not (Test-ReleaseTag $CandidateTag)) {
+        Fail 'downloaded binary has no valid bettercodex release tag'
+    }
+    if ($ExpectedTag -and $CandidateTag -cne $ExpectedTag) {
+        Fail "downloaded binary is $CandidateTag, expected $ExpectedTag"
+    }
+    $CandidateVersion = Get-ReleaseVersion $CandidateTag
+    if (-not (Test-BinaryIdentity $Candidate $CandidateTag $CandidateVersion)) {
+        Fail 'downloaded binary version does not match its release tag'
     }
 
-    $TargetDirectory = Join-Path $CacheRoot 'build\x86_64-pc-windows-msvc\target'
-    Assert-NoReparsePath $TargetDirectory
-    Assert-FreeSpaceBudget @(
-        [pscustomobject]@{ Path = [IO.Path]::GetTempPath(); Bytes = $SourceHeadroom },
-        [pscustomobject]@{ Path = $BinDirectory; Bytes = $InstallHeadroom }
-    )
+    Write-Step "Verifying bettercodex $CandidateVersion"
+    Invoke-BinarySmoke $Candidate $CandidateVersion
+    $CandidateSha256 = Get-FileSha256 $Candidate
 
-    if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
-        Fail 'Windows tar.exe is required to extract the immutable source archive'
-    }
-
-    $TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) (
-        'bettercodex-install.' + [Guid]::NewGuid().ToString('N')
-    )
-    [void](New-Item -ItemType Directory -Path $TemporaryRoot)
-    $ArchivePath = Join-Path $TemporaryRoot 'source.tar.gz'
-    $SourceRoot = Join-Path $TemporaryRoot 'source'
-    $CompilerTemp = Join-Path $TemporaryRoot 'compiler-temp'
-    $SmokeRoot = Join-Path $TemporaryRoot 'smoke'
-    [void](New-Item -ItemType Directory -Path $SourceRoot)
-    [void](New-Item -ItemType Directory -Path $CompilerTemp)
-
-    Write-Step "Installing bettercodex main $($Revision.Substring(0, 12)) for Windows x64"
-    Write-Step 'Downloading the immutable source snapshot'
-    Invoke-BoundedDownload "$GitHubArchiveRoot/$Repository/tar.gz/$Revision" $ArchivePath $MaximumSourceArchiveBytes
-    & tar.exe -xzf $ArchivePath -C $SourceRoot --strip-components=1
-    if ($LASTEXITCODE -ne 0) { Fail 'downloaded source archive could not be extracted' }
-    foreach ($Required in @(
-            'Cargo.toml',
-            'Cargo.lock',
-            'rust-toolchain.toml',
-            'scripts\cargo-with-v8.ps1',
-            'scripts\codex_package\rg'
-        )) {
-        if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot $Required) -PathType Leaf)) {
-            Fail "source commit has no $Required"
-        }
-    }
-    foreach ($Item in Get-ChildItem -LiteralPath $SourceRoot -Force -Recurse) {
-        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Fail "source archive contains a reparse point at $($Item.FullName)"
-        }
-    }
-
-    $CargoManifest = [IO.File]::ReadAllText((Join-Path $SourceRoot 'Cargo.toml'))
-    $VersionMatch = [regex]::Match($CargoManifest, '(?m)^version = "([^"]+)"')
-    if (-not $VersionMatch.Success) { Fail 'source commit has no package version' }
-    $ExpectedVersion = $VersionMatch.Groups[1].Value
-    $ToolchainFile = [IO.File]::ReadAllText((Join-Path $SourceRoot 'rust-toolchain.toml'))
-    $ToolchainMatch = [regex]::Match($ToolchainFile, '(?m)^channel = "([A-Za-z0-9._-]+)"')
-    if (-not $ToolchainMatch.Success) { Fail 'source commit has no pinned Rust toolchain' }
-    $RustToolchain = $ToolchainMatch.Groups[1].Value
-    $RipgrepBundle = Stage-BundledRipgrep $SourceRoot $TemporaryRoot $CacheRoot $BinDirectory $Revision
-
-    $BuildInputHash = Get-SourceInputHash $SourceRoot
-    $BuiltBinary = Join-Path $TargetDirectory 'release\bcodex.exe'
-    $PowerShellPath = (Get-Process -Id $PID).Path
-    $TransactionId = [Guid]::NewGuid().ToString('N')
-    $FinalizeRoot = Join-Path $BinDirectory ".bcodex-finalize.$TransactionId"
-    [void](New-Item -ItemType Directory -Path $FinalizeRoot)
-    $Candidate = Join-Path $FinalizeRoot 'candidate.exe'
-    $ReusableBinaries = @($BuiltBinary, $Destination)
-    $ReusedExistingBinary = Try-StageReusableBinary `
-        $ReusableBinaries $Candidate $Revision $ExpectedVersion $BuildInputHash
-
-    if (-not $ReusedExistingBinary) {
-        $HasWarmBuildCache = Test-Path -LiteralPath $BuiltBinary -PathType Leaf
-        $CacheHeadroom = if ($HasWarmBuildCache) { $WarmBuildCacheHeadroom } else { $FirstBuildCacheHeadroom }
-        Assert-FreeSpaceBudget @(
-            [pscustomobject]@{ Path = $CacheRoot; Bytes = $CacheHeadroom },
-            [pscustomobject]@{ Path = [IO.Path]::GetTempPath(); Bytes = $ScratchHeadroom },
-            [pscustomobject]@{ Path = $BinDirectory; Bytes = $InstallHeadroom }
-        )
-        $OriginalCargoHome = $env:CARGO_HOME
-        $CompilerEnvironment = Get-ProcessEnvironmentSnapshot
-        try {
-            Import-VisualStudioEnvironment
-            $CargoHome = Join-Path $CacheRoot 'cargo'
-            $ManagedRustupHome = Join-Path $CacheRoot 'rustup'
-            [void](New-Item -ItemType Directory -Force -Path $CargoHome)
-            [void](New-Item -ItemType Directory -Force -Path $TargetDirectory)
-            $Rustup = Find-RustupExecutable $OriginalCargoHome $CargoHome
-            $CachedRustup = Join-Path $CargoHome 'bin\rustup.exe'
-            if (-not $Rustup) {
-                if (-not (Test-Path -LiteralPath $CachedRustup -PathType Leaf)) {
-                    Write-Step 'Installing rustup for the pinned bettercodex toolchain'
-                    $RustupInit = Join-Path $TemporaryRoot 'rustup-init.exe'
-                    Invoke-BoundedDownload 'https://win.rustup.rs/x86_64' $RustupInit 32MB
-                    $env:CARGO_HOME = $CargoHome
-                    $env:RUSTUP_HOME = $ManagedRustupHome
-                    & $RustupInit -y --no-modify-path --profile minimal --default-toolchain none
-                    if ($LASTEXITCODE -ne 0) { Fail 'the official rustup installer failed' }
-                }
-                $Rustup = $CachedRustup
-            }
-            $env:CARGO_HOME = $CargoHome
-            Write-Step "Using the pinned Rust $RustToolchain toolchain"
-            $UsesManagedRustupHome = [string]::Equals(
-                [IO.Path]::GetFullPath($Rustup),
-                [IO.Path]::GetFullPath($CachedRustup),
-                [StringComparison]::OrdinalIgnoreCase
-            )
-            if ($UsesManagedRustupHome) { $env:RUSTUP_HOME = $ManagedRustupHome }
-            $RustTools = Find-PinnedRustTools $Rustup $RustToolchain
-            if ($null -eq $RustTools) {
-                # Keep an existing user rustup installation untouched when it does not
-                # already provide the pinned release. Missing toolchains belong to the
-                # reusable bettercodex cache, matching the Unix installer.
-                $env:RUSTUP_HOME = $ManagedRustupHome
-                [void](New-Item -ItemType Directory -Force -Path $ManagedRustupHome)
-                $RustTools = Find-PinnedRustTools $Rustup $RustToolchain
-                if ($null -eq $RustTools) {
-                    Write-Step "Caching missing Rust $RustToolchain at $ManagedRustupHome"
-                    & $Rustup toolchain install $RustToolchain --profile minimal
-                    if ($LASTEXITCODE -ne 0) { Fail "could not install pinned Rust $RustToolchain" }
-                    $RustTools = Find-PinnedRustTools $Rustup $RustToolchain
-                }
-            }
-            if ($null -eq $RustTools) {
-                Fail 'pinned Cargo and rustc executables are unavailable'
-            }
-            $Cargo = $RustTools.Cargo
-            $Rustc = $RustTools.Rustc
-
-            Write-Step "Compiling bettercodex $ExpectedVersion with the warm Cargo cache"
-            $BuildEnvironmentNames = @(
-                'BCODEX_BUILD_INPUT_HASH',
-                'BCODEX_CACHE_DIR',
-                'BCODEX_SOURCE_REVISION',
-                'CARGO',
-                'CARGO_BUILD_BUILD_DIR',
-                'CARGO_BUILD_JOBS',
-                'CARGO_BUILD_TARGET',
-                'CARGO_BUILD_TARGET_DIR',
-                'CARGO_ENCODED_RUSTFLAGS',
-                'CARGO_INCREMENTAL',
-                'CARGO_INSTALL_ROOT',
-                'CARGO_TARGET_DIR',
-                'RUSTC',
-                'RUSTC_WORKSPACE_WRAPPER',
-                'RUSTC_WRAPPER',
-                'RUSTFLAGS',
-                'RUSTUP_TOOLCHAIN',
-                'RUSTY_V8_ARCHIVE',
-                'RUSTY_V8_SRC_BINDING_PATH',
-                'TEMP',
-                'TMP',
-                'V8_FROM_SOURCE'
-            )
-            $BuildEnvironment = Get-ProcessEnvironmentSnapshot
-            foreach ($Name in $BuildEnvironmentNames) {
-                Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
-            }
-            $OriginalPath = $env:Path
-            try {
-                $env:BCODEX_BUILD_INPUT_HASH = $BuildInputHash
-                $env:BCODEX_CACHE_DIR = $CacheRoot
-                $env:CARGO = $Cargo
-                $env:CARGO_INCREMENTAL = '1'
-                $env:CARGO_TARGET_DIR = $TargetDirectory
-                $env:RUSTC = $Rustc
-                $env:TEMP = $CompilerTemp
-                $env:TMP = $CompilerTemp
-                $env:Path = (Split-Path -Parent $Cargo) + ';' + $OriginalPath
-                Push-Location $SourceRoot
-                try {
-                    & $PowerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $SourceRoot 'scripts\cargo-with-v8.ps1') build --release --locked --bin bcodex
-                    if ($LASTEXITCODE -ne 0) { Fail 'local bettercodex compilation failed' }
-                }
-                finally {
-                    Pop-Location
-                }
-            }
-            finally {
-                Restore-ProcessEnvironment $BuildEnvironment
-            }
-
-            if (-not (Test-Path -LiteralPath $BuiltBinary -PathType Leaf)) {
-                Fail 'local build did not produce bcodex.exe'
-            }
-            $BuiltVersion = (& $BuiltBinary --version 2>$null) -join "`n"
-            if ($LASTEXITCODE -ne 0 -or $BuiltVersion.Trim() -cne "bcodex $ExpectedVersion") {
-                Fail "built binary did not report bcodex $ExpectedVersion"
-            }
-            & $BuiltBinary --internal-install-stage $Candidate $Revision $BuildInputHash
-            if ($LASTEXITCODE -ne 0) { Fail "built binary could not stage source revision $Revision" }
-        }
-        finally {
-            Restore-ProcessEnvironment $CompilerEnvironment
-        }
-    }
-    $CandidateVersion = (& $Candidate --version 2>$null) -join "`n"
-    $CandidateRevision = (& $Candidate --internal-source-revision 2>$null) -join "`n"
-    if ($CandidateVersion.Trim() -cne "bcodex $ExpectedVersion" -or $CandidateRevision.Trim() -cne $Revision) {
-        Fail 'staged binary could not be verified'
-    }
-
-    Write-Step 'Smoke-testing V8 and every embedded system resource'
-    foreach ($Directory in @('profile', 'local-app-data', 'codex-home', 'bcodex-home', 'workspace')) {
-        [void](New-Item -ItemType Directory -Force -Path (Join-Path $SmokeRoot $Directory))
-    }
-    $SmokeEnvironment = Get-ProcessEnvironmentSnapshot
-    $PriorDirectory = [Environment]::CurrentDirectory
-    try {
-        $env:USERPROFILE = Join-Path $SmokeRoot 'profile'
-        $env:LOCALAPPDATA = Join-Path $SmokeRoot 'local-app-data'
-        $env:CODEX_HOME = Join-Path $SmokeRoot 'codex-home'
-        $env:BCODEX_HOME = Join-Path $SmokeRoot 'bcodex-home'
-        $env:BCODEX_SKIP_UPDATE_CHECK = '1'
-        [Environment]::CurrentDirectory = Join-Path $SmokeRoot 'workspace'
-        $SmokeOutput = (& $Candidate --internal-install-smoke 2>$null) -join "`n"
-        $SmokeExitCode = $LASTEXITCODE
-    }
-    finally {
-        [Environment]::CurrentDirectory = $PriorDirectory
-        Restore-ProcessEnvironment $SmokeEnvironment
-    }
-    if ($SmokeExitCode -ne 0 -or $SmokeOutput.Trim() -cne "bcodex $ExpectedVersion install smoke passed") {
-        Fail 'staged binary failed its runtime and embedded-resource smoke test'
-    }
-
-    Write-Step "Installing private upstream ripgrep $($RipgrepBundle.Version)"
-    Install-BundledRipgrep $RipgrepBundle $BinDirectory
-
-    $CandidateSha256 = (Get-FileHash -LiteralPath $Candidate -Algorithm SHA256).Hash.ToLowerInvariant()
-    $Backup = Join-Path $FinalizeRoot 'backup.exe'
-    $ManifestPath = Join-Path $FinalizeRoot 'transaction.json'
-    $ParentPid = 0
-    $ParentStartTicks = 0
     if ($env:BCODEX_UPDATE_PARENT_PID -match '^[1-9][0-9]*$') {
         $ParentPid = [int]$env:BCODEX_UPDATE_PARENT_PID
         $Parent = Get-Process -Id $ParentPid -ErrorAction Stop
         $ParentStartTicks = $Parent.StartTime.ToUniversalTime().Ticks
-    }
-    $Manifest = [ordered]@{
-        transaction_id = $TransactionId
-        destination = $Destination
-        candidate = $Candidate
-        backup = $Backup
-        lock = $LockPath
-        sha256 = $CandidateSha256
-        revision = $Revision
-        version = $ExpectedVersion
-    }
-    [IO.File]::WriteAllText($ManifestPath, ($Manifest | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
-
-    if ($ParentPid -gt 0) {
-        [void](Start-DeferredReplacement $ManifestPath $ParentPid $ParentStartTicks $PowerShellPath)
+        Start-DeferredReplacement `
+            $Candidate `
+            $Destination `
+            $CandidateTag `
+            $CandidateVersion `
+            $CandidateSha256 `
+            $ParentPid `
+            $ParentStartTicks `
+            $LockPath
         $Deferred = $true
         Write-Step 'Verified update staged; replacement will finish after this bcodex process exits'
     }
     else {
-        if (Test-Path -LiteralPath $Destination) {
-            Invoke-WithRetry { Move-Item -LiteralPath $Destination -Destination $Backup } 'stage the installed binary backup'
-        }
-        try {
-            Invoke-WithRetry { Move-Item -LiteralPath $Candidate -Destination $Destination } 'install bcodex.exe'
-            $InstalledVersion = (& $Destination --version 2>$null) -join "`n"
-            $InstalledRevision = (& $Destination --internal-source-revision 2>$null) -join "`n"
-            if ($InstalledVersion.Trim() -cne "bcodex $ExpectedVersion" -or $InstalledRevision.Trim() -cne $Revision) {
-                Fail 'installed binary could not be verified'
-            }
-            Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
-        }
-        catch {
-            $InstallFailure = $_
-            try {
-                if (Test-Path -LiteralPath $Destination) {
-                    Invoke-WithRetry {
-                        Remove-Item -LiteralPath $Destination -Force
-                    } 'remove the failed bettercodex candidate'
-                }
-                if (Test-Path -LiteralPath $Backup) {
-                    Invoke-WithRetry {
-                        Move-Item -LiteralPath $Backup -Destination $Destination
-                    } 'restore the previous installed binary'
-                }
-            }
-            catch {
-                $PreserveFinalizeRoot = $true
-                throw "bettercodex installation failed and rollback needs recovery from $ManifestPath`: $_"
-            }
-            throw $InstallFailure
-        }
-        Remove-OwnedTree $FinalizeRoot
-        $FinalizeRoot = $null
-        Write-Step "Installed bcodex $ExpectedVersion ($($Revision.Substring(0, 12))) at $Destination"
+        Install-Candidate $Candidate $Destination $CandidateTag $CandidateVersion $Backup
+        Write-Step "Installed bcodex $CandidateVersion at $Destination"
     }
 
+    Remove-LegacyInstallState $BinDirectory
     Ensure-CommandPath $BinDirectory
     if (-not $Deferred) { Write-Step 'Run: bcodex login' }
 }
 finally {
     if ($null -ne $Lock) { $Lock.Dispose() }
-    if ($TemporaryRoot) {
-        try { Remove-OwnedTree $TemporaryRoot } catch { Write-Warning "could not remove task-owned installer tree $TemporaryRoot`: $_" }
+    Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
+    if (-not $Deferred) {
+        Remove-Item -LiteralPath $Candidate -Force -ErrorAction SilentlyContinue
     }
-    if ($FinalizeRoot -and -not $Deferred -and -not $PreserveFinalizeRoot) {
-        try { Remove-OwnedTree $FinalizeRoot } catch { Write-Warning "could not remove failed finalizer tree $FinalizeRoot`: $_" }
+    Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+    if (-not $Deferred) {
+        Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue
     }
 }
