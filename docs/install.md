@@ -1,8 +1,10 @@
 # Installing and building bettercodex
 
-bettercodex is one Rust package and one `bcodex` binary. Public installations
-track the exact current commit on public `main`. Cargo package versions are
-display metadata; they do not decide whether an installation is current.
+bettercodex is one Rust package and one user-facing `bcodex` binary. Public
+installations track the exact current commit on public `main`. Cargo package
+versions are display metadata; they do not decide whether an installation is
+current. Native Windows installs also include upstream Codex's pinned
+`rg.exe` as a private command dependency; it is not a second product command.
 
 ## Supported and preview systems
 
@@ -31,7 +33,10 @@ Native Windows additionally requires PowerShell 5.1 or PowerShell 7, the
 Windows `tar.exe`, and Visual Studio 2022 Build Tools with **Desktop development
 with C++** and a Windows 10 or 11 SDK. Install those prerequisites from
 [Microsoft's C++ Build Tools page](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-before running the source installer. The first local release build can use
+before running the source installer. Install Git for Windows for Git-backed
+repository features (for example, `winget install --id Git.Git -e`). Git Bash
+does not become the agent shell; native Windows commands default to PowerShell.
+The first local release build can use
 roughly 6–10 GiB persistently for Rust, dependency, V8, and compiled-artifact
 caches. For a cold build, the installer reserves 8 GiB of cache headroom,
 2 GiB of temporary-build headroom, and 256 MiB for installation; when those
@@ -88,7 +93,10 @@ does not change the machine-wide execution policy. The installer pins public
 `main`, downloads that exact source archive, initializes the installed Visual
 Studio build environment, obtains the pinned Rust toolchain and verified
 sandboxed V8 pair, builds `bcodex.exe` when needed, smoke-tests it, then commits
-only the verified candidate.
+only the verified candidate. It also reads the copied upstream ripgrep package
+manifest, checks the Windows x64 archive's exact size and SHA-256 digest,
+extracts only the declared `rg.exe`, verifies its version, and installs it under
+the private `bcodex-path` directory beside the product command.
 
 The default Windows command directory is
 `%LOCALAPPDATA%\Programs\bettercodex\bin`; reusable build state is under
@@ -96,6 +104,9 @@ The default Windows command directory is
 `BCODEX_CACHE_DIR` before invoking the script to override either location. The
 installer updates the current process PATH and the case-insensitive per-user
 PATH without duplicating entries. Open a new terminal after first installation.
+Only the `bin` directory is persisted there. bettercodex prepends
+`bin\bcodex-path` to its own runtime environment so agent commands can use
+`rg`/`rg --files`; the private helper is not added to the user's PATH.
 On update, the installer first reuses an already available pinned Rust
 toolchain without contacting rustup. If the selected commit has the same
 release-input hash as the cached or currently installed executable, it verifies

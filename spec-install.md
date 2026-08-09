@@ -18,6 +18,9 @@ Releases are outside the update decision.
 - A build installs the source commit selected before its archive download
   begins. The explicit updater fetches its installer from that same commit.
 - No unverified candidate replaces an existing command.
+- The native Windows install includes the current upstream-pinned ripgrep as a
+  private subprocess dependency, not a second user-facing command or persistent
+  user-PATH entry.
 - The source-selection, build-input, staging, smoke, and revision-verification
   contract is identical on macOS ARM64, macOS x86-64, Linux ARM64, Linux
   x86-64, and Windows x86-64. Commit mechanics remain target-native.
@@ -58,7 +61,10 @@ The source installation must:
 1. Require a checked-in `Cargo.lock`, pinned `rust-toolchain.toml`, target-native
    Cargo/V8 wrapper, rustup, and a working native C compiler. Windows requires
    the x64 MSVC C++ workload and Windows SDK and may initialize its installed
-   Visual Studio developer environment automatically.
+   Visual Studio developer environment automatically. It also requires the
+   checked-in upstream ripgrep package manifest, verifies the Windows x64
+   archive's exact size and SHA-256 digest, extracts only the declared `rg.exe`,
+   and verifies that executable's reported version.
 2. Hash release-relevant source contents. When no target-native cached or
    installed binary proves that same complete hash, build with `--release
    --locked --bin bcodex`, Cargo incremental compilation enabled, that hash as
@@ -81,6 +87,14 @@ The source installation must:
    the candidate digest, moves the old executable to an install-owned backup,
    commits the candidate, verifies it, and restores the backup on failure.
 8. Verify the installed version and revision again before reporting success.
+
+On native Windows, the verified ripgrep executable and integrity metadata are
+installed under `bcodex-path` inside the command directory. bettercodex prepends
+that private directory only to its own process environment before any worker
+threads or command subprocesses exist. The installer never persists it in the
+user PATH. A same-revision no-op is valid only while both `bcodex.exe` and the
+private ripgrep installation still pass verification; otherwise the installer
+repairs the helper while reusing unchanged bettercodex build output.
 
 The Unix destination defaults to `$HOME/.local/bin`; the Windows destination
 defaults to `%LOCALAPPDATA%\Programs\bettercodex\bin`. Either may be overridden
@@ -130,14 +144,15 @@ target merely because the manifest, lockfile, or wrapper changed. A content hash
 of release inputs must independently prevent stale mtime-based source reuse.
 
 The native cache retains dependency artifacts, the unstamped bettercodex build,
-fingerprints, and incremental bettercodex state. Source archives, extracted
-source, temporary Rust toolchains, compiler scratch, and staged executables are
-disposable. A target-native installer may reuse a cached unstamped or currently
-installed binary without invoking Cargo only after the installer verifies its
-package version and its internal staging helper proves that the complete
-release-input hash matches the selected source. Cleanup must run after success
-and failure without following symlinks or reparse points. If no cache home
-exists, all downloads and build output are disposable.
+fingerprints, incremental bettercodex state, and the verified pinned ripgrep
+archive. Source archives, extracted source, temporary Rust toolchains, compiler
+scratch, and staged executables are disposable. A target-native installer may
+reuse a cached unstamped or currently installed binary without invoking Cargo
+only after the installer verifies its package version and its internal staging
+helper proves that the complete release-input hash matches the selected source.
+Cleanup must run after success and failure without following symlinks or
+reparse points. If no cache home exists, all downloads and build output are
+disposable.
 
 Network payloads and metadata have explicit maximum sizes. Compilation happens
 once for the selected revision even if `main` changes during the build. A later
@@ -150,6 +165,9 @@ launch detects any newer revision.
 - Missing prerequisites produce an actionable platform-specific error.
 - Failed extraction, compilation, embedded-revision verification, runtime smoke
   test, staging, or final verification preserves the installed command.
+- A ripgrep size, digest, member, version, staging, or final verification
+  failure stops before a new bettercodex command is exposed and restores any
+  previous private helper on a handled replacement failure.
 - An active install lock rejects concurrent mutation.
 - A stale transaction may remove only its validated temporary tree, candidate,
   and backup. On Windows, a retained backup restores that transaction's
@@ -171,4 +189,5 @@ verification, moving-`main` behavior, PATH handling, and cleanup with and
 without persistent cache homes. Native Windows coverage additionally requires
 PowerShell syntax, V8 checksum, `.exe` staging, reparse refusal, exact-process
 deferred replacement, sharing-violation retry, rollback, release smoke, and
-same-revision no-op and release-input executable reuse/rejection tests.
+same-revision no-op, private ripgrep manifest/integrity/repair behavior, and
+release-input executable reuse/rejection tests.

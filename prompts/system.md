@@ -33,6 +33,7 @@ Omit generic praise, including praise that contrasts a plan with an obviously in
 {{platform_shell_guidance}}
 - Do not block on sleep or wait operations for more than 60 seconds.
 - Use task-specific variable names. Do not repurpose `HOME`, `home`, `CODEX_HOME`, or `BCODEX_HOME`.
+{{platform_shell_environment_guidance}}
 
 ### File editing
 

@@ -33,6 +33,9 @@ The context limits intentionally match Codex's `gpt-5.6-sol` model catalog.
 The runtime is one Cargo package and one `bcodex` binary. It contains the
 inference loop and terminal UI for one operator. Commands and patches run with
 the invoking user's permissions; bettercodex does not sandbox them.
+Native Windows source installs may also carry upstream Codex's pinned `rg.exe`
+as a private subprocess dependency under `bcodex-path`. It is not another
+user-facing command and enters only the running agent's process-local `PATH`.
 
 The public installation channel is the exact current commit on public `main`.
 The installer and updater build that pinned source revision locally; Cargo
@@ -47,7 +50,8 @@ system, configuration framework, build system, or plugin hook unless the user
 gives a concrete bettercodex use for it. Linux, macOS, and native 64-bit Windows
 11 terminals are supported targets. Windows support must remain target-gated:
 it must not add Windows-only instructions, tools, or platform prose to the
-model-facing context on other platforms. [`SPEC-WINDOWS.md`](../SPEC-WINDOWS.md)
+model-facing context on other platforms; Unix shell prose must likewise remain
+absent from native Windows context. [`SPEC-WINDOWS.md`](../SPEC-WINDOWS.md)
 records the compatibility design and verification checklist; current upstream
 Codex source remains authoritative where that specification is stale or
 incomplete.

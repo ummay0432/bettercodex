@@ -238,6 +238,340 @@ function Invoke-BoundedDownload(
     }
 }
 
+function Get-BundledRipgrepPackage([string] $ManifestPath, [string] $Platform) {
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf) -or
+        (Test-IsReparsePoint $ManifestPath)) {
+        Fail "source commit has no safe ripgrep package manifest at $ManifestPath"
+    }
+    try {
+        $ManifestText = [IO.File]::ReadAllText($ManifestPath)
+        $JsonOffset = $ManifestText.IndexOf('{')
+        if ($JsonOffset -lt 0) { Fail 'ripgrep package manifest contains no JSON object' }
+        $Manifest = $ManifestText.Substring($JsonOffset) | ConvertFrom-Json
+    }
+    catch {
+        Fail "could not parse ripgrep package manifest $ManifestPath`: $_"
+    }
+    if ($Manifest.name -cne 'rg' -or $null -eq $Manifest.platforms) {
+        Fail 'ripgrep package manifest has an invalid identity'
+    }
+    $PlatformProperty = $Manifest.platforms.PSObject.Properties[$Platform]
+    if ($null -eq $PlatformProperty) {
+        Fail "ripgrep package manifest does not support $Platform"
+    }
+    $Package = $PlatformProperty.Value
+    $Providers = @($Package.providers)
+    [long] $Size = 0
+    try { $Size = [Convert]::ToInt64($Package.size) }
+    catch { Fail 'ripgrep package manifest has an invalid archive size' }
+    $Digest = [string]$Package.digest
+    $MemberPath = [string]$Package.path
+    if ($Size -le 0 -or $Size -gt 32MB -or
+        [string]$Package.hash -cne 'sha256' -or
+        $Digest -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Package.format -cne 'zip' -or
+        $Providers.Count -ne 1) {
+        Fail 'ripgrep package manifest has invalid Windows x64 metadata'
+    }
+    $MemberMatch = [regex]::Match(
+        $MemberPath,
+        '^ripgrep-([0-9]+\.[0-9]+\.[0-9]+)-x86_64-pc-windows-msvc/rg\.exe$'
+    )
+    if (-not $MemberMatch.Success) {
+        Fail 'ripgrep package manifest has an invalid Windows x64 member path'
+    }
+    $Version = $MemberMatch.Groups[1].Value
+    $ExpectedUri = "https://github.com/BurntSushi/ripgrep/releases/download/$Version/ripgrep-$Version-x86_64-pc-windows-msvc.zip"
+    $Uri = [string]$Providers[0].url
+    if ($Uri -cne $ExpectedUri) {
+        Fail 'ripgrep package manifest has an unexpected Windows x64 provider'
+    }
+    return [pscustomobject]@{
+        Size = $Size
+        Digest = $Digest
+        MemberPath = $MemberPath
+        Uri = $Uri
+        Version = $Version
+    }
+}
+
+function Test-InstalledBundledRipgrep(
+    [string] $BinDirectory,
+    [object] $Package = $null,
+    [string] $SourceRevision = ''
+) {
+    $PackagePath = Join-Path $BinDirectory 'bcodex-path'
+    $Executable = Join-Path $PackagePath 'rg.exe'
+    $MetadataPath = Join-Path $PackagePath 'rg.json'
+    if ((Test-IsReparsePoint $PackagePath) -or
+        -not (Test-Path -LiteralPath $Executable -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $MetadataPath -PathType Leaf) -or
+        (Test-IsReparsePoint $Executable) -or
+        (Test-IsReparsePoint $MetadataPath)) {
+        return $false
+    }
+    try {
+        $Metadata = [IO.File]::ReadAllText($MetadataPath) | ConvertFrom-Json
+        $ArchiveDigest = [string]$Metadata.archive_sha256
+        $ExecutableDigest = [string]$Metadata.executable_sha256
+        $Version = [string]$Metadata.version
+        $InstalledSourceRevision = [string]$Metadata.source_revision
+        if ($ArchiveDigest -cnotmatch '^[0-9a-f]{64}$' -or
+            $ExecutableDigest -cnotmatch '^[0-9a-f]{64}$' -or
+            $Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
+            $InstalledSourceRevision -cnotmatch '^[0-9a-f]{40}$' -or
+            (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExecutableDigest) {
+            return $false
+        }
+        if ($null -ne $Package -and
+            ($ArchiveDigest -cne [string]$Package.Digest -or
+                $Version -cne [string]$Package.Version)) {
+            return $false
+        }
+        if (-not [string]::IsNullOrEmpty($SourceRevision) -and
+            $InstalledSourceRevision -cne $SourceRevision) {
+            return $false
+        }
+        $VersionOutput = @(& $Executable --version 2>$null)
+        $FirstVersionLine = if ($VersionOutput.Count -gt 0) { [string]($VersionOutput[0]) } else { '' }
+        return $LASTEXITCODE -eq 0 -and
+            $VersionOutput.Count -gt 0 -and
+            $FirstVersionLine -ceq "ripgrep $Version"
+    }
+    catch {
+        return $false
+    }
+}
+
+function Stage-BundledRipgrep(
+    [string] $SourceRoot,
+    [string] $TemporaryRoot,
+    [string] $CacheRoot,
+    [string] $BinDirectory,
+    [string] $SourceRevision
+) {
+    $ManifestPath = Join-Path $SourceRoot 'scripts\codex_package\rg'
+    $Package = Get-BundledRipgrepPackage $ManifestPath 'windows-x86_64'
+    if (Test-InstalledBundledRipgrep $BinDirectory $Package) {
+        return [pscustomobject]@{
+            Candidate = $null
+            ArchiveDigest = $Package.Digest
+            ExecutableDigest = (Get-FileHash -LiteralPath (Join-Path $BinDirectory 'bcodex-path\rg.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+            SourceRevision = $SourceRevision
+            Version = $Package.Version
+        }
+    }
+
+    $DownloadDirectory = Join-Path $CacheRoot 'downloads\ripgrep'
+    Assert-NoReparsePath $DownloadDirectory
+    [void](New-Item -ItemType Directory -Force -Path $DownloadDirectory)
+    $ArchivePath = Join-Path $DownloadDirectory "$($Package.Digest).zip"
+    $ArchiveValid = (Test-Path -LiteralPath $ArchivePath -PathType Leaf) -and
+        -not (Test-IsReparsePoint $ArchivePath) -and
+        (Get-Item -LiteralPath $ArchivePath).Length -eq $Package.Size -and
+        (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $Package.Digest
+    if (-not $ArchiveValid) {
+        if (Test-Path -LiteralPath $ArchivePath) {
+            Remove-OwnedTree $ArchivePath
+        }
+        Write-Step "Downloading upstream ripgrep $($Package.Version) for Windows x64"
+        Invoke-BoundedDownload $Package.Uri $ArchivePath $Package.Size
+    }
+    if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf) -or
+        (Test-IsReparsePoint $ArchivePath) -or
+        (Get-Item -LiteralPath $ArchivePath).Length -ne $Package.Size -or
+        (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Package.Digest) {
+        Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
+        Fail 'downloaded ripgrep archive failed its pinned size or SHA-256 verification'
+    }
+
+    $ExtractionRoot = Join-Path $TemporaryRoot 'ripgrep'
+    [void](New-Item -ItemType Directory -Path $ExtractionRoot)
+    & tar.exe -xf $ArchivePath -C $ExtractionRoot -- $Package.MemberPath
+    if ($LASTEXITCODE -ne 0) {
+        Fail "ripgrep archive member $($Package.MemberPath) could not be extracted"
+    }
+    foreach ($Item in Get-ChildItem -LiteralPath $ExtractionRoot -Force -Recurse) {
+        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "ripgrep archive contains a reparse point at $($Item.FullName)"
+        }
+    }
+    $Candidate = Join-Path $ExtractionRoot ($Package.MemberPath.Replace('/', '\'))
+    if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf) -or
+        (Test-IsReparsePoint $Candidate)) {
+        Fail "ripgrep archive does not contain $($Package.MemberPath)"
+    }
+    $VersionOutput = @(& $Candidate --version 2>$null)
+    $FirstVersionLine = if ($VersionOutput.Count -gt 0) { [string]($VersionOutput[0]) } else { '' }
+    if ($LASTEXITCODE -ne 0 -or $VersionOutput.Count -eq 0 -or
+        $FirstVersionLine -cne "ripgrep $($Package.Version)") {
+        Fail "bundled ripgrep candidate did not report ripgrep $($Package.Version)"
+    }
+    return [pscustomobject]@{
+        Candidate = $Candidate
+        ArchiveDigest = $Package.Digest
+        ExecutableDigest = (Get-FileHash -LiteralPath $Candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+        SourceRevision = $SourceRevision
+        Version = $Package.Version
+    }
+}
+
+function Install-BundledRipgrep([object] $Bundle, [string] $BinDirectory) {
+    $ReplaceExecutable = $null -ne $Bundle.Candidate
+    $PackagePath = Join-Path $BinDirectory 'bcodex-path'
+    Assert-NoReparsePath $PackagePath
+    if ((Test-Path -LiteralPath $PackagePath) -and
+        -not (Test-Path -LiteralPath $PackagePath -PathType Container)) {
+        Fail "$PackagePath exists but is not a directory"
+    }
+    [void](New-Item -ItemType Directory -Force -Path $PackagePath)
+    $Destination = Join-Path $PackagePath 'rg.exe'
+    $MetadataPath = Join-Path $PackagePath 'rg.json'
+    foreach ($ExistingPath in @($Destination, $MetadataPath)) {
+        if ((Test-Path -LiteralPath $ExistingPath) -and
+            (-not (Test-Path -LiteralPath $ExistingPath -PathType Leaf) -or
+                (Test-IsReparsePoint $ExistingPath))) {
+            Fail "refusing unsafe bundled ripgrep path $ExistingPath"
+        }
+    }
+
+    $TransactionId = [Guid]::NewGuid().ToString('N')
+    $Stage = Join-Path $PackagePath ".rg-stage.$TransactionId.exe"
+    $MetadataStage = Join-Path $PackagePath ".rg-stage.$TransactionId.json"
+    $Backup = Join-Path $PackagePath ".rg-backup.$TransactionId.exe"
+    $MetadataBackup = Join-Path $PackagePath ".rg-backup.$TransactionId.json"
+    $PreserveRecovery = $false
+    try {
+        if ($ReplaceExecutable) {
+            Copy-Item -LiteralPath $Bundle.Candidate -Destination $Stage
+            if ((Get-FileHash -LiteralPath $Stage -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                [string]$Bundle.ExecutableDigest) {
+                Fail 'staged ripgrep executable changed before installation'
+            }
+        }
+        $Metadata = [ordered]@{
+            archive_sha256 = [string]$Bundle.ArchiveDigest
+            executable_sha256 = [string]$Bundle.ExecutableDigest
+            source_revision = [string]$Bundle.SourceRevision
+            version = [string]$Bundle.Version
+        }
+        [IO.File]::WriteAllText(
+            $MetadataStage,
+            ($Metadata | ConvertTo-Json -Compress),
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $InstalledExecutable = $false
+        $InstalledMetadata = $false
+        try {
+            if ($ReplaceExecutable -and (Test-Path -LiteralPath $Destination)) {
+                Invoke-WithRetry { Move-Item -LiteralPath $Destination -Destination $Backup } 'stage the previous bundled ripgrep backup'
+            }
+            if (Test-Path -LiteralPath $MetadataPath) {
+                Invoke-WithRetry { Move-Item -LiteralPath $MetadataPath -Destination $MetadataBackup } 'stage the previous ripgrep metadata backup'
+            }
+            if ($ReplaceExecutable) {
+                Invoke-WithRetry { Move-Item -LiteralPath $Stage -Destination $Destination } 'install bundled rg.exe'
+                $InstalledExecutable = $true
+            }
+            Invoke-WithRetry { Move-Item -LiteralPath $MetadataStage -Destination $MetadataPath } 'install bundled ripgrep metadata'
+            $InstalledMetadata = $true
+            $ExpectedPackage = [pscustomobject]@{
+                Digest = [string]$Bundle.ArchiveDigest
+                Version = [string]$Bundle.Version
+            }
+            if (-not (Test-InstalledBundledRipgrep $BinDirectory $ExpectedPackage ([string]$Bundle.SourceRevision))) {
+                Fail 'installed bundled ripgrep could not be verified'
+            }
+            Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $MetadataBackup -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+            $InstallFailure = $_
+            try {
+                if ($InstalledExecutable) {
+                    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+                }
+                if ($InstalledMetadata) {
+                    Remove-Item -LiteralPath $MetadataPath -Force -ErrorAction SilentlyContinue
+                }
+                if ($ReplaceExecutable -and (Test-Path -LiteralPath $Backup)) {
+                    Invoke-WithRetry { Move-Item -LiteralPath $Backup -Destination $Destination } 'restore the previous bundled ripgrep'
+                }
+                if (Test-Path -LiteralPath $MetadataBackup) {
+                    Invoke-WithRetry { Move-Item -LiteralPath $MetadataBackup -Destination $MetadataPath } 'restore the previous ripgrep metadata'
+                }
+            }
+            catch {
+                $PreserveRecovery = $true
+                throw "bundled ripgrep installation failed and rollback needs recovery in $PackagePath`: $_"
+            }
+            throw $InstallFailure
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $Stage -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $MetadataStage -Force -ErrorAction SilentlyContinue
+        if (-not $PreserveRecovery) {
+            Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $MetadataBackup -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Recover-BundledRipgrepArtifacts([string] $BinDirectory) {
+    $PackagePath = Join-Path $BinDirectory 'bcodex-path'
+    if (-not (Test-Path -LiteralPath $PackagePath)) { return }
+    Assert-NoReparsePath $PackagePath
+    if (-not (Test-Path -LiteralPath $PackagePath -PathType Container)) {
+        Fail "$PackagePath exists but is not a directory"
+    }
+
+    $Transactions = @{}
+    foreach ($Artifact in Get-ChildItem -LiteralPath $PackagePath -Force -Filter '.rg-*' -ErrorAction SilentlyContinue) {
+        if ($Artifact.Name -cnotmatch '^\.rg-(stage|backup|interrupted)\.([0-9a-f]{32})\.(exe|json)$' -or
+            -not (Test-Path -LiteralPath $Artifact.FullName -PathType Leaf) -or
+            ($Artifact.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "unsafe bundled ripgrep recovery artifact $($Artifact.FullName)"
+        }
+        $Transactions[$Matches[2]] = $true
+    }
+
+    foreach ($TransactionId in $Transactions.Keys) {
+        foreach ($Extension in @('exe', 'json')) {
+            $DestinationName = if ($Extension -ceq 'exe') { 'rg.exe' } else { 'rg.json' }
+            $Destination = Join-Path $PackagePath $DestinationName
+            $Backup = Join-Path $PackagePath ".rg-backup.$TransactionId.$Extension"
+            $Interrupted = Join-Path $PackagePath ".rg-interrupted.$TransactionId.$Extension"
+            if ((Test-Path -LiteralPath $Destination) -and
+                (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
+                    (Test-IsReparsePoint $Destination))) {
+                Fail "unsafe bundled ripgrep destination $Destination"
+            }
+            if (Test-Path -LiteralPath $Backup -PathType Leaf) {
+                if (Test-Path -LiteralPath $Destination) {
+                    Invoke-WithRetry { Move-Item -LiteralPath $Destination -Destination $Interrupted } 'preserve an interrupted ripgrep candidate'
+                }
+                try {
+                    Invoke-WithRetry { Move-Item -LiteralPath $Backup -Destination $Destination } 'restore the previous bundled ripgrep installation'
+                }
+                catch {
+                    if (-not (Test-Path -LiteralPath $Destination) -and
+                        (Test-Path -LiteralPath $Interrupted -PathType Leaf)) {
+                        Invoke-WithRetry { Move-Item -LiteralPath $Interrupted -Destination $Destination } 'restore the interrupted ripgrep destination after recovery failure'
+                    }
+                    throw
+                }
+            }
+            elseif (-not (Test-Path -LiteralPath $Destination) -and
+                (Test-Path -LiteralPath $Interrupted -PathType Leaf)) {
+                Invoke-WithRetry { Move-Item -LiteralPath $Interrupted -Destination $Destination } 'restore an interrupted ripgrep destination'
+            }
+            Remove-Item -LiteralPath $Interrupted -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $PackagePath ".rg-stage.$TransactionId.$Extension") -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Resolve-MainRevision([string] $Repository) {
     $Uri = "$GitHubApiRoot/repos/$Repository/git/ref/heads/main"
     $Temporary = Join-Path ([IO.Path]::GetTempPath()) (
@@ -705,6 +1039,7 @@ try {
     $Lock.Flush($true)
 
     Recover-FinalizerArtifacts $BinDirectory $Destination
+    Recover-BundledRipgrepArtifacts $BinDirectory
 
     $RequestedRevision = $env:BCODEX_INSTALL_REVISION
     if ($RequestedRevision -and -not (Test-SourceRevision $RequestedRevision)) {
@@ -719,9 +1054,12 @@ try {
     if (Test-Path -LiteralPath $Destination -PathType Leaf) {
         $InstalledRevision = (& $Destination --internal-source-revision 2>$null) -join "`n"
         if ($LASTEXITCODE -eq 0 -and $InstalledRevision.Trim().Equals($Revision, [StringComparison]::OrdinalIgnoreCase)) {
-            Write-Step "bettercodex is already current with main at $($Revision.Substring(0, 12))."
-            Ensure-CommandPath $BinDirectory
-            exit 0
+            if (Test-InstalledBundledRipgrep $BinDirectory $null $Revision) {
+                Write-Step "bettercodex is already current with main at $($Revision.Substring(0, 12))."
+                Ensure-CommandPath $BinDirectory
+                exit 0
+            }
+            Write-Step 'The private bundled ripgrep is missing or invalid; repairing this installation'
         }
     }
 
@@ -752,7 +1090,13 @@ try {
     Invoke-BoundedDownload "$GitHubArchiveRoot/$Repository/tar.gz/$Revision" $ArchivePath $MaximumSourceArchiveBytes
     & tar.exe -xzf $ArchivePath -C $SourceRoot --strip-components=1
     if ($LASTEXITCODE -ne 0) { Fail 'downloaded source archive could not be extracted' }
-    foreach ($Required in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'scripts\cargo-with-v8.ps1')) {
+    foreach ($Required in @(
+            'Cargo.toml',
+            'Cargo.lock',
+            'rust-toolchain.toml',
+            'scripts\cargo-with-v8.ps1',
+            'scripts\codex_package\rg'
+        )) {
         if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot $Required) -PathType Leaf)) {
             Fail "source commit has no $Required"
         }
@@ -771,6 +1115,7 @@ try {
     $ToolchainMatch = [regex]::Match($ToolchainFile, '(?m)^channel = "([A-Za-z0-9._-]+)"')
     if (-not $ToolchainMatch.Success) { Fail 'source commit has no pinned Rust toolchain' }
     $RustToolchain = $ToolchainMatch.Groups[1].Value
+    $RipgrepBundle = Stage-BundledRipgrep $SourceRoot $TemporaryRoot $CacheRoot $BinDirectory $Revision
 
     $BuildInputHash = Get-SourceInputHash $SourceRoot
     $BuiltBinary = Join-Path $TargetDirectory 'release\bcodex.exe'
@@ -938,6 +1283,9 @@ try {
     if ($SmokeExitCode -ne 0 -or $SmokeOutput.Trim() -cne "bcodex $ExpectedVersion install smoke passed") {
         Fail 'staged binary failed its runtime and embedded-resource smoke test'
     }
+
+    Write-Step "Installing private upstream ripgrep $($RipgrepBundle.Version)"
+    Install-BundledRipgrep $RipgrepBundle $BinDirectory
 
     $CandidateSha256 = (Get-FileHash -LiteralPath $Candidate -Algorithm SHA256).Hash.ToLowerInvariant()
     $Backup = Join-Path $FinalizeRoot 'backup.exe'

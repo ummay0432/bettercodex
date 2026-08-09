@@ -128,7 +128,8 @@ Windows target described here.
 Windows support changes the supported platform list, not the core product
 shape. The following existing contracts remain mandatory:
 
-- bettercodex is one Cargo package and one user-facing binary;
+- bettercodex is one Cargo package and one user-facing binary; the private,
+  upstream-pinned `rg.exe` subprocess dependency is not a second entrypoint;
 - the fixed model is `gpt-5.6-sol` at `max` reasoning effort with the existing
   context and output limits;
 - public installations track the exact commit at public `main` rather than a
@@ -144,7 +145,7 @@ shape. The following existing contracts remain mandatory:
   `${BCODEX_HOME}` or the platform's `.bcodex` default;
 - the current system prompt, inference, history, tool, and compaction contracts
   do not gain Windows-specific model behavior unless the platform genuinely
-  requires it; and
+  requires it, and Unix-only shell instructions are absent on Windows; and
 - `/tmux` is a deliberate Unix capability, not a reason to fabricate a Windows
   equivalent.
 
@@ -483,7 +484,9 @@ The Windows installer must preserve the same transaction as Unix:
    validated immutable revision was supplied by the updater.
 3. Download the source archive for exactly that commit.
 4. Validate the checked-in lockfile, toolchain file, PowerShell V8 wrapper, and
-   required checksums.
+   the current upstream ripgrep package manifest. Download only its Windows x64
+   archive over HTTPS, enforce its exact size and SHA-256 digest, extract only
+   its declared `rg.exe`, and verify the reported version.
 5. Reuse target-specific Cargo, registry, Rust toolchain, and V8 caches without
    trusting stale partial entries.
 6. Hash all release-relevant source bytes. If no cached or installed executable
@@ -492,7 +495,8 @@ The Windows installer must preserve the same transaction as Unix:
    otherwise restamp the verified executable without starting Rust or MSVC.
 7. Verify version metadata, release-input hash, V8 initialization, embedded
    resources, and the internal smoke test in isolated Windows user/application
-   homes.
+   homes. Install verified ripgrep bytes under private `bcodex-path`, with
+   rollback and integrity metadata, before exposing a new bettercodex command.
 8. Stamp and verify the exact source revision using the existing fixed-size
    marker contract.
 9. Stage the verified executable beside the destination without following a
@@ -1650,6 +1654,12 @@ Native Windows support is complete only when all of the following are true.
 
 ### 25.4 Commands and tools
 
+- The system prompt and `exec_command` catalogue are selected at compile target:
+  Windows receives only PowerShell/ConPTY guidance, while Linux and macOS retain
+  only their Unix shell guidance.
+- `rg --version`, `rg`, and `rg --files` resolve to the verified private
+  upstream executable in native Windows source installations without adding
+  `rg.exe` to the user's persistent `PATH`.
 - Piped and ConPTY commands preserve paths, environment, output, resize, input,
   exit, interrupt, and process-tree semantics.
 - Repeated commands leak no process, pseudoconsole, pipe, thread, or job handles.

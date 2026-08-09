@@ -1,4 +1,1 @@
 - Treat strings passed to `exec_command` as PowerShell code unless `shell` explicitly selects another installed shell. Use native PowerShell syntax and cmdlets rather than Bash or Unix syntax, and do not interpolate sensitive data into executable strings.
-- Do not compose destructive filesystem commands across shells. Keep deletion and moving in PowerShell, prefer `Remove-Item` and `Move-Item` with `-LiteralPath`, and avoid string-built shell commands for file operations.
-- Before any recursive delete or move, verify that every resolved absolute target stays within the intended workspace or explicitly named target directory.
-- When using `Start-Process` for a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly requested a visible interactive window.

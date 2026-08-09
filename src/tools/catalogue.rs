@@ -1,6 +1,6 @@
 //! Fixed JavaScript tool catalogue ported from Codex's `code_mode_only` plan at
 //! `1669c2403f793d0230065397dfc25f52b844244e` and rechecked against upstream at
-//! `3b366654f1de1b77587ffb026c8f35507f3fe4ef`. bettercodex exposes this one
+//! `a16863f8704831d13e041ed7dba2c4a57a2a940b`. bettercodex exposes this one
 //! execution path unconditionally; it has no tool-mode selector.
 //!
 //! The schemas mirror `core/src/tools/handlers/{apply_patch_spec,plan_spec,
@@ -33,17 +33,18 @@ const EXEC_COMMAND_DESCRIPTION: &str = "Runs shell. Long commands return `sessio
 #[cfg(windows)]
 const EXEC_COMMAND_DESCRIPTION: &str = r#"Runs PowerShell by default on native Windows. Long commands return `session_id` for `write_stdin`; `tty:true` keeps stdin writable.
 
-PowerShell equivalents for common Unix commands:
-- show hidden entries: `Get-ChildItem -Force`
-- recursively find by name: `Get-ChildItem -Recurse -Filter *.py`
-- recursively search text without `rg`: `Get-ChildItem -Recurse -File | Select-String -Pattern 'TODO' -CaseSensitive`
-- filter processes: `Get-Process | Where-Object { $_.ProcessName -like '*python*' }`
-- set an environment variable: `$env:FOO='bar'`
+Examples of valid PowerShell command strings:
+- ls -a (show hidden): `Get-ChildItem -Force`
+- recursive find by name: `Get-ChildItem -Recurse -Filter *.py`
+- recursive grep: `Get-ChildItem -Path C:\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive`
+- ps aux | grep python: `Get-Process | Where-Object { $_.ProcessName -like '*python*' }`
+- setting an env var: `$env:FOO='bar'; echo $env:FOO`
+- running an inline Python script: `@'\nprint('Hello, world!')\n'@ | python -`
 
 Windows safety rules:
-- Do not enumerate paths in PowerShell and pass them to `cmd /c`, batch builtins, or another shell for deletion or moving. Use one shell end-to-end and native PowerShell cmdlets with `-LiteralPath`.
-- Before a recursive delete or move, verify that every resolved absolute target remains within the intended workspace or explicitly named target directory.
-- Use `Start-Process -WindowStyle Hidden` for background helpers or services unless the user explicitly requested a visible interactive window."#;
+- Do not compose destructive filesystem commands across shells. Do not enumerate paths in PowerShell and then pass them to `cmd /c`, batch builtins, or another shell for deletion or moving. Use one shell end-to-end, prefer native PowerShell cmdlets such as `Remove-Item` / `Move-Item` with `-LiteralPath`, and avoid string-built shell commands for file operations.
+- Before any recursive delete or move on Windows, verify the resolved absolute target paths stay within the intended workspace or explicitly named target directory. Never issue a recursive delete or move against a computed path if the final target has not been checked.
+- When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."#;
 
 #[cfg(not(windows))]
 const EXEC_LOGIN_DESCRIPTION: &str =
@@ -651,10 +652,11 @@ mod tests {
         assert!(!text.contains("exec tool declaration"));
         if cfg!(windows) {
             assert!(text.contains("Runs PowerShell by default on native Windows"));
-            assert!(text.contains("Get-ChildItem -Recurse -File | Select-String"));
+            assert!(text.contains("Get-ChildItem -Path C:\\myrepo -Recurse | Select-String"));
+            assert!(text.contains("Start-Process -WindowStyle Hidden"));
         } else {
             assert!(text.contains("Runs shell. Long commands return"));
-            assert!(!text.contains("PowerShell equivalents for common Unix commands"));
+            assert!(!text.contains("Examples of valid PowerShell command strings"));
             assert!(!text.contains("Windows safety rules"));
         }
     }

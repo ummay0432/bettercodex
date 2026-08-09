@@ -24,9 +24,14 @@ function Invoke-InstallerFunctions([string] $InstallerPath) {
         'Restore-ProcessEnvironment',
         'Test-SourceRevision',
         'Test-IsReparsePoint',
+        'Assert-NoReparsePath',
         'Get-VolumeSpace',
         'Assert-FreeSpaceBudget',
         'Remove-OwnedTree',
+        'Get-BundledRipgrepPackage',
+        'Test-InstalledBundledRipgrep',
+        'Install-BundledRipgrep',
+        'Recover-BundledRipgrepArtifacts',
         'Prepend-PathEntry',
         'Invoke-WithRetry',
         'Try-StageReusableBinary',
@@ -94,6 +99,31 @@ fn main() {
     return $Destination
 }
 
+function Build-RipgrepFixture([string] $Rustc, [string] $Root) {
+    $SourcePath = Join-Path $Root 'ripgrep.rs'
+    $Destination = Join-Path $Root 'rg.exe'
+    [IO.File]::WriteAllText(
+        $SourcePath,
+        @'
+use std::env;
+
+fn main() {
+    if env::args().nth(1).as_deref() == Some("--version") {
+        println!("ripgrep 15.2.0");
+    } else {
+        std::process::exit(2);
+    }
+}
+'@,
+        (New-Object Text.UTF8Encoding($false))
+    )
+    & $Rustc --edition=2024 $SourcePath -o $Destination
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
+        throw 'Windows installer test: rustc could not build the ripgrep fixture'
+    }
+    return $Destination
+}
+
 function New-Transaction(
     [string] $TestRoot,
     [string] $Destination,
@@ -147,6 +177,13 @@ $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $InstallerPath = Join-Path $ScriptDirectory 'install.ps1'
 Invoke-InstallerFunctions $InstallerPath
 
+$RipgrepManifest = Join-Path $ScriptDirectory 'codex_package\rg'
+$RipgrepPackage = Get-BundledRipgrepPackage $RipgrepManifest 'windows-x86_64'
+Assert ($RipgrepPackage.Size -eq 1789611) 'upstream ripgrep archive size drifted unexpectedly'
+Assert ($RipgrepPackage.Digest -ceq '71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5') 'upstream ripgrep digest drifted unexpectedly'
+Assert ($RipgrepPackage.Version -ceq '15.2.0') 'upstream ripgrep version drifted unexpectedly'
+Assert ($RipgrepPackage.MemberPath -ceq 'ripgrep-15.2.0-x86_64-pc-windows-msvc/rg.exe') 'upstream ripgrep member drifted unexpectedly'
+
 Assert (Test-SourceRevision 'ABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD') 'valid revision was rejected'
 Assert (-not (Test-SourceRevision '111111111111111111111111111111111111111g')) 'invalid revision was accepted'
 $EnvironmentProbe = 'BCODEX_INSTALL_TEST_' + [Guid]::NewGuid().ToString('N')
@@ -191,8 +228,57 @@ try {
     $NewFixture = Build-Fixture $Rustc $TestRoot 'new' $NewRevision
     $BuildInputHash = 'a' * 64
     $ReusableFixture = Build-Fixture $Rustc $TestRoot 'reusable' $NewRevision $BuildInputHash
+    $RipgrepFixture = Build-RipgrepFixture $Rustc $TestRoot
     $Destination = Join-Path $TestRoot 'bcodex.exe'
     $PowerShellPath = (Get-Process -Id $PID).Path
+
+    $RipgrepBin = Join-Path $TestRoot 'ripgrep-bin'
+    [void](New-Item -ItemType Directory -Path $RipgrepBin)
+    $RipgrepExecutableDigest = (Get-FileHash -LiteralPath $RipgrepFixture -Algorithm SHA256).Hash.ToLowerInvariant()
+    $RipgrepBundle = [pscustomobject]@{
+        Candidate = $RipgrepFixture
+        ArchiveDigest = $RipgrepPackage.Digest
+        ExecutableDigest = $RipgrepExecutableDigest
+        SourceRevision = $NewRevision
+        Version = $RipgrepPackage.Version
+    }
+    Install-BundledRipgrep $RipgrepBundle $RipgrepBin
+    Assert (Test-InstalledBundledRipgrep $RipgrepBin $RipgrepPackage $NewRevision) 'private ripgrep installation did not verify'
+    $MetadataOnlyRevision = '3333333333333333333333333333333333333333'
+    $MetadataOnlyBundle = [pscustomobject]@{
+        Candidate = $null
+        ArchiveDigest = $RipgrepPackage.Digest
+        ExecutableDigest = $RipgrepExecutableDigest
+        SourceRevision = $MetadataOnlyRevision
+        Version = $RipgrepPackage.Version
+    }
+    Install-BundledRipgrep $MetadataOnlyBundle $RipgrepBin
+    Assert (Test-InstalledBundledRipgrep $RipgrepBin $RipgrepPackage $MetadataOnlyRevision) 'unchanged private ripgrep metadata was not advanced to the selected source'
+    Assert ((Get-FileHash -LiteralPath (Join-Path $RipgrepBin 'bcodex-path\rg.exe') -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $RipgrepExecutableDigest) 'metadata-only ripgrep update changed executable bytes'
+    Install-BundledRipgrep $RipgrepBundle $RipgrepBin
+    $InvalidRipgrepBundle = [pscustomobject]@{
+        Candidate = $RipgrepFixture
+        ArchiveDigest = ('b' * 64) -join ''
+        ExecutableDigest = $RipgrepExecutableDigest
+        SourceRevision = $NewRevision
+        Version = '99.0.0'
+    }
+    $RipgrepRollbackObserved = $false
+    try { Install-BundledRipgrep $InvalidRipgrepBundle $RipgrepBin }
+    catch { $RipgrepRollbackObserved = $_.Exception.Message -like '*installed bundled ripgrep could not be verified*' }
+    Assert $RipgrepRollbackObserved 'an invalid private ripgrep candidate did not fail final verification'
+    Assert (Test-InstalledBundledRipgrep $RipgrepBin $RipgrepPackage $NewRevision) 'private ripgrep rollback did not restore the previous installation'
+    Add-Content -LiteralPath (Join-Path $RipgrepBin 'bcodex-path\rg.exe') -Value 'tampered'
+    Assert (-not (Test-InstalledBundledRipgrep $RipgrepBin $RipgrepPackage $NewRevision)) 'private ripgrep tampering was not detected'
+    Install-BundledRipgrep $RipgrepBundle $RipgrepBin
+    $RipgrepPackagePath = Join-Path $RipgrepBin 'bcodex-path'
+    $RipgrepRecoveryId = [Guid]::NewGuid().ToString('N')
+    Move-Item -LiteralPath (Join-Path $RipgrepPackagePath 'rg.exe') -Destination (Join-Path $RipgrepPackagePath ".rg-backup.$RipgrepRecoveryId.exe")
+    Move-Item -LiteralPath (Join-Path $RipgrepPackagePath 'rg.json') -Destination (Join-Path $RipgrepPackagePath ".rg-backup.$RipgrepRecoveryId.json")
+    [IO.File]::WriteAllText((Join-Path $RipgrepPackagePath 'rg.exe'), 'interrupted')
+    [IO.File]::WriteAllText((Join-Path $RipgrepPackagePath 'rg.json'), '{}')
+    Recover-BundledRipgrepArtifacts $RipgrepBin
+    Assert (Test-InstalledBundledRipgrep $RipgrepBin $RipgrepPackage $NewRevision) 'private ripgrep recovery did not restore the previous installation'
 
     $BrokenFixture = Join-Path $TestRoot 'broken.exe'
     [IO.File]::WriteAllText($BrokenFixture, 'not an executable')
