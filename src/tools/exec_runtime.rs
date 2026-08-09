@@ -82,6 +82,10 @@ impl ToolRuntime {
         self.state.tools.processes.clone()
     }
 
+    pub(crate) fn prewarm(&self) {
+        code_runtime::prewarm();
+    }
+
     pub(super) async fn execute(
         &self,
         call_id: &str,
@@ -92,6 +96,9 @@ impl ToolRuntime {
         let parsed = code_runtime::parse_exec_source(source).map_err(|error| anyhow!(error))?;
         let max_output_tokens = output_token_budget(parsed.max_output_tokens);
         let started_at = Instant::now();
+        code_runtime::ensure_initialized()
+            .await
+            .map_err(|error| anyhow!(error))?;
         self.state.ui_events.prepare(events);
         let started = self
             .session

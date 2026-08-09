@@ -542,6 +542,9 @@ impl Agent {
         events: &Option<UnboundedSender<AgentEvent>>,
         control: &TurnControl,
     ) -> Result<SubmitOutcome> {
+        // Hide the one-time ICU decompression and V8 platform initialization behind the model's
+        // first sampling request instead of paying it after the first exec call arrives.
+        self.tools.prewarm();
         let mut pending_steering = VecDeque::new();
         // Sample the fresh turn input first. After a mid-turn compact, sample the
         // compacted tool continuation once before inserting queued steering.
