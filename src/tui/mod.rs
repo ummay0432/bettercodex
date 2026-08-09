@@ -3,6 +3,7 @@ mod clipboard;
 mod clipboard_paste;
 mod context_window;
 mod editor;
+mod event_stream;
 mod file_search;
 mod git_diff;
 mod login_screen;
@@ -13,6 +14,8 @@ mod markdown_style;
 mod markdown_text_merge;
 mod notifications;
 mod palette;
+#[cfg(windows)]
+mod paste_burst;
 mod pending_input;
 mod reasoning_status;
 mod render;
@@ -36,6 +39,8 @@ mod terminal_title;
 mod tool_catalogue;
 mod view;
 mod width;
+#[cfg(any(windows, test))]
+mod windows_console;
 mod wrapping;
 
 use crate::agent::Agent;
@@ -57,7 +62,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clipboard::ClipboardLease;
 use crossterm::event::Event;
-use crossterm::event::EventStream;
+use event_stream::EventStream;
 use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures_util::StreamExt;
@@ -91,6 +96,7 @@ type ResumeTask = JoinHandle<Result<ResumedSession>>;
 type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
 const FRAME_INTERVAL: Duration = Duration::from_millis(32);
 const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
+const PASTE_BURST_TICK_INTERVAL: Duration = Duration::from_millis(9);
 const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
 const MAX_READY_AGENT_EVENTS: usize = 4_096;
 
@@ -282,6 +288,8 @@ impl Runtime {
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut process_ticks = tokio::time::interval(PROCESS_STATUS_INTERVAL);
         process_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut paste_ticks = tokio::time::interval(PASTE_BURST_TICK_INTERVAL);
+        paste_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut redraw = true;
 
         loop {
@@ -469,6 +477,9 @@ impl Runtime {
                 }
                 _ = process_ticks.tick() => {
                     redraw |= self.refresh_background_processes();
+                }
+                _ = receive_paste_tick(self.view.paste_burst_active(), &mut paste_ticks) => {
+                    redraw |= self.view.flush_paste_burst();
                 }
                 _ = receive_frame_tick(animate, &mut ticks) => redraw = true,
             }
@@ -1136,6 +1147,14 @@ fn drain_completed_agent_events(
 
 async fn receive_frame_tick(animate: bool, ticks: &mut Interval) {
     if animate {
+        ticks.tick().await;
+    } else {
+        pending().await
+    }
+}
+
+async fn receive_paste_tick(active: bool, ticks: &mut Interval) {
+    if active {
         ticks.tick().await;
     } else {
         pending().await

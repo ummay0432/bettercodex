@@ -10,9 +10,6 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -55,23 +52,26 @@ pub(crate) fn update_json<T: Serialize>(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("state path has no parent: {}", path.display()))?;
-    let mut directory = std::fs::DirBuilder::new();
-    directory.recursive(true).mode(0o700);
-    directory
-        .create(parent)
+    crate::platform_fs::create_private_directory_all(parent)
         .with_context(|| format!("failed to create bettercodex home {}", parent.display()))?;
 
     let lock_path = companion_path(path, ".lock")?;
     let mut lock_options = OpenOptions::new();
-    lock_options.create(true).read(true).write(true).mode(0o600);
+    lock_options.create(true).read(true).write(true);
+    crate::platform_fs::configure_private_file_nofollow(&mut lock_options, false);
     let lock = lock_options
         .open(&lock_path)
         .with_context(|| format!("failed to open state lock {}", lock_path.display()))?;
-    let lock_result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
-    if lock_result != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to lock {}", path.display()));
+    let lock_metadata = lock
+        .metadata()
+        .with_context(|| format!("failed to inspect state lock {}", lock_path.display()))?;
+    if !lock_metadata.is_file() || crate::platform_fs::is_link(&lock_metadata) {
+        return Err(anyhow!(
+            "state lock {} is not a regular file",
+            lock_path.display()
+        ));
     }
+    File::lock(&lock).with_context(|| format!("failed to lock {}", path.display()))?;
 
     let mut document = load(path)?;
     update(&mut document)?;
@@ -93,20 +93,21 @@ fn write_json<T: Serialize>(path: &Path, document: &T, max_bytes: usize) -> Resu
     let temporary = temporary_path(path)?;
     let write_result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
-        options.create_new(true).write(true).mode(0o600);
+        options.create_new(true).write(true);
+        crate::platform_fs::configure_private_file(&mut options);
         let mut file = options
             .open(&temporary)
             .with_context(|| format!("failed to open temporary state {}", temporary.display()))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path).with_context(|| {
+        crate::platform_fs::replace_file(&temporary, path).with_context(|| {
             format!(
                 "failed to replace state file {} with {}",
                 path.display(),
                 temporary.display()
             )
         })?;
-        File::open(parent)?.sync_all()?;
+        crate::platform_fs::sync_directory(parent)?;
         Ok(())
     })();
     if write_result.is_err() {

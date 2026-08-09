@@ -103,6 +103,16 @@ fn native_copy(text: &str) -> Result<Option<ClipboardLease>, String> {
     Ok(None)
 }
 
+#[cfg(windows)]
+fn native_copy(text: &str) -> Result<Option<ClipboardLease>, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("clipboard unavailable: {error}"))?;
+    clipboard
+        .set_text(text)
+        .map_err(|error| format!("failed to set clipboard text: {error}"))?;
+    Ok(None)
+}
+
 fn tmux_copy(text: &str) -> Result<(), String> {
     let set_clipboard = command_output("tmux", &["show-options", "-gv", "set-clipboard"])?;
     if set_clipboard.trim() == "off" {

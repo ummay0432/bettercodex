@@ -11,10 +11,6 @@ use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::fd::RawFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -69,14 +65,13 @@ impl PromptHistory {
                 )
             })?;
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .mode(0o600)
+        let mut options = OpenOptions::new();
+        options.read(true).append(true).create(true);
+        crate::platform_fs::configure_private_file(&mut options);
+        let file = options
             .open(path)
             .with_context(|| format!("failed to open prompt history {}", path.display()))?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        crate::platform_fs::protect_file(&file)
             .with_context(|| format!("failed to protect prompt history {}", path.display()))?;
         Ok(Self {
             file,
@@ -134,33 +129,23 @@ fn history_path() -> Result<PathBuf> {
     Ok(codex_home.join(HISTORY_FILENAME))
 }
 
-struct FileLock {
-    descriptor: RawFd,
-}
+struct FileLock<'a>(&'a File);
 
-impl FileLock {
-    fn shared(file: &File) -> Result<Self> {
-        Self::lock(file, libc::LOCK_SH)
+impl<'a> FileLock<'a> {
+    fn shared(file: &'a File) -> Result<Self> {
+        File::lock_shared(file)?;
+        Ok(Self(file))
     }
 
-    fn exclusive(file: &File) -> Result<Self> {
-        Self::lock(file, libc::LOCK_EX)
-    }
-
-    fn lock(file: &File, operation: libc::c_int) -> Result<Self> {
-        let descriptor = file.as_raw_fd();
-        let result = unsafe { libc::flock(descriptor, operation) };
-        if result == 0 {
-            Ok(Self { descriptor })
-        } else {
-            Err(std::io::Error::last_os_error().into())
-        }
+    fn exclusive(file: &'a File) -> Result<Self> {
+        File::lock(file)?;
+        Ok(Self(file))
     }
 }
 
-impl Drop for FileLock {
+impl Drop for FileLock<'_> {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.descriptor, libc::LOCK_UN) };
+        let _ = File::unlock(self.0);
     }
 }
 

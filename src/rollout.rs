@@ -24,9 +24,6 @@ use std::io::Read;
 use std::io::Write;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -134,7 +131,7 @@ impl Drop for LockedRolloutFile {
     fn drop(&mut self) {
         // Unlock explicitly: a concurrently forked command can briefly inherit
         // the close-on-exec descriptor and would otherwise extend ownership.
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        let _ = File::unlock(&self.0);
     }
 }
 
@@ -1110,7 +1107,7 @@ fn installation_id(root: &Path) -> Result<String> {
     let _ = std::fs::remove_file(&temporary);
     match linked {
         Ok(()) => {
-            File::open(root)?.sync_all()?;
+            crate::platform_fs::sync_directory(root)?;
             Ok(value)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1124,10 +1121,8 @@ fn installation_id(root: &Path) -> Result<String> {
 }
 
 fn prepare_private_directory(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)
+    crate::platform_fs::create_private_directory_all(path)
         .with_context(|| format!("failed to create state directory {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to protect state directory {}", path.display()))?;
     Ok(())
 }
 
@@ -1137,38 +1132,48 @@ fn open_private_append(path: &Path, create_new: bool) -> Result<File> {
     if create_new {
         options.create_new(true);
     }
-    options.mode(0o600);
+    crate::platform_fs::configure_private_file_nofollow(&mut options, false);
     let file = options
         .open(path)
         .with_context(|| format!("failed to open session journal {}", path.display()))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
+        return Err(anyhow!(
+            "session journal {} is not a regular file",
+            path.display()
+        ));
+    }
+    crate::platform_fs::protect_file(&file)?;
     Ok(file)
 }
 
 fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
     // The lock remains attached to Rollout's file descriptor for the complete
     // process lifetime, covering both replay/repair and every later append.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        return Ok(LockedRolloutFile(file));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return Err(anyhow!(
+    match File::try_lock(&file) {
+        Ok(()) => Ok(LockedRolloutFile(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow!(
             "saved session {} is already open in another bettercodex process",
             path.display()
-        ));
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error)
+            .with_context(|| format!("failed to lock saved session {}", path.display())),
     }
-    Err(error).with_context(|| format!("failed to lock saved session {}", path.display()))
 }
 
 fn open_private_replace(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
-    options.mode(0o600);
-    options
+    crate::platform_fs::configure_private_file_nofollow(&mut options, false);
+    let file = options
         .open(path)
-        .with_context(|| format!("failed to open private file {}", path.display()))
+        .with_context(|| format!("failed to open private file {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
+        return Err(anyhow!("private path {} is not a regular file", path.display()));
+    }
+    crate::platform_fs::protect_file(&file)?;
+    Ok(file)
 }
 
 #[cfg(test)]

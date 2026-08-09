@@ -9,6 +9,19 @@ pub enum ShellType {
     Bash,
     PowerShell,
     Sh,
+    Cmd,
+}
+
+impl ShellType {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Zsh => "zsh",
+            Self::Bash => "bash",
+            Self::PowerShell => "powershell",
+            Self::Sh => "sh",
+            Self::Cmd => "cmd",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,16 +30,45 @@ pub struct DetectedShell {
     pub shell_path: PathBuf,
 }
 
-pub fn detect_shell_type(shell_path: impl AsRef<std::path::Path>) -> Option<ShellType> {
-    match shell_path.as_ref().file_name()?.to_str()? {
-        "zsh" => Some(ShellType::Zsh),
-        "sh" => Some(ShellType::Sh),
-        "bash" => Some(ShellType::Bash),
-        "pwsh" => Some(ShellType::PowerShell),
-        _ => None,
+impl DetectedShell {
+    pub fn name(&self) -> &'static str {
+        self.shell_type.name()
     }
 }
 
+pub fn detect_shell_type(shell_path: impl AsRef<std::path::Path>) -> Option<ShellType> {
+    let shell_path = shell_path.as_ref();
+    if let Some(shell_name) = shell_path.as_os_str().to_str() {
+        let shell_type = if shell_name.eq_ignore_ascii_case("zsh") {
+            Some(ShellType::Zsh)
+        } else if shell_name.eq_ignore_ascii_case("sh") {
+            Some(ShellType::Sh)
+        } else if shell_name.eq_ignore_ascii_case("cmd") {
+            Some(ShellType::Cmd)
+        } else if shell_name.eq_ignore_ascii_case("bash") {
+            Some(ShellType::Bash)
+        } else if shell_name.eq_ignore_ascii_case("pwsh")
+            || shell_name.eq_ignore_ascii_case("powershell")
+        {
+            Some(ShellType::PowerShell)
+        } else {
+            None
+        };
+        if shell_type.is_some() {
+            return shell_type;
+        }
+    }
+
+    if let Some(shell_name) = shell_path.file_stem() {
+        let shell_name_path = std::path::Path::new(shell_name);
+        if shell_name_path != shell_path {
+            return detect_shell_type(shell_name_path);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
 fn get_user_shell_path() -> Option<PathBuf> {
     let uid = unsafe { libc::getuid() };
     use std::ffi::CStr;
@@ -85,6 +127,11 @@ fn get_user_shell_path() -> Option<PathBuf> {
         }
         buffer.resize(new_len, 0);
     }
+}
+
+#[cfg(not(unix))]
+fn get_user_shell_path() -> Option<PathBuf> {
+    None
 }
 
 fn file_exists(path: &std::path::Path) -> Option<PathBuf> {
@@ -159,10 +206,32 @@ fn get_sh_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
     })
 }
 
+// Note the `pwsh` and `powershell` fallback paths are where the respective
+// shells are commonly installed on GitHub Actions Windows runners, but may not
+// be present on all Windows machines:
+// https://docs.github.com/en/actions/tutorials/build-and-test-code/powershell
+
+#[cfg(windows)]
+const PWSH_FALLBACK_PATHS: &[&str] = &[r#"C:\Program Files\PowerShell\7\pwsh.exe"#];
+#[cfg(not(windows))]
 const PWSH_FALLBACK_PATHS: &[&str] = &["/usr/local/bin/pwsh"];
 
+#[cfg(windows)]
+const POWERSHELL_FALLBACK_PATHS: &[&str] =
+    &[r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"#];
+#[cfg(not(windows))]
+const POWERSHELL_FALLBACK_PATHS: &[&str] = &[];
+
 fn get_powershell_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
-    let shell_path = get_shell_path(ShellType::PowerShell, path, "pwsh", PWSH_FALLBACK_PATHS);
+    let shell_path = get_shell_path(ShellType::PowerShell, path, "pwsh", PWSH_FALLBACK_PATHS)
+        .or_else(|| {
+            get_shell_path(
+                ShellType::PowerShell,
+                path,
+                "powershell",
+                POWERSHELL_FALLBACK_PATHS,
+            )
+        });
 
     shell_path.map(|shell_path| DetectedShell {
         shell_type: ShellType::PowerShell,
@@ -170,10 +239,26 @@ fn get_powershell_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
     })
 }
 
+fn get_cmd_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
+    let shell_path = get_shell_path(ShellType::Cmd, path, "cmd", &[]);
+
+    shell_path.map(|shell_path| DetectedShell {
+        shell_type: ShellType::Cmd,
+        shell_path,
+    })
+}
+
 pub fn ultimate_fallback_shell() -> DetectedShell {
-    DetectedShell {
-        shell_type: ShellType::Sh,
-        shell_path: PathBuf::from("/bin/sh"),
+    if cfg!(windows) {
+        DetectedShell {
+            shell_type: ShellType::Cmd,
+            shell_path: PathBuf::from("cmd.exe"),
+        }
+    } else {
+        DetectedShell {
+            shell_type: ShellType::Sh,
+            shell_path: PathBuf::from("/bin/sh"),
+        }
     }
 }
 
@@ -189,6 +274,7 @@ pub fn get_shell(shell_type: ShellType, path: Option<&PathBuf>) -> Option<Detect
         ShellType::Bash => get_bash_shell(path),
         ShellType::PowerShell => get_powershell_shell(path),
         ShellType::Sh => get_sh_shell(path),
+        ShellType::Cmd => get_cmd_shell(path),
     }
 }
 
@@ -197,21 +283,25 @@ pub fn default_user_shell() -> DetectedShell {
 }
 
 pub fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> DetectedShell {
-    let user_default_shell = user_shell_path
-        .and_then(|shell| detect_shell_type(&shell))
-        .and_then(|shell_type| get_shell(shell_type, /*path*/ None));
-
-    let shell_with_fallback = if cfg!(target_os = "macos") {
-        user_default_shell
-            .or_else(|| get_shell(ShellType::Zsh, /*path*/ None))
-            .or_else(|| get_shell(ShellType::Bash, /*path*/ None))
+    if cfg!(windows) {
+        get_shell(ShellType::PowerShell, /*path*/ None).unwrap_or_else(ultimate_fallback_shell)
     } else {
-        user_default_shell
-            .or_else(|| get_shell(ShellType::Bash, /*path*/ None))
-            .or_else(|| get_shell(ShellType::Zsh, /*path*/ None))
-    };
+        let user_default_shell = user_shell_path
+            .and_then(|shell| detect_shell_type(&shell))
+            .and_then(|shell_type| get_shell(shell_type, /*path*/ None));
 
-    shell_with_fallback.unwrap_or_else(ultimate_fallback_shell)
+        let shell_with_fallback = if cfg!(target_os = "macos") {
+            user_default_shell
+                .or_else(|| get_shell(ShellType::Zsh, /*path*/ None))
+                .or_else(|| get_shell(ShellType::Bash, /*path*/ None))
+        } else {
+            user_default_shell
+                .or_else(|| get_shell(ShellType::Bash, /*path*/ None))
+                .or_else(|| get_shell(ShellType::Zsh, /*path*/ None))
+        };
+
+        shell_with_fallback.unwrap_or_else(ultimate_fallback_shell)
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +323,10 @@ mod tests {
             detect_shell_type(PathBuf::from("pwsh")),
             Some(ShellType::PowerShell)
         );
+        assert_eq!(
+            detect_shell_type(PathBuf::from("powershell")),
+            Some(ShellType::PowerShell)
+        );
         assert_eq!(detect_shell_type(PathBuf::from("fish")), None);
         assert_eq!(detect_shell_type(PathBuf::from("other")), None);
         assert_eq!(
@@ -248,6 +342,22 @@ mod tests {
             Some(ShellType::Bash)
         );
         assert_eq!(
+            detect_shell_type(PathBuf::from("powershell.exe")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(PathBuf::from(if cfg!(windows) {
+                "C:\\windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+            } else {
+                "/usr/local/bin/pwsh"
+            })),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(PathBuf::from("pwsh.exe")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
             detect_shell_type(PathBuf::from("/usr/local/bin/pwsh")),
             Some(ShellType::PowerShell)
         );
@@ -256,5 +366,21 @@ mod tests {
             Some(ShellType::Sh)
         );
         assert_eq!(detect_shell_type(PathBuf::from("sh")), Some(ShellType::Sh));
+        assert_eq!(
+            detect_shell_type(PathBuf::from("cmd")),
+            Some(ShellType::Cmd)
+        );
+        assert_eq!(
+            detect_shell_type(PathBuf::from("cmd.exe")),
+            Some(ShellType::Cmd)
+        );
+        assert_eq!(
+            detect_shell_type(PathBuf::from("PowerShell.EXE")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(PathBuf::from("CMD.EXE")),
+            Some(ShellType::Cmd)
+        );
     }
 }

@@ -1104,30 +1104,14 @@ pub(crate) fn message(role: &str, text: String) -> Value {
 }
 
 fn environment_context(cwd: &Path) -> String {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let date = command_output("date", &["+%F"]).unwrap_or_else(|| "unknown".to_string());
-    let timezone = std::fs::read_to_string("/etc/timezone")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| command_output("date", &["+%Z"]))
-        .unwrap_or_else(|| "unknown".to_string());
+    let shell = crate::shell_command::shell_detect::default_user_shell();
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "unknown".to_string());
     format!(
         "<environment_context>\n  <cwd>{}</cwd>\n  <shell>{}</shell>\n  <current_date>{date}</current_date>\n  <timezone>{timezone}</timezone>\n</environment_context>",
         escape_xml(&cwd.display().to_string()),
-        escape_xml(&shell),
+        escape_xml(shell.name()),
     )
-}
-
-fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .args(arguments)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn repository_context(cwd: &Path) -> Result<Option<String>> {

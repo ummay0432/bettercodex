@@ -436,6 +436,7 @@ pub(super) fn shell_command(
             arguments.push(command.to_string());
             arguments
         }
+        ShellType::Cmd => vec!["/c".to_string(), command.to_string()],
     };
     (shell.shell_path.clone(), arguments)
 }

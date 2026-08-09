@@ -1,8 +1,8 @@
 //! Focused Unix process runtime retained from OpenAI Codex's `codex-utils-pty` at
 //! `646f7c0a91b8e327d263335da68ae8ef212895ce`.
 //!
-//! bettercodex supports Linux and macOS, so it uses Codex's direct Unix PTY path instead of
-//! fetching the full Codex repository for its cross-platform process crate and `portable-pty`.
+//! Linux and macOS keep the direct Unix PTY path; Windows uses the target-gated
+//! upstream ConPTY implementation in the sibling module.
 
 use anyhow::Result;
 use std::collections::HashMap;

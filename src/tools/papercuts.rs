@@ -12,7 +12,6 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
@@ -75,20 +74,18 @@ pub(super) fn log(cwd: &Path, input: Value, cancellation: &CancellationToken) ->
 }
 
 fn open_log(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        // bettercodex targets Unix. O_NOFOLLOW closes the check/open race for
-        // symlinks, while O_NONBLOCK prevents a raced-in FIFO from hanging a
-        // blocking worker before the descriptor can be rejected below.
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).append(true);
+    // O_NOFOLLOW/O_NONBLOCK close Unix link/FIFO races; Windows opens the
+    // reparse point itself so the metadata check below can reject it.
+    crate::platform_fs::configure_private_file_nofollow(&mut options, true);
+    let file = options
         .open(path)
         .with_context(|| format!("tools.log_papercut could not open {}", path.display()))?;
     let metadata = file
         .metadata()
         .with_context(|| format!("tools.log_papercut could not inspect {}", path.display()))?;
-    if !metadata.is_file() {
+    if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
         return Err(anyhow!(
             "tools.log_papercut requires {} to be a regular file",
             path.display()
@@ -153,7 +150,7 @@ fn normalize_message(message: &str) -> Result<String> {
 
 fn ensure_regular_file_or_missing(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(metadata) if metadata.is_file() && !crate::platform_fs::is_link(&metadata) => Ok(()),
         Ok(_) => Err(anyhow!(
             "tools.log_papercut requires {} to be a regular file",
             path.display()

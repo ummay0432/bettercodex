@@ -10,10 +10,6 @@ use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -172,19 +168,25 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
     lock_options
         .create(true)
         .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
+        .write(true);
+    crate::platform_fs::configure_private_file_nofollow(&mut lock_options, false);
     let lock = lock_options.open(&lock_path).with_context(|| {
         format!(
             "could not open the system skills lock {}",
             lock_path.display()
         )
     })?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("could not lock system skills at {}", skills_root.display()));
+    let lock_metadata = lock
+        .metadata()
+        .with_context(|| format!("could not inspect system skills lock {}", lock_path.display()))?;
+    if !lock_metadata.is_file() || crate::platform_fs::is_link(&lock_metadata) {
+        return Err(anyhow!(
+            "system skills lock {} is not a regular file",
+            lock_path.display()
+        ));
     }
+    File::lock(&lock)
+        .with_context(|| format!("could not lock system skills at {}", skills_root.display()))?;
 
     let destination = root(home);
     let staging = skills_root.join(STAGING_DIRECTORY_NAME);
@@ -193,7 +195,7 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
 
     let expected_fingerprint = embedded_fingerprint();
     let destination_is_directory = match std::fs::symlink_metadata(&destination) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+        Ok(metadata) if metadata.is_dir() && !crate::platform_fs::is_link(&metadata) => true,
         Ok(_) => {
             return Err(anyhow!(
                 "system skills path {} exists but is not a regular directory",
@@ -230,7 +232,7 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
         }
         let marker = staging.join(MARKER_FILE_NAME);
         write_private_file(&marker, format!("{expected_fingerprint}\n").as_bytes())?;
-        File::open(&staging)?.sync_all()?;
+        crate::platform_fs::sync_directory(&staging)?;
 
         if destination_is_directory {
             std::fs::rename(&destination, &backup).with_context(|| {
@@ -251,9 +253,9 @@ pub(crate) fn install(home: &Path) -> Result<PathBuf> {
                 )
             });
         }
-        File::open(&skills_root)?.sync_all()?;
+        crate::platform_fs::sync_directory(&skills_root)?;
         remove_work_path(&backup)?;
-        File::open(&skills_root)?.sync_all()?;
+        crate::platform_fs::sync_directory(&skills_root)?;
         Ok(())
     })();
     if install_result.is_err() {
@@ -277,20 +279,20 @@ fn recover_interrupted_install(
 ) -> Result<()> {
     let destination_metadata = std::fs::symlink_metadata(destination);
     match destination_metadata {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+        Ok(metadata) if metadata.is_dir() && !crate::platform_fs::is_link(&metadata) => {
             remove_work_path(backup)?;
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::symlink_metadata(backup) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                Ok(metadata) if metadata.is_dir() && !crate::platform_fs::is_link(&metadata) => {
                     std::fs::rename(backup, destination).with_context(|| {
                         format!(
                             "could not restore interrupted system skills install at {}",
                             destination.display()
                         )
                     })?;
-                    File::open(skills_root)?.sync_all()?;
+                    crate::platform_fs::sync_directory(skills_root)?;
                 }
                 Ok(_) => {
                     return Err(anyhow!(
@@ -360,8 +362,8 @@ fn regular_file_matches(path: &Path, expected: &[u8]) -> Result<bool> {
         }
     };
     if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o777 != 0o600
+        || crate::platform_fs::is_link(&metadata)
+        || !crate::platform_fs::private_file_permissions(&metadata)
     {
         return Ok(false);
     }
@@ -380,8 +382,8 @@ fn exact_tree_matches(
     let metadata = std::fs::symlink_metadata(&directory)
         .with_context(|| format!("could not inspect {}", directory.display()))?;
     if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o777 != 0o700
+        || crate::platform_fs::is_link(&metadata)
+        || !crate::platform_fs::private_directory_permissions(&metadata)
     {
         return Ok(false);
     }
@@ -392,13 +394,13 @@ fn exact_tree_matches(
         let child_relative = relative.join(entry.file_name());
         let child_metadata = std::fs::symlink_metadata(entry.path())
             .with_context(|| format!("could not inspect {}", entry.path().display()))?;
-        if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() {
+        if child_metadata.is_dir() && !crate::platform_fs::is_link(&child_metadata) {
             if !expected_directories.contains(&child_relative)
                 || !exact_tree_matches(root, &child_relative, expected_files, expected_directories)?
             {
                 return Ok(false);
             }
-        } else if child_metadata.is_file() && !child_metadata.file_type().is_symlink() {
+        } else if child_metadata.is_file() && !crate::platform_fs::is_link(&child_metadata) {
             if !expected_files.contains(&child_relative) {
                 return Ok(false);
             }
@@ -411,7 +413,7 @@ fn exact_tree_matches(
 
 fn remove_work_path(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+        Ok(metadata) if metadata.is_dir() && !crate::platform_fs::is_link(&metadata) => {
             std::fs::remove_dir_all(path)
                 .with_context(|| format!("could not remove {}", path.display()))
         }
@@ -433,16 +435,14 @@ fn embedded_fingerprint() -> String {
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder
-        .create(path)
+    crate::platform_fs::create_private_directory_all(path)
         .with_context(|| format!("could not create directory {}", path.display()))
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     let mut options = OpenOptions::new();
-    options.create_new(true).write(true).mode(0o600);
+    options.create_new(true).write(true);
+    crate::platform_fs::configure_private_file(&mut options);
     let mut file = options
         .open(path)
         .with_context(|| format!("could not create {}", path.display()))?;

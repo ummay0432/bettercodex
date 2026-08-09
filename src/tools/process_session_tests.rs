@@ -14,6 +14,7 @@ fn retained_output_keeps_head_and_tail() {
     assert!(rendered.ends_with(&"x".repeat(RETAINED_TAIL_BYTES)));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn dropping_an_exited_session_terminates_descendants_holding_output_open() {
     let shell = DetectedShell {
@@ -71,6 +72,7 @@ async fn dropping_an_exited_session_terminates_descendants_holding_output_open()
     );
 }
 
+#[cfg(unix)]
 fn process_exists(process_id: libc::pid_t) -> bool {
     if unsafe { libc::kill(process_id, 0) } == 0 {
         return true;

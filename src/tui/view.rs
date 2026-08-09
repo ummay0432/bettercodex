@@ -48,6 +48,12 @@ use crate::tools::BackgroundProcess;
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::wrapping::word_wrap_line;
 use crate::update::AvailableUpdate;
+#[cfg(windows)]
+use super::paste_burst::CharDecision;
+#[cfg(windows)]
+use super::paste_burst::FlushResult;
+#[cfg(windows)]
+use super::paste_burst::PasteBurst;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -159,6 +165,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         aliases: &[],
         description: "manage installed skills and invocation policy",
     },
+    #[cfg(unix)]
     SlashCommand {
         name: "tmux",
         aliases: &[],
@@ -257,6 +264,8 @@ pub(super) struct View {
     clear_requested: bool,
     resize_reflow_requested: bool,
     editor: Editor,
+    #[cfg(windows)]
+    paste_burst: PasteBurst,
     file_search: FileSearchPopup,
     skill_popup: SkillPopup,
     skills: Vec<Skill>,
@@ -555,6 +564,8 @@ impl View {
             clear_requested: false,
             resize_reflow_requested: false,
             editor: Editor::default(),
+            #[cfg(windows)]
+            paste_burst: PasteBurst::default(),
             file_search: FileSearchPopup::default(),
             skill_popup: SkillPopup::default(),
             skills,
@@ -1212,7 +1223,11 @@ impl View {
         }
         let action = match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                self.handle_key(key)
+                if self.capture_paste_burst_key(key) {
+                    Action::None
+                } else {
+                    self.handle_key(key)
+                }
             }
             Event::Paste(text) if matches!(self.overlay.as_ref(), Some(Overlay::Resume(_))) => {
                 if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
@@ -1222,14 +1237,9 @@ impl View {
             }
             Event::Paste(_) if self.overlay.is_some() => Action::None,
             Event::Paste(text) => {
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                if let Some(image) = clipboard_paste::image_from_pasted_path(&text) {
-                    self.attach_image(image);
-                } else {
-                    self.editor.insert_paste(text);
-                }
-                self.dismissed_slash = None;
-                self.slash_selection = 0;
+                #[cfg(windows)]
+                self.paste_burst.clear_after_explicit_paste();
+                self.apply_pasted_text(text);
                 Action::None
             }
             Event::Resize(_, _) => {
@@ -1238,6 +1248,11 @@ impl View {
             }
             _ => Action::None,
         };
+        self.sync_composer_popups();
+        action
+    }
+
+    fn sync_composer_popups(&mut self) {
         if self.editor.is_browsing_history() || self.editor.history_search_active() {
             self.file_search.hide();
             self.skill_popup.hide();
@@ -1251,7 +1266,175 @@ impl View {
                 &self.skills,
             );
         }
-        action
+    }
+
+    fn apply_pasted_text(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(image) = clipboard_paste::image_from_pasted_path(&text) {
+            self.attach_image(image);
+        } else {
+            self.editor.insert_paste(text);
+        }
+        self.dismissed_slash = None;
+        self.slash_selection = 0;
+    }
+
+    pub(super) fn paste_burst_active(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.paste_burst.is_active()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    pub(super) fn flush_paste_burst(&mut self) -> bool {
+        #[cfg(windows)]
+        {
+            let changed = self.handle_paste_burst_flush(Instant::now());
+            if changed {
+                self.sync_composer_popups();
+            }
+            changed
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_paste_burst_flush(&mut self, now: Instant) -> bool {
+        match self.paste_burst.flush_if_due(now) {
+            FlushResult::Paste(pasted) => {
+                // Preserve the detector's short Enter-suppression window. An
+                // explicit bracketed paste clears it in handle_terminal_event.
+                self.apply_pasted_text(pasted);
+                true
+            }
+            FlushResult::Typed(character) => {
+                let mut encoded = [0; 4];
+                self.editor.insert(character.encode_utf8(&mut encoded));
+                true
+            }
+            FlushResult::None => false,
+        }
+    }
+
+    fn capture_paste_burst_key(&mut self, key: KeyEvent) -> bool {
+        #[cfg(not(windows))]
+        {
+            let _ = key;
+            false
+        }
+
+        #[cfg(windows)]
+        {
+            if self.overlay.is_some() || self.editor.history_search_active() {
+                if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
+                    self.apply_pasted_text(pasted);
+                }
+                self.paste_burst.clear_window_after_non_char();
+                return false;
+            }
+
+            let now = Instant::now();
+            self.handle_paste_burst_flush(now);
+
+            if key.code == KeyCode::Enter {
+                if self.paste_burst.append_newline_if_active(now) {
+                    return true;
+                }
+                if self.paste_burst.direct_insert_newline_should_insert(now) {
+                    self.editor.insert_newline();
+                    self.paste_burst.extend_window(now);
+                    return true;
+                }
+            }
+
+            if let KeyCode::Char(character) = key.code
+                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && !character.is_control()
+            {
+                if !character.is_ascii() {
+                    if self
+                        .paste_burst
+                        .try_append_char_if_active(character, now)
+                    {
+                        return true;
+                    }
+                    if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
+                        self.apply_pasted_text(pasted);
+                    }
+                    if let Some(decision) = self.paste_burst.on_plain_char_no_hold(now) {
+                        match decision {
+                            CharDecision::BufferAppend => {
+                                self.paste_burst.append_char_to_buffer(character, now);
+                                return true;
+                            }
+                            CharDecision::BeginBuffer { retro_chars } => {
+                                let cursor = self.editor.cursor();
+                                let before = &self.editor.text()[..cursor];
+                                if let Some(grab) = self.paste_burst.decide_begin_buffer(
+                                    now,
+                                    before,
+                                    usize::from(retro_chars),
+                                ) {
+                                    if !grab.grabbed.is_empty() {
+                                        self.editor.replace_range(grab.start_byte..cursor, "");
+                                    }
+                                    self.paste_burst.append_char_to_buffer(character, now);
+                                    return true;
+                                }
+                            }
+                            CharDecision::RetainFirstChar
+                            | CharDecision::BeginBufferFromPending => {
+                                unreachable!("non-ASCII paste detection returned an ASCII decision")
+                            }
+                        }
+                    }
+                    return false;
+                }
+
+                match self.paste_burst.on_plain_char(character, now) {
+                    CharDecision::BufferAppend => {
+                        self.paste_burst.append_char_to_buffer(character, now);
+                        return true;
+                    }
+                    CharDecision::BeginBuffer { retro_chars } => {
+                        let cursor = self.editor.cursor();
+                        let before = &self.editor.text()[..cursor];
+                        if let Some(grab) = self.paste_burst.decide_begin_buffer(
+                            now,
+                            before,
+                            usize::from(retro_chars),
+                        ) {
+                            if !grab.grabbed.is_empty() {
+                                self.editor.replace_range(grab.start_byte..cursor, "");
+                            }
+                            self.paste_burst.append_char_to_buffer(character, now);
+                            return true;
+                        }
+                    }
+                    CharDecision::BeginBufferFromPending => {
+                        self.paste_burst.append_char_to_buffer(character, now);
+                        return true;
+                    }
+                    CharDecision::RetainFirstChar => return true,
+                }
+                return false;
+            }
+
+            if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
+                self.apply_pasted_text(pasted);
+            }
+            if !matches!(key.code, KeyCode::Char(_) | KeyCode::Enter) {
+                self.paste_burst.clear_window_after_non_char();
+            }
+            false
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -1668,6 +1851,7 @@ impl View {
                 ),
             };
         }
+        #[cfg(unix)]
         if local_command
             && let Some(arguments) = command.strip_prefix("/tmux")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
@@ -2968,10 +3152,13 @@ fn is_local_command(command: &str) -> bool {
     {
         return true;
     }
-    if let Some(arguments) = command.strip_prefix("/tmux")
-        && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
+    #[cfg(unix)]
     {
-        return true;
+        if let Some(arguments) = command.strip_prefix("/tmux")
+            && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
+        {
+            return true;
+        }
     }
     matches!(
         command,
@@ -5070,16 +5257,18 @@ mod tests {
 
     #[test]
     fn rejected_local_commands_keep_the_draft_editable() {
-        for (draft, busy) in [
+        let mut rejected = vec![
             ("!", false),
             ("/resume not-a-session-id", false),
-            ("/tmux unexpected", false),
             ("/compact", true),
             ("/fork", true),
             ("/clear", true),
             ("/skills", true),
             ("/logout", true),
-        ] {
+        ];
+        #[cfg(unix)]
+        rejected.push(("/tmux unexpected", false));
+        for (draft, busy) in rejected {
             let mut view = View::new(Path::new("/tmp/bettercodex"));
             if busy {
                 view.start_turn("active turn");
@@ -5098,6 +5287,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejected_local_command_preserves_a_compacted_large_paste() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));

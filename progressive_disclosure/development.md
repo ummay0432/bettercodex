@@ -2,8 +2,9 @@
 
 Read this before changing Rust, tests, performance, or installation behavior.
 bettercodex follows Codex's Cargo and `just` workflow, reduced to the one
-retained Rust package. It does not carry Codex's Bazel, Node, release-packaging,
-or Windows machinery.
+retained Rust package. It does not carry Codex's Bazel, Node, or unrelated
+release-packaging machinery. Native Windows support follows the same one-package
+design and keeps platform dependencies and code target-gated.
 
 ## Setup and daily commands
 
@@ -29,6 +30,13 @@ Build or run the binary through the checked-in Cargo wrapper:
 ```sh
 ./scripts/cargo-with-v8.sh build
 ./scripts/cargo-with-v8.sh run --bin bcodex -- "explain this codebase"
+```
+
+In PowerShell on Windows, use the equivalent checked-in wrapper:
+
+```powershell
+.\scripts\cargo-with-v8.ps1 build
+.\scripts\cargo-with-v8.ps1 run --bin bcodex -- "explain this codebase"
 ```
 
 The wrapper downloads and verifies the sandbox-enabled V8 archive and generated

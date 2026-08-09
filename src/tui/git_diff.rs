@@ -17,6 +17,12 @@ const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GIT_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
 const GIT_DIFF_TIMEOUT: Duration = Duration::from_secs(30);
+const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
+    "core.hooksPath=NUL"
+} else {
+    "core.hooksPath=/dev/null"
+};
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 pub(super) async fn get_git_diff(cwd: PathBuf) -> Result<String, String> {
     get_git_diff_with_program(cwd, OsString::from("git")).await
@@ -78,10 +84,7 @@ async fn get_git_diff_with_program(cwd: PathBuf, program: OsString) -> Result<St
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
     {
-        let path = {
-            use std::os::unix::ffi::OsStringExt;
-            OsString::from_vec(path.to_vec())
-        };
+        let path = git_path(path)?;
         let arguments = vec![
             OsString::from("diff"),
             OsString::from("--no-textconv"),
@@ -91,7 +94,7 @@ async fn get_git_diff_with_program(cwd: PathBuf, program: OsString) -> Result<St
             OsString::from("--color=always"),
             OsString::from("--no-index"),
             OsString::from("--"),
-            OsString::from("/dev/null"),
+            OsString::from(NULL_DEVICE),
             path,
         ];
         let remaining = MAX_DIFF_BYTES.saturating_sub(diff.len());
@@ -204,7 +207,7 @@ impl<'a> GitRunner<'a> {
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
-                "core.hooksPath=/dev/null",
+                DISABLE_HOOKS_CONFIG,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -250,6 +253,20 @@ impl<'a> GitRunner<'a> {
             stdout_truncated: stdout.truncated,
             stderr_truncated: stderr.truncated,
         })
+    }
+}
+
+fn git_path(bytes: &[u8]) -> Result<OsString, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(windows)]
+    {
+        String::from_utf8(bytes.to_vec())
+            .map(OsString::from)
+            .map_err(|_| "git returned an untracked Windows path that is not UTF-8".to_string())
     }
 }
 

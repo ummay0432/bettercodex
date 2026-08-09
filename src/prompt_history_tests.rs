@@ -56,10 +56,14 @@ fn codex_history_is_loaded_appended_and_kept_private() {
             "text": "latest prompt",
         })
     );
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }

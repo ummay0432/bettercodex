@@ -12,7 +12,6 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -467,7 +466,7 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
-        options.mode(0o600);
+        crate::platform_fs::configure_private_file(&mut options);
         let mut file = options.open(&temp).with_context(|| {
             format!(
                 "failed to open temporary credential file {}",
@@ -477,14 +476,14 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        std::fs::rename(&temp, path).with_context(|| {
+        crate::platform_fs::replace_file(&temp, path).with_context(|| {
             format!(
                 "failed to replace credential file {} with {}",
                 path.display(),
                 temp.display()
             )
         })?;
-        File::open(parent)?.sync_all()?;
+        crate::platform_fs::sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {

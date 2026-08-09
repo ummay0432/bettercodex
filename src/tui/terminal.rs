@@ -9,6 +9,7 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
+#[cfg(unix)]
 use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyboardEnhancementFlags;
 use crossterm::event::PopKeyboardEnhancementFlags;
@@ -38,19 +39,28 @@ use ratatui::widgets::Clear as WidgetClear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Stdout;
 use std::io::Write;
 use std::io::stdout;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::sync::Once;
+#[cfg(unix)]
 use std::time::Duration;
+#[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const STARTUP_PROBE_TIMEOUT: () = ();
 const MAX_HISTORY_ROWS_PER_CELL: usize = 30_000;
 const CLEAR_VISIBLE_TERMINAL: &[u8] = b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[H";
 const LINE_FEED_CHUNK: [u8; 256] = [b'\n'; 256];
@@ -467,6 +477,13 @@ impl Drop for TerminalSession {
 
 fn initialize_terminal_modes() -> Result<()> {
     enable_raw_mode().context("failed to enable terminal raw mode")?;
+    #[cfg(windows)]
+    if let Err(error) = super::windows_console::set_input_record_mode() {
+        let _ = restore();
+        return Err(error).context("failed to configure Windows console input records");
+    }
+
+    #[cfg(unix)]
     if let Err(error) = execute!(
         stdout(),
         PushKeyboardEnhancementFlags(
@@ -480,9 +497,28 @@ fn initialize_terminal_modes() -> Result<()> {
         let _ = restore();
         return Err(error).context("failed to initialize terminal input modes");
     }
+
+    #[cfg(windows)]
+    {
+        if let Err(error) = execute!(stdout(), EnableBracketedPaste, SetCursorStyle::SteadyBar) {
+            let _ = restore();
+            return Err(error).context("failed to initialize terminal input modes");
+        }
+        // Legacy Windows consoles do not implement the Kitty keyboard protocol.
+        // Crossterm input records still provide the keys bettercodex needs.
+        let _ = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            ),
+            DisableFocusChange,
+        );
+    }
     Ok(())
 }
 
+#[cfg(unix)]
 fn restore() -> io::Result<()> {
     let raw_result = disable_raw_mode();
     let mode_result = execute!(
@@ -493,6 +529,25 @@ fn restore() -> io::Result<()> {
         PopKeyboardEnhancementFlags,
     );
     raw_result.and(mode_result)
+}
+
+#[cfg(windows)]
+fn restore() -> io::Result<()> {
+    let mut first_error = disable_raw_mode().err();
+    if let Err(error) = execute!(
+        stdout(),
+        SetCursorStyle::DefaultUserShape,
+        DisableBracketedPaste,
+        DisableFocusChange,
+    ) {
+        first_error.get_or_insert(error);
+    }
+    // Keyboard enhancement is best-effort on Windows, so restoration is too.
+    let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    if let Err(error) = super::windows_console::restore_input_mode() {
+        first_error.get_or_insert(error);
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn install_panic_hook() {
@@ -512,12 +567,14 @@ struct StartupProbe {
     background: Option<(u8, u8, u8)>,
 }
 
+#[cfg(unix)]
 struct PendingStartupProbe {
     tty: ProbeTty,
     deadline: Instant,
     bytes: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl PendingStartupProbe {
     fn begin(timeout: Duration) -> io::Result<Self> {
         let mut tty = ProbeTty::open()?;
@@ -551,12 +608,14 @@ impl PendingStartupProbe {
     }
 }
 
+#[cfg(unix)]
 struct ProbeTty {
     reader: File,
     writer: File,
     original_flags: libc::c_int,
 }
 
+#[cfg(unix)]
 impl ProbeTty {
     fn open() -> io::Result<Self> {
         let stdio_reader = duplicate_file(libc::STDIN_FILENO);
@@ -636,18 +695,37 @@ impl ProbeTty {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ProbeTty {
     fn drop(&mut self) {
         let _ = unsafe { libc::fcntl(self.reader.as_raw_fd(), libc::F_SETFL, self.original_flags) };
     }
 }
 
+#[cfg(unix)]
 fn duplicate_file(fd: libc::c_int) -> io::Result<File> {
     let duplicated = unsafe { libc::dup(fd) };
     if duplicated == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(duplicated) })
+}
+
+#[cfg(windows)]
+struct PendingStartupProbe;
+
+#[cfg(windows)]
+impl PendingStartupProbe {
+    fn begin(_timeout: ()) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "terminal color probe is unavailable on Windows",
+        ))
+    }
+
+    fn finish(self) -> io::Result<StartupProbe> {
+        Ok(StartupProbe::default())
+    }
 }
 
 fn parse_osc_color(bytes: &[u8], slot: u8) -> Option<(u8, u8, u8)> {

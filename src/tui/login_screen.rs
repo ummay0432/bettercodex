@@ -12,7 +12,6 @@ use crate::login::LoginInstructions;
 use crate::login::LoginMode;
 use anyhow::Result;
 use crossterm::event::Event;
-use crossterm::event::EventStream;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -30,6 +29,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
+
+use super::event_stream::EventStream;
 
 const MIN_ART_HEIGHT: u16 = 37;
 
