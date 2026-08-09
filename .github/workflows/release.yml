@@ -117,6 +117,8 @@ jobs:
           set -euo pipefail
           ./scripts/cargo-with-v8.sh build --release --locked --target x86_64-unknown-linux-gnu --bin bcodex
           binary="target/x86_64-unknown-linux-gnu/release/bcodex"
+          binary_size="$(wc -c <"$binary")"
+          [[ "$binary_size" -le 134217728 ]]
           [[ "$("$binary" --version)" == "bcodex $EXPECTED_VERSION" ]]
           [[ "$("$binary" --internal-release-tag)" == "$EXPECTED_TAG" ]]
           [[ "$("$binary" --internal-source-revision)" == "${EXPECTED_TAG##*-}" ]]
@@ -166,6 +168,8 @@ jobs:
           [[ "$(rustc -vV | sed -n 's/^host: //p')" == aarch64-apple-darwin ]]
           ./scripts/cargo-with-v8.sh build --release --locked --target aarch64-apple-darwin --bin bcodex
           binary="target/aarch64-apple-darwin/release/bcodex"
+          binary_size="$(wc -c <"$binary")"
+          [[ "$binary_size" -le 134217728 ]]
           codesign --force --sign - "$binary"
           codesign --verify --strict "$binary"
           [[ "$("$binary" --version)" == "bcodex $EXPECTED_VERSION" ]]
@@ -206,7 +210,8 @@ jobs:
         shell: powershell
         env:
           RUST_MIN_STACK: "8388608"
-        run: .\scripts\cargo-with-v8.ps1 test --locked --bin bcodex -- --test-threads=1
+          RUST_TEST_THREADS: "1"
+        run: .\scripts\cargo-with-v8.ps1 test --locked --bin bcodex
 
       - name: Build and verify release binary
         shell: powershell
@@ -218,6 +223,7 @@ jobs:
           .\scripts\cargo-with-v8.ps1 build --release --locked --target x86_64-pc-windows-msvc --bin bcodex
           if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
           $binary = 'target\x86_64-pc-windows-msvc\release\bcodex.exe'
+          if ((Get-Item -LiteralPath $binary).Length -gt 128MB) { throw 'release binary exceeds 128 MiB' }
           if ((& $binary --version) -cne "bcodex $env:EXPECTED_VERSION") { throw 'version check failed' }
           if ((& $binary --internal-release-tag) -cne $env:EXPECTED_TAG) { throw 'release tag check failed' }
           if ((& $binary --internal-source-revision) -cne ($env:EXPECTED_TAG -replace '^.*-', '')) { throw 'source revision check failed' }
