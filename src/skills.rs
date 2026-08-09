@@ -8,7 +8,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -38,7 +37,7 @@ const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
 const MAX_SKILLS_CONTEXT_BYTES: usize = 39_000;
 
 fn is_reserved_system_skill_name(name: &str) -> bool {
-    matches!(name, "loop" | "review")
+    name == "review"
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -94,7 +93,7 @@ pub(crate) enum SkillUpdate {
     AllowImplicitInvocation(bool),
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SkillSelection {
     name: String,
     path: PathBuf,
@@ -289,9 +288,6 @@ impl SkillCatalog {
                         if is_reserved_system_skill_name(&skill.name) {
                             skill.enabled = true;
                         }
-                        if skill.name == "loop" {
-                            skill.allow_implicit_invocation = false;
-                        }
                         skills.push(skill);
                         if let Some(warning) = metadata_warning {
                             warnings.push(warning);
@@ -382,9 +378,6 @@ impl SkillCatalog {
 
         for selection in structured {
             blocked_names.insert(selection.name.as_str());
-            if selection.name == "loop" {
-                continue;
-            }
             let Some(skill) = self
                 .skills
                 .iter()
@@ -425,14 +418,10 @@ impl SkillCatalog {
 
         let mut counts = HashMap::<&str, usize>::new();
         for skill in self.skills.iter().filter(|skill| skill.enabled) {
-            if skill.name == "loop" {
-                continue;
-            }
             *counts.entry(skill.name.as_str()).or_default() += 1;
         }
         for skill in self.skills.iter().filter(|skill| skill.enabled) {
-            if skill.name == "loop"
-                || seen_paths.contains(&skill.path)
+            if seen_paths.contains(&skill.path)
                 || blocked_names.contains(skill.name.as_str())
                 || !mentions.plain_names.contains(skill.name.as_str())
                 || counts.get(skill.name.as_str()) != Some(&1)
@@ -498,9 +487,6 @@ impl SkillCatalog {
         for skill in &mut self.skills {
             if is_reserved_system_skill_name(&skill.name) {
                 skill.enabled = true;
-                if skill.name == "loop" {
-                    skill.allow_implicit_invocation = false;
-                }
                 continue;
             }
             let Some(settings) = settings.skills.get(&skill.path) else {

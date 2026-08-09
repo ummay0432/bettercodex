@@ -114,32 +114,6 @@ fn completed_turn_drain_renders_events_beyond_the_fairness_batch() {
     assert!(rendered.contains("tail-marker"), "{rendered}");
 }
 
-#[tokio::test]
-async fn malformed_active_submissions_restore_enter_and_tab_drafts() {
-    const DRAFT: &str = "$loop 0x improve the parser";
-
-    for key in [KeyCode::Enter, KeyCode::Tab] {
-        let mut runtime = runtime_without_agent();
-        runtime.view.start_turn("active turn");
-        runtime.turn = Some(tokio::spawn(std::future::pending()));
-        let action = composer_action(&mut runtime.view, DRAFT, key);
-
-        assert!(!runtime.handle_action(action));
-        assert_eq!(
-            submitted_prompt(runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            )))),
-            UserPrompt::text(DRAFT),
-        );
-        let rendered = rendered_history(&mut runtime.view);
-        assert!(
-            rendered.contains("■ Invalid quality loop request:"),
-            "{rendered}"
-        );
-    }
-}
-
 #[test]
 fn unavailable_agent_restores_an_idle_submission() {
     let mut runtime = runtime_without_agent();

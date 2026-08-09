@@ -1,6 +1,5 @@
 use crate::MODEL;
 use crate::protocol::MessagePhase;
-use crate::skills::SkillSelection;
 use crate::time::unix_timestamp_millis;
 use crate::usage::TokenUsage;
 use anyhow::Context;
@@ -93,16 +92,6 @@ pub(crate) struct LoadedRollout {
     pub(crate) server_reasoning_included: bool,
     pub(crate) compaction_count: u64,
     pub(crate) unfinished_turn: Option<String>,
-    pub(crate) operator_inputs: Vec<OperatorInputRecord>,
-    pub(crate) operator_inputs_complete: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub(crate) struct OperatorInputRecord {
-    pub(crate) message: Value,
-    pub(crate) prompt_text: String,
-    pub(crate) selected_skills: Vec<SkillSelection>,
-    pub(crate) skill_context: Vec<Value>,
 }
 
 pub(crate) struct Rollout {
@@ -137,7 +126,7 @@ impl Drop for LockedRolloutFile {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum RolloutRecordData<Items = Vec<Value>, OperatorItem = OperatorInputRecord> {
+enum RolloutRecordData<Items = Vec<Value>> {
     Session {
         metadata: SessionMetadata,
     },
@@ -147,13 +136,6 @@ enum RolloutRecordData<Items = Vec<Value>, OperatorItem = OperatorInputRecord> {
     },
     TranscriptSnapshot {
         items: Vec<SessionTranscriptItem>,
-    },
-    OperatorInputsSnapshot {
-        items: Vec<OperatorInputRecord>,
-        complete: bool,
-    },
-    OperatorInput {
-        item: OperatorItem,
     },
     HistoryAppend {
         items: Items,
@@ -177,13 +159,15 @@ enum RolloutRecordData<Items = Vec<Value>, OperatorItem = OperatorInputRecord> {
         turn_id: String,
         outcome: TurnOutcome,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 type RolloutRecord = RolloutRecordData;
-// History and operator-input items can contain multi-megabyte images and tool results. Keep the
-// journal schema shared with replay while borrowing those payloads on the write path instead of
-// deep-cloning them into a short-lived record.
-type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value], &'a OperatorInputRecord>;
+// History items can contain multi-megabyte images and tool results. Keep the journal schema shared
+// with replay while borrowing those payloads on the write path instead of deep-cloning them into a
+// short-lived record.
+type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value]>;
 
 // Listing only needs message shape and preview text. Deserialize those selected fields directly
 // from the journal stream while scanning all unselected payloads without materializing them.
@@ -451,10 +435,6 @@ impl Rollout {
             metadata: metadata.clone(),
         };
         rollout.write_record(&RolloutRecord::Session { metadata })?;
-        rollout.write_record(&RolloutRecord::OperatorInputsSnapshot {
-            items: Vec::new(),
-            complete: true,
-        })?;
         Ok(rollout)
     }
 
@@ -508,18 +488,6 @@ impl Rollout {
 
     pub(crate) fn snapshot_transcript(&mut self, items: Vec<SessionTranscriptItem>) -> Result<()> {
         self.write_record(&RolloutRecord::TranscriptSnapshot { items })
-    }
-
-    pub(crate) fn snapshot_operator_inputs(
-        &mut self,
-        items: Vec<OperatorInputRecord>,
-        complete: bool,
-    ) -> Result<()> {
-        self.write_record(&RolloutRecord::OperatorInputsSnapshot { items, complete })
-    }
-
-    pub(crate) fn record_operator_input(&mut self, item: &OperatorInputRecord) -> Result<()> {
-        self.write_record(&BorrowedRolloutRecord::OperatorInput { item })
     }
 
     pub(crate) fn replace_history(
@@ -619,8 +587,6 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut server_reasoning_included = false;
     let mut compaction_count = 0_u64;
     let mut unfinished_turn = None;
-    let mut operator_inputs = Vec::new();
-    let mut operator_inputs_complete = false;
     let mut line_number = 0_usize;
     let mut valid_length = 0_u64;
     let mut valid_record_needs_newline = false;
@@ -669,11 +635,6 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 compaction_count: source_compaction_count,
             } => compaction_count = source_compaction_count,
             RolloutRecord::TranscriptSnapshot { items } => transcript = items,
-            RolloutRecord::OperatorInputsSnapshot { items, complete } => {
-                operator_inputs = items;
-                operator_inputs_complete = complete;
-            }
-            RolloutRecord::OperatorInput { item } => operator_inputs.push(item),
             RolloutRecord::HistoryAppend { items } => {
                 append_transcript_items(&mut transcript, &items);
                 history.extend(items);
@@ -711,6 +672,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                     unfinished_turn = None;
                 }
             }
+            RolloutRecord::Unknown => {}
         }
     }
 
@@ -754,8 +716,6 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         server_reasoning_included,
         compaction_count,
         unfinished_turn,
-        operator_inputs,
-        operator_inputs_complete,
     })
 }
 
@@ -1156,8 +1116,9 @@ fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
             "saved session {} is already open in another bettercodex process",
             path.display()
         )),
-        Err(std::fs::TryLockError::Error(error)) => Err(error)
-            .with_context(|| format!("failed to lock saved session {}", path.display())),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("failed to lock saved session {}", path.display()))
+        }
     }
 }
 
@@ -1170,7 +1131,10 @@ fn open_private_replace(path: &Path) -> Result<File> {
         .with_context(|| format!("failed to open private file {}", path.display()))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
-        return Err(anyhow!("private path {} is not a regular file", path.display()));
+        return Err(anyhow!(
+            "private path {} is not a regular file",
+            path.display()
+        ));
     }
     crate::platform_fs::protect_file(&file)?;
     Ok(file)

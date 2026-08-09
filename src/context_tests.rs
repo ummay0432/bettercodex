@@ -158,19 +158,9 @@ fn projected_append_commits_precomputed_context_metrics_and_history() {
     let initial_len = conversation.items().len();
     let items = vec![message("user", "project once".to_string())];
     let expected_additional_tokens = estimated_tokens(&items);
-    let operator_input = OperatorInputRecord {
-        message: items[0].clone(),
-        prompt_text: "project once".to_string(),
-        selected_skills: Vec::new(),
-        skill_context: Vec::new(),
-    };
-
     let projection = conversation.project_append(items.clone());
     assert_eq!(projection.additional_tokens(), expected_additional_tokens);
     let projected_tokens = projection.projected_tokens();
-    conversation
-        .record_operator_input(operator_input.clone())
-        .unwrap();
     conversation.append_projected(projection).unwrap();
 
     assert_eq!(&conversation.items()[initial_len..], items);
@@ -179,7 +169,6 @@ fn projected_append_commits_precomputed_context_metrics_and_history() {
 
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert_eq!(&loaded.history[initial_len..], items);
-    assert_eq!(loaded.operator_inputs, vec![operator_input]);
 }
 
 #[test]

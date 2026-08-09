@@ -70,7 +70,6 @@ impl ProcessSession {
         command: &str,
         cwd: &Path,
         mode: ProcessMode,
-        environment_overrides: &HashMap<String, String>,
     ) -> Result<Arc<Self>> {
         let (program, arguments) = shell_command(shell, shell_startup, command);
         let program = program
@@ -90,7 +89,6 @@ impl ProcessSession {
             }
             .to_string(),
         );
-        environment.extend(environment_overrides.clone());
         let spawned = match mode {
             ProcessMode::Piped => {
                 spawn_pipe_process_no_stdin(program, &arguments, cwd, &environment).await

@@ -1,6 +1,6 @@
 # Simple Task-Specific Evals Docs Manifest
 
-Use this file as a routing map for constructing the small, task-specific evaluator required by the quality loop in `SPEC.md`. Prefer the live OpenAI docs linked here over copied notes so the evaluator follows current guidance, examples, and platform transitions.
+Use this file as a routing map for constructing small, task-specific evaluators. Prefer the live OpenAI docs linked here over copied notes so each evaluator follows current guidance, examples, and platform transitions.
 
 When starting a task:
 
@@ -92,7 +92,7 @@ Link: https://developers.openai.com/cookbook/examples/evaluation/moving-from-ope
 
 ## Agent Routing Notes
 
-- For the `SPEC.md` quality loop, infer what matters from the operator's request and repository evidence; do not grade every task on a canned list of quality dimensions.
+- Infer what matters from the operator's request and repository evidence; do not grade every task on a canned list of quality dimensions.
 - Start with one claim about good behavior and the cheapest trustworthy evidence that can falsify it.
 - Prefer existing tests, builds, linters, benchmarks, static checks, schemas, and direct artifact inspection before adding model judgment.
 - Use binary, exact, or pairwise decisions when they express the real requirement; add a numeric score only when intermediate quality levels are meaningful.

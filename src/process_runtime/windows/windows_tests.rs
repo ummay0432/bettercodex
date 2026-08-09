@@ -1,10 +1,10 @@
+use super::super::TerminalSize;
+use super::super::spawn_pipe_process_no_stdin;
+use super::super::spawn_pty_process;
 use super::collect_output_until_exit;
 use super::combine_spawned_output;
 use super::find_python;
 use super::wait_for_output_contains;
-use super::super::TerminalSize;
-use super::super::spawn_pipe_process_no_stdin;
-use super::super::spawn_pty_process;
 use std::collections::HashMap;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;

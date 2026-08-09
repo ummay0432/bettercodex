@@ -14,6 +14,12 @@ use super::markdown;
 use super::markdown_cache::MarkdownRenderCache;
 use super::palette;
 use super::palette::TerminalColors;
+#[cfg(windows)]
+use super::paste_burst::CharDecision;
+#[cfg(windows)]
+use super::paste_burst::FlushResult;
+#[cfg(windows)]
+use super::paste_burst::PasteBurst;
 use super::pending_input::PendingInput;
 use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
@@ -38,7 +44,6 @@ use crate::events::SteerId;
 use crate::input::UserPrompt;
 use crate::protocol::MessagePhase;
 use crate::protocol::ParsedCommand;
-use crate::quality_loop::LoopProgress;
 use crate::rollout::SessionTranscriptItem;
 use crate::shell_command::parse_command::parse_command;
 use crate::skills::Skill;
@@ -48,12 +53,6 @@ use crate::tools::BackgroundProcess;
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::wrapping::word_wrap_line;
 use crate::update::AvailableUpdate;
-#[cfg(windows)]
-use super::paste_burst::CharDecision;
-#[cfg(windows)]
-use super::paste_burst::FlushResult;
-#[cfg(windows)]
-use super::paste_burst::PasteBurst;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -98,18 +97,7 @@ const ACTIVITY_COMPOSER_GAP: u16 = 1;
 const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
 const STATUS_DETAIL_PREFIX: &str = "  └ ";
-const LOOP_LINE_HEIGHT: u16 = 1;
-const LOOP_INDENT: &str = "  ";
-const LOOP_SEPARATOR: &str = " · ";
-const LOOP_NAME_COLOR: Color = Color::Indexed(245);
-const LOOP_FIELD_COLOR: Color = Color::Indexed(243);
-const LOOP_SEPARATOR_COLOR: Color = Color::Indexed(240);
 const SLASH_COMMANDS: &[SlashCommand] = &[
-    SlashCommand {
-        name: "loop",
-        aliases: &[],
-        description: "run a task-specific evaluator and improvement loop",
-    },
     SlashCommand {
         name: "review",
         aliases: &[],
@@ -278,7 +266,6 @@ pub(super) struct View {
     turn_had_work: bool,
     reasoning_status: ReasoningStatus,
     status_detail: Option<String>,
-    loop_progress: Option<LoopProgress>,
     pending_input: PendingInput,
     terminal_assistant_received_this_turn: bool,
     active_message_phase: Option<MessagePhase>,
@@ -578,7 +565,6 @@ impl View {
             turn_had_work: false,
             reasoning_status: ReasoningStatus::default(),
             status_detail: None,
-            loop_progress: None,
             pending_input: PendingInput::default(),
             terminal_assistant_received_this_turn: false,
             active_message_phase: None,
@@ -688,7 +674,6 @@ impl View {
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
-        self.loop_progress = None;
         self.status_detail = None;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
@@ -804,7 +789,6 @@ impl View {
             .map(|started| started.elapsed().as_secs());
         let turn_had_work = std::mem::take(&mut self.turn_had_work);
         self.busy = false;
-        self.loop_progress = None;
         let interrupt_intent = self.interrupting.take();
         self.reasoning_status.reset();
         self.status_detail = None;
@@ -1206,8 +1190,6 @@ impl View {
                 self.status_detail = Some("Compacting conversation".to_string());
             }
             AgentEvent::CompactionCompleted => self.status_detail = self.latest_tool_activity(),
-            AgentEvent::LoopProgress(progress) => self.loop_progress = Some(progress),
-            AgentEvent::LoopProgressCleared => self.loop_progress = None,
         }
     }
 
@@ -1355,14 +1337,13 @@ impl View {
             }
 
             if let KeyCode::Char(character) = key.code
-                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 && !character.is_control()
             {
                 if !character.is_ascii() {
-                    if self
-                        .paste_burst
-                        .try_append_char_if_active(character, now)
-                    {
+                    if self.paste_burst.try_append_char_if_active(character, now) {
                         return true;
                     }
                     if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
@@ -1631,10 +1612,6 @@ impl View {
                 KeyCode::Enter if !shift && !alt && !control => {
                     let command = slash_matches[selected];
                     self.complete_slash_command(command, selected);
-                    if command.name == "loop" {
-                        self.editor.insert(" ");
-                        return Action::None;
-                    }
                     return self.submit_action();
                 }
                 KeyCode::Tab => {
@@ -1740,11 +1717,9 @@ impl View {
     }
 
     fn complete_slash_command(&mut self, command: &SlashCommand, selection: usize) {
-        let Some((query, range)) = self.editor.slash_command_query() else {
-            return;
-        };
-        let name = command.completion_name(&query);
-        self.editor.replace_range(range, &format!("/{name}"));
+        let query = self.editor.text().strip_prefix('/').unwrap_or_default();
+        let name = command.completion_name(query);
+        self.editor.set_text(format!("/{name}"));
         self.dismissed_slash = None;
         self.slash_selection = selection;
     }
@@ -2397,11 +2372,10 @@ impl View {
             .saturating_add(2);
         let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
         let activity_height = self.activity_height(width);
-        let loop_height = LOOP_LINE_HEIGHT.saturating_mul(u16::from(self.loop_progress.is_some()));
-        let activity_composer_height = if activity_height > 0 {
-            ACTIVITY_COMPOSER_GAP.max(loop_height)
+        let activity_gap = if activity_height > 0 {
+            ACTIVITY_COMPOSER_GAP
         } else {
-            loop_height
+            0
         };
         let bottom_spacing: u16 = 1;
         let popup_height = self.completion_popup_height(width);
@@ -2423,7 +2397,7 @@ impl View {
         let transcript_chrome_height = bottom_spacing
             .saturating_add(pending_height)
             .saturating_add(activity_height)
-            .saturating_add(activity_composer_height)
+            .saturating_add(activity_gap)
             .saturating_add(composer_height)
             .saturating_add(trailing_height);
         (transcript_chrome_height, overlay_height)
@@ -2450,8 +2424,6 @@ impl View {
         } else {
             self.completion_popup_height(area.width)
         };
-        let requested_loop_height =
-            LOOP_LINE_HEIGHT.saturating_mul(u16::from(self.loop_progress.is_some()));
         let requested_trailing_height = if popup_height > 0 {
             popup_height
         } else {
@@ -2464,24 +2436,24 @@ impl View {
             requested_trailing_height.min(area.height.saturating_sub(minimum_composer_height));
         let height_above_trailing = area.height.saturating_sub(trailing_height);
         let requested_activity_height = self.activity_height(area.width);
-        let requested_activity_composer_height = if requested_activity_height > 0 {
-            ACTIVITY_COMPOSER_GAP.max(requested_loop_height)
+        let requested_activity_gap = if requested_activity_height > 0 {
+            ACTIVITY_COMPOSER_GAP
         } else {
-            requested_loop_height
+            0
         };
-        let requested_pre_composer_height =
-            requested_activity_height.saturating_add(requested_activity_composer_height);
-        let pre_composer_height = requested_pre_composer_height
+        let requested_activity_block_height =
+            requested_activity_height.saturating_add(requested_activity_gap);
+        let activity_block_height = requested_activity_block_height
             .min(height_above_trailing.saturating_sub(minimum_composer_height));
         let pending_lines = self.pending_input.lines();
         let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
         let pending_height = requested_pending_height.min(
             height_above_trailing
-                .saturating_sub(pre_composer_height)
+                .saturating_sub(activity_block_height)
                 .saturating_sub(minimum_composer_height),
         );
         let composer_height_limit = height_above_trailing
-            .saturating_sub(pre_composer_height)
+            .saturating_sub(activity_block_height)
             .saturating_sub(pending_height);
         let editor_height_limit = composer_height_limit.saturating_sub(2).max(1);
         let editor_layout = self
@@ -2504,21 +2476,11 @@ impl View {
         } else {
             Rect::default()
         };
-        // The loop replaces Codex's quiet activity-to-composer spacer. Keeping it in this
-        // interstitial row makes the loop read as nested live activity instead of a second footer.
-        let pre_composer_top = composer_y.saturating_sub(pre_composer_height);
-        let activity_height = requested_activity_height.min(pre_composer_height);
-        let activity_area = Rect::new(area.x, pre_composer_top, area.width, activity_height);
-        let interstitial_height = pre_composer_height.saturating_sub(activity_height);
-        let loop_height = requested_loop_height.min(interstitial_height);
-        let loop_area = Rect::new(
-            area.x,
-            composer_y.saturating_sub(loop_height),
-            area.width,
-            loop_height,
-        );
-        let pending_bottom = if pre_composer_height > 0 {
-            pre_composer_top
+        let activity_top = composer_y.saturating_sub(activity_block_height);
+        let activity_height = requested_activity_height.min(activity_block_height);
+        let activity_area = Rect::new(area.x, activity_top, area.width, activity_height);
+        let pending_bottom = if activity_block_height > 0 {
+            activity_top
         } else {
             composer_area.y
         };
@@ -2530,8 +2492,8 @@ impl View {
         );
         let content_bottom = if pending_height > 0 {
             pending_area.y
-        } else if pre_composer_height > 0 {
-            pre_composer_top
+        } else if activity_block_height > 0 {
+            activity_top
         } else {
             composer_area.y
         };
@@ -2560,14 +2522,6 @@ impl View {
             frame.render_widget(
                 Paragraph::new(self.activity_lines(activity_area.width)),
                 activity_area,
-            );
-        }
-        if let Some(progress) = &self.loop_progress
-            && !loop_area.is_empty()
-        {
-            frame.render_widget(
-                Paragraph::new(loop_status_line(progress, loop_area.width)),
-                loop_area,
             );
         }
         self.render_composer(frame, composer_area, footer_area, editor_layout);
@@ -2853,15 +2807,19 @@ impl View {
         if self.editor.is_browsing_history() || self.editor.history_search_active() {
             return Vec::new();
         }
-        if self.dismissed_slash.as_deref() == Some(self.editor.text()) {
+        let text = self.editor.text();
+        if self.dismissed_slash.as_deref() == Some(text) {
             return Vec::new();
         }
-        let Some((query, _)) = self.editor.slash_command_query() else {
+        let Some(query) = text.strip_prefix('/') else {
             return Vec::new();
         };
+        if query.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
         SLASH_COMMANDS
             .iter()
-            .filter(|command| command.matches(&query))
+            .filter(|command| command.matches(query))
             .collect()
     }
 
@@ -2909,116 +2867,6 @@ impl View {
                 .values()
                 .any(ToolEntry::is_empty_interaction)
     }
-}
-
-fn loop_status_line(progress: &LoopProgress, width: u16) -> Line<'static> {
-    let width = usize::from(width);
-    if width == 0 {
-        return Line::default();
-    }
-    let phase_width = UnicodeWidthStr::width(progress.phase.as_str());
-    let preferred_indent_width = UnicodeWidthStr::width(LOOP_INDENT);
-    let indent = if width >= phase_width.saturating_add(preferred_indent_width) {
-        LOOP_INDENT
-    } else {
-        ""
-    };
-    let content_width = width.saturating_sub(UnicodeWidthStr::width(indent));
-    let diff = progress
-        .additions
-        .zip(progress.deletions)
-        .map(|(additions, deletions)| format!("+{additions} −{deletions}"));
-    if let Some(diff) = diff.as_deref() {
-        let fields = [
-            progress.name.as_str(),
-            progress.phase.as_str(),
-            diff,
-            progress.pulse.as_str(),
-        ];
-        if loop_fields_width(&fields) <= content_width {
-            return styled_loop_fields(&fields, indent, true);
-        }
-    }
-    let fields = [
-        progress.name.as_str(),
-        progress.phase.as_str(),
-        progress.pulse.as_str(),
-    ];
-    if loop_fields_width(&fields) <= content_width {
-        return styled_loop_fields(&fields, indent, true);
-    }
-
-    let fixed = loop_fields_width(&[progress.phase.as_str(), progress.pulse.as_str()])
-        .saturating_add(UnicodeWidthStr::width(LOOP_SEPARATOR));
-    if content_width > fixed {
-        let name = crate::quality_loop::truncate_width(
-            &progress.name,
-            content_width.saturating_sub(fixed),
-        );
-        if !name.is_empty() {
-            let fields = [
-                name.as_str(),
-                progress.phase.as_str(),
-                progress.pulse.as_str(),
-            ];
-            if loop_fields_width(&fields) <= content_width {
-                return styled_loop_fields(&fields, indent, true);
-            }
-        }
-    }
-
-    let separator_width = UnicodeWidthStr::width(LOOP_SEPARATOR);
-    if content_width > phase_width.saturating_add(separator_width) {
-        let pulse = crate::quality_loop::truncate_width(
-            &progress.pulse,
-            content_width
-                .saturating_sub(phase_width)
-                .saturating_sub(separator_width),
-        );
-        if !pulse.is_empty() {
-            return styled_loop_fields(&[progress.phase.as_str(), pulse.as_str()], indent, false);
-        }
-    }
-    let phase = crate::quality_loop::truncate_width(&progress.phase, content_width);
-    styled_loop_fields(&[phase.as_str()], indent, false)
-}
-
-fn loop_fields_width(fields: &[&str]) -> usize {
-    fields
-        .iter()
-        .map(|field| UnicodeWidthStr::width(*field))
-        .sum::<usize>()
-        .saturating_add(
-            fields
-                .len()
-                .saturating_sub(1)
-                .saturating_mul(UnicodeWidthStr::width(LOOP_SEPARATOR)),
-        )
-}
-
-fn styled_loop_fields(fields: &[&str], indent: &str, first_is_name: bool) -> Line<'static> {
-    let mut spans = Vec::with_capacity(fields.len().saturating_mul(2));
-    if !indent.is_empty() {
-        spans.push(Span::from(indent.to_string()));
-    }
-    for (index, field) in fields.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(
-                LOOP_SEPARATOR,
-                Style::default().fg(LOOP_SEPARATOR_COLOR),
-            ));
-        }
-        let color = if index == 0 && first_is_name {
-            LOOP_NAME_COLOR
-        } else {
-            LOOP_FIELD_COLOR
-        };
-        spans.push(Span::styled(
-            (*field).to_string(),
-            Style::default().fg(color),
-        ));
-    }
-    Line::from(spans)
 }
 
 impl View {
@@ -5241,21 +5089,6 @@ mod tests {
     }
 
     #[test]
-    fn loop_completion_inserts_a_prompt_prefix_without_submitting() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.editor.set_text("/loo");
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::None
-        );
-        assert_eq!(view.editor.text(), "/loop ");
-    }
-
-    #[test]
     fn rejected_local_commands_keep_the_draft_editable() {
         let mut rejected = vec![
             ("!", false),
@@ -5359,7 +5192,7 @@ mod tests {
 
         view.reject_composer_submission(
             submission,
-            "Invalid quality loop request: loop iteration count must be positive",
+            "Could not start turn: the active agent is unavailable",
         );
 
         assert_eq!(view.editor.take_prompt(), expected);
@@ -5370,8 +5203,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(
-            rendered
-                .contains("■ Invalid quality loop request: loop iteration count must be positive"),
+            rendered.contains("■ Could not start turn: the active agent is unavailable"),
             "{rendered}"
         );
     }
@@ -5453,121 +5285,6 @@ mod tests {
             plain(&view.status_line(80)),
             "gpt-5.6-sol max │ pi / main │ 20% of 258K"
         );
-    }
-
-    #[test]
-    fn loop_status_line_uses_a_muted_nested_style_and_width_fallbacks() {
-        let progress =
-            LoopProgress::new("Shopify speed", "2/3", Some(233), Some(199), "validating");
-        let full = loop_status_line(&progress, 80);
-        assert_eq!(
-            plain(&full),
-            "  Shopify speed · 2/3 · +233 −199 · validating"
-        );
-        let colors = full
-            .spans
-            .iter()
-            .map(|span| {
-                (
-                    span.content.as_ref(),
-                    span.style.fg,
-                    span.style.add_modifier,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            colors,
-            [
-                ("  ", None, Modifier::empty()),
-                (
-                    "Shopify speed",
-                    Some(Color::Indexed(245)),
-                    Modifier::empty()
-                ),
-                (" · ", Some(Color::Indexed(240)), Modifier::empty()),
-                ("2/3", Some(Color::Indexed(243)), Modifier::empty()),
-                (" · ", Some(Color::Indexed(240)), Modifier::empty()),
-                ("+233 −199", Some(Color::Indexed(243)), Modifier::empty()),
-                (" · ", Some(Color::Indexed(240)), Modifier::empty()),
-                ("validating", Some(Color::Indexed(243)), Modifier::empty()),
-            ]
-        );
-
-        assert_eq!(
-            plain(&loop_status_line(&progress, 32)),
-            "  Shopify sp… · 2/3 · validating"
-        );
-        assert_eq!(
-            plain(&loop_status_line(&progress, 27)),
-            "  Shopi… · 2/3 · validating"
-        );
-        assert_eq!(
-            plain(&loop_status_line(&progress, 19)),
-            "  2/3 · validating"
-        );
-        assert_eq!(plain(&loop_status_line(&progress, 10)), "  2/3 · v…");
-        assert_eq!(plain(&loop_status_line(&progress, 3)), "2/3");
-        for width in 1..80 {
-            let line = loop_status_line(&progress, width);
-            assert!(
-                line_width(&line) <= usize::from(width),
-                "width {width}: {}",
-                plain(&line)
-            );
-        }
-    }
-
-    #[test]
-    fn active_loop_occupies_the_activity_composer_gap() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn("test");
-        let _ = view.take_pending_history_lines(60, 24);
-        let height_without_loop = view.desired_height(60, 24);
-        view.handle_agent_event(AgentEvent::LoopProgress(LoopProgress::new(
-            "Parser speed",
-            "1/3",
-            Some(2),
-            Some(1),
-            "validating",
-        )));
-        let height = view.desired_height(60, 24);
-        assert_eq!(height, height_without_loop);
-        let backend = TestBackend::new(60, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
-        let rows = rendered.lines().collect::<Vec<_>>();
-        let activity_y = rows
-            .iter()
-            .position(|row| row.contains("Working ("))
-            .unwrap() as u16;
-        let loop_y = rows
-            .iter()
-            .position(|row| row.contains("  Parser speed · 1/3 · +2 −1 · validating"))
-            .unwrap() as u16;
-        let footer_y = rows.iter().position(|row| row.contains(MODEL)).unwrap() as u16;
-        let composer_background = view.user_message_style.bg.unwrap();
-        let composer_y = (0..height)
-            .find(|&y| buffer[(0, y)].bg == composer_background)
-            .unwrap();
-        let composer_bottom = (0..height)
-            .rfind(|&y| buffer[(0, y)].bg == composer_background)
-            .unwrap()
-            .saturating_add(1);
-        assert_eq!(loop_y, activity_y + 1, "{rendered}");
-        assert_eq!(composer_y, loop_y + 1, "{rendered}");
-        assert_eq!(footer_y, composer_bottom, "{rendered}");
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.contains("Parser speed"))
-                .count(),
-            1
-        );
-
-        view.handle_agent_event(AgentEvent::LoopProgressCleared);
-        assert_eq!(view.desired_height(60, 24), height);
     }
 
     #[test]

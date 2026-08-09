@@ -8,10 +8,8 @@ task done. Over thousands of sessions, that compounds slop and technical debt.
 
 bettercodex is a work in progress port of
 [OpenAI Codex](https://github.com/openai/codex) trying to fix this in the
-harness. The plan is to use hooks, Andrej Karpathy's
-[`autoresearch`](https://github.com/karpathy/autoresearch), and context efficient
-looping to make the agent notice problems, do the work, and clean up after
-itself.
+harness. The plan is to use hooks and active engineering review to make the
+agent notice problems, do the work, and clean up after itself.
 
 $review is goated, use rigirously to deslop for the time being
 

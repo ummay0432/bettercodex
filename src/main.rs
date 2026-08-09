@@ -21,7 +21,6 @@ mod platform_fs;
 mod process_runtime;
 mod prompt_history;
 mod protocol;
-mod quality_loop;
 mod repository;
 mod rollout;
 mod shell_command;
@@ -54,7 +53,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::sync::mpsc::unbounded_channel;
 use uuid::Uuid;
 
 const MODEL: &str = "gpt-5.6-sol";
@@ -148,14 +146,6 @@ fn run() -> Result<()> {
         Command::Update => update::run_update(),
         Command::UpdateHelp => {
             write_update_help()?;
-            Ok(())
-        }
-        Command::InternalLoopState { run_root, contract } => {
-            let cwd = std::env::current_dir()?;
-            write_stdout_line(format_args!(
-                "{}",
-                quality_loop::capture_state_identity(&cwd, &run_root, &contract)?
-            ))?;
             Ok(())
         }
         Command::Run(options) => run_agent_command(&arguments, options, None),
@@ -272,7 +262,7 @@ async fn run_agent(
         None => Agent::new(&requested_cwd)?,
     };
     if let Some(input) = input {
-        let answer = submit_cli_input(&mut agent, input).await?;
+        let answer = agent.submit_user_input(input).await?;
         write_stdout_line(format_args!("{answer}"))?;
         return Ok(());
     }
@@ -295,49 +285,16 @@ async fn run_line_mode(agent: &mut Agent) -> Result<()> {
             write_stdout_line(format_args!(""))?;
             break;
         };
-        if line.trim().is_empty() {
+        let prompt = line.trim();
+        if prompt.is_empty() {
             continue;
         }
-        match submit_cli_input(agent, UserInput::text(line)).await {
+        match agent.submit(prompt).await {
             Ok(answer) => write_stdout_line(format_args!("{answer}\n"))?,
             Err(error) => write_stderr_line(format_args!("error: {error:#}\n"))?,
         }
     }
     Ok(())
-}
-
-async fn submit_cli_input(agent: &mut Agent, input: UserInput) -> Result<String> {
-    let invocation = quality_loop::parse_invocation_with_mode(
-        input.submitted_text(),
-        input.has_attachments(),
-        false,
-    )?;
-    let Some(invocation) = invocation else {
-        return agent.submit_user_input(input).await;
-    };
-    let (events_tx, mut events_rx) = unbounded_channel();
-    let progress = tokio::spawn(async move {
-        while let Some(event) = events_rx.recv().await {
-            match event {
-                events::AgentEvent::LoopProgress(progress) => {
-                    write_stderr_line(format_args!("{}", progress.stderr_line()))?;
-                }
-                events::AgentEvent::Warning(warning) => {
-                    write_stderr_line(format_args!("warning: {warning}"))?;
-                }
-                _ => {}
-            }
-        }
-        Ok::<(), io::Error>(())
-    });
-    let (_, control) = agent::TurnControl::non_steerable_channel();
-    let outcome =
-        quality_loop::submit_with_control(agent, input, invocation, events_tx, control).await?;
-    progress.await??;
-    match outcome {
-        agent::SubmitOutcome::Completed(answer) => Ok(answer),
-        agent::SubmitOutcome::Cancelled => Err(anyhow!("quality loop was cancelled")),
-    }
 }
 
 enum Command {
@@ -362,10 +319,6 @@ enum Command {
     LogoutHelp,
     Update,
     UpdateHelp,
-    InternalLoopState {
-        run_root: PathBuf,
-        contract: PathBuf,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,27 +387,6 @@ impl Command {
                 ));
             }
             return Ok(Self::InternalSourceRevision);
-        }
-        if arguments
-            .peek()
-            .is_some_and(|argument| argument == "--internal-loop-state")
-        {
-            arguments.next();
-            let run_root = arguments
-                .next()
-                .ok_or_else(|| anyhow!("internal loop state helper requires a run directory"))?;
-            let contract = arguments
-                .next()
-                .ok_or_else(|| anyhow!("internal loop state helper requires a contract"))?;
-            if arguments.next().is_some() {
-                return Err(anyhow!(
-                    "internal loop state helper received extra arguments"
-                ));
-            }
-            return Ok(Self::InternalLoopState {
-                run_root: PathBuf::from(run_root),
-                contract: PathBuf::from(contract),
-            });
         }
         if arguments
             .peek()
@@ -594,7 +526,7 @@ fn write_help() -> io::Result<()> {
         ""
     };
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest public main revision\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work. Use /loop <task> or $loop for the opt-in evaluator-backed quality loop (three working sessions by default).{tmux_help} Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest public main revision\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION"),
     ))
 }

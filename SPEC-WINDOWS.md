@@ -40,7 +40,7 @@ configuration framework, app server, release packaging, or plugin system.
 This is not principally a shortcut-labeling patch. The current checkout has
 Unix-only assumptions in process creation, PTY management, signals, shell
 detection, terminal probing, file locking, durable replacement, permissions,
-tmux migration, Git helpers, installer logic, and the quality loop. A TUI that
+tmux migration, Git helpers, and installer logic. A TUI that
 merely compiles on Windows while command execution, paste, interruption,
 updates, or recovery remain unreliable does not satisfy this specification.
 
@@ -76,9 +76,7 @@ An operator on a supported Windows system must be able to:
    process tree;
 5. use repositories and state stored at native Windows paths, including paths
    containing spaces and non-ASCII characters;
-6. run the bettercodex quality loop with its integrity, evaluator, persistence,
-   and process-lifetime guarantees intact; and
-7. receive the same model-facing behavior and retained Codex behavior as an
+6. receive the same model-facing behavior and retained Codex behavior as an
    equivalent Linux or macOS session, except for explicitly documented
    platform capabilities.
 
@@ -254,7 +252,6 @@ then-current tree rather than treating this table as exhaustive.
 | Embedded skills | `src/system_skills.rs` | Unix modes, `O_NOFOLLOW`, `flock`, rename and directory-sync assumptions | Preserve integrity with Windows-safe locks and reparse-point handling |
 | Git and tools | `src/tui/git_diff.rs`, `src/tools/patch.rs`, `src/tools/papercuts.rs` | `/dev/null`, Unix byte paths, Unix error constants and open flags | Native path/null-device/error and safe-open behavior |
 | Managed terminal | `src/managed_session.rs` | Unix sockets, descriptor passing, PTYs, signals, and tmux | Compile-time Windows stub; hide `/tmux` |
-| Quality loop | `src/quality_loop/` | Unix modes, metadata identities, locks, signals, FIFOs in tests | Port integrity and evaluator lifetime before GA |
 | Installer/updater | `scripts/install.sh`, `src/update.rs`, `spec-install.md` | `/bin/sh`, Unix cache/PATH/atomic-replace assumptions | PowerShell installer and Windows-safe update finalization |
 | CI | repository workflows and local recipes | No Windows target or interactive matrix | Native Windows compile, test, installer, and ConPTY coverage |
 
@@ -292,7 +289,7 @@ differ:
 
 Do not create wrappers for ordinary `std::fs`, `Path`, or terminal operations
 that already work cross-platform. Conversely, do not scatter raw Win32 calls
-through the TUI, state, installer, and quality-loop modules. A small private
+through the TUI, state, and installer modules. A small private
 platform helper is justified when several security-sensitive call sites need
 the same replacement or reparse-point invariant.
 
@@ -663,9 +660,7 @@ Command argument derivation is:
 | Cmd | either | `/c <command>` |
 
 Arguments must be passed as an argument vector. Do not build another quoting
-layer around the complete command line. Direct-argv evaluator commands must
-remain direct argv and must not be routed through PowerShell merely because the
-host is Windows.
+layer around the complete command line.
 
 Unix locale overrides such as `LANG=C.UTF-8`, `LC_CTYPE`, and `LC_ALL` should be
 target-gated; they are not a Windows encoding mechanism. Portable controls such
@@ -1008,8 +1003,8 @@ release them deterministically. Nonblocking acquisition must distinguish
 contention from malformed state or permission failure.
 
 Tests must use separate processes, not only threads, because the relevant
-locking semantics protect installer, history, rollout, state, skills, and
-quality-loop operations across processes.
+locking semantics protect installer, history, rollout, state, and skills across
+processes.
 
 ### 17.3 Atomic replacement
 
@@ -1131,45 +1126,9 @@ On Windows:
 On Unix, current live-migration behavior and tests must remain unchanged. WSL
 users running the Linux binary retain the Linux `/tmux` capability.
 
-## 20. Quality-loop portability
+## 20. Authentication, sessions, skills, and application lifecycle
 
-The quality loop is a core bettercodex capability, not an optional incidental
-command. Native Windows may be labeled preview while `/loop` is temporarily
-unavailable, but it must not be labeled generally supported until the quality
-loop passes the Windows acceptance suite.
-
-The port must address at least:
-
-- Unix modes and `flock` in contracts, run state, repository integrity, and
-  evaluator artifacts;
-- Unix device/inode metadata used to detect identity changes;
-- symlink assumptions, replacing them with Windows reparse-point and stable
-  file-identity checks where the invariant requires identity;
-- evaluator process groups, signals, timeouts, and descendant cleanup, using
-  the shared Job Object runtime rather than a second process implementation;
-- direct executable, `.exe`, `.cmd`, and PowerShell command invocation without
-  ambiguous quoting;
-- repository paths containing drive letters, spaces, and Unicode;
-- test fixtures that currently rely on Unix FIFOs, permissions, or symlinks;
-  and
-- cleanup of evaluator workspaces and task-owned build artifacts after success,
-  rejection, interruption, and process crash.
-
-Windows integrity checks need not manufacture Unix inode semantics. They must
-preserve the actual promise: candidates cannot substitute, redirect, or modify
-fixed evaluator/oracle inputs undetected. Use current upstream/Rust handle and
-file-identity facilities appropriate to Windows and test junction/reparse
-attacks directly.
-
-The loop's evaluator may invoke native commands. A script ending in `.cmd` may
-require `cmd /c`, while `.ps1` may require an explicit PowerShell host under the
-evaluator's direct-argv rules. This dispatch must be deterministic and recorded
-in the evaluation package; it must not infer a shell from untrusted script
-contents.
-
-## 21. Authentication, sessions, skills, and application lifecycle
-
-### 21.1 Authentication
+### 20.1 Authentication
 
 Device-code/ChatGPT login must work in native PowerShell and the primary
 terminal hosts. Browser launch is optional convenience; if Windows cannot open
@@ -1190,7 +1149,7 @@ add a separate certificate store or proxy subsystem merely for the port; follow
 current upstream if the retained client requires Windows-specific native-root
 or system-proxy handling.
 
-### 21.2 Rollouts and resume
+### 20.2 Rollouts and resume
 
 Saved JSONL sessions, rollout indexes, history search, compaction state, and
 resume ordering must behave identically across supported platforms. JSONL is an
@@ -1202,7 +1161,7 @@ interrupted writes, timestamp ordering, non-ASCII paths, and resume after a
 process crash. Unix creation modes and directory flushes may differ internally;
 the externally visible atomicity and privacy promises may not.
 
-### 21.3 Embedded system skills
+### 20.3 Embedded system skills
 
 Embedded skill installation must retain content hashing, lock exclusion,
 staging, backup recovery, symlink/redirection resistance, and complete resource
@@ -1215,7 +1174,7 @@ unconditional follow of an installer-controlled destination. Handle-based or
 metadata checks must be performed close enough to replacement to avoid an
 obvious check/use race under the supported threat model.
 
-### 21.4 Application startup
+### 20.4 Application startup
 
 Startup ordering should remain:
 
@@ -1230,7 +1189,7 @@ Windows-specific work must not move network lookup or V8 initialization into a
 new serial hot path without measurement. Terminal console-mode setup should be
 milliseconds, not a visible startup phase.
 
-## 22. Error handling and diagnostics
+## 21. Error handling and diagnostics
 
 Windows errors should identify the failed operation and relevant path or
 program while retaining `std::io::Error`/Win32 context. Raw numeric OS errors
@@ -1259,9 +1218,9 @@ attachments, or unbounded command output. Platform-specific errors sent to the
 model must remain concise and describe what the model can do next; verbose
 installer and developer diagnostics belong in the terminal/logging path.
 
-## 23. Footprint and bloat budget
+## 22. Footprint and bloat budget
 
-### 23.1 Baseline and methodology
+### 22.1 Baseline and methodology
 
 The drafting baseline measured approximately:
 
@@ -1277,7 +1236,7 @@ measurements. The implementation phase must record exact commands, source
 revision, Rust target, profile, V8 artifact, filesystem allocation, and machine
 for before/after comparisons.
 
-### 23.2 Source estimate
+### 22.2 Source estimate
 
 The expected net source growth is:
 
@@ -1287,7 +1246,7 @@ The expected net source growth is:
 | Console lifecycle, paste, shortcuts, clipboard | 500–800 LOC | 400–700 LOC | Paste-burst tests are intentionally substantial |
 | Paths, locks, replacement, auth/state | 250–450 LOC | 300–500 LOC | Shared primitives prevent duplicate fixes |
 | PowerShell V8/install/update | 700–1,100 LOC | 300–600 LOC | Exact-main and running-executable handling dominate |
-| Git/tools/quality-loop portability | 400–800 LOC | 400–800 LOC | Depends on reuse of process/filesystem primitives |
+| Git/tool portability | 150–350 LOC | 150–350 LOC | Depends on reuse of process/filesystem primitives |
 | CI and user documentation | 200–400 LOC | Included above | Avoid duplicated platform manuals |
 
 After replacing obsolete Unix-only branches and deduplicating common behavior,
@@ -1301,7 +1260,7 @@ be reduced further. A smaller implementation is desirable only if it preserves
 the behavioral and test contract; deleting tests to hit the estimate is not an
 improvement.
 
-### 23.3 Binary size
+### 22.3 Binary size
 
 V8 dominates the current release artifact. Win32 API wrappers mostly call
 system DLLs, and target-only dependencies do not enter Unix binaries. The
@@ -1324,7 +1283,7 @@ Do not quote debug binary size as installed footprint. Report the stripped
 release executable and, if compressed for transport during installation, both
 compressed and installed sizes.
 
-### 23.4 Persistent disk use
+### 22.4 Persistent disk use
 
 The installed command is small relative to a local source-build environment.
 Expected persistent Windows disk use is:
@@ -1347,7 +1306,7 @@ first build and distinguish installed application size from reusable developer
 tool/cache size. Documentation must not market the 60 MiB executable while
 hiding the source-build prerequisites.
 
-### 23.5 Runtime resources
+### 22.5 Runtime resources
 
 Target-gated compatibility code should not materially increase steady-state
 application memory. Each active command adds a pseudoconsole, pipes, a Job
@@ -1367,19 +1326,19 @@ No fixed memory number is specified before a Windows baseline exists. Any
 monotonic handle growth or retained per-command process resource is a release
 blocker.
 
-### 23.6 Dependency and maintenance cost
+### 22.6 Dependency and maintenance cost
 
 The expected direct manifest increase is four to six focused dependencies,
 mostly Windows-only, plus approximately ten to twenty transitive packages.
 Measure the actual target-specific `cargo tree` and duplicate versions in CI.
 
 The largest footprint is maintenance rather than bytes. Every future change to
-terminal lifecycle, composer input, command execution, file replacement,
-installation, or quality-loop integrity gains a native Windows branch and test
+terminal lifecycle, composer input, command execution, file replacement, or
+installation gains a native Windows branch and test
 lane. Windows support must therefore land with ownership in tests and
 documentation, not as a compile-only community tier mislabeled as supported.
 
-### 23.7 Avoided keymap/configuration bloat
+### 22.7 Avoided keymap/configuration bloat
 
 Importing upstream's configurable keymap would pull in several thousand lines
 of key-chord, command, configuration, migration, UI, and test surface. It would
@@ -1390,7 +1349,7 @@ The initial fixed alias matrix is the deliberate smaller design. A future
 operator with a concrete bettercodex use may reopen key remapping as a separate
 product decision with its own footprint and migration analysis.
 
-## 24. Delivery plan
+## 23. Delivery plan
 
 Each phase must leave Linux and macOS green. A phase may use a draft pull
 request, but the public documentation must continue saying Windows is
@@ -1480,20 +1439,7 @@ Gate: install, same-revision no-op, changed-revision incremental update, forced
 failure rollback, and uninstall-by-documented-manual-removal scenarios pass on
 fresh Windows test machines.
 
-### Phase 6: quality-loop parity
-
-Deliverables:
-
-- evaluator and repository-integrity portability;
-- Job Object-backed evaluator cleanup;
-- direct command dispatch for Windows script/executable types;
-- Windows-safe state and artifact cleanup; and
-- representative end-to-end `$loop` and `/loop` runs.
-
-Gate: the quality loop passes its hard acceptance, improvement, interruption,
-resume/recovery, and anti-tampering scenarios natively.
-
-### Phase 7: supported release
+### Phase 6: supported release
 
 Deliverables:
 
@@ -1507,9 +1453,9 @@ Deliverables:
 Gate: all definition-of-done criteria below pass. Only then may the project say
 that native Windows is supported.
 
-## 25. Validation strategy
+## 24. Validation strategy
 
-### 25.1 Continuous integration
+### 24.1 Continuous integration
 
 Add a native `windows-latest` lane that uses the pinned Rust toolchain and
 PowerShell V8 wrapper. At minimum it must run:
@@ -1537,7 +1483,7 @@ Cross-compilation from Linux may supplement dependency checks but cannot
 replace the native Windows lane. Wine cannot validate ConPTY, Windows Terminal,
 clipboard, console modes, Job Objects, or installer replacement semantics.
 
-### 25.2 Automated native integration tests
+### 24.2 Automated native integration tests
 
 Native tests should create isolated temporary profile, Codex, bettercodex,
 cache, repository, and install roots. They must clean those task-owned roots on
@@ -1555,14 +1501,13 @@ Required suites include:
 - junction/reparse-point refusal;
 - Git diff and hooks suppression with Git for Windows;
 - session/auth/skill crash recovery;
-- installer source pinning, caches, PATH, update finalization, and rollback; and
-- quality-loop evaluator integrity and cleanup.
+- installer source pinning, caches, PATH, update finalization, and rollback.
 
 Tests that mutate real console modes or the user PATH must use an isolated
 process/registry environment where possible and restore exact prior state in a
 finally guard.
 
-### 25.3 Interactive terminal matrix
+### 24.3 Interactive terminal matrix
 
 CI cannot prove the complete interactive contract. Before supported release,
 run and record this matrix:
@@ -1579,7 +1524,7 @@ Record OS build, terminal version, shell version, keyboard layout, bcodex source
 revision, Rust target, and result. "Works on my Windows machine" without those
 details is not a support result.
 
-### 25.4 Interactive scenarios
+### 24.4 Interactive scenarios
 
 Each primary terminal/shell pair must cover:
 
@@ -1604,7 +1549,7 @@ Each primary terminal/shell pair must cover:
 18. terminal usability immediately after normal exit, crash-path cleanup, and
     updater exit.
 
-### 25.5 Installer failure matrix
+### 24.5 Installer failure matrix
 
 Installer tests must inject failure before and after every commit boundary:
 
@@ -1630,7 +1575,7 @@ Every case before commit must preserve the installed command byte-for-byte.
 Every case during finalization must leave or restore one verified command and a
 bounded recoverable transaction record.
 
-### 25.6 Performance and footprint measurements
+### 24.6 Performance and footprint measurements
 
 For the final candidate, record:
 
@@ -1647,11 +1592,11 @@ For the final candidate, record:
 Compare Linux/macOS release size and startup against their Phase 0 baselines to
 prove target gating did not impose material regressions.
 
-## 26. Definition of done
+## 25. Definition of done
 
 Native Windows support is complete only when all of the following are true.
 
-### 26.1 Policy and build
+### 25.1 Policy and build
 
 - Product direction explicitly authorizes the support matrix.
 - `x86_64-pc-windows-msvc` builds, tests, and lints through the verified V8
@@ -1660,7 +1605,7 @@ Native Windows support is complete only when all of the following are true.
   longer prevent compilation.
 - The release remains one `bcodex.exe` with no required installed sidecar.
 
-### 26.2 Installation and update
+### 25.2 Installation and update
 
 - A clean supported machine can install from an immutable public-`main`
   selection using the documented PowerShell command.
@@ -1672,7 +1617,7 @@ Native Windows support is complete only when all of the following are true.
 - Every injected failure preserves or restores the previous verified command.
 - PATH and stale-transaction behavior are deterministic and recoverable.
 
-### 26.3 Terminal and shortcuts
+### 25.3 Terminal and shortcuts
 
 - Windows Terminal and VS Code pass the complete interactive scenarios.
 - Multiline paste never submits partially, whether delivered as `Event::Paste`
@@ -1685,7 +1630,7 @@ Native Windows support is complete only when all of the following are true.
   tested exit path.
 - Transcript rows remain in host scrollback after overflow and resize.
 
-### 26.4 Commands and tools
+### 25.4 Commands and tools
 
 - Piped and ConPTY commands preserve paths, environment, output, resize, input,
   exit, interrupt, and process-tree semantics.
@@ -1694,18 +1639,16 @@ Native Windows support is complete only when all of the following are true.
 - Git diff, patch application, clipboard image paths, and papercut logging work
   in native repositories with spaces, Unicode, and CRLF.
 
-### 26.5 Persistence and quality
+### 25.5 Persistence and quality
 
 - Auth, state, history, rollouts, and embedded skills are private enough for the
   documented Windows threat model and failure-atomic.
 - Locks exclude real competing processes and stale state is handled safely.
 - Reparse points cannot redirect protected install, cleanup, or integrity
   operations in the tested cases.
-- `$loop` and `/loop` complete, interrupt, recover, and reject tampering on
-  Windows with task-owned artifacts cleaned.
 - `/tmux` is absent on native Windows and unchanged on Unix.
 
-### 26.6 Regression and footprint
+### 25.6 Regression and footprint
 
 - Linux and macOS retained tests remain green.
 - Current upstream Codex was re-inspected at implementation completion and
@@ -1716,9 +1659,9 @@ Native Windows support is complete only when all of the following are true.
   in Unix artifacts remains.
 - User and developer documentation matches the actual support status.
 
-## 27. Risks and mitigations
+## 26. Risks and mitigations
 
-### 27.1 Upstream drift
+### 26.1 Upstream drift
 
 **Risk:** Codex's active Windows implementation changes while this port is in
 progress, especially crossterm input, ConPTY teardown, paste timing, or
@@ -1728,7 +1671,7 @@ installer behavior.
 again before each retained subsystem lands, and port regression tests with the
 behavior. Do not freeze this drafting revision as design authority.
 
-### 27.2 Terminal protocol differences
+### 26.2 Terminal protocol differences
 
 **Risk:** Windows Terminal, xterm.js, and other ConPTY hosts deliver modified
 keys, paste, focus, scrollback, and query responses differently.
@@ -1737,7 +1680,7 @@ keys, paste, focus, scrollback, and query responses differently.
 use paste-burst detection, retain byte-level tests, and run the explicit
 interactive matrix.
 
-### 27.3 Process-tree leaks or overbroad termination
+### 26.3 Process-tree leaks or overbroad termination
 
 **Risk:** a naive `Child::kill` leaks descendants, while an incorrectly managed
 Job Object kills a process not owned by the command session or drops output
@@ -1747,7 +1690,7 @@ prematurely.
 hard interruption, test root/descendant races, and measure handle/process state
 after repeated cycles.
 
-### 27.4 Running executable and antivirus contention
+### 26.4 Running executable and antivirus contention
 
 **Risk:** Windows file sharing and security software can prevent or delay
 replacement of `bcodex.exe`, producing a broken updater.
@@ -1756,16 +1699,16 @@ replacement of `bcodex.exe`, producing a broken updater.
 use same-volume stage/backup replacement, retry only transient sharing errors,
 and failure-inject every transition.
 
-### 27.5 Reparse-point and ACL mistakes
+### 26.5 Reparse-point and ACL mistakes
 
 **Risk:** mechanically deleting Unix `O_NOFOLLOW` and mode code weakens
-installer, auth, skill, or evaluator integrity.
+installer, auth, or skill integrity.
 
 **Mitigation:** define the actual security promise, use narrow Windows
 handle/reparse checks, rely on user-profile ACLs only after testing them, and
 attack the implementation with junction/reparse fixtures.
 
-### 27.6 Local-build installation burden
+### 26.6 Local-build installation burden
 
 **Risk:** MSVC, Windows SDK, Rust, V8, and Cargo caches consume far more disk and
 setup time than the installed executable suggests.
@@ -1774,7 +1717,7 @@ setup time than the installed executable suggests.
 first-machine possibility, reuse exact caches, require consent before installing
 large prerequisites, and document safe cache removal.
 
-### 27.7 Scope creep
+### 26.7 Scope creep
 
 **Risk:** Windows work becomes a vehicle for sandbox, keymap, configuration,
 installer-package, ARM64, or terminal-tab features that bettercodex did not ask
@@ -1784,32 +1727,31 @@ for.
 behavior, and require a separate concrete product decision and footprint review
 for each expansion.
 
-### 27.8 False support from compile-only validation
+### 26.8 False support from compile-only validation
 
 **Risk:** CI goes green while multiline paste submits early, Ctrl+C is trapped,
 terminal modes remain damaged, or descendants leak.
 
 **Mitigation:** do not label Windows supported until the native process,
-failure, and interactive terminal matrices are recorded and the quality loop is
-portable.
+failure, and interactive terminal matrices are recorded.
 
-## 28. Documentation and rollout
+## 27. Documentation and rollout
 
-### 28.1 Status stages
+### 27.1 Status stages
 
 Use these public labels precisely:
 
 - **Unsupported:** current state; no native support claim.
 - **Developer preview:** native builds are available for contributors, known
   missing capabilities are listed, and no compatibility promise is made.
-- **Preview:** install/TUI/process/state paths work, but a clearly documented GA
-  gate such as quality-loop parity remains.
+- **Preview:** install/TUI/process/state paths work, but clearly documented GA
+  acceptance criteria remain.
 - **Supported:** every definition-of-done item passes for the primary matrix.
 
 Do not call compile success or one maintainer's terminal test a preview by
 itself.
 
-### 28.2 Documentation updates required at support time
+### 27.2 Documentation updates required at support time
 
 Update at least:
 
@@ -1828,7 +1770,7 @@ Update at least:
 The install guide must distinguish native Windows from WSL and must state that
 commands run unsandboxed with the Windows user's permissions.
 
-### 28.3 Rollback
+### 27.3 Rollback
 
 Because public installs track exact `main`, a broken Windows commit cannot be
 hidden behind an unchanged package version. Windows support should therefore
@@ -1839,7 +1781,7 @@ on public `main`; do not manipulate tags or Releases. The installer/updater must
 continue preserving the previous local binary when the new `main` candidate
 cannot build or verify.
 
-## 29. Implementation map
+## 28. Implementation map
 
 This map identifies expected touch points, not a mandate to edit every file.
 Re-run the platform search before implementation because the tree evolves.
@@ -1866,12 +1808,11 @@ Re-run the platform search before implementation because the tree evolves.
 | `src/tui/git_diff.rs` | Native path arguments and Windows null device |
 | `src/tools/patch.rs`, `papercuts.rs` | Portable errors and Windows-safe file opening |
 | `src/managed_session.rs` and callers | Unix cfg plus Windows no-op/hidden command path |
-| `src/quality_loop/` | Locks, identity, process trees, scripts, fixtures, cleanup |
 | `src/update.rs` and tests | Select immutable PowerShell installer and coordinate finalization |
 | CI workflows | Native Windows check/test/clippy/release/installer lanes |
 | user/developer docs | Support matrix, shortcuts, install burden, diagnostics, non-goals |
 
-## 30. Pre-implementation decisions and spikes
+## 29. Pre-implementation decisions and spikes
 
 The product decisions are made above: x64 MSVC first, Windows 11 primary,
 Windows 10 best effort, no sandbox, no keymap framework, no native tmux
@@ -1887,8 +1828,8 @@ Phase 0:
    proven old-or-new guarantee for a running `bcodex.exe`?
 4. Can all state/history/rollout locks use the pinned standard library API, or
    does any shared-lock behavior require a focused dependency?
-5. Which handle/file-ID APIs give the smallest reliable reparse and evaluator-
-   identity implementation on the supported OS floor?
+5. Which handle/file-ID APIs give the smallest reliable reparse-point defense
+   on the supported OS floor?
 6. Does current upstream require its patched crossterm to clear VT input mode,
    or has released crossterm incorporated that behavior by implementation time?
 7. What is the measured absolute Windows release size and clean/warm cache cost
@@ -1898,13 +1839,12 @@ Each spike must end in a source-backed decision and a focused test or benchmark,
 not an enduring alternate implementation. If a result materially changes the
 scope or footprint, update this specification before proceeding.
 
-## 31. Final recommendation
+## 30. Final recommendation
 
 Proceed only as a deliberate platform project. The leanest credible design is
 to port current upstream's ConPTY/Job Object, console mode, shell, clipboard,
 and paste behavior; add Windows-safe persistence and exact-main PowerShell
-installation; hide tmux; and require quality-loop parity before general
-support.
+installation; and hide tmux on native Windows.
 
 The likely installed binary increase is modest because V8 already dominates.
 The meaningful costs are 5,000–8,000 repository lines, a new native CI and

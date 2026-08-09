@@ -212,20 +212,18 @@ enum ActiveSubmissionRoute {
     SteerOrdinary,
 }
 
-fn active_submission_route(prompt: &UserPrompt) -> Result<ActiveSubmissionRoute> {
+fn active_submission_route(prompt: &UserPrompt) -> ActiveSubmissionRoute {
     let text = prompt.text_without_image_placeholders();
-    let invocation =
-        crate::quality_loop::parse_invocation_with_mode(&text, prompt.image_count() > 0, true)?;
     let invokes_review = prompt
         .skill_mentions()
         .iter()
         .any(|mention| mention.selection().name() == "review")
         || crate::skills::explicitly_invokes_review(&text);
-    Ok(if invocation.is_some() || invokes_review {
+    if invokes_review {
         ActiveSubmissionRoute::QueueNextTurn
     } else {
         ActiveSubmissionRoute::SteerOrdinary
-    })
+    }
 }
 
 impl Runtime {
@@ -563,15 +561,11 @@ impl Runtime {
                 let history_text = submission.prompt().text_without_image_placeholders();
                 if self.turn.is_some() {
                     match active_submission_route(submission.prompt()) {
-                        Err(error) => self.view.reject_composer_submission(
-                            submission,
-                            format!("Invalid quality loop request: {error:#}"),
-                        ),
-                        Ok(ActiveSubmissionRoute::QueueNextTurn) => {
+                        ActiveSubmissionRoute::QueueNextTurn => {
                             self.persist_prompt(&history_text);
                             self.view.queue_follow_up(submission.into_prompt());
                         }
-                        Ok(ActiveSubmissionRoute::SteerOrdinary) => {
+                        ActiveSubmissionRoute::SteerOrdinary => {
                             self.persist_prompt(&history_text);
                             let prompt = submission.into_prompt();
                             let steering = self.turn_handle.as_ref().and_then(|turn| {
@@ -590,16 +584,8 @@ impl Runtime {
             Action::Queue(submission) => {
                 let history_text = submission.prompt().text_without_image_placeholders();
                 if self.turn.is_some() {
-                    match active_submission_route(submission.prompt()) {
-                        Ok(_) => {
-                            self.persist_prompt(&history_text);
-                            self.view.queue_follow_up(submission.into_prompt());
-                        }
-                        Err(error) => self.view.reject_composer_submission(
-                            submission,
-                            format!("Invalid quality loop request: {error:#}"),
-                        ),
-                    }
+                    self.persist_prompt(&history_text);
+                    self.view.queue_follow_up(submission.into_prompt());
                 } else if self.start_composer_turn(submission) {
                     self.persist_prompt(&history_text);
                 }
@@ -900,9 +886,9 @@ impl Runtime {
     }
 
     fn start_composer_turn(&mut self, submission: ComposerSubmission) -> bool {
-        match self.prepare_turn_start(submission.prompt()) {
-            Ok((agent, invocation)) => {
-                self.spawn_turn(agent, submission.into_prompt(), invocation);
+        match self.prepare_turn_start() {
+            Ok(agent) => {
+                self.spawn_turn(agent, submission.into_prompt());
                 true
             }
             Err(error) => {
@@ -913,61 +899,30 @@ impl Runtime {
     }
 
     fn start_turn(&mut self, prompt: UserPrompt) {
-        match self.prepare_turn_start(&prompt) {
-            Ok((agent, invocation)) => self.spawn_turn(agent, prompt, invocation),
+        match self.prepare_turn_start() {
+            Ok(agent) => self.spawn_turn(agent, prompt),
             Err(error) => self.view.reject_prompt(prompt, error),
         }
     }
 
-    fn prepare_turn_start(
-        &mut self,
-        prompt: &UserPrompt,
-    ) -> std::result::Result<(Agent, Option<crate::quality_loop::LoopInvocation>), String> {
-        let invocation = crate::quality_loop::parse_invocation_with_mode(
-            &prompt.text_without_image_placeholders(),
-            prompt.image_count() > 0,
-            true,
-        )
-        .map_err(|error| format!("Invalid quality loop request: {error:#}"))?;
-        let agent = self
-            .agent
+    fn prepare_turn_start(&mut self) -> std::result::Result<Agent, String> {
+        self.agent
             .take()
-            .ok_or_else(|| "Could not start turn: the active agent is unavailable".to_string())?;
-        Ok((agent, invocation))
+            .ok_or_else(|| "Could not start turn: the active agent is unavailable".to_string())
     }
 
-    fn spawn_turn(
-        &mut self,
-        mut agent: Agent,
-        prompt: UserPrompt,
-        invocation: Option<crate::quality_loop::LoopInvocation>,
-    ) {
+    fn spawn_turn(&mut self, mut agent: Agent, prompt: UserPrompt) {
         let (events_tx, events_rx) = unbounded_channel();
-        let (turn_handle, turn_control) = if invocation.is_some() {
-            crate::agent::TurnControl::non_steerable_channel()
-        } else {
-            crate::agent::TurnControl::channel()
-        };
+        let (turn_handle, turn_control) = crate::agent::TurnControl::channel();
         self.view.start_turn(prompt.clone());
         self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
         self.turn = Some(tokio::spawn(async move {
             let input = UserInput::prompt(prompt);
-            let result = if let Some(invocation) = invocation {
-                crate::quality_loop::submit_with_control(
-                    &mut agent,
-                    input,
-                    invocation,
-                    events_tx,
-                    turn_control,
-                )
-                .await
-            } else {
-                agent
-                    .submit_with_control(input, events_tx, turn_control)
-                    .await
-            };
+            let result = agent
+                .submit_with_control(input, events_tx, turn_control)
+                .await;
             (agent, TurnCompletion::Submission(result))
         }));
     }
