@@ -23,6 +23,8 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
+const INDEX_BATCH_SIZE: usize = 256;
+
 /// A single match result returned from the search.
 ///
 /// * `score` – Relevance score returned by `nucleo`.
@@ -52,10 +54,26 @@ pub enum MatchType {
     Directory,
 }
 
-/// Carries the entry type observed by the walker so matched paths are not restatted.
+/// Retains only the path data needed to materialize a match.
+///
+/// The fuzzy column already owns the relative path in UTF-32. Keeping another absolute path here
+/// repeated the root prefix for every indexed entry and forced snapshots to rediscover the root.
 struct IndexedEntry {
-    full_path: Arc<str>,
+    relative_path: Box<str>,
+    root_index: u32,
     match_type: MatchType,
+}
+
+struct SearchRoot {
+    path: PathBuf,
+    depth: usize,
+}
+
+impl SearchRoot {
+    fn new(path: PathBuf) -> Self {
+        let depth = path.components().count();
+        Self { path, depth }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
@@ -144,11 +162,18 @@ pub fn create_session(
         anyhow::bail!("at least one search directory is required");
     };
     let override_matcher = build_override_matcher(primary_search_directory, &exclude)?;
+    let search_roots: Arc<[SearchRoot]> = search_directories
+        .into_iter()
+        .map(SearchRoot::new)
+        .collect::<Vec<_>>()
+        .into();
     let (work_tx, work_rx) = unbounded();
 
     let notify_tx = work_tx.clone();
+    let nucleo_tick_queued = Arc::new(AtomicBool::new(false));
+    let tick_queued = Arc::clone(&nucleo_tick_queued);
     let notify = Arc::new(move || {
-        let _ = notify_tx.send(WorkSignal::NucleoNotify);
+        queue_nucleo_tick(&tick_queued, &notify_tx);
     });
     let nucleo = Nucleo::new(
         Config::DEFAULT.match_paths(),
@@ -161,7 +186,7 @@ pub fn create_session(
     let cancelled = cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
     let inner = Arc::new(SessionInner {
-        search_directories,
+        search_roots,
         limit: limit.get(),
         threads: threads.get(),
         compute_indices,
@@ -170,6 +195,7 @@ pub fn create_session(
         shutdown: Arc::new(AtomicBool::new(false)),
         reporter,
         work_tx,
+        nucleo_tick_queued,
     });
 
     let matcher_inner = inner.clone();
@@ -182,7 +208,7 @@ pub fn create_session(
 }
 
 struct SessionInner {
-    search_directories: Vec<PathBuf>,
+    search_roots: Arc<[SearchRoot]>,
     limit: usize,
     threads: usize,
     compute_indices: bool,
@@ -191,6 +217,7 @@ struct SessionInner {
     shutdown: Arc<AtomicBool>,
     reporter: Arc<dyn SessionReporter>,
     work_tx: Sender<WorkSignal>,
+    nucleo_tick_queued: Arc<AtomicBool>,
 }
 
 enum WorkSignal {
@@ -198,6 +225,18 @@ enum WorkSignal {
     NucleoNotify,
     WalkComplete,
     Shutdown,
+}
+
+fn queue_nucleo_tick(tick_queued: &AtomicBool, work_tx: &Sender<WorkSignal>) {
+    if tick_queued
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if work_tx.send(WorkSignal::NucleoNotify).is_err() {
+        tick_queued.store(false, Ordering::Release);
+    }
 }
 
 fn build_override_matcher(
@@ -216,23 +255,63 @@ fn build_override_matcher(
     Ok(Some(matcher))
 }
 
-fn get_file_path<'a>(path: &'a Path, search_directories: &[PathBuf]) -> Option<(usize, &'a str)> {
-    let mut best_match: Option<(usize, &Path)> = None;
-    for (idx, root) in search_directories.iter().enumerate() {
-        if let Ok(rel_path) = path.strip_prefix(root) {
-            let root_depth = root.components().count();
-            match best_match {
-                Some((best_idx, _))
-                    if search_directories[best_idx].components().count() >= root_depth => {}
-                _ => {
-                    best_match = Some((idx, rel_path));
-                }
-            }
+fn get_file_path<'a>(path: &'a Path, search_roots: &[SearchRoot]) -> Option<(usize, &'a str)> {
+    let mut best_match: Option<(usize, usize, &Path)> = None;
+    for (root_index, root) in search_roots.iter().enumerate() {
+        if best_match
+            .as_ref()
+            .is_some_and(|(_, best_depth, _)| *best_depth >= root.depth)
+        {
+            continue;
+        }
+        if let Ok(relative_path) = path.strip_prefix(&root.path) {
+            best_match = Some((root_index, root.depth, relative_path));
         }
     }
 
-    let (root_idx, rel_path) = best_match?;
-    rel_path.to_str().map(|p| (root_idx, p))
+    let (root_index, _, relative_path) = best_match?;
+    relative_path.to_str().map(|path| (root_index, path))
+}
+
+/// Per-walker-thread staging that uses Nucleo's bulk reservation path and emits one matcher
+/// notification per batch instead of one per filesystem entry.
+struct IndexBatch {
+    injector: Injector<IndexedEntry>,
+    entries: Vec<IndexedEntry>,
+}
+
+impl IndexBatch {
+    fn new(injector: Injector<IndexedEntry>) -> Self {
+        Self {
+            injector,
+            entries: Vec::with_capacity(INDEX_BATCH_SIZE),
+        }
+    }
+
+    fn push(&mut self, entry: IndexedEntry) {
+        self.entries.push(entry);
+        if self.entries.len() == INDEX_BATCH_SIZE {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.injector
+            .extend(self.entries.drain(..), |entry, columns| {
+                columns[0] = Utf32String::from(entry.relative_path.as_ref());
+            });
+    }
+}
+
+impl Drop for IndexBatch {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            self.flush();
+        }
+    }
 }
 
 /// Walks the search directories and feeds discovered paths into `nucleo`
@@ -252,14 +331,14 @@ fn walker_worker(
     override_matcher: Option<ignore::overrides::Override>,
     injector: Injector<IndexedEntry>,
 ) {
-    let Some(first_root) = inner.search_directories.first() else {
+    let Some(first_root) = inner.search_roots.first() else {
         let _ = inner.work_tx.send(WorkSignal::WalkComplete);
         return;
     };
 
-    let mut walk_builder = WalkBuilder::new(first_root);
-    for root in inner.search_directories.iter().skip(1) {
-        walk_builder.add(root);
+    let mut walk_builder = WalkBuilder::new(&first_root.path);
+    for root in inner.search_roots.iter().skip(1) {
+        walk_builder.add(&root.path);
     }
     walk_builder
         .threads(inner.threads)
@@ -287,8 +366,8 @@ fn walker_worker(
     walker.run(|| {
         const CHECK_INTERVAL: usize = 1024;
         let mut n = 0;
-        let search_directories = inner.search_directories.clone();
-        let injector = injector.clone();
+        let search_roots = Arc::clone(&inner.search_roots);
+        let mut batch = IndexBatch::new(injector.clone());
         let cancelled = inner.cancelled.clone();
         let shutdown = inner.shutdown.clone();
 
@@ -298,23 +377,22 @@ fn walker_worker(
                 Err(_) => return ignore::WalkState::Continue,
             };
             let path = entry.path();
-            let Some(full_path) = path.to_str() else {
+            if path.to_str().is_none() {
                 return ignore::WalkState::Continue;
-            };
-            if let Some((_, relative_path)) = get_file_path(path, &search_directories) {
+            }
+            if let Some((root_index, relative_path)) = get_file_path(path, &search_roots) {
+                let Ok(root_index) = u32::try_from(root_index) else {
+                    return ignore::WalkState::Continue;
+                };
                 let match_type = match entry.file_type() {
                     Some(file_type) if file_type.is_dir() => MatchType::Directory,
                     _ => MatchType::File,
                 };
-                injector.push(
-                    IndexedEntry {
-                        full_path: Arc::from(full_path),
-                        match_type,
-                    },
-                    |_, cols| {
-                        cols[0] = Utf32String::from(relative_path);
-                    },
-                );
+                batch.push(IndexedEntry {
+                    relative_path: relative_path.into(),
+                    root_index,
+                    match_type,
+                });
             }
             n += 1;
             if n >= CHECK_INTERVAL {
@@ -385,6 +463,7 @@ fn matcher_worker(
             }
             recv(next_notify) -> _ => {
                 will_notify = false;
+                inner.nucleo_tick_queued.store(false, Ordering::Release);
                 let status = nucleo.tick(TICK_TIMEOUT_MS);
                 if status.changed {
                     let snapshot = nucleo.snapshot();
@@ -396,8 +475,8 @@ fn matcher_worker(
                         .take(limit)
                         .filter_map(|match_| {
                             let item = snapshot.get_item(match_.idx)?;
-                            let full_path = item.data.full_path.as_ref();
-                            let (root_idx, relative_path) = get_file_path(Path::new(full_path), &inner.search_directories)?;
+                            let root_index = usize::try_from(item.data.root_index).ok()?;
+                            let root = inner.search_roots.get(root_index)?;
                             let indices = if let Some(indices_matcher) = indices_matcher.as_mut() {
                                 let mut idx_vec = Vec::<u32>::new();
                                 let haystack = item.matcher_columns[0].slice(..);
@@ -410,9 +489,9 @@ fn matcher_worker(
                             };
                             Some(FileMatch {
                                 score: match_.score,
-                                path: PathBuf::from(relative_path),
+                                path: PathBuf::from(item.data.relative_path.as_ref()),
                                 match_type: item.data.match_type,
-                                root: inner.search_directories[root_idx].clone(),
+                                root: root.path.clone(),
                                 indices,
                             })
                         })
@@ -446,3 +525,7 @@ fn matcher_worker(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "file_search_tests.rs"]
+mod tests;
