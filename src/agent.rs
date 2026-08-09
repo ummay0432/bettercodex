@@ -11,7 +11,6 @@ use crate::context::ContextSnapshot;
 use crate::context::Conversation;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::FrozenLoopContext;
-use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserInput;
@@ -651,7 +650,7 @@ impl Agent {
             self.conversation.normalize()?;
             // Preserve the backend usage baseline for old history. Re-estimating the complete
             // rendered input here can substantially overcount a valid long-running session.
-            let active_context_tokens = self.conversation.projected_tokens(&[]);
+            let active_context_tokens = self.conversation.active_context_tokens();
             if active_context_tokens > EFFECTIVE_CONTEXT_WINDOW {
                 return Err(anyhow!(
                     "active conversation requires {active_context_tokens} tokens, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window"
@@ -833,14 +832,16 @@ impl Agent {
         let mut projected = Vec::with_capacity(skill_context.len().saturating_add(1));
         projected.extend(skill_context.iter().cloned());
         projected.push(user_message.clone());
-        let incoming_tokens = estimated_tokens(&projected);
+        let mut projection = self.conversation.project_append(projected);
+        let incoming_tokens = projection.additional_tokens();
         if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
             return Err(anyhow!(
                 "input alone is estimated at {incoming_tokens} tokens, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
-        if self.conversation.needs_compaction_with(&projected)
-            && !self
+        if projection.needs_compaction() {
+            let projected = projection.into_items();
+            if !self
                 .run_compaction(
                     events,
                     cancellation,
@@ -849,10 +850,12 @@ impl Agent {
                     active_turn_context,
                 )
                 .await?
-        {
-            return Ok(false);
+            {
+                return Ok(false);
+            }
+            projection = self.conversation.project_append(projected);
         }
-        let projected_tokens = self.conversation.projected_tokens(&projected);
+        let projected_tokens = projection.projected_tokens();
         if projected_tokens > EFFECTIVE_CONTEXT_WINDOW {
             return Err(anyhow!(
                 "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
@@ -865,7 +868,7 @@ impl Agent {
                 selected_skills,
                 skill_context: skill_context.clone(),
             })?;
-        self.conversation.extend(projected)?;
+        self.conversation.append_projected(projection)?;
         active_turn_context.record_input(skill_context);
         if let Some(id) = steering_id {
             emit(events, AgentEvent::SteeringCommitted(id));

@@ -9,6 +9,9 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use quick_xml::Reader;
+use quick_xml::escape::unescape;
+use quick_xml::events::Event;
 use reqwest::header::ACCEPT;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::header::USER_AGENT;
@@ -30,6 +33,7 @@ const REQUEST_ID: u64 = 1;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+const CHANGELOG_FEED: &str = "https://learn.chatgpt.com/docs/changelog/rss.xml";
 
 #[derive(Clone, Copy)]
 pub(crate) struct OpenAiDocsTool {
@@ -139,6 +143,7 @@ pub(crate) fn is_tool(name: &str) -> bool {
 pub(crate) struct OpenAiDocsClient {
     client: reqwest::Client,
     endpoint: String,
+    changelog_feed: String,
 }
 
 impl OpenAiDocsClient {
@@ -150,6 +155,7 @@ impl OpenAiDocsClient {
         Self {
             client,
             endpoint: endpoint.into(),
+            changelog_feed: CHANGELOG_FEED.to_string(),
         }
     }
 
@@ -166,6 +172,12 @@ impl OpenAiDocsClient {
             return Err(anyhow!(
                 "OpenAI Developer Docs tool `{tool_name}` expects a JSON object"
             ));
+        }
+        if tool_name == FETCH_OPENAI_DOC
+            && let Some(request) = changelog_request(&arguments)?
+        {
+            let markdown = self.fetch_changelog(request, &cancellation).await?;
+            return Ok(Value::String(markdown));
         }
 
         let request = json!({
@@ -214,6 +226,191 @@ impl OpenAiDocsClient {
         let response = decode_response(&body, is_event_stream)?;
         Ok(Value::String(extract_text_result(response)?))
     }
+
+    async fn fetch_changelog(
+        &self,
+        request: ChangelogRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<String> {
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(anyhow!("OpenAI Developer Docs request cancelled"));
+            }
+            response = self.client
+                .get(&self.changelog_feed)
+                .header(ACCEPT, "application/rss+xml, application/xml")
+                .header(USER_AGENT, concat!("bettercodex/", env!("CARGO_PKG_VERSION")))
+                .timeout(REQUEST_TIMEOUT)
+                .send() => response,
+        }
+        .context("OpenAI changelog request failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = read_bounded_body(response, MAX_ERROR_BODY_BYTES, cancellation)
+                .await
+                .unwrap_or_else(|_| b"unreadable response".to_vec());
+            return Err(anyhow!(
+                "OpenAI changelog request failed with HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+                    .chars()
+                    .take(4_000)
+                    .collect::<String>()
+            ));
+        }
+        let body = read_bounded_body(response, MAX_RESPONSE_BYTES, cancellation).await?;
+        changelog_markdown(&body, request.anchor.as_deref())
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ChangelogRequest {
+    anchor: Option<String>,
+}
+
+fn changelog_request(arguments: &Value) -> Result<Option<ChangelogRequest>> {
+    let Some(raw_url) = arguments.get("url").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return Ok(None);
+    };
+    if url.scheme() != "https"
+        || !matches!(
+            url.host_str(),
+            Some("learn.chatgpt.com" | "developers.openai.com")
+        )
+        || !matches!(
+            url.path().trim_end_matches('/'),
+            "/docs/changelog" | "/codex/changelog"
+        )
+    {
+        return Ok(None);
+    }
+    let anchor = arguments
+        .get("anchor")
+        .map(|anchor| {
+            anchor
+                .as_str()
+                .ok_or_else(|| anyhow!("OpenAI changelog anchor must be a string"))
+        })
+        .transpose()?
+        .or_else(|| url.fragment())
+        .map(|anchor| anchor.trim_start_matches('#').to_string())
+        .filter(|anchor| !anchor.is_empty() && anchor != "changelog-content");
+    Ok(Some(ChangelogRequest { anchor }))
+}
+
+#[derive(Default)]
+struct ChangelogFeed {
+    title: String,
+    description: String,
+    items: Vec<ChangelogItem>,
+}
+
+#[derive(Default)]
+struct ChangelogItem {
+    title: String,
+    link: String,
+    published: String,
+    content: String,
+}
+
+fn changelog_markdown(body: &[u8], anchor: Option<&str>) -> Result<String> {
+    let feed = parse_changelog_feed(body)?;
+    let matching_items = feed
+        .items
+        .iter()
+        .filter(|item| {
+            anchor.is_none_or(|anchor| {
+                url::Url::parse(&item.link)
+                    .ok()
+                    .is_some_and(|url| url.fragment() == Some(anchor))
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(anchor) = anchor
+        && matching_items.is_empty()
+    {
+        return Err(anyhow!("OpenAI changelog has no section `{anchor}`"));
+    }
+    if feed.title.is_empty() || matching_items.is_empty() {
+        return Err(anyhow!("OpenAI changelog feed contained no entries"));
+    }
+
+    let mut markdown = format!("# {}\n", feed.title);
+    if anchor.is_none() && !feed.description.is_empty() {
+        markdown.push('\n');
+        markdown.push_str(&feed.description);
+        markdown.push('\n');
+    }
+    for item in matching_items {
+        markdown.push_str("\n## [");
+        markdown.push_str(&item.title);
+        markdown.push_str("](");
+        markdown.push_str(&item.link);
+        markdown.push_str(")\n");
+        if !item.published.is_empty() {
+            markdown.push_str("\nPublished: ");
+            markdown.push_str(&item.published);
+            markdown.push('\n');
+        }
+        if !item.content.is_empty() {
+            markdown.push('\n');
+            markdown.push_str(item.content.trim());
+            markdown.push('\n');
+        }
+    }
+    Ok(markdown)
+}
+
+fn parse_changelog_feed(body: &[u8]) -> Result<ChangelogFeed> {
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut feed = ChangelogFeed::default();
+    let mut item = None::<ChangelogItem>;
+    loop {
+        match reader
+            .read_event()
+            .context("OpenAI changelog returned invalid XML")?
+        {
+            Event::Start(element) => {
+                let local_name = element.local_name();
+                match local_name.as_ref() {
+                    b"item" => item = Some(ChangelogItem::default()),
+                    b"title" | b"description" | b"link" | b"pubDate" | b"encoded" => {
+                        let text = reader
+                            .read_text(element.name())
+                            .context("OpenAI changelog contained invalid text")?
+                            .decode()
+                            .context("OpenAI changelog contained invalid UTF-8")?;
+                        let text = unescape(&text)
+                            .context("OpenAI changelog contained invalid XML entities")?
+                            .into_owned();
+                        match (item.as_mut(), local_name.as_ref()) {
+                            (Some(item), b"title") => item.title = text,
+                            (Some(item), b"link") => item.link = text,
+                            (Some(item), b"pubDate") => item.published = text,
+                            (Some(item), b"encoded") => item.content = text,
+                            (None, b"title") if feed.title.is_empty() => feed.title = text,
+                            (None, b"description") if feed.description.is_empty() => {
+                                feed.description = text;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(element) if element.local_name().as_ref() == b"item" => {
+                if let Some(item) = item.take() {
+                    feed.items.push(item);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(feed)
 }
 
 async fn read_bounded_body(
@@ -362,4 +559,116 @@ fn extract_text_result(response: Value) -> Result<String> {
         return Err(anyhow!("OpenAI Developer Docs tool failed: {text}"));
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    const CHANGELOG_RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>ChatGPT &amp; Codex changelog</title>
+    <description>Latest updates to ChatGPT and Codex.</description>
+    <item>
+      <title>Codex CLI Release: 1.2.3</title>
+      <link>https://learn.chatgpt.com/docs/changelog#release-one</link>
+      <pubDate>Fri, 07 Aug 2026 00:00:00 GMT</pubDate>
+      <content:encoded>&lt;h2&gt;Fixes&lt;/h2&gt;&lt;p&gt;One &amp;amp; two&lt;/p&gt;</content:encoded>
+    </item>
+    <item>
+      <title>Another release</title>
+      <link>https://learn.chatgpt.com/docs/changelog#release-two</link>
+      <pubDate>Thu, 06 Aug 2026 00:00:00 GMT</pubDate>
+      <content:encoded>&lt;p&gt;Other&lt;/p&gt;</content:encoded>
+    </item>
+  </channel>
+</rss>"#;
+
+    #[tokio::test]
+    async fn fetch_changelog_uses_retrievable_feed_and_honors_anchor() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4_096];
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /feed "));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{CHANGELOG_RSS}",
+                CHANGELOG_RSS.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let client = OpenAiDocsClient {
+            client: crate::http_client::build_client(reqwest::Client::builder()).unwrap(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            changelog_feed: format!("http://{address}/feed"),
+        };
+
+        let result = client
+            .call(
+                FETCH_OPENAI_DOC,
+                json!({
+                    "url": "https://learn.chatgpt.com/docs/changelog",
+                    "anchor": "release-one",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        let markdown = result.as_str().unwrap();
+        assert!(markdown.starts_with("# ChatGPT & Codex changelog\n"));
+        assert!(markdown.contains(
+            "## [Codex CLI Release: 1.2.3](https://learn.chatgpt.com/docs/changelog#release-one)"
+        ));
+        assert!(markdown.contains("<h2>Fixes</h2><p>One &amp; two</p>"));
+        assert!(!markdown.contains("Another release"));
+    }
+
+    #[test]
+    fn changelog_fallback_is_limited_to_the_known_dynamic_page() {
+        assert_eq!(
+            changelog_request(&json!({
+                "url": "https://developers.openai.com/codex/changelog/#release-one"
+            }))
+            .unwrap(),
+            Some(ChangelogRequest {
+                anchor: Some("release-one".to_string())
+            })
+        );
+        assert_eq!(
+            changelog_request(&json!({
+                "url": "https://learn.chatgpt.com/docs/changelog#changelog-content"
+            }))
+            .unwrap(),
+            Some(ChangelogRequest { anchor: None })
+        );
+        assert_eq!(
+            changelog_request(&json!({
+                "url": "https://learn.chatgpt.com/docs/developer-commands"
+            }))
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn changelog_feed_formats_the_full_page_and_rejects_unknown_sections() {
+        let markdown = changelog_markdown(CHANGELOG_RSS.as_bytes(), None).unwrap();
+        assert!(markdown.contains("Latest updates to ChatGPT and Codex."));
+        assert!(markdown.contains("Codex CLI Release: 1.2.3"));
+        assert!(markdown.contains("Another release"));
+
+        let error = changelog_markdown(CHANGELOG_RSS.as_bytes(), Some("missing")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OpenAI changelog has no section `missing`"
+        );
+    }
 }

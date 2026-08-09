@@ -18,20 +18,28 @@ pub(super) struct Editor {
     text: String,
     cursor: usize,
     preferred_column: Option<usize>,
-    history: Vec<String>,
+    history: Vec<EditorHistoryEntry>,
     history_index: Option<usize>,
-    saved_draft: String,
+    saved_draft: Option<EditorHistoryEntry>,
     pending_pastes: Vec<PendingPaste>,
     skill_mentions: Vec<SkillMention>,
     image_attachments: Vec<PromptImageAttachment>,
     history_search: Option<HistorySearchSession>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingPaste {
     placeholder: String,
     content: String,
     range: Range<usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EditorHistoryEntry {
+    text: String,
+    pending_pastes: Vec<PendingPaste>,
+    skill_mentions: Vec<SkillMention>,
+    image_attachments: Vec<PromptImageAttachment>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,13 +58,13 @@ struct HistorySearchSession {
     status: HistorySearchStatus,
 }
 
-#[derive(Clone, Debug)]
-struct EditorSnapshot {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct EditorSnapshot {
     text: String,
     cursor: usize,
     preferred_column: Option<usize>,
     history_index: Option<usize>,
-    saved_draft: String,
+    saved_draft: Option<EditorHistoryEntry>,
     pending_pastes: Vec<PendingPaste>,
     skill_mentions: Vec<SkillMention>,
     image_attachments: Vec<PromptImageAttachment>,
@@ -170,7 +178,7 @@ impl Editor {
             status: HistorySearchStatus::Idle,
         });
         self.history_index = None;
-        self.saved_draft.clear();
+        self.saved_draft = None;
     }
 
     pub(super) fn history_search_insert(&mut self, value: &str) {
@@ -236,7 +244,7 @@ impl Editor {
         {
             self.history_search = None;
             self.history_index = None;
-            self.saved_draft.clear();
+            self.saved_draft = None;
             self.cursor = self.text.len();
             self.preferred_column = None;
         }
@@ -303,18 +311,61 @@ impl Editor {
         Ok(())
     }
 
-    pub(super) fn remember(&mut self, text: &str) {
-        if !text.is_empty() && self.history.last().is_none_or(|last| last != text) {
-            self.history.push(text.to_string());
+    pub(super) fn remember_snapshot(&mut self, snapshot: &EditorSnapshot) {
+        self.remember_entry(EditorHistoryEntry {
+            text: snapshot.text.clone(),
+            pending_pastes: snapshot.pending_pastes.clone(),
+            skill_mentions: snapshot.skill_mentions.clone(),
+            image_attachments: snapshot.image_attachments.clone(),
+        });
+    }
+
+    fn remember(&mut self, text: &str) {
+        self.remember_entry(EditorHistoryEntry {
+            text: text.to_string(),
+            ..EditorHistoryEntry::default()
+        });
+    }
+
+    fn remember_entry(&mut self, entry: EditorHistoryEntry) {
+        if !entry.text.is_empty() && self.history.last().is_none_or(|last| last != &entry) {
+            self.history.push(entry);
         }
         self.history_index = None;
-        self.saved_draft.clear();
+        self.saved_draft = None;
     }
 
     pub(super) fn seed_history(&mut self, history: impl IntoIterator<Item = String>) {
         for text in history {
             self.remember(&text);
         }
+    }
+
+    pub(super) fn clear_for_ctrl_c(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+        let snapshot = self.snapshot();
+        self.remember_snapshot(&snapshot);
+        self.set_text("");
+    }
+
+    fn history_entry(&self) -> EditorHistoryEntry {
+        EditorHistoryEntry {
+            text: self.text.clone(),
+            pending_pastes: self.pending_pastes.clone(),
+            skill_mentions: self.skill_mentions.clone(),
+            image_attachments: self.image_attachments.clone(),
+        }
+    }
+
+    fn apply_history_entry(&mut self, entry: EditorHistoryEntry) {
+        self.text = entry.text;
+        self.cursor = self.text.len();
+        self.preferred_column = None;
+        self.pending_pastes = entry.pending_pastes;
+        self.skill_mentions = entry.skill_mentions;
+        self.image_attachments = entry.image_attachments;
     }
 
     pub(super) fn history_previous(&mut self) {
@@ -324,12 +375,12 @@ impl Editor {
         let index = match self.history_index {
             Some(index) => index.saturating_sub(1),
             None => {
-                self.saved_draft = self.text.clone();
+                self.saved_draft = Some(self.history_entry());
                 self.history.len() - 1
             }
         };
         self.history_index = Some(index);
-        self.set_text(self.history[index].clone());
+        self.apply_history_entry(self.history[index].clone());
     }
 
     pub(super) fn history_next(&mut self) {
@@ -339,11 +390,11 @@ impl Editor {
         if index + 1 < self.history.len() {
             let next = index + 1;
             self.history_index = Some(next);
-            self.set_text(self.history[next].clone());
+            self.apply_history_entry(self.history[next].clone());
         } else {
             self.history_index = None;
-            let draft = std::mem::take(&mut self.saved_draft);
-            self.set_text(draft);
+            let draft = self.saved_draft.take().unwrap_or_default();
+            self.apply_history_entry(draft);
         }
     }
 
@@ -771,7 +822,7 @@ impl Editor {
     fn leave_history(&mut self) {
         self.history_search = None;
         self.history_index = None;
-        self.saved_draft.clear();
+        self.saved_draft = None;
     }
 
     fn restart_history_search(&mut self) {
@@ -799,8 +850,8 @@ impl Editor {
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, entry)| entry.to_lowercase().contains(&folded_query))
-            .filter(|(_, entry)| unique.insert(entry.as_str()))
+            .filter(|(_, entry)| entry.text.to_lowercase().contains(&folded_query))
+            .filter(|(_, entry)| unique.insert(entry.text.as_str()))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if let Some(search) = self.history_search.as_mut() {
@@ -824,15 +875,10 @@ impl Editor {
         }) else {
             return;
         };
-        self.text = self.history[history_index].clone();
-        self.cursor = self.text.len();
-        self.preferred_column = None;
-        self.pending_pastes.clear();
-        self.skill_mentions.clear();
-        self.image_attachments.clear();
+        self.apply_history_entry(self.history[history_index].clone());
     }
 
-    fn snapshot(&self) -> EditorSnapshot {
+    pub(super) fn snapshot(&self) -> EditorSnapshot {
         EditorSnapshot {
             text: self.text.clone(),
             cursor: self.cursor,
@@ -845,7 +891,7 @@ impl Editor {
         }
     }
 
-    fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
+    pub(super) fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
         self.text = snapshot.text;
         self.cursor = snapshot.cursor;
         self.preferred_column = snapshot.preferred_column;
@@ -947,7 +993,7 @@ impl Editor {
         self.cursor = 0;
         self.preferred_column = None;
         self.history_index = None;
-        self.saved_draft.clear();
+        self.saved_draft = None;
         (text, mentions, images)
     }
 }

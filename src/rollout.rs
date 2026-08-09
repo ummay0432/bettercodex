@@ -140,7 +140,7 @@ impl Drop for LockedRolloutFile {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum RolloutRecordData<Items = Vec<Value>> {
+enum RolloutRecordData<Items = Vec<Value>, OperatorItem = OperatorInputRecord> {
     Session {
         metadata: SessionMetadata,
     },
@@ -156,7 +156,7 @@ enum RolloutRecordData<Items = Vec<Value>> {
         complete: bool,
     },
     OperatorInput {
-        item: OperatorInputRecord,
+        item: OperatorItem,
     },
     HistoryAppend {
         items: Items,
@@ -183,10 +183,10 @@ enum RolloutRecordData<Items = Vec<Value>> {
 }
 
 type RolloutRecord = RolloutRecordData;
-// History items can contain multi-megabyte images and tool results. Keep the journal schema
-// shared with replay while borrowing those payloads on the write path instead of deep-cloning
-// them into a short-lived record.
-type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value]>;
+// History and operator-input items can contain multi-megabyte images and tool results. Keep the
+// journal schema shared with replay while borrowing those payloads on the write path instead of
+// deep-cloning them into a short-lived record.
+type BorrowedRolloutRecord<'a> = RolloutRecordData<&'a [Value], &'a OperatorInputRecord>;
 
 // Listing only needs message shape and preview text. Deserialize those selected fields directly
 // from the journal stream while scanning all unselected payloads without materializing them.
@@ -521,8 +521,8 @@ impl Rollout {
         self.write_record(&RolloutRecord::OperatorInputsSnapshot { items, complete })
     }
 
-    pub(crate) fn record_operator_input(&mut self, item: OperatorInputRecord) -> Result<()> {
-        self.write_record(&RolloutRecord::OperatorInput { item })
+    pub(crate) fn record_operator_input(&mut self, item: &OperatorInputRecord) -> Result<()> {
+        self.write_record(&BorrowedRolloutRecord::OperatorInput { item })
     }
 
     pub(crate) fn replace_history(

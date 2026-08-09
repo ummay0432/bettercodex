@@ -106,6 +106,100 @@ fn webp_extended_dimensions_are_included_in_image_budgeting() {
 }
 
 #[test]
+fn image_dimension_reader_stops_after_the_available_header() {
+    let mut png = vec![0_u8; 1024 * 1024];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[16..20].copy_from_slice(&2304_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&864_u32.to_be_bytes());
+    let mut reader = std::io::Cursor::new(png);
+
+    assert_eq!(read_image_dimensions(&mut reader), Some((2304, 864)));
+    assert_eq!(reader.position(), 64);
+}
+
+#[test]
+fn image_dimension_reader_grows_until_a_jpeg_frame_header() {
+    let mut jpeg = vec![0_u8; 128];
+    jpeg[..4].copy_from_slice(&[0xff, 0xd8, 0xff, 0xe0]);
+    jpeg[4..6].copy_from_slice(&100_u16.to_be_bytes());
+    jpeg[104..106].copy_from_slice(&[0xff, 0xc0]);
+    jpeg[106..108].copy_from_slice(&7_u16.to_be_bytes());
+    jpeg[109..111].copy_from_slice(&864_u16.to_be_bytes());
+    jpeg[111..113].copy_from_slice(&2304_u16.to_be_bytes());
+    let mut reader = std::io::Cursor::new(jpeg);
+
+    assert_eq!(read_image_dimensions(&mut reader), Some((2304, 864)));
+    assert_eq!(reader.position(), 128);
+}
+
+#[test]
+fn original_image_estimate_reads_dimensions_from_base64_stream() {
+    use base64::Engine as _;
+
+    let mut png = vec![0_u8; 4096];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[16..20].copy_from_slice(&2304_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&864_u32.to_be_bytes());
+    let image_url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    );
+
+    assert_eq!(estimate_image_tokens(&image_url), 72 * 27);
+}
+
+#[test]
+fn projected_append_commits_precomputed_context_metrics_and_history() {
+    let (root, cwd) = temporary_repository("projected-append");
+    let rollout_root = root.join("state");
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let initial_len = conversation.items().len();
+    let items = vec![message("user", "project once".to_string())];
+    let expected_additional_tokens = estimated_tokens(&items);
+    let operator_input = OperatorInputRecord {
+        message: items[0].clone(),
+        prompt_text: "project once".to_string(),
+        selected_skills: Vec::new(),
+        skill_context: Vec::new(),
+    };
+
+    let projection = conversation.project_append(items.clone());
+    assert_eq!(projection.additional_tokens(), expected_additional_tokens);
+    let projected_tokens = projection.projected_tokens();
+    conversation
+        .record_operator_input(operator_input.clone())
+        .unwrap();
+    conversation.append_projected(projection).unwrap();
+
+    assert_eq!(&conversation.items()[initial_len..], items);
+    assert_eq!(conversation.active_context_tokens(), projected_tokens);
+    drop(conversation);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(&loaded.history[initial_len..], items);
+    assert_eq!(loaded.operator_inputs, vec![operator_input]);
+}
+
+#[test]
+fn projected_append_rejects_a_changed_conversation() {
+    let (root, cwd) = temporary_repository("stale-projected-append");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let projection = conversation.project_append(vec![message("user", "stale".to_string())]);
+    conversation
+        .extend([message("assistant", "newer".to_string())])
+        .unwrap();
+    let expected = conversation.items().to_vec();
+
+    let error = conversation.append_projected(projection).unwrap_err();
+
+    assert!(error.to_string().contains("conversation changed"));
+    assert_eq!(conversation.items(), expected);
+}
+
+#[test]
 fn project_root_stops_agents_discovery_at_git_boundary() {
     let root = TemporaryDirectory::new("agents-boundary");
     let repository = root.join("repo");

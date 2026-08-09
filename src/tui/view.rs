@@ -189,16 +189,19 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Action {
     None,
-    Submit(UserPrompt),
-    Queue(UserPrompt),
+    Submit(ComposerSubmission),
+    Queue(ComposerSubmission),
     Cancel,
     Compact,
     Copy(String),
-    Clear,
-    Fork,
+    Clear(ComposerSubmission),
+    Fork(ComposerSubmission),
     ListBackgroundProcesses,
-    OpenResumePicker,
-    ResumeSession(Uuid),
+    OpenResumePicker(ComposerSubmission),
+    ResumeSession {
+        id: Uuid,
+        submission: Option<ComposerSubmission>,
+    },
     RunShellCommand {
         command: String,
         history_text: String,
@@ -213,6 +216,29 @@ pub(super) enum Action {
         update: SkillUpdate,
     },
     Quit,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ComposerSubmission {
+    prompt: UserPrompt,
+    draft: editor::EditorSnapshot,
+}
+
+impl ComposerSubmission {
+    fn take(editor: &mut Editor) -> Self {
+        let draft = editor.snapshot();
+        editor.remember_snapshot(&draft);
+        let prompt = editor.take_prompt();
+        Self { prompt, draft }
+    }
+
+    pub(super) fn prompt(&self) -> &UserPrompt {
+        &self.prompt
+    }
+
+    pub(super) fn into_prompt(self) -> UserPrompt {
+        self.prompt
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -598,6 +624,11 @@ impl View {
         self.entries.push(TranscriptEntry::Notice(notice.into()));
     }
 
+    pub(super) fn add_error(&mut self, error: impl AsRef<str>) {
+        self.entries
+            .push(TranscriptEntry::Error(markdown::sanitize(error.as_ref())));
+    }
+
     pub(super) fn add_update_available(&mut self, update: AvailableUpdate) {
         let insertion = self.entries[self.committed_entries..]
             .iter()
@@ -691,6 +722,34 @@ impl View {
         self.restore_prompts_to_composer(prompts);
     }
 
+    pub(super) fn reject_composer_submission(
+        &mut self,
+        submission: ComposerSubmission,
+        error: impl AsRef<str>,
+    ) {
+        self.restore_composer_submission(submission);
+        self.add_error(error);
+    }
+
+    pub(super) fn defer_composer_action(
+        &mut self,
+        submission: ComposerSubmission,
+        notice: impl Into<String>,
+    ) {
+        self.restore_composer_submission(submission);
+        self.add_notice(notice);
+    }
+
+    pub(super) fn reject_prompt(&mut self, prompt: UserPrompt, error: impl AsRef<str>) {
+        self.restore_prompts_to_composer(vec![prompt]);
+        self.add_error(error);
+    }
+
+    fn restore_composer_submission(&mut self, submission: ComposerSubmission) {
+        self.editor.restore_snapshot(submission.draft);
+        self.dismiss_composer_completions();
+    }
+
     fn restore_prompts_to_composer(&mut self, prompts: Vec<UserPrompt>) {
         if prompts.is_empty() {
             return;
@@ -701,6 +760,10 @@ impl View {
         } else {
             self.editor.prepend_user_prompt(&restored);
         }
+        self.dismiss_composer_completions();
+    }
+
+    fn dismiss_composer_completions(&mut self) {
         self.file_search.dismiss();
         self.skill_popup.hide();
         self.dismissed_slash = None;
@@ -1186,7 +1249,10 @@ impl View {
                     self.overlay = None;
                     Action::None
                 }
-                ResumePickerAction::Resume(id) => Action::ResumeSession(id),
+                ResumePickerAction::Resume(id) => Action::ResumeSession {
+                    id,
+                    submission: None,
+                },
             };
         }
         if control && key.code == KeyCode::Char('o') {
@@ -1201,7 +1267,7 @@ impl View {
                 return Action::None;
             }
             if !self.editor.is_empty() {
-                self.editor.set_text("");
+                self.editor.clear_for_ctrl_c();
                 self.file_search.hide();
                 self.skill_popup.hide();
                 return Action::None;
@@ -1222,7 +1288,7 @@ impl View {
                 SkillsViewAction::Update { path, update } => Action::UpdateSkill { path, update },
             };
         }
-        if let Some(overlay) = self.overlay.as_ref() {
+        if let Some(overlay) = self.overlay.as_mut() {
             let close = match overlay {
                 Overlay::Shortcuts => true,
                 Overlay::Context(context) => context.handle_key(key.code) == ContextAction::Close,
@@ -1537,18 +1603,19 @@ impl View {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
-        let prompt = self.editor.take_prompt();
-        let history_text = prompt.text_without_image_placeholders();
-        self.editor.remember(&history_text);
+        let submission = ComposerSubmission::take(&mut self.editor);
+        let history_text = submission.prompt().text_without_image_placeholders();
         let command = history_text.trim();
-        let local_command = prompt.image_count() == 0;
+        let local_command = submission.prompt().image_count() == 0;
         if local_command && let Some(shell_command) = command.strip_prefix('!') {
             let shell_command = shell_command.trim();
             if shell_command.is_empty() {
-                self.entries.push(TranscriptEntry::Notice(
-                    "Run an operator shell command with !command".to_string(),
-                ));
-                return Action::None;
+                return self.reject_local_submission(
+                    submission,
+                    TranscriptEntry::Notice(
+                        "Run an operator shell command with !command".to_string(),
+                    ),
+                );
             }
             return Action::RunShellCommand {
                 command: shell_command.to_string(),
@@ -1560,23 +1627,28 @@ impl View {
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
             if self.busy {
-                self.entries.push(TranscriptEntry::Notice(
-                    "Interrupt the active turn before resuming another session".to_string(),
-                ));
-                return Action::None;
+                return self.reject_local_submission(
+                    submission,
+                    TranscriptEntry::Notice(
+                        "Interrupt the active turn before resuming another session".to_string(),
+                    ),
+                );
             }
             let arguments = arguments.trim();
             if arguments.is_empty() {
-                return Action::OpenResumePicker;
+                return Action::OpenResumePicker(submission);
             }
             return match Uuid::parse_str(arguments) {
-                Ok(id) => Action::ResumeSession(id),
-                Err(_) => {
-                    self.entries.push(TranscriptEntry::Error(
+                Ok(id) => Action::ResumeSession {
+                    id,
+                    submission: Some(submission),
+                },
+                Err(_) => self.reject_local_submission(
+                    submission,
+                    TranscriptEntry::Error(
                         "`/resume` expects one bettercodex session UUID".to_string(),
-                    ));
-                    Action::None
-                }
+                    ),
+                ),
             };
         }
         if local_command
@@ -1585,52 +1657,50 @@ impl View {
         {
             return match arguments.trim() {
                 "" => Action::EnterTmux,
-                _ => {
-                    self.entries.push(TranscriptEntry::Error(
-                        "`/tmux` does not accept arguments".to_string(),
-                    ));
-                    Action::None
-                }
+                _ => self.reject_local_submission(
+                    submission,
+                    TranscriptEntry::Error("`/tmux` does not accept arguments".to_string()),
+                ),
             };
         }
         match command {
-            _ if !local_command => Action::Submit(prompt),
+            _ if !local_command => Action::Submit(submission),
             "/q" | "/quit" | "/exit" => Action::Quit,
-            "/compact" if self.busy => {
-                self.entries.push(TranscriptEntry::Error(
+            "/compact" if self.busy => self.reject_local_submission(
+                submission,
+                TranscriptEntry::Error(
                     "'/compact' is disabled while a task is in progress.".to_string(),
-                ));
-                Action::None
-            }
+                ),
+            ),
             "/compact" => Action::Compact,
             "/copy" => self.copy_latest_final_action(),
             "/diff" => Action::ShowDiff,
-            "/fork" if self.busy => {
-                self.entries.push(TranscriptEntry::Notice(
+            "/fork" if self.busy => self.reject_local_submission(
+                submission,
+                TranscriptEntry::Notice(
                     "Interrupt the active turn before forking this session".to_string(),
-                ));
-                Action::None
-            }
-            "/fork" => Action::Fork,
-            "/clear" if self.busy => {
-                self.entries.push(TranscriptEntry::Notice(
+                ),
+            ),
+            "/fork" => Action::Fork(submission),
+            "/clear" if self.busy => self.reject_local_submission(
+                submission,
+                TranscriptEntry::Notice(
                     "Interrupt the active turn before starting a fresh session".to_string(),
-                ));
-                Action::None
-            }
-            "/clear" => Action::Clear,
+                ),
+            ),
+            "/clear" => Action::Clear(submission),
             "/context" => Action::ShowContext,
             "/help" => {
                 self.overlay = Some(Overlay::Shortcuts);
                 Action::None
             }
             "/ps" => Action::ListBackgroundProcesses,
-            "/skills" if self.busy => {
-                self.entries.push(TranscriptEntry::Error(
+            "/skills" if self.busy => self.reject_local_submission(
+                submission,
+                TranscriptEntry::Error(
                     "'/skills' is disabled while a task is in progress.".to_string(),
-                ));
-                Action::None
-            }
+                ),
+            ),
             "/skills" => {
                 self.overlay = Some(Overlay::Skills(SkillsView::new()));
                 Action::None
@@ -1640,15 +1710,23 @@ impl View {
                 Action::None
             }
             "/stop" => Action::StopBackgroundProcesses,
-            "/logout" if self.busy => {
-                self.entries.push(TranscriptEntry::Notice(
-                    "Interrupt the active turn before logging out".to_string(),
-                ));
-                Action::None
-            }
+            "/logout" if self.busy => self.reject_local_submission(
+                submission,
+                TranscriptEntry::Notice("Interrupt the active turn before logging out".to_string()),
+            ),
             "/logout" => Action::Logout,
-            _ => Action::Submit(prompt),
+            _ => Action::Submit(submission),
         }
+    }
+
+    fn reject_local_submission(
+        &mut self,
+        submission: ComposerSubmission,
+        entry: TranscriptEntry,
+    ) -> Action {
+        self.restore_composer_submission(submission);
+        self.entries.push(entry);
+        Action::None
     }
 
     fn queue_action(&mut self) -> Action {
@@ -1662,10 +1740,8 @@ impl View {
             ));
             return Action::None;
         }
-        let prompt = self.editor.take_prompt();
-        self.editor
-            .remember(&prompt.text_without_image_placeholders());
-        Action::Queue(prompt)
+        let submission = ComposerSubmission::take(&mut self.editor);
+        Action::Queue(submission)
     }
 
     fn copy_latest_final_action(&mut self) -> Action {
@@ -2297,7 +2373,7 @@ impl View {
         if self.overlay.is_none() {
             self.render_completion_popup(frame, popup_area);
         }
-        match self.overlay.as_ref() {
+        match self.overlay.as_mut() {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
             Some(Overlay::Context(context)) => context.render(frame, area, self.user_message_style),
             Some(Overlay::Resume(picker)) => picker.render(frame, area),
@@ -2895,6 +2971,7 @@ fn is_local_command(command: &str) -> bool {
             | "/skills"
             | "/tools"
             | "/stop"
+            | "/logout"
     )
 }
 
@@ -4876,13 +4953,16 @@ mod tests {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.editor.set_text("/rev");
 
-        let Action::Submit(prompt) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+        let Action::Submit(submission) = view.handle_terminal_event(Event::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
         ))) else {
             panic!("review completion should submit a turn");
         };
-        assert_eq!(prompt.text_without_image_placeholders(), "/review");
+        assert_eq!(
+            submission.prompt().text_without_image_placeholders(),
+            "/review"
+        );
     }
 
     #[test]
@@ -4898,6 +4978,174 @@ mod tests {
             Action::None
         );
         assert_eq!(view.editor.text(), "/loop ");
+    }
+
+    #[test]
+    fn rejected_local_commands_keep_the_draft_editable() {
+        for (draft, busy) in [
+            ("!", false),
+            ("/resume not-a-session-id", false),
+            ("/tmux unexpected", false),
+            ("/compact", true),
+            ("/fork", true),
+            ("/clear", true),
+            ("/skills", true),
+            ("/logout", true),
+        ] {
+            let mut view = View::new(Path::new("/tmp/bettercodex"));
+            if busy {
+                view.start_turn("active turn");
+            }
+            view.editor.set_text(draft);
+
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ))),
+                Action::None,
+                "{draft}"
+            );
+            assert_eq!(view.editor.text(), draft, "{draft}");
+        }
+    }
+
+    #[test]
+    fn rejected_local_command_preserves_a_compacted_large_paste() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let pasted = "x".repeat(1_001);
+        view.editor.set_text("/tmux ");
+        view.editor.insert_paste(pasted.clone());
+        let compact_draft = view.editor.text().to_string();
+        assert!(compact_draft.contains("[Pasted Content"), "{compact_draft}");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), compact_draft);
+        assert_eq!(
+            view.editor.take_prompt().text_without_image_placeholders(),
+            format!("/tmux {pasted}")
+        );
+    }
+
+    #[test]
+    fn logout_cannot_be_queued_as_agent_input() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.start_turn("active turn");
+        view.editor.set_text("/logout ");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "/logout ");
+        assert!(matches!(
+            view.entries.last(),
+            Some(TranscriptEntry::Notice(message))
+                if message.starts_with("Slash commands cannot be queued")
+        ));
+    }
+
+    #[test]
+    fn runtime_rejection_restores_skill_and_image_bindings() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        let text = "$review inspect [Image #1]";
+        let image_label = "[Image #1]";
+        let image_start = text.find(image_label).unwrap();
+        let expected = UserPrompt::with_attachments(
+            text,
+            vec![crate::skills::SkillMention::new(
+                SkillSelection::new("review", "/tmp/review/SKILL.md"),
+                0.."$review".len(),
+            )],
+            vec![crate::input::PromptImageAttachment::new(
+                crate::input::PromptImage::from_bytes(
+                    Path::new("fixture.png"),
+                    b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+                    crate::input::ImageDetail::Original,
+                )
+                .unwrap(),
+                image_start..image_start + image_label.len(),
+            )],
+        );
+        view.editor.set_user_prompt(&expected);
+        let submission = ComposerSubmission::take(&mut view.editor);
+
+        view.reject_composer_submission(
+            submission,
+            "Invalid quality loop request: loop iteration count must be positive",
+        );
+
+        assert_eq!(view.editor.take_prompt(), expected);
+        let rendered = view
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .flat_map(|line| line.line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            rendered
+                .contains("■ Invalid quality loop request: loop iteration count must be positive"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_cleared_rich_draft_is_recoverable_with_up() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let text = "$review inspect [Image #1]";
+        let image_label = "[Image #1]";
+        let image_start = text.find(image_label).unwrap();
+        let prompt = UserPrompt::with_attachments(
+            text,
+            vec![crate::skills::SkillMention::new(
+                SkillSelection::new("review", "/tmp/review/SKILL.md"),
+                0.."$review".len(),
+            )],
+            vec![crate::input::PromptImageAttachment::new(
+                crate::input::PromptImage::from_bytes(
+                    Path::new("fixture.png"),
+                    b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+                    crate::input::ImageDetail::Original,
+                )
+                .unwrap(),
+                image_start..image_start + image_label.len(),
+            )],
+        );
+        view.editor.set_user_prompt(&prompt);
+        let pasted = "z".repeat(1_001);
+        view.editor.insert_paste(pasted.clone());
+        let compact_draft = view.editor.text().to_string();
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+            Action::None
+        );
+        assert!(view.editor.is_empty());
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE,))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), compact_draft);
+
+        let recalled = view.editor.take_prompt();
+        assert_eq!(recalled.image_count(), 1);
+        assert_eq!(recalled.skill_mentions(), prompt.skill_mentions());
+        assert_eq!(
+            recalled.text_without_image_placeholders(),
+            format!("$review inspect {pasted}")
+        );
     }
 
     fn completed_message(text: impl Into<String>) -> AgentEvent {
@@ -5701,13 +5949,13 @@ mod tests {
                 KeyModifiers::NONE,
             )));
         }
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::Submit(prompt("first\nsecond"))
-        );
+        let Action::Submit(submission) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("multiline prompt should submit");
+        };
+        assert_eq!(submission.prompt(), &prompt("first\nsecond"));
     }
 
     #[test]

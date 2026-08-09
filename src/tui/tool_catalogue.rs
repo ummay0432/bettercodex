@@ -18,6 +18,8 @@ const FOOTER_HEIGHT: u16 = 1;
 
 pub(super) struct ToolCatalogueView {
     metrics: CatalogueMetrics,
+    scroll: usize,
+    viewport_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +32,8 @@ impl ToolCatalogueView {
     pub(super) fn new() -> Self {
         Self {
             metrics: crate::tools::catalogue_metrics(),
+            scroll: 0,
+            viewport_rows: 0,
         }
     }
 
@@ -40,14 +44,25 @@ impl ToolCatalogueView {
             .saturating_add(FOOTER_HEIGHT)
     }
 
-    pub(super) fn handle_key(&self, code: KeyCode) -> CatalogueAction {
+    pub(super) fn handle_key(&mut self, code: KeyCode) -> CatalogueAction {
+        let page = self.viewport_rows.max(1);
+        let max_scroll = self.max_scroll();
         match code {
-            KeyCode::Esc => CatalogueAction::Close,
-            _ => CatalogueAction::StayOpen,
+            KeyCode::Esc => return CatalogueAction::Close,
+            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down => self.scroll = self.scroll.saturating_add(1).min(max_scroll),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_add(page).min(max_scroll);
+            }
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = max_scroll,
+            _ => {}
         }
+        CatalogueAction::StayOpen
     }
 
-    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, surface_style: Style) {
+    pub(super) fn render(&mut self, frame: &mut Frame<'_>, area: Rect, surface_style: Style) {
         if area.is_empty() {
             return;
         }
@@ -77,8 +92,19 @@ impl ToolCatalogueView {
             inner.width,
             inner.height.saturating_sub(header_height),
         );
+        let lines = catalogue_lines(crate::tools::display_tools(), self.metrics);
+        self.viewport_rows = usize::from(body_area.height);
+        self.scroll = self
+            .scroll
+            .min(lines.len().saturating_sub(self.viewport_rows));
         frame.render_widget(
-            Paragraph::new(catalogue_lines(crate::tools::display_tools(), self.metrics)),
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(self.scroll)
+                    .take(self.viewport_rows)
+                    .collect::<Vec<_>>(),
+            ),
             body_area,
         );
         if !footer_area.is_empty() {
@@ -88,8 +114,16 @@ impl ToolCatalogueView {
                 footer_area.width.saturating_sub(2),
                 footer_area.height,
             );
-            frame.render_widget(Paragraph::new("Press esc to go back").dim(), hint_area);
+            frame.render_widget(
+                Paragraph::new("↑/↓ scroll · home/end jump · esc go back").dim(),
+                hint_area,
+            );
         }
+    }
+
+    fn max_scroll(&self) -> usize {
+        catalogue_content_line_count(crate::tools::display_tools())
+            .saturating_sub(self.viewport_rows)
     }
 }
 
@@ -138,16 +172,19 @@ fn catalogue_lines<'a>(tools: &'a [CatalogueTool], metrics: CatalogueMetrics) ->
 }
 
 fn catalogue_content_height(tools: &[CatalogueTool]) -> u16 {
+    u16::try_from(catalogue_content_line_count(tools)).unwrap_or(u16::MAX)
+}
+
+fn catalogue_content_line_count(tools: &[CatalogueTool]) -> usize {
     let groups = [CatalogueRoute::Request, CatalogueRoute::InsideExec]
         .into_iter()
         .filter(|route| tools.iter().any(|tool| tool.route == *route))
         .count();
-    let lines = tools
+    tools
         .len()
         .saturating_add(groups)
         .saturating_add(groups.saturating_sub(1))
-        .saturating_add(1 + usize::from(!tools.is_empty()));
-    u16::try_from(lines).unwrap_or(u16::MAX)
+        .saturating_add(1 + usize::from(!tools.is_empty()))
 }
 
 fn format_tokens(tokens: u64) -> String {
@@ -156,5 +193,53 @@ fn format_tokens(tokens: u64) -> String {
         format!("{}.{:01}K", tenths / 10, tenths % 10)
     } else {
         tokens.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn narrow_catalogue_can_scroll_to_every_tool_and_metrics() {
+        let mut catalogue = ToolCatalogueView::new();
+        let first = render(&mut catalogue, 56, 8);
+        let last_tool = crate::tools::display_tools()
+            .last()
+            .expect("tool catalogue")
+            .name
+            .clone();
+        assert!(!first.contains(&last_tool), "{first}");
+
+        assert_eq!(
+            catalogue.handle_key(KeyCode::End),
+            CatalogueAction::StayOpen
+        );
+        let last = render(&mut catalogue, 56, 8);
+        assert!(last.contains(&last_tool), "{last}");
+        assert!(last.contains("prompt tokens"), "{last}");
+        assert!(last.contains("↑/↓ scroll"), "{last}");
+
+        catalogue.handle_key(KeyCode::Home);
+        assert_eq!(render(&mut catalogue, 56, 8), first);
+    }
+
+    fn render(catalogue: &mut ToolCatalogueView, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| catalogue.render(frame, frame.area(), Style::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

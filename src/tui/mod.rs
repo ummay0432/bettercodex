@@ -80,6 +80,7 @@ use tokio::time::Interval;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 use view::Action;
+use view::ComposerSubmission;
 use view::InterruptIntent;
 use view::View;
 
@@ -345,7 +346,7 @@ impl Runtime {
                         }
                         continue;
                     }
-                    if self.handle_action(action)? {
+                    if self.handle_action(action) {
                         break;
                     }
                 }
@@ -378,20 +379,26 @@ impl Runtime {
                 }
                 completion = receive_session_scan(&mut self.session_scan) => {
                     self.session_scan = None;
-                    match completion.context("session listing task stopped unexpectedly")? {
-                        Ok(sessions) => self.view.set_resume_sessions(sessions),
-                        Err(error) => self.view.resume_listing_failed(format!(
+                    match completion {
+                        Ok(Ok(sessions)) => self.view.set_resume_sessions(sessions),
+                        Ok(Err(error)) => self.view.resume_listing_failed(format!(
                             "Could not list saved bettercodex sessions: {error:#}"
+                        )),
+                        Err(error) => self.view.resume_listing_failed(format!(
+                            "Could not list saved bettercodex sessions: listing task stopped unexpectedly: {error}"
                         )),
                     }
                     redraw = true;
                 }
                 completion = receive_resume_completion(&mut self.resume_task) => {
                     self.resume_task = None;
-                    match completion.context("session resume task stopped unexpectedly")? {
-                        Ok(session) => self.activate_resumed_session(session),
-                        Err(error) => self.view.resume_failed(format!(
+                    match completion {
+                        Ok(Ok(session)) => self.activate_resumed_session(session),
+                        Ok(Err(error)) => self.view.resume_failed(format!(
                             "Could not resume the selected bettercodex session: {error:#}"
+                        )),
+                        Err(error) => self.view.resume_failed(format!(
+                            "Could not resume the selected bettercodex session: resume task stopped unexpectedly: {error}"
                         )),
                     }
                     redraw = true;
@@ -538,20 +545,24 @@ impl Runtime {
         self.view.request_terminal_reflow();
     }
 
-    fn handle_action(&mut self, action: Action) -> Result<bool> {
+    fn handle_action(&mut self, action: Action) -> bool {
         match action {
             Action::None => {}
-            Action::Submit(prompt) => {
-                self.persist_prompt(&prompt.text_without_image_placeholders());
+            Action::Submit(submission) => {
+                let history_text = submission.prompt().text_without_image_placeholders();
                 if self.turn.is_some() {
-                    match active_submission_route(&prompt) {
+                    match active_submission_route(submission.prompt()) {
+                        Err(error) => self.view.reject_composer_submission(
+                            submission,
+                            format!("Invalid quality loop request: {error:#}"),
+                        ),
                         Ok(ActiveSubmissionRoute::QueueNextTurn) => {
-                            self.view.queue_follow_up(prompt)
+                            self.persist_prompt(&history_text);
+                            self.view.queue_follow_up(submission.into_prompt());
                         }
-                        Err(error) => self
-                            .view
-                            .add_notice(format!("Invalid quality loop request: {error:#}")),
                         Ok(ActiveSubmissionRoute::SteerOrdinary) => {
+                            self.persist_prompt(&history_text);
+                            let prompt = submission.into_prompt();
                             let steering = self.turn_handle.as_ref().and_then(|turn| {
                                 turn.steer(UserInput::prompt(prompt.clone())).ok()
                             });
@@ -561,16 +572,25 @@ impl Runtime {
                             }
                         }
                     }
-                } else {
-                    self.start_turn(prompt);
+                } else if self.start_composer_turn(submission) {
+                    self.persist_prompt(&history_text);
                 }
             }
-            Action::Queue(prompt) => {
-                self.persist_prompt(&prompt.text_without_image_placeholders());
+            Action::Queue(submission) => {
+                let history_text = submission.prompt().text_without_image_placeholders();
                 if self.turn.is_some() {
-                    self.view.queue_follow_up(prompt);
-                } else {
-                    self.start_turn(prompt);
+                    match active_submission_route(submission.prompt()) {
+                        Ok(_) => {
+                            self.persist_prompt(&history_text);
+                            self.view.queue_follow_up(submission.into_prompt());
+                        }
+                        Err(error) => self.view.reject_composer_submission(
+                            submission,
+                            format!("Invalid quality loop request: {error:#}"),
+                        ),
+                    }
+                } else if self.start_composer_turn(submission) {
+                    self.persist_prompt(&history_text);
                 }
             }
             Action::Cancel => self.interrupt_turn(),
@@ -585,13 +605,18 @@ impl Runtime {
                     .add_notice(format!("Could not copy final response: {error}")),
             },
             Action::Compact => self.start_compaction(),
-            Action::Fork => {
+            Action::Fork(submission) => {
                 if self.has_local_session_activity() {
-                    self.view.add_notice(
+                    self.view.defer_composer_action(
+                        submission,
                         "Wait for the local command or Git diff before forking".to_string(),
                     );
                 } else {
-                    self.fork_session()?;
+                    drop(submission);
+                    if let Err(error) = self.fork_session() {
+                        self.view
+                            .add_error(format!("Could not fork this session: {error:#}"));
+                    }
                 }
             }
             Action::ListBackgroundProcesses => {
@@ -599,45 +624,50 @@ impl Runtime {
                 self.view.set_background_processes(processes.clone());
                 self.view.add_background_process_list(processes);
             }
-            Action::Clear => {
+            Action::Clear(submission) => {
                 if self.has_local_session_activity() {
-                    self.view.add_notice(
+                    self.view.defer_composer_action(
+                        submission,
                         "Wait for the local command or Git diff before clearing".to_string(),
                     );
-                } else if self.turn.is_none() {
-                    let agent = Agent::new(&self.cwd)?;
-                    let prompt_history = PromptHistory::open(agent.session_id())?;
-                    let processes = agent.background_processes();
-                    self.processes.stop_all_background_processes();
-                    self.processes = processes;
-                    self.context_snapshot = agent.context_snapshot();
-                    let skills = agent.skills().to_vec();
-                    let skill_warnings = agent.skill_warnings().to_vec();
-                    self.agent = Some(agent);
-                    self.prompt_history = Some(prompt_history);
-                    self.view.clear();
-                    self.view.set_skills(skills);
-                    for warning in skill_warnings {
-                        self.view.add_notice(format!("Skill warning: {warning}"));
+                } else if self.turn.is_some() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Interrupt the active turn before starting a fresh session".to_string(),
+                    );
+                } else {
+                    drop(submission);
+                    if let Err(error) = self.clear_session() {
+                        self.view
+                            .add_error(format!("Could not start a fresh session: {error:#}"));
                     }
                 }
             }
-            Action::OpenResumePicker => {
+            Action::OpenResumePicker(submission) => {
                 if self.has_local_session_activity() {
-                    self.view.add_notice(
+                    self.view.defer_composer_action(
+                        submission,
                         "Wait for the local command or Git diff before resuming".to_string(),
                     );
                 } else {
-                    self.open_resume_picker()?;
+                    drop(submission);
+                    self.open_resume_picker();
                 }
             }
-            Action::ResumeSession(id) => {
+            Action::ResumeSession { id, submission } => {
                 if self.has_local_session_activity() {
-                    self.view.add_notice(
-                        "Wait for the local command or Git diff before resuming".to_string(),
-                    );
+                    let notice = "Wait for the local command or Git diff before resuming";
+                    if let Some(submission) = submission {
+                        self.view.defer_composer_action(submission, notice);
+                    } else {
+                        self.view.add_notice(notice.to_string());
+                    }
                 } else {
-                    self.start_resume(id)?;
+                    drop(submission);
+                    if let Err(error) = self.start_resume(id) {
+                        self.view
+                            .resume_failed(format!("Could not resume this session: {error:#}"));
+                    }
                 }
             }
             Action::RunShellCommand {
@@ -663,39 +693,40 @@ impl Runtime {
             }
             Action::EnterTmux => unreachable!("tmux handoffs are handled by the event loop"),
             Action::Logout => unreachable!("logout is handled by the event loop"),
-            Action::UpdateSkill { path, update } => {
-                let agent = self
-                    .agent
-                    .as_mut()
-                    .context("skills can only be changed while the agent is idle")?;
-                let result = agent.update_skill(&path, update).map(|()| {
-                    (
-                        agent.context_snapshot(),
-                        agent.context_tokens(),
-                        agent.skills().to_vec(),
-                    )
-                });
-                match result {
-                    Ok((context_snapshot, context_tokens, skills)) => {
-                        self.context_snapshot = context_snapshot;
-                        self.view.set_context_tokens(context_tokens);
-                        self.view.set_skills(skills);
+            Action::UpdateSkill { path, update } => match self.agent.as_mut() {
+                Some(agent) => {
+                    let result = agent.update_skill(&path, update).map(|()| {
+                        (
+                            agent.context_snapshot(),
+                            agent.context_tokens(),
+                            agent.skills().to_vec(),
+                        )
+                    });
+                    match result {
+                        Ok((context_snapshot, context_tokens, skills)) => {
+                            self.context_snapshot = context_snapshot;
+                            self.view.set_context_tokens(context_tokens);
+                            self.view.set_skills(skills);
+                        }
+                        Err(error) => self
+                            .view
+                            .skill_update_failed(format!("Could not update skill: {error:#}")),
                     }
-                    Err(error) => self
-                        .view
-                        .skill_update_failed(format!("Could not update skill: {error:#}")),
                 }
-            }
+                None => self.view.skill_update_failed(
+                    "Could not update skill: skills can only be changed while the agent is idle",
+                ),
+            },
             Action::Quit => {
                 if self.turn.is_some() {
                     self.exit_after_turn = true;
                     self.cancel_turn(InterruptIntent::StopTurn);
                 } else {
-                    return Ok(true);
+                    return true;
                 }
             }
         }
-        Ok(false)
+        false
     }
 
     fn persist_prompt(&mut self, prompt: &str) {
@@ -707,6 +738,27 @@ impl Runtime {
             self.view
                 .add_notice(format!("Prompt history could not be saved: {error:#}"));
         }
+    }
+
+    fn clear_session(&mut self) -> Result<()> {
+        let agent = Agent::new(&self.cwd)?;
+        let prompt_history = PromptHistory::open(agent.session_id())?;
+        let processes = agent.background_processes();
+        let context_snapshot = agent.context_snapshot();
+        let skills = agent.skills().to_vec();
+        let skill_warnings = agent.skill_warnings().to_vec();
+
+        self.processes.stop_all_background_processes();
+        self.processes = processes;
+        self.context_snapshot = context_snapshot;
+        self.agent = Some(agent);
+        self.prompt_history = Some(prompt_history);
+        self.view.clear();
+        self.view.set_skills(skills);
+        for warning in skill_warnings {
+            self.view.add_notice(format!("Skill warning: {warning}"));
+        }
+        Ok(())
     }
 
     fn fork_session(&mut self) -> Result<()> {
@@ -730,12 +782,11 @@ impl Runtime {
         Ok(())
     }
 
-    fn open_resume_picker(&mut self) -> Result<()> {
+    fn open_resume_picker(&mut self) {
         self.view.show_resume_picker();
         if self.session_scan.is_none() {
             self.session_scan = Some(tokio::task::spawn_blocking(Rollout::list_sessions));
         }
-        Ok(())
     }
 
     fn start_resume(&mut self, target: Uuid) -> Result<()> {
@@ -837,24 +888,49 @@ impl Runtime {
         }
     }
 
+    fn start_composer_turn(&mut self, submission: ComposerSubmission) -> bool {
+        match self.prepare_turn_start(submission.prompt()) {
+            Ok((agent, invocation)) => {
+                self.spawn_turn(agent, submission.into_prompt(), invocation);
+                true
+            }
+            Err(error) => {
+                self.view.reject_composer_submission(submission, error);
+                false
+            }
+        }
+    }
+
     fn start_turn(&mut self, prompt: UserPrompt) {
-        let invocation = match crate::quality_loop::parse_invocation_with_mode(
+        match self.prepare_turn_start(&prompt) {
+            Ok((agent, invocation)) => self.spawn_turn(agent, prompt, invocation),
+            Err(error) => self.view.reject_prompt(prompt, error),
+        }
+    }
+
+    fn prepare_turn_start(
+        &mut self,
+        prompt: &UserPrompt,
+    ) -> std::result::Result<(Agent, Option<crate::quality_loop::LoopInvocation>), String> {
+        let invocation = crate::quality_loop::parse_invocation_with_mode(
             &prompt.text_without_image_placeholders(),
             prompt.image_count() > 0,
             true,
-        ) {
-            Ok(invocation) => invocation,
-            Err(error) => {
-                self.view
-                    .add_notice(format!("Invalid quality loop request: {error:#}"));
-                return;
-            }
-        };
-        let Some(mut agent) = self.agent.take() else {
-            self.view
-                .add_notice("Could not start turn: the active agent is unavailable".to_string());
-            return;
-        };
+        )
+        .map_err(|error| format!("Invalid quality loop request: {error:#}"))?;
+        let agent = self
+            .agent
+            .take()
+            .ok_or_else(|| "Could not start turn: the active agent is unavailable".to_string())?;
+        Ok((agent, invocation))
+    }
+
+    fn spawn_turn(
+        &mut self,
+        mut agent: Agent,
+        prompt: UserPrompt,
+        invocation: Option<crate::quality_loop::LoopInvocation>,
+    ) {
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = if invocation.is_some() {
             crate::agent::TurnControl::non_steerable_channel()

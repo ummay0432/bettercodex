@@ -544,6 +544,48 @@ text(`${left.output}:${right.output}`);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_exec_preserves_data_until_javascript_emits_it() {
+        let runtime = runtime(PathBuf::from("."));
+        let result = runtime
+            .execute(
+                "call-raw-output",
+                r#"
+const command = "yes x | tr -d '\\n' | head -c 50000";
+const raw = await tools.exec_command({cmd: command, login: false, shell: "/bin/sh"});
+const explicit = await tools.exec_command({
+  cmd: command,
+  login: false,
+  shell: "/bin/sh",
+  max_output_tokens: 20000,
+});
+const limited = await tools.exec_command({
+  cmd: command,
+  login: false,
+  shell: "/bin/sh",
+  max_output_tokens: 10,
+});
+text(JSON.stringify({
+  raw: raw.output.length,
+  explicit: explicit.output.length,
+  limited: limited.output.startsWith("Warning: truncated output"),
+}));
+"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result
+                .preview
+                .contains(r#"{"raw":50000,"explicit":50000,"limited":true}"#),
+            "{}",
+            result.preview
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nested_calls_emit_codex_tui_events_instead_of_outer_exec_events() {
         let runtime = runtime(PathBuf::from("."));
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -601,9 +601,13 @@ fn truncate_output(
     original_token_count: usize,
     omitted_bytes: usize,
 ) -> String {
-    let max_tokens = max_tokens
-        .unwrap_or(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS)
-        .min(super::MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS);
+    // Nested commands are data sources for the JavaScript cell. Match current
+    // Codex by preserving collected output unless the caller explicitly asks
+    // for a smaller result; the outer exec response is bounded separately
+    // before it enters model history.
+    let Some(max_tokens) = max_tokens else {
+        return output.to_string();
+    };
     if omitted_bytes == 0 {
         return formatted_truncate_text(output, max_tokens);
     }
@@ -632,6 +636,25 @@ mod tests {
         let id = chunk_id();
         assert_eq!(id.len(), 6);
         assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn nested_output_preserves_raw_data_and_honors_explicit_large_budgets() {
+        let output = "x".repeat(50_000);
+        let original_token_count = 12_500;
+
+        assert_eq!(
+            truncate_output(&output, None, original_token_count, 0),
+            output
+        );
+        assert_eq!(
+            truncate_output(&output, Some(20_000), original_token_count, 0),
+            output
+        );
+        assert!(
+            truncate_output(&output, Some(10), original_token_count, 0)
+                .starts_with("Warning: truncated output")
+        );
     }
 
     #[test]

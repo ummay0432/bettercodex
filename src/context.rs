@@ -178,6 +178,33 @@ pub(crate) struct HistoryCursor {
     len: usize,
 }
 
+/// A pending history append and the context accounting computed for those exact items.
+pub(crate) struct ContextProjection {
+    base: HistoryCursor,
+    items: Vec<Value>,
+    metrics: ContextMetrics,
+    additional_tokens: u64,
+    projected_tokens: u64,
+}
+
+impl ContextProjection {
+    pub(crate) fn additional_tokens(&self) -> u64 {
+        self.additional_tokens
+    }
+
+    pub(crate) fn projected_tokens(&self) -> u64 {
+        self.projected_tokens
+    }
+
+    pub(crate) fn needs_compaction(&self) -> bool {
+        self.projected_tokens >= AUTO_COMPACT_TOKEN_LIMIT
+    }
+
+    pub(crate) fn into_items(self) -> Vec<Value> {
+        self.items
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ActiveTurnContext {
     // Keep one block per operator input, including empty blocks, so retained
@@ -399,7 +426,7 @@ impl Conversation {
     }
 
     pub(crate) fn record_operator_input(&mut self, item: OperatorInputRecord) -> Result<()> {
-        self.rollout.record_operator_input(item.clone())?;
+        self.rollout.record_operator_input(&item)?;
         self.operator_inputs.push(item);
         Ok(())
     }
@@ -431,6 +458,43 @@ impl Conversation {
         }
         self.rollout.append_history(&items)?;
         self.context_metrics.extend(&items, &self.world_state);
+        self.history.extend(items);
+        Ok(())
+    }
+
+    pub(crate) fn project_append(&self, items: Vec<Value>) -> ContextProjection {
+        // A real user message advances the instruction boundary used by Codex's
+        // X-Reasoning-Included fallback. Project the complete accounting state so prior
+        // encrypted reasoning cannot appear only after input admission.
+        let mut metrics = self.context_metrics.clone();
+        let additional_tokens = metrics.extend(&items, &self.world_state);
+        let projected_tokens = self
+            .context_tokens_with_metrics(&metrics)
+            .unwrap_or_else(|| self.estimated_context_tokens(&metrics));
+        ContextProjection {
+            base: self.history_cursor(),
+            items,
+            metrics,
+            additional_tokens,
+            projected_tokens,
+        }
+    }
+
+    pub(crate) fn append_projected(&mut self, projection: ContextProjection) -> Result<()> {
+        let ContextProjection {
+            base,
+            items,
+            metrics,
+            ..
+        } = projection;
+        if self.history_cursor() != base {
+            anyhow::bail!("conversation changed after its context append was projected");
+        }
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.rollout.append_history(&items)?;
+        self.context_metrics = metrics;
         self.history.extend(items);
         Ok(())
     }
@@ -623,20 +687,9 @@ impl Conversation {
         }
     }
 
-    pub(crate) fn projected_tokens(&self, additional: &[Value]) -> u64 {
-        if additional.is_empty() {
-            return self
-                .context_tokens()
-                .unwrap_or_else(|| self.estimated_context_tokens(&self.context_metrics));
-        }
-
-        // A real user message advances the instruction boundary used by Codex's
-        // X-Reasoning-Included fallback. Project the complete accounting state so
-        // prior encrypted reasoning cannot appear only after input admission.
-        let mut projected_metrics = self.context_metrics.clone();
-        projected_metrics.extend(additional, &self.world_state);
-        self.context_tokens_with_metrics(&projected_metrics)
-            .unwrap_or_else(|| self.estimated_context_tokens(&projected_metrics))
+    pub(crate) fn active_context_tokens(&self) -> u64 {
+        self.context_tokens()
+            .unwrap_or_else(|| self.estimated_context_tokens(&self.context_metrics))
     }
 
     fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
@@ -649,11 +702,7 @@ impl Conversation {
     }
 
     pub(crate) fn needs_compaction(&self) -> bool {
-        self.projected_tokens(&[]) >= AUTO_COMPACT_TOKEN_LIMIT
-    }
-
-    pub(crate) fn needs_compaction_with(&self, additional: &[Value]) -> bool {
-        self.projected_tokens(additional) >= AUTO_COMPACT_TOKEN_LIMIT
+        self.active_context_tokens() >= AUTO_COMPACT_TOKEN_LIMIT
     }
 
     pub(crate) fn mark_interrupted(&mut self) -> Result<()> {
@@ -847,8 +896,9 @@ impl ContextMetrics {
         metrics
     }
 
-    fn extend(&mut self, history: &[Value], world_state: &WorldState) {
+    fn extend(&mut self, history: &[Value], world_state: &WorldState) -> u64 {
         let [tools_item] = crate::api::stable_input_prefix_items();
+        let mut additional_tokens = 0_u64;
         for item in history {
             if is_initial_context_boundary(item) {
                 self.encrypted_reasoning_before_last_instruction = self.encrypted_reasoning_tokens;
@@ -884,7 +934,9 @@ impl ContextMetrics {
                     self.encrypted_reasoning_tokens.saturating_add(estimated);
             }
             self.estimated_tokens = self.estimated_tokens.saturating_add(estimated);
+            additional_tokens = additional_tokens.saturating_add(estimated);
         }
+        additional_tokens
     }
 }
 
@@ -1310,16 +1362,49 @@ fn estimate_image_tokens(image_url: &str) -> u64 {
     let Some(encoded) = base64_data_url_payload(image_url, "image/") else {
         return RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4);
     };
-    use base64::Engine;
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4);
-    };
-    image_dimensions(&bytes)
+    let decoder = base64::read::DecoderReader::new(
+        encoded.as_bytes(),
+        &base64::engine::general_purpose::STANDARD,
+    );
+    read_image_dimensions(decoder)
         .map(|(width, height)| {
             u64::from(width.div_ceil(32)).saturating_mul(u64::from(height.div_ceil(32)))
         })
         .map(|patches| patches.min(ORIGINAL_IMAGE_MAX_PATCHES))
         .unwrap_or_else(|| RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4))
+}
+
+fn read_image_dimensions(mut reader: impl Read) -> Option<(u32, u32)> {
+    // PNG, GIF, and WebP dimensions live in their small fixed headers. A JPEG's SOF marker can
+    // follow variable-length metadata, so grow geometrically until the existing parser finds it.
+    // Valid common inputs stop after the first read instead of decoding and allocating the full
+    // inline image merely to inspect its dimensions.
+    const INITIAL_HEADER_BYTES: usize = 64;
+    let mut bytes = Vec::with_capacity(INITIAL_HEADER_BYTES);
+    let mut target = INITIAL_HEADER_BYTES;
+    loop {
+        let missing = target.saturating_sub(bytes.len());
+        let read = reader
+            .by_ref()
+            .take(u64::try_from(missing).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if let Some(dimensions) = image_dimensions(&bytes) {
+            return Some(dimensions);
+        }
+        if read < missing || !could_be_supported_image(&bytes) {
+            return None;
+        }
+        target = target.checked_mul(2)?;
+    }
+}
+
+fn could_be_supported_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]))
+        || bytes.starts_with(&[0xff, 0xd8])
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {

@@ -156,6 +156,7 @@ dependencies = [
  "percent-encoding",
  "pretty_assertions",
  "pulldown-cmark",
+ "quick-xml",
  "rand 0.9.5",
  "ratatui",
  "regex-lite",

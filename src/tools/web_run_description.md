@@ -4,6 +4,9 @@ references. News: compare publication/event dates. OpenAI: local code, then
 official only unless asked otherwise. Technical: primary sources; otherwise
 authoritative; label inference.
 
+If opening a literal HTTPS URL is rejected as unsafe, discover it with
+`search_query` and open the returned `ref_id`.
+
 Batch; omit nulls. `search_query` max 4; four needs `response_length`
 `medium`/`long`. Inputs: `ref_id` accepts a result ID/URL; `recency` is days;
 `pageno` is zero-based; dates use YYYY-MM-DD; time uses UTC offsets like

@@ -77,14 +77,25 @@ Update checks do not compare Cargo versions, Git tags, or GitHub Releases. Set
 `BCODEX_SKIP_UPDATE_CHECK=1` to disable the background check. The explicit
 `bcodex update` command remains available.
 
-### Migrating from the release-based updater
+### Migrating binaries without the current updater
 
-Binaries installed before this policy change still query the latest published
-GitHub Release and cannot discover the new updater code on their own. Run
-[`INSTALL_COMMAND.txt`](../INSTALL_COMMAND.txt) once to install current `main`.
-Credentials, settings, sessions, and reusable dependency caches are preserved.
-After that one-time migration, normal notices and `bcodex update` follow public
-`main` directly.
+Binaries installed before this policy change cannot discover the current
+updater on their own. Some older builds also parse the word `update` as an
+interactive prompt, so do not probe support by running `bcodex update` and
+waiting to see what happens. Check the command table first, then use the
+canonical installer when support is absent:
+
+```sh
+if bcodex --help 2>&1 | grep -q '^  update '; then
+    bcodex update
+else
+    curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
+fi
+```
+
+The one-time direct install preserves credentials, settings, sessions, and
+reusable dependency caches. Afterward, normal notices and `bcodex update`
+follow public `main` directly.
 
 ## Caching and cleanup
 
