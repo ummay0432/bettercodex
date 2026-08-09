@@ -1,17 +1,12 @@
 # bettercodex
 
-You cannot motivate agents to be proactive by tweaking the system prompt. You
-have to do it through orchestration.
-
 Claude Code and Codex steer the model toward the smallest change that gets the
 task done. Over thousands of sessions, that compounds slop and technical debt.
 
-bettercodex is a work in progress port of
-[OpenAI Codex](https://github.com/openai/codex) trying to fix this in the
-harness. The plan is to use hooks and active engineering review to make the
-agent notice problems, do the work, and clean up after itself.
-
-$review is goated, use rigirously to deslop for the time being
+bettercodex is a focused, work-in-progress port of
+[OpenAI Codex](https://github.com/openai/codex). It gives the agent room to own
+engineering work proactively, including active review and cleanup, instead of
+making the smallest possible patch the objective.
 
 This is early, unofficial, and not an OpenAI product.
 
@@ -21,9 +16,19 @@ permissions.
 ## Install
 
 bettercodex supports macOS 12 or newer and Linux with glibc 2.31 or newer.
+Native Windows 11 x64 is available as a developer preview while native CI and
+interactive terminal verification are completed.
+
+On macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
+```
+
+In Windows PowerShell 5.1 or newer:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.ps1' | iex"
 ```
 
 Open a new terminal, then run:
@@ -41,4 +46,6 @@ compile only what changed. A release-input content hash keeps that reuse exact
 even when archive timestamps collide. Package versions are display metadata and
 do not control updates. Missing Rust and Linux build tools are installed
 automatically; on a new Mac, complete the Command Line Tools dialog the
-installer opens and rerun the command once.
+installer opens and rerun the command once. Native Windows requires Visual
+Studio 2022 C++ Build Tools and a Windows SDK; see the complete
+[installation guide](docs/install.md) before the first build.

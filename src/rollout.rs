@@ -1041,7 +1041,7 @@ fn read_metadata(path: &Path) -> Result<Option<SessionMetadata>> {
 
 fn state_root() -> Result<PathBuf> {
     let codex_home = crate::paths::codex_home()
-        .ok_or_else(|| anyhow!("cannot locate bettercodex state: HOME is not set"))?;
+        .ok_or_else(|| anyhow!("cannot locate bettercodex state: no user home is available"))?;
     Ok(codex_home.join(STATE_DIRECTORY))
 }
 

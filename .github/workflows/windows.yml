@@ -37,7 +37,11 @@ jobs:
         run: |
           cargo fmt --all -- --check
           $failed = $false
-          foreach ($script in @('scripts/cargo-with-v8.ps1', 'scripts/install.ps1')) {
+          foreach ($script in @(
+            'scripts/cargo-with-v8.ps1',
+            'scripts/install.ps1',
+            'scripts/install_windows_tests.ps1'
+          )) {
             $tokens = $null
             $errors = $null
             [void][Management.Automation.Language.Parser]::ParseFile(
@@ -52,6 +56,11 @@ jobs:
           }
           if ($failed) { exit 1 }
           powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1 -ValidateOnly
+
+      - name: Test PowerShell installer transactions
+        shell: powershell
+        run: |
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/install_windows_tests.ps1
 
       - name: Check all Windows targets
         shell: powershell

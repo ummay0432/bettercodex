@@ -22,6 +22,10 @@ $GitHubArchiveRoot = 'https://codeload.github.com'
 $MaximumMetadataBytes = 1MB
 $MaximumSourceArchiveBytes = 128MB
 $MinimumWindowsBuild = 17763
+$FirstBuildCacheHeadroom = 8GB
+$WarmBuildCacheHeadroom = 2GB
+$ScratchHeadroom = 2GB
+$InstallHeadroom = 256MB
 
 function Write-Step([string] $Message) {
     Write-Host "==> $Message"
@@ -69,6 +73,49 @@ function Assert-NoReparsePath([string] $Path) {
     }
 }
 
+function Get-VolumeSpace([string] $Path) {
+    $Probe = [IO.Path]::GetFullPath($Path)
+    while (-not (Test-Path -LiteralPath $Probe)) {
+        $Parent = Split-Path -Parent $Probe
+        if ([string]::IsNullOrEmpty($Parent) -or $Parent -eq $Probe) {
+            Fail "could not find an existing parent for disk-space check at $Path"
+        }
+        $Probe = $Parent
+    }
+    $Drive = (Get-Item -LiteralPath $Probe -Force).PSDrive
+    if ($null -eq $Drive -or $null -eq $Drive.Free) {
+        Fail "could not determine free disk space for $Path"
+    }
+    return [pscustomobject]@{
+        Root = [string]$Drive.Root
+        Free = [long]$Drive.Free
+    }
+}
+
+function Assert-FreeSpaceBudget([object[]] $Budgets) {
+    $Volumes = @{}
+    foreach ($Budget in $Budgets) {
+        $Volume = Get-VolumeSpace ([string]$Budget.Path)
+        $Key = $Volume.Root.ToLowerInvariant()
+        if (-not $Volumes.ContainsKey($Key)) {
+            $Volumes[$Key] = [pscustomobject]@{
+                Root = $Volume.Root
+                Free = $Volume.Free
+                Required = [long]0
+            }
+        }
+        $Volumes[$Key].Required += [long]$Budget.Bytes
+    }
+    foreach ($Volume in $Volumes.Values) {
+        Write-Step ("Disk preflight: {0:N1} GiB free on {1}; {2:N1} GiB estimated build headroom required" -f
+            ($Volume.Free / 1GB), $Volume.Root, ($Volume.Required / 1GB))
+        if ($Volume.Free -lt $Volume.Required) {
+            Fail ("insufficient disk space on {0}: {1:N1} GiB free, {2:N1} GiB required for this source build" -f
+                $Volume.Root, ($Volume.Free / 1GB), ($Volume.Required / 1GB))
+        }
+    }
+}
+
 function Remove-OwnedTree([string] $Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     if (Test-IsReparsePoint $Path) {
@@ -92,14 +139,19 @@ function Invoke-BoundedDownload(
     [long] $MaximumBytes
 ) {
     Add-Type -AssemblyName System.Net.Http
-    $Handler = New-Object Net.Http.HttpClientHandler
-    $Handler.AllowAutoRedirect = $true
-    $Handler.MaxAutomaticRedirections = 5
-    $Client = New-Object Net.Http.HttpClient($Handler)
-    $Client.Timeout = [TimeSpan]::FromMinutes(2)
-    $Client.DefaultRequestHeaders.UserAgent.ParseAdd('bettercodex')
     $Partial = "$Destination.partial.$([Guid]::NewGuid().ToString('N'))"
+    $Handler = $null
+    $Client = $null
+    $Response = $null
+    $Input = $null
+    $Output = $null
     try {
+        $Handler = New-Object Net.Http.HttpClientHandler
+        $Handler.AllowAutoRedirect = $true
+        $Handler.MaxAutomaticRedirections = 5
+        $Client = New-Object Net.Http.HttpClient($Handler)
+        $Client.Timeout = [TimeSpan]::FromMinutes(2)
+        $Client.DefaultRequestHeaders.UserAgent.ParseAdd('bettercodex')
         $Response = $Client.GetAsync(
             $Uri,
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead
@@ -117,29 +169,31 @@ function Invoke-BoundedDownload(
             81920,
             [IO.FileOptions]::WriteThrough
         )
-        try {
-            $Buffer = New-Object byte[] 81920
-            [long] $Total = 0
-            while (($Read = $Input.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
-                $Total += $Read
-                if ($Total -gt $MaximumBytes) {
-                    Fail "download from $Uri exceeds the $MaximumBytes-byte limit"
-                }
-                $Output.Write($Buffer, 0, $Read)
+        $Buffer = New-Object byte[] 81920
+        [long] $Total = 0
+        while (($Read = $Input.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+            $Total += $Read
+            if ($Total -gt $MaximumBytes) {
+                Fail "download from $Uri exceeds the $MaximumBytes-byte limit"
             }
-            if ($Total -eq 0) { Fail "download from $Uri was empty" }
-            $Output.Flush($true)
+            $Output.Write($Buffer, 0, $Read)
         }
-        finally {
-            $Output.Dispose()
-            $Input.Dispose()
-            $Response.Dispose()
-        }
+        if ($Total -eq 0) { Fail "download from $Uri was empty" }
+        $Output.Flush($true)
+        $Output.Dispose()
+        $Output = $null
+        $Input.Dispose()
+        $Input = $null
+        $Response.Dispose()
+        $Response = $null
         Move-Item -LiteralPath $Partial -Destination $Destination -Force
     }
     finally {
-        $Client.Dispose()
-        $Handler.Dispose()
+        if ($null -ne $Output) { $Output.Dispose() }
+        if ($null -ne $Input) { $Input.Dispose() }
+        if ($null -ne $Response) { $Response.Dispose() }
+        if ($null -ne $Client) { $Client.Dispose() }
+        if ($null -ne $Handler) { $Handler.Dispose() }
         Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
     }
 }
@@ -289,7 +343,7 @@ function Invoke-WithRetry([scriptblock] $Operation, [string] $Description) {
 }
 
 function Recover-FinalizerArtifacts([string] $BinDirectory, [string] $Destination) {
-    foreach ($Directory in Get-ChildItem -LiteralPath $BinDirectory -Directory -Filter '.bcodex-finalize.*' -ErrorAction SilentlyContinue) {
+    foreach ($Directory in Get-ChildItem -LiteralPath $BinDirectory -Directory -Force -Filter '.bcodex-finalize.*' -ErrorAction SilentlyContinue) {
         if ($Directory.Name -cnotmatch '^\.bcodex-finalize\.([0-9a-f]{32})$' -or
             ($Directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             Fail "unsafe bettercodex finalizer artifact $($Directory.FullName)"
@@ -304,9 +358,9 @@ function Recover-FinalizerArtifacts([string] $BinDirectory, [string] $Destinatio
         $ExpectedCandidate = Join-Path $Directory.FullName 'candidate.exe'
         $ExpectedBackup = Join-Path $Directory.FullName 'backup.exe'
         if ($Manifest.transaction_id -cne $TransactionId -or
-            $Manifest.destination -cne $Destination -or
-            $Manifest.candidate -cne $ExpectedCandidate -or
-            $Manifest.backup -cne $ExpectedBackup) {
+            -not [string]::Equals([string]$Manifest.destination, $Destination, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$Manifest.candidate, $ExpectedCandidate, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$Manifest.backup, $ExpectedBackup, [StringComparison]::OrdinalIgnoreCase)) {
             Fail "invalid bettercodex finalizer record $ManifestPath"
         }
         if (-not (Test-Path -LiteralPath $Destination) -and
@@ -340,11 +394,11 @@ $parentPid = [int]$env:BCODEX_FINALIZE_PARENT_PID
 $parentTicks = [long]$env:BCODEX_FINALIZE_PARENT_TICKS
 $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
 $root = Split-Path -Parent $manifestPath
-if ($root -cne (Split-Path -Parent $manifest.candidate) -or $manifest.candidate -cne (Join-Path $root 'candidate.exe') -or $manifest.backup -cne (Join-Path $root 'backup.exe')) { throw 'invalid bettercodex finalizer paths' }
-$parent = Get-Process -Id $parentPid -ErrorAction Stop
-if ($parent.StartTime.ToUniversalTime().Ticks -ne $parentTicks) { throw 'bettercodex updater process identity changed' }
-$parent.WaitForExit()
+if (-not [string]::Equals($root, (Split-Path -Parent $manifest.candidate), [StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals([string]$manifest.candidate, (Join-Path $root 'candidate.exe'), [StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals([string]$manifest.backup, (Join-Path $root 'backup.exe'), [StringComparison]::OrdinalIgnoreCase)) { throw 'invalid bettercodex finalizer paths' }
+$parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+if ($null -ne $parent -and $parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks) { $parent.WaitForExit() }
 $lock = $null
+$completed = $false
 try {
     for ($attempt = 1; $attempt -le 100 -and $null -eq $lock; $attempt++) {
         try { $lock = New-Object IO.FileStream($manifest.lock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch [IO.IOException] { Start-Sleep -Milliseconds 100 }
@@ -359,6 +413,7 @@ try {
         $revision = (& $manifest.destination --internal-source-revision 2>$null) -join "`n"
         if ($version.Trim() -cne "bcodex $($manifest.version)" -or $revision.Trim() -cne $manifest.revision) { throw 'updated bettercodex command failed final verification' }
         if (Test-Path -LiteralPath $manifest.backup) { Remove-Item -LiteralPath $manifest.backup -Force }
+        $completed = $true
         Write-Host "==> Updated bcodex $($manifest.version) ($($manifest.revision.Substring(0, 12))) at $($manifest.destination)"
     } catch {
         Remove-Item -LiteralPath $manifest.destination -Force -ErrorAction SilentlyContinue
@@ -367,8 +422,10 @@ try {
     }
 } finally {
     if ($null -ne $lock) { $lock.Dispose() }
-    Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $root -Force -ErrorAction SilentlyContinue
+    if ($completed) {
+        Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $root -Force -ErrorAction SilentlyContinue
+    }
 }
 '@
     $Bytes = [Text.Encoding]::Unicode.GetBytes($Finalizer)
@@ -383,6 +440,7 @@ try {
     if ($null -eq $Started -or $Started.HasExited) {
         Fail 'could not start the bettercodex update finalizer'
     }
+    return $Started
 }
 
 if ($Help) {
@@ -422,6 +480,8 @@ $CacheRoot = if ($env:BCODEX_CACHE_DIR) {
 }
 Assert-AbsolutePath $BinDirectory 'BCODEX_INSTALL_DIR'
 Assert-AbsolutePath $CacheRoot 'BCODEX_CACHE_DIR'
+$BinDirectory = [IO.Path]::GetFullPath($BinDirectory)
+$CacheRoot = [IO.Path]::GetFullPath($CacheRoot)
 Assert-NoReparsePath $BinDirectory
 Assert-NoReparsePath $CacheRoot
 
@@ -489,6 +549,21 @@ try {
         }
     }
 
+    $TargetDirectory = Join-Path $CacheRoot 'build\x86_64-pc-windows-msvc\target'
+    $HasWarmBuildCache = (Test-Path -LiteralPath (Join-Path $TargetDirectory '.rustc_info.json') -PathType Leaf) -or
+        (Test-Path -LiteralPath (Join-Path $TargetDirectory 'release') -PathType Container)
+    $CacheHeadroom = if ($HasWarmBuildCache) {
+        $WarmBuildCacheHeadroom
+    }
+    else {
+        $FirstBuildCacheHeadroom
+    }
+    Assert-FreeSpaceBudget @(
+        [pscustomobject]@{ Path = $CacheRoot; Bytes = $CacheHeadroom },
+        [pscustomobject]@{ Path = [IO.Path]::GetTempPath(); Bytes = $ScratchHeadroom },
+        [pscustomobject]@{ Path = $BinDirectory; Bytes = $InstallHeadroom }
+    )
+
     Import-VisualStudioEnvironment
     if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
         Fail 'Windows tar.exe is required to extract the immutable source archive'
@@ -532,7 +607,6 @@ try {
 
     $CargoHome = Join-Path $CacheRoot 'cargo'
     $ManagedRustupHome = Join-Path $CacheRoot 'rustup'
-    $TargetDirectory = Join-Path $CacheRoot 'build\x86_64-pc-windows-msvc\target'
     [void](New-Item -ItemType Directory -Force -Path $CargoHome)
     [void](New-Item -ItemType Directory -Force -Path $TargetDirectory)
     $Rustup = (Get-Command rustup.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1)
@@ -648,7 +722,7 @@ try {
     [IO.File]::WriteAllText($ManifestPath, ($Manifest | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
 
     if ($ParentPid -gt 0) {
-        Start-DeferredReplacement $ManifestPath $ParentPid $ParentStartTicks $PowerShellPath
+        [void](Start-DeferredReplacement $ManifestPath $ParentPid $ParentStartTicks $PowerShellPath)
         $Deferred = $true
         Write-Step 'Verified update staged; replacement will finish after this bcodex process exits'
     }

@@ -365,7 +365,7 @@ impl SharedAuth {
 
 pub(crate) fn auth_file_path() -> Result<PathBuf> {
     Ok(crate::paths::codex_home()
-        .ok_or_else(|| anyhow!("cannot locate Codex credentials: HOME is not set"))?
+        .ok_or_else(|| anyhow!("cannot locate Codex credentials: no user home is available"))?
         .join("auth.json"))
 }
 

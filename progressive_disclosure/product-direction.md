@@ -49,4 +49,5 @@ gives a concrete bettercodex use for it. Linux, macOS, and native 64-bit Windows
 it must not add Windows-only instructions, tools, or platform prose to the
 model-facing context on other platforms. [`SPEC-WINDOWS.md`](../SPEC-WINDOWS.md)
 records the compatibility design and verification checklist; current upstream
-Codex source remains authoritative where that proposal is stale or incomplete.
+Codex source remains authoritative where that specification is stale or
+incomplete.

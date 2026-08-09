@@ -37,6 +37,42 @@ const SOURCE_REVISION_LENGTH: usize = 40;
 const SOURCE_REVISION_OFFSET: usize = SOURCE_REVISION_PREFIX.len();
 const SOURCE_REVISION_METADATA_LENGTH: usize = SOURCE_REVISION_OFFSET + SOURCE_REVISION_LENGTH + 2;
 
+#[cfg(windows)]
+struct TemporaryUpdateScript {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+#[cfg(windows)]
+impl TemporaryUpdateScript {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            remove_on_drop: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn remove(mut self) -> Result<()> {
+        fs::remove_file(&self.path)
+            .with_context(|| format!("could not remove update script {}", self.path.display()))?;
+        self.remove_on_drop = false;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TemporaryUpdateScript {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 // Keep the revision in a uniquely framed, fixed-size data record. Source builds
 // contain the non-hexadecimal placeholder and therefore remain development
 // builds. The installer stamps its selected immutable commit into a staged copy
@@ -423,7 +459,7 @@ fn run_installer_script(
         .spawn()
         .context("could not start the bettercodex installer")?;
     #[cfg(windows)]
-    let (mut child, script_path) = {
+    let (mut child, script_file) = {
         let script_path = std::env::temp_dir().join(format!(
             "bettercodex-update-{}-{}.ps1",
             std::process::id(),
@@ -435,8 +471,21 @@ fn run_installer_script(
         let mut file = options
             .open(&script_path)
             .with_context(|| format!("could not create update script {}", script_path.display()))?;
-        file.write_all(script)?;
-        file.sync_all()?;
+        // Take cleanup ownership only after create_new succeeds. Constructing the guard before
+        // open would let an extremely unlikely name collision delete somebody else's file.
+        let script_file = TemporaryUpdateScript::new(script_path);
+        file.write_all(script).with_context(|| {
+            format!(
+                "could not write update script {}",
+                script_file.path().display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "could not flush update script {}",
+                script_file.path().display()
+            )
+        })?;
         drop(file);
         let child = ProcessCommand::new("powershell.exe")
             .args([
@@ -447,7 +496,7 @@ fn run_installer_script(
                 "Bypass",
                 "-File",
             ])
-            .arg(&script_path)
+            .arg(script_file.path())
             .env(INSTALL_DIR_ENV, install_dir)
             .env(INSTALL_REVISION_ENV, revision)
             .env("BCODEX_REPOSITORY", repository)
@@ -457,7 +506,7 @@ fn run_installer_script(
             .stdin(Stdio::null())
             .spawn()
             .context("could not start the bettercodex PowerShell installer")?;
-        (child, script_path)
+        (child, script_file)
     };
     #[cfg(unix)]
     {
@@ -472,12 +521,12 @@ fn run_installer_script(
             return Err(error).context("could not send the bettercodex installer to the shell");
         }
     }
-    let status = child
-        .wait()
-        .context("could not wait for the bettercodex installer")?;
+    let wait_result = child.wait();
     #[cfg(windows)]
-    fs::remove_file(&script_path)
-        .with_context(|| format!("could not remove update script {}", script_path.display()))?;
+    let remove_result = script_file.remove();
+    let status = wait_result.context("could not wait for the bettercodex installer")?;
+    #[cfg(windows)]
+    remove_result?;
     if !status.success() {
         bail!("bettercodex installer exited with {status}");
     }

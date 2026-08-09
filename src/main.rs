@@ -117,7 +117,7 @@ fn run() -> Result<()> {
         Command::InternalInstallSmoke => {
             tools::package_smoke_test().map_err(anyhow::Error::msg)?;
             let home = paths::bettercodex_home().ok_or_else(|| {
-                anyhow!("install smoke test requires BCODEX_HOME or HOME to be set")
+                anyhow!("install smoke test requires BCODEX_HOME or a user home directory")
             })?;
             system_skills::install(&home)?;
             write_stdout_line(format_args!(

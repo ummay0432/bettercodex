@@ -4,13 +4,25 @@ use std::path::PathBuf;
 
 /// Returns the current user's home directory on supported targets.
 ///
-/// This preserves `dirs::home_dir`'s `$HOME` precedence and `getpwuid_r`
-/// fallback on Unix without compiling unrelated platform-directory APIs.
+/// This preserves `dirs::home_dir`'s `$HOME`/`getpwuid_r` behavior on Unix and
+/// uses the native profile environment on Windows without compiling unrelated
+/// platform-directory APIs.
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .or_else(platform_home_dir)
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .or_else(platform_home_dir)
+    }
+    #[cfg(windows)]
+    {
+        platform_home_dir()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        platform_home_dir()
+    }
 }
 
 #[cfg(unix)]
@@ -82,12 +94,14 @@ fn platform_home_dir() -> Option<PathBuf> {
 
 pub(crate) fn bettercodex_home() -> Option<PathBuf> {
     std::env::var_os("BCODEX_HOME")
+        .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".bcodex")))
 }
 
 pub(crate) fn codex_home() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".codex")))
 }

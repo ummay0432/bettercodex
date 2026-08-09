@@ -890,8 +890,7 @@ fn format_relative_time(now_unix_ms: u64, timestamp_unix_ms: u64) -> String {
 }
 
 fn display_cwd(path: &Path) -> String {
-    let display = std::env::var_os("HOME")
-        .map(PathBuf::from)
+    let display = crate::paths::home_dir()
         .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
         .map_or_else(
             || path.display().to_string(),

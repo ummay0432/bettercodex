@@ -270,3 +270,21 @@ fn updater_runs_the_pinned_powershell_installer_from_a_file() {
     );
     run_installer_script(script.as_bytes(), &install_dir, "owner/project", revision).unwrap();
 }
+
+#[cfg(windows)]
+#[test]
+fn temporary_update_script_is_removed_on_drop() {
+    let path = std::env::temp_dir().join(format!(
+        "bettercodex-update-cleanup-test-{}-{}.ps1",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&path, b"test").unwrap();
+    let script = TemporaryUpdateScript::new(path.clone());
+
+    drop(script);
+
+    let removed = !path.exists();
+    let _ = fs::remove_file(path);
+    assert!(removed);
+}

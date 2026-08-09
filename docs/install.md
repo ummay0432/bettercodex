@@ -4,17 +4,19 @@ bettercodex is one Rust package and one `bcodex` binary. Public installations
 track the exact current commit on public `main`. Cargo package versions are
 display metadata; they do not decide whether an installation is current.
 
-## Supported systems
+## Supported and preview systems
 
-| Operating system | Architectures |
-| --- | --- |
-| macOS 12+ | Apple Silicon and Intel |
-| Linux with glibc 2.31+ | ARM64 and x86-64 |
-| Windows 11 | x86-64 |
+| Operating system | Architectures | Status |
+| --- | --- | --- |
+| macOS 12+ | Apple Silicon and Intel | Supported |
+| Linux with glibc 2.31+ | ARM64 and x86-64 | Supported |
+| Windows 11 | x86-64 | Developer preview |
 
 Native Windows 10 version 1809 or newer has the required ConPTY API but remains
-best effort; use current Windows 11 for the supported experience. WSL runs the
-Linux binary and follows the Linux instructions, not the native Windows flow.
+best effort. The native Windows port remains a developer preview until its
+native workflow and interactive Windows Terminal/VS Code matrix are recorded.
+WSL runs the Linux binary and follows the Linux instructions, not the native
+Windows flow.
 
 A public install requires several gigabytes of free space and network access to
 GitHub and the official Rust download servers. The installer supplies its own
@@ -32,6 +34,8 @@ with C++** and a Windows 10 or 11 SDK. Install those prerequisites from
 before running the source installer. The first local release build can use
 roughly 6–10 GiB for Rust, dependency, V8, and compiled-artifact caches; the
 installed product itself remains one `bcodex.exe`.
+The installer reports an aggregated per-volume disk preflight before starting
+the long source build.
 
 ## Install
 
@@ -98,9 +102,11 @@ bcodex login
 bcodex
 ```
 
-ChatGPT credentials remain under `${CODEX_HOME:-$HOME/.codex}`. bettercodex
-settings and sessions remain under `${BCODEX_HOME:-$HOME/.bcodex}`; installing
-or updating does not remove either directory.
+`CODEX_HOME` and `BCODEX_HOME` override the credential and bettercodex state
+directories on every platform. Without overrides, Unix uses `$HOME/.codex` and
+`$HOME/.bcodex`; native Windows uses `%USERPROFILE%\.codex` and
+`%USERPROFILE%\.bcodex`. Installing or updating does not remove either
+directory.
 
 ## Update behavior
 
@@ -226,7 +232,16 @@ python3 scripts/install_tests.py
 
 Native Windows validation is defined in [`.github/workflows/windows.yml`](../.github/workflows/windows.yml):
 format and PowerShell syntax checks, `cargo check --tests`, the native test
-suite, Clippy, a release smoke test, and an exact-revision install/no-op cycle.
+suite, warning-denied Clippy, PowerShell installer transaction tests, a release
+smoke test, and an exact-revision install/no-op cycle. Run the focused installer
+tests directly with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_windows_tests.ps1
+```
+
+The Windows status must not be promoted from developer preview until that
+workflow and the primary interactive terminal matrix pass on native Windows.
 
 See [the development workflow](../progressive_disclosure/development.md) for
 the complete contribution procedure.

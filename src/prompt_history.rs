@@ -125,7 +125,7 @@ impl PromptHistory {
 
 fn history_path() -> Result<PathBuf> {
     let codex_home = crate::paths::codex_home()
-        .ok_or_else(|| anyhow!("cannot locate prompt history: HOME is not set"))?;
+        .ok_or_else(|| anyhow!("cannot locate prompt history: no user home is available"))?;
     Ok(codex_home.join(HISTORY_FILENAME))
 }
 

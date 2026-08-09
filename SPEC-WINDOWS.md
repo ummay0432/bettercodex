@@ -1,24 +1,25 @@
 # Native Windows terminal support specification
 
-Status: proposed; not yet implemented
+Status: implementation candidate; native validation pending
 
 Last updated: 2026-08-09
 
 ## 1. Status and authority
 
 This document specifies the work required to make the native `bcodex.exe`
-client a supported Windows terminal application. It is a design and acceptance
-contract, not a claim that the current tree supports Windows.
+client a supported Windows terminal application. It remains the design and
+acceptance contract, not by itself a claim that every supported-release gate
+has passed.
 
-The current
 [`progressive_disclosure/product-direction.md`](progressive_disclosure/product-direction.md)
-explicitly limits bettercodex to Linux and macOS and says not to add Windows
-compatibility code. That product-direction sentence must be deliberately
-changed before implementation starts. This proposal does not silently override
-it.
+now authorizes native Windows 11 x64 as a target. The source port, target-gated
+dependencies, PowerShell build and install paths, and native workflow are in
+the tree. Native workflow and interactive terminal evidence are still pending,
+so public documentation labels the port a developer preview rather than a
+supported release.
 
-Once approved, this specification governs the Windows port together with the
-existing product invariants. Where it retains behavior that current OpenAI
+This specification governs the Windows port together with the existing product
+invariants. Where it retains behavior that current OpenAI
 Codex already implements, the implementation must inspect and port the then-
 current upstream source rather than reconstructing the behavior from this prose
 or from memory. The upstream revision inspected while drafting this document is
@@ -231,13 +232,23 @@ upstream Codex behavior continue to change:
 The drafting audit compared bettercodex with upstream Codex `main` at
 `646f7c0a91b8e327d263335da68ae8ef212895ce` on 2026-08-09. That hash records
 what informed this proposal. It must not be used instead of fetching current
-upstream when implementation begins.
+upstream for implementation or review work.
 
-## 8. Current-state gap inventory
+The implementation-completion source audit re-fetched upstream `main` at
+`a16863f8704831d13e041ed7dba2c4a57a2a940b` on 2026-08-09. Retained ConPTY,
+pipe, Job Object, Windows input-normalization, console-mode, shell-detection,
+paste-burst, clipboard, and terminal behavior was compared against that source.
+The reduced one-package layout and bettercodex's no-sandbox/no-configuration
+scope explain the retained structural differences. Future changes must still
+re-fetch current upstream rather than treating either revision as a source pin.
 
-The current package cannot compile or operate natively on Windows. The most
-important gaps are summarized below; the implementation must still search the
-then-current tree rather than treating this table as exhaustive.
+## 8. Pre-port gap inventory
+
+When this specification was drafted, the package could not compile or operate
+natively on Windows. The gaps that drove the port are preserved below as
+historical design evidence; they do not describe the implementation candidate
+now in the tree. Validation must inspect the current tree rather than treating
+this table as a live checklist.
 
 | Area | Current files | Current limitation | Required direction |
 | --- | --- | --- | --- |

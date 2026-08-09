@@ -4093,7 +4093,7 @@ fn with_card_border_style(lines: Vec<Line<'static>>, border_style: Style) -> Vec
 }
 
 fn display_directory(cwd: &Path) -> String {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::paths::home_dir() else {
         return markdown::sanitize(&cwd.display().to_string());
     };
     cwd.strip_prefix(&home).map_or_else(
@@ -4115,7 +4115,7 @@ fn display_tool_path(path: &Path, cwd: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(cwd) {
         return markdown::sanitize(&relative.display().to_string());
     }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::paths::home_dir() else {
         return markdown::sanitize(&path.display().to_string());
     };
     path.strip_prefix(home).map_or_else(

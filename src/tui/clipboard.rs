@@ -127,9 +127,16 @@ fn tmux_copy(text: &str) -> Result<(), String> {
 
 fn osc52_copy(text: &str) -> Result<(), String> {
     let sequence = osc52_sequence(text, crate::managed_session::is_tmux_active())?;
-    match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-        Ok(mut tty) => write_and_flush(&mut tty, sequence.as_bytes()),
-        Err(_) => write_and_flush(&mut std::io::stdout().lock(), sequence.as_bytes()),
+    #[cfg(unix)]
+    {
+        match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            Ok(mut tty) => write_and_flush(&mut tty, sequence.as_bytes()),
+            Err(_) => write_and_flush(&mut std::io::stdout().lock(), sequence.as_bytes()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        write_and_flush(&mut std::io::stdout().lock(), sequence.as_bytes())
     }
 }
 

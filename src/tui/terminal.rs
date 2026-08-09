@@ -98,6 +98,7 @@ impl TerminalStartup {
     }
 
     pub(super) fn enter(mut self) -> Result<TerminalSession> {
+        ensure_virtual_terminal_processing()?;
         let mut output = stdout();
 
         let probe = self.finish_probe();
@@ -182,6 +183,7 @@ where
     B: Backend<Error = io::Error> + Write,
 {
     pub(super) fn clear_screen(&mut self) -> Result<()> {
+        ensure_virtual_terminal_processing()?;
         self.refresh_screen_size()?;
         // This is the same reset/home/visible-clear/scrollback-purge sequence Codex uses before
         // replaying source-backed transcript cells after a resize.
@@ -217,6 +219,7 @@ where
         if lines.is_empty() {
             return Ok(());
         }
+        ensure_virtual_terminal_processing()?;
         self.refresh_screen_size()?;
         let width = self.screen_size.width.max(1);
         let next_viewport_height = next_viewport_height.clamp(1, self.screen_size.height.max(1));
@@ -268,6 +271,7 @@ where
         height: u16,
         draw: impl FnOnce(&mut ratatui::Frame<'_>),
     ) -> Result<()> {
+        ensure_virtual_terminal_processing()?;
         self.prepare_viewport(height)?;
         self.terminal
             .draw(draw)
@@ -381,6 +385,7 @@ where
     }
 
     fn finish(&mut self) {
+        let _ = ensure_virtual_terminal_processing();
         let _ = execute!(
             self.terminal.backend_mut(),
             MoveTo(0, self.viewport_top),
@@ -476,6 +481,7 @@ impl Drop for TerminalSession {
 }
 
 fn initialize_terminal_modes() -> Result<()> {
+    ensure_virtual_terminal_processing().context("failed to enable terminal VT output")?;
     enable_raw_mode().context("failed to enable terminal raw mode")?;
     #[cfg(windows)]
     if let Err(error) = super::windows_console::set_input_record_mode() {
@@ -533,7 +539,10 @@ fn restore() -> io::Result<()> {
 
 #[cfg(windows)]
 fn restore() -> io::Result<()> {
-    let mut first_error = disable_raw_mode().err();
+    let mut first_error = ensure_virtual_terminal_processing().err();
+    if let Err(error) = disable_raw_mode() {
+        first_error.get_or_insert(error);
+    }
     if let Err(error) = execute!(
         stdout(),
         SetCursorStyle::DefaultUserShape,
@@ -548,6 +557,49 @@ fn restore() -> io::Result<()> {
         first_error.get_or_insert(error);
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Reassert ANSI output processing because another console client can change the shared screen
+/// buffer mode while bettercodex is running. Redirected handles are deliberately ignored.
+#[cfg(windows)]
+fn ensure_virtual_terminal_processing() -> io::Result<()> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::ENABLE_PROCESSED_OUTPUT;
+    use windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    use windows_sys::Win32::System::Console::GetConsoleMode;
+    use windows_sys::Win32::System::Console::GetStdHandle;
+    use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
+    use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
+    use windows_sys::Win32::System::Console::SetConsoleMode;
+
+    fn enable_for_handle(handle: HANDLE) -> io::Result<()> {
+        if handle == INVALID_HANDLE_VALUE || handle == 0 {
+            return Ok(());
+        }
+
+        let mut mode = 0;
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return Ok(());
+        }
+
+        let requested = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        if mode & requested == requested {
+            return Ok(());
+        }
+        if unsafe { SetConsoleMode(handle, mode | requested) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    enable_for_handle(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) })?;
+    enable_for_handle(unsafe { GetStdHandle(STD_ERROR_HANDLE) })
+}
+
+#[cfg(not(windows))]
+fn ensure_virtual_terminal_processing() -> io::Result<()> {
+    Ok(())
 }
 
 fn install_panic_hook() {

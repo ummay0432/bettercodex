@@ -226,7 +226,7 @@ impl SkillsView {
             return vec![GenericDisplayRow {
                 name: "  No skills installed.".to_string(),
                 description: Some(
-                    "Add SKILL.md under .bcodex/skills or ${BCODEX_HOME:-$HOME/.bcodex}/skills."
+                    "Add SKILL.md under .bcodex/skills or your BCODEX_HOME/skills directory."
                         .to_string(),
                 ),
                 ..Default::default()

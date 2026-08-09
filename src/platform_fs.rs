@@ -12,6 +12,10 @@ pub(crate) fn configure_private_file(options: &mut OpenOptions) {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        let _ = options;
+    }
 }
 
 pub(crate) fn configure_private_file_nofollow(options: &mut OpenOptions, nonblocking: bool) {
@@ -95,7 +99,7 @@ pub(crate) fn is_link(metadata: &Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(unix)]
     {

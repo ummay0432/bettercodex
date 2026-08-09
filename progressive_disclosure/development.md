@@ -39,6 +39,13 @@ In PowerShell on Windows, use the equivalent checked-in wrapper:
 .\scripts\cargo-with-v8.ps1 run --bin bcodex -- "explain this codebase"
 ```
 
+The native installer transaction probes use only PowerShell and the active
+Rust toolchain:
+
+```powershell
+.\scripts\install_windows_tests.ps1
+```
+
 The wrapper downloads and verifies the sandbox-enabled V8 archive and generated
 binding published by upstream Codex, then delegates every argument to Cargo.
 Use it for every command that builds or checks bettercodex, including `check`,

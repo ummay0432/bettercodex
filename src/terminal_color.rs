@@ -1,4 +1,4 @@
-//! Focused truecolor detection matching `supports-color` 3.0.2.
+//! Focused truecolor detection, including Windows Terminal's `WT_SESSION` signal.
 
 use std::io::IsTerminal;
 use std::sync::OnceLock;
@@ -21,7 +21,14 @@ fn detect_stdout_truecolor() -> bool {
         return false;
     }
 
-    std::env::var("COLORTERM").is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit"))
+    #[cfg(windows)]
+    let windows_terminal = std::env::var_os("WT_SESSION").is_some();
+    #[cfg(not(windows))]
+    let windows_terminal = false;
+
+    windows_terminal
+        || std::env::var("COLORTERM")
+            .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit"))
         || std::env::var("TERM")
             .is_ok_and(|value| value.ends_with("direct") || value.ends_with("truecolor"))
         || std::env::var("TERM_PROGRAM").as_deref() == Ok("iTerm.app")

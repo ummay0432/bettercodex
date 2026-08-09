@@ -504,14 +504,14 @@ impl SkillCatalog {
 
 pub(crate) fn save_skill_update(path: &Path, update: SkillUpdate) -> Result<()> {
     let home = paths::bettercodex_home().ok_or_else(|| {
-        anyhow!("cannot save skill settings because neither BCODEX_HOME nor HOME is set")
+        anyhow!("cannot save skill settings because no bettercodex home is available")
     })?;
     skill_settings::save(&home.join(skill_settings::FILE_NAME), path, update)
 }
 
 fn settings_file_display() -> String {
     paths::bettercodex_home().map_or_else(
-        || "${BCODEX_HOME:-$HOME/.bcodex}/skills.json".to_string(),
+        || "BCODEX_HOME/skills.json".to_string(),
         |home| home.join(skill_settings::FILE_NAME).display().to_string(),
     )
 }

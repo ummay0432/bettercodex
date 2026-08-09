@@ -1,5 +1,5 @@
-//! Windows process support ported from OpenAI Codex `codex-utils-pty` at
-//! `646f7c0a91b8e327d263335da68ae8ef212895ce`.
+//! Windows process support ported from OpenAI Codex `codex-utils-pty` and
+//! re-audited at `a16863f8704831d13e041ed7dba2c4a57a2a940b`.
 
 pub mod pipe;
 mod process;
