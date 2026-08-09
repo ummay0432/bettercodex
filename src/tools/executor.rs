@@ -44,7 +44,6 @@ const MAX_PROCESSES: usize = 64;
 #[derive(Clone)]
 pub(crate) struct ProcessManager {
     cwd: Arc<PathBuf>,
-    environment: Arc<HashMap<String, String>>,
     store: Arc<Mutex<ProcessStore>>,
     _cleanup: Arc<ProcessCleanup>,
 }
@@ -82,16 +81,10 @@ enum ProcessStorage {
 }
 
 impl ProcessManager {
-    #[cfg(test)]
     pub(crate) fn new(cwd: PathBuf) -> Self {
-        Self::with_environment(cwd, HashMap::new())
-    }
-
-    pub(crate) fn with_environment(cwd: PathBuf, environment: HashMap<String, String>) -> Self {
         let store = Arc::new(Mutex::new(ProcessStore::default()));
         Self {
             cwd: Arc::new(cwd),
-            environment: Arc::new(environment),
             _cleanup: Arc::new(ProcessCleanup {
                 store: Arc::clone(&store),
             }),
@@ -180,15 +173,8 @@ impl ProcessManager {
         } else {
             ProcessMode::Piped
         };
-        let session = ProcessSession::spawn(
-            &shell,
-            shell_startup,
-            &arguments.cmd,
-            &workdir,
-            mode,
-            &self.environment,
-        )
-        .await?;
+        let session =
+            ProcessSession::spawn(&shell, shell_startup, &arguments.cmd, &workdir, mode).await?;
         let started = Instant::now();
         let storage = if session.has_exited() {
             ProcessStorage::Transient
@@ -704,31 +690,6 @@ mod tests {
         );
         assert!(completed["original_token_count"].as_u64().is_some());
         assert!(completed.get("session_id").is_none());
-    }
-
-    #[tokio::test]
-    async fn command_environment_overrides_are_applied_to_child_processes() {
-        let cwd = std::env::current_dir().unwrap();
-        let manager = ProcessManager::with_environment(
-            cwd,
-            HashMap::from([(
-                "BETTERCODEX_LOOP_ENV_TEST".to_string(),
-                "isolated".to_string(),
-            )]),
-        );
-        let output = manager
-            .exec_command(
-                json!({
-                    "cmd": "printf '%s' \"$BETTERCODEX_LOOP_ENV_TEST\"",
-                    "login": false,
-                }),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(output["exit_code"], 0);
-        assert_eq!(output["output"], "isolated");
     }
 
     #[tokio::test]

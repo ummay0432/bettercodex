@@ -7,12 +7,12 @@ fn explicit_review_queues_behind_an_active_turn() {
         UserPrompt::text("use $review on the update logic"),
     ] {
         assert_eq!(
-            active_submission_route(&prompt).unwrap(),
+            active_submission_route(&prompt),
             ActiveSubmissionRoute::QueueNextTurn
         );
     }
     assert_eq!(
-        active_submission_route(&UserPrompt::text("ordinary follow-up")).unwrap(),
+        active_submission_route(&UserPrompt::text("ordinary follow-up")),
         ActiveSubmissionRoute::SteerOrdinary
     );
 }

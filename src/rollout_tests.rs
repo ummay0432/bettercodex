@@ -11,6 +11,14 @@ fn temporary_directory(name: &str) -> PathBuf {
     path
 }
 
+struct DirectoryCleanup(PathBuf);
+
+impl Drop for DirectoryCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn rollout_replays_replacements_usage_and_turn_state() {
     let root = temporary_directory("rollout-replay");
@@ -71,6 +79,31 @@ fn appended_records_are_visible_while_the_rollout_is_open() {
     }
 
     drop(rollout);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unknown_journal_records_are_ignored_when_resuming() {
+    let root = temporary_directory("rollout-unknown-record");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let path = rollout.path.clone();
+    let item = json!({"type": "message", "role": "user", "content": []});
+    rollout.append_history(std::slice::from_ref(&item)).unwrap();
+    drop(rollout);
+
+    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(b"{\"type\":\"retired_extension\",\"payload\":{\"ignored\":true}}\n")
+        .unwrap();
+    file.flush().unwrap();
+    drop(file);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.history, vec![item]);
+
     std::fs::remove_dir_all(root).unwrap();
 }
 

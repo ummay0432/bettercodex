@@ -10,12 +10,10 @@ use crate::context::ActiveTurnContext;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
-use crate::context::FrozenLoopContext;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserInput;
 use crate::rollout::LoadedRollout;
-use crate::rollout::OperatorInputRecord;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionTranscriptItem;
@@ -27,7 +25,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
@@ -131,18 +128,6 @@ impl TurnControl {
             cancellation,
             steering: None,
         }
-    }
-
-    pub(crate) fn child_non_steerable(&self) -> Self {
-        Self::cancellation_only(self.cancellation.clone())
-    }
-
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
-    }
-
-    pub(crate) fn cancellation(&self) -> CancellationToken {
-        self.cancellation.clone()
     }
 
     fn drain_steering(&self, pending: &mut VecDeque<SteeringInput>) {
@@ -265,10 +250,6 @@ impl Agent {
         self.conversation.session_id()
     }
 
-    pub(crate) fn latest_usage(&self) -> Option<crate::usage::TokenUsage> {
-        self.conversation.latest_usage().cloned()
-    }
-
     pub(crate) fn context_tokens(&self) -> Option<u64> {
         self.conversation.context_tokens()
     }
@@ -297,126 +278,6 @@ impl Agent {
         self.conversation.skill_catalog().warnings()
     }
 
-    pub(crate) fn record_loop_invocation(
-        &mut self,
-        input: UserInput,
-        events: &Option<UnboundedSender<AgentEvent>>,
-    ) -> Result<FrozenLoopContext> {
-        if input.is_empty() {
-            return Err(anyhow!("prompt and image list are both empty"));
-        }
-        let existing = self.conversation.operator_inputs().ok_or_else(|| {
-            anyhow!(
-                "this resumed session predates exact operator-input capture; start a fresh session before invoking the quality loop"
-            )
-        })?;
-        let (message, prompt_text, selected_skills) = input.into_message_and_skills();
-        let injections = self
-            .conversation
-            .skill_catalog()
-            .explicit_injections(&prompt_text, &selected_skills);
-        for warning in &injections.warnings {
-            emit(events, AgentEvent::Warning(warning.clone()));
-        }
-        let record = OperatorInputRecord {
-            message: message.clone(),
-            prompt_text,
-            selected_skills,
-            skill_context: injections.items.clone(),
-        };
-        let mut records = existing.to_vec();
-        records.push(record.clone());
-        let (frozen, warnings) = FrozenLoopContext::capture(&self.cwd, &records)?;
-        for warning in warnings {
-            emit(events, AgentEvent::Warning(warning));
-        }
-        self.conversation.record_operator_input(record)?;
-        self.conversation
-            .extend(injections.items.into_iter().chain([message]))?;
-        self.emit_context(events);
-        Ok(frozen)
-    }
-
-    pub(crate) fn start_loop_turn(&mut self) -> Result<String> {
-        let turn_id = self.api.begin_turn().to_string();
-        self.conversation.start_turn(&turn_id)?;
-        Ok(turn_id)
-    }
-
-    pub(crate) fn finish_loop_turn(
-        &mut self,
-        turn_id: &str,
-        answer: Option<&str>,
-        outcome: TurnOutcome,
-    ) -> Result<()> {
-        if let Some(answer) = answer {
-            self.conversation.extend([serde_json::json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": answer}],
-            })])?;
-        }
-        if outcome == TurnOutcome::Interrupted {
-            self.conversation.mark_interrupted()?;
-        }
-        self.conversation.finish_turn(turn_id, outcome)
-    }
-
-    pub(crate) fn new_frozen_loop_session(
-        cwd: &Path,
-        local_state_root: &Path,
-        frozen: &FrozenLoopContext,
-        phase_prompt: &str,
-        command_environment: HashMap<String, String>,
-    ) -> Result<Self> {
-        let auth = Auth::load()?;
-        let rollout = Rollout::create_in(local_state_root, cwd)?;
-        let identity = rollout.identity().clone();
-        let conversation = Conversation::from_frozen_loop(frozen, rollout)?;
-        let instructions = format!(
-            "{}\n\n{}",
-            crate::api::harness_instructions(),
-            phase_prompt.trim()
-        );
-        let api = ApiClient::new_with_instructions(auth, &identity, 0, instructions)?;
-        let tools = ToolRuntime::with_environment(
-            cwd.to_path_buf(),
-            api.web_search_client(),
-            api.openai_docs_client(),
-            command_environment,
-        );
-        Ok(Self {
-            cwd: cwd.to_path_buf(),
-            api,
-            conversation,
-            tools,
-            resumed_transcript: Vec::new(),
-        })
-    }
-
-    pub(crate) async fn submit_preloaded_with_control(
-        &mut self,
-        events: Option<UnboundedSender<AgentEvent>>,
-        control: TurnControl,
-    ) -> Result<SubmitOutcome> {
-        let turn_id = self.api.begin_turn().to_string();
-        self.conversation.start_turn(&turn_id)?;
-        let result = self
-            .run_active_turn(ActiveTurnContext::default(), &events, &control)
-            .await;
-        control.close();
-        let outcome = match &result {
-            Ok(SubmitOutcome::Completed(_)) => TurnOutcome::Completed,
-            Ok(SubmitOutcome::Cancelled) => {
-                self.conversation.mark_interrupted()?;
-                TurnOutcome::Interrupted
-            }
-            Err(_) => TurnOutcome::Failed,
-        };
-        self.conversation.finish_turn(&turn_id, outcome)?;
-        result
-    }
-
     pub(crate) fn update_skill(
         &mut self,
         path: &Path,
@@ -429,6 +290,10 @@ impl Agent {
         self.conversation
             .reload_skills(&self.cwd)
             .context("skill setting was saved, but the active session could not reload skills")
+    }
+
+    pub(crate) async fn submit(&mut self, prompt: &str) -> Result<String> {
+        self.submit_user_input(UserInput::text(prompt)).await
     }
 
     pub(crate) async fn submit_user_input(&mut self, input: UserInput) -> Result<String> {
@@ -532,16 +397,6 @@ impl Agent {
             return Ok(SubmitOutcome::Cancelled);
         }
 
-        self.run_active_turn(active_turn_context, events, control)
-            .await
-    }
-
-    async fn run_active_turn(
-        &mut self,
-        mut active_turn_context: ActiveTurnContext,
-        events: &Option<UnboundedSender<AgentEvent>>,
-        control: &TurnControl,
-    ) -> Result<SubmitOutcome> {
         // Hide the one-time ICU decompression and V8 platform initialization behind the model's
         // first sampling request instead of paying it after the first exec call arrives.
         self.tools.prewarm();
@@ -834,7 +689,7 @@ impl Agent {
         let skill_context = injections.items;
         let mut projected = Vec::with_capacity(skill_context.len().saturating_add(1));
         projected.extend(skill_context.iter().cloned());
-        projected.push(user_message.clone());
+        projected.push(user_message);
         let mut projection = self.conversation.project_append(projected);
         let incoming_tokens = projection.additional_tokens();
         if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
@@ -864,13 +719,6 @@ impl Agent {
                 "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
-        self.conversation
-            .record_operator_input(OperatorInputRecord {
-                message: user_message,
-                prompt_text,
-                selected_skills,
-                skill_context: skill_context.clone(),
-            })?;
         self.conversation.append_projected(projection)?;
         active_turn_context.record_input(skill_context);
         if let Some(id) = steering_id {

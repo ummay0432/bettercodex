@@ -273,7 +273,7 @@ impl FromStr for ImageDetail {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct UserInput {
     text: String,
     images: Vec<Value>,
@@ -324,14 +324,6 @@ impl UserInput {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.text.trim().is_empty() && self.images.is_empty()
-    }
-
-    pub(crate) fn submitted_text(&self) -> &str {
-        &self.text
-    }
-
-    pub(crate) fn has_attachments(&self) -> bool {
-        !self.images.is_empty()
     }
 
     pub(crate) fn into_message_and_skills(self) -> (Value, String, Vec<SkillSelection>) {

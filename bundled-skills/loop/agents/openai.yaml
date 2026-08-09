@@ -1,6 +1,0 @@
-interface:
-  display_name: "Quality Loop"
-  short_description: "Task-specific evaluator and iterative improvement loop"
-
-policy:
-  allow_implicit_invocation: false
