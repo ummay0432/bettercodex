@@ -27,6 +27,14 @@ pub(crate) use service::InProcessCodeModeSession;
 pub(crate) const PUBLIC_TOOL_NAME: &str = "exec";
 pub(crate) const WAIT_TOOL_NAME: &str = "wait";
 
+pub(crate) fn prewarm() {
+    v8_init::prewarm_v8();
+}
+
+pub(crate) async fn ensure_initialized() -> Result<(), String> {
+    v8_init::ensure_v8_initialized_async().await
+}
+
 pub(crate) fn package_smoke_test() -> Result<(), String> {
     v8_init::ensure_v8_initialized()
 }
