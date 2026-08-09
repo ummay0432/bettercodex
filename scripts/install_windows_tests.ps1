@@ -29,6 +29,7 @@ function Invoke-InstallerFunctions([string] $InstallerPath) {
         'Remove-OwnedTree',
         'Prepend-PathEntry',
         'Invoke-WithRetry',
+        'Try-StageReusableBinary',
         'Recover-FinalizerArtifacts',
         'Start-DeferredReplacement'
     )
@@ -47,23 +48,43 @@ function Invoke-InstallerFunctions([string] $InstallerPath) {
     }
 }
 
-function Build-Fixture([string] $Rustc, [string] $Root, [string] $Name, [string] $Revision) {
+function Build-Fixture(
+    [string] $Rustc,
+    [string] $Root,
+    [string] $Name,
+    [string] $Revision,
+    [string] $BuildInputHash = ''
+) {
     $SourcePath = Join-Path $Root "$Name.rs"
     $Destination = Join-Path $Root "$Name.exe"
     $Template = @'
 use std::env;
+use std::fs;
+
+const REVISION: &str = "__REVISION__";
+const BUILD_INPUT_HASH: &str = "__BUILD_INPUT_HASH__";
 
 fn main() {
     match env::args().nth(1).as_deref() {
         Some("--version") => println!("bcodex 0.1.2"),
-        Some("--internal-source-revision") => println!("__REVISION__"),
+        Some("--internal-source-revision") => println!("{REVISION}"),
+        Some("--internal-install-stage") => {
+            let arguments = env::args().collect::<Vec<_>>();
+            if arguments.len() != 5 {
+                std::process::exit(3);
+            }
+            fs::copy(env::current_exe().unwrap(), &arguments[2]).unwrap();
+            if arguments[3] != REVISION || arguments[4] != BUILD_INPUT_HASH {
+                std::process::exit(4);
+            }
+        }
         _ => std::process::exit(2),
     }
 }
 '@
     [IO.File]::WriteAllText(
         $SourcePath,
-        $Template.Replace('__REVISION__', $Revision),
+        $Template.Replace('__REVISION__', $Revision).Replace('__BUILD_INPUT_HASH__', $BuildInputHash),
         (New-Object Text.UTF8Encoding($false))
     )
     & $Rustc --edition=2024 $SourcePath -o $Destination
@@ -168,8 +189,24 @@ try {
     $NewRevision = '2222222222222222222222222222222222222222'
     $OldFixture = Build-Fixture $Rustc $TestRoot 'old' $OldRevision
     $NewFixture = Build-Fixture $Rustc $TestRoot 'new' $NewRevision
+    $BuildInputHash = 'a' * 64
+    $ReusableFixture = Build-Fixture $Rustc $TestRoot 'reusable' $NewRevision $BuildInputHash
     $Destination = Join-Path $TestRoot 'bcodex.exe'
     $PowerShellPath = (Get-Process -Id $PID).Path
+
+    $BrokenFixture = Join-Path $TestRoot 'broken.exe'
+    [IO.File]::WriteAllText($BrokenFixture, 'not an executable')
+    $ReusableCandidate = Join-Path $TestRoot 'reusable-candidate.exe'
+    $Reused = Try-StageReusableBinary `
+        @($BrokenFixture, $ReusableFixture) $ReusableCandidate $NewRevision '0.1.2' $BuildInputHash
+    Assert $Reused 'a damaged cache entry blocked verified executable reuse'
+    Assert ((& $ReusableCandidate --internal-source-revision).Trim() -ceq $NewRevision) 'reused executable staged the wrong revision'
+    Remove-Item -LiteralPath $ReusableCandidate -Force
+
+    $ReusedMismatch = Try-StageReusableBinary `
+        @($ReusableFixture) $ReusableCandidate $NewRevision '0.1.2' ('b' * 64)
+    Assert (-not $ReusedMismatch) 'a mismatched build-input hash reused stale code'
+    Assert (-not (Test-Path -LiteralPath $ReusableCandidate)) 'failed executable reuse retained a partial candidate'
 
     $EmptyFinalizer = Join-Path $TestRoot ('.bcodex-finalize.' + [Guid]::NewGuid().ToString('N'))
     [void](New-Item -ItemType Directory -Path $EmptyFinalizer)

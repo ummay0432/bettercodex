@@ -427,6 +427,53 @@ function Invoke-WithRetry([scriptblock] $Operation, [string] $Description) {
     Fail "could not $Description"
 }
 
+function Try-StageReusableBinary(
+    [string[]] $Binaries,
+    [string] $Candidate,
+    [string] $Revision,
+    [string] $ExpectedVersion,
+    [string] $BuildInputHash
+) {
+    foreach ($ReusableBinary in $Binaries) {
+        if (-not (Test-Path -LiteralPath $ReusableBinary -PathType Leaf)) { continue }
+
+        $ReusableVersion = $null
+        $VersionExitCode = -1
+        try {
+            $ReusableVersion = (& $ReusableBinary --version 2>$null) -join "`n"
+            $VersionExitCode = $LASTEXITCODE
+        }
+        catch {
+            # A damaged cached executable must not block a valid installed
+            # executable or the source-build fallback.
+        }
+        if ($VersionExitCode -eq 0 -and $ReusableVersion.Trim() -ceq "bcodex $ExpectedVersion") {
+            $StageExitCode = -1
+            try {
+                $null = & $ReusableBinary --internal-install-stage $Candidate $Revision $BuildInputHash 2>$null
+                $StageExitCode = $LASTEXITCODE
+            }
+            catch {
+                # The exact release-input hash is proved by the helper. Any
+                # launch or staging failure falls through to the next source.
+            }
+            if ($StageExitCode -eq 0 -and
+                (Test-Path -LiteralPath $Candidate -PathType Leaf) -and
+                -not (Test-IsReparsePoint $Candidate)) {
+                Write-Step 'Reusing a verified bettercodex executable for unchanged release inputs'
+                return $true
+            }
+        }
+
+        if (Test-Path -LiteralPath $Candidate) {
+            Invoke-WithRetry {
+                Remove-OwnedTree $Candidate
+            } 'remove an unusable reusable-binary stage'
+        }
+    }
+    return $false
+}
+
 function Recover-FinalizerArtifacts([string] $BinDirectory, [string] $Destination) {
     foreach ($Directory in Get-ChildItem -LiteralPath $BinDirectory -Directory -Force -Filter '.bcodex-finalize.*' -ErrorAction SilentlyContinue) {
         if ($Directory.Name -cnotmatch '^\.bcodex-finalize\.([0-9a-f]{32})$' -or
@@ -679,6 +726,7 @@ try {
     }
 
     $TargetDirectory = Join-Path $CacheRoot 'build\x86_64-pc-windows-msvc\target'
+    Assert-NoReparsePath $TargetDirectory
     Assert-FreeSpaceBudget @(
         [pscustomobject]@{ Path = [IO.Path]::GetTempPath(); Bytes = $SourceHeadroom },
         [pscustomobject]@{ Path = $BinDirectory; Bytes = $InstallHeadroom }
@@ -731,27 +779,9 @@ try {
     $FinalizeRoot = Join-Path $BinDirectory ".bcodex-finalize.$TransactionId"
     [void](New-Item -ItemType Directory -Path $FinalizeRoot)
     $Candidate = Join-Path $FinalizeRoot 'candidate.exe'
-    $ReusedExistingBinary = $false
     $ReusableBinaries = @($BuiltBinary, $Destination)
-    foreach ($ReusableBinary in $ReusableBinaries) {
-        if (-not (Test-Path -LiteralPath $ReusableBinary -PathType Leaf)) { continue }
-        $ReusableVersion = (& $ReusableBinary --version 2>$null) -join "`n"
-        if ($LASTEXITCODE -eq 0 -and $ReusableVersion.Trim() -ceq "bcodex $ExpectedVersion") {
-            & $ReusableBinary --internal-install-stage $Candidate $Revision $BuildInputHash 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                $ReusedExistingBinary = $true
-                Write-Step 'Reusing a verified bettercodex executable for unchanged release inputs'
-                break
-            }
-            else {
-                if (Test-Path -LiteralPath $Candidate) {
-                    Invoke-WithRetry {
-                        Remove-Item -LiteralPath $Candidate -Force
-                    } 'remove an unusable reusable-binary stage'
-                }
-            }
-        }
-    }
+    $ReusedExistingBinary = Try-StageReusableBinary `
+        $ReusableBinaries $Candidate $Revision $ExpectedVersion $BuildInputHash
 
     if (-not $ReusedExistingBinary) {
         $HasWarmBuildCache = Test-Path -LiteralPath $BuiltBinary -PathType Leaf

@@ -136,9 +136,8 @@ disposable. A target-native installer may reuse a cached unstamped or currently
 installed binary without invoking Cargo only after the installer verifies its
 package version and its internal staging helper proves that the complete
 release-input hash matches the selected source. Cleanup must run after success
-and failure without following
-symlinks or reparse points. If no cache home exists, all downloads and build
-output are disposable.
+and failure without following symlinks or reparse points. If no cache home
+exists, all downloads and build output are disposable.
 
 Network payloads and metadata have explicit maximum sizes. Compilation happens
 once for the selected revision even if `main` changes during the build. A later
@@ -172,4 +171,4 @@ verification, moving-`main` behavior, PATH handling, and cleanup with and
 without persistent cache homes. Native Windows coverage additionally requires
 PowerShell syntax, V8 checksum, `.exe` staging, reparse refusal, exact-process
 deferred replacement, sharing-violation retry, rollback, release smoke, and
-same-revision no-op tests.
+same-revision no-op and release-input executable reuse/rejection tests.

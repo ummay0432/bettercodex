@@ -486,8 +486,10 @@ The Windows installer must preserve the same transaction as Unix:
    required checksums.
 5. Reuse target-specific Cargo, registry, Rust toolchain, and V8 caches without
    trusting stale partial entries.
-6. Hash all release-relevant source bytes and build `--release --locked --bin
-   bcodex` with that content hash tracked independently of archive mtimes.
+6. Hash all release-relevant source bytes. If no cached or installed executable
+   proves that exact hash through its internal staging helper, build `--release
+   --locked --bin bcodex` with the hash tracked independently of archive mtimes;
+   otherwise restamp the verified executable without starting Rust or MSVC.
 7. Verify version metadata, release-input hash, V8 initialization, embedded
    resources, and the internal smoke test in isolated Windows user/application
    homes.
