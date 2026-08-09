@@ -21,8 +21,12 @@ use std::sync::LazyLock;
 
 const EXEC_SOURCE_GRAMMAR: &str = r#"start: SOURCE
 SOURCE: /[\s\S]+/"#;
+// Upstream also advertises `audio`, `generatedImage`, and `ALL_TOOLS`. bettercodex
+// has no MCP or image-generation integrations, and its fixed nested surface is
+// fully declared below, so those compatibility globals are deliberately omitted
+// from model-facing guidance.
 const EXEC_RUNTIME_GUIDANCE: &str = r#"Input raw JavaScript directly (no JSON, string, or Markdown wrapper) into fresh V8: top-level `await`; no Node.js/filesystem/network/console. Call `await tools.name(args)`; errors reject. Use `Promise.all` for independent calls and await all work. Emit with `text(value)`/`image(item,detail?)`; `notify` is interim; `yield_control` yields while code continues; `store`/`load` persist serializable values across cells; `exit`, `setTimeout`, and `clearTimeout` exist. Optional first line `// @exec:{"yield_time_ms":10000,"max_output_tokens":1000}`; both default 10000."#;
-const TOOL_DEFAULTS: &str = "Defaults: command cwd=turn, shell=user, `login:true`, `tty:false`, yield=10s; stdin yield=.25s after writes/5s polling; outer exec/wait output=10k tokens; nested command output=collected raw unless `max_output_tokens` is set; image detail=`high`. Yields clamp to .25–30s (poll 5–300s). Process: `output`+`wall_time_seconds` always; `session_id`=running, `exit_code`=done, `original_token_count`=before truncation, `chunk_id`=output chunk.";
+const TOOL_DEFAULTS: &str = "Defaults: command cwd=turn, shell=user, `login:true`, `tty:false`, yield=10s; stdin yield=.25s after writes/5s polling; outer exec/wait output=10k tokens; nested command output=collected raw unless `max_output_tokens` is set; image detail=`high`. Nested command and non-empty write yields clamp to .25–30s; empty polls to 5–300s; top-level `exec`/`wait` yields are not clamped. Process: `output`+`wall_time_seconds` always; `session_id`=running, `exit_code`=done, `original_token_count`=before truncation, `chunk_id`=output chunk.";
 const WAIT_DESCRIPTION: &str = "Wait on a yielded top-level `exec` cell using its string `cell_id`; process `session_id` values from `exec_command` belong to `tools.write_stdin`. Returns only new output; repeat while active or use `terminate:true` to stop. `yield_time_ms`/`max_tokens` default 10000.";
 
 static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
