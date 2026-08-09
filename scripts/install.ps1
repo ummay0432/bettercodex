@@ -25,6 +25,7 @@ $MinimumWindowsBuild = 17763
 $FirstBuildCacheHeadroom = 8GB
 $WarmBuildCacheHeadroom = 2GB
 $ScratchHeadroom = 2GB
+$SourceHeadroom = 512MB
 $InstallHeadroom = 256MB
 
 function Write-Step([string] $Message) {
@@ -33,6 +34,27 @@ function Write-Step([string] $Message) {
 
 function Fail([string] $Message) {
     throw "bettercodex installer: $Message"
+}
+
+function Get-ProcessEnvironmentSnapshot {
+    $Snapshot = @{}
+    foreach ($Entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) {
+        $Snapshot[[string]$Entry.Key] = [string]$Entry.Value
+    }
+    return $Snapshot
+}
+
+function Restore-ProcessEnvironment([hashtable] $Snapshot) {
+    $CurrentEnvironment = [Environment]::GetEnvironmentVariables('Process')
+    foreach ($Entry in $CurrentEnvironment.GetEnumerator()) {
+        $Name = [string]$Entry.Key
+        if (-not $Snapshot.ContainsKey($Name)) {
+            Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($Name in $Snapshot.Keys) {
+        [Environment]::SetEnvironmentVariable($Name, $Snapshot[$Name], 'Process')
+    }
 }
 
 function Test-SourceRevision([string] $Revision) {
@@ -133,7 +155,7 @@ function Remove-OwnedTree([string] $Path) {
     }
 }
 
-function Invoke-BoundedDownload(
+function Invoke-BoundedDownloadAttempt(
     [string] $Uri,
     [string] $Destination,
     [long] $MaximumBytes
@@ -198,6 +220,24 @@ function Invoke-BoundedDownload(
     }
 }
 
+function Invoke-BoundedDownload(
+    [string] $Uri,
+    [string] $Destination,
+    [long] $MaximumBytes
+) {
+    for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+        try {
+            Invoke-BoundedDownloadAttempt $Uri $Destination $MaximumBytes
+            return
+        }
+        catch {
+            if ($Attempt -eq 3) { throw }
+            Write-Warning "download from $Uri failed; retrying ($($Attempt + 1)/3)"
+            Start-Sleep -Seconds $Attempt
+        }
+    }
+}
+
 function Resolve-MainRevision([string] $Repository) {
     $Uri = "$GitHubApiRoot/repos/$Repository/git/ref/heads/main"
     $Temporary = Join-Path ([IO.Path]::GetTempPath()) (
@@ -251,6 +291,42 @@ function Import-VisualStudioEnvironment {
     }
 }
 
+function Find-RustupExecutable(
+    [string] $OriginalCargoHome,
+    [string] $ManagedCargoHome
+) {
+    $Command = Get-Command rustup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $Command) { return [string]$Command.Source }
+
+    $Candidates = New-Object 'System.Collections.Generic.List[string]'
+    if (-not [string]::IsNullOrWhiteSpace($OriginalCargoHome) -and
+        [IO.Path]::IsPathRooted($OriginalCargoHome)) {
+        $Candidates.Add((Join-Path $OriginalCargoHome 'bin\rustup.exe'))
+    }
+    if ($env:USERPROFILE) {
+        $Candidates.Add((Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'))
+    }
+    $Candidates.Add((Join-Path $ManagedCargoHome 'bin\rustup.exe'))
+    foreach ($Candidate in $Candidates) {
+        if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
+    }
+    return $null
+}
+
+function Find-PinnedRustTools([string] $Rustup, [string] $Toolchain) {
+    $Cargo = (& $Rustup which --toolchain $Toolchain cargo 2>$null | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$Cargo) -or
+        -not (Test-Path -LiteralPath $Cargo -PathType Leaf)) {
+        return $null
+    }
+    $Rustc = (& $Rustup which --toolchain $Toolchain rustc 2>$null | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$Rustc) -or
+        -not (Test-Path -LiteralPath $Rustc -PathType Leaf)) {
+        return $null
+    }
+    return [pscustomobject]@{ Cargo = [string]$Cargo; Rustc = [string]$Rustc }
+}
+
 function Get-SourceInputHash([string] $SourceRoot) {
     $Inputs = New-Object 'System.Collections.Generic.List[IO.FileInfo]'
     foreach ($Relative in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'scripts\cargo-with-v8.ps1', 'src')) {
@@ -295,17 +371,6 @@ function Get-SourceInputHash([string] $SourceRoot) {
     }
 }
 
-function Test-PathContains([string] $PathValue, [string] $Entry) {
-    if ([string]::IsNullOrWhiteSpace($PathValue)) { return $false }
-    $Expected = $Entry.TrimEnd('\')
-    foreach ($Segment in $PathValue.Split(';')) {
-        if ($Segment.Trim().TrimEnd('\').Equals($Expected, [StringComparison]::OrdinalIgnoreCase)) {
-            return $true
-        }
-    }
-    return $false
-}
-
 function Prepend-PathEntry([string] $PathValue, [string] $Entry) {
     $Entries = New-Object 'System.Collections.Generic.List[string]'
     $Entries.Add($Entry.TrimEnd('\'))
@@ -319,6 +384,26 @@ function Prepend-PathEntry([string] $PathValue, [string] $Entry) {
         }
     }
     return $Entries -join ';'
+}
+
+function Ensure-CommandPath([string] $BinDirectory) {
+    try {
+        $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $NewUserPath = Prepend-PathEntry $UserPath $BinDirectory
+        if ($NewUserPath -cne $UserPath) {
+            [Environment]::SetEnvironmentVariable('Path', $NewUserPath, 'User')
+            Write-Step 'PATH updated for future terminal sessions'
+        }
+    }
+    catch {
+        Write-Warning "could not update the per-user PATH; add $BinDirectory manually for future terminals: $_"
+    }
+    try {
+        $env:Path = Prepend-PathEntry $env:Path $BinDirectory
+    }
+    catch {
+        Write-Warning "could not update this process's PATH; run $BinDirectory\bcodex.exe directly: $_"
+    }
 }
 
 function Invoke-WithRetry([scriptblock] $Operation, [string] $Description) {
@@ -350,6 +435,16 @@ function Recover-FinalizerArtifacts([string] $BinDirectory, [string] $Destinatio
         }
         $TransactionId = $Matches[1]
         $ManifestPath = Join-Path $Directory.FullName 'transaction.json'
+        if (-not (Test-Path -LiteralPath $ManifestPath)) {
+            $Artifacts = @(Get-ChildItem -LiteralPath $Directory.FullName -Force)
+            if ($Artifacts.Count -eq 0) {
+                Invoke-WithRetry {
+                    Remove-Item -LiteralPath $Directory.FullName -Force
+                } 'remove the empty completed finalizer transaction'
+                continue
+            }
+            Fail "incomplete bettercodex finalizer record $ManifestPath"
+        }
         if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf) -or
             (Test-IsReparsePoint $ManifestPath)) {
             Fail "incomplete bettercodex finalizer record $ManifestPath"
@@ -363,9 +458,39 @@ function Recover-FinalizerArtifacts([string] $BinDirectory, [string] $Destinatio
             -not [string]::Equals([string]$Manifest.backup, $ExpectedBackup, [StringComparison]::OrdinalIgnoreCase)) {
             Fail "invalid bettercodex finalizer record $ManifestPath"
         }
-        if (-not (Test-Path -LiteralPath $Destination) -and
-            (Test-Path -LiteralPath $ExpectedBackup -PathType Leaf)) {
-            Move-Item -LiteralPath $ExpectedBackup -Destination $Destination
+        foreach ($Artifact in @($ExpectedCandidate, $ExpectedBackup)) {
+            if ((Test-Path -LiteralPath $Artifact) -and (Test-IsReparsePoint $Artifact)) {
+                Fail "unsafe bettercodex finalizer artifact $Artifact"
+            }
+        }
+        if (Test-Path -LiteralPath $ExpectedBackup -PathType Leaf) {
+            # A retained backup means the previous command was moved but the
+            # transaction did not finish its cleanup. Prefer the known previous
+            # command even if the candidate reached the destination before a
+            # crash; the requested update can then retry normally.
+            $Interrupted = Join-Path $Directory.FullName 'interrupted.exe'
+            if (Test-Path -LiteralPath $Interrupted) {
+                Fail "unsafe bettercodex recovery artifact $Interrupted"
+            }
+            if (Test-Path -LiteralPath $Destination) {
+                Invoke-WithRetry {
+                    Move-Item -LiteralPath $Destination -Destination $Interrupted
+                } 'preserve the interrupted update candidate'
+            }
+            try {
+                Invoke-WithRetry {
+                    Move-Item -LiteralPath $ExpectedBackup -Destination $Destination
+                } 'restore the previous installed binary'
+            }
+            catch {
+                if (-not (Test-Path -LiteralPath $Destination) -and
+                    (Test-Path -LiteralPath $Interrupted -PathType Leaf)) {
+                    Invoke-WithRetry {
+                        Move-Item -LiteralPath $Interrupted -Destination $Destination
+                    } 'restore the interrupted destination after recovery failure'
+                }
+                throw
+            }
         }
         Remove-OwnedTree $Directory.FullName
     }
@@ -403,7 +528,7 @@ try {
     }
     if ($null -eq $lock) { throw 'could not acquire the bettercodex install lock for finalization' }
     $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
-    if ($null -ne $parent -and $parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks) { $parent.WaitForExit() }
+    if ($null -ne $parent -and $parent.StartTime.ToUniversalTime().Ticks -eq $parentTicks -and -not $parent.WaitForExit(300000)) { throw 'timed out waiting for the bettercodex updater process to exit' }
     if ((Get-FileHash -LiteralPath $manifest.candidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.sha256) { throw 'staged bettercodex digest changed before finalization' }
     if (Test-Path -LiteralPath $manifest.backup) { Remove-Item -LiteralPath $manifest.backup -Force }
     if (Test-Path -LiteralPath $manifest.destination) { Retry { Move-Item -LiteralPath $manifest.destination -Destination $manifest.backup } }
@@ -430,13 +555,19 @@ try {
 '@
     $Bytes = [Text.Encoding]::Unicode.GetBytes($Finalizer)
     $Encoded = [Convert]::ToBase64String($Bytes)
-    $env:BCODEX_FINALIZE_MANIFEST = $ManifestPath
-    $env:BCODEX_FINALIZE_PARENT_PID = [string]$ParentPid
-    $env:BCODEX_FINALIZE_PARENT_TICKS = [string]$ParentStartTicks
-    $Started = Start-Process -FilePath $PowerShellPath -ArgumentList @(
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-EncodedCommand', $Encoded
-    ) -PassThru
+    $FinalizeEnvironment = Get-ProcessEnvironmentSnapshot
+    try {
+        $env:BCODEX_FINALIZE_MANIFEST = $ManifestPath
+        $env:BCODEX_FINALIZE_PARENT_PID = [string]$ParentPid
+        $env:BCODEX_FINALIZE_PARENT_TICKS = [string]$ParentStartTicks
+        $Started = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-EncodedCommand', $Encoded
+        ) -PassThru
+    }
+    finally {
+        Restore-ProcessEnvironment $FinalizeEnvironment
+    }
     if ($null -eq $Started -or $Started.HasExited) {
         Fail 'could not start the bettercodex update finalizer'
     }
@@ -505,6 +636,7 @@ $Lock = $null
 $TemporaryRoot = $null
 $FinalizeRoot = $null
 $Deferred = $false
+$PreserveFinalizeRoot = $false
 try {
     try {
         $Lock = New-Object IO.FileStream(
@@ -541,30 +673,17 @@ try {
         $InstalledRevision = (& $Destination --internal-source-revision 2>$null) -join "`n"
         if ($LASTEXITCODE -eq 0 -and $InstalledRevision.Trim().Equals($Revision, [StringComparison]::OrdinalIgnoreCase)) {
             Write-Step "bettercodex is already current with main at $($Revision.Substring(0, 12))."
-            $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-            if (-not (Test-PathContains $UserPath $BinDirectory)) {
-                [Environment]::SetEnvironmentVariable('Path', (Prepend-PathEntry $UserPath $BinDirectory), 'User')
-            }
+            Ensure-CommandPath $BinDirectory
             exit 0
         }
     }
 
     $TargetDirectory = Join-Path $CacheRoot 'build\x86_64-pc-windows-msvc\target'
-    $HasWarmBuildCache = (Test-Path -LiteralPath (Join-Path $TargetDirectory '.rustc_info.json') -PathType Leaf) -or
-        (Test-Path -LiteralPath (Join-Path $TargetDirectory 'release') -PathType Container)
-    $CacheHeadroom = if ($HasWarmBuildCache) {
-        $WarmBuildCacheHeadroom
-    }
-    else {
-        $FirstBuildCacheHeadroom
-    }
     Assert-FreeSpaceBudget @(
-        [pscustomobject]@{ Path = $CacheRoot; Bytes = $CacheHeadroom },
-        [pscustomobject]@{ Path = [IO.Path]::GetTempPath(); Bytes = $ScratchHeadroom },
+        [pscustomobject]@{ Path = [IO.Path]::GetTempPath(); Bytes = $SourceHeadroom },
         [pscustomobject]@{ Path = $BinDirectory; Bytes = $InstallHeadroom }
     )
 
-    Import-VisualStudioEnvironment
     if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
         Fail 'Windows tar.exe is required to extract the immutable source archive'
     }
@@ -605,73 +724,161 @@ try {
     if (-not $ToolchainMatch.Success) { Fail 'source commit has no pinned Rust toolchain' }
     $RustToolchain = $ToolchainMatch.Groups[1].Value
 
-    $CargoHome = Join-Path $CacheRoot 'cargo'
-    $ManagedRustupHome = Join-Path $CacheRoot 'rustup'
-    [void](New-Item -ItemType Directory -Force -Path $CargoHome)
-    [void](New-Item -ItemType Directory -Force -Path $TargetDirectory)
-    $Rustup = (Get-Command rustup.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1)
-    $ManagedRustup = $false
-    if (-not $Rustup) {
-        $CachedRustup = Join-Path $CargoHome 'bin\rustup.exe'
-        if (-not (Test-Path -LiteralPath $CachedRustup -PathType Leaf)) {
-            Write-Step 'Installing rustup for the pinned bettercodex toolchain'
-            $RustupInit = Join-Path $TemporaryRoot 'rustup-init.exe'
-            Invoke-BoundedDownload 'https://win.rustup.rs/x86_64' $RustupInit 32MB
-            $env:CARGO_HOME = $CargoHome
-            $env:RUSTUP_HOME = $ManagedRustupHome
-            & $RustupInit -y --no-modify-path --profile minimal --default-toolchain none
-            if ($LASTEXITCODE -ne 0) { Fail 'the official rustup installer failed' }
-        }
-        $Rustup = $CachedRustup
-        $ManagedRustup = $true
-    }
-    if ($ManagedRustup) { $env:RUSTUP_HOME = $ManagedRustupHome }
-    $env:CARGO_HOME = $CargoHome
-    Write-Step "Using the pinned Rust $RustToolchain toolchain"
-    & $Rustup toolchain install $RustToolchain --profile minimal
-    if ($LASTEXITCODE -ne 0) { Fail "could not install pinned Rust $RustToolchain" }
-    $Cargo = (& $Rustup which --toolchain $RustToolchain cargo | Select-Object -First 1)
-    $Rustc = (& $Rustup which --toolchain $RustToolchain rustc | Select-Object -First 1)
-    if (-not (Test-Path -LiteralPath $Cargo -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $Rustc -PathType Leaf)) {
-        Fail 'pinned Cargo and rustc executables are unavailable'
-    }
-
     $BuildInputHash = Get-SourceInputHash $SourceRoot
-    Write-Step "Compiling bettercodex $ExpectedVersion with the warm Cargo cache"
-    $env:BCODEX_BUILD_INPUT_HASH = $BuildInputHash
-    $env:BCODEX_CACHE_DIR = $CacheRoot
-    $env:CARGO = $Cargo
-    $env:CARGO_INCREMENTAL = '1'
-    $env:CARGO_TARGET_DIR = $TargetDirectory
-    $env:RUSTC = $Rustc
-    $env:TEMP = $CompilerTemp
-    $env:TMP = $CompilerTemp
-    $PowerShellPath = (Get-Process -Id $PID).Path
-    Push-Location $SourceRoot
-    try {
-        & $PowerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $SourceRoot 'scripts\cargo-with-v8.ps1') build --release --locked --bin bcodex
-        if ($LASTEXITCODE -ne 0) { Fail 'local bettercodex compilation failed' }
-    }
-    finally {
-        Pop-Location
-    }
-
     $BuiltBinary = Join-Path $TargetDirectory 'release\bcodex.exe'
-    if (-not (Test-Path -LiteralPath $BuiltBinary -PathType Leaf)) {
-        Fail 'local build did not produce bcodex.exe'
-    }
-    $BuiltVersion = (& $BuiltBinary --version 2>$null) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $BuiltVersion.Trim() -cne "bcodex $ExpectedVersion") {
-        Fail "built binary did not report bcodex $ExpectedVersion"
-    }
-
+    $PowerShellPath = (Get-Process -Id $PID).Path
     $TransactionId = [Guid]::NewGuid().ToString('N')
     $FinalizeRoot = Join-Path $BinDirectory ".bcodex-finalize.$TransactionId"
     [void](New-Item -ItemType Directory -Path $FinalizeRoot)
     $Candidate = Join-Path $FinalizeRoot 'candidate.exe'
-    & $BuiltBinary --internal-install-stage $Candidate $Revision $BuildInputHash
-    if ($LASTEXITCODE -ne 0) { Fail "built binary could not stage source revision $Revision" }
+    $ReusedExistingBinary = $false
+    $ReusableBinaries = @($BuiltBinary, $Destination)
+    foreach ($ReusableBinary in $ReusableBinaries) {
+        if (-not (Test-Path -LiteralPath $ReusableBinary -PathType Leaf)) { continue }
+        $ReusableVersion = (& $ReusableBinary --version 2>$null) -join "`n"
+        if ($LASTEXITCODE -eq 0 -and $ReusableVersion.Trim() -ceq "bcodex $ExpectedVersion") {
+            & $ReusableBinary --internal-install-stage $Candidate $Revision $BuildInputHash 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $ReusedExistingBinary = $true
+                Write-Step 'Reusing a verified bettercodex executable for unchanged release inputs'
+                break
+            }
+            else {
+                if (Test-Path -LiteralPath $Candidate) {
+                    Invoke-WithRetry {
+                        Remove-Item -LiteralPath $Candidate -Force
+                    } 'remove an unusable reusable-binary stage'
+                }
+            }
+        }
+    }
+
+    if (-not $ReusedExistingBinary) {
+        $HasWarmBuildCache = Test-Path -LiteralPath $BuiltBinary -PathType Leaf
+        $CacheHeadroom = if ($HasWarmBuildCache) { $WarmBuildCacheHeadroom } else { $FirstBuildCacheHeadroom }
+        Assert-FreeSpaceBudget @(
+            [pscustomobject]@{ Path = $CacheRoot; Bytes = $CacheHeadroom },
+            [pscustomobject]@{ Path = [IO.Path]::GetTempPath(); Bytes = $ScratchHeadroom },
+            [pscustomobject]@{ Path = $BinDirectory; Bytes = $InstallHeadroom }
+        )
+        $OriginalCargoHome = $env:CARGO_HOME
+        $CompilerEnvironment = Get-ProcessEnvironmentSnapshot
+        try {
+            Import-VisualStudioEnvironment
+            $CargoHome = Join-Path $CacheRoot 'cargo'
+            $ManagedRustupHome = Join-Path $CacheRoot 'rustup'
+            [void](New-Item -ItemType Directory -Force -Path $CargoHome)
+            [void](New-Item -ItemType Directory -Force -Path $TargetDirectory)
+            $Rustup = Find-RustupExecutable $OriginalCargoHome $CargoHome
+            $CachedRustup = Join-Path $CargoHome 'bin\rustup.exe'
+            if (-not $Rustup) {
+                if (-not (Test-Path -LiteralPath $CachedRustup -PathType Leaf)) {
+                    Write-Step 'Installing rustup for the pinned bettercodex toolchain'
+                    $RustupInit = Join-Path $TemporaryRoot 'rustup-init.exe'
+                    Invoke-BoundedDownload 'https://win.rustup.rs/x86_64' $RustupInit 32MB
+                    $env:CARGO_HOME = $CargoHome
+                    $env:RUSTUP_HOME = $ManagedRustupHome
+                    & $RustupInit -y --no-modify-path --profile minimal --default-toolchain none
+                    if ($LASTEXITCODE -ne 0) { Fail 'the official rustup installer failed' }
+                }
+                $Rustup = $CachedRustup
+            }
+            $env:CARGO_HOME = $CargoHome
+            Write-Step "Using the pinned Rust $RustToolchain toolchain"
+            $UsesManagedRustupHome = [string]::Equals(
+                [IO.Path]::GetFullPath($Rustup),
+                [IO.Path]::GetFullPath($CachedRustup),
+                [StringComparison]::OrdinalIgnoreCase
+            )
+            if ($UsesManagedRustupHome) { $env:RUSTUP_HOME = $ManagedRustupHome }
+            $RustTools = Find-PinnedRustTools $Rustup $RustToolchain
+            if ($null -eq $RustTools) {
+                # Keep an existing user rustup installation untouched when it does not
+                # already provide the pinned release. Missing toolchains belong to the
+                # reusable bettercodex cache, matching the Unix installer.
+                $env:RUSTUP_HOME = $ManagedRustupHome
+                [void](New-Item -ItemType Directory -Force -Path $ManagedRustupHome)
+                $RustTools = Find-PinnedRustTools $Rustup $RustToolchain
+                if ($null -eq $RustTools) {
+                    Write-Step "Caching missing Rust $RustToolchain at $ManagedRustupHome"
+                    & $Rustup toolchain install $RustToolchain --profile minimal
+                    if ($LASTEXITCODE -ne 0) { Fail "could not install pinned Rust $RustToolchain" }
+                    $RustTools = Find-PinnedRustTools $Rustup $RustToolchain
+                }
+            }
+            if ($null -eq $RustTools) {
+                Fail 'pinned Cargo and rustc executables are unavailable'
+            }
+            $Cargo = $RustTools.Cargo
+            $Rustc = $RustTools.Rustc
+
+            Write-Step "Compiling bettercodex $ExpectedVersion with the warm Cargo cache"
+            $BuildEnvironmentNames = @(
+                'BCODEX_BUILD_INPUT_HASH',
+                'BCODEX_CACHE_DIR',
+                'BCODEX_SOURCE_REVISION',
+                'CARGO',
+                'CARGO_BUILD_BUILD_DIR',
+                'CARGO_BUILD_JOBS',
+                'CARGO_BUILD_TARGET',
+                'CARGO_BUILD_TARGET_DIR',
+                'CARGO_ENCODED_RUSTFLAGS',
+                'CARGO_INCREMENTAL',
+                'CARGO_INSTALL_ROOT',
+                'CARGO_TARGET_DIR',
+                'RUSTC',
+                'RUSTC_WORKSPACE_WRAPPER',
+                'RUSTC_WRAPPER',
+                'RUSTFLAGS',
+                'RUSTUP_TOOLCHAIN',
+                'RUSTY_V8_ARCHIVE',
+                'RUSTY_V8_SRC_BINDING_PATH',
+                'TEMP',
+                'TMP',
+                'V8_FROM_SOURCE'
+            )
+            $BuildEnvironment = Get-ProcessEnvironmentSnapshot
+            foreach ($Name in $BuildEnvironmentNames) {
+                Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+            }
+            $OriginalPath = $env:Path
+            try {
+                $env:BCODEX_BUILD_INPUT_HASH = $BuildInputHash
+                $env:BCODEX_CACHE_DIR = $CacheRoot
+                $env:CARGO = $Cargo
+                $env:CARGO_INCREMENTAL = '1'
+                $env:CARGO_TARGET_DIR = $TargetDirectory
+                $env:RUSTC = $Rustc
+                $env:TEMP = $CompilerTemp
+                $env:TMP = $CompilerTemp
+                $env:Path = (Split-Path -Parent $Cargo) + ';' + $OriginalPath
+                Push-Location $SourceRoot
+                try {
+                    & $PowerShellPath -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $SourceRoot 'scripts\cargo-with-v8.ps1') build --release --locked --bin bcodex
+                    if ($LASTEXITCODE -ne 0) { Fail 'local bettercodex compilation failed' }
+                }
+                finally {
+                    Pop-Location
+                }
+            }
+            finally {
+                Restore-ProcessEnvironment $BuildEnvironment
+            }
+
+            if (-not (Test-Path -LiteralPath $BuiltBinary -PathType Leaf)) {
+                Fail 'local build did not produce bcodex.exe'
+            }
+            $BuiltVersion = (& $BuiltBinary --version 2>$null) -join "`n"
+            if ($LASTEXITCODE -ne 0 -or $BuiltVersion.Trim() -cne "bcodex $ExpectedVersion") {
+                Fail "built binary did not report bcodex $ExpectedVersion"
+            }
+            & $BuiltBinary --internal-install-stage $Candidate $Revision $BuildInputHash
+            if ($LASTEXITCODE -ne 0) { Fail "built binary could not stage source revision $Revision" }
+        }
+        finally {
+            Restore-ProcessEnvironment $CompilerEnvironment
+        }
+    }
     $CandidateVersion = (& $Candidate --version 2>$null) -join "`n"
     $CandidateRevision = (& $Candidate --internal-source-revision 2>$null) -join "`n"
     if ($CandidateVersion.Trim() -cne "bcodex $ExpectedVersion" -or $CandidateRevision.Trim() -cne $Revision) {
@@ -682,20 +889,23 @@ try {
     foreach ($Directory in @('profile', 'local-app-data', 'codex-home', 'bcodex-home', 'workspace')) {
         [void](New-Item -ItemType Directory -Force -Path (Join-Path $SmokeRoot $Directory))
     }
+    $SmokeEnvironment = Get-ProcessEnvironmentSnapshot
     $PriorDirectory = [Environment]::CurrentDirectory
-    $env:USERPROFILE = Join-Path $SmokeRoot 'profile'
-    $env:LOCALAPPDATA = Join-Path $SmokeRoot 'local-app-data'
-    $env:CODEX_HOME = Join-Path $SmokeRoot 'codex-home'
-    $env:BCODEX_HOME = Join-Path $SmokeRoot 'bcodex-home'
-    $env:BCODEX_SKIP_UPDATE_CHECK = '1'
-    [Environment]::CurrentDirectory = Join-Path $SmokeRoot 'workspace'
     try {
+        $env:USERPROFILE = Join-Path $SmokeRoot 'profile'
+        $env:LOCALAPPDATA = Join-Path $SmokeRoot 'local-app-data'
+        $env:CODEX_HOME = Join-Path $SmokeRoot 'codex-home'
+        $env:BCODEX_HOME = Join-Path $SmokeRoot 'bcodex-home'
+        $env:BCODEX_SKIP_UPDATE_CHECK = '1'
+        [Environment]::CurrentDirectory = Join-Path $SmokeRoot 'workspace'
         $SmokeOutput = (& $Candidate --internal-install-smoke 2>$null) -join "`n"
+        $SmokeExitCode = $LASTEXITCODE
     }
     finally {
         [Environment]::CurrentDirectory = $PriorDirectory
+        Restore-ProcessEnvironment $SmokeEnvironment
     }
-    if ($LASTEXITCODE -ne 0 -or $SmokeOutput.Trim() -cne "bcodex $ExpectedVersion install smoke passed") {
+    if ($SmokeExitCode -ne 0 -or $SmokeOutput.Trim() -cne "bcodex $ExpectedVersion install smoke passed") {
         Fail 'staged binary failed its runtime and embedded-resource smoke test'
     }
 
@@ -740,24 +950,31 @@ try {
             Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
         }
         catch {
-            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-            if (Test-Path -LiteralPath $Backup) {
-                Move-Item -LiteralPath $Backup -Destination $Destination
+            $InstallFailure = $_
+            try {
+                if (Test-Path -LiteralPath $Destination) {
+                    Invoke-WithRetry {
+                        Remove-Item -LiteralPath $Destination -Force
+                    } 'remove the failed bettercodex candidate'
+                }
+                if (Test-Path -LiteralPath $Backup) {
+                    Invoke-WithRetry {
+                        Move-Item -LiteralPath $Backup -Destination $Destination
+                    } 'restore the previous installed binary'
+                }
             }
-            throw
+            catch {
+                $PreserveFinalizeRoot = $true
+                throw "bettercodex installation failed and rollback needs recovery from $ManifestPath`: $_"
+            }
+            throw $InstallFailure
         }
         Remove-OwnedTree $FinalizeRoot
         $FinalizeRoot = $null
         Write-Step "Installed bcodex $ExpectedVersion ($($Revision.Substring(0, 12))) at $Destination"
     }
 
-    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $NewUserPath = Prepend-PathEntry $UserPath $BinDirectory
-    if ($NewUserPath -cne $UserPath) {
-        [Environment]::SetEnvironmentVariable('Path', $NewUserPath, 'User')
-        Write-Step 'PATH updated for future terminal sessions'
-    }
-    $env:Path = Prepend-PathEntry $env:Path $BinDirectory
+    Ensure-CommandPath $BinDirectory
     if (-not $Deferred) { Write-Step 'Run: bcodex login' }
 }
 finally {
@@ -765,7 +982,7 @@ finally {
     if ($TemporaryRoot) {
         try { Remove-OwnedTree $TemporaryRoot } catch { Write-Warning "could not remove task-owned installer tree $TemporaryRoot`: $_" }
     }
-    if ($FinalizeRoot -and -not $Deferred) {
+    if ($FinalizeRoot -and -not $Deferred -and -not $PreserveFinalizeRoot) {
         try { Remove-OwnedTree $FinalizeRoot } catch { Write-Warning "could not remove failed finalizer tree $FinalizeRoot`: $_" }
     }
 }

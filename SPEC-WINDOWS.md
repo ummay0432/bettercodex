@@ -13,10 +13,10 @@ has passed.
 
 [`progressive_disclosure/product-direction.md`](progressive_disclosure/product-direction.md)
 now authorizes native Windows 11 x64 as a target. The source port, target-gated
-dependencies, PowerShell build and install paths, and native workflow are in
-the tree. Native workflow and interactive terminal evidence are still pending,
-so public documentation labels the port a developer preview rather than a
-supported release.
+dependencies, PowerShell build and install paths, and native test harnesses are
+in the tree. Complete native automated and interactive terminal evidence is
+still pending, so public documentation labels the port a developer preview
+rather than a supported release.
 
 This specification governs the Windows port together with the existing product
 invariants. Where it retains behavior that current OpenAI
@@ -158,9 +158,9 @@ not duplicate this document's implementation details.
 
 | Environment | Initial status | Requirement |
 | --- | --- | --- |
-| Windows 11 x64, current servicing release | Supported | Required CI and interactive coverage |
+| Windows 11 x64, current servicing release | Supported | Required native automated and interactive coverage |
 | Windows 10 x64 1809+ | Best effort | ConPTY-capable; periodic compatibility coverage |
-| Windows Server 2019+ | CI/headless only | Process and noninteractive tests; no desktop UX promise |
+| Windows Server 2019+ | Headless only | Process and noninteractive tests; no desktop UX promise |
 | Windows on ARM64 | Unsupported initially | Revisit only after x64 is stable and upstream V8 artifacts are verified |
 | 32-bit Windows | Unsupported | Fail before download or compilation |
 | WSL 1 or WSL 2 | Linux target | Use the Linux installer and Linux behavior |
@@ -264,7 +264,7 @@ this table as a live checklist.
 | Git and tools | `src/tui/git_diff.rs`, `src/tools/patch.rs`, `src/tools/papercuts.rs` | `/dev/null`, Unix byte paths, Unix error constants and open flags | Native path/null-device/error and safe-open behavior |
 | Managed terminal | `src/managed_session.rs` | Unix sockets, descriptor passing, PTYs, signals, and tmux | Compile-time Windows stub; hide `/tmux` |
 | Installer/updater | `scripts/install.sh`, `src/update.rs`, `spec-install.md` | `/bin/sh`, Unix cache/PATH/atomic-replace assumptions | PowerShell installer and Windows-safe update finalization |
-| CI | repository workflows and local recipes | No Windows target or interactive matrix | Native Windows compile, test, installer, and ConPTY coverage |
+| Validation | local recipes and native test harnesses | No Windows target or interactive matrix | Native Windows compile, test, installer, and ConPTY coverage |
 
 The transcript scrollback path must continue using full-screen line-feed
 scrolling rather than assuming `CSI S` inserts displaced rows into terminal
@@ -402,8 +402,8 @@ point must:
 9. delegate the caller's Cargo arguments without reparsing or lossy quoting.
 
 Raw Cargo remains unsupported for build/check/test commands that need the
-published V8 artifacts. Documentation and CI must use the platform's checked-in
-wrapper.
+published V8 artifacts. Documentation and native validation must use the
+platform's checked-in wrapper.
 
 ### 10.3 Developer prerequisites
 
@@ -1251,14 +1251,14 @@ for before/after comparisons.
 
 The expected net source growth is:
 
-| Workstream | Production/docs/CI | Tests | Notes |
+| Workstream | Production/docs/validation | Tests | Notes |
 | --- | ---: | ---: | --- |
 | ConPTY, pipes, process tree, shell | 1,200–1,800 LOC | 400–800 LOC | Largest runtime addition; existing Unix code remains reusable |
 | Console lifecycle, paste, shortcuts, clipboard | 500–800 LOC | 400–700 LOC | Paste-burst tests are intentionally substantial |
 | Paths, locks, replacement, auth/state | 250–450 LOC | 300–500 LOC | Shared primitives prevent duplicate fixes |
 | PowerShell V8/install/update | 700–1,100 LOC | 300–600 LOC | Exact-main and running-executable handling dominate |
 | Git/tool portability | 150–350 LOC | 150–350 LOC | Depends on reuse of process/filesystem primitives |
-| CI and user documentation | 200–400 LOC | Included above | Avoid duplicated platform manuals |
+| Native validation and user documentation | 200–400 LOC | Included above | Avoid duplicated platform manuals |
 
 After replacing obsolete Unix-only branches and deduplicating common behavior,
 the total expected repository growth is **5,000–8,000 lines**, or roughly
@@ -1341,7 +1341,8 @@ blocker.
 
 The expected direct manifest increase is four to six focused dependencies,
 mostly Windows-only, plus approximately ten to twenty transitive packages.
-Measure the actual target-specific `cargo tree` and duplicate versions in CI.
+Measure the actual target-specific `cargo tree` and duplicate versions during
+native validation.
 
 The largest footprint is maintenance rather than bytes. Every future change to
 terminal lifecycle, composer input, command execution, file replacement, or
@@ -1405,7 +1406,7 @@ Deliverables:
 - resize, stdin, interrupt, timeout, and descendant cleanup; and
 - native process failure-injection tests.
 
-Gate: the complete process regression suite passes on a real Windows runner
+Gate: the complete process regression suite passes on a real Windows machine
 with stable process/handle counts.
 
 ### Phase 3: port the TUI
@@ -1454,7 +1455,7 @@ fresh Windows test machines.
 
 Deliverables:
 
-- complete CI and interactive matrix;
+- complete automated native and interactive matrix;
 - measured footprint report against this budget;
 - updated README, install, development, slash-command, security, and support
   documentation;
@@ -1466,15 +1467,16 @@ that native Windows is supported.
 
 ## 24. Validation strategy
 
-### 24.1 Continuous integration
+### 24.1 Native automated validation
 
-Add a native `windows-latest` lane that uses the pinned Rust toolchain and
-PowerShell V8 wrapper. At minimum it must run:
+Run the native suite directly on a Windows x64 machine using the pinned Rust
+toolchain and PowerShell V8 wrapper. Hosted CI and GitHub Actions are not part
+of the bettercodex delivery path. At minimum the native suite must run:
 
 ```text
 format verification
 cargo check --locked --tests
-tests through the repository's retained Cargo/nextest workflow
+tests through the repository's retained Cargo/nextest commands
 clippy with warnings denied
 PowerShell installer unit/integration tests
 release build and internal install smoke test
@@ -1486,13 +1488,16 @@ particular, do not add Pester solely because the installer is PowerShell if the
 existing Python or Rust harness can test the script more simply. The public
 installer itself must not require Python.
 
-CI caches must be target-specific. A job may clean only its task-owned
-temporary/artifact root and must never delete a shared checkout target or a
-target used by a live Cargo/rustc process.
+Validation caches must be target-specific. A validation process may clean only
+its task-owned temporary/artifact root and must never delete a shared checkout
+target or a target used by a live Cargo/rustc process. Reusing one persistent
+native target between check, test, Clippy, release, and installer probes is the
+default because it keeps repeated validation fast and local.
 
 Cross-compilation from Linux may supplement dependency checks but cannot
-replace the native Windows lane. Wine cannot validate ConPTY, Windows Terminal,
-clipboard, console modes, Job Objects, or installer replacement semantics.
+replace execution on native Windows. Wine cannot validate ConPTY, Windows
+Terminal, clipboard, console modes, Job Objects, or installer replacement
+semantics.
 
 ### 24.2 Automated native integration tests
 
@@ -1520,8 +1525,8 @@ finally guard.
 
 ### 24.3 Interactive terminal matrix
 
-CI cannot prove the complete interactive contract. Before supported release,
-run and record this matrix:
+Automated checks cannot prove the complete interactive contract. Before a
+supported release, run and record this matrix:
 
 | OS | Terminal | Shell | Priority |
 | --- | --- | --- | --- |
@@ -1611,7 +1616,7 @@ Native Windows support is complete only when all of the following are true.
 
 - Product direction explicitly authorizes the support matrix.
 - `x86_64-pc-windows-msvc` builds, tests, and lints through the verified V8
-  wrapper on a native Windows runner.
+  wrapper on a native Windows machine.
 - Windows-only dependencies are target-gated and Unix-only dependencies no
   longer prevent compilation.
 - The release remains one `bcodex.exe` with no required installed sidecar.
@@ -1740,8 +1745,8 @@ for each expansion.
 
 ### 26.8 False support from compile-only validation
 
-**Risk:** CI goes green while multiline paste submits early, Ctrl+C is trapped,
-terminal modes remain damaged, or descendants leak.
+**Risk:** automated checks pass while multiline paste submits early, Ctrl+C is
+trapped, terminal modes remain damaged, or descendants leak.
 
 **Mitigation:** do not label Windows supported until the native process,
 failure, and interactive terminal matrices are recorded.
@@ -1772,7 +1777,7 @@ Update at least:
   install/update, cache, PATH, and troubleshooting;
 - `spec-install.md` with the Windows exact-main transaction and finalizer;
 - `progressive_disclosure/development.md` with the PowerShell V8 wrapper and
-  native validation workflow;
+  native validation procedure;
 - `docs/slash_commands.md` to state that `/tmux` is Unix-only;
 - `SECURITY.md` if Windows path/reparse or unsandboxed-execution wording needs a
   platform clarification; and
@@ -1785,7 +1790,7 @@ commands run unsandboxed with the Windows user's permissions.
 
 Because public installs track exact `main`, a broken Windows commit cannot be
 hidden behind an unchanged package version. Windows support should therefore
-land behind passing native CI before product documentation advertises it.
+land behind passing native validation before product documentation advertises it.
 
 If a post-support regression lands, fix or revert the offending source commit
 on public `main`; do not manipulate tags or Releases. The installer/updater must
@@ -1820,7 +1825,7 @@ Re-run the platform search before implementation because the tree evolves.
 | `src/tools/patch.rs`, `papercuts.rs` | Portable errors and Windows-safe file opening |
 | `src/managed_session.rs` and callers | Unix cfg plus Windows no-op/hidden command path |
 | `src/update.rs` and tests | Select immutable PowerShell installer and coordinate finalization |
-| CI workflows | Native Windows check/test/clippy/release/installer lanes |
+| Native validation commands | Windows check/test/Clippy/release/installer coverage |
 | user/developer docs | Support matrix, shortcuts, install burden, diagnostics, non-goals |
 
 ## 29. Pre-implementation decisions and spikes
@@ -1858,7 +1863,7 @@ and paste behavior; add Windows-safe persistence and exact-main PowerShell
 installation; and hide tmux on native Windows.
 
 The likely installed binary increase is modest because V8 already dominates.
-The meaningful costs are 5,000–8,000 repository lines, a new native CI and
+The meaningful costs are 5,000–8,000 repository lines, a native automated and
 interactive terminal matrix, and a 12–20+ GiB first-machine source-build
 environment when Rust/MSVC caches are absent. Avoiding a configurable keymap,
 sandbox, release package system, ARM64 target, and fabricated tmux replacement

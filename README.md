@@ -16,8 +16,8 @@ permissions.
 ## Install
 
 bettercodex supports macOS 12 or newer and Linux with glibc 2.31 or newer.
-Native Windows 11 x64 is available as a developer preview while native CI and
-interactive terminal verification are completed.
+Native Windows 11 x64 is available as a developer preview while the native
+automated and interactive terminal matrices are completed.
 
 On macOS or Linux:
 
@@ -42,9 +42,11 @@ The installer pins the current public `main` commit, builds it locally, verifies
 the resulting binary, and installs it atomically. Later, `bcodex update` repeats
 that flow only when the exact public `main` revision changes. Cargo downloads,
 compiled dependencies, and incremental bettercodex state stay warm, so updates
-compile only what changed. A release-input content hash keeps that reuse exact
-even when archive timestamps collide. Package versions are display metadata and
-do not control updates. Missing Rust and Linux build tools are installed
+compile only what changed. On Windows, a commit that does not alter release
+inputs is restamped from a verified cached or installed executable without
+starting Rust or MSVC. A release-input content hash keeps that reuse exact even
+when archive timestamps collide. Package versions are display metadata and do
+not control updates. Missing Rust and Linux build tools are installed
 automatically; on a new Mac, complete the Command Line Tools dialog the
 installer opens and rerun the command once. Native Windows requires Visual
 Studio 2022 C++ Build Tools and a Windows SDK; see the complete

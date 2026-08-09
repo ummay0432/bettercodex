@@ -53,22 +53,24 @@ script resolves public `main` once. It downloads only the codeload archive for
 the selected immutable commit and must not consult package registries, tags, or
 GitHub Releases to select a version.
 
-The source build must:
+The source installation must:
 
 1. Require a checked-in `Cargo.lock`, pinned `rust-toolchain.toml`, target-native
    Cargo/V8 wrapper, rustup, and a working native C compiler. Windows requires
    the x64 MSVC C++ workload and Windows SDK and may initialize its installed
    Visual Studio developer environment automatically.
-2. Hash release-relevant source contents and build with `--release --locked
-   --bin bcodex`, Cargo incremental compilation enabled, that hash as a tracked
-   compiler input, and no source-revision input that would invalidate compiler
-   output. If SHA-256 is unavailable, use a revision-specific freshness key.
+2. Hash release-relevant source contents. When no target-native cached or
+   installed binary proves that same complete hash, build with `--release
+   --locked --bin bcodex`, Cargo incremental compilation enabled, that hash as
+   a tracked compiler input, and no source-revision input that would invalidate
+   compiler output. If SHA-256 is unavailable, use a revision-specific
+   freshness key.
 3. Require `bcodex --version` to match the package metadata in that source.
-4. Require the built binary's tracked release-input hash to match, then use its
-   internal staging helper to copy itself beside the destination and replace
-   its unique fixed-size revision marker with the selected commit. On macOS,
-   ad-hoc sign the modified Mach-O and verify that signature before executing
-   it.
+4. Require the selected binary's tracked release-input hash to match, then use
+   its internal staging helper to copy itself beside the destination and
+   replace its unique fixed-size revision marker with the selected commit. On
+   macOS, ad-hoc sign the modified Mach-O and verify that signature before
+   executing it.
 5. Require staged `bcodex --internal-source-revision` to equal the selected
    commit.
 6. Run staged `bcodex --internal-install-smoke` with isolated user and
@@ -101,7 +103,7 @@ junctions, and other reparse-point redirections are rejected.
    `BCODEX_INSTALL_REVISION`, and the validated repository as
    `BCODEX_REPOSITORY`. Windows also receives the updater PID so the installer
    can bind deferred replacement to that process's start identity.
-4. Lets the installer perform the complete source-build and replacement
+4. Lets the installer perform the complete source-install and replacement
    contract above.
 
 The updater clears obsolete release-selection environment variables before
@@ -130,7 +132,11 @@ of release inputs must independently prevent stale mtime-based source reuse.
 The native cache retains dependency artifacts, the unstamped bettercodex build,
 fingerprints, and incremental bettercodex state. Source archives, extracted
 source, temporary Rust toolchains, compiler scratch, and staged executables are
-disposable. Cleanup must run after success and failure without following
+disposable. A target-native installer may reuse a cached unstamped or currently
+installed binary without invoking Cargo only after the installer verifies its
+package version and its internal staging helper proves that the complete
+release-input hash matches the selected source. Cleanup must run after success
+and failure without following
 symlinks or reparse points. If no cache home exists, all downloads and build
 output are disposable.
 
@@ -147,8 +153,9 @@ launch detects any newer revision.
   test, staging, or final verification preserves the installed command.
 - An active install lock rejects concurrent mutation.
 - A stale transaction may remove only its validated temporary tree, candidate,
-  and backup. On Windows, a missing destination is restored from that
-  transaction's backup before cleanup.
+  and backup. On Windows, a retained backup restores that transaction's
+  previous verified command before cleanup, replacing an interrupted candidate
+  if necessary.
 - PATH setup failure does not invalidate an otherwise verified installation;
   the installer prints the manual action.
 

@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn powershell_commands_request_utf8_output_without_an_extra_shell_layer() {
+    let shell = DetectedShell {
+        shell_type: ShellType::PowerShell,
+        shell_path: PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+    };
+
+    let (program, arguments) = shell_command(&shell, ShellStartup::NonLogin, "Write-Output 'ü'");
+
+    assert_eq!(program, shell.shell_path);
+    assert_eq!(
+        arguments,
+        vec![
+            "-NoProfile",
+            "-Command",
+            "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\nWrite-Output 'ü'",
+        ]
+    );
+}
+
+#[test]
 fn retained_output_keeps_head_and_tail() {
     let mut output = PendingOutput::default();
     let bytes = vec![b'x'; RETAINED_HEAD_BYTES + RETAINED_TAIL_BYTES + 17];

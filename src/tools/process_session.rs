@@ -9,6 +9,7 @@ use crate::process_runtime::SpawnedProcess;
 use crate::process_runtime::TerminalSize;
 use crate::process_runtime::spawn_pipe_process_no_stdin;
 use crate::process_runtime::spawn_pty_process;
+use crate::shell_command::powershell::prefix_powershell_script_with_utf8;
 use crate::shell_command::shell_detect::DetectedShell;
 use crate::shell_command::shell_detect::ShellType;
 use anyhow::Context;
@@ -431,7 +432,7 @@ pub(super) fn shell_command(
                 arguments.push("-NoProfile".to_string());
             }
             arguments.push("-Command".to_string());
-            arguments.push(command.to_string());
+            arguments.push(prefix_powershell_script_with_utf8(command));
             arguments
         }
         ShellType::Cmd => vec!["/c".to_string(), command.to_string()],

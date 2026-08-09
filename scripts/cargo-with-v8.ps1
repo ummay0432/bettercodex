@@ -47,68 +47,90 @@ function Get-VerifiedDownload(
     $Directory = Split-Path -Parent $Destination
     [void](New-Item -ItemType Directory -Force -Path $Directory)
     $Temporary = "$Destination.tmp.$([Guid]::NewGuid().ToString('N'))"
-    $Handler = $null
-    $Client = $null
-    $Response = $null
-    $Input = $null
-    $Output = $null
+    Add-Type -AssemblyName System.Net.Http
     try {
         Write-Host "Downloading $(Split-Path -Leaf $Destination)"
-        Add-Type -AssemblyName System.Net.Http
-        $Handler = New-Object Net.Http.HttpClientHandler
-        $Handler.AllowAutoRedirect = $true
-        $Handler.MaxAutomaticRedirections = 5
-        $Client = New-Object Net.Http.HttpClient($Handler)
-        $Client.Timeout = [TimeSpan]::FromMinutes(5)
-        $Client.DefaultRequestHeaders.UserAgent.ParseAdd('bettercodex')
-        $Response = $Client.GetAsync(
-            $Url,
-            [Net.Http.HttpCompletionOption]::ResponseHeadersRead
-        ).GetAwaiter().GetResult()
-        $Response.EnsureSuccessStatusCode() | Out-Null
-        if ($Response.Content.Headers.ContentLength -gt $MaximumBytes) {
-            Fail "download from $Url exceeds the $MaximumBytes-byte limit"
-        }
-        $Input = $Response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        $Output = New-Object IO.FileStream(
-            $Temporary,
-            [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::None,
-            81920,
-            [IO.FileOptions]::WriteThrough
-        )
-        $Buffer = New-Object byte[] 81920
-        [long] $Total = 0
-        while (($Read = $Input.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
-            $Total += $Read
-            if ($Total -gt $MaximumBytes) {
-                Fail "download from $Url exceeds the $MaximumBytes-byte limit"
+        for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+            Remove-Item -LiteralPath $Temporary -Force -ErrorAction SilentlyContinue
+            $Handler = $null
+            $Client = $null
+            $Response = $null
+            $Input = $null
+            $Output = $null
+            $DownloadFailure = $null
+            try {
+                $Handler = New-Object Net.Http.HttpClientHandler
+                $Handler.AllowAutoRedirect = $true
+                $Handler.MaxAutomaticRedirections = 5
+                $Client = New-Object Net.Http.HttpClient($Handler)
+                $Client.Timeout = [TimeSpan]::FromMinutes(5)
+                $Client.DefaultRequestHeaders.UserAgent.ParseAdd('bettercodex')
+                $Response = $Client.GetAsync(
+                    $Url,
+                    [Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                ).GetAwaiter().GetResult()
+                $Response.EnsureSuccessStatusCode() | Out-Null
+                if ($Response.Content.Headers.ContentLength -gt $MaximumBytes) {
+                    Fail "download from $Url exceeds the $MaximumBytes-byte limit"
+                }
+                $Input = $Response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $Output = New-Object IO.FileStream(
+                    $Temporary,
+                    [IO.FileMode]::CreateNew,
+                    [IO.FileAccess]::Write,
+                    [IO.FileShare]::None,
+                    81920,
+                    [IO.FileOptions]::WriteThrough
+                )
+                $Buffer = New-Object byte[] 81920
+                [long] $Total = 0
+                while (($Read = $Input.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+                    $Total += $Read
+                    if ($Total -gt $MaximumBytes) {
+                        Fail "download from $Url exceeds the $MaximumBytes-byte limit"
+                    }
+                    $Output.Write($Buffer, 0, $Read)
+                }
+                if ($Total -eq 0) {
+                    Fail "download from $Url was empty"
+                }
+                $Output.Flush($true)
             }
-            $Output.Write($Buffer, 0, $Read)
+            catch {
+                $DownloadFailure = $_
+            }
+            finally {
+                if ($null -ne $Output) { $Output.Dispose() }
+                if ($null -ne $Input) { $Input.Dispose() }
+                if ($null -ne $Response) { $Response.Dispose() }
+                if ($null -ne $Client) { $Client.Dispose() }
+                if ($null -ne $Handler) { $Handler.Dispose() }
+            }
+            if ($null -eq $DownloadFailure) { break }
+            Remove-Item -LiteralPath $Temporary -Force -ErrorAction SilentlyContinue
+            if ($Attempt -eq 3) { throw $DownloadFailure }
+            Write-Warning "download from $Url failed; retrying ($($Attempt + 1)/3)"
+            Start-Sleep -Seconds $Attempt
         }
-        if ($Total -eq 0) {
-            Fail "download from $Url was empty"
+        if (-not (Test-Path -LiteralPath $Temporary -PathType Leaf)) {
+            Fail "download from $Url did not produce a file"
         }
-        $Output.Flush($true)
-        $Output.Dispose()
-        $Output = $null
-        $Input.Dispose()
-        $Input = $null
-        $Response.Dispose()
-        $Response = $null
         $ActualSha256 = Get-FileSha256 $Temporary
         if ($ActualSha256 -ne $ExpectedSha256) {
             Fail "$(Split-Path -Leaf $Destination) has SHA-256 $ActualSha256, expected $ExpectedSha256"
         }
-        Move-Item -LiteralPath $Temporary -Destination $Destination -Force
+        try {
+            Move-Item -LiteralPath $Temporary -Destination $Destination -Force
+        }
+        catch {
+            if ((Test-Path -LiteralPath $Destination -PathType Leaf) -and
+                (Get-FileSha256 $Destination) -eq $ExpectedSha256) {
+                return
+            }
+            throw
+        }
     }
     finally {
-        if ($null -ne $Output) { $Output.Dispose() }
-        if ($null -ne $Input) { $Input.Dispose() }
-        if ($null -ne $Response) { $Response.Dispose() }
-        if ($null -ne $Client) { $Client.Dispose() }
-        if ($null -ne $Handler) { $Handler.Dispose() }
         Remove-Item -LiteralPath $Temporary -Force -ErrorAction SilentlyContinue
     }
 }

@@ -20,13 +20,15 @@ function Invoke-InstallerFunctions([string] $InstallerPath) {
     $Names = @(
         'Write-Step',
         'Fail',
+        'Get-ProcessEnvironmentSnapshot',
+        'Restore-ProcessEnvironment',
         'Test-SourceRevision',
         'Test-IsReparsePoint',
         'Get-VolumeSpace',
         'Assert-FreeSpaceBudget',
         'Remove-OwnedTree',
-        'Test-PathContains',
         'Prepend-PathEntry',
+        'Invoke-WithRetry',
         'Recover-FinalizerArtifacts',
         'Start-DeferredReplacement'
     )
@@ -126,7 +128,11 @@ Invoke-InstallerFunctions $InstallerPath
 
 Assert (Test-SourceRevision 'ABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD') 'valid revision was rejected'
 Assert (-not (Test-SourceRevision '111111111111111111111111111111111111111g')) 'invalid revision was accepted'
-Assert (Test-PathContains 'C:\Other;C:\TOOLS\bettercodex\bin\' 'c:\tools\bettercodex\bin') 'PATH lookup was case-sensitive'
+$EnvironmentProbe = 'BCODEX_INSTALL_TEST_' + [Guid]::NewGuid().ToString('N')
+$EnvironmentSnapshot = Get-ProcessEnvironmentSnapshot
+[Environment]::SetEnvironmentVariable($EnvironmentProbe, 'temporary', 'Process')
+Restore-ProcessEnvironment $EnvironmentSnapshot
+Assert ($null -eq [Environment]::GetEnvironmentVariable($EnvironmentProbe, 'Process')) 'compiler environment cleanup leaked a variable'
 $UpdatedPath = Prepend-PathEntry 'C:\Other;C:\TOOLS\bettercodex\bin\' 'c:\tools\bettercodex\bin'
 Assert ($UpdatedPath -ceq 'c:\tools\bettercodex\bin;C:\Other') 'PATH update did not deduplicate and prepend'
 
@@ -165,6 +171,11 @@ try {
     $Destination = Join-Path $TestRoot 'bcodex.exe'
     $PowerShellPath = (Get-Process -Id $PID).Path
 
+    $EmptyFinalizer = Join-Path $TestRoot ('.bcodex-finalize.' + [Guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $EmptyFinalizer)
+    Recover-FinalizerArtifacts $TestRoot $Destination
+    Assert (-not (Test-Path -LiteralPath $EmptyFinalizer)) 'recovery retained an empty completed transaction'
+
     Copy-Item -LiteralPath $OldFixture -Destination $Destination
     $CandidateHash = (Get-FileHash -LiteralPath $NewFixture -Algorithm SHA256).Hash.ToLowerInvariant()
     $Success = New-Transaction $TestRoot $Destination $NewFixture $NewRevision $CandidateHash
@@ -182,7 +193,32 @@ try {
     $Parent = Start-TestParent $PowerShellPath 3000
     $Processes.Add($Parent)
     $ParentTicks = $Parent.StartTime.ToUniversalTime().Ticks
-    $Finalizer = Start-DeferredReplacement $Success.Manifest $Parent.Id $ParentTicks $PowerShellPath
+    $FinalizeEnvironmentNames = @(
+        'BCODEX_FINALIZE_MANIFEST',
+        'BCODEX_FINALIZE_PARENT_PID',
+        'BCODEX_FINALIZE_PARENT_TICKS'
+    )
+    $FinalizeEnvironment = Get-ProcessEnvironmentSnapshot
+    Remove-Item -LiteralPath "Env:$($FinalizeEnvironmentNames[0])" -ErrorAction SilentlyContinue
+    foreach ($Name in $FinalizeEnvironmentNames[1..2]) {
+        [Environment]::SetEnvironmentVariable($Name, "sentinel-$Name", 'Process')
+    }
+    $ExpectedFinalizeEnvironment = Get-ProcessEnvironmentSnapshot
+    try {
+        $Finalizer = Start-DeferredReplacement $Success.Manifest $Parent.Id $ParentTicks $PowerShellPath
+        foreach ($Name in $FinalizeEnvironmentNames) {
+            $Value = [Environment]::GetEnvironmentVariable($Name, 'Process')
+            if ($ExpectedFinalizeEnvironment.ContainsKey($Name)) {
+                Assert ($Value -ceq $ExpectedFinalizeEnvironment[$Name]) "finalizer launch changed $Name"
+            }
+            else {
+                Assert ($null -eq $Value) "finalizer launch leaked $Name"
+            }
+        }
+    }
+    finally {
+        Restore-ProcessEnvironment $FinalizeEnvironment
+    }
     $Processes.Add($Finalizer)
     Assert (Test-Path -LiteralPath $Success.Root) 'finalizer did not wait for the exact parent process'
     $FinalizerOwnsLock = $false
@@ -214,6 +250,15 @@ try {
 
     Remove-Item -LiteralPath $Destination -Force
     Copy-Item -LiteralPath $OldFixture -Destination $Destination
+    $Interrupted = New-Transaction $TestRoot $Destination $NewFixture $NewRevision $CandidateHash
+    Move-Item -LiteralPath $Destination -Destination $Interrupted.Backup
+    Move-Item -LiteralPath $Interrupted.Candidate -Destination $Destination
+    Recover-FinalizerArtifacts $TestRoot $Destination
+    Assert (-not (Test-Path -LiteralPath $Interrupted.Root)) 'recovery retained an interrupted committed transaction'
+    Assert ((& $Destination --internal-source-revision).Trim() -ceq $OldRevision) 'recovery discarded the previous verified command'
+
+    Remove-Item -LiteralPath $Destination -Force
+    Copy-Item -LiteralPath $OldFixture -Destination $Destination
     $Failure = New-Transaction $TestRoot $Destination $NewFixture $NewRevision (('0' * 64) -join '')
     $FailureParent = Start-TestParent $PowerShellPath 1000
     $Processes.Add($FailureParent)
@@ -237,18 +282,26 @@ try {
     $RecoveryBackup = Join-Path $RecoveryRoot 'backup.exe'
     Copy-Item -LiteralPath $NewFixture -Destination $RecoveryCandidate
     Copy-Item -LiteralPath $OldFixture -Destination $RecoveryBackup
+    $RecordedDestination = $Destination
+    $RecordedCandidate = $RecoveryCandidate
+    $RecordedBackup = $RecoveryBackup
+    if ($env:OS -ceq 'Windows_NT') {
+        $RecordedDestination = $RecordedDestination.ToUpperInvariant()
+        $RecordedCandidate = $RecordedCandidate.ToUpperInvariant()
+        $RecordedBackup = $RecordedBackup.ToUpperInvariant()
+    }
     $RecoveryManifest = [ordered]@{
         transaction_id = $RecoveryId
-        destination = $Destination.ToUpperInvariant()
-        candidate = $RecoveryCandidate.ToUpperInvariant()
-        backup = $RecoveryBackup.ToUpperInvariant()
+        destination = $RecordedDestination
+        candidate = $RecordedCandidate
+        backup = $RecordedBackup
     }
     [IO.File]::WriteAllText(
         (Join-Path $RecoveryRoot 'transaction.json'),
         ($RecoveryManifest | ConvertTo-Json -Compress)
     )
     Recover-FinalizerArtifacts $TestRoot $Destination
-    Assert (-not (Test-Path -LiteralPath $RecoveryRoot)) 'recovery retained a valid case-variant record'
+    Assert (-not (Test-Path -LiteralPath $RecoveryRoot)) 'recovery retained a valid transaction record'
     Assert ((& $Destination --internal-source-revision).Trim() -ceq $OldRevision) 'recovery did not restore the backup'
 
     Write-Host 'Windows installer transaction tests passed.'

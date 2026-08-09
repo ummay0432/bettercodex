@@ -14,9 +14,9 @@ display metadata; they do not decide whether an installation is current.
 
 Native Windows 10 version 1809 or newer has the required ConPTY API but remains
 best effort. The native Windows port remains a developer preview until its
-native workflow and interactive Windows Terminal/VS Code matrix are recorded.
-WSL runs the Linux binary and follows the Linux instructions, not the native
-Windows flow.
+native automated and interactive Windows Terminal/VS Code matrices are
+recorded. WSL runs the Linux binary and follows the Linux instructions, not the
+native Windows flow.
 
 A public install requires several gigabytes of free space and network access to
 GitHub and the official Rust download servers. The installer supplies its own
@@ -87,8 +87,8 @@ PowerShell 7 users can run the equivalent command with `pwsh`. This invocation
 does not change the machine-wide execution policy. The installer pins public
 `main`, downloads that exact source archive, initializes the installed Visual
 Studio build environment, obtains the pinned Rust toolchain and verified
-sandboxed V8 pair, builds and smoke-tests `bcodex.exe`, then commits only the
-verified candidate.
+sandboxed V8 pair, builds `bcodex.exe` when needed, smoke-tests it, then commits
+only the verified candidate.
 
 The default Windows command directory is
 `%LOCALAPPDATA%\Programs\bettercodex\bin`; reusable build state is under
@@ -96,6 +96,11 @@ The default Windows command directory is
 `BCODEX_CACHE_DIR` before invoking the script to override either location. The
 installer updates the current process PATH and the case-insensitive per-user
 PATH without duplicating entries. Open a new terminal after first installation.
+On update, the installer first reuses an already available pinned Rust
+toolchain without contacting rustup. If the selected commit has the same
+release-input hash as the cached or currently installed executable, it verifies
+and restamps that executable without starting Rust or MSVC at all; otherwise
+Cargo incrementally rebuilds into the same persistent target.
 
 After installation, open a new terminal when requested, then run:
 
@@ -232,18 +237,33 @@ just clippy -- -D warnings
 python3 scripts/install_tests.py
 ```
 
-Native Windows validation is defined in [`.github/workflows/windows.yml`](../.github/workflows/windows.yml):
-format and PowerShell syntax checks, `cargo check --tests`, the native test
-suite, warning-denied Clippy, PowerShell installer transaction tests, a release
-smoke test, and an exact-revision install/no-op cycle. Run the focused installer
-tests directly with:
+Run native Windows validation directly on a Windows x64 machine. The commands
+share the checkout's Cargo target and the persistent V8 cache, so each stage
+reuses the previous stage instead of rebuilding dependencies:
 
 ```powershell
+cargo fmt --all -- --check
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1 -ValidateOnly
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_windows_tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 check --locked --tests
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 test --locked --no-fail-fast
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 clippy --locked --all-targets -- -D warnings
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 build --release --locked --bin bcodex
+$smokeHome = Join-Path $env:TEMP ("bettercodex-release-smoke." + [Guid]::NewGuid().ToString('N'))
+$previousHome = $env:BCODEX_HOME
+try {
+    $env:BCODEX_HOME = $smokeHome
+    & .\target\release\bcodex.exe --internal-install-smoke
+    if ($LASTEXITCODE -ne 0) { throw 'release smoke test failed' }
+} finally {
+    if ($null -eq $previousHome) { Remove-Item Env:BCODEX_HOME -ErrorAction SilentlyContinue }
+    else { $env:BCODEX_HOME = $previousHome }
+    Remove-Item -LiteralPath $smokeHome -Recurse -Force -ErrorAction SilentlyContinue
+}
 ```
 
 The Windows status must not be promoted from developer preview until that
-workflow and the primary interactive terminal matrix pass on native Windows.
+native suite and the primary interactive terminal matrix pass on Windows.
 
 See [the development workflow](../progressive_disclosure/development.md) for
 the complete contribution procedure.

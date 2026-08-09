@@ -206,10 +206,8 @@ fn get_sh_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
     })
 }
 
-// Note the `pwsh` and `powershell` fallback paths are where the respective
-// shells are commonly installed on GitHub Actions Windows runners, but may not
-// be present on all Windows machines:
-// https://docs.github.com/en/actions/tutorials/build-and-test-code/powershell
+// These are the standard system-wide installation paths for PowerShell 7 and
+// Windows PowerShell. Either shell can instead be discovered through PATH.
 
 #[cfg(windows)]
 const PWSH_FALLBACK_PATHS: &[&str] = &[r#"C:\Program Files\PowerShell\7\pwsh.exe"#];
