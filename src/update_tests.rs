@@ -62,6 +62,46 @@ fn accepts_only_full_source_revisions_and_safe_repository_names() {
     assert!(validate_repository("owner").is_err());
     assert!(validate_repository("owner/repo/extra").is_err());
     assert!(validate_repository("owner/repo?ref=other").is_err());
+    assert!(is_build_input_hash(&"a".repeat(64)));
+    assert!(is_build_input_hash(&"F".repeat(64)));
+    assert!(!is_build_input_hash(&"a".repeat(63)));
+    assert!(!is_build_input_hash(&"g".repeat(64)));
+    assert_eq!(build_input_hash(), None);
+}
+
+#[test]
+fn source_revision_staging_replaces_one_framed_marker() {
+    let revision = "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD";
+    let mut image = b"binary prefix".to_vec();
+    let marker_offset = image.len();
+    image.extend_from_slice(&SOURCE_REVISION_METADATA);
+    image.extend_from_slice(b"binary suffix");
+
+    patch_source_revision(&mut image, revision).unwrap();
+
+    assert_eq!(
+        &image[marker_offset + SOURCE_REVISION_OFFSET
+            ..marker_offset + SOURCE_REVISION_OFFSET + SOURCE_REVISION_LENGTH],
+        revision.as_bytes()
+    );
+    assert!(patch_source_revision(&mut image, revision).is_err());
+    assert!(patch_source_revision(&mut [0; 128], revision).is_err());
+    let mut marker = SOURCE_REVISION_METADATA;
+    assert!(patch_source_revision(&mut marker, "invalid").is_err());
+
+    let mut duplicate = SOURCE_REVISION_METADATA.repeat(2);
+    assert!(patch_source_revision(&mut duplicate, revision).is_err());
+}
+
+#[test]
+fn current_binary_contains_one_source_revision_record() {
+    let executable = std::env::current_exe().unwrap();
+    let image = fs::read(executable).unwrap();
+    assert_eq!(
+        memmem::find_iter(&image, SOURCE_REVISION_METADATA.as_slice()).count(),
+        1
+    );
+    assert_eq!(source_revision(), None);
 }
 
 #[test]

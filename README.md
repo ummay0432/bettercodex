@@ -37,5 +37,8 @@ bcodex
 
 The installer pins the current public `main` commit, builds it locally, verifies
 the resulting binary, and installs it atomically. Later, `bcodex update` repeats
-that flow only when the exact public `main` revision changes. Package versions
-are display metadata and do not control updates.
+that flow only when the exact public `main` revision changes. Cargo downloads,
+compiled dependencies, and incremental bettercodex state stay warm, so updates
+compile only what changed. A release-input content hash keeps that reuse exact
+even when archive timestamps collide. Package versions are display metadata and
+do not control updates.

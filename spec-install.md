@@ -55,15 +55,22 @@ The source build must:
 
 1. Require a checked-in `Cargo.lock`, pinned `rust-toolchain.toml`, executable
    Cargo/V8 wrapper, rustup, and a working native C compiler.
-2. Build with `--release --locked --bin bcodex` and
-   `BCODEX_SOURCE_REVISION=<selected-commit>`.
+2. Hash release-relevant source contents and build with `--release --locked
+   --bin bcodex`, Cargo incremental compilation enabled, that hash as a tracked
+   compiler input, and no source-revision input that would invalidate compiler
+   output. If SHA-256 is unavailable, use a revision-specific freshness key.
 3. Require `bcodex --version` to match the package metadata in that source.
-4. Require `bcodex --internal-source-revision` to equal the selected commit.
-5. Run `bcodex --internal-install-smoke` with isolated user and application
-   homes, covering V8 startup and every embedded resource.
-6. Stage the exact verified bytes beside the destination, compare the copy, and
-   atomically rename it over the destination.
-7. Verify the installed version and revision again before reporting success.
+4. Require the built binary's tracked release-input hash to match, then use its
+   internal staging helper to copy itself beside the destination and replace
+   its unique fixed-size revision marker with the selected commit. On macOS,
+   ad-hoc sign the modified Mach-O and verify that signature before executing
+   it.
+5. Require staged `bcodex --internal-source-revision` to equal the selected
+   commit.
+6. Run staged `bcodex --internal-install-smoke` with isolated user and
+   application homes, covering V8 startup and every embedded resource.
+7. Atomically rename the verified staged bytes over the destination.
+8. Verify the installed version and revision again before reporting success.
 
 The destination defaults to `$HOME/.local/bin` and may be overridden only with
 an absolute `BCODEX_INSTALL_DIR`. Symlinked destinations are rejected.
@@ -97,15 +104,19 @@ not create a notice.
 
 ## Cache and resource bounds
 
-The installer may retain dependency downloads and one compatible native-target
-build cache below `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. Cache identity
-includes the host target and hashes of the pinned toolchain, Cargo manifest,
-lockfile, and V8 wrapper. An identity change replaces the previous target.
+The installer may retain dependency downloads and one native-target Cargo build
+cache below `${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. Cargo owns
+fine-grained invalidation for compiler, profile, manifest, lockfile, feature,
+build-script, dependency, and source changes. The installer must not discard the
+target merely because the manifest, lockfile, or wrapper changed. A content hash
+of release inputs must independently prevent stale mtime-based source reuse.
 
-Source archives, extracted source, temporary Rust toolchains, compiler scratch,
-staged executables, and bettercodex-owned build outputs are disposable. Cleanup
-must run after success and failure without following symlinks. If no cache home
-exists, all downloads and build output are disposable.
+The native cache retains dependency artifacts, the unstamped bettercodex build,
+fingerprints, and incremental bettercodex state. Source archives, extracted
+source, temporary Rust toolchains, compiler scratch, and staged executables are
+disposable. Cleanup must run after success and failure without following
+symlinks. If no cache home exists, all downloads and build output are
+disposable.
 
 Network payloads and metadata have explicit maximum sizes. Compilation happens
 once for the selected revision even if `main` changes during the build. A later
@@ -129,7 +140,9 @@ launch detects any newer revision.
 Tests must cover exact main-ref parsing, same and different revision checks,
 failure-silent background behavior, immutable installer/source URLs, pinned
 environment propagation, all four host mappings, transient and exhausted
-network failures, prerequisite diagnostics, cache reuse and invalidation,
+network failures, prerequisite diagnostics, granular cache reuse across
+same-metadata manifest and lockfile changes, build-input verification,
+revision-marker staging,
 symlink refusal, stale and active locks, atomic preservation on every failed
 verification, moving-`main` behavior, PATH handling, and cleanup with and
 without persistent cache homes.

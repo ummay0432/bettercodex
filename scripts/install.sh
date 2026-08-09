@@ -1,8 +1,8 @@
 #!/bin/sh
 
-# Install one exact public bettercodex `main` revision from source. The source,
-# compiler scratch space, and bettercodex-owned outputs are disposable; verified
-# dependency downloads and compatible compiled dependencies are reused.
+# Install one exact public bettercodex `main` revision from source. Source and
+# compiler scratch space are disposable; verified downloads and Cargo's native
+# compilation cache are reused across revisions.
 
 set -eu
 
@@ -82,12 +82,6 @@ cleanup_recorded_temp() {
 cleanup() {
   set +e
   cleanup_incomplete=0
-  if [ "$build_cache_used" -eq 1 ] && [ -n "$target_dir" ]; then
-    if ! remove_bettercodex_outputs; then
-      cleanup_incomplete=1
-      warn "could not remove bettercodex-owned compilation output from $target_dir"
-    fi
-  fi
   if [ -n "$staged_binary" ]; then
     if ! rm -f "$staged_binary"; then
       cleanup_incomplete=1
@@ -193,7 +187,6 @@ case "$os:$arch" in
 esac
 
 require_command awk
-require_command cmp
 require_command curl
 require_command dirname
 require_command grep
@@ -280,7 +273,7 @@ cleanup_retired_updater_cache() {
   [ -n "$cache_root" ] || return 0
 
   # The retired cache used build/target directly. The current cache stores one
-  # compatible generation below build/<host>/target.
+  # native Cargo target below build/<host>/target.
   legacy_build_root="$cache_root/build"
   if [ -L "$legacy_build_root" ]; then
     warn "not removing retired cache through symlink $legacy_build_root"
@@ -405,8 +398,46 @@ file_sha256() {
   fi
 }
 
+source_build_input_hash() {
+  raw_hashes="$attempt_root/source-input-hashes"
+  sorted_hashes="$attempt_root/source-input-hashes.sorted"
+
+  set -- Cargo.toml Cargo.lock rust-toolchain.toml scripts/cargo-with-v8.sh src
+  for optional_input in .cargo build.rs bundled-skills docs/evals prompts; do
+    if [ -e "$source_dir/$optional_input" ] || [ -L "$source_dir/$optional_input" ]; then
+      set -- "$@" "$optional_input"
+    fi
+  done
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    (
+      cd "$source_dir"
+      find "$@" \( -type f -o -type l \) -exec sha256sum {} +
+    ) >"$raw_hashes" || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    (
+      cd "$source_dir"
+      find "$@" \( -type f -o -type l \) -exec shasum -a 256 {} +
+    ) >"$raw_hashes" || return 1
+  elif command -v openssl >/dev/null 2>&1; then
+    (
+      cd "$source_dir"
+      find "$@" \( -type f -o -type l \) -exec openssl dgst -sha256 {} +
+    ) >"$raw_hashes" || return 1
+  else
+    return 1
+  fi
+  LC_ALL=C sort "$raw_hashes" >"$sorted_hashes" || return 1
+  file_sha256 "$sorted_hashes"
+}
+
 require_source_build_tools() {
+  require_command find
+  require_command sort
   require_command tar
+  if [ "$os" = "macOS" ]; then
+    require_command codesign
+  fi
   if ! command -v rustup >/dev/null 2>&1; then
     fail "rustup is required; install Rust from https://rustup.rs/ and retry"
   fi
@@ -426,77 +457,37 @@ prepare_compilation_target() {
   build_root="$cache_root/build"
   target_cache="$build_root/$host_target"
   if [ -L "$build_root" ] || { [ -e "$build_root" ] && [ ! -d "$build_root" ]; }; then
-    warn "compiled-dependency cache $build_root is not a regular directory; using disposable output"
+    warn "Cargo compilation cache $build_root is not a regular directory; using disposable output"
     return 0
   fi
   mkdir -p "$build_root"
   if [ -L "$target_cache" ] || { [ -e "$target_cache" ] && [ ! -d "$target_cache" ]; }; then
-    warn "compiled-dependency cache $target_cache is not a regular directory; using disposable output"
+    warn "Cargo compilation cache $target_cache is not a regular directory; using disposable output"
     return 0
   fi
   mkdir -p "$target_cache"
 
-  desired_identity="$attempt_root/build-cache-identity"
-  if ! toolchain_hash="$(file_sha256 "$source_dir/rust-toolchain.toml")" ||
-    ! manifest_hash="$(file_sha256 "$source_dir/Cargo.toml")" ||
-    ! lockfile_hash="$(file_sha256 "$source_dir/Cargo.lock")" ||
-    ! v8_wrapper_hash="$(file_sha256 "$source_dir/scripts/cargo-with-v8.sh")"; then
-    warn "sha256sum or shasum is unavailable; using disposable compilation output"
-    return 0
-  fi
-  printf '%s\n' \
-    'bettercodex-build-cache-v1' \
-    "host=$host_target" \
-    "toolchain=$toolchain_hash" \
-    "manifest=$manifest_hash" \
-    "lockfile=$lockfile_hash" \
-    "v8-wrapper=$v8_wrapper_hash" >"$desired_identity"
-
+  # Older installers discarded this entire target whenever Cargo.toml or
+  # Cargo.lock changed. Cargo already fingerprints the compiler, profile,
+  # manifest, lockfile, features, build scripts, and source inputs at artifact
+  # granularity. Retire the coarse identity while preserving every artifact
+  # Cargo can still use; the content hash below closes its source-mtime gap.
   identity_path="$target_cache/identity"
-  if ! cmp -s "$desired_identity" "$identity_path"; then
-    step "Resetting incompatible compiled-dependency cache for $host_target"
-    if [ -L "$target_cache/target" ]; then
-      rm -f "$target_cache/target" || fail "could not replace the compiled-dependency cache"
-    else
-      rm -rf "$target_cache/target" || fail "could not reset the compiled-dependency cache"
-    fi
-    if [ -L "$identity_path" ]; then
-      rm -f "$identity_path" || fail "could not replace the compiled-dependency cache identity"
-    elif [ -d "$identity_path" ]; then
-      rm -rf "$identity_path" || fail "could not replace the compiled-dependency cache identity"
-    fi
-    mv -f "$desired_identity" "$identity_path" ||
-      fail "could not record the compiled-dependency cache identity"
+  if [ -L "$identity_path" ] || [ -f "$identity_path" ]; then
+    rm -f "$identity_path" || fail "could not retire the obsolete compilation-cache identity"
+  elif [ -e "$identity_path" ]; then
+    warn "obsolete compilation-cache identity $identity_path is not a regular file; leaving it untouched"
   fi
 
   target_dir="$target_cache/target"
   if [ -L "$target_dir" ] || { [ -e "$target_dir" ] && [ ! -d "$target_dir" ]; }; then
-    warn "compiled-dependency cache $target_dir is not a regular directory; using disposable output"
+    warn "Cargo compilation cache $target_dir is not a regular directory; using disposable output"
     target_dir="$attempt_root/target"
     return 0
   fi
   mkdir -p "$target_dir"
   build_cache_used=1
-  step "Reusing compiled dependencies at $target_dir"
-}
-
-remove_bettercodex_outputs() {
-  # The source archive has a new workspace path on every update. Remove only
-  # this package's prior outputs so those path-specific files cannot accumulate;
-  # registry and Git dependency artifacts remain available to Cargo.
-  for build_output in \
-    "$target_dir/release/bcodex" \
-    "$target_dir/release/bcodex.d" \
-    "$target_dir/release/deps"/bcodex-* \
-    "$target_dir/release/deps"/bettercodex-* \
-    "$target_dir/release/.fingerprint"/bettercodex-* \
-    "$target_dir/release/incremental"/bcodex-* \
-    "$target_dir/release/incremental"/bettercodex-*; do
-    if [ -e "$build_output" ] || [ -L "$build_output" ]; then
-      rm -rf "$build_output" || return 1
-    fi
-  done
-  return 0
+  step "Reusing Cargo compilation cache at $target_dir"
 }
 
 install_temp_parent="${TMPDIR:-/tmp}"
@@ -596,14 +587,22 @@ fi
 rust_toolchain_bin="$(dirname "$cargo_program")"
 
 prepare_compilation_target
-remove_bettercodex_outputs || fail "could not remove obsolete bettercodex output"
+if ! build_input_hash="$(source_build_input_hash)" ||
+  ! printf '%s\n' "$build_input_hash" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+  # A revision-derived key still guarantees a rebuild on every update when the
+  # host has no supported SHA-256 utility. Normal hosts take the byte-accurate
+  # path above and keep non-build revisions fresh.
+  build_input_hash="$resolved_commit$(printf '%.24s' "$resolved_commit")"
+  warn "could not calculate a SHA-256 build-input hash; using conservative per-revision freshness"
+fi
 if [ "$build_cache_used" -eq 1 ]; then
-  step "Compiling bettercodex $expected_version with cached dependencies"
+  step "Compiling bettercodex $expected_version with the warm Cargo cache"
 else
   step "Compiling bettercodex $expected_version in a disposable build directory"
 fi
 if ! (
   unset \
+    BCODEX_BUILD_INPUT_HASH \
     BCODEX_SOURCE_REVISION \
     CARGO \
     CARGO_BUILD_JOBS \
@@ -625,10 +624,10 @@ if ! (
     V8_FROM_SOURCE \
     XDG_CACHE_HOME
   cd "$source_dir"
-  BCODEX_SOURCE_REVISION="$resolved_commit" \
+  BCODEX_BUILD_INPUT_HASH="$build_input_hash" \
     CARGO="$cargo_program" \
     CARGO_HOME="$cargo_home" \
-    CARGO_INCREMENTAL=0 \
+    CARGO_INCREMENTAL=1 \
     CARGO_TARGET_DIR="$target_dir" \
     PATH="$rust_toolchain_bin:$PATH" \
     RUSTC="$rustc_program" \
@@ -646,9 +645,24 @@ built_binary="$target_dir/release/bcodex"
 version_output="$("$built_binary" --version 2>/dev/null || true)"
 [ "$version_output" = "bcodex $expected_version" ] ||
   fail "built binary did not report bcodex $expected_version"
-revision_output="$("$built_binary" --internal-source-revision 2>/dev/null || true)"
-[ "$revision_output" = "$resolved_commit" ] ||
-  fail "built binary did not embed source revision $resolved_commit"
+
+staged_binary="$bin_dir/.bcodex-stage.$$"
+rm -f "$staged_binary"
+if ! "$built_binary" --internal-install-stage \
+  "$staged_binary" "$resolved_commit" "$build_input_hash"; then
+  fail "built binary could not stage source revision $resolved_commit"
+fi
+chmod 0755 "$staged_binary"
+if [ "$os" = "macOS" ]; then
+  codesign --force --sign - "$staged_binary" >/dev/null 2>&1 ||
+    fail "could not apply the required macOS ad-hoc signature to the staged binary"
+  codesign --verify --strict "$staged_binary" >/dev/null 2>&1 ||
+    fail "staged binary has an invalid macOS code signature"
+fi
+[ "$("$staged_binary" --version 2>/dev/null || true)" = "bcodex $expected_version" ] ||
+  fail "staged binary could not be verified"
+[ "$("$staged_binary" --internal-source-revision 2>/dev/null || true)" = "$resolved_commit" ] ||
+  fail "staged binary lost its embedded source revision"
 
 step "Smoke-testing V8 and every embedded system resource"
 mkdir -p "$smoke_root/home" "$smoke_root/codex-home" "$smoke_root/bcodex-home" "$smoke_root/workspace"
@@ -658,23 +672,12 @@ if ! smoke_output="$(
     CODEX_HOME="$smoke_root/codex-home" \
     BCODEX_HOME="$smoke_root/bcodex-home" \
     BCODEX_SKIP_UPDATE_CHECK=1 \
-    "$built_binary" --internal-install-smoke
+    "$staged_binary" --internal-install-smoke
 )"; then
-  fail "built binary failed its runtime and embedded-resource smoke test"
+  fail "staged binary failed its runtime and embedded-resource smoke test"
 fi
 [ "$smoke_output" = "bcodex $expected_version install smoke passed" ] ||
-  fail "built binary returned an unexpected install smoke result"
-
-staged_binary="$bin_dir/.bcodex-stage.$$"
-rm -f "$staged_binary"
-cp "$built_binary" "$staged_binary"
-chmod 0755 "$staged_binary"
-cmp -s "$built_binary" "$staged_binary" ||
-  fail "staged binary does not exactly match the verified build"
-[ "$("$staged_binary" --version 2>/dev/null || true)" = "bcodex $expected_version" ] ||
-  fail "staged binary could not be verified"
-[ "$("$staged_binary" --internal-source-revision 2>/dev/null || true)" = "$resolved_commit" ] ||
-  fail "staged binary lost its embedded source revision"
+  fail "staged binary returned an unexpected install smoke result"
 
 mv -f "$staged_binary" "$bin_path"
 staged_binary=""
@@ -686,10 +689,6 @@ installed_version="$expected_version"
   fail "installed binary did not retain version $installed_version"
 [ "$("$bin_path" --internal-source-revision 2>/dev/null || true)" = "$installed_revision" ] ||
   fail "installed binary could not be verified"
-cmp -s "$built_binary" "$bin_path" ||
-  fail "installed binary does not exactly match the verified build"
-remove_bettercodex_outputs ||
-  fail "could not remove bettercodex-owned compilation output after installation"
 
 pick_profile() {
   case "$os:${SHELL:-}" in
@@ -808,7 +807,7 @@ else
 fi
 if [ -n "$cache_root" ]; then
   if [ "$build_cache_used" -eq 1 ]; then
-    step "Removed disposable source and bettercodex scratch output; retained compiled dependencies at $cache_root/build/$host_target"
+    step "Removed disposable source and compiler scratch; retained the warm Cargo cache at $cache_root/build/$host_target"
   else
     step "Removed disposable source and build output; retained dependency downloads at $cache_root"
   fi

@@ -66,7 +66,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(marker.read_text(encoding="utf-8"), "canonical")
 
-    def test_install_and_update_reuse_downloads_and_compiled_dependencies(self) -> None:
+    def test_install_and_update_reuse_downloads_and_cargo_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "friend's better codex"
             legacy = root / "cache" / "bettercodex"
@@ -85,7 +85,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertIn("Installed bcodex", first.stdout)
             self.assertIn("Updated bcodex", second.stdout)
-            self.assertIn("retained compiled dependencies", second.stdout)
+            self.assertIn("retained the warm Cargo cache", second.stdout)
             installed = root / "install" / "bin" / "bcodex"
             self.assertEqual(run_binary(installed, "--version"), f"bcodex {VERSION}\n")
             self.assertEqual(run_binary(installed, "--internal-source-revision"), f"{COMMIT}\n")
@@ -107,20 +107,30 @@ class InstallScriptTest(unittest.TestCase):
             expected_cargo_home = legacy / "cargo"
             expected_cache_home = root / "cache"
             expected_target = legacy / "build" / "x86_64-unknown-linux-gnu" / "target"
+            build_input_hashes = []
             for build in builds:
-                revision, cargo_home, target, cache_home, compiler_tmp, arguments = build.split(
-                    "|", 5
-                )
-                self.assertEqual(revision, COMMIT)
+                (
+                    incremental,
+                    cargo_home,
+                    target,
+                    cache_home,
+                    compiler_tmp,
+                    build_input_hash,
+                    arguments,
+                ) = build.split("|", 6)
+                self.assertEqual(incremental, "1")
+                self.assertRegex(build_input_hash, r"^[0-9a-f]{64}$")
+                build_input_hashes.append(build_input_hash)
                 self.assertEqual(arguments, "build --release --locked --bin bcodex")
                 self.assertEqual(Path(cargo_home), expected_cargo_home)
                 self.assertEqual(Path(cache_home), expected_cache_home)
                 self.assertEqual(Path(target), expected_target)
                 self.assertIn("bettercodex-install.", compiler_tmp)
                 self.assertFalse(Path(compiler_tmp).exists())
+            self.assertEqual(build_input_hashes[0], build_input_hashes[1])
             self.assertTrue(expected_cargo_home.is_dir())
             self.assertTrue((expected_target / "release" / "deps" / "fixture-dependency.rlib").is_file())
-            self.assertFalse((expected_target / "release" / "bcodex").exists())
+            self.assertTrue((expected_target / "release" / "bcodex").is_file())
             self.assertEqual(
                 (root / "compile.log").read_text(encoding="utf-8").splitlines(),
                 ["dependency"],
@@ -160,7 +170,7 @@ class InstallScriptTest(unittest.TestCase):
                 f"{COMMIT}\n",
             )
             builds = (root / "build.log").read_text(encoding="utf-8").splitlines()
-            self.assertEqual([build.split("|", 1)[0] for build in builds], [COMMIT])
+            self.assertEqual([build.split("|", 1)[0] for build in builds], ["1"])
             self.assertEqual(
                 (root / "compile.log").read_text(encoding="utf-8").splitlines(),
                 ["dependency"],
@@ -173,8 +183,12 @@ class InstallScriptTest(unittest.TestCase):
     def test_failed_build_or_verification_preserves_the_existing_binary(self) -> None:
         cases = (
             ({"build_success": False}, "local bettercodex compilation failed"),
-            ({"embedded_revision": NEXT_COMMIT}, "did not embed source revision"),
-            ({"smoke_success": False}, "failed its runtime and embedded-resource smoke test"),
+            (
+                {"embedded_build_input_hash": "b" * 64},
+                "built binary could not stage source revision",
+            ),
+            ({"embedded_revision": NEXT_COMMIT}, "staged binary lost its embedded source revision"),
+            ({"smoke_success": False}, "staged binary failed its runtime and embedded-resource smoke test"),
         )
         for options, expected_error in cases:
             with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as directory:
@@ -248,6 +262,14 @@ class InstallScriptTest(unittest.TestCase):
                     Path(build[2]),
                     root / "cache" / "bettercodex" / "build" / host_target / "target",
                 )
+                codesign_log = root / "codesign.log"
+                if system == "Darwin":
+                    codesign_calls = codesign_log.read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(len(codesign_calls), 2)
+                    self.assertTrue(codesign_calls[0].startswith("--force --sign - "))
+                    self.assertTrue(codesign_calls[1].startswith("--verify --strict "))
+                else:
+                    self.assertFalse(codesign_log.exists())
                 assert_no_installer_residue(self, root)
 
     def test_explicit_install_directory_works_without_home(self) -> None:
@@ -320,7 +342,7 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn("bettercodex-install.", install_home)
             self.assertTrue(install_home.endswith("/rustup-home"))
             self.assertFalse(Path(install_home).exists())
-            self.assertIn("retained compiled dependencies", result.stdout)
+            self.assertIn("retained the warm Cargo cache", result.stdout)
             assert_no_installer_residue(self, root)
 
     def test_known_revision_skips_the_redundant_initial_main_lookup(self) -> None:
@@ -337,11 +359,23 @@ class InstallScriptTest(unittest.TestCase):
             )
             assert_no_installer_residue(self, root)
 
-    def test_changed_build_identity_replaces_one_cache_generation(self) -> None:
+    def test_failed_source_hash_uses_revision_specific_freshness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
 
-            first = run_installer(root)
+            result = run_installer(root, source_hash_success=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("using conservative per-revision freshness", result.stderr)
+            build = (root / "build.log").read_text(encoding="utf-8").strip().split("|")
+            self.assertEqual(build[-2], COMMIT + COMMIT[:24])
+            assert_no_installer_residue(self, root)
+
+    def test_manifest_and_lockfile_changes_keep_cargo_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            first = run_installer(root, source_generation="first")
             identity = (
                 root
                 / "cache"
@@ -351,16 +385,31 @@ class InstallScriptTest(unittest.TestCase):
                 / "identity"
             )
             self.assertEqual(first.returncode, 0, first.stderr)
-            identity.write_text("incompatible fixture\n", encoding="utf-8")
+            identity.write_text(
+                "bettercodex-build-cache-v1\n"
+                "host=x86_64-unknown-linux-gnu\n"
+                "toolchain=old-toolchain-hash\n"
+                "manifest=old-manifest-hash\n"
+                "lockfile=old-lockfile-hash\n"
+                "v8-wrapper=old-wrapper-hash\n",
+                encoding="utf-8",
+            )
 
-            second = run_installer(root)
+            second = run_installer(root, source_generation="other")
 
             self.assertEqual(second.returncode, 0, second.stderr)
-            self.assertIn("Resetting incompatible compiled-dependency cache", second.stdout)
+            self.assertNotIn("Resetting", second.stdout)
+            self.assertFalse(identity.exists())
             self.assertEqual(
                 (root / "compile.log").read_text(encoding="utf-8").splitlines(),
-                ["dependency", "dependency"],
+                ["dependency"],
             )
+            build_input_hashes = [
+                build.split("|")[-2]
+                for build in (root / "build.log").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(build_input_hashes), 2)
+            self.assertNotEqual(build_input_hashes[0], build_input_hashes[1])
             assert_no_installer_residue(self, root)
 
     def test_transient_github_failures_retry_without_mixing_partial_archives(self) -> None:
@@ -408,6 +457,23 @@ class InstallScriptTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("xcode-select --install", result.stderr)
             self.assertFalse((root / "build.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_failed_macos_signing_preserves_the_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(
+                root,
+                system="Darwin",
+                machine="arm64",
+                codesign_success=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not apply the required macOS ad-hoc signature", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
             assert_no_installer_residue(self, root)
 
     def test_an_older_bcodex_earlier_on_path_is_reported_and_overridden(self) -> None:
@@ -557,7 +623,7 @@ class InstallScriptTest(unittest.TestCase):
             builds = (root / "build.log").read_text(encoding="utf-8").splitlines()
             self.assertEqual(
                 [build.split("|", 1)[0] for build in builds],
-                [COMMIT],
+                ["1"],
             )
             assert_no_installer_residue(self, root)
 
@@ -606,7 +672,9 @@ def run_installer(
     machine: str = "x86_64",
     archive_failures: int = 0,
     build_success: bool = True,
+    codesign_success: bool = True,
     compiler_works: bool = True,
+    embedded_build_input_hash: str | None = None,
     embedded_revision: str | None = None,
     install_revision: str | None = None,
     main_failures: int = 0,
@@ -618,6 +686,8 @@ def run_installer(
     cleanup_success: bool = True,
     advancing_main: bool = False,
     shadowed_binary: bool = False,
+    source_hash_success: bool = True,
+    source_generation: str = "first",
     xdg_cache_enabled: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     root.mkdir(parents=True, exist_ok=True)
@@ -628,7 +698,7 @@ def run_installer(
     install_dir = root / "install" / "bin"
     temporary = root / "temporary"
     temporary.mkdir(exist_ok=True)
-    archive = create_source_archive(root)
+    archive = create_source_archive(root, source_generation)
 
     write_executable(
         fake_bin / "uname",
@@ -741,7 +811,15 @@ def run_installer(
         fake_bin / "cc",
         "#!/bin/sh\n[ \"$BCODEX_TEST_COMPILER_WORKS\" = 1 ]\n",
     )
+    write_executable(
+        fake_bin / "codesign",
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >>\"$BCODEX_TEST_CODESIGN_LOG\"\n"
+        "[ \"$BCODEX_TEST_CODESIGN_SUCCESS\" = 1 ]\n",
+    )
     write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+    if not source_hash_success:
+        write_executable(fake_bin / "sha256sum", "#!/bin/sh\nexit 1\n")
     if shadowed_binary:
         write_executable(
             fake_bin / "bcodex",
@@ -793,6 +871,7 @@ def run_installer(
         "BCODEX_INSTALL_DIR",
         "BCODEX_INSTALL_REVISION",
         "BCODEX_REPOSITORY",
+        "BCODEX_BUILD_INPUT_HASH",
         "BCODEX_SOURCE_REVISION",
         "CARGO_BUILD_JOBS",
         "CARGO_BUILD_BUILD_DIR",
@@ -827,9 +906,12 @@ def run_installer(
             "BCODEX_TEST_BUILT_VERSION": VERSION,
             "BCODEX_TEST_COMMIT": COMMIT,
             "BCODEX_TEST_COMPILE_LOG": str(root / "compile.log"),
+            "BCODEX_TEST_CODESIGN_LOG": str(root / "codesign.log"),
+            "BCODEX_TEST_CODESIGN_SUCCESS": "1" if codesign_success else "0",
             "BCODEX_TEST_CLEANUP_SUCCESS": "1" if cleanup_success else "0",
             "BCODEX_TEST_COMPILER_WORKS": "1" if compiler_works else "0",
             "BCODEX_TEST_DOWNLOAD_LOG": str(root / "download.log"),
+            "BCODEX_TEST_EMBEDDED_BUILD_INPUT_HASH": embedded_build_input_hash or "",
             "BCODEX_TEST_EMBEDDED_REVISION": embedded_revision or "",
             "BCODEX_TEST_FAKE_BIN": str(fake_bin),
             "BCODEX_TEST_GITHUB_LOG": str(root / "github.log"),
@@ -864,13 +946,17 @@ def run_installer(
     )
 
 
-def create_source_archive(root: Path) -> Path:
+def create_source_archive(root: Path, source_generation: str) -> Path:
     archive = root / "source.tar.gz"
     prefix = f"ummay0432-bettercodex-{COMMIT[:7]}"
     files = {
-        "Cargo.toml": f'[package]\nname = "bettercodex"\nversion = "{VERSION}"\n',
-        "Cargo.lock": "# fixture lockfile\n",
+        "Cargo.toml": (
+            f'[package]\nname = "bettercodex"\nversion = "{VERSION}"\n'
+            f"# source generation {source_generation}\n"
+        ),
+        "Cargo.lock": f"# fixture lockfile {source_generation}\n",
         "rust-toolchain.toml": '[toolchain]\nchannel = "1.95.0"\n',
+        "src/main.rs": "fn main() {}\n",
         "scripts/cargo-with-v8.sh": textwrap.dedent(
             """\
             #!/bin/sh
@@ -892,19 +978,28 @@ def create_source_archive(root: Path) -> Path:
               printf '%s\\n' dependency >>"$BCODEX_TEST_COMPILE_LOG"
               : >"$compiled_dependency"
             fi
-            printf '%s|%s|%s|%s|%s|%s\\n' \
-              "$BCODEX_SOURCE_REVISION" "$CARGO_HOME" "$CARGO_TARGET_DIR" \
-              "$XDG_CACHE_HOME" "$TMPDIR" "$*" >>"$BCODEX_TEST_BUILD_LOG"
+            printf '%s|%s|%s|%s|%s|%s|%s\\n' \
+              "$CARGO_INCREMENTAL" "$CARGO_HOME" "$CARGO_TARGET_DIR" \
+              "$XDG_CACHE_HOME" "$TMPDIR" "$BCODEX_BUILD_INPUT_HASH" \
+              "$*" >>"$BCODEX_TEST_BUILD_LOG"
             [ "$BCODEX_TEST_BUILD_SUCCESS" = "1" ] || exit 9
             mkdir -p "$CARGO_TARGET_DIR/release"
             {
               printf '%s\\n' '#!/bin/sh'
               printf 'version=%s\\n' "$BCODEX_TEST_BUILT_VERSION"
-              printf 'source_revision=%s\\n' "${BCODEX_TEST_EMBEDDED_REVISION:-$BCODEX_SOURCE_REVISION}"
+              printf '%s\\n' 'source_revision=unpatched'
+              printf 'build_input_hash=%s\\n' \
+                "${BCODEX_TEST_EMBEDDED_BUILD_INPUT_HASH:-$BCODEX_BUILD_INPUT_HASH}"
               printf 'smoke_success=%s\\n' "$BCODEX_TEST_SMOKE_SUCCESS"
               printf '%s\\n' 'case "${1:-}" in'
               printf '%s\\n' '  --version) printf "bcodex %s\\n" "$version" ;;'
               printf '%s\\n' '  --internal-source-revision) printf "%s\\n" "$source_revision" ;;'
+              printf '%s\\n' '  --internal-install-stage)'
+              printf '%s\\n' '    [ "$#" -eq 4 ] || exit 14'
+              printf '%s\\n' '    [ "$build_input_hash" = "$4" ] || exit 15'
+              printf '%s\\n' '    staged_revision="${BCODEX_TEST_EMBEDDED_REVISION:-$3}"'
+              printf '%s\\n' '    sed "s/^source_revision=.*/source_revision=$staged_revision/" "$0" >"$2"'
+              printf '%s\\n' '    ;;'
               printf '%s\\n' '  --internal-install-smoke)'
               printf '%s\\n' '    [ "$smoke_success" = 1 ] || exit 12'
               printf '%s\\n' '    printf "bcodex %s install smoke passed\\n" "$version"'

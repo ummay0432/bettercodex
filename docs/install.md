@@ -30,11 +30,14 @@ then:
 1. Resolves `refs/heads/main` once to a full 40-character commit ID.
 2. Downloads the immutable source archive for exactly that commit.
 3. Uses the checked-in lockfile and pinned Rust toolchain.
-4. Builds `bcodex` with the exact commit embedded in the binary.
-5. Checks its version and embedded revision, initializes V8, and materializes
+4. Hashes release-relevant source bytes, then reuses Cargo's native-target cache
+   and incrementally builds only changed bettercodex code and dependencies.
+5. Stamps the exact commit into a staged copy without invalidating reusable
+   compiler output, then reapplies and verifies the required ad-hoc code
+   signature on macOS.
+6. Checks its version and embedded revision, initializes V8, and materializes
    every embedded system resource in isolated directories.
-6. Copies the verified binary to a stage beside the destination and atomically
-   renames it over the installed command.
+7. Atomically renames the verified stage over the installed command.
 
 The selected commit does not change if `main` advances while compilation is in
 progress. The next launch or explicit update discovers the newer commit.
@@ -70,8 +73,10 @@ The explicit command resolves public `main`. If the exact revision is already
 installed, it exits without compiling. Otherwise it fetches the installer from
 that same immutable commit and passes the pinned commit to it, so the script and
 the source snapshot cannot drift apart. The installer reuses cached downloads
-and compatible compiled dependencies, performs all verification again, and
-atomically replaces the command. Restart a running TUI to use the new binary.
+and Cargo's fine-grained compilation state, performs all verification again,
+and atomically replaces the command. A manifest or lockfile edit recompiles
+only affected artifacts; it never erases the whole target first. Restart a
+running TUI to use the new binary.
 
 Update checks do not compare Cargo versions, Git tags, or GitHub Releases. Set
 `BCODEX_SKIP_UPDATE_CHECK=1` to disable the background check. The explicit
@@ -100,12 +105,16 @@ follow public `main` directly.
 ## Caching and cleanup
 
 When a cache home is available, the installer retains reusable downloads and
-one compatible compiled-dependency generation under
-`${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. A changed toolchain, manifest,
-lockfile, or V8 wrapper resets the incompatible compiled target instead of
-accumulating generations. Package-owned binaries, fingerprints, incremental
-output, source archives, compiler scratch space, and stage files are removed on
-success and failure.
+one native-target Cargo cache under
+`${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. Cargo fingerprints compiler,
+profile, manifest, lockfile, feature, build-script, dependency, and source
+changes at artifact granularity. The updater also makes a SHA-256 hash of the
+release inputs a compiler input, avoiding Cargo's mtime ambiguity across newly
+extracted source trees. The staged binary must match that hash before it can be
+stamped. The updater preserves Cargo artifacts and enables incremental
+compilation for the bettercodex package; registry dependencies do not gain
+incremental copies. Source archives, extracted source, compiler scratch space,
+and stage files remain disposable.
 
 The installer refuses symlinked destinations and never follows cache symlinks
 while cleaning. A lock rejects concurrent installs and records temporary state

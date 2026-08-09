@@ -8,8 +8,11 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use memchr::memmem;
 use serde::Deserialize;
 use std::ffi::OsStr;
+use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -26,6 +29,23 @@ const MAX_INSTALLER_BYTES: usize = 1024 * 1024;
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const INSTALL_DIR_ENV: &str = "BCODEX_INSTALL_DIR";
 const INSTALL_REVISION_ENV: &str = "BCODEX_INSTALL_REVISION";
+// Cargo tracks option_env! values independently from source mtimes. Feeding it
+// the installer's content hash prevents a relocated archive with colliding
+// mtimes and sizes from reusing a stale package binary.
+const BUILD_INPUT_HASH: Option<&str> = option_env!("BCODEX_BUILD_INPUT_HASH");
+const SOURCE_REVISION_PREFIX: &[u8] = b"\0bettercodex.source-revision.v1=";
+const SOURCE_REVISION_LENGTH: usize = 40;
+const SOURCE_REVISION_OFFSET: usize = SOURCE_REVISION_PREFIX.len();
+const SOURCE_REVISION_METADATA_LENGTH: usize = SOURCE_REVISION_OFFSET + SOURCE_REVISION_LENGTH + 2;
+
+// Keep the revision in a uniquely framed, fixed-size data record. Source builds
+// contain the non-hexadecimal placeholder and therefore remain development
+// builds. The installer stamps its selected immutable commit into a staged copy
+// after Cargo finishes, so advancing main does not invalidate an otherwise
+// reusable Rust compilation solely to change 40 metadata bytes.
+#[used]
+static SOURCE_REVISION_METADATA: [u8; SOURCE_REVISION_METADATA_LENGTH] =
+    *b"\0bettercodex.source-revision.v1=........................................;\0";
 
 const CURL_ARGUMENTS: &[&str] = &[
     "--proto",
@@ -119,7 +139,60 @@ pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
 }
 
 pub(crate) fn source_revision() -> Option<&'static str> {
-    option_env!("BCODEX_SOURCE_REVISION").filter(|revision| is_source_revision(revision))
+    let metadata = std::hint::black_box(&SOURCE_REVISION_METADATA);
+    let revision = std::str::from_utf8(
+        &metadata[SOURCE_REVISION_OFFSET..SOURCE_REVISION_OFFSET + SOURCE_REVISION_LENGTH],
+    )
+    .ok()?;
+    is_source_revision(revision).then_some(revision)
+}
+
+pub(crate) fn stage_current_binary(
+    destination: &Path,
+    revision: &str,
+    expected_build_input_hash: &str,
+) -> Result<()> {
+    if !is_source_revision(revision) {
+        bail!("cannot stage a binary with an invalid source revision");
+    }
+    if !is_build_input_hash(expected_build_input_hash) {
+        bail!("cannot stage a binary with an invalid build-input hash");
+    }
+    if build_input_hash() != Some(expected_build_input_hash) {
+        bail!("binary does not match the selected source build inputs");
+    }
+    let executable = std::env::current_exe().context("could not locate the binary being staged")?;
+    let mut image = fs::read(&executable)
+        .with_context(|| format!("could not read binary {}", executable.display()))?;
+    patch_source_revision(&mut image, revision)?;
+
+    let mut staged = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .with_context(|| format!("could not create staged binary {}", destination.display()))?;
+    staged
+        .write_all(&image)
+        .with_context(|| format!("could not write staged binary {}", destination.display()))?;
+    Ok(())
+}
+
+fn patch_source_revision(image: &mut [u8], revision: &str) -> Result<()> {
+    if !is_source_revision(revision) {
+        bail!("cannot patch an invalid source revision");
+    }
+    let marker = std::hint::black_box(SOURCE_REVISION_METADATA.as_slice());
+    let mut matches = memmem::find_iter(image, marker);
+    let marker_offset = matches
+        .next()
+        .context("binary has no bettercodex source-revision marker")?;
+    if matches.next().is_some() {
+        bail!("binary has multiple bettercodex source-revision markers");
+    }
+    let revision_offset = marker_offset + SOURCE_REVISION_OFFSET;
+    image[revision_offset..revision_offset + SOURCE_REVISION_LENGTH]
+        .copy_from_slice(revision.as_bytes());
+    Ok(())
 }
 
 async fn check_for_source_update_with(
@@ -174,6 +247,14 @@ fn parse_github_main_revision(response: &[u8]) -> Result<String> {
 
 fn is_source_revision(revision: &str) -> bool {
     revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn build_input_hash() -> Option<&'static str> {
+    BUILD_INPUT_HASH.filter(|hash| is_build_input_hash(hash))
+}
+
+fn is_build_input_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn short_revision(revision: &str) -> &str {

@@ -132,6 +132,11 @@ fn run() -> Result<()> {
             write_stdout_line(format_args!("{revision}"))?;
             Ok(())
         }
+        Command::InternalInstallStage {
+            destination,
+            revision,
+            build_input_hash,
+        } => update::stage_current_binary(&destination, &revision, &build_input_hash),
         Command::Login(command) => run_login_command(command),
         Command::Logout => run_logout_command(),
         Command::LogoutHelp => {
@@ -344,6 +349,11 @@ enum Command {
     ToolCatalogue,
     ToolCatalogueStats,
     InternalInstallSmoke,
+    InternalInstallStage {
+        destination: PathBuf,
+        revision: String,
+        build_input_hash: String,
+    },
     InternalSourceRevision,
     Login(LoginCommand),
     Logout,
@@ -374,6 +384,31 @@ struct RunOptions {
 impl Command {
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut arguments = arguments.into_iter().peekable();
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--internal-install-stage")
+        {
+            arguments.next();
+            let destination = arguments
+                .next()
+                .ok_or_else(|| anyhow!("internal install stage helper requires a destination"))?;
+            let revision = arguments
+                .next()
+                .ok_or_else(|| anyhow!("internal install stage helper requires a revision"))?;
+            let build_input_hash = arguments.next().ok_or_else(|| {
+                anyhow!("internal install stage helper requires a build-input hash")
+            })?;
+            if arguments.next().is_some() {
+                return Err(anyhow!(
+                    "internal install stage helper received extra arguments"
+                ));
+            }
+            return Ok(Self::InternalInstallStage {
+                destination: PathBuf::from(destination),
+                revision,
+                build_input_hash,
+            });
+        }
         if arguments
             .peek()
             .is_some_and(|argument| argument == "--internal-install-smoke")
@@ -571,7 +606,7 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Install the latest public bettercodex main revision\n\nUsage:\n  bcodex update\n\nThe updater compares the binary's embedded source revision with public main. If they match, it exits immediately. Otherwise it pins that exact commit and runs the source installer, which reuses dependency caches, compiles and smoke-tests the candidate, and atomically replaces the installed command. Package versions do not control update freshness."
+        "Install the latest public bettercodex main revision\n\nUsage:\n  bcodex update\n\nThe updater compares the binary's embedded source revision with public main. If they match, it exits immediately. Otherwise it pins that exact commit and runs the source installer, which reuses Cargo's fine-grained compilation cache, builds only changed artifacts, stamps and smoke-tests the candidate, and atomically replaces the installed command. Package versions do not control update freshness."
     ))
 }
 
@@ -654,6 +689,23 @@ mod tests {
     #[test]
     fn internal_install_verification_commands_are_strictly_parsed() {
         assert!(matches!(
+            Command::parse([
+                "--internal-install-stage".to_string(),
+                "/tmp/candidate".to_string(),
+                "1".repeat(40),
+                "2".repeat(64),
+            ])
+            .unwrap(),
+            Command::InternalInstallStage {
+                destination,
+                revision,
+                build_input_hash,
+            }
+                if destination.as_path() == std::path::Path::new("/tmp/candidate")
+                    && revision == "1".repeat(40)
+                    && build_input_hash == "2".repeat(64)
+        ));
+        assert!(matches!(
             Command::parse(["--internal-install-smoke".to_string()]).unwrap(),
             Command::InternalInstallSmoke
         ));
@@ -664,6 +716,24 @@ mod tests {
         assert!(
             Command::parse([
                 "--internal-source-revision".to_string(),
+                "unexpected".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            Command::parse([
+                "--internal-install-stage".to_string(),
+                "/tmp/candidate".to_string(),
+                "1".repeat(40),
+            ])
+            .is_err()
+        );
+        assert!(
+            Command::parse([
+                "--internal-install-stage".to_string(),
+                "/tmp/candidate".to_string(),
+                "1".repeat(40),
+                "2".repeat(64),
                 "unexpected".to_string(),
             ])
             .is_err()
