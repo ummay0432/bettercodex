@@ -1,2 +1,2 @@
-- In `bash`, `zsh`, and `sh`, backticks and `$()` execute unless safely quoted.
+- In `bash`, `zsh`, and `sh`, backticks and `$()` can trigger command substitution, including inside double quotes.
 - In zsh, do not name a variable `path`; assigning it mutates `PATH`.
