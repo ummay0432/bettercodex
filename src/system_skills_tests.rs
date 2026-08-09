@@ -1,5 +1,7 @@
 use super::*;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
 
 struct TestDirectory(PathBuf);
@@ -29,6 +31,7 @@ fn embedded_system_skills_are_exact_private_and_idempotent() {
 
     let installed_root = install(&home).unwrap();
     assert_eq!(installed_root, root(&home));
+    #[cfg(unix)]
     assert_eq!(
         std::fs::metadata(&installed_root)
             .unwrap()
@@ -40,6 +43,7 @@ fn embedded_system_skills_are_exact_private_and_idempotent() {
     for embedded in EMBEDDED_FILES {
         let path = installed_root.join(embedded.relative_path);
         assert_eq!(std::fs::read(&path).unwrap(), embedded.contents);
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -59,6 +63,7 @@ fn current_marker_does_not_hide_modified_missing_or_retired_files() {
     let retired = installed_root.join("retired/SKILL.md");
 
     std::fs::write(&modified, "locally drifted contents").unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(&modified, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::remove_file(&missing).unwrap();
     std::fs::create_dir_all(retired.parent().unwrap()).unwrap();
@@ -69,6 +74,7 @@ fn current_marker_does_not_hide_modified_missing_or_retired_files() {
         std::fs::read(&modified).unwrap(),
         EMBEDDED_FILES[0].contents
     );
+    #[cfg(unix)]
     assert_eq!(
         std::fs::metadata(&modified).unwrap().permissions().mode() & 0o777,
         0o600
@@ -99,6 +105,7 @@ fn interrupted_directory_swap_is_recovered_before_verification() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn system_skill_installation_refuses_to_replace_a_symlink() {
     let test_directory = TestDirectory::new("system-skills-symlink");
@@ -116,4 +123,32 @@ fn system_skill_installation_refuses_to_replace_a_symlink() {
         std::fs::read_to_string(outside.join("keep")).unwrap(),
         "untouched"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn system_skill_installation_refuses_to_replace_a_junction() {
+    let test_directory = TestDirectory::new("system-skills-junction");
+    let home = test_directory.0.join("home");
+    let outside = test_directory.0.join("outside");
+    std::fs::create_dir_all(home.join(SKILLS_DIRECTORY)).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "untouched").unwrap();
+    let destination = root(&home);
+    let status = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&destination)
+        .arg(&outside)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let error = install(&home).unwrap_err();
+
+    assert!(error.to_string().contains("not a regular directory"));
+    assert_eq!(
+        std::fs::read_to_string(outside.join("keep")).unwrap(),
+        "untouched"
+    );
+    std::fs::remove_dir(&destination).unwrap();
 }
