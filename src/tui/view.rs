@@ -425,7 +425,15 @@ enum ToolDisplay {
     Plan(PlanDisplay),
     ViewImage(String),
     WebSearch(Vec<crate::web_search::WebActivity>),
+    OpenAiDocs(OpenAiDocsActivity),
     Other,
+}
+
+#[derive(Debug)]
+struct OpenAiDocsActivity {
+    title: &'static str,
+    detail: String,
+    active_label: &'static str,
 }
 
 #[derive(Debug)]
@@ -1149,8 +1157,17 @@ impl View {
                                 | ToolDisplay::Patch(_)
                                 | ToolDisplay::Papercut
                                 | ToolDisplay::WebSearch(_)
+                                | ToolDisplay::OpenAiDocs(_)
                                 | ToolDisplay::Other
                         );
+                        let output = if matches!(&tool.display, ToolDisplay::OpenAiDocs(_)) {
+                            match output {
+                                Ok(_) => Ok(Value::Null),
+                                Err(error) => Err(first_display_line(&markdown::sanitize(&error))),
+                            }
+                        } else {
+                            output
+                        };
                         tool.outcome = Some(ToolOutcome { output });
                         completed_work
                     });
@@ -3144,7 +3161,9 @@ impl ToolEntry {
                     .unwrap_or_else(|| "image".to_string()),
             ),
             "web.run" => ToolDisplay::WebSearch(crate::web_search::activities_for_display(input)),
-            _ => ToolDisplay::Other,
+            _ => OpenAiDocsActivity::from_call(&name, input.as_ref())
+                .map(ToolDisplay::OpenAiDocs)
+                .unwrap_or(ToolDisplay::Other),
         };
         Self {
             call_id,
@@ -3163,7 +3182,7 @@ impl ToolEntry {
                         .iter()
                         .all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
             }
-            ToolDisplay::WebSearch(_) => true,
+            ToolDisplay::WebSearch(_) | ToolDisplay::OpenAiDocs(_) => true,
             _ => false,
         }
     }
@@ -3195,6 +3214,7 @@ impl ToolEntry {
             ToolDisplay::Plan(_) => "Updating plan".to_string(),
             ToolDisplay::ViewImage(path) => format!("Viewing {path}"),
             ToolDisplay::WebSearch(_) => "Searching the web".to_string(),
+            ToolDisplay::OpenAiDocs(activity) => activity.active_label.to_string(),
             ToolDisplay::Other => self.name.clone(),
         }
     }
@@ -3219,7 +3239,9 @@ impl ToolEntry {
             ToolDisplay::Papercut => papercut_lines(self, width),
             ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
             ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
-            ToolDisplay::WebSearch(_) => exploration_lines(std::slice::from_ref(self), width),
+            ToolDisplay::WebSearch(_) | ToolDisplay::OpenAiDocs(_) => {
+                exploration_lines(std::slice::from_ref(self), width)
+            }
             ToolDisplay::Other => generic_tool_lines(self, width),
         }
     }
@@ -3233,6 +3255,59 @@ impl ToolEntry {
                 .and_then(Value::as_i64)
                 .is_none_or(|code| code == 0),
         })
+    }
+}
+
+impl OpenAiDocsActivity {
+    fn from_call(name: &str, input: Option<&Value>) -> Option<Self> {
+        let tool = name
+            .strip_prefix(crate::openai_docs::NAMESPACE)?
+            .strip_prefix('.')?;
+        let argument = |key| {
+            input
+                .and_then(|input| input.get(key))
+                .and_then(Value::as_str)
+                .map(markdown::sanitize)
+                .unwrap_or_default()
+        };
+        let activity = match tool {
+            crate::openai_docs::SEARCH_OPENAI_DOCS => Self {
+                title: "Search OpenAI docs",
+                detail: argument("query"),
+                active_label: "Searching OpenAI docs",
+            },
+            crate::openai_docs::FETCH_OPENAI_DOC => {
+                let mut detail = argument("url");
+                let anchor = argument("anchor");
+                let anchor = anchor.trim_start_matches('#');
+                if !detail.is_empty() && !anchor.is_empty() && !detail.contains('#') {
+                    detail.push('#');
+                    detail.push_str(anchor);
+                }
+                Self {
+                    title: "Fetch OpenAI doc",
+                    detail,
+                    active_label: "Fetching OpenAI doc",
+                }
+            }
+            crate::openai_docs::GET_OPENAPI_SPEC => Self {
+                title: "Read OpenAPI spec",
+                detail: argument("url"),
+                active_label: "Reading OpenAPI spec",
+            },
+            crate::openai_docs::LIST_API_ENDPOINTS => Self {
+                title: "List API endpoints",
+                detail: String::new(),
+                active_label: "Listing API endpoints",
+            },
+            crate::openai_docs::LIST_OPENAI_DOCS => Self {
+                title: "List OpenAI docs",
+                detail: String::new(),
+                active_label: "Listing OpenAI docs",
+            },
+            _ => return None,
+        };
+        Some(activity)
     }
 }
 
@@ -4412,15 +4487,28 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
                     };
                     details.push((activity.verb, detail_style, spans));
                 }
-                if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
-                    details.push((
-                        "Error",
-                        Style::default().fg(Color::Red),
-                        vec![Span::from(first_display_line(error)).red()],
-                    ));
-                }
+            }
+            ToolDisplay::OpenAiDocs(activity) => {
+                flush_reads(&mut details, &mut read_names);
+                let spans = if activity.detail.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Span::from(activity.detail.clone())]
+                };
+                details.push((activity.title, detail_style, spans));
             }
             _ => {}
+        }
+        if matches!(
+            &tool.display,
+            ToolDisplay::WebSearch(_) | ToolDisplay::OpenAiDocs(_)
+        ) && let Some(ToolOutcome { output: Err(error) }) = &tool.outcome
+        {
+            details.push((
+                "Error",
+                Style::default().fg(Color::Red),
+                vec![Span::from(first_display_line(error)).red()],
+            ));
         }
     }
     flush_reads(&mut details, &mut read_names);
@@ -5803,6 +5891,118 @@ mod tests {
         assert!(rendered.contains("• Explored"), "{rendered}");
         assert!(rendered.contains("Read main.rs"), "{rendered}");
         assert!(!rendered.contains("fn main"), "{rendered}");
+    }
+
+    #[test]
+    fn openai_docs_calls_collapse_into_one_explored_tree() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        let calls = [
+            (
+                "search",
+                "openaiDeveloperDocs.search_openai_docs",
+                json!({"query": "Responses API compaction"}),
+            ),
+            (
+                "fetch",
+                "openaiDeveloperDocs.fetch_openai_doc",
+                json!({
+                    "url": "https://developers.openai.com/api/docs/guides/compaction",
+                    "anchor": "server-side-compaction"
+                }),
+            ),
+            (
+                "spec",
+                "openaiDeveloperDocs.get_openapi_spec",
+                json!({"url": "https://api.openai.com/v1/responses"}),
+            ),
+            (
+                "endpoints",
+                "openaiDeveloperDocs.list_api_endpoints",
+                json!({}),
+            ),
+            (
+                "list",
+                "openaiDeveloperDocs.list_openai_docs",
+                json!({"limit": 10}),
+            ),
+        ];
+
+        for (call_id, name, input) in calls {
+            view.handle_agent_event(AgentEvent::ToolStarted {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                input: Some(input),
+            });
+            view.handle_agent_event(AgentEvent::ToolCompleted {
+                call_id: call_id.to_string(),
+                output: Ok(json!("FULL DOCUMENT BODY MUST STAY COLLAPSED")),
+                duration: Duration::from_millis(10),
+            });
+        }
+        view.seal_exploration();
+
+        let retained_output = &view
+            .find_tool_mut("search")
+            .expect("search tool")
+            .outcome
+            .as_ref()
+            .expect("search outcome")
+            .output;
+        assert_eq!(retained_output, &Ok(Value::Null));
+
+        let rendered = view
+            .take_pending_history_lines(120, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered,
+            "• Explored\n  └ Search OpenAI docs Responses API compaction\n    Fetch OpenAI doc https://developers.openai.com/api/docs/guides/compaction#server-side-compaction\n    Read OpenAPI spec https://api.openai.com/v1/responses\n    List API endpoints\n    List OpenAI docs"
+        );
+        assert!(!rendered.contains("openaiDeveloperDocs"), "{rendered}");
+        assert!(!rendered.contains("FULL DOCUMENT BODY"), "{rendered}");
+    }
+
+    #[test]
+    fn openai_docs_tree_shows_live_status_and_failures() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "fetch".to_string(),
+            name: "openaiDeveloperDocs.fetch_openai_doc".to_string(),
+            input: Some(json!({"url": "https://developers.openai.com/codex/cli"})),
+        });
+
+        let live = view
+            .active_lines(80)
+            .iter()
+            .map(|line| plain(&line.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live.contains("Exploring"), "{live}");
+        assert!(live.contains("Fetch OpenAI doc"), "{live}");
+        assert_eq!(view.status_detail.as_deref(), Some("Fetching OpenAI doc"));
+
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "fetch".to_string(),
+            output: Err("documentation request timed out\nretry exhausted".to_string()),
+            duration: Duration::from_millis(10),
+        });
+        view.seal_exploration();
+        let rendered = view
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("• Explored"), "{rendered}");
+        assert!(
+            rendered.contains("Error documentation request timed out"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("retry exhausted"), "{rendered}");
     }
 
     #[test]
