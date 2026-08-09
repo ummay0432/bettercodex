@@ -103,29 +103,32 @@ struct Release {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AvailableUpdate {
-    current_version: String,
-    latest_version: String,
+    current_revision: String,
+    latest_revision: String,
 }
 
 impl AvailableUpdate {
-    fn new(current_version: &str, latest_version: &str) -> Self {
+    fn new(current_revision: &str, latest_revision: &str) -> Self {
         Self {
-            current_version: current_version.to_string(),
-            latest_version: latest_version.to_string(),
+            current_revision: current_revision.to_string(),
+            latest_revision: latest_revision.to_string(),
         }
     }
 
-    pub(crate) fn current_version(&self) -> &str {
-        &self.current_version
+    pub(crate) fn current_short_revision(&self) -> &str {
+        short_revision(&self.current_revision)
     }
 
-    pub(crate) fn latest_version(&self) -> &str {
-        &self.latest_version
+    pub(crate) fn latest_short_revision(&self) -> &str {
+        short_revision(&self.latest_revision)
     }
 
     #[cfg(test)]
     pub(crate) fn test_fixture() -> Self {
-        Self::new("0.1.2", "0.1.3")
+        Self::new(
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+        )
     }
 }
 
@@ -147,6 +150,14 @@ pub(crate) fn release_tag() -> Option<&'static str> {
     let tag = BUILD_RELEASE_TAG?;
     let release = parse_release_tag(tag).ok()?;
     (release.version == env!("CARGO_PKG_VERSION")).then_some(tag)
+}
+
+/// Retained for release clients older than 0.1.3, which verify this exact
+/// revision before accepting an update.
+pub(crate) fn source_revision() -> Option<&'static str> {
+    release_tag()?
+        .rsplit_once('-')
+        .map(|(_, revision)| revision)
 }
 
 fn current_release() -> Option<Release> {
@@ -181,7 +192,7 @@ async fn check_for_release_update_at(
     let latest = parse_latest_release(&response).ok()?;
     is_newer(&latest.version, &current.version)
         .is_some_and(|newer| newer)
-        .then(|| AvailableUpdate::new(&current.version, &latest.version))
+        .then(|| AvailableUpdate::new(&current.revision, &latest.revision))
 }
 
 fn latest_release_api_url(repository: &str) -> String {
@@ -287,7 +298,7 @@ fn parse_release_tag(tag: &str) -> Result<Release> {
     Ok(Release {
         tag: tag.to_string(),
         version: version.to_string(),
-        revision: revision.to_ascii_lowercase(),
+        revision: revision.to_string(),
     })
 }
 
@@ -304,7 +315,14 @@ fn is_newer(latest: &str, current: &str) -> Option<bool> {
 }
 
 fn is_source_revision(revision: &str) -> bool {
-    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    revision.len() == 40
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn short_revision(revision: &str) -> &str {
+    revision.get(..12).unwrap_or(revision)
 }
 
 fn is_sha256_digest(digest: &str) -> bool {

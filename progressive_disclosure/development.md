@@ -94,5 +94,6 @@ target installed on Linux is not a useful substitute.
 
 The manual release workflow is the only distribution build path. It must build
 all three targets from one public `main` revision, qualify the shared Linux
-binary on Ubuntu and Debian, and create a draft with exactly the three
-compressed assets named in `SPEC.md`.
+binary on Ubuntu and Debian, and create a draft with exactly the five compressed
+assets named in `SPEC.md`. The two zstd assets are compatibility encodings of
+the macOS and Linux binaries for immutable clients older than 0.1.3.

@@ -19,10 +19,6 @@ CANDIDATE = textwrap.dedent(
     case "${{1:-}}" in
       --internal-release-tag) printf '%s\\n' "${{FIXTURE_TAG:-{TAG}}}" ;;
       --version) printf 'bcodex %s\\n' "${{FIXTURE_VERSION:-1.2.3}}" ;;
-      --internal-install-smoke)
-        [ "${{FIXTURE_SMOKE_FAIL:-0}}" != 1 ] || exit 9
-        printf 'bcodex %s install smoke passed\\n' "${{FIXTURE_SMOKE_VERSION:-${{FIXTURE_VERSION:-1.2.3}}}}"
-        ;;
       *) exit 64 ;;
     esac
     """
@@ -180,6 +176,10 @@ class InstallerTests(unittest.TestCase):
             ({"BCODEX_REPOSITORY": "invalid"}, "owner/repository"),
             ({"BCODEX_INSTALL_DIR": "relative"}, "absolute path"),
             ({"BCODEX_INSTALL_RELEASE_TAG": "v1.2.3"}, "RELEASE_TAG is invalid"),
+            (
+                {"BCODEX_INSTALL_RELEASE_TAG": f"bcodex-v1.2.3-{'A' * 40}"},
+                "RELEASE_TAG is invalid",
+            ),
         ):
             result = self.f.run(**changes)
             self.assertNotEqual(result.returncode, 0)
@@ -191,8 +191,6 @@ class InstallerTests(unittest.TestCase):
         cases = (
             ({"FIXTURE_TAG": f"bcodex-v9.9.9-{'9' * 40}"}, "downloaded binary is"),
             ({"FIXTURE_VERSION": "9.9.9"}, "version does not match"),
-            ({"FIXTURE_SMOKE_FAIL": "1"}, "runtime smoke test"),
-            ({"FIXTURE_SMOKE_VERSION": "9.9.9"}, "smoke-test result"),
             (
                 {"FIXTURE_CODESIGN_FAIL": "1", "FAKE_UNAME_S": "Darwin", "FAKE_UNAME_M": "arm64"},
                 "code signature",

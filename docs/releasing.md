@@ -13,20 +13,24 @@ release authorization.
 - Use tag `bcodex-v<version>-<40-character-revision>` and title
   `bettercodex <version>`.
 - Build all targets from that same revision on standard GitHub-hosted runners.
-- Create exactly these three compressed assets:
+- Create exactly these five compressed assets for the three supported binaries:
 
   - `bcodex-aarch64-apple-darwin.gz`
+  - `bcodex-aarch64-apple-darwin.zst`
   - `bcodex-x86_64-pc-windows-msvc.exe.gz`
   - `bcodex-x86_64-unknown-linux-gnu.gz`
+  - `bcodex-x86_64-unknown-linux-gnu.zst`
 
 - Qualify the Linux asset on Ubuntu 22.04 and Debian 12. Do not rebuild a
   separate Debian binary.
+- Keep the zstd copies of the Unix binaries compatible with immutable 0.1.2
+  clients; they are alternate encodings, not additional binaries.
 - GitHub's release API digest is the asset checksum. Do not add checksum,
   manifest, source, or installer assets.
 
 The manual [release workflow](../.github/workflows/release.yml) validates the
 revision and version, tests each native installer and binary, embeds the exact
-release tag, creates the three assets, and opens a draft release. It never runs
+release tag, creates the five assets, and opens a draft release. It never runs
 on pushes, schedules, or version changes and never publishes the draft.
 
 ## Prepare a draft
@@ -56,7 +60,7 @@ Before publication, query the draft and verify:
 - its tag encodes the selected version and exact source revision;
 - it is a draft, not a prerelease;
 - all build and Linux qualification jobs passed;
-- the asset names above are present exactly once, with nonzero sizes and
+- the five asset names above are present exactly once, with nonzero sizes and
   `sha256:` digests; and
 - each decompressed binary reports the expected version and embedded tag and
   passed its isolated installation smoke test in Actions.
@@ -67,9 +71,9 @@ and require a new release decision.
 
 If publication was explicitly authorized, publish the verified draft as the
 latest non-prerelease release. Then query the public release again and confirm
-its tag, target revision, three-asset set, digests, and latest status. Published
+its tag, target revision, five-asset set, digests, and latest status. Published
 releases must remain immutable.
 
 Report the release URL, version, full revision, workflow run URL, three targets,
-and final verification result. If any gate fails, leave the previous release
-current and report the blocker.
+five assets, and final verification result. If any gate fails, leave the
+previous release current and report the blocker.

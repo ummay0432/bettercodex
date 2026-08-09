@@ -11,7 +11,6 @@ MAX_ARCHIVE_BYTES=134217728
 MAX_BINARY_BYTES=268435456
 
 candidate=""
-smoke_root=""
 
 step() {
   printf '==> %s\n' "$1"
@@ -30,9 +29,6 @@ cleanup() {
   set +e
   if [ -n "$candidate" ]; then
     rm -f "$candidate"
-  fi
-  if [ -n "$smoke_root" ]; then
-    rm -rf "$smoke_root"
   fi
 }
 
@@ -81,7 +77,7 @@ validate_absolute_path() {
 
 valid_release_tag() {
   printf '%s\n' "$1" |
-    grep -Eq '^bcodex-v[0-9]+\.[0-9]+\.[0-9]+-[0-9a-fA-F]{40}$'
+    grep -Eq '^bcodex-v[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{40}$'
 }
 
 require_command chmod
@@ -194,24 +190,6 @@ if [ "$(uname -s)" = "Darwin" ]; then
   codesign --verify --strict "$candidate" >/dev/null 2>&1 ||
     fail "downloaded macOS binary has an invalid code signature"
 fi
-
-smoke_parent="${TMPDIR:-/tmp}"
-validate_absolute_path "$smoke_parent" TMPDIR
-smoke_root="$(mktemp -d "$smoke_parent/bettercodex-smoke.XXXXXXXX")" ||
-  fail "could not create a temporary smoke-test directory"
-mkdir -p "$smoke_root/codex" "$smoke_root/bcodex"
-step "Verifying bettercodex $candidate_version"
-smoke_output="$(
-  CODEX_HOME="$smoke_root/codex" \
-    BCODEX_HOME="$smoke_root/bcodex" \
-    BCODEX_SKIP_UPDATE_CHECK=1 \
-    "$candidate" --internal-install-smoke 2>/dev/null
-)" || fail "downloaded binary failed its runtime smoke test"
-if [ "$smoke_output" != "bcodex $candidate_version install smoke passed" ]; then
-  fail "downloaded binary returned an invalid smoke-test result"
-fi
-rm -rf "$smoke_root"
-smoke_root=""
 
 mv -f "$candidate" "$bin_path"
 candidate=""

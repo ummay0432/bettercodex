@@ -58,10 +58,8 @@ function Assert-Eventually([scriptblock] $Condition, [string] $Message) {
 function Write-Candidate(
     [string] $Path,
     [string] $ReleaseTag,
-    [string] $Version,
-    [bool] $SmokeSucceeds = $true
+    [string] $Version
 ) {
-    $SmokeExit = if ($SmokeSucceeds) { 'exit /b 0' } else { 'exit /b 9' }
     $Source = @"
 @echo off
 if "%~1"=="--internal-release-tag" (
@@ -71,10 +69,6 @@ if "%~1"=="--internal-release-tag" (
 if "%~1"=="--version" (
   echo bcodex $Version
   exit /b 0
-)
-if "%~1"=="--internal-install-smoke" (
-  echo bcodex $Version install smoke passed
-  $SmokeExit
 )
 exit /b 64
 "@
@@ -103,6 +97,7 @@ try {
     Assert-True (Test-ReleaseTag $Tag) 'valid release tag was rejected'
     Assert-True (-not (Test-ReleaseTag 'v1.2.3')) 'invalid release tag was accepted'
     Assert-True (-not (Test-ReleaseTag "bcodex-v1.2-$Revision")) 'short version was accepted'
+    Assert-True (-not (Test-ReleaseTag "bcodex-v1.2.3-$('A' * 40)")) 'uppercase revision was accepted'
     Assert-Equal (Get-ReleaseVersion $Tag) '1.2.3' 'release version parsing failed'
 
     $Path = Prepend-PathEntry 'C:\Existing;D:\Tools' 'C:\bettercodex\bin'
@@ -123,12 +118,12 @@ try {
     Assert-Equal (Get-BinaryReleaseTag $Candidate) $Tag 'candidate tag verification failed'
     Assert-True (Test-BinaryIdentity $Candidate $Tag '1.2.3') 'candidate identity failed'
     Assert-True (-not (Test-BinaryIdentity $Candidate $Tag '9.9.9')) 'wrong version was accepted'
-    Invoke-BinarySmoke $Candidate '1.2.3'
 
     $Destination = Join-Path $TestRoot 'installed.cmd'
     $Backup = Join-Path $TestRoot 'backup.cmd'
     Write-Candidate $Destination "bcodex-v1.2.2-$('2' * 40)" '1.2.2'
-    Install-Candidate $Candidate $Destination $Tag '1.2.3' $Backup
+    $CandidateDigest = Get-FileSha256 $Candidate
+    Install-Candidate $Candidate $Destination $CandidateDigest $Backup
     Assert-True (Test-BinaryIdentity $Destination $Tag '1.2.3') 'candidate was not installed'
     Assert-True (-not (Test-Path -LiteralPath $Backup)) 'successful install retained backup'
 
@@ -137,7 +132,7 @@ try {
     Write-Candidate $InvalidCandidate "bcodex-v9.9.9-$('9' * 40)" '9.9.9'
     $RollbackFailed = $false
     try {
-        Install-Candidate $InvalidCandidate $Destination $Tag '1.2.3' $Backup
+        Install-Candidate $InvalidCandidate $Destination $OldDigest $Backup
     }
     catch {
         $RollbackFailed = $true
@@ -151,7 +146,7 @@ try {
     Write-Candidate $FreshCandidate "bcodex-v9.9.9-$('9' * 40)" '9.9.9'
     $FreshInstallFailed = $false
     try {
-        Install-Candidate $FreshCandidate $FreshDestination $Tag '1.2.3' $Backup
+        Install-Candidate $FreshCandidate $FreshDestination $OldDigest $Backup
     }
     catch {
         $FreshInstallFailed = $true
@@ -172,7 +167,6 @@ try {
     Start-DeferredReplacement `
         $DeferredCandidate `
         $DeferredDestination `
-        $Tag `
         '1.2.3' `
         (Get-FileSha256 $DeferredCandidate) `
         $Waiter.Id `
@@ -197,17 +191,16 @@ try {
     Start-DeferredReplacement `
         $DeferredInvalidCandidate `
         $DeferredDestination `
-        $Tag `
         '1.2.3' `
-        (Get-FileSha256 $DeferredInvalidCandidate) `
+        $DeferredDigest `
         $Waiter.Id `
         $Waiter.StartTime.ToUniversalTime().Ticks `
         $DeferredLock
     Assert-Eventually {
         (-not (Test-Path -LiteralPath $DeferredInvalidCandidate)) -and
         (-not (Test-Path -LiteralPath $DeferredLock))
-    } 'failed deferred replacement did not finish rollback'
-    Assert-Equal (Get-FileSha256 $DeferredDestination) $DeferredDigest 'failed deferred replacement did not roll back'
+    } 'rejected deferred replacement did not finish cleanup'
+    Assert-Equal (Get-FileSha256 $DeferredDestination) $DeferredDigest 'rejected deferred replacement changed the installation'
     Assert-Equal @(
         Get-ChildItem -LiteralPath $TestRoot -Filter 'deferred-installed.cmd.backup.*'
     ).Count 0 'failed deferred replacement retained a transaction backup'

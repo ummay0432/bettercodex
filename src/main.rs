@@ -132,6 +132,12 @@ fn run() -> Result<()> {
             write_stdout_line(format_args!("{tag}"))?;
             Ok(())
         }
+        Command::InternalSourceRevision => {
+            let revision = update::source_revision()
+                .ok_or_else(|| anyhow!("this build has no embedded source revision"))?;
+            write_stdout_line(format_args!("{revision}"))?;
+            Ok(())
+        }
         Command::Login(command) => run_login_command(command),
         Command::Logout => run_logout_command(),
         Command::LogoutHelp => {
@@ -304,6 +310,7 @@ enum Command {
     ToolCatalogueStats,
     InternalInstallSmoke,
     InternalReleaseTag,
+    InternalSourceRevision,
     Login(LoginCommand),
     Logout,
     LogoutHelp,
@@ -352,6 +359,18 @@ impl Command {
                 ));
             }
             return Ok(Self::InternalReleaseTag);
+        }
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--internal-source-revision")
+        {
+            arguments.next();
+            if arguments.next().is_some() {
+                return Err(anyhow!(
+                    "internal source revision helper received extra arguments"
+                ));
+            }
+            return Ok(Self::InternalSourceRevision);
         }
         if arguments
             .peek()
@@ -510,7 +529,7 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Install the latest published bettercodex release\n\nUsage:\n  bcodex update\n\nThe updater compares this binary's embedded release version with GitHub's latest published full release. If already current, it exits immediately. Otherwise it downloads, smoke-tests, and atomically installs the matching prebuilt binary without compiling."
+        "Install the latest published bettercodex release\n\nUsage:\n  bcodex update\n\nThe updater compares this binary's embedded release version with GitHub's latest published full release. If already current, it exits immediately. Otherwise it downloads, verifies, and atomically installs the matching prebuilt binary without compiling."
     ))
 }
 
@@ -600,9 +619,13 @@ mod tests {
             Command::parse(["--internal-release-tag".to_string()]).unwrap(),
             Command::InternalReleaseTag
         ));
+        assert!(matches!(
+            Command::parse(["--internal-source-revision".to_string()]).unwrap(),
+            Command::InternalSourceRevision
+        ));
         assert!(
             Command::parse([
-                "--internal-release-tag".to_string(),
+                "--internal-source-revision".to_string(),
                 "unexpected".to_string(),
             ])
             .is_err()

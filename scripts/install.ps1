@@ -42,11 +42,11 @@ function Test-IsReparsePoint([string] $Path) {
 }
 
 function Test-ReleaseTag([string] $Tag) {
-    return $Tag -cmatch '^bcodex-v([0-9]+\.[0-9]+\.[0-9]+)-[0-9a-fA-F]{40}$'
+    return $Tag -cmatch '^bcodex-v([0-9]+\.[0-9]+\.[0-9]+)-[0-9a-f]{40}$'
 }
 
 function Get-ReleaseVersion([string] $Tag) {
-    if ($Tag -cnotmatch '^bcodex-v([0-9]+\.[0-9]+\.[0-9]+)-[0-9a-fA-F]{40}$') {
+    if ($Tag -cnotmatch '^bcodex-v([0-9]+\.[0-9]+\.[0-9]+)-[0-9a-f]{40}$') {
         Fail "invalid bettercodex release tag $Tag"
     }
     return $Matches[1]
@@ -218,41 +218,6 @@ function Test-BinaryIdentity(
     }
 }
 
-function Invoke-BinarySmoke([string] $Binary, [string] $ExpectedVersion) {
-    $SmokeRoot = Join-Path ([IO.Path]::GetTempPath()) (
-        'bettercodex-smoke.' + [Guid]::NewGuid().ToString('N')
-    )
-    $VariableNames = @(
-        'USERPROFILE', 'LOCALAPPDATA', 'CODEX_HOME', 'BCODEX_HOME',
-        'BCODEX_SKIP_UPDATE_CHECK'
-    )
-    $Previous = @{}
-    foreach ($Name in $VariableNames) {
-        $Previous[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
-    }
-    try {
-        foreach ($Name in @('profile', 'local-app-data', 'codex-home', 'bcodex-home')) {
-            [void](New-Item -ItemType Directory -Force -Path (Join-Path $SmokeRoot $Name))
-        }
-        $env:USERPROFILE = Join-Path $SmokeRoot 'profile'
-        $env:LOCALAPPDATA = Join-Path $SmokeRoot 'local-app-data'
-        $env:CODEX_HOME = Join-Path $SmokeRoot 'codex-home'
-        $env:BCODEX_HOME = Join-Path $SmokeRoot 'bcodex-home'
-        $env:BCODEX_SKIP_UPDATE_CHECK = '1'
-        $Output = (& $Binary --internal-install-smoke 2>$null) -join "`n"
-        if ($LASTEXITCODE -ne 0 -or
-            $Output.Trim() -cne "bcodex $ExpectedVersion install smoke passed") {
-            Fail 'downloaded binary failed its runtime smoke test'
-        }
-    }
-    finally {
-        foreach ($Name in $VariableNames) {
-            [Environment]::SetEnvironmentVariable($Name, $Previous[$Name], 'Process')
-        }
-        Remove-Item -LiteralPath $SmokeRoot -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
 function Invoke-WithRetry([scriptblock] $Operation, [string] $Description) {
     $Delay = 50
     for ($Attempt = 1; $Attempt -le 10; $Attempt++) {
@@ -291,8 +256,7 @@ function Restore-Backup(
 function Install-Candidate(
     [string] $Candidate,
     [string] $Destination,
-    [string] $ExpectedTag,
-    [string] $ExpectedVersion,
+    [string] $ExpectedSha256,
     [string] $Backup
 ) {
     $HadDestination = Test-Path -LiteralPath $Destination -PathType Leaf
@@ -306,8 +270,8 @@ function Install-Candidate(
         else {
             [IO.File]::Move($Candidate, $Destination)
         }
-        if (-not (Test-BinaryIdentity $Destination $ExpectedTag $ExpectedVersion)) {
-            Fail 'installed binary failed final verification'
+        if ((Get-FileSha256 $Destination) -cne $ExpectedSha256) {
+            Fail 'installed binary digest changed during replacement'
         }
         if (Test-Path -LiteralPath $Backup -PathType Leaf) {
             Invoke-WithRetry {
@@ -347,7 +311,6 @@ function Install-Candidate(
 function Start-DeferredReplacement(
     [string] $Candidate,
     [string] $Destination,
-    [string] $ExpectedTag,
     [string] $ExpectedVersion,
     [string] $CandidateSha256,
     [int] $ParentPid,
@@ -373,7 +336,6 @@ function Restore([string] $Backup, [string] $Destination, [string] $ExpectedSha2
 }
 $candidate = $env:BCODEX_FINALIZE_CANDIDATE
 $destination = $env:BCODEX_FINALIZE_DESTINATION
-$expectedTag = $env:BCODEX_FINALIZE_TAG
 $expectedVersion = $env:BCODEX_FINALIZE_VERSION
 $expectedSha256 = $env:BCODEX_FINALIZE_SHA256
 $parentPid = [int]$env:BCODEX_FINALIZE_PARENT_PID
@@ -390,15 +352,15 @@ try {
         try { $lock = New-Object IO.FileStream($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch [IO.IOException] { Start-Sleep -Milliseconds 100 }
     }
     if ($null -eq $lock) { throw 'could not acquire the bettercodex install lock' }
-    if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedSha256) { throw 'staged bettercodex digest changed before finalization' }
     $hadDestination = Test-Path -LiteralPath $destination -PathType Leaf
     if ($hadDestination) {
         $previousSha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedSha256) { throw 'staged bettercodex digest changed before finalization' }
+    if ($hadDestination) {
         Retry { [IO.File]::Replace($candidate, $destination, $backup, $true) }
     } else { [IO.File]::Move($candidate, $destination) }
-    $tag = (& $destination --internal-release-tag 2>$null) -join "`n"
-    $version = (& $destination --version 2>$null) -join "`n"
-    if ($tag.Trim() -cne $expectedTag -or $version.Trim() -cne "bcodex $expectedVersion") { throw 'updated bettercodex command failed final verification' }
+    if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedSha256) { throw 'updated bettercodex digest changed during replacement' }
     if (Test-Path -LiteralPath $backup -PathType Leaf) { Retry { [IO.File]::Delete($backup) } }
     Write-Host "==> Updated bcodex $expectedVersion at $destination"
 } catch {
@@ -425,7 +387,7 @@ try {
     $Encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Finalizer))
     $Names = @(
         'BCODEX_FINALIZE_CANDIDATE', 'BCODEX_FINALIZE_DESTINATION',
-        'BCODEX_FINALIZE_TAG', 'BCODEX_FINALIZE_VERSION', 'BCODEX_FINALIZE_SHA256',
+        'BCODEX_FINALIZE_VERSION', 'BCODEX_FINALIZE_SHA256',
         'BCODEX_FINALIZE_PARENT_PID', 'BCODEX_FINALIZE_PARENT_TICKS',
         'BCODEX_FINALIZE_LOCK'
     )
@@ -436,7 +398,6 @@ try {
     try {
         $env:BCODEX_FINALIZE_CANDIDATE = $Candidate
         $env:BCODEX_FINALIZE_DESTINATION = $Destination
-        $env:BCODEX_FINALIZE_TAG = $ExpectedTag
         $env:BCODEX_FINALIZE_VERSION = $ExpectedVersion
         $env:BCODEX_FINALIZE_SHA256 = $CandidateSha256
         $env:BCODEX_FINALIZE_PARENT_PID = [string]$ParentPid
@@ -605,8 +566,6 @@ try {
         Fail 'downloaded binary version does not match its release tag'
     }
 
-    Write-Step "Verifying bettercodex $CandidateVersion"
-    Invoke-BinarySmoke $Candidate $CandidateVersion
     $CandidateSha256 = Get-FileSha256 $Candidate
 
     if ($env:BCODEX_UPDATE_PARENT_PID -match '^[1-9][0-9]*$') {
@@ -616,7 +575,6 @@ try {
         Start-DeferredReplacement `
             $Candidate `
             $Destination `
-            $CandidateTag `
             $CandidateVersion `
             $CandidateSha256 `
             $ParentPid `
@@ -626,7 +584,7 @@ try {
         Write-Step 'Verified update staged; replacement will finish after this bcodex process exits'
     }
     else {
-        Install-Candidate $Candidate $Destination $CandidateTag $CandidateVersion $Backup
+        Install-Candidate $Candidate $Destination $CandidateSha256 $Backup
         Write-Step "Installed bcodex $CandidateVersion at $Destination"
     }
 

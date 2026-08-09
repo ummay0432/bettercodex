@@ -36,7 +36,7 @@ fn serve_once(
 
 #[test]
 fn accepts_only_strict_release_tags_versions_digests_and_repository_names() {
-    let parsed = parse_release_tag(&release_tag_fixture("1.2.3", 'A')).unwrap();
+    let parsed = parse_release_tag(&release_tag_fixture("1.2.3", 'a')).unwrap();
     assert_eq!(parsed.version, "1.2.3");
     assert_eq!(parsed.revision, "a".repeat(40));
 
@@ -45,6 +45,7 @@ fn accepts_only_strict_release_tags_versions_digests_and_repository_names() {
         "bcodex-v1.2-1111111111111111111111111111111111111111",
         "bcodex-v1.2.3-not-a-revision",
         "bcodex-v1.2.3-beta-1111111111111111111111111111111111111111",
+        "bcodex-v1.2.3-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     ] {
         assert!(parse_release_tag(tag).is_err(), "accepted {tag}");
     }
@@ -65,6 +66,7 @@ fn accepts_only_strict_release_tags_versions_digests_and_repository_names() {
     assert!(validate_repository("owner/repo/extra").is_err());
     assert!(validate_repository("owner/repo?ref=other").is_err());
     assert_eq!(release_tag(), None);
+    assert_eq!(source_revision(), None);
 }
 
 #[test]
@@ -107,7 +109,7 @@ async fn bounded_lookup_reports_only_newer_release_versions() {
     );
     assert_eq!(
         check_for_release_update_at(&url, &current, Duration::from_secs(1)).await,
-        Some(AvailableUpdate::new("1.2.3", "1.3.0"))
+        Some(AvailableUpdate::new(&"1".repeat(40), &"2".repeat(40)))
     );
     server.join().unwrap();
 

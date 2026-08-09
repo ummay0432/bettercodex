@@ -39,7 +39,7 @@ bcodex
 ```
 
 The installer downloads the matching binary from the latest published full
-release, verifies its embedded version and exact source revision, smoke-tests
-it, and replaces the command only after validation succeeds. Neither installs
-nor `bcodex update` require Rust, Cargo, or native build tools. See the complete
-[installation guide](docs/install.md).
+release, verifies its embedded version and exact source revision, and replaces
+the command only after validation succeeds. Neither installs nor `bcodex update`
+require Rust, Cargo, or native build tools. See the complete [installation
+guide](docs/install.md).

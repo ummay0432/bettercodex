@@ -40,9 +40,10 @@ bcodex
 The Unix installer requires `curl`, `gzip`, and standard POSIX utilities. The
 Windows installer uses built-in PowerShell and .NET functionality. Both select
 the matching asset from the latest published full release, reject unexpected
-sizes or binary identities, run an isolated runtime smoke test, and replace the
-installed command only after verification succeeds. The macOS installer also
-verifies the binary's code signature.
+sizes or binary identities, and replace the installed command only after
+verification succeeds. The macOS installer also verifies the binary's code
+signature. Release Actions smoke-test each binary on its native runner before
+it can become a release asset.
 
 The default command locations are:
 
@@ -54,12 +55,12 @@ adds the default directory to the user's `PATH` when needed. It does not remove
 credentials, settings, or sessions.
 
 A successful install leaves one executable plus a `PATH` entry only when one
-was needed. Download archives, staged binaries, smoke-test state, and locks are
-transaction-local and removed. When migrating from the retired source-building
-installer, the installer also removes its recognized compiler, toolchain,
-dependency, and private ripgrep caches. A standalone V8 cache is preserved when
-there is no evidence that the installer owns it, because it may belong to a
-developer checkout.
+was needed. Download archives, staged binaries, and locks are transaction-local
+and removed. When migrating from the retired source-building installer, the
+installer also removes its recognized compiler, toolchain, dependency, and
+private ripgrep caches. A standalone V8 cache is preserved when there is no
+evidence that the installer owns it, because it may belong to a developer
+checkout.
 
 ## Releases and updates
 

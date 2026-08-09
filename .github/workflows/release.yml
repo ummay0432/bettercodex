@@ -119,24 +119,28 @@ jobs:
           binary="target/x86_64-unknown-linux-gnu/release/bcodex"
           [[ "$("$binary" --version)" == "bcodex $EXPECTED_VERSION" ]]
           [[ "$("$binary" --internal-release-tag)" == "$EXPECTED_TAG" ]]
+          [[ "$("$binary" --internal-source-revision)" == "${EXPECTED_TAG##*-}" ]]
           smoke_root="$(mktemp -d)"
           trap 'rm -rf "$smoke_root"' EXIT
           BCODEX_HOME="$smoke_root/bcodex" CODEX_HOME="$smoke_root/codex" \
             "$binary" --internal-install-smoke
           mkdir -p dist
           gzip -9 -n -c "$binary" >dist/bcodex-x86_64-unknown-linux-gnu.gz
+          zstd -19 --no-progress -f "$binary" -o dist/bcodex-x86_64-unknown-linux-gnu.zst
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: linux-release
-          path: dist/bcodex-x86_64-unknown-linux-gnu.gz
+          path: |
+            dist/bcodex-x86_64-unknown-linux-gnu.gz
+            dist/bcodex-x86_64-unknown-linux-gnu.zst
           if-no-files-found: error
           retention-days: 1
 
   macos:
     name: Build macOS Apple silicon
     needs: prepare
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -166,17 +170,21 @@ jobs:
           codesign --verify --strict "$binary"
           [[ "$("$binary" --version)" == "bcodex $EXPECTED_VERSION" ]]
           [[ "$("$binary" --internal-release-tag)" == "$EXPECTED_TAG" ]]
+          [[ "$("$binary" --internal-source-revision)" == "${EXPECTED_TAG##*-}" ]]
           smoke_root="$(mktemp -d)"
           trap 'rm -rf "$smoke_root"' EXIT
           BCODEX_HOME="$smoke_root/bcodex" CODEX_HOME="$smoke_root/codex" \
             "$binary" --internal-install-smoke
           mkdir -p dist
           gzip -9 -n -c "$binary" >dist/bcodex-aarch64-apple-darwin.gz
+          zstd -19 --no-progress -f "$binary" -o dist/bcodex-aarch64-apple-darwin.zst
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: macos-release
-          path: dist/bcodex-aarch64-apple-darwin.gz
+          path: |
+            dist/bcodex-aarch64-apple-darwin.gz
+            dist/bcodex-aarch64-apple-darwin.zst
           if-no-files-found: error
           retention-days: 1
 
@@ -194,16 +202,11 @@ jobs:
         shell: powershell
         run: .\scripts\install_windows_tests.ps1
 
-      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
-        with:
-          tool: nextest
-          version: 0.9.103
-
       - name: Test bettercodex
         shell: powershell
         env:
           RUST_MIN_STACK: "8388608"
-        run: .\scripts\cargo-with-v8.ps1 nextest run --locked --no-fail-fast --bin bcodex
+        run: .\scripts\cargo-with-v8.ps1 test --locked --bin bcodex -- --test-threads=1
 
       - name: Build and verify release binary
         shell: powershell
@@ -217,6 +220,7 @@ jobs:
           $binary = 'target\x86_64-pc-windows-msvc\release\bcodex.exe'
           if ((& $binary --version) -cne "bcodex $env:EXPECTED_VERSION") { throw 'version check failed' }
           if ((& $binary --internal-release-tag) -cne $env:EXPECTED_TAG) { throw 'release tag check failed' }
+          if ((& $binary --internal-source-revision) -cne ($env:EXPECTED_TAG -replace '^.*-', '')) { throw 'source revision check failed' }
           $smokeRoot = Join-Path $env:RUNNER_TEMP ('bettercodex-smoke.' + [Guid]::NewGuid().ToString('N'))
           try {
             $env:BCODEX_HOME = Join-Path $smokeRoot 'bcodex'
@@ -257,6 +261,7 @@ jobs:
           set -euo pipefail
           gzip -dc dist/bcodex-x86_64-unknown-linux-gnu.gz >dist/bcodex
           chmod 755 dist/bcodex
+          cmp dist/bcodex <(zstd -dc dist/bcodex-x86_64-unknown-linux-gnu.zst)
           [[ "$(dist/bcodex --internal-release-tag)" == "$EXPECTED_TAG" ]]
           smoke_root="$(mktemp -d)"
           trap 'rm -rf "$smoke_root"' EXIT
@@ -293,8 +298,10 @@ jobs:
           set -euo pipefail
           expected=(
             bcodex-aarch64-apple-darwin.gz
+            bcodex-aarch64-apple-darwin.zst
             bcodex-x86_64-pc-windows-msvc.exe.gz
             bcodex-x86_64-unknown-linux-gnu.gz
+            bcodex-x86_64-unknown-linux-gnu.zst
           )
           mapfile -t actual < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
           mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
@@ -302,7 +309,8 @@ jobs:
             printf 'unexpected release assets:\n%s\n' "${actual[*]}" >&2
             exit 1
           }
-          for asset in "${expected[@]}"; do gzip -t "dist/$asset"; done
+          gzip -t dist/*.gz
+          zstd -t dist/*.zst
 
           notes="Source revision: \`$RELEASE_REVISION\`
 

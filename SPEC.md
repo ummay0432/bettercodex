@@ -18,6 +18,17 @@ environments, but not separate release targets.
 GitHub Actions will build the three binaries and publish them as downloadable
 release assets. The Linux binary must be tested on both Ubuntu and Debian.
 
+The current installers consume one gzip asset per binary. Releases also retain
+zstd copies of the macOS and Linux binaries because the immutable 0.1.2 clients
+require those exact asset names to discover and install newer releases. These
+are alternate encodings of the same three binaries, not additional targets:
+
+- `bcodex-aarch64-apple-darwin.gz`
+- `bcodex-aarch64-apple-darwin.zst`
+- `bcodex-x86_64-pc-windows-msvc.exe.gz`
+- `bcodex-x86_64-unknown-linux-gnu.gz`
+- `bcodex-x86_64-unknown-linux-gnu.zst`
+
 ## Installation and updates
 
 bettercodex will be refactored so normal installations and updates download the
