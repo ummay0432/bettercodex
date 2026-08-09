@@ -21,7 +21,6 @@ use crossterm::style::SetAttribute;
 use crossterm::style::SetBackgroundColor;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
-use crossterm::terminal::ScrollUp;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
 use ratatui::Terminal;
@@ -54,6 +53,7 @@ use std::time::Instant;
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_HISTORY_ROWS_PER_CELL: usize = 30_000;
 const CLEAR_VISIBLE_TERMINAL: &[u8] = b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[H";
+const LINE_FEED_CHUNK: [u8; 256] = [b'\n'; 256];
 
 /// Codex keeps finalized transcript cells in normal terminal scrollback and owns only the mutable
 /// tail plus composer. Ratatui's fixed viewport gives this lean client the same dynamic-height
@@ -217,7 +217,7 @@ where
         if history_capacity == 0 {
             for source_y in 0..rendered_height {
                 self.draw_buffer_rows(&buffer, source_y, 1, 0)?;
-                execute!(self.terminal.backend_mut(), ScrollUp(1))?;
+                self.scroll_screen_up_into_scrollback(1)?;
             }
             self.viewport_top = 0;
         } else {
@@ -230,7 +230,7 @@ where
                     .saturating_add(next_viewport_height);
                 let scroll_by = needed_bottom.saturating_sub(self.screen_size.height);
                 if scroll_by > 0 {
-                    execute!(self.terminal.backend_mut(), ScrollUp(scroll_by))?;
+                    self.scroll_screen_up_into_scrollback(scroll_by)?;
                     self.viewport_top = self.viewport_top.saturating_sub(scroll_by);
                 }
                 self.draw_buffer_rows(&buffer, source_y, rows, self.viewport_top)?;
@@ -273,7 +273,7 @@ where
             .saturating_add(height)
             .saturating_sub(self.screen_size.height);
         if overflow > 0 {
-            execute!(self.terminal.backend_mut(), ScrollUp(overflow))?;
+            self.scroll_screen_up_into_scrollback(overflow)?;
             self.viewport_top = self.viewport_top.saturating_sub(overflow);
         }
         let area = Rect::new(0, self.viewport_top, self.screen_size.width, height);
@@ -289,6 +289,29 @@ where
                 .resize(area)
                 .context("failed to resize inline terminal viewport")?;
             self.viewport_area = area;
+        }
+        Ok(())
+    }
+
+    /// Scroll the complete normal screen with line feeds so displaced rows enter scrollback.
+    ///
+    /// `CSI S` only edits the active page in terminals such as Windows Terminal and xterm.js, so
+    /// rows pushed above the screen can be discarded instead of becoming scrollback. A line feed
+    /// at the bottom of the full scrolling region uses the same history-producing path as ordinary
+    /// shell output. The mutable viewport is repainted after every caller of this helper.
+    fn scroll_screen_up_into_scrollback(&mut self, rows: u16) -> Result<()> {
+        if rows == 0 || self.screen_size.height == 0 {
+            return Ok(());
+        }
+
+        let writer = self.terminal.backend_mut();
+        writer.write_all(b"\x1b[r\x1b[0m")?;
+        queue!(writer, MoveTo(0, self.screen_size.height - 1))?;
+        let mut remaining = usize::from(rows);
+        while remaining > 0 {
+            let chunk_len = remaining.min(LINE_FEED_CHUNK.len());
+            writer.write_all(&LINE_FEED_CHUNK[..chunk_len])?;
+            remaining -= chunk_len;
         }
         Ok(())
     }
@@ -686,6 +709,7 @@ mod tests {
     #[derive(Clone)]
     struct SharedParser {
         parser: Rc<RefCell<vt100::Parser>>,
+        bytes: Rc<RefCell<Vec<u8>>>,
     }
 
     impl SharedParser {
@@ -696,6 +720,7 @@ mod tests {
                     width,
                     TEST_SCROLLBACK_ROWS,
                 ))),
+                bytes: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
@@ -716,10 +741,32 @@ mod tests {
             parser.screen_mut().set_scrollback(0);
             found
         }
+
+        fn output_contains(&self, sequence: &[u8]) -> bool {
+            self.bytes
+                .borrow()
+                .windows(sequence.len())
+                .any(|window| window == sequence)
+        }
+
+        fn emitted_csi_scroll_up(&self) -> bool {
+            let bytes = self.bytes.borrow();
+            bytes.iter().enumerate().any(|(index, byte)| {
+                if *byte != 0x1b || bytes.get(index + 1) != Some(&b'[') {
+                    return false;
+                }
+                let mut end = index + 2;
+                while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                    end += 1;
+                }
+                end > index + 2 && bytes.get(end) == Some(&b'S')
+            })
+        }
     }
 
     impl Write for SharedParser {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.borrow_mut().extend_from_slice(buffer);
             self.parser.borrow_mut().write(buffer)
         }
 
@@ -850,7 +897,28 @@ mod tests {
         width: u16,
         screen_height: u16,
     ) {
-        let mut history = view.take_pending_history_lines(width, screen_height);
+        let history = view.take_pending_history_lines(width, screen_height);
+        render_test_terminal(view, terminal, width, screen_height, history);
+    }
+
+    fn reflow_test_terminal(
+        view: &mut View,
+        terminal: &mut AppTerminal<VtBackend>,
+        width: u16,
+        screen_height: u16,
+    ) {
+        terminal.clear_screen().unwrap();
+        let history = view.history_lines_for_resize_reflow(width, screen_height);
+        render_test_terminal(view, terminal, width, screen_height, history);
+    }
+
+    fn render_test_terminal(
+        view: &mut View,
+        terminal: &mut AppTerminal<VtBackend>,
+        width: u16,
+        screen_height: u16,
+        mut history: Vec<HyperlinkLine>,
+    ) {
         let mut prepared = view.prepare(width, screen_height);
         history.extend(prepared.take_history_lines());
         let viewport_height = prepared.height();
@@ -898,6 +966,15 @@ mod tests {
         assert!(screen.contains(MODEL), "{screen}");
         assert!(output.history_contains("Ran printf tool-marker"));
         assert!(output.history_contains("response-row-00"));
+
+        reflow_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+
+        let screen = output.screen();
+        assert!(screen.contains("response-row-39"), "{screen}");
+        assert!(screen.contains(MODEL), "{screen}");
+        assert!(output.history_contains("Ran printf tool-marker"));
+        assert!(output.history_contains("response-row-00"));
+        assert!(!output.emitted_csi_scroll_up());
     }
 
     #[test]
@@ -938,6 +1015,26 @@ mod tests {
         assert!(screen.contains(MODEL), "{screen}");
         assert!(output.history_contains("Ran printf wrapped-tool-marker"));
         assert!(output.history_contains("prefix-marker"));
+    }
+
+    #[test]
+    fn resize_replay_rebuilds_scrollback_with_full_screen_line_feeds() {
+        const WIDTH: u16 = 24;
+        const SCREEN_HEIGHT: u16 = 4;
+
+        let (mut terminal, output) =
+            test_terminal(WIDTH, SCREEN_HEIGHT, /*viewport_height*/ 1);
+        terminal.clear_screen().unwrap();
+        let lines = (0..8)
+            .map(|index| Line::from(format!("history-row-{index:02}")))
+            .collect();
+        let lines = terminal_hyperlinks::plain_hyperlink_lines(lines);
+
+        terminal.insert_history_lines(lines, 1).unwrap();
+
+        assert!(output.history_contains("history-row-00"));
+        assert!(!output.emitted_csi_scroll_up());
+        assert!(output.output_contains(b"\x1b[r\x1b[0m\x1b[4;1H\n"));
     }
 
     #[test]
