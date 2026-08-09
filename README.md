@@ -41,4 +41,6 @@ that flow only when the exact public `main` revision changes. Cargo downloads,
 compiled dependencies, and incremental bettercodex state stay warm, so updates
 compile only what changed. A release-input content hash keeps that reuse exact
 even when archive timestamps collide. Package versions are display metadata and
-do not control updates.
+do not control updates. Missing Rust and Linux build tools are installed
+automatically; on a new Mac, complete the Command Line Tools dialog the
+installer opens and rerun the command once.

@@ -9,7 +9,9 @@ set -eu
 DEFAULT_REPOSITORY="ummay0432/bettercodex"
 GITHUB_API_ROOT="https://api.github.com"
 GITHUB_ARCHIVE_ROOT="https://codeload.github.com"
+RUSTUP_INIT_URL="https://sh.rustup.rs"
 MAX_GITHUB_ATTEMPTS=3
+MAX_RUSTUP_ATTEMPTS=3
 MAX_METADATA_BYTES=1048576
 MAX_SOURCE_ARCHIVE_BYTES=134217728
 
@@ -19,6 +21,9 @@ lock_dir=""
 lock_acquired=0
 build_cache_used=0
 target_dir=""
+rustup_program=""
+rustup_home_override=""
+managed_rustup_home=""
 
 step() {
   printf '==> %s\n' "$1"
@@ -38,7 +43,8 @@ usage() {
 Usage: install.sh
 
 Resolves the exact source revision at public main, builds and verifies it, and
-atomically installs it. Rust and a native C compiler are required.
+atomically installs it. Missing Rust and native build tools are bootstrapped
+automatically when the host provides a supported installation path.
 
 Environment:
   BCODEX_INSTALL_DIR  Binary directory (default: \$HOME/.local/bin).
@@ -431,22 +437,165 @@ source_build_input_hash() {
   file_sha256 "$sorted_hashes"
 }
 
-require_source_build_tools() {
+require_source_utilities() {
   require_command find
   require_command sort
   require_command tar
+}
+
+native_build_tools_work() {
+  command -v cc >/dev/null 2>&1 &&
+    command -v c++ >/dev/null 2>&1 &&
+    cc --version >/dev/null 2>&1 &&
+    c++ --version >/dev/null 2>&1
+}
+
+run_with_system_privileges() {
+  if [ "$(id -u 2>/dev/null || true)" = "0" ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    return 126
+  fi
+}
+
+install_linux_build_tools() {
+  if command -v apt-get >/dev/null 2>&1; then
+    native_build_remedy="sudo apt-get update && sudo apt-get install -y build-essential"
+    run_with_system_privileges apt-get update &&
+      run_with_system_privileges apt-get install -y build-essential
+  elif command -v dnf >/dev/null 2>&1; then
+    native_build_remedy="sudo dnf -y group install 'Development Tools'"
+    run_with_system_privileges dnf -y group install "Development Tools"
+  elif command -v yum >/dev/null 2>&1; then
+    native_build_remedy="sudo yum -y groupinstall 'Development Tools'"
+    run_with_system_privileges yum -y groupinstall "Development Tools"
+  elif command -v zypper >/dev/null 2>&1; then
+    native_build_remedy="sudo zypper --non-interactive install --type pattern devel_basis"
+    run_with_system_privileges \
+      zypper --non-interactive install --type pattern devel_basis
+  elif command -v pacman >/dev/null 2>&1; then
+    native_build_remedy="sudo pacman -S --needed base-devel"
+    run_with_system_privileges pacman -S --needed --noconfirm base-devel
+  elif command -v xbps-install >/dev/null 2>&1; then
+    native_build_remedy="sudo xbps-install -Sy base-devel"
+    run_with_system_privileges xbps-install -Sy base-devel
+  else
+    native_build_remedy="install your system's C/C++ compiler, linker, and libc development headers"
+    return 127
+  fi
+}
+
+ensure_native_build_tools() {
+  native_build_tools_work && return 0
+
   if [ "$os" = "macOS" ]; then
-    require_command codesign
-  fi
-  if ! command -v rustup >/dev/null 2>&1; then
-    fail "rustup is required; install Rust from https://rustup.rs/ and retry"
-  fi
-  if ! command -v cc >/dev/null 2>&1 || ! cc --version >/dev/null 2>&1; then
-    if [ "$os" = "macOS" ]; then
-      fail "Xcode Command Line Tools are required; run 'xcode-select --install', finish the installation, and retry"
+    require_command xcode-select
+    step "Requesting Xcode Command Line Tools from macOS"
+    if ! xcode-select --install >/dev/null 2>&1; then
+      fail "macOS could not start the Xcode Command Line Tools installer; \
+run 'xcode-select --install' or install them from Software Update, then retry"
     fi
-    fail "a working native C compiler is required; install your system's C build tools and retry"
+    native_build_tools_work && return 0
+    fail "Xcode Command Line Tools installation was requested; \
+finish the macOS installation dialog, then rerun this command"
   fi
+
+  step "Installing the native build tools required by bettercodex"
+  native_build_remedy=""
+  if ! install_linux_build_tools; then
+    fail "automatic native build-tool installation failed; run: $native_build_remedy"
+  fi
+  native_build_tools_work ||
+    fail "native build tools were installed but no working C/C++ compiler is available; run: $native_build_remedy"
+}
+
+download_rustup_init() {
+  rustup_installer="$tmp_dir/rustup-init.sh"
+  rustup_attempt=1
+  while [ "$rustup_attempt" -le "$MAX_RUSTUP_ATTEMPTS" ]; do
+    rm -f "$rustup_installer"
+    if curl \
+      --proto '=https' \
+      --tlsv1.2 \
+      --fail \
+      --silent \
+      --show-error \
+      --location \
+      --connect-timeout 10 \
+      --max-time 120 \
+      --max-filesize "$MAX_METADATA_BYTES" \
+      --output "$rustup_installer" \
+      "$RUSTUP_INIT_URL" &&
+      [ -s "$rustup_installer" ]; then
+      return 0
+    fi
+    if [ "$rustup_attempt" -lt "$MAX_RUSTUP_ATTEMPTS" ]; then
+      warn "rustup bootstrap download failed; retrying ($((rustup_attempt + 1))/$MAX_RUSTUP_ATTEMPTS)"
+      sleep "$rustup_attempt"
+    fi
+    rustup_attempt=$((rustup_attempt + 1))
+  done
+  rm -f "$rustup_installer"
+  return 1
+}
+
+discover_rustup() {
+  rustup_program="$(command -v rustup 2>/dev/null || true)"
+  [ -z "$rustup_program" ] || return 0
+
+  if [ -n "${CARGO_HOME:-}" ]; then
+    case "$CARGO_HOME" in
+      /*)
+        if [ -x "$CARGO_HOME/bin/rustup" ]; then
+          rustup_program="$CARGO_HOME/bin/rustup"
+          step "Using rustup at $rustup_program even though it is not on PATH"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  if [ -n "${HOME:-}" ] && [ -x "$HOME/.cargo/bin/rustup" ]; then
+    rustup_program="$HOME/.cargo/bin/rustup"
+    step "Using rustup at $rustup_program even though it is not on PATH"
+    return 0
+  fi
+  if [ -x "$cargo_home/bin/rustup" ]; then
+    rustup_program="$cargo_home/bin/rustup"
+    rustup_home_override="$managed_rustup_home"
+    step "Reusing the installer-managed rustup at $rustup_program"
+  fi
+}
+
+bootstrap_rustup() {
+  step "Installing rustup for the pinned bettercodex toolchain"
+  download_rustup_init || fail "could not download the official rustup installer from $RUSTUP_INIT_URL"
+  mkdir -p "$cargo_home" "$managed_rustup_home"
+  if ! CARGO_HOME="$cargo_home" \
+    RUSTUP_HOME="$managed_rustup_home" \
+    /bin/sh "$rustup_installer" \
+      -y --no-modify-path --profile minimal --default-toolchain none; then
+    fail "the official rustup installer failed"
+  fi
+  rustup_program="$cargo_home/bin/rustup"
+  rustup_home_override="$managed_rustup_home"
+  [ -x "$rustup_program" ] || fail "rustup installation did not produce $rustup_program"
+}
+
+run_rustup() {
+  if [ -n "$rustup_home_override" ]; then
+    RUSTUP_HOME="$rustup_home_override" "$rustup_program" "$@"
+  else
+    "$rustup_program" "$@"
+  fi
+}
+
+locate_pinned_rust_tools() {
+  cargo_program="$(run_rustup which --toolchain "$rust_toolchain" cargo 2>/dev/null)" &&
+    rustc_program="$(run_rustup which --toolchain "$rust_toolchain" rustc 2>/dev/null)" &&
+    [ -x "$cargo_program" ] &&
+    [ -x "$rustc_program" ]
 }
 
 prepare_compilation_target() {
@@ -504,12 +653,14 @@ fi
 
 installed_revision=""
 installed_version=""
-require_source_build_tools
+require_source_utilities
 cargo_home="$tmp_dir/cargo-home"
 v8_cache_home="$tmp_dir/cache"
+managed_rustup_home="$tmp_dir/rustup-home"
 if [ -n "$cache_root" ]; then
   cargo_home="$cache_root/cargo"
   v8_cache_home="$cache_base"
+  managed_rustup_home="$cache_root/rustup"
   step "Using dependency download cache at $cache_root"
 else
   warn "HOME and XDG_CACHE_HOME are unset; dependency downloads cannot be reused"
@@ -559,28 +710,32 @@ rust_toolchain="$(
     sed -n '1p'
 )"
 [ -n "$rust_toolchain" ] || fail "source commit has no valid pinned Rust toolchain"
+
+ensure_native_build_tools
+if [ "$os" = "macOS" ]; then
+  require_command codesign
+fi
+
+discover_rustup
+if [ -z "$rustup_program" ]; then
+  bootstrap_rustup
+fi
+
 step "Using the pinned Rust $rust_toolchain toolchain"
-if cargo_program="$(rustup which --toolchain "$rust_toolchain" cargo 2>/dev/null)" &&
-  rustc_program="$(rustup which --toolchain "$rust_toolchain" rustc 2>/dev/null)" &&
-  [ -x "$cargo_program" ] && [ -x "$rustc_program" ]; then
-  :
-else
-  temporary_rustup_home="$tmp_dir/rustup-home"
-  mkdir -p "$temporary_rustup_home"
-  step "Downloading missing Rust $rust_toolchain into the disposable install tree"
-  RUSTUP_HOME="$temporary_rustup_home" \
-    rustup toolchain install "$rust_toolchain" --profile minimal ||
-    fail "could not download the pinned Rust $rust_toolchain toolchain"
-  cargo_program="$(
-    RUSTUP_HOME="$temporary_rustup_home" \
-      rustup which --toolchain "$rust_toolchain" cargo
-  )" ||
-    fail "could not locate Cargo for Rust $rust_toolchain"
-  rustc_program="$(
-    RUSTUP_HOME="$temporary_rustup_home" \
-      rustup which --toolchain "$rust_toolchain" rustc
-  )" ||
-    fail "could not locate rustc for Rust $rust_toolchain"
+if ! locate_pinned_rust_tools; then
+  rustup_home_override="$managed_rustup_home"
+  mkdir -p "$managed_rustup_home"
+  if ! locate_pinned_rust_tools; then
+    if [ -n "$cache_root" ]; then
+      step "Caching missing Rust $rust_toolchain at $managed_rustup_home"
+    else
+      step "Downloading missing Rust $rust_toolchain into the disposable install tree"
+    fi
+    run_rustup toolchain install "$rust_toolchain" --profile minimal ||
+      fail "could not download the pinned Rust $rust_toolchain toolchain"
+    locate_pinned_rust_tools ||
+      fail "could not locate Cargo and rustc for Rust $rust_toolchain"
+  fi
 fi
 [ -x "$cargo_program" ] || fail "pinned Cargo executable is unavailable"
 [ -x "$rustc_program" ] || fail "pinned rustc executable is unavailable"
@@ -807,9 +962,18 @@ else
 fi
 if [ -n "$cache_root" ]; then
   if [ "$build_cache_used" -eq 1 ]; then
-    step "Removed disposable source and compiler scratch; retained the warm Cargo cache at $cache_root/build/$host_target"
+    if [ -n "$rustup_home_override" ]; then
+      step "Removed disposable source and compiler scratch; retained warm Rust and Cargo caches under $cache_root"
+    else
+      step "Removed disposable source and compiler scratch; \
+retained the warm Cargo cache at $cache_root/build/$host_target"
+    fi
   else
-    step "Removed disposable source and build output; retained dependency downloads at $cache_root"
+    if [ -n "$rustup_home_override" ]; then
+      step "Removed disposable source and build output; retained Rust and dependency downloads at $cache_root"
+    else
+      step "Removed disposable source and build output; retained dependency downloads at $cache_root"
+    fi
   fi
 else
   step "Removed the disposable install tree: source, dependency downloads, optional Rust toolchain, and build output"

@@ -11,10 +11,14 @@ display metadata; they do not decide whether an installation is current.
 | macOS 12+ | Apple Silicon and Intel |
 | Linux with glibc 2.31+ | ARM64 and x86-64 |
 
-Windows is not supported. A public install requires
-[rustup](https://rustup.rs/), a working native C compiler, several gigabytes of
-temporary free space, and network access to GitHub. On a new Mac, install Xcode
-Command Line Tools with `xcode-select --install` before retrying.
+Windows is not supported. A public install requires `curl`, several gigabytes
+of free space, and network access to GitHub and the official Rust download
+servers. The installer supplies its own [rustup](https://rustup.rs/) and pinned
+Rust toolchain when necessary. If native C/C++ build tools are missing, it
+installs the distribution's development-tool package through `apt-get`, `dnf`,
+`yum`, `zypper`, `pacman`, or `xbps-install`; privilege escalation may request
+the operator's password. On a new Mac it starts Apple's Xcode Command Line
+Tools installer. Finish the macOS system dialog and rerun the command once.
 
 ## Install
 
@@ -29,15 +33,18 @@ then:
 
 1. Resolves `refs/heads/main` once to a full 40-character commit ID.
 2. Downloads the immutable source archive for exactly that commit.
-3. Uses the checked-in lockfile and pinned Rust toolchain.
-4. Hashes release-relevant source bytes, then reuses Cargo's native-target cache
+3. Bootstraps missing native build tools, rustup, and the pinned Rust toolchain.
+   A rustup just installed at `$HOME/.cargo/bin` is detected immediately even
+   when the current shell has not reloaded `PATH`.
+4. Uses the checked-in lockfile and pinned Rust toolchain.
+5. Hashes release-relevant source bytes, then reuses Cargo's native-target cache
    and incrementally builds only changed bettercodex code and dependencies.
-5. Stamps the exact commit into a staged copy without invalidating reusable
+6. Stamps the exact commit into a staged copy without invalidating reusable
    compiler output, then reapplies and verifies the required ad-hoc code
    signature on macOS.
-6. Checks its version and embedded revision, initializes V8, and materializes
+7. Checks its version and embedded revision, initializes V8, and materializes
    every embedded system resource in isolated directories.
-7. Atomically renames the verified stage over the installed command.
+8. Atomically renames the verified stage over the installed command.
 
 The selected commit does not change if `main` advances while compilation is in
 progress. The next launch or explicit update discovers the newer commit.
@@ -104,14 +111,16 @@ follow public `main` directly.
 
 ## Caching and cleanup
 
-When a cache home is available, the installer retains reusable downloads and
-one native-target Cargo cache under
-`${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. Cargo fingerprints compiler,
-profile, manifest, lockfile, feature, build-script, dependency, and source
-changes at artifact granularity. The updater also makes a SHA-256 hash of the
-release inputs a compiler input, avoiding Cargo's mtime ambiguity across newly
-extracted source trees. The staged binary must match that hash before it can be
-stamped. The updater preserves Cargo artifacts and enables incremental
+When a cache home is available, the installer retains reusable dependency
+downloads and one native-target Cargo cache under
+`${XDG_CACHE_HOME:-$HOME/.cache}/bettercodex`. If it must supply rustup or the
+pinned toolchain, those stay in the same cache. An existing user toolchain is
+reused when it already provides the pinned Rust release. Cargo fingerprints
+compiler, profile, manifest, lockfile, feature, build-script, dependency, and
+source changes at artifact granularity. The updater also makes a SHA-256 hash
+of the release inputs a compiler input, avoiding Cargo's mtime ambiguity across
+newly extracted source trees. The staged binary must match that hash before it
+can be stamped. The updater preserves Cargo artifacts and enables incremental
 compilation for the bettercodex package; registry dependencies do not gain
 incremental copies. Source archives, extracted source, compiler scratch space,
 and stage files remain disposable.
@@ -122,8 +131,9 @@ so a later invocation can recover an orphan left by an untrappable crash. Any
 failed download, extraction, build, smoke test, copy, or verification leaves an
 existing installed binary untouched.
 
-Without `HOME` or `XDG_CACHE_HOME`, dependency downloads and build output stay
-inside the disposable installation tree and are removed afterward.
+Without `HOME` or `XDG_CACHE_HOME`, rustup, the pinned Rust toolchain, dependency
+downloads, and build output stay inside the disposable installation tree and
+are removed afterward.
 
 ## Build from a checkout
 

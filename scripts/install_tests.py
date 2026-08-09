@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -322,27 +323,120 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertFalse(Path(disposable_path).exists())
             assert_no_installer_residue(self, root)
 
-    def test_missing_pinned_rust_toolchain_is_installed_only_in_the_temp_tree(self) -> None:
+    def test_rust_bootstrap_is_disposable_without_home_or_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
 
-            result = run_installer(root, toolchain_installed=False)
+            result = run_installer(
+                root,
+                home_enabled=False,
+                rustup_location="absent",
+                toolchain_installed=False,
+                xdg_cache_enabled=False,
+            )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            bootstrap = (root / "rustup-bootstrap.log").read_text(
+                encoding="utf-8"
+            ).strip()
+            cargo_home, rustup_home, _arguments = bootstrap.split("|", 2)
+            for disposable_path in (cargo_home, rustup_home):
+                self.assertIn("bettercodex-install.", disposable_path)
+                self.assertFalse(Path(disposable_path).exists())
+            self.assertIn("optional Rust toolchain", result.stdout)
+            assert_no_installer_residue(self, root)
+
+    def test_missing_pinned_rust_toolchain_is_cached_once_for_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            first = run_installer(root, toolchain_installed=False)
+            second = run_installer(root, toolchain_installed=False)
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
             rustup_calls = (root / "rustup.log").read_text(encoding="utf-8").splitlines()
-            install_home, install_arguments = next(
+            installs = [
                 call.split("|", 1)
                 for call in rustup_calls
                 if "toolchain install" in call
-            )
+            ]
+            self.assertEqual(len(installs), 1)
+            install_home, install_arguments = installs[0]
             self.assertEqual(
                 install_arguments,
                 "toolchain install 1.95.0 --profile minimal",
             )
-            self.assertIn("bettercodex-install.", install_home)
-            self.assertTrue(install_home.endswith("/rustup-home"))
-            self.assertFalse(Path(install_home).exists())
-            self.assertIn("retained the warm Cargo cache", result.stdout)
+            self.assertEqual(
+                Path(install_home), root / "cache" / "bettercodex" / "rustup"
+            )
+            self.assertTrue(Path(install_home).is_dir())
+            self.assertIn("retained warm Rust and Cargo caches", second.stdout)
+            assert_no_installer_residue(self, root)
+
+    def test_rustup_installed_but_not_on_path_is_used_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, rustup_location="home")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("even though it is not on PATH", result.stdout)
+            self.assertFalse((root / "rustup-bootstrap.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_missing_rustup_and_toolchain_are_bootstrapped_and_cached_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            first = run_installer(
+                root, rustup_location="absent", toolchain_installed=False
+            )
+            second = run_installer(
+                root, rustup_location="absent", toolchain_installed=False
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            bootstrap = (root / "rustup-bootstrap.log").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(len(bootstrap), 1)
+            cargo_home, rustup_home, arguments = bootstrap[0].split("|", 2)
+            self.assertEqual(
+                Path(cargo_home), root / "cache" / "bettercodex" / "cargo"
+            )
+            self.assertEqual(
+                Path(rustup_home), root / "cache" / "bettercodex" / "rustup"
+            )
+            self.assertEqual(
+                arguments,
+                "-y --no-modify-path --profile minimal --default-toolchain none",
+            )
+            rustup_calls = (root / "rustup.log").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(
+                sum("toolchain install" in call for call in rustup_calls), 1
+            )
+            self.assertIn("Reusing the installer-managed rustup", second.stdout)
+            assert_no_installer_residue(self, root)
+
+    def test_failed_rustup_bootstrap_preserves_the_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(
+                root,
+                rustup_bootstrap_success=False,
+                rustup_location="absent",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("the official rustup installer failed", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+            self.assertFalse((root / "build.log").exists())
             assert_no_installer_residue(self, root)
 
     def test_known_revision_skips_the_redundant_initial_main_lookup(self) -> None:
@@ -448,14 +542,99 @@ class InstallScriptTest(unittest.TestCase):
             self.assertFalse((root / "build.log").exists())
             assert_no_installer_residue(self, root)
 
-    def test_fresh_macos_without_command_line_tools_gets_the_exact_remedy(self) -> None:
+    def test_fresh_linux_installs_native_build_tools_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(root, compiler_works=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (root / "system-packages.log").read_text(encoding="utf-8").splitlines(),
+                ["update", "install -y build-essential"],
+            )
+            self.assertEqual(
+                (root / "sudo.log").read_text(encoding="utf-8").splitlines(),
+                ["apt-get update", "apt-get install -y build-essential"],
+            )
+            self.assertIn("Installing the native build tools", result.stdout)
+            self.assertTrue((root / "install" / "bin" / "bcodex").is_file())
+            assert_no_installer_residue(self, root)
+
+    def test_supported_linux_package_managers_install_native_build_tools(self) -> None:
+        cases = {
+            "dnf": "-y group install Development Tools",
+            "yum": "-y groupinstall Development Tools",
+            "zypper": "--non-interactive install --type pattern devel_basis",
+            "pacman": "-S --needed --noconfirm base-devel",
+            "xbps-install": "-Sy base-devel",
+        }
+        for package_manager, expected_arguments in cases.items():
+            with self.subTest(package_manager=package_manager), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+
+                result = run_installer(
+                    root,
+                    compiler_works=False,
+                    package_manager=package_manager,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    (root / "system-packages.log").read_text(encoding="utf-8").strip(),
+                    expected_arguments,
+                )
+                self.assertEqual(
+                    (root / "sudo.log").read_text(encoding="utf-8").strip(),
+                    f"{package_manager} {expected_arguments}",
+                )
+                assert_no_installer_residue(self, root)
+
+    def test_failed_native_build_tool_bootstrap_preserves_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = existing_binary(root)
+
+            result = run_installer(
+                root,
+                compiler_works=False,
+                build_tools_install_success=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("automatic native build-tool installation failed", result.stderr)
+            self.assertIn("apt-get install -y build-essential", result.stderr)
+            self.assertEqual(installed.read_text(encoding="utf-8"), "existing binary\n")
+            self.assertFalse((root / "build.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_unknown_linux_package_manager_gets_an_actionable_remedy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            result = run_installer(
+                root,
+                compiler_works=False,
+                package_manager="none",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("C/C++ compiler, linker, and libc development headers", result.stderr)
+            self.assertFalse((root / "build.log").exists())
+            assert_no_installer_residue(self, root)
+
+    def test_fresh_macos_requests_command_line_tools_before_stopping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
 
             result = run_installer(root, system="Darwin", machine="arm64", compiler_works=False)
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("xcode-select --install", result.stderr)
+            self.assertIn("finish the macOS installation dialog", result.stderr)
+            self.assertEqual(
+                (root / "xcode-select.log").read_text(encoding="utf-8").strip(),
+                "--install",
+            )
             self.assertFalse((root / "build.log").exists())
             assert_no_installer_residue(self, root)
 
@@ -672,6 +851,7 @@ def run_installer(
     machine: str = "x86_64",
     archive_failures: int = 0,
     build_success: bool = True,
+    build_tools_install_success: bool = True,
     codesign_success: bool = True,
     compiler_works: bool = True,
     embedded_build_input_hash: str | None = None,
@@ -681,6 +861,9 @@ def run_installer(
     smoke_success: bool = True,
     next_commit: str = COMMIT,
     home_enabled: bool = True,
+    package_manager: str = "apt-get",
+    rustup_bootstrap_success: bool = True,
+    rustup_location: str = "path",
     toolchain_installed: bool = True,
     shell: str = "/bin/sh",
     cleanup_success: bool = True,
@@ -690,9 +873,47 @@ def run_installer(
     source_generation: str = "first",
     xdg_cache_enabled: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    if package_manager not in {
+        "apt-get",
+        "dnf",
+        "none",
+        "pacman",
+        "xbps-install",
+        "yum",
+        "zypper",
+    }:
+        raise ValueError(f"unsupported package manager fixture: {package_manager}")
+    if rustup_location not in {"path", "home", "absent"}:
+        raise ValueError(f"unsupported rustup fixture location: {rustup_location}")
     root.mkdir(parents=True, exist_ok=True)
     fake_bin = root / "fake-bin"
     fake_bin.mkdir(exist_ok=True)
+    system_bin = root / "system-bin"
+    system_bin.mkdir(exist_ok=True)
+    for command in (
+        "awk",
+        "cat",
+        "chmod",
+        "cp",
+        "dirname",
+        "find",
+        "grep",
+        "gzip",
+        "mkdir",
+        "mktemp",
+        "mv",
+        "sed",
+        "sha256sum",
+        "sort",
+        "tar",
+        "tr",
+    ):
+        program = shutil.which(command)
+        if program is None:
+            raise RuntimeError(f"installer test host has no {command}")
+        command_path = system_bin / command
+        if not command_path.exists():
+            command_path.symlink_to(program)
     home = root / "home"
     home.mkdir(exist_ok=True)
     install_dir = root / "install" / "bin"
@@ -761,6 +982,9 @@ def run_installer(
             }
 
             case "$url" in
+              "https://sh.rustup.rs")
+                emit_file "$BCODEX_TEST_RUSTUP_INSTALLER" 200
+                ;;
               "https://api.github.com/repos/$BCODEX_TEST_REPOSITORY/git/ref/heads/main")
                 count=0
                 if [ -f "$BCODEX_TEST_MAIN_REQUEST_COUNT_FILE" ]; then
@@ -807,9 +1031,33 @@ def run_installer(
     )
     for command in ("cargo", "rustc"):
         write_executable(fake_bin / command, "#!/bin/sh\nexit 0\n")
+    for command in ("cc", "c++"):
+        write_executable(
+            fake_bin / command,
+            "#!/bin/sh\n"
+            "[ \"$BCODEX_TEST_COMPILER_WORKS\" = 1 ] || "
+            "[ -f \"$BCODEX_TEST_COMPILER_INSTALLED_FILE\" ]\n",
+        )
+    write_executable(fake_bin / "id", "#!/bin/sh\nprintf '1000\\n'\n")
     write_executable(
-        fake_bin / "cc",
-        "#!/bin/sh\n[ \"$BCODEX_TEST_COMPILER_WORKS\" = 1 ]\n",
+        fake_bin / "sudo",
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >>\"$BCODEX_TEST_SUDO_LOG\"\n"
+        "exec \"$@\"\n",
+    )
+    if package_manager != "none":
+        write_executable(
+            fake_bin / package_manager,
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >>\"$BCODEX_TEST_SYSTEM_PACKAGES_LOG\"\n"
+            "[ \"$BCODEX_TEST_BUILD_TOOLS_INSTALL_SUCCESS\" = 1 ] || exit 9\n"
+            ": >\"$BCODEX_TEST_COMPILER_INSTALLED_FILE\"\n",
+        )
+    write_executable(
+        fake_bin / "xcode-select",
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >>\"$BCODEX_TEST_XCODE_SELECT_LOG\"\n"
+        "exit 0\n",
     )
     write_executable(
         fake_bin / "codesign",
@@ -835,8 +1083,9 @@ def run_installer(
         "fi\n"
         "exec /bin/rm \"$@\"\n",
     )
+    rustup_fixture = root / "rustup-fixture"
     write_executable(
-        fake_bin / "rustup",
+        rustup_fixture,
         "#!/bin/sh\n"
         "printf '%s|%s\\n' \"${RUSTUP_HOME:-<default>}\" \"$*\" "
         ">>\"$BCODEX_TEST_RUSTUP_LOG\"\n"
@@ -865,6 +1114,26 @@ def run_installer(
         "  *) exit 2 ;;\n"
         "esac\n",
     )
+    write_executable(
+        root / "rustup-init-fixture",
+        "#!/bin/sh\n"
+        "printf '%s|%s|%s\\n' \"$CARGO_HOME\" \"$RUSTUP_HOME\" \"$*\" "
+        ">>\"$BCODEX_TEST_RUSTUP_BOOTSTRAP_LOG\"\n"
+        "[ \"$BCODEX_TEST_RUSTUP_BOOTSTRAP_SUCCESS\" = 1 ] || exit 8\n"
+        "mkdir -p \"$CARGO_HOME/bin\" \"$RUSTUP_HOME\"\n"
+        "cp \"$BCODEX_TEST_RUSTUP_PROGRAM\" \"$CARGO_HOME/bin/rustup\"\n"
+        "chmod 0755 \"$CARGO_HOME/bin/rustup\"\n",
+    )
+    (fake_bin / "rustup").unlink(missing_ok=True)
+    (home / ".cargo" / "bin" / "rustup").unlink(missing_ok=True)
+    if rustup_location == "path":
+        write_executable(
+            fake_bin / "rustup", rustup_fixture.read_text(encoding="utf-8")
+        )
+    elif rustup_location == "home":
+        hidden_rustup = home / ".cargo" / "bin" / "rustup"
+        hidden_rustup.parent.mkdir(parents=True, exist_ok=True)
+        write_executable(hidden_rustup, rustup_fixture.read_text(encoding="utf-8"))
 
     environment = os.environ.copy()
     for name in (
@@ -903,12 +1172,16 @@ def run_installer(
             ),
             "BCODEX_TEST_BUILD_LOG": str(root / "build.log"),
             "BCODEX_TEST_BUILD_SUCCESS": "1" if build_success else "0",
+            "BCODEX_TEST_BUILD_TOOLS_INSTALL_SUCCESS": (
+                "1" if build_tools_install_success else "0"
+            ),
             "BCODEX_TEST_BUILT_VERSION": VERSION,
             "BCODEX_TEST_COMMIT": COMMIT,
             "BCODEX_TEST_COMPILE_LOG": str(root / "compile.log"),
             "BCODEX_TEST_CODESIGN_LOG": str(root / "codesign.log"),
             "BCODEX_TEST_CODESIGN_SUCCESS": "1" if codesign_success else "0",
             "BCODEX_TEST_CLEANUP_SUCCESS": "1" if cleanup_success else "0",
+            "BCODEX_TEST_COMPILER_INSTALLED_FILE": str(root / "compiler-installed"),
             "BCODEX_TEST_COMPILER_WORKS": "1" if compiler_works else "0",
             "BCODEX_TEST_DOWNLOAD_LOG": str(root / "download.log"),
             "BCODEX_TEST_EMBEDDED_BUILD_INPUT_HASH": embedded_build_input_hash or "",
@@ -919,11 +1192,20 @@ def run_installer(
             "BCODEX_TEST_MAIN_REQUEST_COUNT_FILE": str(root / "main-request-count"),
             "BCODEX_TEST_NEXT_COMMIT": next_commit,
             "BCODEX_TEST_REPOSITORY": "ummay0432/bettercodex",
+            "BCODEX_TEST_RUSTUP_BOOTSTRAP_LOG": str(root / "rustup-bootstrap.log"),
+            "BCODEX_TEST_RUSTUP_BOOTSTRAP_SUCCESS": (
+                "1" if rustup_bootstrap_success else "0"
+            ),
+            "BCODEX_TEST_RUSTUP_INSTALLER": str(root / "rustup-init-fixture"),
             "BCODEX_TEST_RUSTUP_LOG": str(root / "rustup.log"),
+            "BCODEX_TEST_RUSTUP_PROGRAM": str(rustup_fixture),
             "BCODEX_TEST_SMOKE_SUCCESS": "1" if smoke_success else "0",
             "BCODEX_TEST_SOURCE_ARCHIVE": str(archive),
+            "BCODEX_TEST_SUDO_LOG": str(root / "sudo.log"),
+            "BCODEX_TEST_SYSTEM_PACKAGES_LOG": str(root / "system-packages.log"),
             "BCODEX_TEST_TOOLCHAIN_INSTALLED": "1" if toolchain_installed else "0",
-            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "BCODEX_TEST_XCODE_SELECT_LOG": str(root / "xcode-select.log"),
+            "PATH": f"{fake_bin}:{system_bin}",
             "SHELL": shell,
             "TMPDIR": str(temporary),
         }
