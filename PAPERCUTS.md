@@ -1,1 +1,2 @@
 # Papercuts
+- The migration probe in docs/install.md treats any binary whose help lists `update` as current, but installed revision e1fa10e4086e still used release-version freshness and refused newer public `main` as a downgrade. Detect revision-aware update behavior explicitly, or direct legacy builds to the canonical installer regardless of the help entry.
