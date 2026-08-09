@@ -1339,16 +1339,22 @@ fn render_system_prompt(
         1,
         "system prompt must contain exactly one platform shell environment guidance marker"
     );
-    template
-        .trim()
-        .replace(
-            PLATFORM_SHELL_GUIDANCE_MARKER,
-            platform_shell_guidance.trim(),
+    let prompt = template.trim().replace(
+        PLATFORM_SHELL_GUIDANCE_MARKER,
+        platform_shell_guidance.trim(),
+    );
+    let platform_shell_environment_guidance = platform_shell_environment_guidance.trim();
+    if platform_shell_environment_guidance.is_empty() {
+        prompt.replace(
+            &format!("{PLATFORM_SHELL_ENVIRONMENT_GUIDANCE_MARKER}\n"),
+            "",
         )
-        .replace(
+    } else {
+        prompt.replace(
             PLATFORM_SHELL_ENVIRONMENT_GUIDANCE_MARKER,
-            platform_shell_environment_guidance.trim(),
+            platform_shell_environment_guidance,
         )
+    }
 }
 
 pub(crate) fn estimated_harness_instruction_tokens() -> u64 {

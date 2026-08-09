@@ -95,6 +95,18 @@ fn system_prompt_renderer_replaces_one_platform_fragment() {
     );
 }
 
+#[test]
+fn system_prompt_renderer_removes_an_empty_platform_fragment_line() {
+    assert_eq!(
+        render_system_prompt(
+            "before\n{{platform_shell_guidance}}\nmiddle\n{{platform_shell_environment_guidance}}\nafter",
+            "- host shell",
+            "",
+        ),
+        "before\n- host shell\nmiddle\nafter"
+    );
+}
+
 fn assistant_item(text: &str) -> Value {
     json!({
         "id": format!("msg_{text}"),

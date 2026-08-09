@@ -653,7 +653,8 @@ mod tests {
         if cfg!(windows) {
             assert!(text.contains("Runs PowerShell by default on native Windows"));
             assert!(text.contains("Get-ChildItem -Path C:\\myrepo -Recurse | Select-String"));
-            assert!(text.contains("Start-Process -WindowStyle Hidden"));
+            assert!(text.contains("When using `Start-Process`"));
+            assert!(text.contains("pass `-WindowStyle Hidden`"));
         } else {
             assert!(text.contains("Runs shell. Long commands return"));
             assert!(!text.contains("Examples of valid PowerShell command strings"));
