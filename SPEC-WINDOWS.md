@@ -166,10 +166,12 @@ not duplicate this document's implementation details.
 | 32-bit Windows | Unsupported | Fail before download or compilation |
 | WSL 1 or WSL 2 | Linux target | Use the Linux installer and Linux behavior |
 
-The Windows 11 requirement follows current official Codex guidance and gives a
-maintainable primary target. The technical floor remains Windows 10 1809
-because that is the first client release with ConPTY. The installer must report
-an actionable error on unsupported architecture or OS, rather than continuing
+The Windows 11 requirement follows current official
+[native Codex Windows guidance](https://learn.chatgpt.com/docs/windows/windows-sandbox)
+and gives a maintainable primary target. This reference does not import Codex's
+sandbox into bettercodex. The technical floor remains Windows 10 1809 because
+that is the first client release with ConPTY. The installer must report an
+actionable error on unsupported architecture or OS, rather than continuing
 until compilation or terminal initialization fails mysteriously.
 
 ### 6.2 Terminal hosts
@@ -434,14 +436,11 @@ package layout do not belong in bettercodex.
 The canonical bootstrap should have a documented form equivalent to:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command \
-  "irm https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.ps1' | iex"
 ```
 
-PowerShell's line-continuation spelling should be presented correctly in final
-user documentation; the wrapped example above is explanatory. An equivalent
-`pwsh` command may be documented. The script must not require users to weaken
-their machine-wide execution policy permanently.
+An equivalent `pwsh` command may be documented. The script must not require
+users to weaken their machine-wide execution policy permanently.
 
 Unless overridden by an absolute `BCODEX_INSTALL_DIR`, the Windows command
 directory should be:
@@ -856,10 +855,11 @@ documented against the specific terminal host.
 ### 15.1 Ownership rule
 
 Windows Terminal processes its configured actions before the application. Its
-documented defaults use Ctrl+C/Ctrl+Shift+C/Ctrl+Insert for copy and
-Ctrl+V/Ctrl+Shift+V/Shift+Insert for paste. When no selection exists, its copy
-action sends Ctrl+C through to the application. bettercodex must design around
-that ownership rather than attempting to seize terminal-level chords.
+documented defaults use Ctrl+C/Ctrl+Shift+C/Ctrl+Insert, and Enter in applicable
+selection behavior, for copy and Ctrl+V/Ctrl+Shift+V/Shift+Insert for paste.
+When no selection exists, its copy action sends Ctrl+C through to the
+application. bettercodex must design around that ownership rather than
+attempting to seize terminal-level chords.
 
 The first Windows release should retain a fixed, platform-aware shortcut set.
 It must not import upstream's configurable `/keymap` and configuration
@@ -878,7 +878,7 @@ actions with far less source and maintenance cost.
 | Move one word | Ctrl+Left / Ctrl+Right | Alt+Left / Alt+Right where delivered | bettercodex; hints prefer Windows `Ctrl` terminology |
 | Delete previous word | Ctrl+Backspace | Ctrl+W; retain Alt+Backspace where delivered | bettercodex; Ctrl+Backspace must not degrade to one-character deletion |
 | Clear/cancel/exit | Ctrl+C | Esc for active interruption where existing | Terminal passes Ctrl+C when no selection; preserve staged clear, interrupt, idle-exit behavior |
-| Copy terminal selection | Ctrl+C or Ctrl+Shift+C | Ctrl+Insert | Windows Terminal when text is selected; bettercodex receives no chord |
+| Copy terminal selection | Ctrl+C or Ctrl+Shift+C | Ctrl+Insert; Enter where configured/defaulted | Windows Terminal when text is selected; bettercodex receives no chord |
 | Copy latest final response | Ctrl+O | `/copy` | bettercodex; native clipboard first, raw Markdown unchanged |
 | Paste clipboard | Ctrl+V | Ctrl+Shift+V or Shift+Insert | Terminal-owned; bettercodex consumes explicit paste or detected character burst |
 | Edit queued follow-up | Alt+Up | Shift+Left | bettercodex; retain both because terminal profiles differ |
@@ -1405,7 +1405,7 @@ Deliverables:
 - verify the current Windows V8 artifact and checksum publication path;
 - inventory every unconditional Unix import and platform-specific test in the
   then-current tree;
-- choose the narrow current upstream crossterm/PTTY dependency revisions; and
+- choose the narrow current upstream crossterm/PTY dependency revisions; and
 - create measured Linux/macOS source, binary, startup, and test baselines.
 
 Gate: approved target/non-goal list and no unresolved upstream source question
