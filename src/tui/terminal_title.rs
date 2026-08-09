@@ -1,8 +1,7 @@
 //! Sanitized OSC 0 activity titles for the interactive TUI.
 
-use crossterm::Command;
 use crossterm::execute;
-use std::fmt;
+use crossterm::terminal::SetTitle;
 use std::io;
 use std::io::IsTerminal;
 use std::io::stdout;
@@ -67,7 +66,7 @@ impl TerminalTitle {
         if self.last_title.take().is_none() || !stdout().is_terminal() {
             return Ok(());
         }
-        execute!(stdout(), SetWindowTitle(String::new()))
+        execute!(stdout(), SetTitle(String::new()))
     }
 }
 
@@ -85,17 +84,8 @@ fn set_terminal_title(title: &str) -> io::Result<bool> {
     if title.is_empty() {
         return Ok(false);
     }
-    execute!(stdout(), SetWindowTitle(title))?;
+    execute!(stdout(), SetTitle(title))?;
     Ok(true)
-}
-
-#[derive(Debug, Clone)]
-struct SetWindowTitle(String);
-
-impl Command for SetWindowTitle {
-    fn write_ansi(&self, output: &mut impl fmt::Write) -> fmt::Result {
-        write!(output, "\x1b]0;{}\x07", self.0)
-    }
 }
 
 fn sanitize_terminal_title(title: &str) -> String {
