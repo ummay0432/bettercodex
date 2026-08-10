@@ -130,6 +130,8 @@ class InstallerTests(unittest.TestCase):
         (self.f.bin / "bcodex-path").mkdir()
         result = self.f.run(check=True)
         self.assertIn("Installed bcodex 1.2.3", result.stdout)
+        self.assertIn("Run: bcodex", result.stdout)
+        self.assertNotIn("bcodex login", result.stdout)
         self.assertEqual(
             self.f.urls(),
             ["https://github.com/owner/project/releases/latest/download/bcodex-x86_64-unknown-linux-gnu.gz"],
@@ -140,6 +142,15 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(cache.exists())
         self.assertFalse((self.f.bin / "bcodex-path").exists())
         self.assertEqual(list(self.f.bin.glob(".bcodex-stage.*")), [])
+
+    def test_existing_install_is_reported_as_update_without_login_guidance(self) -> None:
+        self.f.installed.write_bytes(b"previous")
+
+        result = self.f.run(check=True, BCODEX_INSTALL_RELEASE_TAG=TAG)
+
+        self.assertIn("Updated bcodex 1.2.3", result.stdout)
+        self.assertNotIn("Run: bcodex", result.stdout)
+        self.assertNotIn("bcodex login", result.stdout)
 
     def test_standalone_developer_v8_cache_is_not_claimed_as_installer_state(self) -> None:
         developer_cache = self.f.home / ".cache" / "bettercodex" / "rusty-v8-development"

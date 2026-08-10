@@ -525,6 +525,7 @@ if ((Test-Path -LiteralPath $Destination) -and
         (Test-IsReparsePoint $Destination))) {
     Fail "refusing unsafe bettercodex destination $Destination"
 }
+$ExistingInstall = Test-Path -LiteralPath $Destination -PathType Leaf
 
 $TagPath = if ($ExpectedTag) { "download/$ExpectedTag" } else { 'latest/download' }
 $DownloadUrl = "https://github.com/$Repository/releases/$TagPath/$AssetName"
@@ -585,12 +586,17 @@ try {
     }
     else {
         Install-Candidate $Candidate $Destination $CandidateSha256 $Backup
-        Write-Step "Installed bcodex $CandidateVersion at $Destination"
+        if ($ExistingInstall) {
+            Write-Step "Updated bcodex $CandidateVersion at $Destination"
+        }
+        else {
+            Write-Step "Installed bcodex $CandidateVersion at $Destination"
+        }
     }
 
     Remove-LegacyInstallState $BinDirectory
     Ensure-CommandPath $BinDirectory
-    if (-not $Deferred) { Write-Step 'Run: bcodex login' }
+    if (-not $Deferred -and -not $ExistingInstall) { Write-Step 'Run: bcodex' }
 }
 finally {
     if ($null -ne $Lock) { $Lock.Dispose() }

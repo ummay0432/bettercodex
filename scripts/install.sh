@@ -139,6 +139,10 @@ fi
 if [ -e "$bin_path" ] && [ ! -f "$bin_path" ]; then
   fail "$bin_path exists but is not a regular file"
 fi
+existing_install=0
+if [ -f "$bin_path" ]; then
+  existing_install=1
+fi
 
 candidate="$(mktemp "$bin_dir/.bcodex-stage.XXXXXXXX")" ||
   fail "could not create a staged executable in $bin_dir"
@@ -256,5 +260,9 @@ if [ "$path_ready" -eq 0 ]; then
   fi
 fi
 
-step "Installed bcodex $candidate_version at $bin_path"
-step "Run: bcodex login"
+if [ "$existing_install" -eq 1 ]; then
+  step "Updated bcodex $candidate_version at $bin_path"
+else
+  step "Installed bcodex $candidate_version at $bin_path"
+  step "Run: bcodex"
+fi

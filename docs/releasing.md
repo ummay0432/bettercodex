@@ -23,6 +23,9 @@ release authorization.
 
 - Qualify the Linux asset on Ubuntu 22.04 and Debian 12. Do not rebuild a
   separate Debian binary.
+- On Windows, run the native installer suite, update-path Rust tests, release
+  build, and package smoke test. The complete native product matrix remains the
+  promotion gate in [`SPEC-WINDOWS.md`](../SPEC-WINDOWS.md).
 - Keep the zstd copies of the Unix binaries compatible with immutable 0.1.2
   clients; they are alternate encodings, not additional binaries.
 - Keep every decompressed binary at or below 128 MiB, the limit enforced by

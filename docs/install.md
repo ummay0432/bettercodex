@@ -33,9 +33,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubu
 Open a new terminal when requested, then run:
 
 ```sh
-bcodex login
 bcodex
 ```
+
+On the first interactive launch, bettercodex asks you to sign in only when no
+valid Codex credentials are available. Existing credentials remain valid across
+installs and updates.
 
 The Unix installer requires `curl`, `gzip`, and standard POSIX utilities. The
 Windows installer uses built-in PowerShell and .NET functionality. Both select
