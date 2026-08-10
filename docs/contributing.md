@@ -25,9 +25,8 @@ just install
 
 Retained Codex behavior should be ported from current upstream source rather
 than reimplemented. Keep bettercodex's fixed product boundaries in
-[`progressive_disclosure/product-direction.md`](../progressive_disclosure/product-direction.md)
-and follow the complete workflow in
-[`progressive_disclosure/development.md`](../progressive_disclosure/development.md).
+[`product-direction.md`](product-direction.md) and follow the complete workflow
+in [`development.md`](development.md).
 
 Before proposing an agreed change, run:
 
@@ -43,5 +42,11 @@ Document user-visible behavior and keep commits focused. By submitting a
 contribution, you agree that it is licensed under this repository's
 [Apache-2.0 license](../LICENSE).
 
-Report security vulnerabilities through the private process in
-[`SECURITY.md`](../SECURITY.md), not through a public issue.
+Report suspected vulnerabilities, exposed credentials, or private session data
+through GitHub's private vulnerability reporting form, not through a public
+issue:
+
+<https://github.com/ummay0432/bettercodex/security/advisories/new>
+
+Revoke or rotate any potentially exposed credential before submitting the
+report.

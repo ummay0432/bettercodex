@@ -20,9 +20,9 @@ only when the user explicitly asks to edit the system prompt.
 ## Writing and placement
 
 Keep `AGENTS.md` to facts and instructions useful in almost every bettercodex
-session. Put task-specific context in `progressive_disclosure/`, implementation
-contracts with the code that owns them, and historical material outside active
-instructions.
+session. Put task-specific context in the linked documents under `docs/`,
+implementation contracts with the code that owns them, and historical material
+outside active instructions.
 
 When moving or restructuring prose, preserve the author's voice and intent and
 keep descriptive rationale separate from operational rules.

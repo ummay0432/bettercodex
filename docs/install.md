@@ -12,9 +12,8 @@ They do not download source code or require Rust, Cargo, or native build tools.
 | Windows 11 build 22000+ | x86-64 | Developer preview |
 
 Ubuntu and Debian share the `x86_64-unknown-linux-gnu` release binary. WSL uses
-that Linux binary. Native Windows remains a developer preview until the native
-automated and interactive terminal matrices in
-[`SPEC-WINDOWS.md`](../SPEC-WINDOWS.md) pass.
+that Linux binary. Native Windows remains a developer preview until the
+[native qualification gate](development.md#native-windows-qualification) passes.
 
 ## Install
 
@@ -141,5 +140,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_windows_test
 ```
 
 Run the PowerShell suite and the Windows terminal matrix on native Windows.
-See [the development workflow](../progressive_disclosure/development.md) for
-source and artifact rules.
+See [the development workflow](development.md) for source and artifact rules.

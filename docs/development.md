@@ -92,8 +92,24 @@ Run the prebuilt installer tests on their native platforms. Windows source and
 terminal validation still requires a native Windows machine with MSVC; a Rust
 target installed on Linux is not a useful substitute.
 
+## Native Windows qualification
+
+Before native Windows leaves developer preview, validate on x86-64 Windows 11
+with MSVC:
+
+- pipe and ConPTY execution, including stream separation or merging, resize,
+  interruption, timeout, descendant cleanup, and non-ASCII paths;
+- Windows Terminal and VS Code's integrated terminal, including keyboard input,
+  ordinary and bracketed paste, IME input, clipboard operations, hyperlinks,
+  resize and reflow, resume, login, and clean shutdown;
+- public installation and updates from clean and existing profiles, including
+  rollback and locked-file failures; and
+- platform-specific model context isolation and cleanup of every task-owned
+  process, stage, cache, lock, and temporary file after failures.
+
 The manual release workflow is the only distribution build path. It must build
 all three targets from one public `main` revision, qualify the shared Linux
 binary on Ubuntu and Debian, and create a draft with exactly the five compressed
-assets named in `SPEC.md`. The two zstd assets are compatibility encodings of
-the macOS and Linux binaries for immutable clients older than 0.1.3.
+assets listed in [`releasing.md`](releasing.md). The two zstd assets are
+compatibility encodings of the macOS and Linux binaries for immutable clients
+older than 0.1.3.

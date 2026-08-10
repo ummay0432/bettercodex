@@ -48,10 +48,10 @@ Do not add another model, provider, binary, app server, SDK, MCP layer, plugin
 system, configuration framework, build system, or plugin hook unless the user
 gives a concrete bettercodex use for it. Supported release targets are Apple
 silicon macOS, x86-64 Ubuntu and Debian, and native x86-64 Windows 11. Windows
-support must remain target-gated:
-it must not add Windows-only instructions, tools, or platform prose to the
-model-facing context on other platforms; Unix shell prose must likewise remain
-absent from native Windows context. [`SPEC-WINDOWS.md`](../SPEC-WINDOWS.md)
-records the compatibility design and verification checklist; current upstream
-Codex source remains authoritative where that specification is stale or
-incomplete.
+support must remain target-gated: it must not add Windows-only instructions,
+tools, or platform prose to the model-facing context on other platforms; Unix
+shell prose must likewise remain absent from native Windows context. Current
+upstream Codex source remains authoritative for retained compatibility behavior,
+and
+[`development.md`](development.md#native-windows-qualification) records the
+native verification gate.

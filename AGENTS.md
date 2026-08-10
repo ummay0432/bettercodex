@@ -18,7 +18,7 @@ caches, and isolated compiled artifacts, including on failure. Never remove the
 checkout's shared `target/`, another session's artifact root, or a target still
 referenced by a live Cargo or rustc process.
 
-bettercodex is a focused port of [OpenAI Codex](https://github.com/openai/codex), not an independent implementation. For every retained behavior Codex already implements, inspect and port the current upstream source before editing; unexplained reimplementation or drift is forbidden unless [`product-direction.md`](progressive_disclosure/product-direction.md) explicitly requires the departure.
+bettercodex is a focused port of [OpenAI Codex](https://github.com/openai/codex), not an independent implementation. For every retained behavior Codex already implements, inspect and port the current upstream source before editing; unexplained reimplementation or drift is forbidden unless [`product-direction.md`](docs/product-direction.md) explicitly requires the departure.
 
 Do not invent Cargo, build, packaging, release, or test infrastructure; mirror current upstream Codex for retained workflows unless an explicit bettercodex requirement makes a deviation necessary.
 
@@ -31,12 +31,12 @@ Only the user decides when a release is ready; when explicitly asked to prepare 
 This file is the universal context layer. Before working, open only the matching
 task-specific context; do not preload the whole folder:
 
-- [`progressive_disclosure/product-direction.md`](progressive_disclosure/product-direction.md): before changing product scope, fixed model/runtime choices, supported platforms, or major dependencies.
-- [`progressive_disclosure/development.md`](progressive_disclosure/development.md): before changing Rust, build scripts, tests, performance, or installation behavior.
-- [`progressive_disclosure/inference.md`](progressive_disclosure/inference.md): before changing requests, Responses items, history, reasoning, compaction, caching, streaming, recovery, tools, or saved sessions.
+- [`docs/product-direction.md`](docs/product-direction.md): before changing product scope, fixed model/runtime choices, supported platforms, or major dependencies.
+- [`docs/development.md`](docs/development.md): before changing Rust, build scripts, tests, performance, or installation behavior.
+- [`docs/inference.md`](docs/inference.md): before changing requests, Responses items, history, reasoning, compaction, caching, streaming, recovery, tools, or saved sessions.
 - [`docs/instruction-hierarchy.md`](docs/instruction-hierarchy.md): before changing message roles, trust boundaries, repository/skill/tool context authority, prompt-injection defenses, or related evaluations.
-- [`progressive_disclosure/terminal-ui.md`](progressive_disclosure/terminal-ui.md): before changing `src/tui/`, terminal lifecycle, rendering, composer behavior, or shortcuts.
-- [`progressive_disclosure/model-facing-context.md`](progressive_disclosure/model-facing-context.md): before changing `AGENTS.md`, `prompts/*.md`, tool descriptions, or model-visible errors.
+- [`docs/terminal-ui.md`](docs/terminal-ui.md): before changing `src/tui/`, terminal lifecycle, rendering, composer behavior, or shortcuts.
+- [`docs/model-facing-context.md`](docs/model-facing-context.md): before changing `AGENTS.md`, `prompts/*.md`, tool descriptions, or model-visible errors.
 
 ## Repository map
 
