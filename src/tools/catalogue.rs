@@ -1,6 +1,6 @@
 //! Fixed JavaScript tool catalogue ported from Codex's `code_mode_only` plan at
 //! `1669c2403f793d0230065397dfc25f52b844244e` and rechecked against upstream at
-//! `a16863f8704831d13e041ed7dba2c4a57a2a940b`. bettercodex exposes this one
+//! `1c042dd4d823b451ae44029abaf0e13b7cef8904`. bettercodex exposes this one
 //! execution path unconditionally; it has no tool-mode selector.
 //!
 //! The schemas mirror `core/src/tools/handlers/{apply_patch_spec,plan_spec,
@@ -25,9 +25,9 @@ SOURCE: /[\s\S]+/"#;
 // MCP or image-generation integrations, and its fixed nested surface is fully
 // declared below, so those compatibility globals are deliberately omitted from
 // model-facing guidance.
-const EXEC_RUNTIME_GUIDANCE: &str = r#"Input raw JavaScript directly (no JSON, string, or Markdown wrapper) into fresh V8: top-level `await`; no Node.js/filesystem/network/console. Call `await tools.name(args)`; errors reject. Use `Promise.all` for independent calls and await all work. Emit with `text(value)`/`image(item,detail?)`; `notify` is interim; `yield_control` yields while code continues; `store`/`load` persist serializable values across cells; `exit`, `setTimeout`, and `clearTimeout` exist. Optional first line `// @exec:{"yield_time_ms":10000,"max_output_tokens":1000}`; both default 10000."#;
+const EXEC_RUNTIME_GUIDANCE: &str = r#"Input raw JavaScript directly (no JSON, string, or Markdown wrapper) into fresh V8: top-level `await`; no Node.js/filesystem/network/console. Call `await tools.name(args)`; errors reject. Use `Promise.all` for independent calls and await all work. Emit with `text(value)`/`image(item,detail?)`; `notify(value)` is interim; `yield_control()` yields while code continues; `store(key,value)`/`load(key)` persist serializable values across cells; `exit()`, `setTimeout(callback,delayMs)`, and `clearTimeout(timeoutId)` exist. Optional first line `// @exec:{"yield_time_ms":10000,"max_output_tokens":1000}`; both default 10000."#;
 const TOOL_DEFAULTS: &str = "Defaults: command cwd=turn, shell=user, `login:true`, `tty:false`, yield=10s; stdin yield=.25s after writes/5s polling; outer exec/wait output=10k tokens; nested command output=collected raw unless `max_output_tokens` is set; image detail=`high`. Nested command and non-empty write yields clamp to .25–30s; empty polls to 5–300s; top-level `exec`/`wait` yields are not clamped. Process: `output`+`wall_time_seconds` always; `session_id`=running, `exit_code`=done, `original_token_count`=before truncation, `chunk_id`=output chunk.";
-const WAIT_DESCRIPTION: &str = "Wait on a yielded top-level `exec` cell using its string `cell_id`; process `session_id` values from `exec_command` belong to `tools.write_stdin`. Returns only new output; repeat while active or use `terminate:true` to stop. `yield_time_ms`/`max_tokens` default 10000.";
+const WAIT_DESCRIPTION: &str = "Call top-level `wait` only after `exec` returns `Script running with cell ID ...`; never call `tools.wait`. Use that string `cell_id`; numeric process `session_id` values from `exec_command` belong to `tools.write_stdin`. Returns only new output; repeat only while it reports the cell is running, or use `terminate:true` to stop. `yield_time_ms`/`max_tokens` default 10000.";
 #[cfg(not(windows))]
 const EXEC_COMMAND_DESCRIPTION: &str = "Runs shell. Long commands return `session_id` for `write_stdin`; `tty:true` keeps stdin writable.";
 #[cfg(windows)]
@@ -92,7 +92,7 @@ static CORE_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
         ),
         function_tool(
             "write_stdin",
-            "Writes `chars` or, when omitted, polls an `exec_command` session; returns new output.",
+            "Writes `chars` or polls an `exec_command` `session_id`; returns new output. Reuse the ID only while the preceding result contains `session_id`; `exit_code` means stop. Never poll one ID concurrently.",
             write_stdin_input_schema(),
             Some(unified_exec_output_schema()),
         ),
