@@ -7,9 +7,11 @@ compaction, caching, streaming, recovery, tools, or saved sessions.
 
 - Build model history incrementally; do not rewrite earlier history during
   normal turns. Keep stable request items stable so prompt caching can work.
-- Put a hard bound on every new model-visible item and tool result. Review a new
-  item carefully if it can exceed 1,000 tokens; no single item may exceed 10,000
-  tokens.
+- Put a hard default bound on every new model-visible item and tool result.
+  Review a new item carefully if it can exceed 1,000 tokens; no single item may
+  exceed 10,000 tokens unless an upstream tool contract exposes a per-call
+  output budget and the model explicitly requests a larger value. That explicit
+  value remains the hard bound for the call.
 - Search for breakage in CLI arguments, saved JSONL sessions and resume,
   Responses request and output items, and model-visible tool names and schemas.
 - Install compaction transactionally: validate the opaque output, restore exact

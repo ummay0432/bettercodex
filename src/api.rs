@@ -1,6 +1,4 @@
 use crate::assistant_message::AssistantMessage;
-use crate::assistant_message::has_assistant_text;
-use crate::assistant_message::terminal_answer;
 use crate::auth::Auth;
 use crate::auth::AuthSnapshot;
 use crate::auth::SharedAuth;
@@ -14,6 +12,7 @@ use crate::http_client::bounded_error_body;
 use crate::model::ModelCatalogClient;
 use crate::model::ModelSelection;
 use crate::model::SharedModelSelection;
+use crate::model::ToolMode;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
 use crate::service_tier::ServiceTier;
@@ -36,7 +35,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
-use std::ops::Range;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -81,12 +79,50 @@ const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
 static SYSTEM_PROMPT: LazyLock<String> =
     LazyLock::new(|| render_system_prompt(SYSTEM_PROMPT_TEMPLATE, PLATFORM_SHELL_GUIDANCE));
-static STABLE_INPUT_PREFIX_ITEMS: LazyLock<[Value; 1]> = LazyLock::new(|| {
-    [json!({
-        "type": "additional_tools",
-        "role": "developer",
-        "tools": tools::specifications(),
-    })]
+static STABLE_INPUT_PREFIX_ITEMS: LazyLock<[[[Value; 2]; 3]; 2]> = LazyLock::new(|| {
+    [false, true].map(|supports_image_detail_original| {
+        ToolMode::ALL.map(|tool_mode| {
+            [
+                json!({
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": tools::responses_lite_specifications(
+                        tool_mode,
+                        supports_image_detail_original,
+                    ),
+                }),
+                developer_instructions_item(),
+            ]
+        })
+    })
+});
+static STABLE_HARNESS_TOKEN_ESTIMATES: LazyLock<[[[[u64; 2]; 3]; 2]; 2]> = LazyLock::new(|| {
+    [false, true].map(|use_responses_lite| {
+        [false, true].map(|supports_image_detail_original| {
+            ToolMode::ALL.map(|tool_mode| {
+                if use_responses_lite {
+                    let [tools_item, instructions_item] =
+                        stable_input_prefix_items(tool_mode, supports_image_detail_original);
+                    [
+                        estimated_tokens(std::slice::from_ref(tools_item)),
+                        estimated_tokens(std::slice::from_ref(instructions_item)),
+                    ]
+                } else {
+                    [
+                        estimated_tokens(&[json!({
+                            "tools": tools::specifications(
+                                tool_mode,
+                                supports_image_detail_original,
+                            ),
+                        })]),
+                        estimated_tokens(&[json!({
+                            "instructions": harness_instructions(),
+                        })]),
+                    ]
+                }
+            })
+        })
+    })
 });
 
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -188,7 +224,9 @@ pub(crate) struct ApiClient {
     websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
     websocket_reasoning_included: bool,
+    websocket_server_model: Option<String>,
     websocket_baseline: Option<WebSocketBaseline>,
+    server_model_warning_emitted: bool,
     stream_idle_timeout: Duration,
 }
 
@@ -217,6 +255,44 @@ enum RequestInputIdentity {
         cursor: HistoryCursor,
         trailing_items: usize,
     },
+}
+
+#[derive(Clone, Copy)]
+enum OutputItemMode {
+    /// Keep output in the response and publish a copy to the consumer.
+    RetainAndEmit,
+    /// Keep output only in the response (compaction and connection warmup).
+    Retain,
+    /// Move output directly to conversation history and retain only response metadata.
+    Transfer,
+}
+
+struct ResponseValidation<'a> {
+    expected_model: &'a str,
+    use_responses_lite: bool,
+    server_model_warning_emitted: &'a mut bool,
+}
+
+impl OutputItemMode {
+    fn for_http(request_kind: RequestKind) -> Self {
+        match request_kind {
+            RequestKind::Turn => Self::Transfer,
+            RequestKind::Prewarm | RequestKind::Compaction(_) => Self::Retain,
+        }
+    }
+
+    fn for_websocket(request_kind: RequestKind, input_identity: RequestInputIdentity) -> Self {
+        match (request_kind, input_identity) {
+            (
+                RequestKind::Turn,
+                RequestInputIdentity::AppendOnly {
+                    trailing_items: 0, ..
+                },
+            ) => Self::Transfer,
+            (RequestKind::Turn, _) => Self::RetainAndEmit,
+            (RequestKind::Prewarm | RequestKind::Compaction(_), _) => Self::Retain,
+        }
+    }
 }
 
 pub(crate) struct SamplingRequest {
@@ -310,7 +386,14 @@ impl Drop for WebSocketRequestGuard<'_> {
 }
 
 struct SamplingInputRestoration {
-    inserted_tools: bool,
+    inserted_prefix: Option<(ToolMode, bool)>,
+    stripped_image_details: Vec<StrippedImageDetail>,
+}
+
+struct StrippedImageDetail {
+    item_index: usize,
+    content_index: usize,
+    detail: Value,
 }
 
 impl WebSocketBaseline {
@@ -330,9 +413,14 @@ impl WebSocketBaseline {
             } => WebSocketBaselineInput::AppendOnly {
                 cursor,
                 request_len: request_input.len(),
-                response_items: response.items.len(),
+                response_items: response.output_item_count,
             },
             RequestInputIdentity::Exact | RequestInputIdentity::AppendOnly { .. } => {
+                if response.items.len() != response.output_item_count {
+                    return Err(ApiError::fatal(
+                        "an exact WebSocket baseline did not retain its output items",
+                    ));
+                }
                 WebSocketBaselineInput::Exact {
                     request: request_input.clone(),
                     output: response.items.clone(),
@@ -363,17 +451,30 @@ impl SamplingRequest {
 
 impl SamplingInputRestoration {
     fn restore(self, mut input: Vec<Value>) -> ApiResult<Vec<Value>> {
-        if self.inserted_tools {
-            let expected = &stable_input_prefix_items()[0];
-            if !input
-                .first()
-                .is_some_and(|item| is_additional_tools_item(item, expected))
-            {
+        if let Some((tool_mode, supports_image_detail_original)) = self.inserted_prefix {
+            let expected = stable_input_prefix_items(tool_mode, supports_image_detail_original);
+            if input.get(..expected.len()) != Some(expected.as_slice()) {
                 return Err(ApiError::fatal(
-                    "sampling request lost its inserted tool catalogue",
+                    "sampling request lost its inserted Responses Lite prefix",
                 ));
             }
-            input.remove(0);
+            input.drain(..expected.len());
+        }
+        for stripped in self.stripped_image_details {
+            let content = input
+                .get_mut(stripped.item_index)
+                .and_then(image_content_items_mut)
+                .ok_or_else(|| {
+                    ApiError::fatal("sampling request lost image content while it was in flight")
+                })?;
+            let image = content
+                .get_mut(stripped.content_index)
+                .and_then(Value::as_object_mut)
+                .filter(|image| image.get("type").and_then(Value::as_str) == Some("input_image"))
+                .ok_or_else(|| {
+                    ApiError::fatal("sampling request changed an image while it was in flight")
+                })?;
+            image.insert("detail".to_string(), stripped.detail);
         }
         Ok(input)
     }
@@ -386,6 +487,8 @@ enum WebSocketRequestMode {
 }
 
 pub(crate) struct ModelResponse {
+    // Compaction and exact WebSocket-baseline responses retain their output. Normal sampling moves
+    // those values into conversation history and leaves this vector empty.
     pub(crate) items: Vec<Value>,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) final_answer: Option<String>,
@@ -393,11 +496,13 @@ pub(crate) struct ModelResponse {
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) server_reasoning_included: bool,
     response_id: String,
+    output_item_count: usize,
+    has_assistant_text: bool,
 }
 
 impl ModelResponse {
     pub(crate) fn has_assistant_text(&self) -> bool {
-        has_assistant_text(&self.items)
+        self.has_assistant_text
     }
 }
 
@@ -461,7 +566,9 @@ impl ApiClient {
             websocket_prewarm_attempted: false,
             websocket: None,
             websocket_reasoning_included: false,
+            websocket_server_model: None,
             websocket_baseline: None,
+            server_model_warning_emitted: false,
             stream_idle_timeout: STREAM_IDLE_TIMEOUT,
         })
     }
@@ -470,6 +577,7 @@ impl ApiClient {
         self.turn_id = uuid::Uuid::new_v4().to_string();
         self.turn_started_at_unix_ms = unix_timestamp_millis();
         self.turn_state = None;
+        self.server_model_warning_emitted = false;
         &self.turn_id
     }
 
@@ -529,12 +637,19 @@ impl ApiClient {
     }
 
     pub(crate) fn tool_turn_context(&self, history: &[Value]) -> ToolTurnContext {
-        ToolTurnContext::from_history(history, self.turn_metadata(RequestKind::Turn).to_string())
+        let selection = self.model_selection.get();
+        ToolTurnContext::from_history(
+            history,
+            self.turn_metadata(RequestKind::Turn).to_string(),
+            selection.truncation_policy(),
+            selection.supports_image_detail_original(),
+        )
     }
 
     pub(crate) fn abandon_response(&mut self) {
         self.websocket = None;
         self.websocket_reasoning_included = false;
+        self.websocket_server_model = None;
         self.websocket_baseline = None;
     }
 
@@ -713,7 +828,15 @@ impl ApiClient {
         let response = self
             .post("responses", request, "text/event-stream", request_kind)
             .await?;
-        validate_server_model_header(response.headers(), &expected_model)?;
+        observe_server_model(
+            response
+                .headers()
+                .get("openai-model")
+                .and_then(|value| value.to_str().ok()),
+            &expected_model,
+            events,
+            &mut self.server_model_warning_emitted,
+        );
         let server_reasoning_included = response.headers().contains_key("x-reasoning-included");
         self.capture_turn_state(response.headers());
         let mut response = collect_http_stream(
@@ -721,8 +844,12 @@ impl ApiClient {
             completed_items,
             events,
             self.stream_idle_timeout,
-            &expected_model,
-            use_responses_lite,
+            ResponseValidation {
+                expected_model: &expected_model,
+                use_responses_lite,
+                server_model_warning_emitted: &mut self.server_model_warning_emitted,
+            },
+            OutputItemMode::for_http(request_kind),
         )
         .await?;
         response.server_reasoning_included = server_reasoning_included;
@@ -762,6 +889,13 @@ impl ApiClient {
         let expected_model = request_model(logical_request)?.to_string();
         let use_responses_lite = self.model_selection.get().use_responses_lite;
         self.ensure_websocket(request_kind).await?;
+        let websocket_server_model = self.websocket_server_model.clone();
+        observe_server_model(
+            websocket_server_model.as_deref(),
+            &expected_model,
+            events,
+            &mut self.server_model_warning_emitted,
+        );
         let idle_timeout = match mode {
             WebSocketRequestMode::Inference => self.stream_idle_timeout,
             WebSocketRequestMode::Warmup => {
@@ -781,7 +915,8 @@ impl ApiClient {
         guard.restore()?;
         send_result?;
 
-        let mut collected = CollectedResponse::default();
+        let mut collected =
+            CollectedResponse::new(OutputItemMode::for_websocket(request_kind, input_identity));
         loop {
             let text = self
                 .websocket
@@ -806,6 +941,7 @@ impl ApiClient {
                 events,
                 &expected_model,
                 use_responses_lite,
+                &mut self.server_model_warning_emitted,
             )?;
             if collected.completed {
                 break;
@@ -830,9 +966,11 @@ impl ApiClient {
         insert_header(&mut headers, "openai-beta", RESPONSES_WEBSOCKET_BETA)?;
         let url = websocket_url(&self.base_url, "responses")?;
         let (websocket, response_headers) = WebSocketConnection::connect(&url, &headers).await?;
-        let expected_model = self.model_selection.get().model;
-        validate_server_model_header(&response_headers, &expected_model)?;
         self.websocket_reasoning_included = response_headers.contains_key("x-reasoning-included");
+        self.websocket_server_model = response_headers
+            .get("openai-model")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         self.capture_turn_state(&response_headers);
         self.websocket = Some(websocket);
         Ok(())
@@ -971,6 +1109,7 @@ impl ApiClient {
         history: &[Value],
         cursor: HistoryCursor,
         compaction: CompactionRequest,
+        events: Option<&UnboundedSender<AgentEvent>>,
     ) -> ApiResult<CompactionResult> {
         self.compact_with_identity(
             history,
@@ -979,6 +1118,7 @@ impl ApiClient {
                 cursor,
                 trailing_items: 1,
             },
+            events,
         )
         .await
     }
@@ -988,25 +1128,23 @@ impl ApiClient {
         history: &[Value],
         compaction: CompactionRequest,
         mut input_identity: RequestInputIdentity,
+        events: Option<&UnboundedSender<AgentEvent>>,
     ) -> ApiResult<CompactionResult> {
         if history.is_empty() {
             return Err(ApiError::fatal("cannot compact an empty conversation"));
         }
         let trigger = compaction::compaction_trigger();
-        let [tools_item] = stable_input_prefix_items();
-        let tool_prefix_tokens = if history
-            .iter()
-            .any(|item| is_additional_tools_item(item, tools_item))
-        {
-            0
-        } else {
-            estimated_tokens(std::slice::from_ref(tools_item))
-        };
+        let selection = self.model_selection.get();
+        let [tool_prefix_tokens, instruction_tokens] = estimated_harness_tokens(
+            selection.use_responses_lite,
+            selection.tool_mode(),
+            selection.supports_image_detail_original(),
+        );
         let prefix_tokens = tool_prefix_tokens
-            .saturating_add(estimated_harness_instruction_tokens())
+            .saturating_add(instruction_tokens)
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
         let mut prompt_history = history.to_vec();
-        let effective_context_window = self.model_selection.get().effective_context_window();
+        let effective_context_window = selection.effective_context_window();
         let rewritten_outputs = compaction::trim_tool_outputs_to_fit(
             &mut prompt_history,
             effective_context_window.saturating_sub(prefix_tokens),
@@ -1028,7 +1166,7 @@ impl ApiClient {
                 .respond_request_with_events(
                     &mut request,
                     &completed_items,
-                    None,
+                    events,
                     request_kind,
                     input_identity,
                 )
@@ -1068,7 +1206,12 @@ impl ApiClient {
 
     fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> Value {
         let selection = self.model_selection.get();
-        let input = compose_input(history, selection.use_responses_lite);
+        let input = compose_input(
+            history,
+            selection.use_responses_lite,
+            selection.tool_mode(),
+            selection.supports_image_detail_original(),
+        );
         self.build_request_from_input(input, request_kind, &selection)
     }
 
@@ -1078,8 +1221,12 @@ impl ApiClient {
         cursor: HistoryCursor,
     ) -> SamplingRequest {
         let selection = self.model_selection.get();
-        let (input, input_restoration) =
-            compose_sampling_input(history, selection.use_responses_lite);
+        let (input, input_restoration) = compose_sampling_input(
+            history,
+            selection.use_responses_lite,
+            selection.tool_mode(),
+            selection.supports_image_detail_original(),
+        );
         SamplingRequest {
             request: self.build_request_from_input(input, RequestKind::Turn, &selection),
             cursor,
@@ -1102,9 +1249,9 @@ impl ApiClient {
         }
         let mut request = json!({
             "model": selection.model,
-            "instructions": harness_instructions(),
             "tool_choice": "auto",
-            "parallel_tool_calls": false,
+            "parallel_tool_calls": selection.supports_parallel_tool_calls
+                && !selection.use_responses_lite,
             "reasoning": reasoning,
             "store": false,
             "stream": true,
@@ -1113,8 +1260,13 @@ impl ApiClient {
             "text": {"verbosity": "low"},
             "client_metadata": self.client_metadata(request_kind),
         });
+        // Responses Lite receives both tools and base instructions as developer input items.
         if !selection.use_responses_lite {
-            request["tools"] = Value::Array(tools::specifications());
+            request["instructions"] = Value::String(harness_instructions().to_string());
+            request["tools"] = Value::Array(tools::specifications(
+                selection.tool_mode(),
+                selection.supports_image_detail_original(),
+            ));
         }
         if let Some(service_tier) = self.effective_service_tier(selection) {
             request["service_tier"] = Value::String(service_tier.to_string());
@@ -1382,33 +1534,48 @@ impl RequestKind {
     }
 }
 
-fn compose_input(history: Vec<Value>, use_responses_lite: bool) -> Vec<Value> {
-    compose_sampling_input(history, use_responses_lite).0
+fn compose_input(
+    history: Vec<Value>,
+    use_responses_lite: bool,
+    tool_mode: ToolMode,
+    supports_image_detail_original: bool,
+) -> Vec<Value> {
+    compose_sampling_input(
+        history,
+        use_responses_lite,
+        tool_mode,
+        supports_image_detail_original,
+    )
+    .0
 }
 
 fn compose_sampling_input(
     mut history: Vec<Value>,
     use_responses_lite: bool,
+    tool_mode: ToolMode,
+    supports_image_detail_original: bool,
 ) -> (Vec<Value>, SamplingInputRestoration) {
     if !use_responses_lite {
         return (
             history,
             SamplingInputRestoration {
-                inserted_tools: false,
+                inserted_prefix: None,
+                stripped_image_details: Vec::new(),
             },
         );
     }
-    let [tools_item] = stable_request_prefix();
-    let inserted_tools = if history
-        .iter()
-        .any(|item| is_additional_tools_item(item, &tools_item))
-    {
-        false
-    } else {
-        history.insert(0, tools_item);
-        true
-    };
-    (history, SamplingInputRestoration { inserted_tools })
+    let stripped_image_details = strip_image_details(&mut history);
+    history.splice(
+        0..0,
+        stable_request_prefix(tool_mode, supports_image_detail_original),
+    );
+    (
+        history,
+        SamplingInputRestoration {
+            inserted_prefix: Some((tool_mode, supports_image_detail_original)),
+            stripped_image_details,
+        },
+    )
 }
 
 fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
@@ -1417,16 +1584,93 @@ fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
         .all(|field| item.get(field) == expected.get(field))
 }
 
-pub(crate) fn stable_input_prefix_items() -> &'static [Value; 1] {
-    &STABLE_INPUT_PREFIX_ITEMS
+fn strip_image_details(history: &mut [Value]) -> Vec<StrippedImageDetail> {
+    let mut stripped = Vec::new();
+    for (item_index, item) in history.iter_mut().enumerate() {
+        let Some(content) = image_content_items_mut(item) else {
+            continue;
+        };
+        for (content_index, content_item) in content.iter_mut().enumerate() {
+            if content_item.get("type").and_then(Value::as_str) != Some("input_image") {
+                continue;
+            }
+            let Some(detail) = content_item
+                .as_object_mut()
+                .and_then(|image| image.remove("detail"))
+            else {
+                continue;
+            };
+            stripped.push(StrippedImageDetail {
+                item_index,
+                content_index,
+                detail,
+            });
+        }
+    }
+    stripped
 }
 
-pub(crate) fn stable_request_prefix() -> [Value; 1] {
-    (*stable_input_prefix_items()).clone()
+fn image_content_items_mut(item: &mut Value) -> Option<&mut Vec<Value>> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => item.get_mut("content")?.as_array_mut(),
+        Some("function_call_output" | "custom_tool_call_output") => {
+            item.get_mut("output")?.as_array_mut()
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn stable_input_prefix_items(
+    tool_mode: ToolMode,
+    supports_image_detail_original: bool,
+) -> &'static [Value; 2] {
+    &STABLE_INPUT_PREFIX_ITEMS[usize::from(supports_image_detail_original)][tool_mode.index()]
+}
+
+pub(crate) fn stable_request_prefix(
+    tool_mode: ToolMode,
+    supports_image_detail_original: bool,
+) -> [Value; 2] {
+    (*stable_input_prefix_items(tool_mode, supports_image_detail_original)).clone()
+}
+
+pub(crate) fn is_stable_tools_prefix_item(item: &Value) -> bool {
+    [false, true]
+        .into_iter()
+        .flat_map(|supports_image_detail_original| {
+            ToolMode::ALL.map(|tool_mode| (tool_mode, supports_image_detail_original))
+        })
+        .any(|(tool_mode, supports_image_detail_original)| {
+            is_additional_tools_item(
+                item,
+                &stable_input_prefix_items(tool_mode, supports_image_detail_original)[0],
+            )
+        })
+}
+
+pub(crate) fn is_stable_instructions_prefix_item(item: &Value) -> bool {
+    ToolMode::ALL.into_iter().any(|tool_mode| {
+        let expected =
+            &stable_input_prefix_items(tool_mode, /*supports_image_detail_original*/ true)[1];
+        ["type", "role", "content"]
+            .into_iter()
+            .all(|field| item.get(field) == expected.get(field))
+    })
 }
 
 pub(crate) fn harness_instructions() -> &'static str {
     SYSTEM_PROMPT.as_str()
+}
+
+fn developer_instructions_item() -> Value {
+    json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": harness_instructions(),
+        }],
+    })
 }
 
 fn render_system_prompt(template: &str, platform_shell_guidance: &str) -> String {
@@ -1441,8 +1685,13 @@ fn render_system_prompt(template: &str, platform_shell_guidance: &str) -> String
     )
 }
 
-pub(crate) fn estimated_harness_instruction_tokens() -> u64 {
-    estimated_tokens(&[json!({"instructions": harness_instructions()})])
+pub(crate) fn estimated_harness_tokens(
+    use_responses_lite: bool,
+    tool_mode: ToolMode,
+    supports_image_detail_original: bool,
+) -> [u64; 2] {
+    STABLE_HARNESS_TOKEN_ESTIMATES[usize::from(use_responses_lite)]
+        [usize::from(supports_image_detail_original)][tool_mode.index()]
 }
 
 fn is_reusable_request_property(name: &str) -> bool {
@@ -1479,11 +1728,11 @@ async fn collect_http_stream(
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
     idle_timeout: Duration,
-    expected_model: &str,
-    use_responses_lite: bool,
+    validation: ResponseValidation<'_>,
+    output_item_mode: OutputItemMode,
 ) -> ApiResult<ModelResponse> {
     let mut decoder = SseDecoder::default();
-    let mut collected = CollectedResponse::default();
+    let mut collected = CollectedResponse::new(output_item_mode);
     let mut decoded = Vec::new();
     let mut event_deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
@@ -1501,8 +1750,9 @@ async fn collect_http_stream(
                     &mut collected,
                     completed_items,
                     events,
-                    expected_model,
-                    use_responses_lite,
+                    validation.expected_model,
+                    validation.use_responses_lite,
+                    &mut *validation.server_model_warning_emitted,
                 )?;
             }
             break;
@@ -1517,8 +1767,9 @@ async fn collect_http_stream(
                 &mut collected,
                 completed_items,
                 events,
-                expected_model,
-                use_responses_lite,
+                validation.expected_model,
+                validation.use_responses_lite,
+                &mut *validation.server_model_warning_emitted,
             )?;
         }
         if collected.completed {
@@ -1533,31 +1784,85 @@ async fn collect_http_stream(
     collected.finish()
 }
 
-#[derive(Default)]
 struct CollectedResponse {
-    items: Vec<Value>,
+    output_items: CollectedOutputItems,
     pending_items: BTreeMap<usize, Value>,
+    item_summary: ResponseItemSummary,
     usage: Option<TokenUsage>,
     end_turn: Option<bool>,
     response_id: Option<String>,
     completed: bool,
 }
 
+enum CollectedOutputItems {
+    RetainedAndEmitted(Vec<Value>),
+    Retained(Vec<Value>),
+    Transferred { count: usize },
+}
+
+#[derive(Default)]
+struct ResponseItemSummary {
+    tool_calls: Vec<ToolCall>,
+    final_answer: Option<String>,
+    has_assistant_text: bool,
+}
+
 impl CollectedResponse {
+    fn new(output_item_mode: OutputItemMode) -> Self {
+        let output_items = match output_item_mode {
+            OutputItemMode::RetainAndEmit => CollectedOutputItems::RetainedAndEmitted(Vec::new()),
+            OutputItemMode::Retain => CollectedOutputItems::Retained(Vec::new()),
+            OutputItemMode::Transfer => CollectedOutputItems::Transferred { count: 0 },
+        };
+        Self {
+            output_items,
+            pending_items: BTreeMap::new(),
+            item_summary: ResponseItemSummary::default(),
+            usage: None,
+            end_turn: None,
+            response_id: None,
+            completed: false,
+        }
+    }
+
+    fn item_count(&self) -> usize {
+        match &self.output_items {
+            CollectedOutputItems::RetainedAndEmitted(items)
+            | CollectedOutputItems::Retained(items) => items.len(),
+            CollectedOutputItems::Transferred { count } => *count,
+        }
+    }
+
     fn push_item(
         &mut self,
         index: usize,
         item: Value,
         completed_items: &UnboundedSender<Value>,
-    ) -> ApiResult<Range<usize>> {
+        events: Option<&UnboundedSender<AgentEvent>>,
+    ) -> ApiResult<()> {
         validate_assistant_message_phase(&item)?;
-        if index < self.items.len() {
-            if self.items[index] == item {
-                return Ok(index..index);
+        let item_count = self.item_count();
+        if index < item_count {
+            let conflicts = match &self.output_items {
+                CollectedOutputItems::RetainedAndEmitted(items)
+                | CollectedOutputItems::Retained(items) => items[index] != item,
+                CollectedOutputItems::Transferred { .. } => false,
+            };
+            if conflicts {
+                return Err(ApiError::fatal(format!(
+                    "model sent conflicting output items at index {index}"
+                )));
             }
-            return Err(ApiError::fatal(format!(
-                "model sent conflicting output items at index {index}"
-            )));
+            // Match Codex by treating output_item.done as authoritative. A transferred value is
+            // already in history, so the duplicate copy carried by response.completed is ignored.
+            return Ok(());
+        }
+        if index == item_count {
+            self.accept_item(item, completed_items, events);
+            while let Some(item) = self.pending_items.remove(&self.item_count()) {
+                self.accept_item(item, completed_items, events);
+            }
+            return Ok(());
         }
         match self.pending_items.entry(index) {
             Entry::Vacant(entry) => {
@@ -1570,12 +1875,30 @@ impl CollectedResponse {
                 )));
             }
         }
-        let appended_start = self.items.len();
-        while let Some(item) = self.pending_items.remove(&self.items.len()) {
-            let _ = completed_items.send(item.clone());
-            self.items.push(item);
+        Ok(())
+    }
+
+    fn accept_item(
+        &mut self,
+        item: Value,
+        completed_items: &UnboundedSender<Value>,
+        events: Option<&UnboundedSender<AgentEvent>>,
+    ) {
+        let completed_message = self.item_summary.observe(&item, events.is_some());
+        match &mut self.output_items {
+            CollectedOutputItems::RetainedAndEmitted(items) => {
+                let _ = completed_items.send(item.clone());
+                items.push(item);
+            }
+            CollectedOutputItems::Retained(items) => items.push(item),
+            CollectedOutputItems::Transferred { count } => {
+                *count = count.saturating_add(1);
+                let _ = completed_items.send(item);
+            }
         }
-        Ok(appended_start..self.items.len())
+        if let (Some(events), Some(message)) = (events, completed_message) {
+            let _ = events.send(AgentEvent::ModelMessageCompleted(message));
+        }
     }
 
     fn finish(self) -> ApiResult<ModelResponse> {
@@ -1584,23 +1907,48 @@ impl CollectedResponse {
                 "model response completed with a gap in output item indexes",
             ));
         }
-        let tool_calls = self
-            .items
-            .iter()
-            .filter_map(ToolCall::from_response_item)
-            .collect();
-        let final_answer = terminal_answer(&self.items);
+        let output_item_count = self.item_count();
+        let items = match self.output_items {
+            CollectedOutputItems::RetainedAndEmitted(items)
+            | CollectedOutputItems::Retained(items) => items,
+            CollectedOutputItems::Transferred { .. } => Vec::new(),
+        };
         Ok(ModelResponse {
-            items: self.items,
-            tool_calls,
-            final_answer,
+            items,
+            tool_calls: self.item_summary.tool_calls,
+            final_answer: self.item_summary.final_answer,
             end_turn: self.end_turn,
             usage: self.usage,
             server_reasoning_included: false,
             response_id: self
                 .response_id
                 .ok_or_else(|| ApiError::fatal("response.completed omitted the response ID"))?,
+            output_item_count,
+            has_assistant_text: self.item_summary.has_assistant_text,
         })
+    }
+}
+
+impl ResponseItemSummary {
+    fn observe(&mut self, item: &Value, emit_completed_message: bool) -> Option<AssistantMessage> {
+        if let Some(tool_call) = ToolCall::from_response_item(item) {
+            self.tool_calls.push(tool_call);
+        }
+        let message = AssistantMessage::from_response_item(item)?;
+        let has_text = !message.text.trim().is_empty();
+        let is_terminal = message.is_terminal();
+        self.has_assistant_text |= has_text;
+        if emit_completed_message {
+            if is_terminal && has_text {
+                self.final_answer = Some(message.text.clone());
+            }
+            Some(message)
+        } else if is_terminal && has_text {
+            self.final_answer = Some(message.text);
+            None
+        } else {
+            None
+        }
     }
 }
 
@@ -1611,6 +1959,7 @@ fn process_event(
     events: Option<&UnboundedSender<AgentEvent>>,
     expected_model: &str,
     use_responses_lite: bool,
+    server_model_warning_emitted: &mut bool,
 ) -> ApiResult<()> {
     if data == "[DONE]" {
         return Ok(());
@@ -1624,6 +1973,7 @@ fn process_event(
         events,
         expected_model,
         use_responses_lite,
+        server_model_warning_emitted,
     )
 }
 
@@ -1634,23 +1984,27 @@ fn process_event_value(
     events: Option<&UnboundedSender<AgentEvent>>,
     expected_model: &str,
     use_responses_lite: bool,
+    server_model_warning_emitted: &mut bool,
 ) -> ApiResult<()> {
-    validate_event_server_model(&event, expected_model)?;
+    observe_server_model(
+        event_server_model(&event),
+        expected_model,
+        events,
+        server_model_warning_emitted,
+    );
     // Completed items can contain multi-megabyte encrypted reasoning. Move the item out of the
-    // event so the collector only pays for the one copy simultaneously owned by conversation
-    // history.
+    // event so normal sampling can transfer that allocation directly into conversation history.
     if event.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
         let index = event
             .get("output_index")
             .and_then(Value::as_u64)
             .and_then(|index| usize::try_from(index).ok())
-            .unwrap_or_else(|| collected.items.len() + collected.pending_items.len());
+            .unwrap_or_else(|| collected.item_count() + collected.pending_items.len());
         let item = event
             .get_mut("item")
             .map(Value::take)
             .ok_or_else(|| ApiError::fatal("output_item.done omitted its item"))?;
-        let appended = collected.push_item(index, item, completed_items)?;
-        emit_completed_message_events(&collected.items[appended], events);
+        collected.push_item(index, item, completed_items, events)?;
         return Ok(());
     }
     match event.get("type").and_then(Value::as_str) {
@@ -1690,12 +2044,11 @@ fn process_event_value(
                 .get_mut("response")
                 .map(Value::take)
                 .ok_or_else(|| ApiError::fatal("response.completed omitted its response"))?;
-            validate_completed_response(&response, expected_model, use_responses_lite)?;
+            validate_completed_response(&response, use_responses_lite)?;
             let mut response = response;
             if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
                 for (index, item) in std::mem::take(output).into_iter().enumerate() {
-                    let appended = collected.push_item(index, item, completed_items)?;
-                    emit_completed_message_events(&collected.items[appended], events);
+                    collected.push_item(index, item, completed_items, events)?;
                 }
             }
             collected.usage = response.get("usage").and_then(parse_usage);
@@ -1736,18 +2089,6 @@ fn process_event_value(
         _ => {}
     }
     Ok(())
-}
-
-fn emit_completed_message_events(items: &[Value], events: Option<&UnboundedSender<AgentEvent>>) {
-    let Some(events) = events else {
-        return;
-    };
-    for message in items
-        .iter()
-        .filter_map(AssistantMessage::from_response_item)
-    {
-        let _ = events.send(AgentEvent::ModelMessageCompleted(message));
-    }
 }
 
 fn validate_assistant_message_phase(item: &Value) -> ApiResult<()> {
@@ -1817,14 +2158,7 @@ fn classify_stream_error(code: &str, message: &str) -> ApiError {
     }
 }
 
-fn validate_completed_response(
-    response: &Value,
-    expected_model: &str,
-    use_responses_lite: bool,
-) -> ApiResult<()> {
-    if let Some(model) = response.get("model").and_then(Value::as_str) {
-        validate_server_model(model, expected_model)?;
-    }
+fn validate_completed_response(response: &Value, use_responses_lite: bool) -> ApiResult<()> {
     if use_responses_lite
         && let Some(context) = response
             .pointer("/reasoning/context")
@@ -1838,34 +2172,17 @@ fn validate_completed_response(
     Ok(())
 }
 
-fn validate_server_model_header(headers: &HeaderMap, expected_model: &str) -> ApiResult<()> {
-    if let Some(model) = headers
-        .get("openai-model")
-        .and_then(|value| value.to_str().ok())
-    {
-        validate_server_model(model, expected_model)?;
-    }
-    Ok(())
-}
-
-fn validate_event_server_model(event: &Value, expected_model: &str) -> ApiResult<()> {
-    if let Some(model) = event.pointer("/response/model").and_then(Value::as_str) {
-        validate_server_model(model, expected_model)?;
-    }
+fn event_server_model(event: &Value) -> Option<&str> {
     let response_headers = event
         .pointer("/response/headers")
         .and_then(Value::as_object);
     let event_headers = event.get("headers").and_then(Value::as_object);
-    if let Some(model) = response_headers
+    response_headers
         .and_then(|headers| json_header_value(headers, &["openai-model", "x-openai-model"]))
         .or_else(|| {
             event_headers
                 .and_then(|headers| json_header_value(headers, &["openai-model", "x-openai-model"]))
         })
-    {
-        validate_server_model(model, expected_model)?;
-    }
-    Ok(())
 }
 
 fn json_header_value<'a>(
@@ -1885,13 +2202,34 @@ fn json_header_value<'a>(
     })
 }
 
-fn validate_server_model(model: &str, expected_model: &str) -> ApiResult<()> {
-    if model == expected_model {
-        return Ok(());
+fn observe_server_model(
+    server_model: Option<&str>,
+    requested_model: &str,
+    events: Option<&UnboundedSender<AgentEvent>>,
+    warning_emitted: &mut bool,
+) {
+    let Some(server_model) = server_model else {
+        return;
+    };
+    if server_model.eq_ignore_ascii_case(requested_model) {
+        tracing::debug!(%server_model, "server model matches the requested model");
+        return;
     }
-    Err(ApiError::fatal(format!(
-        "backend returned model `{model}` for requested bettercodex model `{expected_model}`"
-    )))
+    tracing::warn!(
+        %requested_model,
+        %server_model,
+        "server reported a different model than requested"
+    );
+    if *warning_emitted {
+        return;
+    }
+    let Some(events) = events else {
+        return;
+    };
+    *warning_emitted = true;
+    let _ = events.send(AgentEvent::Warning(format!(
+        "OpenAI routed this request from {requested_model} to {server_model}. This can occur when potentially high-risk cyber activity triggers a safety fallback; the `/model` selection remains {requested_model}."
+    )));
 }
 
 fn request_model(request: &Value) -> ApiResult<&str> {

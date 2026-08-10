@@ -63,7 +63,7 @@ impl TestApiClient for ApiClient {
         history: &[Value],
         compaction: CompactionRequest,
     ) -> ApiResult<CompactionResult> {
-        self.compact_with_identity(history, compaction, RequestInputIdentity::Exact)
+        self.compact_with_identity(history, compaction, RequestInputIdentity::Exact, None)
             .await
     }
 }
@@ -74,6 +74,88 @@ fn user_message(text: &str) -> Value {
         "role": "user",
         "content": [{"type": "input_text", "text": text}],
     })
+}
+
+fn tool_names(tools: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    for tool in tools.as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        if tool["type"] != "namespace" {
+            names.push(name.to_string());
+            continue;
+        }
+        for nested in tool["tools"].as_array().unwrap() {
+            let nested_name = nested["name"].as_str().unwrap();
+            names.push(if name == "functions" {
+                nested_name.to_string()
+            } else {
+                format!("{name}__{nested_name}")
+            });
+        }
+    }
+    names
+}
+
+fn namespace_tools<'a>(tools: &'a Value, namespace: &str) -> &'a Value {
+    tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["type"] == "namespace" && tool["name"] == namespace)
+        .and_then(|namespace| namespace.get("tools"))
+        .unwrap()
+}
+
+fn responses_lite_function_tools(additional_tools: &Value) -> &Value {
+    namespace_tools(additional_tools, "functions")
+}
+
+fn expected_direct_tool_names() -> Vec<&'static str> {
+    vec![
+        "exec_command",
+        "write_stdin",
+        "update_plan",
+        "apply_patch",
+        "view_image",
+        "log_papercut",
+        "openaiDeveloperDocs__fetch_openai_doc",
+        "openaiDeveloperDocs__get_openapi_spec",
+        "openaiDeveloperDocs__list_api_endpoints",
+        "openaiDeveloperDocs__list_openai_docs",
+        "openaiDeveloperDocs__search_openai_docs",
+        "web__run",
+    ]
+}
+
+fn expected_direct_function_tool_names() -> Vec<&'static str> {
+    vec![
+        "exec_command",
+        "write_stdin",
+        "update_plan",
+        "apply_patch",
+        "view_image",
+        "log_papercut",
+    ]
+}
+
+fn expected_openai_docs_tool_names() -> Vec<&'static str> {
+    vec![
+        "fetch_openai_doc",
+        "get_openapi_spec",
+        "list_api_endpoints",
+        "list_openai_docs",
+        "search_openai_docs",
+    ]
+}
+
+fn expected_code_mode_tool_names() -> Vec<&'static str> {
+    let mut names = vec!["exec", "wait"];
+    names.extend(expected_direct_tool_names());
+    names
+}
+
+fn expected_code_mode_only_tool_names() -> Vec<&'static str> {
+    vec!["exec", "wait"]
 }
 
 #[test]
@@ -183,7 +265,8 @@ fn completed_event(response_id: &str, item: &Value) -> Value {
 #[test]
 fn completed_event_records_full_cache_usage() {
     let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut collected = CollectedResponse::default();
+    let mut collected = CollectedResponse::new(OutputItemMode::Retain);
+    let mut server_model_warning_emitted = false;
     process_event_value(
         completed_event("resp_usage", &assistant_item("done")),
         &mut collected,
@@ -191,6 +274,7 @@ fn completed_event_records_full_cache_usage() {
         None,
         MODEL,
         true,
+        &mut server_model_warning_emitted,
     )
     .unwrap();
 
@@ -211,17 +295,26 @@ fn completed_event_records_full_cache_usage() {
 #[test]
 fn completed_items_are_emitted_once_in_api_order() {
     let (completed_items, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let mut collected = CollectedResponse::default();
-    let first = json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "cipher"});
-    let second = assistant_item("done");
+    let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::new(OutputItemMode::Transfer);
+    let mut server_model_warning_emitted = false;
+    let first = json!({
+        "type": "custom_tool_call",
+        "call_id": "call_1",
+        "name": "exec",
+        "input": "text('done')",
+    });
+    let second = assistant_item_with_phase("working", "commentary");
+    let third = assistant_item_with_phase("done", "final_answer");
 
     process_event_value(
-        json!({"type": "response.output_item.done", "output_index": 1, "item": second}),
+        json!({"type": "response.output_item.done", "output_index": 2, "item": third}),
         &mut collected,
         &completed_items,
-        None,
+        Some(&events),
         MODEL,
         true,
+        &mut server_model_warning_emitted,
     )
     .unwrap();
     assert!(received.try_recv().is_err());
@@ -229,69 +322,76 @@ fn completed_items_are_emitted_once_in_api_order() {
         json!({"type": "response.output_item.done", "output_index": 0, "item": first}),
         &mut collected,
         &completed_items,
-        None,
+        Some(&events),
         MODEL,
         true,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    assert_eq!(received.try_recv().unwrap(), first);
+    assert!(received.try_recv().is_err());
+    process_event_value(
+        json!({"type": "response.output_item.done", "output_index": 1, "item": second}),
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        true,
+        &mut server_model_warning_emitted,
     )
     .unwrap();
 
-    assert_eq!(received.try_recv().unwrap()["id"], "rs_1");
-    assert_eq!(received.try_recv().unwrap()["id"], "msg_done");
+    assert_eq!(received.try_recv().unwrap(), second);
+    assert_eq!(received.try_recv().unwrap(), third);
     assert!(received.try_recv().is_err());
-}
-
-#[test]
-fn completed_item_retains_its_stream_allocation_in_the_collector() {
-    let (completed_items, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let mut collected = CollectedResponse::default();
-    let event = json!({
-        "type": "response.output_item.done",
-        "output_index": 0,
-        "item": {
-            "type": "reasoning",
-            "id": "rs_move",
-            "encrypted_content": "cipher payload",
-        },
-    });
-    let stream_allocation = event["item"]["encrypted_content"]
-        .as_str()
-        .unwrap()
-        .as_ptr();
-
-    process_event_value(event, &mut collected, &completed_items, None, MODEL, true).unwrap();
-
+    let mut completed = completed_event("resp_summary", &Value::Null);
+    completed["response"]["output"] = json!([first, second, third,]);
+    process_event_value(
+        completed,
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        true,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    assert!(received.try_recv().is_err());
     assert_eq!(
-        collected.items[0]["encrypted_content"]
-            .as_str()
-            .unwrap()
-            .as_ptr(),
-        stream_allocation,
-        "stream payloads must move into the response collector instead of being deep-cloned"
+        received_events.try_recv().unwrap(),
+        AgentEvent::ModelMessageCompleted(AssistantMessage {
+            text: "working".to_string(),
+            phase: Some(crate::protocol::MessagePhase::Commentary),
+        })
     );
-    assert_eq!(received.try_recv().unwrap(), collected.items[0]);
+    assert_eq!(
+        received_events.try_recv().unwrap(),
+        AgentEvent::ModelMessageCompleted(AssistantMessage {
+            text: "done".to_string(),
+            phase: Some(crate::protocol::MessagePhase::FinalAnswer),
+        })
+    );
+    assert!(received_events.try_recv().is_err());
+    let response = collected.finish().unwrap();
+    assert_eq!(
+        response.tool_calls,
+        vec![ToolCall::Custom {
+            call_id: "call_1".to_string(),
+            namespace: None,
+            name: "exec".to_string(),
+            input: "text('done')".to_string(),
+        }]
+    );
+    assert_eq!(response.final_answer.as_deref(), Some("done"));
+    assert!(response.has_assistant_text());
 }
 
 #[test]
 fn extracts_text_and_forwards_streaming_events() {
-    assert_eq!(
-        terminal_answer(&[assistant_item("done")]).as_deref(),
-        Some("done")
-    );
-    assert_eq!(
-        terminal_answer(&[
-            assistant_item_with_phase("working", "commentary"),
-            assistant_item_with_phase("done", "final_answer"),
-        ])
-        .as_deref(),
-        Some("done")
-    );
-    assert_eq!(
-        terminal_answer(&[assistant_item_with_phase("future", "unknown")]),
-        None
-    );
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut collected = CollectedResponse::default();
+    let mut collected = CollectedResponse::new(OutputItemMode::Retain);
+    let mut server_model_warning_emitted = false;
     process_event(
         r#"{"type":"response.output_text.delta","delta":"hello"}"#,
         &mut collected,
@@ -299,6 +399,7 @@ fn extracts_text_and_forwards_streaming_events() {
         Some(&events),
         MODEL,
         true,
+        &mut server_model_warning_emitted,
     )
     .unwrap();
     process_event(
@@ -308,6 +409,7 @@ fn extracts_text_and_forwards_streaming_events() {
         Some(&events),
         MODEL,
         true,
+        &mut server_model_warning_emitted,
     )
     .unwrap();
     process_event(
@@ -317,6 +419,7 @@ fn extracts_text_and_forwards_streaming_events() {
         Some(&events),
         MODEL,
         true,
+        &mut server_model_warning_emitted,
     )
     .unwrap();
 
@@ -409,8 +512,54 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
     assert!(body.get("service_tier").is_none());
     assert!(body.get("max_output_tokens").is_none());
     assert!(body.get("tools").is_none());
+    assert!(body.get("instructions").is_none());
+    assert_eq!(body["parallel_tool_calls"], false);
     assert_eq!(body["reasoning"]["context"], "all_turns");
     assert_eq!(body["input"][0]["type"], "additional_tools");
+    assert_eq!(body["input"][0]["role"], "developer");
+    assert_eq!(
+        body["input"][1],
+        json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": harness_instructions(),
+            }],
+        })
+    );
+    let additional_tools = body["input"][0]["tools"].as_array().unwrap();
+    assert_eq!(additional_tools.len(), 1);
+    assert_eq!(additional_tools[0]["type"], "namespace");
+    assert_eq!(additional_tools[0]["name"], "functions");
+    assert_eq!(additional_tools[0]["description"], "");
+    let tools = responses_lite_function_tools(&body["input"][0]["tools"]);
+    assert_eq!(tool_names(tools), expected_code_mode_only_tool_names());
+    let exec = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "exec")
+        .unwrap();
+    assert!(
+        exec["description"]
+            .as_str()
+            .unwrap()
+            .contains("### `apply_patch`")
+    );
+    assert!(exec["description"].as_str().unwrap().contains("ALL_TOOLS"));
+    assert!(
+        exec["description"]
+            .as_str()
+            .unwrap()
+            .contains("declare const tools: { apply_patch(input: string): Promise<")
+    );
+    assert!(
+        exec["description"]
+            .as_str()
+            .unwrap()
+            .contains("detail?: \"high\" | \"original\";")
+    );
     assert_eq!(
         body["input"].as_array().unwrap().last().unwrap(),
         &user_message("hello")
@@ -446,6 +595,64 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
     server.join().unwrap();
 }
 
+#[tokio::test]
+async fn model_rerouting_warns_once_per_turn_without_rejecting_payload_aliases() {
+    const FALLBACK_MODEL: &str = "gpt-5.2";
+    let first_item = assistant_item("first");
+    let mut first_completed = completed_event("resp_rerouted_event", &first_item);
+    first_completed["response"]["model"] = Value::String("backend-payload-alias".to_string());
+    let first_stream = format!(
+        "data: {}\n\ndata: {first_completed}\n\n",
+        json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_rerouted_event",
+                "headers": {"OpenAI-Model": FALLBACK_MODEL},
+            },
+        })
+    );
+    let second_item = assistant_item("second");
+    let (base_url, _requests, server) = spawn_http_server(vec![
+        HttpReply::ok("text/event-stream", first_stream).with_header("openai-model", MODEL),
+        HttpReply::ok(
+            "text/event-stream",
+            completed_sse("resp_rerouted_header", &second_item),
+        )
+        .with_header("openai-model", FALLBACK_MODEL),
+    ]);
+    let mut client = test_client(base_url);
+    client.prefer_websocket = false;
+    client.begin_turn();
+    let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    for (prompt, expected) in [("first", "first"), ("second", "second")] {
+        let mut request = client.build_request(vec![user_message(prompt)], RequestKind::Turn);
+        let response = client
+            .respond_request_with_events(
+                &mut request,
+                &completed_items,
+                Some(&events),
+                RequestKind::Turn,
+                RequestInputIdentity::Exact,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.final_answer.as_deref(), Some(expected));
+    }
+
+    let warnings = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::Warning(warning) => Some(warning),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains(MODEL));
+    assert!(warnings[0].contains(FALLBACK_MODEL));
+    server.join().unwrap();
+}
+
 #[test]
 fn standard_responses_models_use_their_native_request_contract() {
     let mut client = test_client("http://127.0.0.1:1".to_string());
@@ -460,13 +667,205 @@ fn standard_responses_models_use_their_native_request_contract() {
     assert_eq!(request["model"], "gpt-5.2");
     assert_eq!(request["reasoning"]["effort"], "xhigh");
     assert!(request["reasoning"].get("context").is_none());
+    assert_eq!(request["parallel_tool_calls"], true);
+    assert_eq!(tool_names(&request["tools"]), expected_direct_tool_names());
+    let tools = request["tools"].as_array().unwrap();
+    assert_eq!(
+        tool_names(namespace_tools(&request["tools"], "openaiDeveloperDocs")),
+        expected_openai_docs_tool_names()
+    );
+    assert_eq!(
+        tool_names(namespace_tools(&request["tools"], "web")),
+        vec!["run"]
+    );
+    assert!(tools.iter().all(|tool| tool.get("output_schema").is_none()));
+    assert!(tools.iter().all(|tool| tool["name"] != "exec"));
+    assert!(tools.iter().all(|tool| tool["name"] != "wait"));
+    let patch = tools
+        .iter()
+        .find(|tool| tool["name"] == "apply_patch")
+        .unwrap();
+    assert_eq!(patch["type"], "custom");
+    assert_eq!(patch["format"]["type"], "grammar");
     assert!(
-        request["tools"]
-            .as_array()
-            .is_some_and(|tools| !tools.is_empty())
+        patch["format"]["definition"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch")
+    );
+    let view_image = tools
+        .iter()
+        .find(|tool| tool["name"] == "view_image")
+        .unwrap();
+    assert!(
+        view_image["parameters"]["properties"]
+            .get("detail")
+            .is_none()
     );
     assert_eq!(request["input"], json!([message]));
     assert!(request.get("service_tier").is_none());
+}
+
+#[test]
+fn standard_code_mode_is_hybrid_and_code_mode_only_hides_nested_tools() {
+    let mut client = test_client("http://127.0.0.1:1".to_string());
+    let mut selection =
+        crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::Medium);
+    selection.tool_mode = Some(ToolMode::CodeMode);
+    client.set_model_selection(selection.clone());
+
+    let hybrid = client.build_request(vec![user_message("hybrid")], RequestKind::Turn);
+    assert_eq!(
+        tool_names(&hybrid["tools"]),
+        expected_code_mode_tool_names()
+    );
+    let hybrid_tools = hybrid["tools"].as_array().unwrap();
+    let hybrid_exec = hybrid_tools
+        .iter()
+        .find(|tool| tool["name"] == "exec")
+        .unwrap();
+    assert!(
+        hybrid_exec["description"]
+            .as_str()
+            .unwrap()
+            .contains("Defaults to 30000 ms.")
+    );
+    assert!(
+        !hybrid_exec["description"]
+            .as_str()
+            .unwrap()
+            .contains("### `apply_patch`")
+    );
+    let hybrid_patch = hybrid_tools
+        .iter()
+        .find(|tool| tool["name"] == "apply_patch")
+        .unwrap();
+    assert!(
+        hybrid_patch["description"]
+            .as_str()
+            .unwrap()
+            .contains("exec tool declaration:")
+    );
+
+    selection.tool_mode = Some(ToolMode::CodeModeOnly);
+    client.set_model_selection(selection);
+    let code_mode_only =
+        client.build_request(vec![user_message("code mode only")], RequestKind::Turn);
+    assert_eq!(
+        tool_names(&code_mode_only["tools"]),
+        expected_code_mode_only_tool_names()
+    );
+    let exec = code_mode_only["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "exec")
+        .unwrap();
+    assert!(
+        exec["description"]
+            .as_str()
+            .unwrap()
+            .contains("### `apply_patch`")
+    );
+    assert!(
+        !exec["description"]
+            .as_str()
+            .unwrap()
+            .contains("detail?: \"high\" | \"original\";")
+    );
+}
+
+#[test]
+fn responses_lite_uses_the_selected_direct_catalogue() {
+    let mut client = test_client("http://127.0.0.1:1".to_string());
+    let mut selection =
+        crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::Medium);
+    selection.use_responses_lite = true;
+    client.set_model_selection(selection);
+
+    let request = client.build_request(vec![user_message("direct lite")], RequestKind::Turn);
+
+    assert!(request.get("tools").is_none());
+    assert!(request.get("instructions").is_none());
+    assert_eq!(request["input"][0]["type"], "additional_tools");
+    let tools = &request["input"][0]["tools"];
+    assert_eq!(tool_names(tools), expected_direct_tool_names());
+    assert_eq!(
+        tool_names(responses_lite_function_tools(tools)),
+        expected_direct_function_tool_names()
+    );
+    let view_image = responses_lite_function_tools(tools)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "view_image")
+        .unwrap();
+    assert!(
+        view_image["parameters"]["properties"]
+            .get("detail")
+            .is_none()
+    );
+    assert_eq!(
+        tool_names(namespace_tools(tools, "openaiDeveloperDocs")),
+        expected_openai_docs_tool_names()
+    );
+    assert_eq!(tool_names(namespace_tools(tools, "web")), vec!["run"]);
+    assert_eq!(request["input"][1]["role"], "developer");
+}
+
+#[test]
+fn responses_lite_strips_image_details_only_from_the_request_copy() {
+    let history = vec![
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": "data:image/png;base64,user",
+                "detail": "original",
+            }],
+        }),
+        json!({
+            "type": "function_call_output",
+            "call_id": "function",
+            "output": [{
+                "type": "input_image",
+                "image_url": "data:image/png;base64,function",
+                "detail": "high",
+            }],
+        }),
+        json!({
+            "type": "custom_tool_call_output",
+            "call_id": "custom",
+            "output": [{
+                "type": "input_image",
+                "image_url": "data:image/png;base64,custom",
+                "detail": "auto",
+            }],
+        }),
+    ];
+
+    let (request_input, restoration) = compose_sampling_input(
+        history.clone(),
+        true,
+        ToolMode::CodeModeOnly,
+        /*supports_image_detail_original*/ true,
+    );
+
+    assert!(
+        request_input
+            .iter()
+            .flat_map(|item| {
+                item.get("content")
+                    .or_else(|| item.get("output"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|item| item["type"] == "input_image")
+            .all(|image| image.get("detail").is_none())
+    );
+    assert_eq!(restoration.restore(request_input).unwrap(), history);
 }
 
 #[test]
@@ -477,7 +876,7 @@ fn standard_responses_accept_completed_events_without_lite_reasoning_context() {
         "output": [],
     });
 
-    validate_completed_response(&response, "gpt-5.2", false).unwrap();
+    validate_completed_response(&response, false).unwrap();
 }
 
 #[tokio::test]

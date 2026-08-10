@@ -5,6 +5,7 @@ use crate::input::UserPrompt;
 use crate::skills::SkillMention;
 use crate::skills::SkillSelection;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -18,13 +19,16 @@ pub(super) struct Editor {
     text: String,
     cursor: usize,
     preferred_column: Option<usize>,
-    history: Vec<EditorHistoryEntry>,
+    history: VecDeque<EditorHistoryEntry>,
     history_index: Option<usize>,
     saved_draft: Option<EditorHistoryEntry>,
     pending_pastes: Vec<PendingPaste>,
     skill_mentions: Vec<SkillMention>,
     image_attachments: Vec<PromptImageAttachment>,
     history_search: Option<HistorySearchSession>,
+    history_has_older: bool,
+    history_load_in_flight: bool,
+    pending_history_load: Option<HistoryLoadIntent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,7 +50,14 @@ struct EditorHistoryEntry {
 pub(super) enum HistorySearchStatus {
     Idle,
     Match,
+    Searching,
     NoMatch,
+}
+
+#[derive(Debug)]
+enum HistoryLoadIntent {
+    RecallPrevious { steps: usize },
+    Search { query: String, target_match: usize },
 }
 
 #[derive(Debug)]
@@ -54,6 +65,7 @@ struct HistorySearchSession {
     original: EditorSnapshot,
     query: String,
     matches: Vec<usize>,
+    seen_texts: HashSet<String>,
     selected: Option<usize>,
     status: HistorySearchStatus,
 }
@@ -126,6 +138,7 @@ impl Editor {
             original: self.snapshot(),
             query: String::new(),
             matches: Vec::new(),
+            seen_texts: HashSet::new(),
             selected: None,
             status: HistorySearchStatus::Idle,
         });
@@ -161,18 +174,42 @@ impl Editor {
     }
 
     pub(super) fn history_search_older(&mut self) {
-        let Some(search) = self.history_search.as_mut() else {
+        let Some((query, target_match, match_count)) =
+            self.history_search.as_ref().and_then(|search| {
+                (!search.query.is_empty()).then(|| {
+                    (
+                        search.query.clone(),
+                        search
+                            .selected
+                            .map_or(0, |selected| selected.saturating_add(1)),
+                        search.matches.len(),
+                    )
+                })
+            })
+        else {
             return;
         };
-        if search.query.is_empty() || search.matches.is_empty() {
-            return;
+        if target_match < match_count {
+            if let Some(search) = self.history_search.as_mut() {
+                search.selected = Some(target_match);
+                search.status = HistorySearchStatus::Match;
+            }
+            self.preview_history_search_match();
+        } else if self.history_has_older {
+            self.request_history_load(HistoryLoadIntent::Search {
+                query,
+                target_match,
+            });
+            if let Some(search) = self.history_search.as_mut() {
+                search.status = HistorySearchStatus::Searching;
+            }
+        } else if let Some(search) = self.history_search.as_mut() {
+            search.status = if search.matches.is_empty() {
+                HistorySearchStatus::NoMatch
+            } else {
+                HistorySearchStatus::Match
+            };
         }
-        let selected = search
-            .selected
-            .map_or(0, |selected| (selected + 1).min(search.matches.len() - 1));
-        search.selected = Some(selected);
-        search.status = HistorySearchStatus::Match;
-        self.preview_history_search_match();
     }
 
     pub(super) fn history_search_newer(&mut self) {
@@ -181,6 +218,12 @@ impl Editor {
         };
         if search.query.is_empty() || search.matches.is_empty() {
             return;
+        }
+        if matches!(
+            self.pending_history_load,
+            Some(HistoryLoadIntent::Search { .. })
+        ) {
+            self.pending_history_load = None;
         }
         let selected = search.selected.unwrap_or_default().saturating_sub(1);
         search.selected = Some(selected);
@@ -192,9 +235,10 @@ impl Editor {
         if self
             .history_search
             .as_ref()
-            .is_some_and(|search| search.status == HistorySearchStatus::Match)
+            .is_some_and(|search| search.selected.is_some())
         {
             self.history_search = None;
+            self.pending_history_load = None;
             self.history_index = None;
             self.saved_draft = None;
             self.cursor = self.text.len();
@@ -203,6 +247,7 @@ impl Editor {
     }
 
     pub(super) fn cancel_history_search(&mut self) {
+        self.pending_history_load = None;
         if let Some(search) = self.history_search.take() {
             self.restore_snapshot(search.original);
         }
@@ -210,6 +255,7 @@ impl Editor {
 
     pub(super) fn set_text(&mut self, text: impl Into<String>) {
         self.history_search = None;
+        self.pending_history_load = None;
         self.text = text.into();
         self.cursor = self.text.len();
         self.preferred_column = None;
@@ -280,9 +326,10 @@ impl Editor {
     }
 
     fn remember_entry(&mut self, entry: EditorHistoryEntry) {
-        if !entry.text.is_empty() && self.history.last().is_none_or(|last| last != &entry) {
-            self.history.push(entry);
+        if !entry.text.is_empty() && self.history.back().is_none_or(|last| last != &entry) {
+            self.history.push_back(entry);
         }
+        self.pending_history_load = None;
         self.history_index = None;
         self.saved_draft = None;
     }
@@ -291,6 +338,63 @@ impl Editor {
         for text in history {
             self.remember(&text);
         }
+    }
+
+    pub(super) fn set_persistent_history_available(&mut self, available: bool) {
+        self.history_has_older = available;
+        if !available && !self.history_load_in_flight {
+            self.pending_history_load = None;
+        }
+    }
+
+    /// Marks a pending lazy-history request as started.
+    ///
+    /// The caller owns the blocking I/O task and returns its newest-first batch through
+    /// [`Self::persistent_history_loaded`].
+    pub(super) fn begin_history_load(&mut self) -> bool {
+        if self.history_has_older
+            && !self.history_load_in_flight
+            && self.pending_history_load.is_some()
+        {
+            self.history_load_in_flight = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn persistent_history_loaded(
+        &mut self,
+        newest_first: impl IntoIterator<Item = String>,
+        has_more: bool,
+    ) {
+        self.history_load_in_flight = false;
+        self.history_has_older = has_more;
+        self.prepend_persistent_history(newest_first);
+
+        let intent = self.pending_history_load.take();
+        match intent {
+            Some(HistoryLoadIntent::RecallPrevious { mut steps }) => {
+                while steps > 0 && self.recall_previous_loaded() {
+                    steps = steps.saturating_sub(1);
+                }
+                if steps > 0 && self.history_has_older {
+                    self.pending_history_load = Some(HistoryLoadIntent::RecallPrevious { steps });
+                }
+            }
+            Some(HistoryLoadIntent::Search {
+                query,
+                target_match,
+            }) => self.fulfill_history_search(query, target_match),
+            None => self.refresh_active_history_search(),
+        }
+    }
+
+    pub(super) fn persistent_history_failed(&mut self) {
+        self.history_load_in_flight = false;
+        self.history_has_older = false;
+        self.pending_history_load = None;
+        self.refresh_active_history_search();
     }
 
     pub(super) fn clear_for_ctrl_c(&mut self) {
@@ -322,20 +426,26 @@ impl Editor {
 
     pub(super) fn history_previous(&mut self) {
         if self.history.is_empty() {
+            if self.history_has_older {
+                if self.saved_draft.is_none() {
+                    self.saved_draft = Some(self.history_entry());
+                }
+                self.request_previous_history(1);
+            }
             return;
         }
-        let index = match self.history_index {
-            Some(index) => index.saturating_sub(1),
-            None => {
-                self.saved_draft = Some(self.history_entry());
-                self.history.len() - 1
-            }
-        };
-        self.history_index = Some(index);
-        self.apply_history_entry(self.history[index].clone());
+        if !self.recall_previous_loaded() && self.history_has_older {
+            self.request_previous_history(1);
+        }
     }
 
     pub(super) fn history_next(&mut self) {
+        if matches!(
+            self.pending_history_load,
+            Some(HistoryLoadIntent::RecallPrevious { .. })
+        ) {
+            self.pending_history_load = None;
+        }
         let Some(index) = self.history_index else {
             return;
         };
@@ -355,7 +465,7 @@ impl Editor {
     }
 
     pub(super) fn can_recall_older(&self) -> bool {
-        !self.history.is_empty()
+        (!self.history.is_empty() || self.history_has_older)
             && (self.text.is_empty()
                 || (self.is_browsing_history()
                     && (self.cursor == 0 || self.cursor == self.text.len())))
@@ -773,8 +883,113 @@ impl Editor {
 
     fn leave_history(&mut self) {
         self.history_search = None;
+        self.pending_history_load = None;
         self.history_index = None;
         self.saved_draft = None;
+    }
+
+    fn request_history_load(&mut self, intent: HistoryLoadIntent) {
+        if self.history_has_older {
+            self.pending_history_load = Some(intent);
+        }
+    }
+
+    fn request_previous_history(&mut self, steps: usize) {
+        if !self.history_has_older {
+            return;
+        }
+        if let Some(HistoryLoadIntent::RecallPrevious {
+            steps: pending_steps,
+        }) = self.pending_history_load.as_mut()
+        {
+            *pending_steps = pending_steps.saturating_add(steps);
+        } else {
+            self.pending_history_load = Some(HistoryLoadIntent::RecallPrevious { steps });
+        }
+    }
+
+    fn recall_previous_loaded(&mut self) -> bool {
+        let Some(index) = self.history_index else {
+            let Some(index) = self.history.len().checked_sub(1) else {
+                return false;
+            };
+            if self.saved_draft.is_none() {
+                self.saved_draft = Some(self.history_entry());
+            }
+            self.history_index = Some(index);
+            self.apply_history_entry(self.history[index].clone());
+            return true;
+        };
+        let Some(index) = index.checked_sub(1) else {
+            return false;
+        };
+        self.history_index = Some(index);
+        self.apply_history_entry(self.history[index].clone());
+        true
+    }
+
+    fn prepend_persistent_history(&mut self, newest_first: impl IntoIterator<Item = String>) {
+        let mut added = 0;
+        for text in newest_first {
+            let entry = EditorHistoryEntry {
+                text,
+                ..EditorHistoryEntry::default()
+            };
+            if !entry.text.is_empty() && self.history.front().is_none_or(|newer| newer != &entry) {
+                self.history.push_front(entry);
+                added += 1;
+            }
+        }
+        if added == 0 {
+            return;
+        }
+
+        let shift = |index: &mut Option<usize>| {
+            if let Some(index) = index {
+                *index = index.saturating_add(added);
+            }
+        };
+        shift(&mut self.history_index);
+        if let Some(search) = self.history_search.as_mut() {
+            shift(&mut search.original.history_index);
+            for index in &mut search.matches {
+                *index = index.saturating_add(added);
+            }
+        }
+        self.extend_active_history_search(added);
+    }
+
+    fn matching_history(&self, query: &str) -> (Vec<usize>, HashSet<String>) {
+        let folded_query = query.to_lowercase();
+        let mut unique = HashSet::new();
+        let matches = self
+            .history
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, entry)| entry.text.to_lowercase().contains(&folded_query))
+            .filter(|(_, entry)| unique.insert(entry.text.clone()))
+            .map(|(index, _)| index)
+            .collect();
+        (matches, unique)
+    }
+
+    fn extend_active_history_search(&mut self, added: usize) {
+        let Some(search) = self.history_search.as_mut() else {
+            return;
+        };
+        if search.query.is_empty() {
+            return;
+        }
+        let folded_query = search.query.to_lowercase();
+        for index in (0..added).rev() {
+            let entry = &self.history[index];
+            if entry.text.to_lowercase().contains(&folded_query)
+                && search.seen_texts.insert(entry.text.clone())
+            {
+                search.matches.push(index);
+            }
+        }
     }
 
     fn restart_history_search(&mut self) {
@@ -785,32 +1000,108 @@ impl Editor {
         else {
             return;
         };
+        self.pending_history_load = None;
         self.restore_snapshot(original);
         if query.is_empty() {
             if let Some(search) = self.history_search.as_mut() {
                 search.matches.clear();
+                search.seen_texts.clear();
                 search.selected = None;
                 search.status = HistorySearchStatus::Idle;
             }
             return;
         }
 
-        let folded_query = query.to_lowercase();
-        let mut unique = HashSet::new();
-        let matches = self
-            .history
-            .iter()
-            .enumerate()
-            .rev()
-            .filter(|(_, entry)| entry.text.to_lowercase().contains(&folded_query))
-            .filter(|(_, entry)| unique.insert(entry.text.as_str()))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let (matches, seen_texts) = self.matching_history(&query);
+        let has_match = !matches.is_empty();
         if let Some(search) = self.history_search.as_mut() {
             search.matches = matches;
-            search.selected = (!search.matches.is_empty()).then_some(0);
-            search.status = if search.matches.is_empty() {
+            search.seen_texts = seen_texts;
+            search.selected = has_match.then_some(0);
+            search.status = if has_match {
+                HistorySearchStatus::Match
+            } else if self.history_has_older {
+                HistorySearchStatus::Searching
+            } else {
                 HistorySearchStatus::NoMatch
+            };
+        }
+        if has_match {
+            self.preview_history_search_match();
+        } else if self.history_has_older {
+            self.request_history_load(HistoryLoadIntent::Search {
+                query,
+                target_match: 0,
+            });
+        }
+    }
+
+    fn fulfill_history_search(&mut self, query: String, target_match: usize) {
+        if self.history_search_query() != Some(query.as_str()) {
+            self.refresh_active_history_search();
+            return;
+        }
+        let selected = self
+            .history_search
+            .as_ref()
+            .and_then(|search| (target_match < search.matches.len()).then_some(target_match));
+        if let Some(search) = self.history_search.as_mut() {
+            if let Some(selected) = selected {
+                search.selected = Some(selected);
+                search.status = HistorySearchStatus::Match;
+            } else if self.history_has_older {
+                search.status = HistorySearchStatus::Searching;
+                if let Some(previous) = search.selected {
+                    search.selected = (!search.matches.is_empty())
+                        .then_some(previous.min(search.matches.len() - 1));
+                }
+            } else if search.matches.is_empty() {
+                search.selected = None;
+                search.status = HistorySearchStatus::NoMatch;
+            } else {
+                search.selected = Some(search.matches.len() - 1);
+                search.status = HistorySearchStatus::Match;
+            }
+        }
+        if selected.is_some() || !self.history_has_older {
+            self.preview_history_search_match();
+        } else {
+            self.request_history_load(HistoryLoadIntent::Search {
+                query,
+                target_match,
+            });
+        }
+    }
+
+    fn refresh_active_history_search(&mut self) {
+        let Some((query, selected, was_searching)) = self.history_search.as_ref().map(|search| {
+            (
+                search.query.clone(),
+                search.selected,
+                search.status == HistorySearchStatus::Searching,
+            )
+        }) else {
+            return;
+        };
+        if query.is_empty() {
+            if let Some(search) = self.history_search.as_mut() {
+                search.matches.clear();
+                search.seen_texts.clear();
+                search.selected = None;
+                search.status = HistorySearchStatus::Idle;
+            }
+            return;
+        }
+        if let Some(search) = self.history_search.as_mut() {
+            search.selected = selected
+                .filter(|selected| *selected < search.matches.len())
+                .or_else(|| (!search.matches.is_empty()).then_some(0));
+            search.status = if search.matches.is_empty() {
+                if was_searching && self.history_load_in_flight {
+                    HistorySearchStatus::Searching
+                } else {
+                    HistorySearchStatus::NoMatch
+                }
             } else {
                 HistorySearchStatus::Match
             };
@@ -858,7 +1149,7 @@ impl Editor {
         let Some(search) = self
             .history_search
             .as_ref()
-            .filter(|search| search.status == HistorySearchStatus::Match)
+            .filter(|search| search.selected.is_some())
         else {
             return Vec::new();
         };
@@ -1259,5 +1550,75 @@ mod tests {
         assert_eq!(editor.text(), "first");
         editor.history_next();
         assert_eq!(editor.text(), "draft");
+    }
+
+    #[test]
+    fn history_navigation_continues_across_lazy_batches() {
+        let mut editor = Editor::default();
+        editor.set_persistent_history_available(true);
+
+        editor.history_previous();
+        assert!(editor.begin_history_load());
+        editor.persistent_history_loaded(["newer", "older"].map(str::to_string), true);
+        assert_eq!(editor.text(), "newer");
+
+        editor.history_previous();
+        assert_eq!(editor.text(), "older");
+        editor.history_previous();
+        assert!(editor.begin_history_load());
+        editor.persistent_history_loaded(["oldest".to_string()], false);
+        assert_eq!(editor.text(), "oldest");
+
+        editor.history_next();
+        assert_eq!(editor.text(), "older");
+    }
+
+    #[test]
+    fn reverse_search_loads_until_an_older_match_is_found() {
+        let mut editor = Editor::default();
+        editor.set_persistent_history_available(true);
+        editor.begin_history_search();
+        editor.history_search_insert("needle");
+
+        assert_eq!(
+            editor.history_search_status(),
+            Some(HistorySearchStatus::Searching)
+        );
+        assert!(editor.begin_history_load());
+        editor.persistent_history_loaded(["unrelated".to_string()], true);
+        assert_eq!(
+            editor.history_search_status(),
+            Some(HistorySearchStatus::Searching)
+        );
+        assert!(editor.begin_history_load());
+
+        editor.persistent_history_loaded(["old needle".to_string()], false);
+        assert_eq!(
+            editor.history_search_status(),
+            Some(HistorySearchStatus::Match)
+        );
+        assert_eq!(editor.text(), "old needle");
+    }
+
+    #[test]
+    fn reverse_search_cycles_through_matches_from_later_batches() {
+        let mut editor = Editor::default();
+        editor.seed_history(["newest needle".to_string()]);
+        editor.set_persistent_history_available(true);
+        editor.begin_history_search();
+        editor.history_search_insert("needle");
+        assert_eq!(editor.text(), "newest needle");
+
+        editor.history_search_older();
+        assert_eq!(
+            editor.history_search_status(),
+            Some(HistorySearchStatus::Searching)
+        );
+        assert!(editor.begin_history_load());
+        editor.persistent_history_loaded(["older needle".to_string()], false);
+        assert_eq!(editor.text(), "older needle");
+
+        editor.history_search_newer();
+        assert_eq!(editor.text(), "newest needle");
     }
 }

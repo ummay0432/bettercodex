@@ -23,17 +23,19 @@ use crate::rollout::SessionTranscriptItem;
 use crate::rollout::TurnOutcome;
 use crate::service_tier::ServiceTier;
 use crate::tools::ProcessManager;
-use crate::tools::ToolResult;
 use crate::tools::ToolRuntime;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesOrdered;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
@@ -172,6 +174,7 @@ pub(crate) struct Agent {
     conversation: Conversation,
     tools: ToolRuntime,
     resumed_transcript: Vec<SessionTranscriptItem>,
+    transcript_checkpoint: Option<usize>,
 }
 
 impl Agent {
@@ -182,7 +185,12 @@ impl Agent {
             tracing::warn!(%error, "failed to load saved model selection; using the default");
             ModelSelection::default()
         });
-        let conversation = Conversation::create_with_selection(&cwd, model_selection)?;
+        let service_tier = crate::service_tier::load_default().unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to load saved Fast mode preference; using off");
+            ServiceTier::default()
+        });
+        let mut conversation = Conversation::create_with_selection(&cwd, model_selection)?;
+        conversation.set_service_tier(service_tier)?;
         let identity = conversation.identity().clone();
         let api = ApiClient::new(
             auth,
@@ -202,6 +210,7 @@ impl Agent {
             conversation,
             tools,
             resumed_transcript: Vec::new(),
+            transcript_checkpoint: None,
         })
     }
 
@@ -218,6 +227,7 @@ impl Agent {
         let identity = rollout.identity().clone();
         let compaction_count = self.api.compaction_count();
         rollout.record_fork(self.session_id(), compaction_count)?;
+        let transcript_checkpoint = Some(transcript.len());
         rollout.snapshot_transcript(transcript)?;
         let conversation = self.conversation.fork(rollout)?;
         let api = ApiClient::new(
@@ -238,6 +248,7 @@ impl Agent {
             conversation,
             tools,
             resumed_transcript: Vec::new(),
+            transcript_checkpoint,
         })
     }
 
@@ -246,6 +257,7 @@ impl Agent {
         let identity = loaded.metadata.identity.clone();
         let compaction_count = loaded.compaction_count;
         let resumed_transcript = std::mem::take(&mut loaded.transcript);
+        let transcript_checkpoint = loaded.transcript_checkpoint;
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
         let api = ApiClient::new(
@@ -266,6 +278,7 @@ impl Agent {
             conversation,
             tools,
             resumed_transcript,
+            transcript_checkpoint,
         })
     }
 
@@ -319,6 +332,36 @@ impl Agent {
 
     pub(crate) fn take_resumed_transcript(&mut self) -> Vec<SessionTranscriptItem> {
         std::mem::take(&mut self.resumed_transcript)
+    }
+
+    pub(crate) fn transcript_checkpoint(&self) -> Option<usize> {
+        self.transcript_checkpoint
+    }
+
+    pub(crate) fn invalidate_transcript_checkpoint(&mut self) {
+        self.transcript_checkpoint = None;
+    }
+
+    pub(crate) fn persist_transcript(
+        &mut self,
+        items: Vec<SessionTranscriptItem>,
+        total_items: usize,
+    ) -> Result<()> {
+        match self.transcript_checkpoint {
+            Some(checkpoint) if checkpoint.saturating_add(items.len()) == total_items => {
+                self.conversation.append_transcript(items)?;
+            }
+            _ if items.len() == total_items => {
+                self.conversation.snapshot_transcript(items)?;
+            }
+            _ => {
+                return Err(anyhow!(
+                    "complete transcript is required to replace its saved checkpoint"
+                ));
+            }
+        }
+        self.transcript_checkpoint = Some(total_items);
+        Ok(())
     }
 
     pub(crate) fn skills(&self) -> &[crate::skills::Skill] {
@@ -477,14 +520,26 @@ impl Agent {
         }
 
         // Hide the one-time ICU decompression and V8 platform initialization behind the model's
-        // first sampling request instead of paying it after the first exec call arrives.
-        self.tools.prewarm();
+        // first sampling request without charging direct-only models for an unavailable route.
+        if self
+            .conversation
+            .model_selection()
+            .tool_mode()
+            .includes_code_mode()
+        {
+            self.tools.prewarm();
+        }
         let mut pending_steering = VecDeque::new();
         // Sample the fresh turn input first. After a mid-turn compact, sample the
         // compacted tool continuation once before inserting queued steering.
         let mut can_record_pending_steering = false;
         loop {
             if can_record_pending_steering {
+                let notifications = self.tools.take_notifications()?;
+                if !notifications.is_empty() {
+                    self.conversation.extend(notifications)?;
+                    self.emit_context(events);
+                }
                 control.drain_steering(&mut pending_steering);
                 while let Some(input) = pending_steering.pop_front() {
                     if !self
@@ -503,6 +558,11 @@ impl Agent {
             }
             can_record_pending_steering = true;
 
+            let tool_mode = self.conversation.model_selection().tool_mode();
+            let code_mode_step = tool_mode.includes_code_mode().then(|| {
+                let context = self.api.tool_turn_context(self.conversation.items());
+                self.tools.begin_step(context, events.clone())
+            });
             let response = match self.sample_with_recovery(events, control).await? {
                 SamplingOutcome::Response(response) => response,
                 SamplingOutcome::Cancelled => return Ok(SubmitOutcome::Cancelled),
@@ -515,10 +575,14 @@ impl Agent {
             self.emit_context(events);
             emit(events, AgentEvent::ModelResponseCompleted);
 
-            let mut tool_calls = response.tool_calls.into_iter();
-            if tool_calls.len() == 0 && !model_needs_follow_up {
+            let tool_calls = response.tool_calls;
+            if tool_calls.is_empty() && !model_needs_follow_up {
+                drop(code_mode_step);
                 control.drain_steering(&mut pending_steering);
                 if !pending_steering.is_empty() {
+                    continue;
+                }
+                if self.tools.has_notifications()? {
                     continue;
                 }
                 if !control.close_if_idle(&mut pending_steering) {
@@ -535,29 +599,39 @@ impl Agent {
                 return Err(anyhow!("model returned no text or tool call"));
             }
 
-            while let Some(tool_call) = tool_calls.next() {
-                let context = self.api.tool_turn_context(self.conversation.items());
-                let output = tool_call
-                    .execute(
-                        &self.tools,
-                        context,
-                        events.clone(),
-                        control.cancellation.clone(),
-                    )
-                    .await;
+            let context = self.api.tool_turn_context(self.conversation.items());
+            let execution_gate = Arc::new(RwLock::new(()));
+            let mut in_flight = FuturesOrdered::new();
+            for tool_call in tool_calls {
+                let execution_gate = Arc::clone(&execution_gate);
+                let context = context.clone();
+                let cancellation = control.cancellation.clone();
+                let events = events.clone();
+                let tools = &self.tools;
+                in_flight.push_back(async move {
+                    let output = if tool_call.supports_parallel_execution() {
+                        let _execution = execution_gate.read_owned().await;
+                        tool_call
+                            .execute(tools, tool_mode, context, events, cancellation)
+                            .await
+                    } else {
+                        let _execution = execution_gate.write_owned().await;
+                        tool_call
+                            .execute(tools, tool_mode, context, events, cancellation)
+                            .await
+                    };
+                    (tool_call, output)
+                });
+            }
+            while let Some((tool_call, output)) = in_flight.next().await {
                 self.conversation
                     .extend(tool_call.into_output_items(output))?;
                 self.emit_context(events);
-                if control.cancellation.is_cancelled() {
-                    for pending in tool_calls {
-                        let output = ToolResult::text(
-                            "tool error: skipped after user interruption".to_string(),
-                        );
-                        self.conversation
-                            .extend(pending.into_output_items(output))?;
-                    }
-                    return Ok(SubmitOutcome::Cancelled);
-                }
+            }
+            drop(in_flight);
+            drop(code_mode_step);
+            if control.cancellation.is_cancelled() {
+                return Ok(SubmitOutcome::Cancelled);
             }
             if self.conversation.needs_compaction() {
                 if !self
@@ -592,7 +666,7 @@ impl Agent {
             return Some(ModelSwitchCompactionReason::CompHashChanged);
         }
         let downshift_exceeds_limit = previous.model != current.model
-            && previous.raw_context_window > current.raw_context_window
+            && previous.effective_context_window() > current.effective_context_window()
             && self.conversation.active_context_tokens() >= current.auto_compact_token_limit();
         downshift_exceeds_limit.then_some(ModelSwitchCompactionReason::ModelDownshift)
     }
@@ -800,7 +874,7 @@ impl Agent {
         self.conversation.normalize()?;
         let history_cursor = self.conversation.history_cursor();
         let compacted = self
-            .request_compaction(cancellation, compaction, history_cursor)
+            .request_compaction(events, cancellation, compaction, history_cursor)
             .await;
         let compacted = match compacted {
             Some(Err(previous_error)) if let Some(fallback_selection) = fallback_selection => {
@@ -811,7 +885,7 @@ impl Agent {
                 );
                 self.api.set_model_selection(fallback_selection.clone());
                 match self
-                    .request_compaction(cancellation, compaction, history_cursor)
+                    .request_compaction(events, cancellation, compaction, history_cursor)
                     .await
                 {
                     Some(Ok(compacted)) => Some(Ok(compacted)),
@@ -853,13 +927,17 @@ impl Agent {
 
     async fn request_compaction(
         &mut self,
+        events: &Option<UnboundedSender<AgentEvent>>,
         cancellation: &CancellationToken,
         compaction: CompactionRequest,
         history_cursor: crate::context::HistoryCursor,
     ) -> Option<std::result::Result<CompactionResult, ApiError>> {
-        let request =
-            self.api
-                .compact_append_only(self.conversation.items(), history_cursor, compaction);
+        let request = self.api.compact_append_only(
+            self.conversation.items(),
+            history_cursor,
+            compaction,
+            events.as_ref(),
+        );
         tokio::pin!(request);
         tokio::select! {
             biased;

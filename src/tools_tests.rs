@@ -12,6 +12,7 @@ fn parses_exec_and_wait_calls() {
         })),
         Some(ToolCall::Custom {
             call_id: "call-1".to_string(),
+            namespace: None,
             name: "exec".to_string(),
             input: "text('done')".to_string(),
         })
@@ -20,11 +21,43 @@ fn parses_exec_and_wait_calls() {
         ToolCall::from_response_item(&json!({
             "type": "function_call",
             "call_id": "call-2",
+            "namespace": "functions",
             "name": "wait",
             "arguments": "{\"cell_id\":\"cell-1\"}"
         })),
         Some(ToolCall::Function {
             call_id: "call-2".to_string(),
+            namespace: None,
+            name: "wait".to_string(),
+            arguments: "{\"cell_id\":\"cell-1\"}".to_string(),
+        })
+    );
+    assert_eq!(
+        ToolCall::from_response_item(&json!({
+            "type": "function_call",
+            "call_id": "call-3",
+            "namespace": "web",
+            "name": "run",
+            "arguments": "{\"search_query\":[{\"q\":\"codex\"}]}"
+        })),
+        Some(ToolCall::Function {
+            call_id: "call-3".to_string(),
+            namespace: Some("web".to_string()),
+            name: "run".to_string(),
+            arguments: "{\"search_query\":[{\"q\":\"codex\"}]}".to_string(),
+        })
+    );
+    assert_eq!(
+        ToolCall::from_response_item(&json!({
+            "type": "function_call",
+            "call_id": "call-4",
+            "namespace": "",
+            "name": "wait",
+            "arguments": "{\"cell_id\":\"cell-1\"}"
+        })),
+        Some(ToolCall::Function {
+            call_id: "call-4".to_string(),
+            namespace: None,
             name: "wait".to_string(),
             arguments: "{\"cell_id\":\"cell-1\"}".to_string(),
         })
@@ -35,13 +68,13 @@ fn parses_exec_and_wait_calls() {
 fn custom_outputs_preserve_structured_content_items() {
     let call = ToolCall::Custom {
         call_id: "call-1".to_string(),
+        namespace: None,
         name: "exec".to_string(),
         input: "text('done')".to_string(),
     };
     let output = ToolResult {
         body: json!([{"type": "input_text", "text": "done"}]),
         preview: "done".to_string(),
-        preceding_items: Vec::new(),
     };
     let items = call.into_output_items(output);
 
@@ -76,7 +109,12 @@ fn view_image_rejects_oversized_files_before_loading_them() {
     file.set_len(u64::try_from(crate::input::MAX_TOTAL_IMAGE_BYTES).unwrap() + 1)
         .unwrap();
 
-    let error = super::view_image(&cwd, json!({"path": "oversized.png"})).unwrap_err();
+    let error = super::view_image(
+        &cwd,
+        json!({"path": "oversized.png"}),
+        /*supports_image_detail_original*/ true,
+    )
+    .unwrap_err();
 
     assert!(error.to_string().contains("50 MiB view_image limit"));
     std::fs::remove_dir_all(cwd).unwrap();

@@ -34,7 +34,10 @@ use super::process_session::ShellStartup;
 use super::process_session::shell_command;
 
 const DEFAULT_EXEC_YIELD: Duration = Duration::from_secs(10);
+#[cfg(not(windows))]
 const MIN_EXEC_YIELD: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const MIN_EXEC_YIELD: Duration = Duration::from_secs(10);
 const MAX_EXEC_YIELD: Duration = Duration::from_secs(30);
 const DEFAULT_WRITE_YIELD: Duration = Duration::from_millis(250);
 const DEFAULT_POLL_YIELD: Duration = Duration::from_secs(5);

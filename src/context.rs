@@ -25,7 +25,6 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::LazyLock;
 use uuid::Uuid;
 
 // Match Codex's default aggregate AGENTS.md budget. Besides avoiding needless context pressure,
@@ -39,13 +38,6 @@ const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;
 // the raw window: 95% is usable, while automatic compaction starts at 90%.
 pub(crate) const RAW_CONTEXT_WINDOW: u64 = 272_000;
 pub(crate) const EFFECTIVE_CONTEXT_WINDOW: u64 = RAW_CONTEXT_WINDOW * 95 / 100;
-static STABLE_HARNESS_TOKEN_ESTIMATES: LazyLock<[u64; 2]> = LazyLock::new(|| {
-    let [tools_item] = crate::api::stable_input_prefix_items();
-    [
-        estimate_value_tokens(tools_item),
-        crate::api::estimated_harness_instruction_tokens(),
-    ]
-});
 const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
 const CRASH_GUIDANCE: &str = "The previous bettercodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
@@ -252,6 +244,7 @@ struct ContextMetrics {
     encrypted_reasoning_tokens: u64,
     encrypted_reasoning_before_last_instruction: u64,
     has_tools: bool,
+    has_system_prompt: bool,
 }
 
 /// Incremental index of the call/output invariants enforced before sampling.
@@ -439,6 +432,20 @@ impl Conversation {
 
     pub(crate) fn finish_turn(&mut self, turn_id: &str, outcome: TurnOutcome) -> Result<()> {
         self.rollout.finish_turn(turn_id, outcome)
+    }
+
+    pub(crate) fn snapshot_transcript(
+        &mut self,
+        items: Vec<crate::rollout::SessionTranscriptItem>,
+    ) -> Result<()> {
+        self.rollout.snapshot_transcript(items)
+    }
+
+    pub(crate) fn append_transcript(
+        &mut self,
+        items: Vec<crate::rollout::SessionTranscriptItem>,
+    ) -> Result<()> {
+        self.rollout.append_transcript(items)
     }
 
     pub(crate) fn extend(&mut self, items: impl IntoIterator<Item = Value>) -> Result<()> {
@@ -638,7 +645,11 @@ impl Conversation {
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
-        let [tools_tokens, system_prompt_tokens] = *STABLE_HARNESS_TOKEN_ESTIMATES;
+        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens(
+            self.model_selection.use_responses_lite,
+            self.model_selection.tool_mode(),
+            self.model_selection.supports_image_detail_original(),
+        );
         let mut tokens = self.context_metrics.tokens;
         let mut items = self.context_metrics.items;
         if !self.context_metrics.has_tools {
@@ -649,12 +660,14 @@ impl Conversation {
                 tools_tokens,
             );
         }
-        record_context_estimate(
-            &mut tokens,
-            &mut items,
-            ContextKind::SystemPrompt,
-            system_prompt_tokens,
-        );
+        if !self.context_metrics.has_system_prompt {
+            record_context_estimate(
+                &mut tokens,
+                &mut items,
+                ContextKind::SystemPrompt,
+                system_prompt_tokens,
+            );
+        }
 
         let mut sections = CONTEXT_KINDS
             .into_iter()
@@ -688,12 +701,19 @@ impl Conversation {
     }
 
     fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
-        let [tools_tokens, system_prompt_tokens] = *STABLE_HARNESS_TOKEN_ESTIMATES;
+        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens(
+            self.model_selection.use_responses_lite,
+            self.model_selection.tool_mode(),
+            self.model_selection.supports_image_detail_original(),
+        );
         let mut estimate = metrics.estimated_tokens;
         if !metrics.has_tools {
             estimate = estimate.saturating_add(tools_tokens);
         }
-        estimate.saturating_add(system_prompt_tokens)
+        if !metrics.has_system_prompt {
+            estimate = estimate.saturating_add(system_prompt_tokens);
+        }
+        estimate
     }
 
     pub(crate) fn needs_compaction(&self) -> bool {
@@ -891,15 +911,17 @@ impl ContextMetrics {
     }
 
     fn extend(&mut self, history: &[Value], world_state: &WorldState) -> u64 {
-        let [tools_item] = crate::api::stable_input_prefix_items();
         let mut additional_tokens = 0_u64;
         for item in history {
             if is_initial_context_boundary(item) {
                 self.encrypted_reasoning_before_last_instruction = self.encrypted_reasoning_tokens;
             }
-            let kind = if same_additional_tools_item(item, tools_item) {
+            let kind = if crate::api::is_stable_tools_prefix_item(item) {
                 self.has_tools = true;
                 ContextKind::ToolCatalogue
+            } else if crate::api::is_stable_instructions_prefix_item(item) {
+                self.has_system_prompt = true;
+                ContextKind::SystemPrompt
             } else if same_model_visible_message(item, &world_state.environment) {
                 ContextKind::Environment
             } else if world_state
@@ -938,12 +960,6 @@ fn same_model_visible_message(left: &Value, right: &Value) -> bool {
     ["type", "role", "content"]
         .into_iter()
         .all(|field| left.get(field) == right.get(field))
-}
-
-fn same_additional_tools_item(item: &Value, expected: &Value) -> bool {
-    ["type", "role", "tools"]
-        .into_iter()
-        .all(|field| item.get(field) == expected.get(field))
 }
 
 fn context_kind(item: &Value) -> ContextKind {

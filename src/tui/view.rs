@@ -45,6 +45,8 @@ use crate::model::ModelSelection;
 use crate::protocol::MessagePhase;
 use crate::protocol::ParsedCommand;
 use crate::rollout::SessionTranscriptItem;
+use crate::rollout::SessionTranscriptTool;
+use crate::rollout::SessionTranscriptToolOutput;
 use crate::service_tier::ServiceTier;
 use crate::shell_command::parse_command::parse_command;
 use crate::skills::Skill;
@@ -195,6 +197,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Action {
     None,
+    LoadPromptHistory,
     Submit(ComposerSubmission),
     Queue(ComposerSubmission),
     Cancel,
@@ -414,6 +417,7 @@ struct StreamedAssistantHistory {
 struct ToolEntry {
     call_id: String,
     name: String,
+    input: Option<Value>,
     display: ToolDisplay,
     outcome: Option<ToolOutcome>,
     started_at: Instant,
@@ -427,6 +431,7 @@ struct UnifiedExecWaitStreak {
 
 #[derive(Debug)]
 enum ToolDisplay {
+    CodeMode(String),
     Command {
         command: String,
         parsed: Vec<ParsedCommand>,
@@ -440,7 +445,7 @@ enum ToolDisplay {
     Papercut,
     Plan(PlanDisplay),
     ViewImage(String),
-    WebSearch(Vec<crate::web_search::WebActivity>),
+    WebSearch(crate::web_search::WebSearchAction),
     OpenAiDocs(OpenAiDocsActivity),
     Other,
 }
@@ -611,8 +616,28 @@ impl View {
         palette::set_terminal_colors(foreground, background);
     }
 
-    pub(super) fn seed_prompt_history(&mut self, history: impl IntoIterator<Item = String>) {
+    pub(super) fn seed_prompt_history(
+        &mut self,
+        history: impl IntoIterator<Item = String>,
+        has_persistent_history: bool,
+    ) {
         self.editor.seed_history(history);
+        self.editor
+            .set_persistent_history_available(has_persistent_history);
+    }
+
+    pub(super) fn prompt_history_loaded(
+        &mut self,
+        newest_first: impl IntoIterator<Item = String>,
+        has_more: bool,
+    ) -> bool {
+        self.editor
+            .persistent_history_loaded(newest_first, has_more);
+        self.editor.begin_history_load()
+    }
+
+    pub(super) fn prompt_history_failed(&mut self) {
+        self.editor.persistent_history_failed();
     }
 
     pub(super) fn set_skills(&mut self, skills: Vec<Skill>) {
@@ -905,11 +930,13 @@ impl View {
 
     pub(super) fn set_model_selection(&mut self, selection: ModelSelection) {
         self.model_selection = selection;
+        self.refresh_open_model_picker();
     }
 
     pub(super) fn set_models(&mut self, models: Vec<ModelPreset>) {
         if !models.is_empty() {
             self.models = models;
+            self.refresh_open_model_picker();
         }
     }
 
@@ -920,7 +947,16 @@ impl View {
         self.models
             .iter()
             .find(|preset| preset.model == selection.model)
-            .map(|preset| preset.selection_with_reasoning_fallback(&selection.reasoning_effort))
+            .map(|preset| preset.selection(selection.reasoning_effort.clone()))
+    }
+
+    fn refresh_open_model_picker(&mut self) {
+        if matches!(self.overlay, Some(Overlay::Model(_))) {
+            self.overlay = Some(Overlay::Model(Box::new(ModelPicker::new(
+                self.models.clone(),
+                self.model_selection.clone(),
+            ))));
+        }
     }
 
     pub(super) fn set_service_tier(&mut self, service_tier: ServiceTier) {
@@ -971,25 +1007,64 @@ impl View {
     }
 
     pub(super) fn session_transcript(&self) -> Vec<SessionTranscriptItem> {
-        self.entries
-            .iter()
-            .filter_map(|entry| match entry {
-                TranscriptEntry::User(prompt) => Some(SessionTranscriptItem::User {
-                    text: prompt.model_text.clone(),
-                    image_count: prompt.image_count,
-                }),
+        self.session_transcript_since(None).1
+    }
+
+    pub(super) fn session_transcript_since(
+        &self,
+        checkpoint: Option<usize>,
+    ) -> (usize, Vec<SessionTranscriptItem>) {
+        let checkpoint = checkpoint.unwrap_or_default();
+        let mut item_count = 0_usize;
+        let mut items = Vec::new();
+        for entry in &self.entries {
+            let included = match entry {
+                TranscriptEntry::User(_) | TranscriptEntry::Tool(_) => true,
                 TranscriptEntry::Assistant {
                     text,
-                    phase,
                     streaming: false,
                     ..
-                } if !text.trim().is_empty() => Some(SessionTranscriptItem::Assistant {
-                    text: text.clone(),
-                    phase: phase.clone(),
-                }),
-                _ => None,
-            })
-            .collect()
+                } => !text.trim().is_empty(),
+                TranscriptEntry::Exploration { tools, .. } => !tools.is_empty(),
+                _ => false,
+            };
+            if !included {
+                continue;
+            }
+            if item_count >= checkpoint {
+                let item = match entry {
+                    TranscriptEntry::User(prompt) => SessionTranscriptItem::User {
+                        text: prompt.model_text.clone(),
+                        image_count: prompt.image_count,
+                    },
+                    TranscriptEntry::Assistant { text, phase, .. } => {
+                        SessionTranscriptItem::Assistant {
+                            text: text.clone(),
+                            phase: phase.clone(),
+                        }
+                    }
+                    TranscriptEntry::Tool(tool) => SessionTranscriptItem::Tool {
+                        tool: tool.session_transcript_tool(/*retain_success_output*/ true),
+                    },
+                    TranscriptEntry::Exploration { tools, .. } => {
+                        SessionTranscriptItem::Exploration {
+                            tools: tools
+                                .iter()
+                                .map(|tool| {
+                                    tool.session_transcript_tool(
+                                        /*retain_success_output*/ false,
+                                    )
+                                })
+                                .collect(),
+                        }
+                    }
+                    _ => unreachable!("transcript entry inclusion was checked above"),
+                };
+                items.push(item);
+            }
+            item_count = item_count.saturating_add(1);
+        }
+        (item_count, items)
     }
 
     pub(super) fn show_context(&mut self, snapshot: ContextSnapshot) {
@@ -1043,19 +1118,74 @@ impl View {
         &mut self,
         transcript: impl IntoIterator<Item = SessionTranscriptItem>,
     ) {
-        self.entries
-            .extend(transcript.into_iter().map(|item| match item {
+        let mut replaying_legacy_exploration = false;
+        for item in transcript {
+            match item {
                 SessionTranscriptItem::User { text, image_count } => {
-                    TranscriptEntry::User(DisplayedUserPrompt::replayed(text, image_count))
+                    replaying_legacy_exploration = false;
+                    self.entries
+                        .push(TranscriptEntry::User(DisplayedUserPrompt::replayed(
+                            text,
+                            image_count,
+                        )));
                 }
-                SessionTranscriptItem::Assistant { text, phase } => TranscriptEntry::Assistant {
-                    text,
-                    phase,
-                    streaming: false,
-                    rendered: MarkdownRenderCache::default(),
-                    history: StreamedAssistantHistory::default(),
-                },
-            }));
+                SessionTranscriptItem::Assistant { text, phase } => {
+                    replaying_legacy_exploration = false;
+                    self.entries.push(TranscriptEntry::Assistant {
+                        text,
+                        phase,
+                        streaming: false,
+                        rendered: MarkdownRenderCache::default(),
+                        history: StreamedAssistantHistory::default(),
+                    });
+                }
+                SessionTranscriptItem::Tool { tool } => {
+                    replaying_legacy_exploration =
+                        self.replay_tool(tool, replaying_legacy_exploration);
+                }
+                SessionTranscriptItem::Exploration { tools } => {
+                    replaying_legacy_exploration = false;
+                    let mut replayed = Vec::with_capacity(tools.len());
+                    let mut call_ids = Vec::with_capacity(tools.len());
+                    for tool in tools {
+                        call_ids.push(tool.call_id.clone());
+                        replayed.push(ToolEntry::from_session_transcript(
+                            tool,
+                            &self.cwd,
+                            &self.process_commands,
+                        ));
+                    }
+                    if !replayed.is_empty() {
+                        self.entries.push(TranscriptEntry::Exploration {
+                            tools: replayed,
+                            sealed: true,
+                        });
+                        for call_id in call_ids {
+                            self.remember_process_command(&call_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn replay_tool(&mut self, tool: SessionTranscriptTool, join_legacy_exploration: bool) -> bool {
+        let call_id = tool.call_id.clone();
+        let tool = ToolEntry::from_session_transcript(tool, &self.cwd, &self.process_commands);
+        let is_exploration = tool.is_exploration();
+        if is_exploration {
+            match (join_legacy_exploration, self.entries.last_mut()) {
+                (true, Some(TranscriptEntry::Exploration { tools, .. })) => tools.push(tool),
+                _ => self.entries.push(TranscriptEntry::Exploration {
+                    tools: vec![tool],
+                    sealed: true,
+                }),
+            }
+        } else {
+            self.entries.push(TranscriptEntry::Tool(tool));
+        }
+        self.remember_process_command(&call_id);
+        is_exploration
     }
 
     pub(super) fn switch_session(
@@ -1064,6 +1194,7 @@ impl View {
         context_tokens: Option<u64>,
         transcript: impl IntoIterator<Item = SessionTranscriptItem>,
         prompt_history: impl IntoIterator<Item = String>,
+        has_persistent_history: bool,
         skills: Vec<Skill>,
     ) {
         let user_message_style = self.user_message_style;
@@ -1074,6 +1205,8 @@ impl View {
         self.context_tokens = context_tokens;
         self.replay_transcript(transcript);
         self.editor.seed_history(prompt_history);
+        self.editor
+            .set_persistent_history_available(has_persistent_history);
         self.clear_requested = true;
     }
 
@@ -1207,7 +1340,8 @@ impl View {
                     let completed_work = self.find_tool_mut(&call_id).is_some_and(|tool| {
                         let completed_work = matches!(
                             &tool.display,
-                            ToolDisplay::Command { .. }
+                            ToolDisplay::CodeMode(_)
+                                | ToolDisplay::Command { .. }
                                 | ToolDisplay::Patch(_)
                                 | ToolDisplay::Papercut
                                 | ToolDisplay::WebSearch(_)
@@ -1260,7 +1394,7 @@ impl View {
             && self.editor.history_search_active()
         {
             self.editor.history_search_insert(text);
-            return Action::None;
+            return self.prompt_history_action(Action::None);
         }
         let action = match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
@@ -1290,7 +1424,15 @@ impl View {
             _ => Action::None,
         };
         self.sync_composer_popups();
-        action
+        self.prompt_history_action(action)
+    }
+
+    fn prompt_history_action(&mut self, action: Action) -> Action {
+        if matches!(&action, Action::None) && self.editor.begin_history_load() {
+            Action::LoadPromptHistory
+        } else {
+            action
+        }
     }
 
     fn sync_composer_popups(&mut self) {
@@ -3032,6 +3174,9 @@ impl View {
                     "Esc".cyan().bold(),
                     " cancel".dim(),
                 ]),
+                editor::HistorySearchStatus::Searching => {
+                    spans.push("  searching older prompts…".dim());
+                }
                 editor::HistorySearchStatus::NoMatch => spans.push("  no match".red()),
             }
             return truncate_line(Line::from(spans), usize::from(width));
@@ -3248,6 +3393,17 @@ impl ToolEntry {
         process_commands: &HashMap<i64, String>,
     ) -> Self {
         let display = match name.as_str() {
+            "exec" => ToolDisplay::CodeMode(
+                input
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            "wait" => ToolDisplay::CodeMode(format!(
+                "wait({})",
+                input.as_ref().map(Value::to_string).unwrap_or_default()
+            )),
             "exec_command" => {
                 let command = input
                     .as_ref()
@@ -3299,7 +3455,9 @@ impl ToolEntry {
                     .map(|path| display_tool_path(Path::new(path), cwd))
                     .unwrap_or_else(|| "image".to_string()),
             ),
-            "web.run" => ToolDisplay::WebSearch(crate::web_search::activities_for_display(input)),
+            "web.run" => {
+                ToolDisplay::WebSearch(crate::web_search::action_for_display(input.clone()))
+            }
             _ => OpenAiDocsActivity::from_call(&name, input.as_ref())
                 .map(ToolDisplay::OpenAiDocs)
                 .unwrap_or(ToolDisplay::Other),
@@ -3307,9 +3465,58 @@ impl ToolEntry {
         Self {
             call_id,
             name,
+            input,
             display,
             outcome: None,
             started_at: Instant::now(),
+        }
+    }
+
+    fn from_session_transcript(
+        tool: SessionTranscriptTool,
+        cwd: &Path,
+        process_commands: &HashMap<i64, String>,
+    ) -> Self {
+        let SessionTranscriptTool {
+            call_id,
+            name,
+            input,
+            output,
+        } = tool;
+        let mut tool = Self::new(call_id, name, input, cwd, process_commands);
+        tool.outcome = output.map(|output| ToolOutcome {
+            output: match output {
+                SessionTranscriptToolOutput::Success(output) => Ok(output),
+                SessionTranscriptToolOutput::Error(error) => Err(error),
+            },
+        });
+        tool.finish_if_incomplete();
+        tool
+    }
+
+    fn session_transcript_tool(&self, retain_success_output: bool) -> SessionTranscriptTool {
+        let retain_success_output = retain_success_output
+            && matches!(
+                &self.display,
+                ToolDisplay::CodeMode(_)
+                    | ToolDisplay::Command { .. }
+                    | ToolDisplay::Interaction { .. }
+                    | ToolDisplay::Papercut
+                    | ToolDisplay::Other
+            );
+        let output = self.outcome.as_ref().map(|outcome| match &outcome.output {
+            Ok(output) => SessionTranscriptToolOutput::Success(if retain_success_output {
+                output.clone()
+            } else {
+                Value::Null
+            }),
+            Err(error) => SessionTranscriptToolOutput::Error(error.clone()),
+        });
+        SessionTranscriptTool {
+            call_id: self.call_id.clone(),
+            name: self.name.clone(),
+            input: self.input.clone(),
+            output,
         }
     }
 
@@ -3321,7 +3528,7 @@ impl ToolEntry {
                         .iter()
                         .all(|command| !matches!(command, ParsedCommand::Unknown { .. }))
             }
-            ToolDisplay::WebSearch(_) | ToolDisplay::OpenAiDocs(_) => true,
+            ToolDisplay::OpenAiDocs(_) => true,
             _ => false,
         }
     }
@@ -3346,6 +3553,7 @@ impl ToolEntry {
 
     fn activity_label(&self) -> String {
         match &self.display {
+            ToolDisplay::CodeMode(_) => "Running code".to_string(),
             ToolDisplay::Command { command, .. } => first_display_line(command),
             ToolDisplay::Interaction { command, .. } => command.clone(),
             ToolDisplay::Patch(_) => "Applying patch".to_string(),
@@ -3368,6 +3576,7 @@ impl ToolEntry {
 
     fn display_lines(&self, width: u16, user_style: Style) -> Vec<Line<'static>> {
         match &self.display {
+            ToolDisplay::CodeMode(source) => code_mode_lines(self, source, width),
             ToolDisplay::Command { command, .. } => command_lines(self, command, width),
             ToolDisplay::Interaction { command, input, .. } => {
                 interaction_lines(self, command, input, width)
@@ -3378,9 +3587,8 @@ impl ToolEntry {
             ToolDisplay::Papercut => papercut_lines(self, width),
             ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
             ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
-            ToolDisplay::WebSearch(_) | ToolDisplay::OpenAiDocs(_) => {
-                exploration_lines(std::slice::from_ref(self), width)
-            }
+            ToolDisplay::WebSearch(action) => web_search_lines(self, action, width),
+            ToolDisplay::OpenAiDocs(_) => exploration_lines(std::slice::from_ref(self), width),
             ToolDisplay::Other => generic_tool_lines(self, width),
         }
     }
@@ -4504,6 +4712,71 @@ fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Ve
     ]
 }
 
+fn code_mode_lines(tool: &ToolEntry, source: &str, width: u16) -> Vec<Line<'static>> {
+    let (bullet, title) = match tool.succeeded() {
+        None => (activity_marker(Some(tool.started_at)), "Running code"),
+        Some(true) => ("•".green().bold(), "Ran code"),
+        Some(false) => ("•".red().bold(), "Ran code"),
+    };
+    let calls = code_mode_tool_names(source);
+    let mut header = vec![bullet, " ".into(), title.bold()];
+    if !calls.is_empty() {
+        header.push(" · ".dim());
+        header.push(calls.join(", ").cyan());
+    }
+    let mut lines = wrap_styled_line(&Line::from(header), width.max(1));
+    append_bounded_output(source, width, &mut lines);
+    if let Some(outcome) = &tool.outcome {
+        match &outcome.output {
+            Ok(output) => {
+                let output = transcript_output_text(output);
+                if !output.is_empty() {
+                    append_bounded_output(&output, width, &mut lines);
+                }
+            }
+            Err(error) => append_bounded_output(error, width, &mut lines),
+        }
+    }
+    lines
+}
+
+fn code_mode_tool_names(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut remaining = source;
+    while let Some(index) = remaining.find("tools.") {
+        remaining = &remaining[index + "tools.".len()..];
+        let length = remaining
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if length == 0 {
+            continue;
+        }
+        let name = remaining[..length].replace("__", ".");
+        if !names.contains(&name) {
+            names.push(name);
+        }
+        remaining = &remaining[length..];
+    }
+    names
+}
+
+fn transcript_output_text(output: &Value) -> String {
+    match output {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect(),
+        Value::Object(object) => object
+            .get("output")
+            .map(transcript_output_text)
+            .unwrap_or_else(|| output.to_string()),
+        Value::Null => String::new(),
+        Value::Bool(_) | Value::Number(_) => output.to_string(),
+    }
+}
+
 fn command_lines(tool: &ToolEntry, command: &str, width: u16) -> Vec<Line<'static>> {
     let (bullet, title) = match tool.succeeded() {
         None => (activity_marker(Some(tool.started_at)), "Running"),
@@ -4678,17 +4951,6 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
                     }
                 }
             }
-            ToolDisplay::WebSearch(activities) => {
-                flush_reads(&mut details, &mut read_names);
-                for activity in activities {
-                    let spans = if activity.detail.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![Span::from(activity.detail.clone())]
-                    };
-                    details.push((activity.verb, detail_style, spans));
-                }
-            }
             ToolDisplay::OpenAiDocs(activity) => {
                 flush_reads(&mut details, &mut read_names);
                 let spans = if activity.detail.is_empty() {
@@ -4700,10 +4962,8 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             }
             _ => {}
         }
-        if matches!(
-            &tool.display,
-            ToolDisplay::WebSearch(_) | ToolDisplay::OpenAiDocs(_)
-        ) && let Some(ToolOutcome { output: Err(error) }) = &tool.outcome
+        if matches!(&tool.display, ToolDisplay::OpenAiDocs(_))
+            && let Some(ToolOutcome { output: Err(error) }) = &tool.outcome
         {
             details.push((
                 "Error",
@@ -4763,6 +5023,83 @@ fn view_image_lines(outcome: Option<&ToolOutcome>, path: &str, width: u16) -> Ve
             ),
         ],
         Some(Err(error)) => failed_tool_lines("Failed to view image", error, width),
+    }
+}
+
+fn web_search_lines(
+    tool: &ToolEntry,
+    action: &crate::web_search::WebSearchAction,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
+        return failed_tool_lines("Failed to search the web", error, width);
+    }
+
+    let completed = tool.outcome.is_some();
+    let detail = if completed {
+        web_search_action_detail(action)
+    } else {
+        String::new()
+    };
+    let mut content = vec![
+        Span::from(if completed {
+            "Searched the web"
+        } else {
+            "Searching the web"
+        })
+        .bold(),
+    ];
+    if !detail.is_empty() {
+        content.push(" for ".into());
+        content.push(Span::from(detail));
+    }
+    let wrapped = wrap_styled_line(&Line::from(content), width.saturating_sub(2).max(1));
+    let bullet = if completed {
+        "•".dim()
+    } else {
+        activity_marker(Some(tool.started_at))
+    };
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            let mut spans = if index == 0 {
+                vec![bullet.clone(), " ".into()]
+            } else {
+                vec!["  ".into()]
+            };
+            spans.append(&mut line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn web_search_action_detail(action: &crate::web_search::WebSearchAction) -> String {
+    use crate::web_search::WebSearchAction;
+
+    match action {
+        WebSearchAction::Search { query, queries } => {
+            query.clone().filter(|q| !q.is_empty()).unwrap_or_else(|| {
+                let items = queries.as_ref();
+                let first = items
+                    .and_then(|queries| queries.first())
+                    .cloned()
+                    .unwrap_or_default();
+                if items.is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
+                    format!("{first} ...")
+                } else {
+                    first
+                }
+            })
+        }
+        WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
+        WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
+            (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
+            (Some(pattern), None) => format!("'{pattern}'"),
+            (None, Some(url)) => url.clone(),
+            (None, None) => String::new(),
+        },
+        WebSearchAction::Other => String::new(),
     }
 }
 
@@ -5234,6 +5571,56 @@ mod tests {
     }
 
     #[test]
+    fn resumed_transcript_renders_user_tool_and_assistant_history_in_order() {
+        let source =
+            "const result = await tools.exec_command({cmd:\"cargo test\"}); text(result.output);";
+        let transcript = vec![
+            SessionTranscriptItem::User {
+                text: "run the checks".to_string(),
+                image_count: 0,
+            },
+            SessionTranscriptItem::Tool {
+                tool: SessionTranscriptTool {
+                    call_id: "call-1".to_string(),
+                    name: "exec".to_string(),
+                    input: Some(Value::String(source.to_string())),
+                    output: Some(SessionTranscriptToolOutput::Success(Value::String(
+                        "Script completed\nWall time 0.1 seconds\nOutput:\ntest result: ok"
+                            .to_string(),
+                    ))),
+                },
+            },
+            SessionTranscriptItem::Assistant {
+                text: "All checks pass.".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+            },
+        ];
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+
+        view.replay_transcript(transcript.clone());
+
+        assert_eq!(view.session_transcript(), transcript);
+        let rendered = view
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let user = rendered.find("run the checks").expect("replayed user");
+        let tool = rendered.find("Ran code").expect("replayed Code Mode call");
+        assert!(rendered.contains("exec_command"), "{rendered}");
+        let output = rendered.find("test result: ok").expect("replayed output");
+        let assistant = rendered
+            .find("All checks pass.")
+            .expect("replayed assistant");
+        assert!(
+            user < tool && tool < output && output < assistant,
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn assistant_live_suffix_matches_the_full_render() {
         let source = "first paragraph\n\nsecond paragraph\n\nthird paragraph";
         let mut cache = MarkdownRenderCache::default();
@@ -5456,6 +5843,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn first_persistent_history_recall_requests_a_lazy_batch() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.seed_prompt_history(std::iter::empty(), true);
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE,))),
+            Action::LoadPromptHistory
+        );
+        assert!(!view.prompt_history_loaded(["older prompt".to_string()], false));
+        assert_eq!(view.editor.text(), "older prompt");
+    }
+
     fn completed_message(text: impl Into<String>) -> AgentEvent {
         AgentEvent::ModelMessageCompleted(AssistantMessage {
             text: text.into(),
@@ -5521,7 +5921,7 @@ mod tests {
     }
 
     #[test]
-    fn model_command_opens_the_codex_picker_locally() {
+    fn model_command_uses_live_catalog_when_refresh_completes_while_open() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.editor.set_text("/model");
 
@@ -5534,6 +5934,20 @@ mod tests {
         );
         assert!(matches!(&view.overlay, Some(Overlay::Model(_))));
         assert!(view.editor.is_empty());
+
+        let mut refreshed_preset = crate::model::bundled_models()[0].clone();
+        refreshed_preset.raw_context_window = 100_000;
+        refreshed_preset.supported_reasoning_efforts.truncate(1);
+        let expected = refreshed_preset.selection(crate::model::ReasoningEffort::Low);
+        view.set_models(vec![refreshed_preset]);
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::SelectModel(expected)
+        );
     }
 
     #[test]
@@ -5551,7 +5965,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_metadata_refresh_preserves_supported_effort_and_falls_back_to_default() {
+    fn catalog_metadata_refresh_preserves_explicit_effort() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         let current =
             crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::XHigh);
@@ -5577,8 +5991,9 @@ mod tests {
         let refreshed = view.selection_with_catalog_metadata(&unsupported).unwrap();
         assert_eq!(
             refreshed.reasoning_effort,
-            crate::model::ReasoningEffort::Medium
+            crate::model::ReasoningEffort::Minimal
         );
+        assert_eq!(refreshed.effective_context_window(), 80_000);
     }
 
     #[test]
@@ -6142,6 +6557,44 @@ mod tests {
         assert!(rendered.contains("• Explored"), "{rendered}");
         assert!(rendered.contains("Read main.rs"), "{rendered}");
         assert!(!rendered.contains("fn main"), "{rendered}");
+    }
+
+    #[test]
+    fn web_search_uses_codex_activity_cell_and_hides_internal_reference_ids() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:web".to_string(),
+            name: "web.run".to_string(),
+            input: Some(json!({
+                "open": [
+                    {"ref_id": "turn0search1"},
+                    {"ref_id": "turn0search3"},
+                    {"ref_id": "turn0search4"},
+                    {"ref_id": "turn0search0"},
+                ],
+            })),
+        });
+
+        assert_eq!(
+            view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
+            ["• Searching the web"]
+        );
+
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:web".to_string(),
+            output: Ok(json!(
+                "opaque search result that must remain model-facing only"
+            )),
+            duration: Duration::from_millis(50),
+        });
+        assert_eq!(
+            view.take_pending_history_lines(80, 24)
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>(),
+            ["• Searched the web"]
+        );
     }
 
     #[test]

@@ -1,14 +1,15 @@
 //! Model catalogue and active-selection state ported from current OpenAI Codex.
 //!
 //! The bundled picker rows track `codex-rs/models-manager/models.json` at
-//! upstream commit 8cabf5a6 while retaining only reasoning efforts this
-//! runtime implements. ChatGPT's `/models` response replaces this snapshot
-//! when available, matching Codex's remote-catalogue behavior while retaining
-//! a usable picker offline.
+//! upstream commit 92cbfb4d2431bdc53dc03507aea2dc5b8e932e40 while retaining
+//! only reasoning efforts this runtime implements. ChatGPT's `/models`
+//! response replaces this snapshot when available, matching Codex's
+//! remote-catalogue behavior while retaining a usable picker offline.
 
 use crate::auth::SharedAuth;
 use crate::http_client::bounded_error_body;
 use crate::state_file;
+use crate::truncation::TruncationPolicy;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -31,6 +32,7 @@ const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u64 = 95;
 
 const MODEL_SETTINGS_FILE: &str = "model.json";
 const MODEL_SETTINGS_VERSION: u32 = 1;
+const TOOL_MODE_SELECTOR_VERSION: u8 = 1;
 const MAX_MODEL_SETTINGS_BYTES: usize = 16 * 1024;
 const MODELS_ENDPOINT_CLIENT_VERSION: &str = "0.147.0";
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,6 +46,8 @@ const MAX_DESCRIPTION_BYTES: usize = 4_096;
 const MAX_CUSTOM_EFFORT_BYTES: usize = 64;
 const MAX_COMP_HASH_BYTES: usize = 256;
 const MAX_CONTEXT_WINDOW: u64 = 10_000_000;
+const ULTRA_REASONING_EFFORT: &str = "ultra";
+const DEFAULT_TOOL_TRUNCATION_LIMIT: usize = 10_000;
 
 /// Reasoning efforts bettercodex sends to the Responses API.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
@@ -122,9 +126,9 @@ impl FromStr for ReasoningEffort {
             "high" => Ok(Self::High),
             "xhigh" => Ok(Self::XHigh),
             "max" => Ok(Self::Max),
-            // Codex's orchestration-only level uses Max on inference requests.
-            // Normalize catalogue and saved-session values to the API effort.
-            "ultra" => Ok(Self::Max),
+            // Legacy saved selections used Codex's orchestration-only level. Resume them at the
+            // API effort while filtering Ultra out of new catalogue choices before conversion.
+            effort if is_ultra_reasoning_effort(effort) => Ok(Self::Max),
             "" => Err("reasoning effort must not be empty".to_string()),
             effort if effort.len() <= MAX_CUSTOM_EFFORT_BYTES => {
                 Ok(Self::Custom(effort.to_string()))
@@ -156,6 +160,31 @@ impl<'de> Deserialize<'de> for ReasoningEffort {
     }
 }
 
+/// Model-facing tool route selected by the Codex model catalogue.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolMode {
+    Direct,
+    CodeMode,
+    CodeModeOnly,
+}
+
+impl ToolMode {
+    pub(crate) const ALL: [Self; 3] = [Self::Direct, Self::CodeMode, Self::CodeModeOnly];
+
+    pub(crate) fn includes_code_mode(self) -> bool {
+        matches!(self, Self::CodeMode | Self::CodeModeOnly)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Direct => 0,
+            Self::CodeMode => 1,
+            Self::CodeModeOnly => 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelSelection {
@@ -169,6 +198,18 @@ pub(crate) struct ModelSelection {
     pub(crate) configured_auto_compact_token_limit: Option<u64>,
     #[serde(default)]
     pub(crate) use_responses_lite: bool,
+    #[serde(default)]
+    pub(crate) supports_parallel_tool_calls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) truncation_policy: Option<TruncationPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) supports_image_detail_original: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_mode: Option<ToolMode>,
+    /// Distinguishes exact selectors from selections saved by the short-lived implementation that
+    /// collapsed `code_mode_only` into `code_mode`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) tool_mode_selector_version: u8,
     #[serde(default = "default_true")]
     pub(crate) prefer_websocket: bool,
     #[serde(default)]
@@ -187,6 +228,11 @@ impl Default for ModelSelection {
             effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
             configured_auto_compact_token_limit: None,
             use_responses_lite: true,
+            supports_parallel_tool_calls: true,
+            truncation_policy: Some(TruncationPolicy::Tokens(DEFAULT_TOOL_TRUNCATION_LIMIT)),
+            supports_image_detail_original: Some(true),
+            tool_mode: Some(ToolMode::CodeModeOnly),
+            tool_mode_selector_version: TOOL_MODE_SELECTOR_VERSION,
             prefer_websocket: true,
             supports_fast: true,
             comp_hash: Some("3000".to_string()),
@@ -197,6 +243,9 @@ impl Default for ModelSelection {
 impl ModelSelection {
     pub(crate) fn from_identity(model: impl Into<String>, effort: ReasoningEffort) -> Self {
         let model = model.into();
+        let truncation_policy = default_truncation_policy_for_model(&model);
+        let supports_image_detail_original = default_supports_image_detail_original(&model);
+        let supports_parallel_tool_calls = current_model_supports_parallel_tool_calls(&model);
         bundled_models()
             .iter()
             .find(|preset| preset.model == model)
@@ -208,6 +257,11 @@ impl ModelSelection {
                 effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
                 configured_auto_compact_token_limit: None,
                 use_responses_lite: false,
+                supports_parallel_tool_calls,
+                truncation_policy: Some(truncation_policy),
+                supports_image_detail_original: Some(supports_image_detail_original),
+                tool_mode: None,
+                tool_mode_selector_version: TOOL_MODE_SELECTOR_VERSION,
                 prefer_websocket: true,
                 supports_fast: false,
                 comp_hash: None,
@@ -218,6 +272,47 @@ impl ModelSelection {
         self.raw_context_window
             .saturating_mul(self.effective_context_window_percent)
             / 100
+    }
+
+    pub(crate) fn tool_mode(&self) -> ToolMode {
+        if self.tool_mode_selector_version == 0 && is_current_code_mode_only_model(&self.model) {
+            return ToolMode::CodeModeOnly;
+        }
+        self.tool_mode.unwrap_or(ToolMode::Direct)
+    }
+
+    pub(crate) fn truncation_policy(&self) -> TruncationPolicy {
+        self.truncation_policy
+            .unwrap_or_else(|| default_truncation_policy_for_model(&self.model))
+    }
+
+    pub(crate) fn supports_image_detail_original(&self) -> bool {
+        self.supports_image_detail_original
+            .unwrap_or_else(|| default_supports_image_detail_original(&self.model))
+    }
+
+    /// Repairs catalogue metadata omitted by older saved selections, including the short-lived
+    /// implementation that serialized `code_mode_only` as `code_mode`. Newly fetched tool-mode
+    /// selectors carry a version so a future change for the same model slug remains authoritative.
+    pub(crate) fn migrate_legacy_tool_mode_selector(&mut self) {
+        self.truncation_policy
+            .get_or_insert_with(|| default_truncation_policy_for_model(&self.model));
+        self.supports_image_detail_original
+            .get_or_insert_with(|| default_supports_image_detail_original(&self.model));
+        if self.tool_mode_selector_version != 0 {
+            return;
+        }
+        // `supports_parallel_tool_calls` was introduced with the selector metadata and older
+        // settings deserialize its absent field as false. Every model in the current Codex
+        // catalogue opts in, so repair known rows while preserving the false fallback for an
+        // unknown model.
+        if current_model_supports_parallel_tool_calls(&self.model) {
+            self.supports_parallel_tool_calls = true;
+        }
+        if is_current_code_mode_only_model(&self.model) {
+            self.tool_mode = Some(ToolMode::CodeModeOnly);
+        }
+        self.tool_mode_selector_version = TOOL_MODE_SELECTOR_VERSION;
     }
 
     pub(crate) fn auto_compact_token_limit(&self) -> u64 {
@@ -243,6 +338,11 @@ impl ModelSelection {
         if self.configured_auto_compact_token_limit == Some(0) {
             return Err(anyhow!(
                 "configured automatic compaction limit must be greater than zero"
+            ));
+        }
+        if self.truncation_policy().byte_budget() == 0 {
+            return Err(anyhow!(
+                "tool output truncation limit must be greater than zero"
             ));
         }
         if let Some(comp_hash) = &self.comp_hash {
@@ -293,6 +393,10 @@ pub(crate) struct ModelPreset {
     pub(crate) effective_context_window_percent: u64,
     pub(crate) configured_auto_compact_token_limit: Option<u64>,
     pub(crate) use_responses_lite: bool,
+    pub(crate) supports_parallel_tool_calls: bool,
+    pub(crate) truncation_policy: TruncationPolicy,
+    pub(crate) supports_image_detail_original: bool,
+    pub(crate) tool_mode: ToolMode,
     pub(crate) prefer_websocket: bool,
     pub(crate) supports_fast: bool,
     pub(crate) comp_hash: Option<String>,
@@ -308,36 +412,15 @@ impl ModelPreset {
             effective_context_window_percent: self.effective_context_window_percent,
             configured_auto_compact_token_limit: self.configured_auto_compact_token_limit,
             use_responses_lite: self.use_responses_lite,
+            supports_parallel_tool_calls: self.supports_parallel_tool_calls,
+            truncation_policy: Some(self.truncation_policy),
+            supports_image_detail_original: Some(self.supports_image_detail_original),
+            tool_mode: Some(self.tool_mode),
+            tool_mode_selector_version: TOOL_MODE_SELECTOR_VERSION,
             prefer_websocket: self.prefer_websocket,
             supports_fast: self.supports_fast,
             comp_hash: self.comp_hash.clone(),
         }
-    }
-
-    pub(crate) fn selection_with_reasoning_fallback(
-        &self,
-        requested_effort: &ReasoningEffort,
-    ) -> ModelSelection {
-        self.selection(self.reasoning_effort_with_fallback(requested_effort))
-    }
-
-    fn reasoning_effort_with_fallback(
-        &self,
-        requested_effort: &ReasoningEffort,
-    ) -> ReasoningEffort {
-        self.supported_reasoning_efforts
-            .iter()
-            .find(|preset| &preset.effort == requested_effort)
-            .or_else(|| {
-                self.supported_reasoning_efforts
-                    .iter()
-                    .find(|preset| preset.effort == self.default_reasoning_effort)
-            })
-            .or_else(|| self.supported_reasoning_efforts.first())
-            .map_or_else(
-                || self.default_reasoning_effort.clone(),
-                |preset| preset.effort.clone(),
-            )
     }
 }
 
@@ -352,6 +435,10 @@ pub(crate) fn bundled_models() -> &'static [ModelPreset] {
                 BundledModelMetadata {
                     comp_hash: Some("3000"),
                     use_responses_lite: true,
+                    supports_parallel_tool_calls: true,
+                    truncation_policy: TruncationPolicy::Tokens(DEFAULT_TOOL_TRUNCATION_LIMIT),
+                    supports_image_detail_original: true,
+                    tool_mode: ToolMode::CodeModeOnly,
                     supports_fast: true,
                     is_default: true,
                 },
@@ -364,6 +451,10 @@ pub(crate) fn bundled_models() -> &'static [ModelPreset] {
                 BundledModelMetadata {
                     comp_hash: Some("3000"),
                     use_responses_lite: true,
+                    supports_parallel_tool_calls: true,
+                    truncation_policy: TruncationPolicy::Tokens(DEFAULT_TOOL_TRUNCATION_LIMIT),
+                    supports_image_detail_original: true,
+                    tool_mode: ToolMode::CodeModeOnly,
                     supports_fast: true,
                     is_default: false,
                 },
@@ -376,6 +467,10 @@ pub(crate) fn bundled_models() -> &'static [ModelPreset] {
                 BundledModelMetadata {
                     comp_hash: Some("3000"),
                     use_responses_lite: true,
+                    supports_parallel_tool_calls: true,
+                    truncation_policy: TruncationPolicy::Tokens(DEFAULT_TOOL_TRUNCATION_LIMIT),
+                    supports_image_detail_original: true,
+                    tool_mode: ToolMode::CodeModeOnly,
                     supports_fast: true,
                     is_default: false,
                 },
@@ -405,6 +500,10 @@ pub(crate) fn bundled_models() -> &'static [ModelPreset] {
                 BundledModelMetadata {
                     comp_hash: Some("2911"),
                     use_responses_lite: false,
+                    supports_parallel_tool_calls: true,
+                    truncation_policy: TruncationPolicy::Tokens(DEFAULT_TOOL_TRUNCATION_LIMIT),
+                    supports_image_detail_original: true,
+                    tool_mode: ToolMode::Direct,
                     supports_fast: true,
                     is_default: false,
                 },
@@ -434,6 +533,10 @@ pub(crate) fn bundled_models() -> &'static [ModelPreset] {
                 BundledModelMetadata {
                     comp_hash: None,
                     use_responses_lite: false,
+                    supports_parallel_tool_calls: true,
+                    truncation_policy: TruncationPolicy::Bytes(DEFAULT_TOOL_TRUNCATION_LIMIT),
+                    supports_image_detail_original: false,
+                    tool_mode: ToolMode::Direct,
                     supports_fast: false,
                     is_default: false,
                 },
@@ -447,6 +550,10 @@ pub(crate) fn bundled_models() -> &'static [ModelPreset] {
 struct BundledModelMetadata {
     comp_hash: Option<&'static str>,
     use_responses_lite: bool,
+    supports_parallel_tool_calls: bool,
+    truncation_policy: TruncationPolicy,
+    supports_image_detail_original: bool,
+    tool_mode: ToolMode,
     supports_fast: bool,
     is_default: bool,
 }
@@ -467,6 +574,10 @@ fn model_preset(
         effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         configured_auto_compact_token_limit: None,
         use_responses_lite: metadata.use_responses_lite,
+        supports_parallel_tool_calls: metadata.supports_parallel_tool_calls,
+        truncation_policy: metadata.truncation_policy,
+        supports_image_detail_original: metadata.supports_image_detail_original,
+        tool_mode: metadata.tool_mode,
         prefer_websocket: true,
         supports_fast: metadata.supports_fast,
         comp_hash: metadata.comp_hash.map(str::to_string),
@@ -595,7 +706,7 @@ struct RemoteModel {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
-    default_reasoning_level: Option<ReasoningEffort>,
+    default_reasoning_level: Option<String>,
     #[serde(default)]
     supported_reasoning_levels: Vec<RemoteReasoningEffort>,
     #[serde(default)]
@@ -610,6 +721,14 @@ struct RemoteModel {
     effective_context_window_percent: i64,
     #[serde(default)]
     use_responses_lite: bool,
+    #[serde(default)]
+    supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    truncation_policy: Option<TruncationPolicy>,
+    #[serde(default)]
+    supports_image_detail_original: bool,
+    #[serde(default, deserialize_with = "deserialize_remote_tool_mode")]
+    tool_mode: Option<ToolMode>,
     #[serde(default = "default_true")]
     prefer_websockets: bool,
     #[serde(default)]
@@ -624,7 +743,7 @@ struct RemoteModel {
 
 #[derive(Deserialize)]
 struct RemoteReasoningEffort {
-    effort: ReasoningEffort,
+    effort: String,
     #[serde(default)]
     description: String,
 }
@@ -725,15 +844,25 @@ fn remote_model_preset(model: RemoteModel) -> Result<ModelPreset> {
     let description = bounded_catalogue_text(model.description.unwrap_or_default())?;
     let default_reasoning_effort = model
         .default_reasoning_level
+        .as_deref()
+        .map(|effort| {
+            if is_ultra_reasoning_effort(effort) {
+                Ok(ReasoningEffort::Max)
+            } else {
+                parse_reasoning_effort(effort)
+            }
+        })
+        .transpose()?
         .unwrap_or(ReasoningEffort::None);
     default_reasoning_effort.validate()?;
     let mut supported_reasoning_efforts = model
         .supported_reasoning_levels
         .into_iter()
+        .filter(|option| !is_ultra_reasoning_effort(&option.effort))
         .map(|option| {
-            option.effort.validate()?;
+            let effort = parse_reasoning_effort(&option.effort)?;
             Ok(ReasoningEffortPreset {
-                effort: option.effort,
+                effort,
                 description: bounded_catalogue_text(option.description)?,
             })
         })
@@ -750,6 +879,15 @@ fn remote_model_preset(model: RemoteModel) -> Result<ModelPreset> {
             .additional_speed_tiers
             .iter()
             .any(|tier| tier == "fast");
+    let truncation_policy = model
+        .truncation_policy
+        .unwrap_or_else(|| default_truncation_policy_for_model(&model.slug));
+    if truncation_policy.byte_budget() == 0 {
+        return Err(anyhow!(
+            "model `{}` has an invalid tool output truncation limit",
+            model.slug
+        ));
+    }
     Ok(ModelPreset {
         model: model.slug,
         description,
@@ -759,11 +897,93 @@ fn remote_model_preset(model: RemoteModel) -> Result<ModelPreset> {
         effective_context_window_percent,
         configured_auto_compact_token_limit,
         use_responses_lite: model.use_responses_lite,
+        supports_parallel_tool_calls: model.supports_parallel_tool_calls,
+        truncation_policy,
+        supports_image_detail_original: model.supports_image_detail_original,
+        // Match Codex exactly: an absent or unknown selector uses native direct calls.
+        tool_mode: model.tool_mode.unwrap_or(ToolMode::Direct),
         prefer_websocket: model.prefer_websockets,
         supports_fast,
         comp_hash: model.comp_hash,
         is_default: false,
     })
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
+    let effort: ReasoningEffort = value.parse().map_err(|error: String| anyhow!(error))?;
+    effort.validate()?;
+    Ok(effort)
+}
+
+fn is_ultra_reasoning_effort(value: &str) -> bool {
+    value.eq_ignore_ascii_case(ULTRA_REASONING_EFFORT)
+}
+
+fn deserialize_remote_tool_mode<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<ToolMode>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(match value.as_str() {
+        "direct" => Some(ToolMode::Direct),
+        "code_mode" => Some(ToolMode::CodeMode),
+        "code_mode_only" => Some(ToolMode::CodeModeOnly),
+        _ => None,
+    })
+}
+
+fn is_current_code_mode_only_model(model: &str) -> bool {
+    matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
+}
+
+fn current_model_supports_parallel_tool_calls(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-5.6-luna"
+            | "gpt-5.5"
+            | "gpt-5.4"
+            | "gpt-5.4-mini"
+            | "gpt-5.2"
+            | "codex-auto-review"
+    )
+}
+
+fn default_truncation_policy_for_model(model: &str) -> TruncationPolicy {
+    if matches!(
+        model,
+        "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-5.6-luna"
+            | "gpt-5.5"
+            | "gpt-5.4"
+            | "gpt-5.4-mini"
+            | "codex-auto-review"
+    ) {
+        TruncationPolicy::Tokens(DEFAULT_TOOL_TRUNCATION_LIMIT)
+    } else {
+        // This matches Codex's fallback ModelInfo and the retained GPT-5.2 metadata. Current
+        // catalogue rows always serialize the explicit policy into new selections.
+        TruncationPolicy::Bytes(DEFAULT_TOOL_TRUNCATION_LIMIT)
+    }
+}
+
+fn default_supports_image_detail_original(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-5.6-luna"
+            | "gpt-5.5"
+            | "gpt-5.4"
+            | "gpt-5.4-mini"
+            | "codex-auto-review"
+    )
 }
 
 fn validate_model_slug(model: &str) -> Result<()> {
@@ -817,12 +1037,15 @@ pub(crate) fn load_default_selection() -> Result<ModelSelection> {
     let Some(home) = crate::paths::bettercodex_home() else {
         return Ok(ModelSelection::default());
     };
-    let settings = read_model_settings(&home.join(MODEL_SETTINGS_FILE))?;
+    let mut settings = read_model_settings(&home.join(MODEL_SETTINGS_FILE))?;
+    settings.selection.migrate_legacy_tool_mode_selector();
     settings.selection.validate()?;
     Ok(settings.selection)
 }
 
 pub(crate) fn save_default_selection(selection: &ModelSelection) -> Result<()> {
+    let mut selection = selection.clone();
+    selection.migrate_legacy_tool_mode_selector();
     selection.validate()?;
     let home = crate::paths::bettercodex_home()
         .ok_or_else(|| anyhow!("cannot save the model because no bettercodex home is available"))?;
@@ -832,8 +1055,11 @@ pub(crate) fn save_default_selection(selection: &ModelSelection) -> Result<()> {
         MAX_MODEL_SETTINGS_BYTES,
         read_model_settings,
         |settings| {
-            settings.selection = selection.clone();
-            Ok(())
+            let changed = settings.selection != selection;
+            if changed {
+                settings.selection = selection;
+            }
+            Ok(state_file::StateChange::from_changed(changed))
         },
     )
 }
@@ -864,6 +1090,10 @@ const fn default_remote_effective_context_window_percent() -> i64 {
 
 const fn default_true() -> bool {
     true
+}
+
+const fn is_zero(value: &u8) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]

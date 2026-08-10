@@ -64,7 +64,7 @@ fn normalization_inserts_stable_outputs_and_removes_orphans() {
 }
 
 #[test]
-fn normalization_preserves_exec_notifications_and_final_output() {
+fn normalization_preserves_exec_final_output_and_notifications() {
     let mut history = vec![
         json!({
             "type": "custom_tool_call",
@@ -75,14 +75,13 @@ fn normalization_preserves_exec_notifications_and_final_output() {
         json!({
             "type": "custom_tool_call_output",
             "call_id": "call_exec",
-            "name": "exec",
-            "output": "working",
+            "output": [{"type": "input_text", "text": "done"}],
         }),
         json!({
             "type": "custom_tool_call_output",
             "call_id": "call_exec",
             "name": "exec",
-            "output": [{"type": "input_text", "text": "done"}],
+            "output": "working",
         }),
     ];
     let expected = history.clone();

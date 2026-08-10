@@ -2,9 +2,11 @@
 
 bettercodex deliberately has no general configuration framework. Its model,
 reasoning effort, and matching context limits are selected through `/model` and
-saved as focused bettercodex state. Its provider and remaining runtime behavior
-are fixed by the project. Upstream Codex `config.toml`, profiles, managed
-requirements, MCP, provider, and lifecycle-hook settings do not apply.
+saved as focused bettercodex state. `/fast` stores the last on/off choice as
+focused bettercodex state for the next new session. Its provider and remaining
+runtime behavior are fixed by the project. Upstream Codex `config.toml`,
+profiles, managed requirements, MCP, provider, and lifecycle-hook settings do
+not apply.
 
 The supported path overrides are:
 

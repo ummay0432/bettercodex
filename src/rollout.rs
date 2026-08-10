@@ -15,6 +15,7 @@ use serde::de::MapAccess;
 use serde::de::Visitor;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -38,6 +39,9 @@ const SESSIONS_DIRECTORY: &str = "sessions";
 const INSTALLATION_ID_FILE: &str = "installation_id";
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 160;
+const HISTORY_APPEND_PREFIX: &[u8] = br#"{"type":"history_append""#;
+const SESSION_LIST_MAX_WORKERS: usize = 4;
+const SESSION_LIST_MIN_FILES_PER_WORKER: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionIdentity {
@@ -83,6 +87,29 @@ pub(crate) enum SessionTranscriptItem {
         text: String,
         phase: Option<MessagePhase>,
     },
+    Tool {
+        tool: SessionTranscriptTool,
+    },
+    Exploration {
+        tools: Vec<SessionTranscriptTool>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionTranscriptTool {
+    pub(crate) call_id: String,
+    pub(crate) name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) input: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output: Option<SessionTranscriptToolOutput>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub(crate) enum SessionTranscriptToolOutput {
+    Success(Value),
+    Error(String),
 }
 
 pub(crate) struct LoadedRollout {
@@ -90,6 +117,7 @@ pub(crate) struct LoadedRollout {
     pub(crate) metadata: SessionMetadata,
     pub(crate) history: Vec<Value>,
     pub(crate) transcript: Vec<SessionTranscriptItem>,
+    pub(crate) transcript_checkpoint: Option<usize>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) usage_history_estimate: Option<u64>,
     pub(crate) server_reasoning_included: bool,
@@ -141,6 +169,12 @@ enum RolloutRecordData<Items = Vec<Value>> {
         compaction_count: u64,
     },
     TranscriptSnapshot {
+        items: Vec<SessionTranscriptItem>,
+        // Snapshots written before tool replay existed contained only messages.
+        #[serde(default)]
+        complete: bool,
+    },
+    TranscriptAppend {
         items: Vec<SessionTranscriptItem>,
     },
     HistoryAppend {
@@ -543,7 +577,17 @@ impl Rollout {
     }
 
     pub(crate) fn snapshot_transcript(&mut self, items: Vec<SessionTranscriptItem>) -> Result<()> {
-        self.write_record(&RolloutRecord::TranscriptSnapshot { items })
+        self.write_record(&RolloutRecord::TranscriptSnapshot {
+            items,
+            complete: true,
+        })
+    }
+
+    pub(crate) fn append_transcript(&mut self, items: Vec<SessionTranscriptItem>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.write_record(&RolloutRecord::TranscriptAppend { items })
     }
 
     pub(crate) fn replace_history(
@@ -661,6 +705,15 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut metadata = None;
     let mut history = Vec::new();
     let mut transcript = Vec::new();
+    // History remains the compatibility source for journals written before complete transcript
+    // records existed and for a turn interrupted before its final transcript checkpoint. A
+    // successful checkpoint supersedes only the history-derived tail that precedes it.
+    let mut transcript_tail = Vec::new();
+    let mut transcript_tail_tools = HashMap::new();
+    let mut transcript_tail_history_start = None;
+    let mut has_transcript_checkpoint = false;
+    let mut legacy_transcript_snapshot = false;
+    let mut forked_session = false;
     let mut usage = None;
     let mut usage_history_estimate = None;
     let mut server_reasoning_included = false;
@@ -722,10 +775,28 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             RolloutRecord::ForkedFrom {
                 session_id: _,
                 compaction_count: source_compaction_count,
-            } => compaction_count = source_compaction_count,
-            RolloutRecord::TranscriptSnapshot { items } => transcript = items,
+            } => {
+                forked_session = true;
+                compaction_count = source_compaction_count;
+            }
+            RolloutRecord::TranscriptSnapshot { items, complete } => {
+                transcript = items;
+                transcript_tail.clear();
+                transcript_tail_tools.clear();
+                transcript_tail_history_start = None;
+                has_transcript_checkpoint = complete;
+                legacy_transcript_snapshot = !complete;
+            }
+            RolloutRecord::TranscriptAppend { items } => {
+                transcript.extend(items);
+                transcript_tail.clear();
+                transcript_tail_tools.clear();
+                transcript_tail_history_start = None;
+                has_transcript_checkpoint = true;
+                legacy_transcript_snapshot = false;
+            }
             RolloutRecord::HistoryAppend { items } => {
-                append_transcript_items(&mut transcript, &items);
+                transcript_tail_history_start.get_or_insert(history.len());
                 history.extend(items);
             }
             RolloutRecord::HistoryReplace {
@@ -733,6 +804,22 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 items,
                 response_usage: _,
             } => {
+                flush_transcript_history(
+                    &history,
+                    &mut transcript_tail_history_start,
+                    &mut transcript_tail,
+                    &mut transcript_tail_tools,
+                );
+                if legacy_transcript_snapshot
+                    && forked_session
+                    && reason == HistoryReplacement::Initial
+                    && transcript_tail.is_empty()
+                    && let Some(recovered) = recover_legacy_fork_transcript(&transcript, &items)
+                {
+                    transcript = recovered;
+                    has_transcript_checkpoint = false;
+                    legacy_transcript_snapshot = false;
+                }
                 if reason == HistoryReplacement::Compaction {
                     compaction_count = compaction_count.saturating_add(1);
                 }
@@ -758,7 +845,8 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             RolloutRecord::ServiceTierChanged {
                 service_tier: updated_service_tier,
             } => service_tier = updated_service_tier,
-            RolloutRecord::ModelChanged { selection } => {
+            RolloutRecord::ModelChanged { mut selection } => {
+                selection.migrate_legacy_tool_mode_selector();
                 selection.validate().with_context(|| {
                     format!(
                         "invalid model selection at {}:{line_number}",
@@ -767,7 +855,10 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 })?;
                 model_selection = Some(selection);
             }
-            RolloutRecord::HistoryModelChanged { selection } => {
+            RolloutRecord::HistoryModelChanged { mut selection } => {
+                if let Some(selection) = &mut selection {
+                    selection.migrate_legacy_tool_mode_selector();
+                }
                 if let Some(selection) = &selection {
                     selection.validate().with_context(|| {
                         format!("invalid history model at {}:{line_number}", path.display())
@@ -802,6 +893,12 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         // The model captured at turn start is the best available compatibility baseline.
         history_model_selection = turn_model_selection;
     }
+    flush_transcript_history(
+        &history,
+        &mut transcript_tail_history_start,
+        &mut transcript_tail,
+        &mut transcript_tail_tools,
+    );
     repair_rollout_tail(
         &mut file,
         &path,
@@ -824,6 +921,9 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     if let Some(history_model_selection) = &history_model_selection {
         history_model_selection.validate()?;
     }
+    let transcript_checkpoint =
+        (has_transcript_checkpoint && transcript_tail.is_empty()).then_some(transcript.len());
+    transcript.append(&mut transcript_tail);
 
     let rollout = Rollout {
         file,
@@ -835,6 +935,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         metadata,
         history,
         transcript,
+        transcript_checkpoint,
         usage,
         usage_history_estimate,
         server_reasoning_included,
@@ -855,52 +956,254 @@ fn model_selection_from_metadata(metadata: &SessionMetadata) -> Result<ModelSele
     ))
 }
 
-fn append_transcript_items(transcript: &mut Vec<SessionTranscriptItem>, items: &[Value]) {
+fn append_transcript_items(
+    transcript: &mut Vec<SessionTranscriptItem>,
+    pending_tools: &mut HashMap<String, usize>,
+    items: &[Value],
+) {
     for item in items {
-        if item.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
-        }
-        let Some(role) = item.get("role").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(content) = item.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        let text_kind = match role {
-            "user" => "input_text",
-            "assistant" => "output_text",
-            _ => continue,
-        };
-        let text = content
-            .iter()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some(text_kind))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        match role {
-            "user" => {
-                let image_count = content
-                    .iter()
-                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
-                    .count();
-                if (text.trim().is_empty() && image_count == 0)
-                    || crate::context::is_contextual_user_text(&text)
-                {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => append_transcript_message(transcript, item),
+            Some("function_call" | "custom_tool_call") => {
+                let Some(tool) = transcript_tool_from_history(item) else {
+                    continue;
+                };
+                let call_id = tool.call_id.clone();
+                let index = transcript.len();
+                transcript.push(SessionTranscriptItem::Tool { tool });
+                pending_tools.insert(call_id, index);
+            }
+            Some("function_call_output" | "custom_tool_call_output") => {
+                if item.get("name").and_then(Value::as_str) == Some("exec") {
+                    // Code Mode `notify(...)` records reuse the outer call ID. They are injected
+                    // into model history, not rendered as separate transcript cells.
                     continue;
                 }
-                transcript.push(SessionTranscriptItem::User { text, image_count });
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(index) = pending_tools.remove(call_id) else {
+                    // Output-only records were not separate transcript cells while live, so they
+                    // should not become orphan cells here.
+                    continue;
+                };
+                let Some(SessionTranscriptItem::Tool { tool }) = transcript.get_mut(index) else {
+                    continue;
+                };
+                let output = item.get("output").cloned().unwrap_or(Value::Null);
+                tool.output = Some(transcript_tool_output_from_history(&tool.name, output));
             }
-            "assistant" if !text.trim().is_empty() => {
-                let phase = item
-                    .get("phase")
-                    .and_then(|phase| serde_json::from_value(phase.clone()).ok());
-                transcript.push(SessionTranscriptItem::Assistant { text, phase });
-            }
-            "assistant" => {}
-            _ => unreachable!("message roles were filtered above"),
+            _ => {}
         }
     }
+}
+
+fn flush_transcript_history(
+    history: &[Value],
+    start: &mut Option<usize>,
+    transcript: &mut Vec<SessionTranscriptItem>,
+    pending_tools: &mut HashMap<String, usize>,
+) {
+    let Some(start) = start.take() else {
+        return;
+    };
+    append_transcript_items(
+        transcript,
+        pending_tools,
+        &history[start.min(history.len())..],
+    );
+}
+
+fn recover_legacy_fork_transcript(
+    snapshot: &[SessionTranscriptItem],
+    history: &[Value],
+) -> Option<Vec<SessionTranscriptItem>> {
+    if !snapshot.iter().all(|item| {
+        matches!(
+            item,
+            SessionTranscriptItem::User { .. } | SessionTranscriptItem::Assistant { .. }
+        )
+    }) {
+        return None;
+    }
+    let mut recovered = Vec::new();
+    append_transcript_items(&mut recovered, &mut HashMap::new(), history);
+    if !recovered
+        .iter()
+        .any(|item| matches!(item, SessionTranscriptItem::Tool { .. }))
+    {
+        return None;
+    }
+    let mut recovered_messages = recovered.iter().filter(|item| {
+        matches!(
+            item,
+            SessionTranscriptItem::User { .. } | SessionTranscriptItem::Assistant { .. }
+        )
+    });
+    let messages_match = snapshot
+        .iter()
+        .all(|item| recovered_messages.next() == Some(item))
+        && recovered_messages.next().is_none();
+    messages_match.then_some(recovered)
+}
+
+fn append_transcript_message(transcript: &mut Vec<SessionTranscriptItem>, item: &Value) {
+    let Some(role) = item.get("role").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(content) = item.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    let text_kind = match role {
+        "user" => "input_text",
+        "assistant" => "output_text",
+        _ => return,
+    };
+    let text = content
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some(text_kind))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    match role {
+        "user" => {
+            let image_count = content
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+                .count();
+            if (text.trim().is_empty() && image_count == 0)
+                || crate::context::is_contextual_user_text(&text)
+            {
+                return;
+            }
+            transcript.push(SessionTranscriptItem::User { text, image_count });
+        }
+        "assistant" if !text.trim().is_empty() => {
+            let phase = item
+                .get("phase")
+                .and_then(|phase| serde_json::from_value(phase.clone()).ok());
+            transcript.push(SessionTranscriptItem::Assistant { text, phase });
+        }
+        "assistant" => {}
+        _ => unreachable!("message roles were filtered above"),
+    }
+}
+
+fn transcript_tool_from_history(item: &Value) -> Option<SessionTranscriptTool> {
+    let call_id = item.get("call_id")?.as_str()?.to_string();
+    let name = item.get("name")?.as_str()?;
+    let namespace = match item.get("namespace") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(namespace)) if namespace == "functions" => None,
+        Some(Value::String(namespace)) => Some(namespace.as_str()),
+        Some(_) => return None,
+    };
+    let input = match item.get("type").and_then(Value::as_str)? {
+        "function_call" => item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map(|arguments| {
+                serde_json::from_str(arguments)
+                    .unwrap_or_else(|_| Value::String(arguments.to_string()))
+            }),
+        "custom_tool_call" => item.get("input").cloned(),
+        _ => return None,
+    };
+    let name = if let Some(namespace) = namespace {
+        format!("{namespace}.{name}")
+    } else {
+        name.to_string()
+    };
+    Some(SessionTranscriptTool {
+        call_id,
+        name,
+        input,
+        output: None,
+    })
+}
+
+fn transcript_tool_output_from_history(name: &str, output: Value) -> SessionTranscriptToolOutput {
+    let text = history_output_text(&output);
+    if text.starts_with("Script failed") || text.contains("\nScript error:\n") {
+        return SessionTranscriptToolOutput::Error(text);
+    }
+    let projected = match name {
+        "exec" | "wait" => Value::String(text),
+        "exec_command" | "write_stdin" => project_process_output(output, &text),
+        "apply_patch" | "update_plan" | "view_image" | "web.run" => Value::Null,
+        name if name.starts_with("openaiDeveloperDocs.") => Value::Null,
+        "log_papercut" => serde_json::from_str(&text).unwrap_or(output),
+        _ => output,
+    };
+    SessionTranscriptToolOutput::Success(projected)
+}
+
+fn history_output_text(output: &Value) -> String {
+    match output {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text").and_then(Value::as_str).filter(|_| {
+                    matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("input_text" | "output_text")
+                    )
+                })
+            })
+            .collect(),
+        Value::Object(object) => object
+            .get("output")
+            .map(history_output_text)
+            .unwrap_or_else(|| output.to_string()),
+        Value::Null | Value::Bool(_) | Value::Number(_) => output.to_string(),
+    }
+}
+
+fn project_process_output(output: Value, text: &str) -> Value {
+    if output.get("output").is_some() {
+        return output;
+    }
+    let (header, body) = text
+        .split_once("\nOutput:\n")
+        .map_or(("", text), |(header, body)| (header, body));
+    let mut projected = serde_json::Map::new();
+    projected.insert("output".to_string(), Value::String(body.to_string()));
+    for line in header.lines() {
+        if let Some(value) = line.strip_prefix("Chunk ID: ") {
+            projected.insert("chunk_id".to_string(), Value::String(value.to_string()));
+        } else if let Some(value) = line
+            .strip_prefix("Wall time: ")
+            .or_else(|| line.strip_prefix("Wall time "))
+            .and_then(|value| value.strip_suffix(" seconds"))
+            .and_then(|value| value.parse::<f64>().ok())
+        {
+            if let Some(value) = serde_json::Number::from_f64(value) {
+                projected.insert("wall_time_seconds".to_string(), Value::Number(value));
+            }
+        } else if let Some(value) = line
+            .strip_prefix("Process exited with code ")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            projected.insert("exit_code".to_string(), Value::Number(value.into()));
+        } else if let Some(value) = line.strip_prefix("Process running with session ID ") {
+            let value = value.parse::<i64>().map_or_else(
+                |_| Value::String(value.to_string()),
+                |value| Value::Number(value.into()),
+            );
+            projected.insert("session_id".to_string(), value);
+        } else if let Some(value) = line
+            .strip_prefix("Original token count: ")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            projected.insert(
+                "original_token_count".to_string(),
+                Value::Number(value.into()),
+            );
+        }
+    }
+    Value::Object(projected)
 }
 
 fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>> {
@@ -947,7 +1250,7 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).context("failed to list saved bettercodex sessions"),
     };
-    let mut sessions = Vec::new();
+    let mut candidates = Vec::new();
     for entry in entries {
         let entry = entry.context("failed to inspect a saved bettercodex session")?;
         let path = entry.path();
@@ -958,10 +1261,37 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok();
-        if let Some(summary) = read_session_summary(&path, modified_at)? {
-            sessions.push(summary);
-        }
+        candidates.push((path, modified_at));
     }
+    let worker_count = session_list_worker_count(candidates.len());
+    let mut sessions = if worker_count == 1 {
+        read_session_summaries(candidates.iter())?
+    } else {
+        std::thread::scope(|scope| -> Result<Vec<SessionSummary>> {
+            let candidates = &candidates;
+            let mut workers = Vec::with_capacity(worker_count);
+            for worker_index in 0..worker_count {
+                let worker = std::thread::Builder::new()
+                    .name(format!("session-list-{worker_index}"))
+                    .spawn_scoped(scope, move || {
+                        read_session_summaries(
+                            candidates.iter().skip(worker_index).step_by(worker_count),
+                        )
+                    })
+                    .context("failed to start saved session discovery worker")?;
+                workers.push(worker);
+            }
+
+            let mut sessions = Vec::with_capacity(candidates.len());
+            for worker in workers {
+                let mut found = worker
+                    .join()
+                    .map_err(|_| anyhow!("saved session discovery worker panicked"))??;
+                sessions.append(&mut found);
+            }
+            Ok(sessions)
+        })?
+    };
     sessions.sort_unstable_by(|left, right| {
         right
             .updated_at_unix_ms
@@ -969,6 +1299,26 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
             .then_with(|| right.created_at_unix_ms.cmp(&left.created_at_unix_ms))
             .then_with(|| right.id.cmp(&left.id))
     });
+    Ok(sessions)
+}
+
+fn session_list_worker_count(session_count: usize) -> usize {
+    let useful_workers = (session_count / SESSION_LIST_MIN_FILES_PER_WORKER).max(1);
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(SESSION_LIST_MAX_WORKERS)
+        .min(useful_workers)
+}
+
+fn read_session_summaries<'a>(
+    candidates: impl Iterator<Item = &'a (PathBuf, Option<SystemTime>)>,
+) -> Result<Vec<SessionSummary>> {
+    let mut sessions = Vec::new();
+    for (path, modified_at) in candidates {
+        if let Some(summary) = read_session_summary(path, *modified_at)? {
+            sessions.push(summary);
+        }
+    }
     Ok(sessions)
 }
 
@@ -1003,26 +1353,23 @@ fn read_session_summary(
     };
 
     let mut preview = None;
-    while let Some(record) = read_json_line::<PreviewRolloutRecord>(&mut reader)
+    while let Some(record) = read_next_history_append_record(&mut reader)
         .with_context(|| format!("failed to inspect saved session {}", path.display()))?
     {
-        match record.content {
-            JsonLineContent::Record(Ok(PreviewRolloutRecord::HistoryAppend { items })) => {
+        match record {
+            Ok(PreviewRolloutRecord::HistoryAppend { items }) => {
                 if let Some(found) = preview_from_items(&items) {
                     preview = Some(found);
                     break;
                 }
             }
-            JsonLineContent::Blank
-            | JsonLineContent::Record(Ok(
-                PreviewRolloutRecord::Session { .. } | PreviewRolloutRecord::Other,
-            )) => {}
-            JsonLineContent::Record(Err(error)) if error.is_io() => {
+            Ok(PreviewRolloutRecord::Session { .. } | PreviewRolloutRecord::Other) => {}
+            Err(error) if error.is_io() => {
                 return Err(error).with_context(|| {
                     format!("failed to inspect saved session {}", path.display())
                 });
             }
-            JsonLineContent::Record(Err(_)) => break,
+            Err(_) => break,
         }
     }
 
@@ -1037,6 +1384,57 @@ fn read_session_summary(
         updated_at_unix_ms,
         preview,
     }))
+}
+
+/// Finds and streams the next history append without parsing unrelated journal records.
+///
+/// Rollout serialization writes the externally tagged record type first. Inspecting that fixed
+/// prefix lets session discovery discard model, usage, reasoning, and tool records directly from
+/// the buffered input while matching records retain the line-framed, bounded-memory JSON parser.
+fn read_next_history_append_record(
+    reader: &mut impl BufRead,
+) -> std::io::Result<Option<serde_json::Result<PreviewRolloutRecord>>> {
+    if !skip_to_record_prefix(reader, HISTORY_APPEND_PREFIX)? {
+        return Ok(None);
+    }
+
+    let mut line = JsonLineReader::new(reader);
+    let record = {
+        let prefix = std::io::Cursor::new(HISTORY_APPEND_PREFIX).chain(&mut line);
+        let mut buffered = BufReader::with_capacity(JOURNAL_BUFFER_BYTES, prefix);
+        serde_json::from_reader(&mut buffered)
+    };
+    line.finish()?;
+    Ok(Some(record))
+}
+
+fn skip_to_record_prefix(reader: &mut impl BufRead, prefix: &[u8]) -> std::io::Result<bool> {
+    'records: loop {
+        let mut matched = 0;
+        while matched < prefix.len() {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(false);
+            }
+            let compared = available.len().min(prefix.len() - matched);
+            let expected = &prefix[matched..matched + compared];
+            if let Some(mismatch) = available[..compared]
+                .iter()
+                .zip(expected)
+                .position(|(actual, expected)| actual != expected)
+            {
+                let mismatch_byte = available[mismatch];
+                reader.consume(mismatch + 1);
+                if mismatch_byte != b'\n' {
+                    reader.skip_until(b'\n')?;
+                }
+                continue 'records;
+            }
+            reader.consume(compared);
+            matched += compared;
+        }
+        return Ok(true);
+    }
 }
 
 fn compatible_session_id(path: &Path, metadata: &SessionMetadata) -> Option<Uuid> {

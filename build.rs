@@ -7,13 +7,18 @@ use std::path::PathBuf;
 
 use sha2::Digest;
 
-const ICU_DICTIONARY_SIZE: u32 = 16 * 1024 * 1024;
+const ICU_DICTIONARY_SIZE: u32 = 3 * 1024 * 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
 
-    let mut options = lzma_rust2::Lzma2Options::with_preset(9);
+    let mut options = lzma_rust2::Lzma2Options::with_preset(6);
+    // ICU's aligned binary tables compress better with one literal-position bit and no
+    // previous-byte literal context. A 3 MiB dictionary is the corpus's compression knee, saving
+    // 13 MiB of decoder workspace; these settings recover more than the smaller window costs.
     options.lzma_options.dict_size = ICU_DICTIONARY_SIZE;
+    options.lzma_options.lc = 0;
+    options.lzma_options.lp = 1;
     let mut encoder = lzma_rust2::Lzma2Writer::new(Vec::new(), options);
     encoder.write_all(deno_core_icudata::ICU_DATA)?;
     let compressed = encoder.finish()?;

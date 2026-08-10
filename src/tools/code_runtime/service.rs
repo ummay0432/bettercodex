@@ -6,7 +6,7 @@ use crate::tools::code_runtime::CodeModeNestedToolCall;
 use crate::tools::code_runtime::CodeModeSessionDelegate;
 use crate::tools::code_runtime::CodeModeSessionResultFuture;
 use crate::tools::code_runtime::CodeModeToolKind;
-use crate::tools::code_runtime::DEFAULT_EXEC_YIELD_TIME_MS;
+use crate::tools::code_runtime::DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS;
 use crate::tools::code_runtime::ExecuteRequest;
 use crate::tools::code_runtime::FunctionCallOutputContentItem;
 use crate::tools::code_runtime::ImageDetail;
@@ -52,7 +52,9 @@ impl InProcessCodeModeSession {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
-        let yield_time_ms = request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS);
+        let yield_time_ms = request
+            .yield_time_ms
+            .unwrap_or(DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS);
         let started = self
             .runtime
             .execute(runtime_request(request), yield_timeout(yield_time_ms))

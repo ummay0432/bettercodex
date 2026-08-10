@@ -26,6 +26,8 @@ pub(crate) use service::InProcessCodeModeSession;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = "exec";
 pub(crate) const WAIT_TOOL_NAME: &str = "wait";
+// Codex core overrides the protocol crate's 10-second fallback with this session default.
+pub(crate) const DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS: u64 = DEFAULT_EXEC_YIELD_TIME_MS * 3;
 
 pub(crate) fn prewarm() {
     v8_init::prewarm_v8();

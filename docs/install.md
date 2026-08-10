@@ -35,6 +35,11 @@ Open a new terminal when requested, then run:
 bcodex
 ```
 
+Windows gives each process its own copy of `PATH`. The installer updates its
+PowerShell process and the persistent user `PATH`, but an already-open parent
+Command Prompt or PowerShell window keeps its old copy. When the installer
+reports this, open a new terminal rather than retrying `bcodex` in the old one.
+
 On the first interactive launch, bettercodex asks you to sign in only when no
 valid Codex credentials are available. Existing credentials remain valid across
 installs and updates.

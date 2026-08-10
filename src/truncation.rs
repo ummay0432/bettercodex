@@ -1,31 +1,85 @@
 //! Helpers for truncating tool and exec output.
 //!
 //! Ported from OpenAI Codex commit
-//! `1669c2403f793d0230065397dfc25f52b844244e`.
+//! `92cbfb4d2431bdc53dc03507aea2dc5b8e932e40`.
 
 mod string;
 
 pub(crate) use self::string::approx_bytes_for_tokens;
 pub(crate) use self::string::approx_token_count;
 pub(crate) use self::string::approx_tokens_from_byte_count;
+use self::string::truncate_middle_chars;
 use self::string::truncate_middle_with_token_budget;
 use crate::protocol::FunctionCallOutputContentItem;
+use serde::Deserialize;
+use serde::Serialize;
+use std::ops::Mul;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "mode", content = "limit", rename_all = "snake_case")]
+pub(crate) enum TruncationPolicy {
+    Bytes(usize),
+    Tokens(usize),
+}
+
+impl TruncationPolicy {
+    pub(crate) fn token_budget(self) -> usize {
+        match self {
+            Self::Bytes(bytes) => {
+                usize::try_from(approx_tokens_from_byte_count(bytes)).unwrap_or(usize::MAX)
+            }
+            Self::Tokens(tokens) => tokens,
+        }
+    }
+
+    pub(crate) fn byte_budget(self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Tokens(tokens) => approx_bytes_for_tokens(tokens),
+        }
+    }
+}
+
+impl Mul<f64> for TruncationPolicy {
+    type Output = Self;
+
+    fn mul(self, multiplier: f64) -> Self::Output {
+        match self {
+            Self::Bytes(bytes) => Self::Bytes((bytes as f64 * multiplier).ceil() as usize),
+            Self::Tokens(tokens) => Self::Tokens((tokens as f64 * multiplier).ceil() as usize),
+        }
+    }
+}
 
 pub(crate) fn formatted_truncate_text(content: &str, max_tokens: usize) -> String {
-    if content.len() <= approx_bytes_for_tokens(max_tokens) {
+    formatted_truncate_text_with_policy(content, TruncationPolicy::Tokens(max_tokens))
+}
+
+pub(crate) fn formatted_truncate_text_with_policy(
+    content: &str,
+    policy: TruncationPolicy,
+) -> String {
+    if content.len() <= policy.byte_budget() {
         return content.to_string();
     }
 
     let original_token_count = approx_token_count(content);
     let total_lines = content.lines().count();
-    let result = truncate_text(content, max_tokens);
+    let result = truncate_text_with_policy(content, policy);
     format!(
         "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{result}"
     )
 }
 
 pub(crate) fn truncate_text(content: &str, max_tokens: usize) -> String {
-    truncate_middle_with_token_budget(content, max_tokens).0
+    truncate_text_with_policy(content, TruncationPolicy::Tokens(max_tokens))
+}
+
+pub(crate) fn truncate_text_with_policy(content: &str, policy: TruncationPolicy) -> String {
+    match policy {
+        TruncationPolicy::Bytes(bytes) => truncate_middle_chars(content, bytes),
+        TruncationPolicy::Tokens(tokens) => truncate_middle_with_token_budget(content, tokens).0,
+    }
 }
 
 pub(crate) fn formatted_truncate_text_content_items(

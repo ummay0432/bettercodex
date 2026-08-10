@@ -20,8 +20,35 @@ fn bundled_catalogue_preserves_picker_models_and_supported_efforts() {
     assert!(models[0].is_default);
     assert!(models[..4].iter().all(|model| model.supports_fast));
     assert!(!models[4].supports_fast);
+    assert!(
+        models[..4]
+            .iter()
+            .all(|model| model.supports_image_detail_original)
+    );
+    assert!(!models[4].supports_image_detail_original);
     assert!(models[..3].iter().all(|model| model.use_responses_lite));
     assert!(models[3..].iter().all(|model| !model.use_responses_lite));
+    assert!(
+        models
+            .iter()
+            .all(|model| model.supports_parallel_tool_calls)
+    );
+    assert!(
+        models[..3]
+            .iter()
+            .all(|model| model.tool_mode == ToolMode::CodeModeOnly)
+    );
+    assert!(
+        models[3..]
+            .iter()
+            .all(|model| model.tool_mode == ToolMode::Direct)
+    );
+    assert!(
+        models[..4]
+            .iter()
+            .all(|model| model.truncation_policy == TruncationPolicy::Tokens(10_000))
+    );
+    assert_eq!(models[4].truncation_policy, TruncationPolicy::Bytes(10_000));
     assert_eq!(
         models[0]
             .supported_reasoning_efforts
@@ -49,6 +76,7 @@ fn remote_catalogue_filters_sorts_and_derives_transport_capabilities() -> Result
                     {"effort": "high", "description": "Think hard"}
                 ],
                 "context_window": 100000,
+                "tool_mode": "future_mode",
                 "visibility": "list",
                 "priority": 20
             },
@@ -58,14 +86,18 @@ fn remote_catalogue_filters_sorts_and_derives_transport_capabilities() -> Result
                 "default_reasoning_level": "medium",
                 "supported_reasoning_levels": [
                     {"effort": "medium", "description": "Balanced"},
-                    {"effort": "max", "description": "Deep reasoning"},
-                    {"effort": "ultra", "description": "Orchestration"}
+                    {"effort": "ultra", "description": "Automatic task delegation"},
+                    {"effort": "max", "description": "Deep reasoning"}
                 ],
                 "context_window": 200000,
                 "effective_context_window_percent": 80,
                 "auto_compact_token_limit": 170000,
                 "comp_hash": "compatible-v2",
                 "use_responses_lite": true,
+                "supports_parallel_tool_calls": true,
+                "truncation_policy": {"mode": "tokens", "limit": 12345},
+                "supports_image_detail_original": true,
+                "tool_mode": "code_mode_only",
                 "prefer_websockets": false,
                 "service_tiers": [{"id": "priority"}],
                 "visibility": "list",
@@ -79,8 +111,15 @@ fn remote_catalogue_filters_sorts_and_derives_transport_capabilities() -> Result
     assert_eq!(models[0].model, "first");
     assert!(models[0].is_default);
     assert!(models[0].use_responses_lite);
+    assert!(models[0].supports_parallel_tool_calls);
+    assert!(models[0].supports_image_detail_original);
     assert!(!models[0].prefer_websocket);
     assert!(models[0].supports_fast);
+    assert_eq!(models[0].tool_mode, ToolMode::CodeModeOnly);
+    assert_eq!(
+        models[0].truncation_policy,
+        TruncationPolicy::Tokens(12_345)
+    );
     assert_eq!(models[0].comp_hash.as_deref(), Some("compatible-v2"));
     assert_eq!(models[0].raw_context_window, 200_000);
     let selection = models[0].selection(ReasoningEffort::Medium);
@@ -94,8 +133,18 @@ fn remote_catalogue_filters_sorts_and_derives_transport_capabilities() -> Result
             .collect::<Vec<_>>(),
         ["medium", "max"]
     );
+    assert_eq!(
+        models[0]
+            .supported_reasoning_efforts
+            .iter()
+            .map(|preset| preset.description.as_str())
+            .collect::<Vec<_>>(),
+        ["Balanced", "Deep reasoning"]
+    );
     assert_eq!(models[1].model, "later");
     assert!(!models[1].is_default);
+    assert_eq!(models[1].tool_mode, ToolMode::Direct);
+    assert_eq!(models[1].truncation_policy, TruncationPolicy::Bytes(10_000));
     Ok(())
 }
 
@@ -108,6 +157,11 @@ fn selection_round_trips_custom_remote_metadata() -> Result<()> {
         effective_context_window_percent: 80,
         configured_auto_compact_token_limit: Some(350_000),
         use_responses_lite: true,
+        supports_parallel_tool_calls: true,
+        truncation_policy: Some(TruncationPolicy::Bytes(12_345)),
+        supports_image_detail_original: Some(true),
+        tool_mode: Some(ToolMode::CodeMode),
+        tool_mode_selector_version: TOOL_MODE_SELECTOR_VERSION,
         prefer_websocket: false,
         supports_fast: true,
         comp_hash: Some("remote-v3".to_string()),
@@ -117,6 +171,54 @@ fn selection_round_trips_custom_remote_metadata() -> Result<()> {
     assert_eq!(decoded, selection);
     assert_eq!(decoded.effective_context_window(), 364_800);
     assert_eq!(decoded.auto_compact_token_limit(), 350_000);
+    Ok(())
+}
+
+#[test]
+fn legacy_collapsed_sol_selector_migrates_to_code_mode_only() -> Result<()> {
+    let mut selection: ModelSelection = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "max",
+        "raw_context_window": 272000,
+        "effective_context_window_percent": 95,
+        "use_responses_lite": true,
+        "supports_parallel_tool_calls": false,
+        "tool_mode": "code_mode",
+        "prefer_websocket": true,
+        "supports_fast": true
+    }))?;
+
+    assert_eq!(selection.tool_mode(), ToolMode::CodeModeOnly);
+    assert_eq!(
+        selection.truncation_policy(),
+        TruncationPolicy::Tokens(10_000)
+    );
+    selection.migrate_legacy_tool_mode_selector();
+    assert_eq!(selection.tool_mode, Some(ToolMode::CodeModeOnly));
+    assert_eq!(
+        selection.truncation_policy,
+        Some(TruncationPolicy::Tokens(10_000))
+    );
+    assert_eq!(selection.supports_image_detail_original, Some(true));
+    assert!(selection.supports_parallel_tool_calls);
+    assert_eq!(
+        selection.tool_mode_selector_version,
+        TOOL_MODE_SELECTOR_VERSION
+    );
+
+    let mut legacy_gpt_5_2: ModelSelection = serde_json::from_value(json!({
+        "model": "gpt-5.2",
+        "reasoning_effort": "medium"
+    }))?;
+    assert_eq!(
+        legacy_gpt_5_2.truncation_policy(),
+        TruncationPolicy::Bytes(10_000)
+    );
+    assert!(!legacy_gpt_5_2.supports_image_detail_original());
+    assert!(!legacy_gpt_5_2.supports_parallel_tool_calls);
+    legacy_gpt_5_2.migrate_legacy_tool_mode_selector();
+    assert!(legacy_gpt_5_2.supports_parallel_tool_calls);
+    assert_eq!(legacy_gpt_5_2.tool_mode(), ToolMode::Direct);
     Ok(())
 }
 

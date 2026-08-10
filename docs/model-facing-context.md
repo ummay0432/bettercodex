@@ -9,13 +9,16 @@ Do not alter Codex-derived agent-facing context in `prompts/*.md`, tool
 descriptions, or model-visible errors without explicit user permission.
 
 `prompts/system.md` is the active harness template. `src/api.rs` renders it with
-exactly one of `prompts/system-unix.md` or `prompts/system-windows.md`, then sends
-the result through the Responses API's top-level `instructions` field at
-developer authority; it is not OpenAI's root or system layer. Edit these files
-only when the user explicitly asks to edit the system prompt.
+exactly one of `prompts/system-unix.md` or `prompts/system-windows.md`. Standard
+Responses requests send the result through the top-level `instructions` field;
+Responses Lite requests prepend it as a developer message after the
+`additional_tools` item, matching Codex. In both forms it has developer
+authority; it is not OpenAI's root or system layer. Edit these files only when
+the user explicitly asks to edit the system prompt.
 
-`src/tools/catalogue.rs` generates the tool text. Inspect the active output with
-`bcodex --tool-catalogue`; do not maintain a copied snapshot.
+`src/tools/catalogue.rs` generates direct tool specifications and the Code Mode
+text. Inspect the active `exec` description with `bcodex --tool-catalogue`; do
+not maintain a copied snapshot.
 
 ## Writing and placement
 

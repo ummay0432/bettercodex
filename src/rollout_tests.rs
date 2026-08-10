@@ -20,6 +20,231 @@ impl Drop for DirectoryCleanup {
 }
 
 #[test]
+fn legacy_resume_reconstructs_user_tool_and_assistant_transcript() {
+    let root = temporary_directory("rollout-complete-transcript");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let source =
+        "const result = await tools.exec_command({cmd:\"cargo test\"}); text(result.output);";
+    rollout
+        .append_history(&[json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "run the checks"}],
+        })])
+        .unwrap();
+    rollout
+        .append_history(&[json!({
+            "type": "custom_tool_call",
+            "call_id": "call-1",
+            "name": "exec",
+            "input": source,
+        })])
+        .unwrap();
+    rollout
+        .append_history(&[json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call-1",
+            "name": "exec",
+            "output": "still running",
+        })])
+        .unwrap();
+    rollout
+        .append_history(&[json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call-1",
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": "Script completed\nWall time 0.1 seconds\nOutput:\n",
+                },
+                {"type": "input_text", "text": "test result: ok\n"},
+            ],
+        })])
+        .unwrap();
+    rollout
+        .append_history(&[json!({
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "All checks pass."}],
+        })])
+        .unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+
+    assert_eq!(
+        loaded.transcript,
+        vec![
+            SessionTranscriptItem::User {
+                text: "run the checks".to_string(),
+                image_count: 0,
+            },
+            SessionTranscriptItem::Tool {
+                tool: SessionTranscriptTool {
+                    call_id: "call-1".to_string(),
+                    name: "exec".to_string(),
+                    input: Some(Value::String(source.to_string())),
+                    output: Some(SessionTranscriptToolOutput::Success(Value::String(
+                        "Script completed\nWall time 0.1 seconds\nOutput:\ntest result: ok\n"
+                            .to_string(),
+                    ))),
+                },
+            },
+            SessionTranscriptItem::Assistant {
+                text: "All checks pass.".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+            },
+        ]
+    );
+    assert_eq!(loaded.transcript_checkpoint, None);
+}
+
+#[test]
+fn legacy_fork_snapshot_recovers_tools_from_matching_history() {
+    let root = temporary_directory("rollout-legacy-fork-transcript");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let user = SessionTranscriptItem::User {
+        text: "inspect the repository".to_string(),
+        image_count: 0,
+    };
+    let assistant = SessionTranscriptItem::Assistant {
+        text: "Inspection complete.".to_string(),
+        phase: Some(MessagePhase::FinalAnswer),
+    };
+    rollout.record_fork("source-session", 0).unwrap();
+    rollout
+        .write_record(&RolloutRecord::TranscriptSnapshot {
+            items: vec![user.clone(), assistant.clone()],
+            complete: false,
+        })
+        .unwrap();
+    rollout
+        .replace_history(
+            &[
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect the repository"}],
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}",
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "Chunk ID: abc\nWall time: 0.1000 seconds\nProcess exited with code 0\nOutput:\n/repo\n",
+                }),
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Inspection complete."}],
+                }),
+            ],
+            HistoryReplacement::Initial,
+        )
+        .unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+
+    assert_eq!(
+        loaded.transcript,
+        vec![
+            user,
+            SessionTranscriptItem::Tool {
+                tool: SessionTranscriptTool {
+                    call_id: "call-1".to_string(),
+                    name: "exec_command".to_string(),
+                    input: Some(json!({"cmd": "pwd"})),
+                    output: Some(SessionTranscriptToolOutput::Success(json!({
+                        "chunk_id": "abc",
+                        "exit_code": 0,
+                        "output": "/repo\n",
+                        "wall_time_seconds": 0.1,
+                    }))),
+                },
+            },
+            assistant,
+        ]
+    );
+    assert_eq!(loaded.transcript_checkpoint, None);
+}
+
+#[test]
+fn explicit_transcript_records_replace_fallback_history_and_append_incrementally() {
+    let root = temporary_directory("rollout-transcript-checkpoints");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let user = SessionTranscriptItem::User {
+        text: "inspect this".to_string(),
+        image_count: 0,
+    };
+    let assistant = SessionTranscriptItem::Assistant {
+        text: "Inspection complete.".to_string(),
+        phase: Some(MessagePhase::FinalAnswer),
+    };
+    rollout
+        .append_history(&[json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "inspect this"}],
+        })])
+        .unwrap();
+    rollout.snapshot_transcript(vec![user.clone()]).unwrap();
+    rollout
+        .append_history(&[json!({
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "history fallback"}],
+        })])
+        .unwrap();
+    rollout.append_transcript(vec![assistant.clone()]).unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+
+    assert_eq!(loaded.transcript, vec![user.clone(), assistant.clone()]);
+    assert_eq!(loaded.transcript_checkpoint, Some(2));
+
+    let recovered = SessionTranscriptItem::Assistant {
+        text: "Recovered after interruption.".to_string(),
+        phase: Some(MessagePhase::Commentary),
+    };
+    let mut rollout = loaded.rollout;
+    rollout
+        .append_history(&[json!({
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "Recovered after interruption."}],
+        })])
+        .unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+
+    assert_eq!(loaded.transcript, vec![user, assistant, recovered]);
+    assert_eq!(loaded.transcript_checkpoint, None);
+}
+
+#[test]
 fn rollout_replays_replacements_usage_and_turn_state() {
     let root = temporary_directory("rollout-replay");
     let cwd = root.join("repo");
@@ -114,6 +339,11 @@ fn rollout_replays_initial_remote_model_metadata() {
         effective_context_window_percent: 80,
         configured_auto_compact_token_limit: Some(350_000),
         use_responses_lite: true,
+        supports_parallel_tool_calls: true,
+        truncation_policy: Some(crate::truncation::TruncationPolicy::Bytes(12_345)),
+        supports_image_detail_original: Some(true),
+        tool_mode: Some(crate::model::ToolMode::CodeMode),
+        tool_mode_selector_version: 1,
         prefer_websocket: false,
         supports_fast: true,
         comp_hash: Some("remote-v3".to_string()),

@@ -103,6 +103,35 @@ try {
     Assert-Equal $Path 'C:\bettercodex\bin;C:\Existing;D:\Tools' 'PATH prepend failed'
     $Path = Prepend-PathEntry 'c:\BETTERCODEX\BIN;D:\Tools' 'C:\bettercodex\bin'
     Assert-Equal $Path 'C:\bettercodex\bin;D:\Tools' 'PATH deduplication failed'
+    Assert-True (Test-PathEntry $Path 'c:\BetterCodex\bin\') 'PATH entry was not found case-insensitively'
+    Assert-True (-not (Test-PathEntry $Path 'C:\Missing')) 'missing PATH entry was found'
+
+    $OriginalUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $OriginalProcessPath = [Environment]::GetEnvironmentVariable('Path', 'Process')
+    $PathBin = Join-Path $TestRoot 'path-bin'
+    $ConfiguredUserPath = Prepend-PathEntry $OriginalUserPath $PathBin
+    try {
+        [Environment]::SetEnvironmentVariable('Path', $ConfiguredUserPath, 'User')
+        [Environment]::SetEnvironmentVariable('Path', $OriginalProcessPath, 'Process')
+        $PathOutput = (Ensure-CommandPath $PathBin *>&1) -join "`n"
+        Assert-Equal `
+            ([Environment]::GetEnvironmentVariable('Path', 'User')) `
+            $ConfiguredUserPath `
+            'already-configured user PATH changed'
+        Assert-True `
+            (Test-PathEntry ([Environment]::GetEnvironmentVariable('Path', 'Process')) $PathBin) `
+            'installer PowerShell PATH was not activated'
+        Assert-True `
+            $PathOutput.Contains('PATH is already configured for future terminal sessions') `
+            'stale parent shell was not distinguished from the persisted PATH'
+        Assert-True `
+            $PathOutput.Contains('Already-open parent shells keep their old PATH') `
+            'stale parent shell did not receive restart guidance'
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('Path', $OriginalUserPath, 'User')
+        [Environment]::SetEnvironmentVariable('Path', $OriginalProcessPath, 'Process')
+    }
 
     $Source = Join-Path $TestRoot 'source.bin'
     $Archive = Join-Path $TestRoot 'source.bin.gz'

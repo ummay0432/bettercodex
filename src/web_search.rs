@@ -14,6 +14,7 @@ use crate::protocol::ImageDetail;
 use crate::protocol::InternalChatMessageMetadataPassthrough;
 use crate::protocol::MessagePhase;
 use crate::protocol::ResponseItem;
+use crate::truncation::TruncationPolicy;
 use crate::truncation::approx_bytes_for_tokens;
 use crate::truncation::approx_token_count;
 use crate::truncation::formatted_truncate_text;
@@ -41,7 +42,6 @@ pub(crate) const TOOL_NAME: &str = "run";
 pub(crate) const DESCRIPTION: &str = include_str!("tools/web_run_description.md");
 
 const ASSISTANT_CONTEXT_TOKEN_LIMIT: usize = 1_000;
-const MAX_OUTPUT_TOKENS: usize = 10_000;
 const SEARCH_PATH: &str = "alpha/search";
 const REQUEST_MAX_RETRIES: u64 = 4;
 const REQUEST_RETRY_DELAY: Duration = Duration::from_millis(200);
@@ -63,10 +63,23 @@ pub(crate) struct WebSearchClient {
     model_selection: SharedModelSelection,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ToolTurnContext {
     input: Option<Arc<SearchInput>>,
     turn_metadata: String,
+    truncation_policy: TruncationPolicy,
+    supports_image_detail_original: bool,
+}
+
+impl Default for ToolTurnContext {
+    fn default() -> Self {
+        Self {
+            input: None,
+            turn_metadata: String::new(),
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            supports_image_detail_original: true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +105,7 @@ impl<'a> SearchRequest<'a> {
         model: &'a str,
         input: Option<&'a SearchInput>,
         commands: &'a SearchCommands,
+        max_output_tokens: usize,
     ) -> Self {
         Self {
             id,
@@ -102,7 +116,7 @@ impl<'a> SearchRequest<'a> {
                 allowed_callers: ["direct"],
                 external_web_access: true,
             },
-            max_output_tokens: u64::try_from(MAX_OUTPUT_TOKENS).unwrap_or(u64::MAX),
+            max_output_tokens: u64::try_from(max_output_tokens).unwrap_or(u64::MAX),
         }
     }
 }
@@ -302,15 +316,6 @@ enum SportsFunction {
     Standings,
 }
 
-impl SportsFunction {
-    fn display_name(self) -> &'static str {
-        match self {
-            Self::Schedule => "schedule",
-            Self::Standings => "standings",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SportsLeague {
@@ -323,22 +328,6 @@ enum SportsLeague {
     Ncaamb,
     Ncaawb,
     Ipl,
-}
-
-impl SportsLeague {
-    fn display_name(self) -> &'static str {
-        match self {
-            Self::Nba => "NBA",
-            Self::Wnba => "WNBA",
-            Self::Nfl => "NFL",
-            Self::Nhl => "NHL",
-            Self::Mlb => "MLB",
-            Self::Epl => "EPL",
-            Self::Ncaamb => "NCAAMB",
-            Self::Ncaawb => "NCAAWB",
-            Self::Ipl => "IPL",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -360,20 +349,20 @@ struct SearchResponse {
     output: String,
 }
 
-/// One concise row in the TUI's grouped web-activity tree.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct WebActivity {
-    pub(crate) verb: &'static str,
-    pub(crate) detail: String,
-}
-
-impl WebActivity {
-    fn new(verb: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            verb,
-            detail: detail.into(),
-        }
-    }
+pub(crate) enum WebSearchAction {
+    Search {
+        query: Option<String>,
+        queries: Option<Vec<String>>,
+    },
+    OpenPage {
+        url: Option<String>,
+    },
+    FindInPage {
+        url: Option<String>,
+        pattern: Option<String>,
+    },
+    Other,
 }
 
 impl WebSearchClient {
@@ -404,11 +393,13 @@ impl WebSearchClient {
         }
         let commands = parse_commands(input)?;
         let model_selection = self.model_selection.get();
+        let max_output_tokens = model_selection.truncation_policy().token_budget();
         let request = SearchRequest::new(
             &self.session_id,
             &model_selection.model,
             context.input.as_deref(),
             &commands,
+            max_output_tokens,
         );
         let body = Bytes::from(
             serde_json::to_vec(&request)
@@ -449,23 +440,57 @@ impl WebSearchClient {
         .map_err(|error| anyhow!("standalone web search request failed: {error}"))?;
         let response: SearchResponse = serde_json::from_slice(&response)
             .context("failed to decode standalone web search response")?;
-        Ok(Value::String(bounded_search_output(response.output)))
+        Ok(Value::String(bounded_search_output(
+            response.output,
+            max_output_tokens,
+        )))
     }
 }
 
-fn bounded_search_output(output: String) -> String {
-    if output.len() <= approx_bytes_for_tokens(MAX_OUTPUT_TOKENS) {
+fn bounded_search_output(output: String, max_output_tokens: usize) -> String {
+    if output.len() <= approx_bytes_for_tokens(max_output_tokens) {
         output
     } else {
-        formatted_truncate_text(&output, MAX_OUTPUT_TOKENS)
+        formatted_truncate_text(&output, max_output_tokens)
     }
 }
 
 impl ToolTurnContext {
-    pub(crate) fn from_history(history: &[Value], turn_metadata: String) -> Self {
+    pub(crate) fn from_history(
+        history: &[Value],
+        turn_metadata: String,
+        truncation_policy: TruncationPolicy,
+        supports_image_detail_original: bool,
+    ) -> Self {
         Self {
             input: recent_input(history).map(Arc::new),
             turn_metadata,
+            truncation_policy,
+            supports_image_detail_original,
+        }
+    }
+
+    pub(crate) fn truncation_policy(&self) -> TruncationPolicy {
+        self.truncation_policy
+    }
+
+    pub(crate) fn supports_image_detail_original(&self) -> bool {
+        self.supports_image_detail_original
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_truncation_policy(truncation_policy: TruncationPolicy) -> Self {
+        Self {
+            truncation_policy,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_original_image_detail() -> Self {
+        Self {
+            supports_image_detail_original: false,
+            ..Self::default()
         }
     }
 }
@@ -474,129 +499,10 @@ pub(crate) fn input_schema() -> &'static Value {
     &INPUT_SCHEMA
 }
 
-pub(crate) fn activities_for_display(input: Option<Value>) -> Vec<WebActivity> {
-    let Ok(commands) = parse_commands(input) else {
-        return vec![WebActivity::new("Browse", String::new())];
-    };
-    let SearchCommands {
-        search_query,
-        image_query,
-        open,
-        click,
-        find,
-        screenshot,
-        finance,
-        weather,
-        sports,
-        time,
-        response_length: _,
-    } = commands;
-    let mut activities = Vec::new();
-
-    if let Some(queries) = search_query {
-        activities.extend(
-            queries
-                .into_iter()
-                .map(|query| WebActivity::new("Search", query.q)),
-        );
-    }
-    if let Some(queries) = image_query {
-        activities.extend(
-            queries
-                .into_iter()
-                .map(|query| WebActivity::new("Image search", query.q)),
-        );
-    }
-    if let Some(operations) = open {
-        activities.extend(operations.into_iter().map(|operation| {
-            let detail = match operation.lineno {
-                Some(line) => format!("{} at line {line}", operation.ref_id),
-                None => operation.ref_id,
-            };
-            WebActivity::new("Open", detail)
-        }));
-    }
-    if let Some(operations) = click {
-        activities.extend(operations.into_iter().map(|operation| {
-            WebActivity::new(
-                "Open",
-                format!("link {} in {}", operation.id, operation.ref_id),
-            )
-        }));
-    }
-    if let Some(operations) = find {
-        activities.extend(operations.into_iter().map(|operation| {
-            WebActivity::new(
-                "Find",
-                format!("'{}' in {}", operation.pattern, operation.ref_id),
-            )
-        }));
-    }
-    if let Some(operations) = screenshot {
-        activities.extend(operations.into_iter().map(|operation| {
-            WebActivity::new(
-                "Screenshot",
-                format!("page index {} of {}", operation.pageno, operation.ref_id),
-            )
-        }));
-    }
-    if let Some(operations) = finance {
-        activities.extend(operations.into_iter().map(|operation| {
-            let ticker = operation.ticker;
-            let detail = match operation.market.filter(|market| !market.is_empty()) {
-                Some(market) => format!("{ticker} ({market})"),
-                None => ticker,
-            };
-            WebActivity::new("Finance", detail)
-        }));
-    }
-    if let Some(operations) = weather {
-        activities.extend(operations.into_iter().map(|operation| {
-            let mut detail = operation.location;
-            if let Some(start) = operation.start {
-                detail.push_str(&format!(" from {start}"));
-            }
-            if let Some(duration) = operation.duration {
-                let plural = if duration == 1 { "" } else { "s" };
-                detail.push_str(&format!(" for {duration} day{plural}"));
-            }
-            WebActivity::new("Weather", detail)
-        }));
-    }
-    if let Some(operations) = sports {
-        activities.extend(operations.into_iter().map(|operation| {
-            let mut detail = format!(
-                "{} {}",
-                operation.league.display_name(),
-                operation.r#fn.display_name()
-            );
-            if let Some(team) = operation.team {
-                detail.push_str(&format!(" for {team}"));
-            }
-            if let Some(opponent) = operation.opponent {
-                detail.push_str(&format!(" vs {opponent}"));
-            }
-            match (operation.date_from, operation.date_to) {
-                (Some(from), Some(to)) => detail.push_str(&format!(" from {from} to {to}")),
-                (Some(from), None) => detail.push_str(&format!(" from {from}")),
-                (None, Some(to)) => detail.push_str(&format!(" through {to}")),
-                (None, None) => {}
-            }
-            WebActivity::new("Sports", detail)
-        }));
-    }
-    if let Some(operations) = time {
-        activities.extend(
-            operations
-                .into_iter()
-                .map(|operation| WebActivity::new("Time", operation.utc_offset)),
-        );
-    }
-
-    if activities.is_empty() {
-        activities.push(WebActivity::new("Browse", String::new()));
-    }
-    activities
+pub(crate) fn action_for_display(input: Option<Value>) -> WebSearchAction {
+    parse_commands(input)
+        .map(|commands| command_action(&commands))
+        .unwrap_or(WebSearchAction::Other)
 }
 
 fn parse_commands(input: Option<Value>) -> Result<SearchCommands> {
@@ -608,6 +514,55 @@ fn parse_commands(input: Option<Value>) -> Result<SearchCommands> {
             "tool `web.run` expects a JSON object for arguments"
         )),
     }
+}
+
+fn command_action(commands: &SearchCommands) -> WebSearchAction {
+    commands
+        .search_query
+        .as_deref()
+        .and_then(query_action)
+        .or_else(|| commands.image_query.as_deref().and_then(query_action))
+        .or_else(|| {
+            commands
+                .open
+                .as_deref()
+                .and_then(|operations| operations.first())
+                .and_then(|operation| {
+                    literal_url(&operation.ref_id)
+                        .map(|url| WebSearchAction::OpenPage { url: Some(url) })
+                })
+        })
+        .or_else(|| {
+            commands
+                .find
+                .as_deref()
+                .and_then(|operations| operations.first())
+                .map(|operation| WebSearchAction::FindInPage {
+                    url: literal_url(&operation.ref_id),
+                    pattern: Some(operation.pattern.clone()),
+                })
+        })
+        .unwrap_or(WebSearchAction::Other)
+}
+
+fn query_action(queries: &[SearchQuery]) -> Option<WebSearchAction> {
+    match queries {
+        [] => None,
+        [query] => Some(WebSearchAction::Search {
+            query: Some(query.q.clone()),
+            queries: None,
+        }),
+        queries => Some(WebSearchAction::Search {
+            query: None,
+            queries: Some(queries.iter().map(|query| query.q.clone()).collect()),
+        }),
+    }
+}
+
+fn literal_url(ref_id: &str) -> Option<String> {
+    reqwest::Url::parse(ref_id)
+        .is_ok()
+        .then(|| ref_id.to_string())
 }
 
 fn search_headers(turn_metadata: &str, auth: &crate::auth::AuthSnapshot) -> Result<HeaderMap> {

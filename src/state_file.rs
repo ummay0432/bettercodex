@@ -13,15 +13,45 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StateChange {
+    Unchanged,
+    Changed,
+}
+
+impl StateChange {
+    pub(crate) const fn from_changed(changed: bool) -> Self {
+        if changed {
+            Self::Changed
+        } else {
+            Self::Unchanged
+        }
+    }
+}
+
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: usize) -> Result<Option<T>> {
-    let mut file = match File::open(path) {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // O_NONBLOCK prevents a substituted FIFO from hanging startup on Unix;
+    // no-follow handling keeps reads on the bettercodex-owned state file.
+    crate::platform_fs::configure_private_file_nofollow(&mut options, true);
+    let mut file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    if file.metadata()?.len() > max_bytes as u64 {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect state file {}", path.display()))?;
+    if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
+        return Err(anyhow!(
+            "state file {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > max_bytes as u64 {
         return Err(anyhow!(
             "{} exceeds the {max_bytes}-byte limit",
             path.display()
@@ -47,7 +77,7 @@ pub(crate) fn update_json<T: Serialize>(
     path: &Path,
     max_bytes: usize,
     load: impl FnOnce(&Path) -> Result<T>,
-    update: impl FnOnce(&mut T) -> Result<()>,
+    update: impl FnOnce(&mut T) -> Result<StateChange>,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -74,7 +104,9 @@ pub(crate) fn update_json<T: Serialize>(
     File::lock(&lock).with_context(|| format!("failed to lock {}", path.display()))?;
 
     let mut document = load(path)?;
-    update(&mut document)?;
+    if update(&mut document)? == StateChange::Unchanged {
+        return Ok(());
+    }
     write_json(path, &document, max_bytes)
 }
 
@@ -135,3 +167,7 @@ fn temporary_path(path: &Path) -> Result<PathBuf> {
         &format!(".tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4()),
     )
 }
+
+#[cfg(test)]
+#[path = "state_file_tests.rs"]
+mod tests;

@@ -54,13 +54,13 @@ pub(crate) fn save(path: &Path, skill_path: &Path, update: SkillUpdate) -> Resul
             ));
         }
         let settings = document.skills.entry(skill_path).or_default();
-        match update {
-            SkillUpdate::Enabled(enabled) => settings.enabled = Some(enabled),
+        let changed = match update {
+            SkillUpdate::Enabled(enabled) => settings.enabled.replace(enabled) != Some(enabled),
             SkillUpdate::AllowImplicitInvocation(allow) => {
-                settings.allow_implicit_invocation = Some(allow);
+                settings.allow_implicit_invocation.replace(allow) != Some(allow)
             }
-        }
-        Ok(())
+        };
+        Ok(state_file::StateChange::from_changed(changed))
     })
 }
 

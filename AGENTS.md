@@ -15,6 +15,9 @@ Do not use emojis, except for Codex's established checkmark status marker.
 
 The startup art is off limits: do not modify or delete it.
 
+Do not add audio or video support, dependencies, protocol items, runtime helpers,
+tool descriptions, fixtures, or tests; bettercodex does not use either modality.
+
 Rust builds and tests must clean up task-owned temporary files, fixtures,
 caches, and isolated compiled artifacts, including on failure. Never remove the
 checkout's shared `target/`, another session's artifact root, or a target still

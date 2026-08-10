@@ -54,6 +54,7 @@ use crate::input::UserPrompt;
 use crate::model::ModelPreset;
 use crate::model::ModelSelection;
 use crate::prompt_history::PromptHistory;
+use crate::prompt_history::PromptHistoryReader;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionSummary;
@@ -98,6 +99,7 @@ type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
 type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
 type ModelCatalogTask = JoinHandle<Result<Vec<ModelPreset>>>;
+type PromptHistoryTask = JoinHandle<(PromptHistoryReader, Result<Vec<String>>)>;
 const FRAME_INTERVAL: Duration = Duration::from_millis(32);
 const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(windows)]
@@ -194,6 +196,9 @@ struct Runtime {
     file_search: FileSearchManager,
     file_search_updates: UnboundedReceiver<FileSearchUpdate>,
     prompt_history: Option<PromptHistory>,
+    prompt_history_reader: Option<PromptHistoryReader>,
+    prompt_history_task: Option<PromptHistoryTask>,
+    prompt_history_exclusions: HashSet<String>,
     processes: ProcessManager,
     model_selection: ModelSelection,
     model_catalog_task: Option<ModelCatalogTask>,
@@ -216,8 +221,17 @@ struct Runtime {
 struct ResumedSession {
     agent: Agent,
     prompt_history: PromptHistory,
+    prompt_history_reader: PromptHistoryReader,
+    prompt_history_exclusions: HashSet<String>,
     composer_history: Vec<String>,
     transcript: Vec<SessionTranscriptItem>,
+}
+
+struct SessionPromptHistory {
+    writer: PromptHistory,
+    reader: PromptHistoryReader,
+    exclusions: HashSet<String>,
+    composer_history: Vec<String>,
 }
 
 struct OperatorCommandCompletion {
@@ -271,8 +285,17 @@ impl Runtime {
             view.add_notice(format!("Skill warning: {warning}"));
         }
         view.set_context_tokens(agent.context_tokens());
-        let (prompt_history, composer_history) = prompt_history_for_agent(&agent)?;
-        view.seed_prompt_history(composer_history);
+        let SessionPromptHistory {
+            writer: prompt_history,
+            reader: prompt_history_reader,
+            exclusions: mut prompt_history_exclusions,
+            composer_history,
+        } = prompt_history_for_agent(&agent)?;
+        let has_persistent_history = prompt_history_reader.has_more();
+        if !has_persistent_history {
+            prompt_history_exclusions.clear();
+        }
+        view.seed_prompt_history(composer_history, has_persistent_history);
         let context_snapshot = agent.context_snapshot();
         let processes = agent.background_processes();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
@@ -299,6 +322,9 @@ impl Runtime {
             file_search,
             file_search_updates,
             prompt_history: Some(prompt_history),
+            prompt_history_reader: Some(prompt_history_reader),
+            prompt_history_task: None,
+            prompt_history_exclusions,
             processes,
             model_selection,
             model_catalog_task,
@@ -438,6 +464,41 @@ impl Runtime {
                     }
                     redraw = true;
                 }
+                completion = receive_prompt_history(&mut self.prompt_history_task) => {
+                    self.prompt_history_task = None;
+                    match completion {
+                        Ok((reader, Ok(mut entries))) => {
+                            let has_more = reader.has_more();
+                            self.prompt_history_reader = Some(reader);
+                            entries.retain(|entry| {
+                                !self.prompt_history_exclusions.contains(entry)
+                            });
+                            if !has_more {
+                                self.prompt_history_exclusions.clear();
+                            }
+                            if self.view.prompt_history_loaded(entries, has_more) {
+                                self.start_prompt_history_load();
+                            }
+                        }
+                        Ok((_reader, Err(error))) => {
+                            self.prompt_history_reader = None;
+                            self.prompt_history_exclusions.clear();
+                            self.view.prompt_history_failed();
+                            self.view.add_notice(format!(
+                                "Older prompt history could not be loaded: {error:#}"
+                            ));
+                        }
+                        Err(error) => {
+                            self.prompt_history_reader = None;
+                            self.prompt_history_exclusions.clear();
+                            self.view.prompt_history_failed();
+                            self.view.add_notice(format!(
+                                "Older prompt history task stopped unexpectedly: {error}"
+                            ));
+                        }
+                    }
+                    redraw = true;
+                }
                 completion = receive_session_scan(&mut self.session_scan) => {
                     self.session_scan = None;
                     match completion {
@@ -471,7 +532,6 @@ impl Runtime {
                     self.sync_model_selection_to_agent(&mut agent);
                     self.sync_service_tier_to_agent(&mut agent);
                     self.context_snapshot = agent.context_snapshot();
-                    self.agent = Some(agent);
                     self.turn_handle = None;
                     let elapsed = self.turn_started_at.take().map(|started| started.elapsed());
                     let notification = match &completion {
@@ -491,6 +551,12 @@ impl Runtime {
                             None
                         }
                     };
+                    if let Err(error) = persist_session_transcript(&self.view, &mut agent) {
+                        self.view.add_notice(format!(
+                            "Session transcript could not be saved: {error:#}"
+                        ));
+                    }
+                    self.agent = Some(agent);
                     redraw = true;
 
                     if self.exit_after_turn {
@@ -520,6 +586,17 @@ impl Runtime {
                             &completion.call_id,
                             completion.output,
                         );
+                        if let Some(agent) = self.agent.as_mut() {
+                            // A local command can finish after a model turn checkpointed its
+                            // still-running cell. Replace the checkpoint so the completed outcome
+                            // cannot remain stale on resume.
+                            agent.invalidate_transcript_checkpoint();
+                            if let Err(error) = persist_session_transcript(&self.view, agent) {
+                                self.view.add_notice(format!(
+                                    "Session transcript could not be saved: {error:#}"
+                                ));
+                            }
+                        }
                         redraw = true;
                     }
                 }
@@ -614,6 +691,7 @@ impl Runtime {
     fn handle_action(&mut self, action: Action) -> bool {
         match action {
             Action::None => {}
+            Action::LoadPromptHistory => self.start_prompt_history_load(),
             Action::Submit(submission) => {
                 let history_text = submission.prompt().text_without_image_placeholders();
                 if self.turn.is_some() {
@@ -800,6 +878,11 @@ impl Runtime {
         }
         self.service_tier = service_tier;
         self.view.set_service_tier(service_tier);
+        if let Err(error) = crate::service_tier::save_default(service_tier) {
+            self.view.add_error(format!(
+                "Fast mode changed for this session, but the preference could not be saved: {error:#}"
+            ));
+        }
     }
 
     fn select_model(&mut self, selection: ModelSelection) {
@@ -841,7 +924,6 @@ impl Runtime {
         if selection == self.model_selection {
             return;
         }
-        let previous_effort = self.model_selection.reasoning_effort.clone();
         if let Some(agent) = self.agent.as_mut()
             && let Err(error) = agent.set_model_selection(selection.clone())
         {
@@ -849,12 +931,6 @@ impl Runtime {
             return;
         }
         self.apply_model_selection(selection.clone());
-        if selection.reasoning_effort != previous_effort {
-            self.view.add_notice(format!(
-                "{} no longer offers {previous_effort}; using {} instead",
-                selection.model, selection.reasoning_effort
-            ));
-        }
         if let Err(error) = crate::model::save_default_selection(&selection) {
             tracing::warn!(%error, "failed to persist refreshed model metadata");
         }
@@ -900,6 +976,20 @@ impl Runtime {
             self.view
                 .add_notice(format!("Prompt history could not be saved: {error:#}"));
         }
+    }
+
+    fn start_prompt_history_load(&mut self) {
+        if self.prompt_history_task.is_some() {
+            return;
+        }
+        let Some(mut reader) = self.prompt_history_reader.take() else {
+            self.view.prompt_history_failed();
+            return;
+        };
+        self.prompt_history_task = Some(tokio::task::spawn_blocking(move || {
+            let result = reader.read_older();
+            (reader, result)
+        }));
     }
 
     fn clear_session(&mut self) -> Result<()> {
@@ -966,11 +1056,18 @@ impl Runtime {
         let requested_cwd = self.cwd.clone();
         self.resume_task = Some(tokio::task::spawn_blocking(move || {
             let mut agent = Agent::resume(&requested_cwd, ResumeSelector::Id(target))?;
-            let (prompt_history, composer_history) = prompt_history_for_agent(&agent)?;
+            let SessionPromptHistory {
+                writer: prompt_history,
+                reader: prompt_history_reader,
+                exclusions: prompt_history_exclusions,
+                composer_history,
+            } = prompt_history_for_agent(&agent)?;
             let transcript = agent.take_resumed_transcript();
             Ok(ResumedSession {
                 agent,
                 prompt_history,
+                prompt_history_reader,
+                prompt_history_exclusions,
                 composer_history,
                 transcript,
             })
@@ -1024,6 +1121,8 @@ impl Runtime {
         let ResumedSession {
             mut agent,
             prompt_history,
+            prompt_history_reader,
+            mut prompt_history_exclusions,
             composer_history,
             transcript,
         } = session;
@@ -1055,10 +1154,23 @@ impl Runtime {
         self.file_search = file_search;
         self.file_search_updates = file_search_updates;
         self.prompt_history = Some(prompt_history);
+        abort_join_task(&mut self.prompt_history_task);
+        let has_persistent_history = prompt_history_reader.has_more();
+        if !has_persistent_history {
+            prompt_history_exclusions.clear();
+        }
+        self.prompt_history_reader = Some(prompt_history_reader);
+        self.prompt_history_exclusions = prompt_history_exclusions;
         self.model_selection = model_selection.clone();
         self.service_tier = service_tier;
-        self.view
-            .switch_session(&cwd, context_tokens, transcript, composer_history, skills);
+        self.view.switch_session(
+            &cwd,
+            context_tokens,
+            transcript,
+            composer_history,
+            has_persistent_history,
+            skills,
+        );
         self.view.set_service_tier(service_tier);
         self.view.set_model_selection(model_selection);
         for warning in skill_warnings {
@@ -1216,6 +1328,7 @@ impl Drop for Runtime {
         abort_join_task(&mut self.resume_task);
         abort_join_task(&mut self.update_check);
         abort_join_task(&mut self.model_catalog_task);
+        abort_join_task(&mut self.prompt_history_task);
         for (_, task) in self.operator_command_tasks.drain() {
             task.abort();
         }
@@ -1230,22 +1343,29 @@ fn abort_join_task<T>(task: &mut Option<JoinHandle<T>>) {
     }
 }
 
+fn persist_session_transcript(view: &View, agent: &mut Agent) -> Result<()> {
+    let checkpoint = agent.transcript_checkpoint();
+    let (mut total_items, mut items) = view.session_transcript_since(checkpoint);
+    if checkpoint.is_some_and(|checkpoint| checkpoint.saturating_add(items.len()) != total_items) {
+        (total_items, items) = view.session_transcript_since(None);
+    }
+    agent.persist_transcript(items, total_items)
+}
+
 fn should_notify_turn_completion(terminal_focused: bool, elapsed: Duration) -> bool {
     !terminal_focused && elapsed >= LONG_TASK_NOTIFICATION_THRESHOLD
 }
 
-fn prompt_history_for_session(mut persistent: Vec<String>, resumed: Vec<String>) -> Vec<String> {
-    let resumed_set = resumed.iter().map(String::as_str).collect::<HashSet<_>>();
-    persistent.retain(|prompt| !resumed_set.contains(prompt.as_str()));
-    drop(resumed_set);
-    persistent.extend(resumed);
-    persistent
-}
-
-fn prompt_history_for_agent(agent: &Agent) -> Result<(PromptHistory, Vec<String>)> {
-    let (prompt_history, persistent) = PromptHistory::open_with_entries(agent.session_id())?;
-    let composer_history = prompt_history_for_session(persistent, agent.prompt_history());
-    Ok((prompt_history, composer_history))
+fn prompt_history_for_agent(agent: &Agent) -> Result<SessionPromptHistory> {
+    let (writer, reader) = PromptHistory::open_with_reader(agent.session_id())?;
+    let composer_history = agent.prompt_history();
+    let exclusions = composer_history.iter().cloned().collect();
+    Ok(SessionPromptHistory {
+        writer,
+        reader,
+        exclusions,
+        composer_history,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1352,6 +1472,15 @@ async fn receive_update_check(
 async fn receive_model_catalog(
     task: &mut Option<ModelCatalogTask>,
 ) -> std::result::Result<Result<Vec<ModelPreset>>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => pending().await,
+    }
+}
+
+async fn receive_prompt_history(
+    task: &mut Option<PromptHistoryTask>,
+) -> std::result::Result<(PromptHistoryReader, Result<Vec<String>>), tokio::task::JoinError> {
     match task {
         Some(task) => task.await,
         None => pending().await,

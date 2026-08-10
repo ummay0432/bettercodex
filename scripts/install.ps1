@@ -419,6 +419,22 @@ try {
     }
 }
 
+function Test-PathEntry([string] $PathValue, [string] $Entry) {
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return $false }
+    $Needle = $Entry.TrimEnd('\')
+    foreach ($Segment in $PathValue.Split(';')) {
+        $Trimmed = $Segment.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($Trimmed) -and
+            $Trimmed.TrimEnd('\').Equals(
+                $Needle,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Prepend-PathEntry([string] $PathValue, [string] $Entry) {
     $Entries = New-Object 'System.Collections.Generic.List[string]'
     $Entries.Add($Entry.TrimEnd('\'))
@@ -438,16 +454,33 @@ function Prepend-PathEntry([string] $PathValue, [string] $Entry) {
 }
 
 function Ensure-CommandPath([string] $BinDirectory) {
+    $ProcessPath = [Environment]::GetEnvironmentVariable('Path', 'Process')
+    $ProcessPathReady = Test-PathEntry $ProcessPath $BinDirectory
+    $FuturePathReady = $false
     try {
         $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         $NewUserPath = Prepend-PathEntry $UserPath $BinDirectory
         if ($NewUserPath -cne $UserPath) {
             [Environment]::SetEnvironmentVariable('Path', $NewUserPath, 'User')
-            Write-Step 'PATH updated for future terminal sessions; open a new terminal'
+            Write-Step 'PATH updated for future terminal sessions'
         }
+        elseif (-not $ProcessPathReady) {
+            Write-Step 'PATH is already configured for future terminal sessions'
+        }
+        $FuturePathReady = $true
     }
     catch {
         Write-Warning "could not update the user PATH; add $BinDirectory manually"
+    }
+    if (-not $ProcessPathReady) {
+        [Environment]::SetEnvironmentVariable(
+            'Path',
+            (Prepend-PathEntry $ProcessPath $BinDirectory),
+            'Process'
+        )
+        if ($FuturePathReady) {
+            Write-Step 'Already-open parent shells keep their old PATH; open a new terminal before running bcodex there'
+        }
     }
 }
 

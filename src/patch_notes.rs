@@ -131,10 +131,11 @@ fn for_startup_at(
         };
 
         notes = notes_between(changelog, Some(last_seen), current)?;
-        if state.last_seen_version.is_none() || last_seen < current {
+        let changed = state.last_seen_version.is_none() || last_seen < current;
+        if changed {
             state.last_seen_version = Some(current.to_string());
         }
-        Ok(())
+        Ok(state_file::StateChange::from_changed(changed))
     })?;
     Ok(notes)
 }

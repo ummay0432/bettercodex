@@ -14,6 +14,155 @@ impl Drop for DirectoryCleanup {
 }
 
 #[tokio::test]
+async fn direct_model_executes_native_apply_patch_and_returns_its_output_to_the_model() -> Result<()>
+{
+    let root = temporary_root("direct-apply-patch");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let patch = "*** Begin Patch\n*** Add File: direct.txt\n+direct tool route\n*** End Patch";
+    let tool_call = json!({
+        "type": "custom_tool_call",
+        "id": "ctc_direct_patch",
+        "call_id": "call_direct_patch",
+        "name": "apply_patch",
+        "input": patch,
+    });
+    let answer = json!({
+        "type": "message",
+        "id": "msg_direct_patch",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "patched directly"}],
+    });
+    let (base_url, requests, server) = serve_responses(vec![
+        (
+            200,
+            completed_sse("resp_direct_patch", "gpt-5.5", &tool_call, false),
+        ),
+        (
+            200,
+            completed_sse("resp_direct_answer", "gpt-5.5", &answer, false),
+        ),
+    ]);
+    let (mut agent, _previous, target) = model_switch_agent(&root, base_url, TestHistory::Fresh)?;
+    assert_eq!(target.tool_mode(), crate::model::ToolMode::Direct);
+
+    let result = agent.submit("create a file with apply_patch").await?;
+
+    assert_eq!(result, "patched directly");
+    assert_eq!(
+        std::fs::read_to_string(agent.cwd().join("direct.txt"))?,
+        "direct tool route\n"
+    );
+
+    let first_request = requests.recv_timeout(Duration::from_secs(2))?;
+    let second_request = requests.recv_timeout(Duration::from_secs(2))?;
+    server
+        .join()
+        .map_err(|_| anyhow!("direct apply_patch test server panicked"))?;
+
+    let advertised_tools = first_request["tools"]
+        .as_array()
+        .ok_or_else(|| anyhow!("direct Responses request omitted tools"))?;
+    assert!(
+        advertised_tools
+            .iter()
+            .any(|tool| { tool["type"] == "custom" && tool["name"] == "apply_patch" })
+    );
+    assert!(!advertised_tools.iter().any(|tool| tool["name"] == "exec"));
+    let follow_up_input = second_request["input"]
+        .as_array()
+        .ok_or_else(|| anyhow!("direct follow-up request omitted input"))?;
+    assert!(follow_up_input.iter().any(|item| item == &tool_call));
+    let output = follow_up_input
+        .iter()
+        .find(|item| {
+            item["type"] == "custom_tool_call_output" && item["call_id"] == "call_direct_patch"
+        })
+        .ok_or_else(|| anyhow!("direct follow-up request omitted apply_patch output"))?;
+    assert!(
+        output["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("Success"))
+    );
+    assert!(agent.conversation.items().contains(output));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_notify_follows_the_terminal_exec_output_in_model_history() -> Result<()> {
+    let root = temporary_root("code-mode-notify-order");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let tool_call = json!({
+        "type": "custom_tool_call",
+        "id": "ctc_notify",
+        "call_id": "call_notify",
+        "name": "exec",
+        "input": "await tools.update_plan({plan: [{step: 'exercise nested dispatch', status: 'completed'}]}); notify('notification marker'); text('terminal marker');",
+    });
+    let answer = json!({
+        "type": "message",
+        "id": "msg_notify_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "notification observed"}],
+    });
+    let selection = ModelSelection {
+        prefer_websocket: false,
+        ..ModelSelection::default()
+    };
+    let (base_url, requests, server) = serve_responses(vec![
+        (
+            200,
+            completed_sse("resp_notify_exec", &selection.model, &tool_call, true),
+        ),
+        (
+            200,
+            completed_sse("resp_notify_answer", &selection.model, &answer, true),
+        ),
+    ]);
+    let (mut agent, _previous, _direct) = model_switch_agent(&root, base_url, TestHistory::Fresh)?;
+    agent.set_model_selection(selection)?;
+
+    assert_eq!(
+        agent.submit("exercise exec notify").await?,
+        "notification observed"
+    );
+
+    let _first_request = requests.recv_timeout(Duration::from_secs(2))?;
+    let second_request = requests.recv_timeout(Duration::from_secs(2))?;
+    server
+        .join()
+        .map_err(|_| anyhow!("code mode notify test server panicked"))?;
+
+    let input = second_request["input"]
+        .as_array()
+        .ok_or_else(|| anyhow!("code mode follow-up request omitted input"))?;
+    let terminal_index = input
+        .iter()
+        .position(|item| {
+            item["type"] == "custom_tool_call_output"
+                && item["call_id"] == "call_notify"
+                && item.get("name").is_none()
+                && item["output"].to_string().contains("terminal marker")
+        })
+        .ok_or_else(|| anyhow!("code mode follow-up omitted terminal exec output"))?;
+    let notification_index = input
+        .iter()
+        .position(|item| {
+            item["type"] == "custom_tool_call_output"
+                && item["call_id"] == "call_notify"
+                && item["name"] == "exec"
+                && item["output"] == "notification marker"
+        })
+        .ok_or_else(|| anyhow!("code mode follow-up omitted notify output"))?;
+    assert!(
+        terminal_index < notification_index,
+        "notify output must follow the terminal exec output: {input:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn model_switch_compacts_previous_history_before_sampling_with_the_new_model() -> Result<()> {
     let root = temporary_root("model-switch");
     let _cleanup = DirectoryCleanup(root.clone());
@@ -56,6 +205,7 @@ async fn model_switch_compacts_previous_history_before_sampling_with_the_new_mod
             .await?
     );
     sample_once(&mut agent, "after switch").await?;
+    assert_eq!(agent.conversation.items().last(), Some(&answer));
     agent
         .conversation
         .finish_turn(&turn_id, TurnOutcome::Completed)?;
@@ -78,6 +228,70 @@ async fn model_switch_compacts_previous_history_before_sampling_with_the_new_mod
     assert_eq!(metadata["compaction"]["trigger"], "auto");
     assert_eq!(metadata["compaction"]["reason"], "comp_hash_changed");
     assert_eq!(metadata["compaction"]["phase"], "pre_turn");
+    assert_eq!(agent.conversation.history_model_selection(), Some(&target));
+    Ok(())
+}
+
+#[tokio::test]
+async fn model_switch_compacts_when_only_the_effective_context_window_shrinks() -> Result<()> {
+    let root = temporary_root("effective-model-downshift");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let compacted = json!({
+        "type": "compaction",
+        "id": "cmp_effective_downshift",
+        "encrypted_content": "opaque effective-window summary",
+    });
+    let (base_url, requests, server) = serve_responses(vec![(
+        200,
+        completed_sse(
+            "resp_effective_downshift",
+            &ModelSelection::default().model,
+            &compacted,
+            true,
+        ),
+    )]);
+    let (mut agent, previous, mut target) =
+        model_switch_agent(&root, base_url, TestHistory::PreviousModel)?;
+    agent.conversation.record_usage(
+        Some(crate::usage::TokenUsage {
+            input_tokens: 20_000,
+            total_tokens: 20_000,
+            ..Default::default()
+        }),
+        true,
+    )?;
+    target.comp_hash.clone_from(&previous.comp_hash);
+    target.raw_context_window = previous.raw_context_window;
+    target.effective_context_window_percent = 50;
+    target.configured_auto_compact_token_limit = Some(10_000);
+    agent.set_model_selection(target.clone())?;
+
+    let turn_id = agent.api.begin_turn().to_string();
+    agent.conversation.start_turn(&turn_id)?;
+    assert!(
+        agent
+            .prepare_model_switch(
+                &None,
+                &CancellationToken::new(),
+                &ActiveTurnContext::default(),
+            )
+            .await?
+    );
+    agent
+        .conversation
+        .finish_turn(&turn_id, TurnOutcome::Completed)?;
+
+    let compact_request = requests.recv_timeout(Duration::from_secs(2))?;
+    server
+        .join()
+        .map_err(|_| anyhow!("effective model-downshift test server panicked"))?;
+    assert_eq!(compact_request["model"], previous.model);
+    let metadata: Value = serde_json::from_str(
+        compact_request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .ok_or_else(|| anyhow!("compaction request omitted turn metadata"))?,
+    )?;
+    assert_eq!(metadata["compaction"]["reason"], "model_downshift");
     assert_eq!(agent.conversation.history_model_selection(), Some(&target));
     Ok(())
 }
@@ -222,6 +436,7 @@ fn model_switch_agent(
         conversation,
         tools,
         resumed_transcript: Vec::new(),
+        transcript_checkpoint: None,
     };
     let mut target = crate::model::bundled_models()[3].selection(ReasoningEffort::Medium);
     target.prefer_websocket = false;

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5] - 2026-08-10
+
+- Fixed programmatic tool calling drift (dw about it)
+- Improved harness performance
+- Fixed `/resume` (chats show the full transcript)
+- `/fast` stays enabled after quitting
+
 ## [0.1.4] - 2026-08-10
 
 - Added `/model` selector.

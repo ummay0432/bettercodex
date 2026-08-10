@@ -27,12 +27,22 @@ framework, Node workspace, and Bazel build.
   snapshot for startup and offline fallback;
 - context and automatic-compaction limits: the selected model's Codex catalog
   metadata (the default remains 272,000 raw, 258,400 effective, and 244,800 at
-  automatic compaction); and
-- maximum output tokens: 128,000.
+  automatic compaction);
+- maximum output tokens: 128,000; and
+- tool routing: the selected model's current Codex `tool_mode` selector without
+  reinterpretation. `direct` exposes native tools, `code_mode` adds local
+  `exec`/`wait` while retaining those direct tools, and `code_mode_only` exposes
+  `exec`/`wait` while making the retained implementations available as nested
+  tools.
+
+Codex Code Mode is the upstream client-side V8 `exec`/`wait` path, not the
+Responses API's hosted `programmatic_tool_calling` tool. Do not translate
+between them or add hosted-PTC request fields unless current upstream Codex does.
 
 `/model` is the only model-selection surface. It persists the selection as
 focused bettercodex state without introducing providers, profiles, or a general
-configuration framework.
+configuration framework. `/fast` is the only service-tier surface and persists
+the last on/off choice for new sessions.
 
 The runtime is one Cargo package and one `bcodex` binary. It contains the
 inference loop and terminal UI for one operator. Commands and patches run with
