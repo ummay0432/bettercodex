@@ -1,6 +1,7 @@
 use super::*;
 use crate::compaction::CompactionPhase;
 use crate::compaction::CompactionRequest;
+use crate::model::DEFAULT_MODEL as MODEL;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
@@ -15,7 +16,15 @@ fn test_client(base_url: String) -> ApiClient {
         session_id: "session-test".to_string(),
         thread_id: "thread-test".to_string(),
     };
-    ApiClient::new_with_base_url(Auth::for_test("token-test"), &identity, 0, base_url).unwrap()
+    ApiClient::new_with_base_url(
+        Auth::for_test("token-test"),
+        &identity,
+        0,
+        ModelSelection::default(),
+        ServiceTier::default(),
+        base_url,
+    )
+    .unwrap()
 }
 
 trait TestApiClient {
@@ -180,6 +189,8 @@ fn completed_event_records_full_cache_usage() {
         &mut collected,
         &completed_items,
         None,
+        MODEL,
+        true,
     )
     .unwrap();
 
@@ -209,6 +220,8 @@ fn completed_items_are_emitted_once_in_api_order() {
         &mut collected,
         &completed_items,
         None,
+        MODEL,
+        true,
     )
     .unwrap();
     assert!(received.try_recv().is_err());
@@ -217,6 +230,8 @@ fn completed_items_are_emitted_once_in_api_order() {
         &mut collected,
         &completed_items,
         None,
+        MODEL,
+        true,
     )
     .unwrap();
 
@@ -243,7 +258,7 @@ fn completed_item_retains_its_stream_allocation_in_the_collector() {
         .unwrap()
         .as_ptr();
 
-    process_event_value(event, &mut collected, &completed_items, None).unwrap();
+    process_event_value(event, &mut collected, &completed_items, None, MODEL, true).unwrap();
 
     assert_eq!(
         collected.items[0]["encrypted_content"]
@@ -282,6 +297,8 @@ fn extracts_text_and_forwards_streaming_events() {
         &mut collected,
         &completed_items,
         Some(&events),
+        MODEL,
+        true,
     )
     .unwrap();
     process_event(
@@ -289,6 +306,8 @@ fn extracts_text_and_forwards_streaming_events() {
         &mut collected,
         &completed_items,
         Some(&events),
+        MODEL,
+        true,
     )
     .unwrap();
     process_event(
@@ -296,6 +315,8 @@ fn extracts_text_and_forwards_streaming_events() {
         &mut collected,
         &completed_items,
         Some(&events),
+        MODEL,
+        true,
     )
     .unwrap();
 
@@ -385,7 +406,11 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
     assert!(request.headers.contains("content-encoding: zstd"));
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["model"], MODEL);
+    assert!(body.get("service_tier").is_none());
     assert!(body.get("max_output_tokens").is_none());
+    assert!(body.get("tools").is_none());
+    assert_eq!(body["reasoning"]["context"], "all_turns");
+    assert_eq!(body["input"][0]["type"], "additional_tools");
     assert_eq!(
         body["input"].as_array().unwrap().last().unwrap(),
         &user_message("hello")
@@ -418,6 +443,86 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
         client_turn_metadata["turn_started_at_unix_ms"]
     );
     assert_eq!(header_turn_metadata, client_turn_metadata);
+    server.join().unwrap();
+}
+
+#[test]
+fn standard_responses_models_use_their_native_request_contract() {
+    let mut client = test_client("http://127.0.0.1:1".to_string());
+    let selection =
+        crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::XHigh);
+    client.set_model_selection(selection);
+    client.set_service_tier(ServiceTier::Fast);
+    let message = user_message("hello standard Responses");
+
+    let request = client.build_request(vec![message.clone()], RequestKind::Turn);
+
+    assert_eq!(request["model"], "gpt-5.2");
+    assert_eq!(request["reasoning"]["effort"], "xhigh");
+    assert!(request["reasoning"].get("context").is_none());
+    assert!(
+        request["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert_eq!(request["input"], json!([message]));
+    assert!(request.get("service_tier").is_none());
+}
+
+#[test]
+fn standard_responses_accept_completed_events_without_lite_reasoning_context() {
+    let response = json!({
+        "id": "resp_standard",
+        "model": "gpt-5.2",
+        "output": [],
+    });
+
+    validate_completed_response(&response, "gpt-5.2", false).unwrap();
+}
+
+#[tokio::test]
+async fn http_transport_tracks_fast_service_tier_in_body_and_routing_hint() {
+    let (base_url, requests, server) = spawn_http_server(vec![
+        HttpReply::ok(
+            "text/event-stream",
+            completed_sse("resp_fast", &assistant_item("fast")),
+        ),
+        HttpReply::ok(
+            "text/event-stream",
+            completed_sse("resp_standard", &assistant_item("standard")),
+        ),
+    ]);
+    let mut client = test_client(base_url);
+    client.prefer_websocket = false;
+    let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    client.set_service_tier(ServiceTier::Fast);
+    client
+        .respond(vec![user_message("use Fast mode")], &completed_items)
+        .await
+        .unwrap();
+    client.set_service_tier(ServiceTier::Standard);
+    client
+        .respond(vec![user_message("use standard mode")], &completed_items)
+        .await
+        .unwrap();
+
+    let fast_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    let fast_body: Value = serde_json::from_slice(&fast_request.body).unwrap();
+    assert_eq!(fast_body["service_tier"], "priority");
+    assert!(fast_request.headers.contains(&format!(
+        "x-codex-routing-hint: model={MODEL};tier=priority"
+    )));
+
+    let standard_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    let standard_body: Value = serde_json::from_slice(&standard_request.body).unwrap();
+    assert!(standard_body.get("service_tier").is_none());
+    assert!(
+        standard_request
+            .headers
+            .contains(&format!("x-codex-routing-hint: model={MODEL}"))
+    );
+    assert!(!standard_request.headers.contains(";tier="));
     server.join().unwrap();
 }
 
@@ -466,6 +571,7 @@ async fn compaction_sends_the_trigger_and_returns_only_retained_history() {
     )]);
     let mut client = test_client(base_url);
     client.prefer_websocket = false;
+    client.set_service_tier(ServiceTier::Fast);
 
     let result = client
         .compact(
@@ -483,6 +589,7 @@ async fn compaction_sends_the_trigger_and_returns_only_retained_history() {
     let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(request.path, "/responses");
     let request: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(request["service_tier"], "priority");
     let input = request["input"].as_array().unwrap();
     assert!(input.contains(&retained));
     assert!(input.contains(&discarded));

@@ -104,9 +104,6 @@ pub(crate) enum FunctionCallOutputContentItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
     },
-    InputAudio {
-        audio_url: String,
-    },
     EncryptedContent {
         encrypted_content: String,
     },
@@ -122,9 +119,6 @@ pub(crate) enum ContentItem {
         image_url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
-    },
-    InputAudio {
-        audio_url: String,
     },
     OutputText {
         text: String,

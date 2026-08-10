@@ -12,6 +12,7 @@ mod markdown_cache;
 mod markdown_render;
 mod markdown_style;
 mod markdown_text_merge;
+mod model_picker;
 mod notifications;
 mod palette;
 #[cfg(windows)]
@@ -36,7 +37,6 @@ mod table_detect;
 mod terminal;
 mod terminal_hyperlinks;
 mod terminal_title;
-mod tool_catalogue;
 mod view;
 mod width;
 #[cfg(any(windows, test))]
@@ -51,11 +51,14 @@ use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
 use crate::input::UserPrompt;
+use crate::model::ModelPreset;
+use crate::model::ModelSelection;
 use crate::prompt_history::PromptHistory;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionSummary;
 use crate::rollout::SessionTranscriptItem;
+use crate::service_tier::ServiceTier;
 use crate::tools::ProcessManager;
 use crate::update::AvailableUpdate;
 use anyhow::Context;
@@ -94,6 +97,7 @@ type TurnTask = JoinHandle<TurnResult>;
 type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
 type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
+type ModelCatalogTask = JoinHandle<Result<Vec<ModelPreset>>>;
 const FRAME_INTERVAL: Duration = Duration::from_millis(32);
 const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(windows)]
@@ -140,13 +144,13 @@ pub(crate) async fn run(
             return Ok(());
         }
         session.terminal_mut().clear_screen()?;
-        let agent = load_agent(&requested_cwd, resume)?;
-        let cwd = agent.cwd().to_path_buf();
-        (Runtime::new(agent, cwd, worker_handoff)?, session)
+        let loaded = load_agent(&requested_cwd, resume)?;
+        let cwd = loaded.agent.cwd().to_path_buf();
+        (Runtime::new(loaded, cwd, worker_handoff)?, session)
     } else {
-        let agent = load_agent(&requested_cwd, resume)?;
-        let cwd = agent.cwd().to_path_buf();
-        let runtime = Runtime::new(agent, cwd, worker_handoff)?;
+        let loaded = load_agent(&requested_cwd, resume)?;
+        let cwd = loaded.agent.cwd().to_path_buf();
+        let runtime = Runtime::new(loaded, cwd, worker_handoff)?;
         (runtime, startup.0.enter()?)
     };
     runtime
@@ -157,11 +161,22 @@ pub(crate) async fn run(
     result
 }
 
-fn load_agent(requested_cwd: &Path, resume: Option<ResumeSelector>) -> Result<Agent> {
-    match resume {
-        Some(selector) => Agent::resume(requested_cwd, selector),
-        None => Agent::new(requested_cwd),
-    }
+struct LoadedAgent {
+    agent: Agent,
+    patch_notes: Result<Option<String>>,
+}
+
+fn load_agent(requested_cwd: &Path, resume: Option<ResumeSelector>) -> Result<LoadedAgent> {
+    let had_saved_sessions = resume
+        .is_none()
+        .then(Rollout::has_saved_sessions)
+        .transpose()?;
+    let agent = match resume {
+        Some(selector) => Agent::resume(requested_cwd, selector)?,
+        None => Agent::new(requested_cwd)?,
+    };
+    let patch_notes = had_saved_sessions.map_or(Ok(None), crate::patch_notes::for_startup);
+    Ok(LoadedAgent { agent, patch_notes })
 }
 
 struct Runtime {
@@ -180,6 +195,9 @@ struct Runtime {
     file_search_updates: UnboundedReceiver<FileSearchUpdate>,
     prompt_history: Option<PromptHistory>,
     processes: ProcessManager,
+    model_selection: ModelSelection,
+    model_catalog_task: Option<ModelCatalogTask>,
+    service_tier: ServiceTier,
     session_scan: Option<SessionScanTask>,
     resume_task: Option<ResumeTask>,
     notifier: Option<Notifier>,
@@ -229,12 +247,25 @@ fn active_submission_route(prompt: &UserPrompt) -> ActiveSubmissionRoute {
 
 impl Runtime {
     fn new(
-        mut agent: Agent,
+        loaded: LoadedAgent,
         cwd: PathBuf,
         worker_handoff: Option<crate::managed_session::WorkerHandoff>,
     ) -> Result<Self> {
+        let LoadedAgent {
+            mut agent,
+            patch_notes,
+        } = loaded;
         let mut view = View::new(&cwd);
+        let model_selection = agent.model_selection().clone();
+        view.set_model_selection(model_selection.clone());
+        let service_tier = agent.service_tier();
+        view.set_service_tier(service_tier);
         view.replay_transcript(agent.take_resumed_transcript());
+        match patch_notes {
+            Ok(Some(markdown)) => view.add_patch_notes(markdown),
+            Ok(None) => {}
+            Err(error) => view.add_notice(format!("Patch notes could not be loaded: {error:#}")),
+        }
         view.set_skills(agent.skills().to_vec());
         for warning in agent.skill_warnings() {
             view.add_notice(format!("Skill warning: {warning}"));
@@ -248,6 +279,10 @@ impl Runtime {
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
         let (operator_command_updates_tx, operator_command_updates) = unbounded_channel();
         let (diff_updates_tx, diff_updates) = unbounded_channel();
+        let model_catalog = agent.model_catalog_client();
+        let model_catalog_task = Some(tokio::spawn(
+            async move { model_catalog.list_models().await },
+        ));
         Ok(Self {
             clipboard_lease: None,
             view,
@@ -265,6 +300,9 @@ impl Runtime {
             file_search_updates,
             prompt_history: Some(prompt_history),
             processes,
+            model_selection,
+            model_catalog_task,
+            service_tier,
             session_scan: None,
             resume_task: None,
             notifier: Some(Notifier::detect()),
@@ -388,6 +426,18 @@ impl Runtime {
                         redraw = true;
                     }
                 }
+                completion = receive_model_catalog(&mut self.model_catalog_task) => {
+                    self.model_catalog_task = None;
+                    match completion {
+                        Ok(Ok(models)) => {
+                            self.view.set_models(models);
+                            self.refresh_model_metadata();
+                        }
+                        Ok(Err(error)) => tracing::warn!(%error, "failed to refresh model catalogue; using bundled models"),
+                        Err(error) => tracing::warn!(%error, "model catalogue refresh task stopped unexpectedly"),
+                    }
+                    redraw = true;
+                }
                 completion = receive_session_scan(&mut self.session_scan) => {
                     self.session_scan = None;
                     match completion {
@@ -415,9 +465,11 @@ impl Runtime {
                     redraw = true;
                 }
                 completion = receive_turn_completion(&mut self.turn) => {
-                    let (agent, completion) = completion.context("agent task stopped unexpectedly")?;
+                    let (mut agent, completion) = completion.context("agent task stopped unexpectedly")?;
                     self.turn = None;
                     self.drain_completed_turn_events();
+                    self.sync_model_selection_to_agent(&mut agent);
+                    self.sync_service_tier_to_agent(&mut agent);
                     self.context_snapshot = agent.context_snapshot();
                     self.agent = Some(agent);
                     self.turn_handle = None;
@@ -607,6 +659,8 @@ impl Runtime {
                     .add_notice(format!("Could not copy final response: {error}")),
             },
             Action::Compact => self.start_compaction(),
+            Action::ToggleFast => self.toggle_fast_mode(),
+            Action::SelectModel(selection) => self.select_model(selection),
             Action::Fork(submission) => {
                 if self.has_local_session_activity() {
                     self.view.defer_composer_action(
@@ -731,6 +785,112 @@ impl Runtime {
         false
     }
 
+    fn toggle_fast_mode(&mut self) {
+        let service_tier = self.service_tier.toggled();
+        if let Some(agent) = self.agent.as_mut() {
+            if let Err(error) = agent.set_service_tier(service_tier) {
+                self.view
+                    .add_error(format!("Could not change Fast mode: {error:#}"));
+                return;
+            }
+        } else if self.turn.is_none() {
+            self.view
+                .add_error("Could not change Fast mode: the active agent is unavailable");
+            return;
+        }
+        self.service_tier = service_tier;
+        self.view.set_service_tier(service_tier);
+    }
+
+    fn select_model(&mut self, selection: ModelSelection) {
+        if let Err(error) = selection.validate() {
+            self.view
+                .add_error(format!("Could not change model: {error:#}"));
+            return;
+        }
+        if let Some(agent) = self.agent.as_mut() {
+            if let Err(error) = agent.set_model_selection(selection.clone()) {
+                self.view
+                    .add_error(format!("Could not change model: {error:#}"));
+                return;
+            }
+        } else if self.turn.is_none() {
+            self.view
+                .add_error("Could not change model: the active agent is unavailable");
+            return;
+        }
+        self.apply_model_selection(selection.clone());
+        self.view.add_notice(format!(
+            "Model changed to {} {}",
+            selection.model, selection.reasoning_effort
+        ));
+        if let Err(error) = crate::model::save_default_selection(&selection) {
+            self.view.add_error(format!(
+                "Model changed for this session, but the default could not be saved: {error:#}"
+            ));
+        }
+    }
+
+    fn refresh_model_metadata(&mut self) {
+        let Some(selection) = self
+            .view
+            .selection_with_catalog_metadata(&self.model_selection)
+        else {
+            return;
+        };
+        if selection == self.model_selection {
+            return;
+        }
+        let previous_effort = self.model_selection.reasoning_effort.clone();
+        if let Some(agent) = self.agent.as_mut()
+            && let Err(error) = agent.set_model_selection(selection.clone())
+        {
+            tracing::warn!(%error, "failed to apply refreshed metadata for the selected model");
+            return;
+        }
+        self.apply_model_selection(selection.clone());
+        if selection.reasoning_effort != previous_effort {
+            self.view.add_notice(format!(
+                "{} no longer offers {previous_effort}; using {} instead",
+                selection.model, selection.reasoning_effort
+            ));
+        }
+        if let Err(error) = crate::model::save_default_selection(&selection) {
+            tracing::warn!(%error, "failed to persist refreshed model metadata");
+        }
+    }
+
+    fn apply_model_selection(&mut self, selection: ModelSelection) {
+        self.model_selection = selection.clone();
+        self.view.set_model_selection(selection.clone());
+        self.context_snapshot.context_window = selection.effective_context_window();
+        self.context_snapshot.compact_at_tokens = selection.auto_compact_token_limit();
+    }
+
+    fn sync_model_selection_to_agent(&mut self, agent: &mut Agent) {
+        if agent.model_selection() == &self.model_selection {
+            return;
+        }
+        if let Err(error) = agent.set_model_selection(self.model_selection.clone()) {
+            self.model_selection = agent.model_selection().clone();
+            self.view.set_model_selection(self.model_selection.clone());
+            self.view
+                .add_error(format!("Could not change model: {error:#}"));
+        }
+    }
+
+    fn sync_service_tier_to_agent(&mut self, agent: &mut Agent) {
+        if agent.service_tier() == self.service_tier {
+            return;
+        }
+        if let Err(error) = agent.set_service_tier(self.service_tier) {
+            self.service_tier = agent.service_tier();
+            self.view.set_service_tier(self.service_tier);
+            self.view
+                .add_error(format!("Could not change Fast mode: {error:#}"));
+        }
+    }
+
     fn persist_prompt(&mut self, prompt: &str) {
         let Some(history) = self.prompt_history.as_mut() else {
             return;
@@ -743,7 +903,9 @@ impl Runtime {
     }
 
     fn clear_session(&mut self) -> Result<()> {
-        let agent = Agent::new(&self.cwd)?;
+        let mut agent = Agent::new(&self.cwd)?;
+        agent.set_model_selection(self.model_selection.clone())?;
+        agent.set_service_tier(self.service_tier)?;
         let prompt_history = PromptHistory::open(agent.session_id())?;
         let processes = agent.background_processes();
         let context_snapshot = agent.context_snapshot();
@@ -860,11 +1022,21 @@ impl Runtime {
 
     fn activate_resumed_session(&mut self, session: ResumedSession) {
         let ResumedSession {
-            agent,
+            mut agent,
             prompt_history,
             composer_history,
             transcript,
         } = session;
+        if let Some(selection) = self
+            .view
+            .selection_with_catalog_metadata(agent.model_selection())
+            && selection != *agent.model_selection()
+            && let Err(error) = agent.set_model_selection(selection)
+        {
+            tracing::warn!(%error, "failed to apply refreshed metadata to resumed model");
+        }
+        let model_selection = agent.model_selection().clone();
+        let service_tier = agent.service_tier();
         let cwd = agent.cwd().to_path_buf();
         let context_snapshot = agent.context_snapshot();
         let context_tokens = agent.context_tokens();
@@ -883,8 +1055,12 @@ impl Runtime {
         self.file_search = file_search;
         self.file_search_updates = file_search_updates;
         self.prompt_history = Some(prompt_history);
+        self.model_selection = model_selection.clone();
+        self.service_tier = service_tier;
         self.view
             .switch_session(&cwd, context_tokens, transcript, composer_history, skills);
+        self.view.set_service_tier(service_tier);
+        self.view.set_model_selection(model_selection);
         for warning in skill_warnings {
             self.view.add_notice(format!("Skill warning: {warning}"));
         }
@@ -1039,6 +1215,7 @@ impl Drop for Runtime {
         abort_join_task(&mut self.session_scan);
         abort_join_task(&mut self.resume_task);
         abort_join_task(&mut self.update_check);
+        abort_join_task(&mut self.model_catalog_task);
         for (_, task) in self.operator_command_tasks.drain() {
             task.abort();
         }
@@ -1166,6 +1343,15 @@ async fn receive_resume_completion(
 async fn receive_update_check(
     task: &mut Option<UpdateCheckTask>,
 ) -> std::result::Result<Option<AvailableUpdate>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => pending().await,
+    }
+}
+
+async fn receive_model_catalog(
+    task: &mut Option<ModelCatalogTask>,
+) -> std::result::Result<Result<Vec<ModelPreset>>, tokio::task::JoinError> {
     match task {
         Some(task) => task.await,
         None => pending().await,

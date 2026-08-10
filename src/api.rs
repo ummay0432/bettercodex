@@ -1,4 +1,3 @@
-use crate::MODEL;
 use crate::assistant_message::AssistantMessage;
 use crate::assistant_message::has_assistant_text;
 use crate::assistant_message::terminal_answer;
@@ -7,14 +6,17 @@ use crate::auth::AuthSnapshot;
 use crate::auth::SharedAuth;
 use crate::compaction;
 use crate::compaction::CompactionRequest;
-use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::context::HistoryCursor;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::http_client::backoff;
 use crate::http_client::bounded_error_body;
+use crate::model::ModelCatalogClient;
+use crate::model::ModelSelection;
+use crate::model::SharedModelSelection;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
+use crate::service_tier::ServiceTier;
 use crate::time::unix_timestamp_millis;
 use crate::tools;
 use crate::tools::ToolCall;
@@ -180,6 +182,8 @@ pub(crate) struct ApiClient {
     turn_started_at_unix_ms: u64,
     turn_state: Option<String>,
     window: u64,
+    model_selection: SharedModelSelection,
+    service_tier: ServiceTier,
     prefer_websocket: bool,
     websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
@@ -408,14 +412,25 @@ impl ApiClient {
         auth: Auth,
         identity: &SessionIdentity,
         compaction_count: u64,
+        model_selection: ModelSelection,
+        service_tier: ServiceTier,
     ) -> anyhow::Result<Self> {
-        Self::new_with_base_url(auth, identity, compaction_count, BASE_URL.to_string())
+        Self::new_with_base_url(
+            auth,
+            identity,
+            compaction_count,
+            model_selection,
+            service_tier,
+            BASE_URL.to_string(),
+        )
     }
 
     pub(crate) fn new_with_base_url(
         auth: Auth,
         identity: &SessionIdentity,
         compaction_count: u64,
+        model_selection: ModelSelection,
+        service_tier: ServiceTier,
         base_url: String,
     ) -> anyhow::Result<Self> {
         crate::http_client::ensure_rustls_crypto_provider();
@@ -428,6 +443,7 @@ impl ApiClient {
                 .connect_timeout(Duration::from_secs(20)),
         )
         .context("failed to create HTTP client")?;
+        let prefer_websocket = model_selection.prefer_websocket;
         Ok(Self {
             client,
             auth: SharedAuth::new(auth),
@@ -439,7 +455,9 @@ impl ApiClient {
             turn_started_at_unix_ms: unix_timestamp_millis(),
             turn_state: None,
             window: compaction_count,
-            prefer_websocket: true,
+            model_selection: SharedModelSelection::new(model_selection),
+            service_tier,
+            prefer_websocket,
             websocket_prewarm_attempted: false,
             websocket: None,
             websocket_reasoning_included: false,
@@ -459,6 +477,28 @@ impl ApiClient {
         self.window
     }
 
+    pub(crate) fn set_service_tier(&mut self, service_tier: ServiceTier) {
+        if self.service_tier == service_tier {
+            return;
+        }
+        self.service_tier = service_tier;
+        // A routing change invalidates both the incremental request baseline and the routing hint
+        // attached to the existing WebSocket handshake. Reconnect on the next request.
+        self.abandon_response();
+    }
+
+    pub(crate) fn set_model_selection(&mut self, selection: ModelSelection) {
+        if self.model_selection.get() == selection {
+            return;
+        }
+        self.prefer_websocket = selection.prefer_websocket;
+        self.model_selection.set(selection);
+        self.websocket_prewarm_attempted = false;
+        // Model, tool transport, reasoning fields, and routing headers are all
+        // connection/baseline properties.
+        self.abandon_response();
+    }
+
     pub(crate) fn commit_compaction(&mut self) {
         self.window = self.window.saturating_add(1);
         // Compaction replaces history instead of appending to it, so no prefix
@@ -472,6 +512,15 @@ impl ApiClient {
             self.auth.clone(),
             self.base_url.clone(),
             self.session_id.clone(),
+            self.model_selection.clone(),
+        )
+    }
+
+    pub(crate) fn model_catalog_client(&self) -> ModelCatalogClient {
+        ModelCatalogClient::new(
+            self.client.clone(),
+            self.auth.clone(),
+            self.base_url.clone(),
         )
     }
 
@@ -659,15 +708,23 @@ impl ApiClient {
         events: Option<&UnboundedSender<AgentEvent>>,
         request_kind: RequestKind,
     ) -> ApiResult<ModelResponse> {
+        let expected_model = request_model(request)?.to_string();
+        let use_responses_lite = self.model_selection.get().use_responses_lite;
         let response = self
             .post("responses", request, "text/event-stream", request_kind)
             .await?;
-        validate_server_model_header(response.headers())?;
+        validate_server_model_header(response.headers(), &expected_model)?;
         let server_reasoning_included = response.headers().contains_key("x-reasoning-included");
         self.capture_turn_state(response.headers());
-        let mut response =
-            collect_http_stream(response, completed_items, events, self.stream_idle_timeout)
-                .await?;
+        let mut response = collect_http_stream(
+            response,
+            completed_items,
+            events,
+            self.stream_idle_timeout,
+            &expected_model,
+            use_responses_lite,
+        )
+        .await?;
         response.server_reasoning_included = server_reasoning_included;
         Ok(response)
     }
@@ -702,6 +759,8 @@ impl ApiClient {
         mode: WebSocketRequestMode,
         input_identity: RequestInputIdentity,
     ) -> ApiResult<ModelResponse> {
+        let expected_model = request_model(logical_request)?.to_string();
+        let use_responses_lite = self.model_selection.get().use_responses_lite;
         self.ensure_websocket(request_kind).await?;
         let idle_timeout = match mode {
             WebSocketRequestMode::Inference => self.stream_idle_timeout,
@@ -740,7 +799,14 @@ impl ApiClient {
                 ApiError::fatal(format!("failed to decode WebSocket event: {error}"))
             })?;
             self.capture_event_turn_state(&event);
-            process_event_value(event, &mut collected, completed_items, events)?;
+            process_event_value(
+                event,
+                &mut collected,
+                completed_items,
+                events,
+                &expected_model,
+                use_responses_lite,
+            )?;
             if collected.completed {
                 break;
             }
@@ -764,7 +830,8 @@ impl ApiClient {
         insert_header(&mut headers, "openai-beta", RESPONSES_WEBSOCKET_BETA)?;
         let url = websocket_url(&self.base_url, "responses")?;
         let (websocket, response_headers) = WebSocketConnection::connect(&url, &headers).await?;
-        validate_server_model_header(&response_headers)?;
+        let expected_model = self.model_selection.get().model;
+        validate_server_model_header(&response_headers, &expected_model)?;
         self.websocket_reasoning_included = response_headers.contains_key("x-reasoning-included");
         self.capture_turn_state(&response_headers);
         self.websocket = Some(websocket);
@@ -857,10 +924,13 @@ impl ApiClient {
                 Value::String(turn_state.clone()),
             );
         }
-        let client_responses_lite = client_metadata.insert(
-            WS_RESPONSES_LITE_CLIENT_METADATA.to_string(),
-            Value::String("true".to_string()),
-        );
+        let client_responses_lite = client_metadata.remove(WS_RESPONSES_LITE_CLIENT_METADATA);
+        if self.model_selection.get().use_responses_lite {
+            client_metadata.insert(
+                WS_RESPONSES_LITE_CLIENT_METADATA.to_string(),
+                Value::String("true".to_string()),
+            );
+        }
         object.insert(
             "type".to_string(),
             Value::String("response.create".to_string()),
@@ -936,9 +1006,10 @@ impl ApiClient {
             .saturating_add(estimated_harness_instruction_tokens())
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
         let mut prompt_history = history.to_vec();
+        let effective_context_window = self.model_selection.get().effective_context_window();
         let rewritten_outputs = compaction::trim_tool_outputs_to_fit(
             &mut prompt_history,
-            EFFECTIVE_CONTEXT_WINDOW.saturating_sub(prefix_tokens),
+            effective_context_window.saturating_sub(prefix_tokens),
         );
         if rewritten_outputs > 0 {
             input_identity = RequestInputIdentity::Exact;
@@ -996,8 +1067,9 @@ impl ApiClient {
     }
 
     fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> Value {
-        let input = compose_input(history);
-        self.build_request_from_input(input, request_kind)
+        let selection = self.model_selection.get();
+        let input = compose_input(history, selection.use_responses_lite);
+        self.build_request_from_input(input, request_kind, &selection)
     }
 
     pub(crate) fn build_sampling_request(
@@ -1005,21 +1077,35 @@ impl ApiClient {
         history: Vec<Value>,
         cursor: HistoryCursor,
     ) -> SamplingRequest {
-        let (input, input_restoration) = compose_sampling_input(history);
+        let selection = self.model_selection.get();
+        let (input, input_restoration) =
+            compose_sampling_input(history, selection.use_responses_lite);
         SamplingRequest {
-            request: self.build_request_from_input(input, RequestKind::Turn),
+            request: self.build_request_from_input(input, RequestKind::Turn, &selection),
             cursor,
             input_restoration,
         }
     }
 
-    fn build_request_from_input(&self, input: Vec<Value>, request_kind: RequestKind) -> Value {
+    fn build_request_from_input(
+        &self,
+        input: Vec<Value>,
+        request_kind: RequestKind,
+        selection: &ModelSelection,
+    ) -> Value {
+        let mut reasoning = json!({
+            "effort": selection.reasoning_effort.as_str(),
+            "summary": "auto",
+        });
+        if selection.use_responses_lite {
+            reasoning["context"] = Value::String("all_turns".to_string());
+        }
         let mut request = json!({
-            "model": MODEL,
+            "model": selection.model,
             "instructions": harness_instructions(),
             "tool_choice": "auto",
             "parallel_tool_calls": false,
-            "reasoning": {"effort": "max", "summary": "auto", "context": "all_turns"},
+            "reasoning": reasoning,
             "store": false,
             "stream": true,
             "include": ["reasoning.encrypted_content"],
@@ -1027,6 +1113,12 @@ impl ApiClient {
             "text": {"verbosity": "low"},
             "client_metadata": self.client_metadata(request_kind),
         });
+        if !selection.use_responses_lite {
+            request["tools"] = Value::Array(tools::specifications());
+        }
+        if let Some(service_tier) = self.effective_service_tier(selection) {
+            request["service_tier"] = Value::String(service_tier.to_string());
+        }
         request["input"] = Value::Array(input);
         request
     }
@@ -1085,6 +1177,14 @@ impl ApiClient {
         format!("{}:{}", self.thread_id, self.window)
     }
 
+    fn effective_service_tier(&self, selection: &ModelSelection) -> Option<&'static str> {
+        if selection.supports_fast {
+            self.service_tier.request_value()
+        } else {
+            None
+        }
+    }
+
     fn request_headers(
         &self,
         accept: &str,
@@ -1111,16 +1211,19 @@ impl ApiClient {
             "x-codex-turn-metadata",
             &self.turn_metadata(request_kind).to_string(),
         )?;
-        insert_header(
-            &mut headers,
-            X_CODEX_ROUTING_HINT,
-            &format!("model={MODEL}"),
-        )?;
-        insert_header(
-            &mut headers,
-            "x-openai-internal-codex-responses-lite",
-            "true",
-        )?;
+        let selection = self.model_selection.get();
+        let routing_hint = match self.effective_service_tier(&selection) {
+            Some(service_tier) => format!("model={};tier={service_tier}", selection.model),
+            None => format!("model={}", selection.model),
+        };
+        insert_header(&mut headers, X_CODEX_ROUTING_HINT, &routing_hint)?;
+        if selection.use_responses_lite {
+            insert_header(
+                &mut headers,
+                "x-openai-internal-codex-responses-lite",
+                "true",
+            )?;
+        }
         insert_header(
             &mut headers,
             "x-codex-beta-features",
@@ -1279,11 +1382,22 @@ impl RequestKind {
     }
 }
 
-fn compose_input(history: Vec<Value>) -> Vec<Value> {
-    compose_sampling_input(history).0
+fn compose_input(history: Vec<Value>, use_responses_lite: bool) -> Vec<Value> {
+    compose_sampling_input(history, use_responses_lite).0
 }
 
-fn compose_sampling_input(mut history: Vec<Value>) -> (Vec<Value>, SamplingInputRestoration) {
+fn compose_sampling_input(
+    mut history: Vec<Value>,
+    use_responses_lite: bool,
+) -> (Vec<Value>, SamplingInputRestoration) {
+    if !use_responses_lite {
+        return (
+            history,
+            SamplingInputRestoration {
+                inserted_tools: false,
+            },
+        );
+    }
     let [tools_item] = stable_request_prefix();
     let inserted_tools = if history
         .iter()
@@ -1365,6 +1479,8 @@ async fn collect_http_stream(
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
     idle_timeout: Duration,
+    expected_model: &str,
+    use_responses_lite: bool,
 ) -> ApiResult<ModelResponse> {
     let mut decoder = SseDecoder::default();
     let mut collected = CollectedResponse::default();
@@ -1380,7 +1496,14 @@ async fn collect_http_stream(
         let Some(chunk) = chunk else {
             decoder.finish(&mut decoded)?;
             for data in decoded.drain(..) {
-                process_event(&data, &mut collected, completed_items, events)?;
+                process_event(
+                    &data,
+                    &mut collected,
+                    completed_items,
+                    events,
+                    expected_model,
+                    use_responses_lite,
+                )?;
             }
             break;
         };
@@ -1389,7 +1512,14 @@ async fn collect_http_stream(
             event_deadline = tokio::time::Instant::now() + idle_timeout;
         }
         for data in decoded.drain(..) {
-            process_event(&data, &mut collected, completed_items, events)?;
+            process_event(
+                &data,
+                &mut collected,
+                completed_items,
+                events,
+                expected_model,
+                use_responses_lite,
+            )?;
         }
         if collected.completed {
             break;
@@ -1479,13 +1609,22 @@ fn process_event(
     collected: &mut CollectedResponse,
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
+    expected_model: &str,
+    use_responses_lite: bool,
 ) -> ApiResult<()> {
     if data == "[DONE]" {
         return Ok(());
     }
     let event: Value = serde_json::from_str(data)
         .map_err(|error| ApiError::fatal(format!("failed to decode SSE event: {error}")))?;
-    process_event_value(event, collected, completed_items, events)
+    process_event_value(
+        event,
+        collected,
+        completed_items,
+        events,
+        expected_model,
+        use_responses_lite,
+    )
 }
 
 fn process_event_value(
@@ -1493,8 +1632,10 @@ fn process_event_value(
     collected: &mut CollectedResponse,
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
+    expected_model: &str,
+    use_responses_lite: bool,
 ) -> ApiResult<()> {
-    validate_event_server_model(&event)?;
+    validate_event_server_model(&event, expected_model)?;
     // Completed items can contain multi-megabyte encrypted reasoning. Move the item out of the
     // event so the collector only pays for the one copy simultaneously owned by conversation
     // history.
@@ -1549,7 +1690,7 @@ fn process_event_value(
                 .get_mut("response")
                 .map(Value::take)
                 .ok_or_else(|| ApiError::fatal("response.completed omitted its response"))?;
-            validate_completed_response(&response)?;
+            validate_completed_response(&response, expected_model, use_responses_lite)?;
             let mut response = response;
             if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
                 for (index, item) in std::mem::take(output).into_iter().enumerate() {
@@ -1676,13 +1817,18 @@ fn classify_stream_error(code: &str, message: &str) -> ApiError {
     }
 }
 
-fn validate_completed_response(response: &Value) -> ApiResult<()> {
+fn validate_completed_response(
+    response: &Value,
+    expected_model: &str,
+    use_responses_lite: bool,
+) -> ApiResult<()> {
     if let Some(model) = response.get("model").and_then(Value::as_str) {
-        validate_server_model(model)?;
+        validate_server_model(model, expected_model)?;
     }
-    if let Some(context) = response
-        .pointer("/reasoning/context")
-        .and_then(Value::as_str)
+    if use_responses_lite
+        && let Some(context) = response
+            .pointer("/reasoning/context")
+            .and_then(Value::as_str)
         && context != "all_turns"
     {
         return Err(ApiError::fatal(format!(
@@ -1692,19 +1838,19 @@ fn validate_completed_response(response: &Value) -> ApiResult<()> {
     Ok(())
 }
 
-fn validate_server_model_header(headers: &HeaderMap) -> ApiResult<()> {
+fn validate_server_model_header(headers: &HeaderMap, expected_model: &str) -> ApiResult<()> {
     if let Some(model) = headers
         .get("openai-model")
         .and_then(|value| value.to_str().ok())
     {
-        validate_server_model(model)?;
+        validate_server_model(model, expected_model)?;
     }
     Ok(())
 }
 
-fn validate_event_server_model(event: &Value) -> ApiResult<()> {
+fn validate_event_server_model(event: &Value, expected_model: &str) -> ApiResult<()> {
     if let Some(model) = event.pointer("/response/model").and_then(Value::as_str) {
-        validate_server_model(model)?;
+        validate_server_model(model, expected_model)?;
     }
     let response_headers = event
         .pointer("/response/headers")
@@ -1717,7 +1863,7 @@ fn validate_event_server_model(event: &Value) -> ApiResult<()> {
                 .and_then(|headers| json_header_value(headers, &["openai-model", "x-openai-model"]))
         })
     {
-        validate_server_model(model)?;
+        validate_server_model(model, expected_model)?;
     }
     Ok(())
 }
@@ -1739,13 +1885,20 @@ fn json_header_value<'a>(
     })
 }
 
-fn validate_server_model(model: &str) -> ApiResult<()> {
-    if model == MODEL {
+fn validate_server_model(model: &str, expected_model: &str) -> ApiResult<()> {
+    if model == expected_model {
         return Ok(());
     }
     Err(ApiError::fatal(format!(
-        "backend returned model `{model}` for fixed bettercodex model `{MODEL}`"
+        "backend returned model `{model}` for requested bettercodex model `{expected_model}`"
     )))
+}
+
+fn request_model(request: &Value) -> ApiResult<&str> {
+    request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::fatal("Responses request omitted its model"))
 }
 
 fn parse_usage(usage: &Value) -> Option<TokenUsage> {

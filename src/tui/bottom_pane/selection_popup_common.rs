@@ -177,20 +177,27 @@ fn build_name_spans(name: &str, limit: usize) -> Vec<Span<'static>> {
     spans
 }
 
-fn build_full_line(row: &GenericDisplayRow, description_column: usize) -> Line<'static> {
-    let name_limit = row
-        .description
-        .as_ref()
+fn build_full_line(
+    row: &GenericDisplayRow,
+    description_column: usize,
+    description: Option<&str>,
+    include_name: bool,
+) -> Line<'static> {
+    let name_limit = description
         .map(|_| description_column.saturating_sub(2))
         .unwrap_or(usize::MAX);
-    let mut spans = build_name_spans(&row.name, name_limit);
+    let mut spans = if include_name {
+        build_name_spans(&row.name, name_limit)
+    } else {
+        Vec::new()
+    };
     let name_width = line_width(&Line::from(spans.clone()));
-    if let Some(description) = &row.description {
+    if let Some(description) = description {
         let gap = description_column.saturating_sub(name_width);
         if gap > 0 {
             spans.push(Span::from(" ".repeat(gap)));
         }
-        spans.push(Span::from(description.clone()).dim());
+        spans.push(Span::from(description.to_string()).dim());
     }
     Line::from(spans)
 }
@@ -200,7 +207,6 @@ fn wrap_row_lines(
     description_column: usize,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let full_line = build_full_line(row, description_column);
     let maximum_indent = width.saturating_sub(1) as usize;
     let continuation_indent = row
         .wrap_indent
@@ -215,10 +221,27 @@ fn wrap_row_lines(
     let options = RtOptions::new(width.max(1) as usize)
         .initial_indent(Line::default())
         .subsequent_indent(Line::from(" ".repeat(continuation_indent)));
-    word_wrap_line(&full_line, options)
-        .into_iter()
-        .map(line_to_owned)
-        .collect()
+    let descriptions = row
+        .description
+        .as_deref()
+        .map(|description| description.split('\n').collect::<Vec<_>>())
+        .unwrap_or_else(|| vec![""]);
+    let mut lines = Vec::new();
+    for (index, description) in descriptions.into_iter().enumerate() {
+        let description = row.description.as_ref().map(|_| description);
+        let full_line = build_full_line(
+            row,
+            description_column,
+            description,
+            /*include_name*/ index == 0,
+        );
+        lines.extend(
+            word_wrap_line(&full_line, options.clone())
+                .into_iter()
+                .map(line_to_owned),
+        );
+    }
+    lines
 }
 
 fn line_to_owned(line: Line<'_>) -> Line<'static> {

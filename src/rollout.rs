@@ -1,5 +1,7 @@
-use crate::MODEL;
+use crate::model::ModelSelection;
+use crate::model::ReasoningEffort;
 use crate::protocol::MessagePhase;
+use crate::service_tier::ServiceTier;
 use crate::time::unix_timestamp_millis;
 use crate::usage::TokenUsage;
 use anyhow::Context;
@@ -25,6 +27,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
@@ -91,6 +94,9 @@ pub(crate) struct LoadedRollout {
     pub(crate) usage_history_estimate: Option<u64>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) compaction_count: u64,
+    pub(crate) model_selection: ModelSelection,
+    pub(crate) history_model_selection: Option<ModelSelection>,
+    pub(crate) service_tier: ServiceTier,
     pub(crate) unfinished_turn: Option<String>,
 }
 
@@ -151,6 +157,15 @@ enum RolloutRecordData<Items = Vec<Value>> {
         history_estimate: u64,
         #[serde(default)]
         server_reasoning_included: bool,
+    },
+    ServiceTierChanged {
+        service_tier: ServiceTier,
+    },
+    ModelChanged {
+        selection: ModelSelection,
+    },
+    HistoryModelChanged {
+        selection: Option<ModelSelection>,
     },
     TurnStarted {
         turn_id: String,
@@ -405,11 +420,21 @@ pub(crate) enum TurnOutcome {
 }
 
 impl Rollout {
-    pub(crate) fn create(cwd: &Path) -> Result<Self> {
-        Self::create_in(&state_root()?, cwd)
+    pub(crate) fn create_with_selection(cwd: &Path, selection: &ModelSelection) -> Result<Self> {
+        Self::create_in_with_selection(&state_root()?, cwd, selection)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_in(root: &Path, cwd: &Path) -> Result<Self> {
+        Self::create_in_with_selection(root, cwd, &ModelSelection::default())
+    }
+
+    pub(crate) fn create_in_with_selection(
+        root: &Path,
+        cwd: &Path,
+        selection: &ModelSelection,
+    ) -> Result<Self> {
+        selection.validate()?;
         prepare_private_directory(root)?;
         let sessions = root.join(SESSIONS_DIRECTORY);
         prepare_private_directory(&sessions)?;
@@ -424,8 +449,8 @@ impl Rollout {
             identity,
             cwd: cwd.to_path_buf(),
             created_at_unix_ms: unix_timestamp_millis(),
-            model: MODEL.to_string(),
-            reasoning_effort: "max".to_string(),
+            model: selection.model.clone(),
+            reasoning_effort: selection.reasoning_effort.to_string(),
         };
         let path = sessions.join(format!("{}.jsonl", metadata.identity.session_id));
         let file = lock_rollout(open_private_append(&path, true)?, &path)?;
@@ -435,6 +460,10 @@ impl Rollout {
             metadata: metadata.clone(),
         };
         rollout.write_record(&RolloutRecord::Session { metadata })?;
+        // The session header keeps its compact, backwards-compatible model identity, while this
+        // record preserves the complete catalogue metadata needed to resume remote models exactly.
+        rollout.record_model_selection(selection)?;
+        rollout.record_history_model_selection(None)?;
         Ok(rollout)
     }
 
@@ -444,6 +473,33 @@ impl Rollout {
 
     pub(crate) fn list_sessions() -> Result<Vec<SessionSummary>> {
         list_sessions_in(&state_root()?)
+    }
+
+    pub(crate) fn has_saved_sessions() -> Result<bool> {
+        let sessions = state_root()?.join(SESSIONS_DIRECTORY);
+        let entries = match std::fs::read_dir(&sessions) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", sessions.display()));
+            }
+        };
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("failed to inspect {}", sessions.display()))?;
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
+                && entry
+                    .file_type()
+                    .with_context(|| {
+                        format!("failed to inspect saved session {}", entry.path().display())
+                    })?
+                    .is_file()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn resume_in(
@@ -529,6 +585,29 @@ impl Rollout {
         })
     }
 
+    pub(crate) fn record_service_tier(&mut self, service_tier: ServiceTier) -> Result<()> {
+        self.write_record(&RolloutRecord::ServiceTierChanged { service_tier })
+    }
+
+    pub(crate) fn record_model_selection(&mut self, selection: &ModelSelection) -> Result<()> {
+        selection.validate()?;
+        self.write_record(&RolloutRecord::ModelChanged {
+            selection: selection.clone(),
+        })
+    }
+
+    pub(crate) fn record_history_model_selection(
+        &mut self,
+        selection: Option<&ModelSelection>,
+    ) -> Result<()> {
+        if let Some(selection) = selection {
+            selection.validate()?;
+        }
+        self.write_record(&RolloutRecord::HistoryModelChanged {
+            selection: selection.cloned(),
+        })
+    }
+
     pub(crate) fn start_turn(&mut self, turn_id: &str) -> Result<()> {
         self.write_record(&RolloutRecord::TurnStarted {
             turn_id: turn_id.to_string(),
@@ -586,6 +665,11 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut usage_history_estimate = None;
     let mut server_reasoning_included = false;
     let mut compaction_count = 0_u64;
+    let mut model_selection = None;
+    let mut history_model_selection = None;
+    let mut turn_model_selection = None;
+    let mut has_explicit_history_model = false;
+    let mut service_tier = ServiceTier::default();
     let mut unfinished_turn = None;
     let mut line_number = 0_usize;
     let mut valid_length = 0_u64;
@@ -623,6 +707,11 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             RolloutRecord::Session {
                 metadata: session_metadata,
             } => {
+                let initial_selection = model_selection_from_metadata(&session_metadata)
+                    .with_context(|| {
+                        format!("invalid session model at {}:{line_number}", path.display())
+                    })?;
+                model_selection = Some(initial_selection);
                 if metadata.replace(session_metadata).is_some() {
                     return Err(anyhow!(
                         "{} contains multiple session headers",
@@ -666,8 +755,38 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 usage_history_estimate = Some(history_estimate);
                 server_reasoning_included = reasoning_included;
             }
-            RolloutRecord::TurnStarted { turn_id } => unfinished_turn = Some(turn_id),
+            RolloutRecord::ServiceTierChanged {
+                service_tier: updated_service_tier,
+            } => service_tier = updated_service_tier,
+            RolloutRecord::ModelChanged { selection } => {
+                selection.validate().with_context(|| {
+                    format!(
+                        "invalid model selection at {}:{line_number}",
+                        path.display()
+                    )
+                })?;
+                model_selection = Some(selection);
+            }
+            RolloutRecord::HistoryModelChanged { selection } => {
+                if let Some(selection) = &selection {
+                    selection.validate().with_context(|| {
+                        format!("invalid history model at {}:{line_number}", path.display())
+                    })?;
+                }
+                history_model_selection = selection;
+                has_explicit_history_model = true;
+            }
+            RolloutRecord::TurnStarted { turn_id } => {
+                unfinished_turn = Some(turn_id);
+                turn_model_selection = model_selection.clone();
+            }
             RolloutRecord::TurnFinished { turn_id, .. } => {
+                if !has_explicit_history_model && let Some(selection) = turn_model_selection.take()
+                {
+                    // Older rollouts can only identify the history model at turn granularity.
+                    // Preserve that best available compatibility baseline.
+                    history_model_selection = Some(selection);
+                }
                 if unfinished_turn.as_deref() == Some(turn_id.as_str()) {
                     unfinished_turn = None;
                 }
@@ -677,6 +796,12 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     }
 
     drop(reader);
+
+    if !has_explicit_history_model && unfinished_turn.is_some() {
+        // An older rollout may end during a turn before it has an explicit history-model marker.
+        // The model captured at turn start is the best available compatibility baseline.
+        history_model_selection = turn_model_selection;
+    }
     repair_rollout_tail(
         &mut file,
         &path,
@@ -693,12 +818,11 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             metadata.version
         ));
     }
-    if metadata.model != MODEL || metadata.reasoning_effort != "max" {
-        return Err(anyhow!(
-            "saved session uses {} at {}; bettercodex requires {MODEL} at max",
-            metadata.model,
-            metadata.reasoning_effort
-        ));
+    let model_selection =
+        model_selection.ok_or_else(|| anyhow!("{} has no valid session model", path.display()))?;
+    model_selection.validate()?;
+    if let Some(history_model_selection) = &history_model_selection {
+        history_model_selection.validate()?;
     }
 
     let rollout = Rollout {
@@ -715,8 +839,20 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         usage_history_estimate,
         server_reasoning_included,
         compaction_count,
+        model_selection,
+        history_model_selection,
+        service_tier,
         unfinished_turn,
     })
+}
+
+fn model_selection_from_metadata(metadata: &SessionMetadata) -> Result<ModelSelection> {
+    let effort = ReasoningEffort::from_str(&metadata.reasoning_effort)
+        .map_err(|error| anyhow!("saved session has an invalid reasoning effort: {error}"))?;
+    Ok(ModelSelection::from_identity(
+        metadata.model.clone(),
+        effort,
+    ))
 }
 
 fn append_transcript_items(transcript: &mut Vec<SessionTranscriptItem>, items: &[Value]) {
@@ -904,9 +1040,11 @@ fn read_session_summary(
 }
 
 fn compatible_session_id(path: &Path, metadata: &SessionMetadata) -> Option<Uuid> {
+    let selection = ReasoningEffort::from_str(&metadata.reasoning_effort)
+        .ok()
+        .map(|effort| ModelSelection::from_identity(metadata.model.clone(), effort));
     if metadata.version != ROLLOUT_VERSION
-        || metadata.model != MODEL
-        || metadata.reasoning_effort != "max"
+        || selection.is_none_or(|selection| selection.validate().is_err())
         || path.file_stem().and_then(|stem| stem.to_str())
             != Some(metadata.identity.session_id.as_str())
     {

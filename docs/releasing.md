@@ -10,6 +10,8 @@ release authorization.
 - Read the version from that revision's `Cargo.toml`. It must be strictly newer
   than the latest published release and unused by every existing tag, draft,
   and release.
+- Require a `CHANGELOG.md` section for that exact version containing only patch
+  notes whose wording the user approved under [`AGENTS.md`](../AGENTS.md).
 - Use tag `bcodex-v<version>-<40-character-revision>` and title
   `bettercodex <version>`.
 - Build all targets from that same revision on standard GitHub-hosted runners.

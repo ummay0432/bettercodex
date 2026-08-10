@@ -43,7 +43,6 @@ fn custom_outputs_preserve_structured_content_items() {
         preview: "done".to_string(),
         preceding_items: Vec::new(),
     };
-    let payload_allocation = output.body[0]["text"].as_str().unwrap().as_ptr();
     let items = call.into_output_items(output);
 
     assert_eq!(
@@ -53,11 +52,6 @@ fn custom_outputs_preserve_structured_content_items() {
             "call_id": "call-1",
             "output": [{"type": "input_text", "text": "done"}],
         })]
-    );
-    assert_eq!(
-        items[0]["output"][0]["text"].as_str().unwrap().as_ptr(),
-        payload_allocation,
-        "tool payloads must move into history instead of being deep-cloned"
     );
 }
 

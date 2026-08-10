@@ -1,9 +1,10 @@
 # Configuration
 
 bettercodex deliberately has no general configuration framework. Its model,
-reasoning effort, context limits, provider, and runtime behavior are fixed by
-the project. Upstream Codex `config.toml`, profiles, managed requirements, MCP,
-provider, and lifecycle-hook settings do not apply.
+reasoning effort, and matching context limits are selected through `/model` and
+saved as focused bettercodex state. Its provider and remaining runtime behavior
+are fixed by the project. Upstream Codex `config.toml`, profiles, managed
+requirements, MCP, provider, and lifecycle-hook settings do not apply.
 
 The supported path overrides are:
 

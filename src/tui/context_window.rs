@@ -1,6 +1,5 @@
 use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
 use super::bottom_pane::selection_popup_common::render_menu_surface;
-use crate::MODEL;
 use crate::context::ContextKind;
 use crate::context::ContextSnapshot;
 use crossterm::event::KeyCode;
@@ -25,6 +24,7 @@ const PANEL_CHROME_HEIGHT: u16 = menu_surface_padding_height() + HEADER_HEIGHT +
 
 pub(super) struct ContextWindowView {
     snapshot: ContextSnapshot,
+    model: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,8 +41,8 @@ struct Segment {
 }
 
 impl ContextWindowView {
-    pub(super) fn new(snapshot: ContextSnapshot) -> Self {
-        Self { snapshot }
+    pub(super) fn new(snapshot: ContextSnapshot, model: String) -> Self {
+        Self { snapshot, model }
     }
 
     pub(super) fn update(&mut self, snapshot: ContextSnapshot) {
@@ -108,7 +108,7 @@ impl ContextWindowView {
         let lines = vec![
             Line::from("Context").bold(),
             Line::from(vec![
-                Span::from(MODEL).cyan().bold(),
+                Span::from(self.model.clone()).cyan().bold(),
                 Span::from(format!(
                     "  ·  {} / {} tokens  ·  {used_percent} used",
                     format_tokens(self.snapshot.used_tokens),

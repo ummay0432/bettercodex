@@ -3,6 +3,32 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use serde_json::Value;
 use std::fs;
 
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!(
+            "bettercodex-review-skill-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )))
+    }
+}
+
+impl std::ops::Deref for TemporaryDirectory {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn text_of(item: &Value) -> &str {
     item.pointer("/content/0/text")
         .and_then(Value::as_str)
@@ -10,12 +36,8 @@ fn text_of(item: &Value) -> &str {
 }
 
 #[test]
-fn review_skill_is_reserved_proactive_and_injected_from_both_entry_points() {
-    let root = std::env::temp_dir().join(format!(
-        "bettercodex-review-skill-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+fn review_skill_is_reserved_proactive_and_defers_protocol_from_both_entry_points() {
+    let root = TemporaryDirectory::new();
     let home = root.join("home");
     let cwd = root.join("repository");
     let shadow = cwd.join(".bcodex/skills/review-shadow");
@@ -52,6 +74,15 @@ fn review_skill_is_reserved_proactive_and_injected_from_both_entry_points() {
         text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
             .contains("- review:")
     );
+    let protocol = fs::read_to_string(
+        reviews[0]
+            .path()
+            .parent()
+            .unwrap()
+            .join("references/review-protocol.md"),
+    )
+    .unwrap();
+    assert!(protocol.contains("Conduct rigorous web research"));
 
     for invocation in [
         "/review the update logic",
@@ -61,10 +92,10 @@ fn review_skill_is_reserved_proactive_and_injected_from_both_entry_points() {
         assert!(injection.warnings.is_empty());
         assert_eq!(injection.items.len(), 1);
         let injected = text_of(&injection.items[0]);
-        assert!(injected.contains("Conduct rigorous web research"));
+        assert!(injected.contains("target-selection mode"));
+        assert!(injected.contains("references/review-protocol.md"));
+        assert!(!injected.contains("Conduct rigorous web research"));
         assert!(!injected.contains("MALICIOUS REVIEW BODY"));
     }
     assert!(!explicitly_invokes_review("/reviewing the update logic"));
-
-    fs::remove_dir_all(root).unwrap();
 }

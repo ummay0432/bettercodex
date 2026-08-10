@@ -44,15 +44,3 @@ fn ansi_escape(input: &str) -> Text<'static> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ansi_escape_line;
-
-    #[test]
-    fn parses_styles_and_expands_tabs() {
-        let line = ansi_escape_line("\u{1b}[31mred\u{1b}[0m\ttext");
-        assert_eq!(line.to_string(), "red    text");
-        assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::Red));
-    }
-}

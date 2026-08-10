@@ -37,7 +37,6 @@ pub(crate) fn formatted_truncate_text_content_items(
         .filter_map(|item| match item {
             FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
             FunctionCallOutputContentItem::InputImage { .. }
-            | FunctionCallOutputContentItem::InputAudio { .. }
             | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -69,11 +68,6 @@ pub(crate) fn formatted_truncate_text_content_items(
                 detail: *detail,
             })
         }
-        FunctionCallOutputContentItem::InputAudio { audio_url } => {
-            Some(FunctionCallOutputContentItem::InputAudio {
-                audio_url: audio_url.clone(),
-            })
-        }
         FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
             Some(FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: encrypted_content.clone(),
@@ -88,12 +82,10 @@ pub(crate) fn formatted_truncate_text_content_items(
 pub(crate) fn truncate_function_output_items(
     items: &[FunctionCallOutputContentItem],
     max_tokens: usize,
-    estimate_audio_token_count: impl Fn(&str) -> usize,
 ) -> Vec<FunctionCallOutputContentItem> {
     let mut out: Vec<FunctionCallOutputContentItem> = Vec::with_capacity(items.len());
     let mut remaining_budget = max_tokens;
     let mut omitted_text_items = 0usize;
-    let mut omitted_audio_items = 0usize;
 
     for item in items {
         match item {
@@ -124,17 +116,6 @@ pub(crate) fn truncate_function_output_items(
                     detail: *detail,
                 });
             }
-            FunctionCallOutputContentItem::InputAudio { audio_url } => {
-                let cost = estimate_audio_token_count(audio_url);
-                if cost <= remaining_budget {
-                    out.push(FunctionCallOutputContentItem::InputAudio {
-                        audio_url: audio_url.clone(),
-                    });
-                    remaining_budget = remaining_budget.saturating_sub(cost);
-                } else {
-                    omitted_audio_items += 1;
-                }
-            }
             FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
                 out.push(FunctionCallOutputContentItem::EncryptedContent {
                     encrypted_content: encrypted_content.clone(),
@@ -148,12 +129,6 @@ pub(crate) fn truncate_function_output_items(
             text: format!("[omitted {omitted_text_items} text items ...]"),
         });
     }
-    if omitted_audio_items > 0 {
-        out.push(FunctionCallOutputContentItem::InputText {
-            text: format!("[omitted {omitted_audio_items} audio items ...]"),
-        });
-    }
-
     out
 }
 

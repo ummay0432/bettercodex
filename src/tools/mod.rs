@@ -10,9 +10,6 @@ mod process_session;
 const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
     code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
 
-pub(crate) use catalogue::CatalogueMetrics;
-pub(crate) use catalogue::CatalogueRoute;
-pub(crate) use catalogue::CatalogueTool;
 pub(crate) use code_runtime::package_smoke_test;
 pub(crate) use exec_runtime::ToolRuntime;
 pub(crate) use executor::BackgroundProcess;
@@ -330,14 +327,6 @@ pub(crate) fn specifications() -> Vec<Value> {
 
 pub(crate) fn catalogue_text() -> &'static str {
     catalogue::text()
-}
-
-pub(crate) fn display_tools() -> &'static [CatalogueTool] {
-    catalogue::display_tools()
-}
-
-pub(crate) fn catalogue_metrics() -> CatalogueMetrics {
-    catalogue::metrics()
 }
 
 #[cfg(test)]

@@ -2,122 +2,18 @@
 
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::anyhow;
-use std::collections::BTreeSet;
+use include_dir::Dir;
 use std::collections::hash_map::DefaultHasher;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+const SYSTEM_SKILLS_DIR: Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/bundled-skills");
 const SKILLS_DIRECTORY: &str = "skills";
 const SYSTEM_DIRECTORY: &str = ".system";
 const MARKER_FILE_NAME: &str = ".bettercodex-system-skills.marker";
-const LOCK_FILE_NAME: &str = ".bettercodex-system-skills.lock";
-const STAGING_DIRECTORY_NAME: &str = ".bettercodex-system-skills.stage";
-const BACKUP_DIRECTORY_NAME: &str = ".bettercodex-system-skills.backup";
 const FINGERPRINT_SALT: &str = "v1";
-
-struct EmbeddedFile {
-    relative_path: &'static str,
-    contents: &'static [u8],
-}
-
-const EMBEDDED_FILES: &[EmbeddedFile] = &[
-    EmbeddedFile {
-        relative_path: "openai-docs/LICENSE.txt",
-        contents: include_bytes!("../bundled-skills/openai-docs/LICENSE.txt"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/SKILL.md",
-        contents: include_bytes!("../bundled-skills/openai-docs/SKILL.md"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/agents/openai.yaml",
-        contents: include_bytes!("../bundled-skills/openai-docs/agents/openai.yaml"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/assets/openai-small.svg",
-        contents: include_bytes!("../bundled-skills/openai-docs/assets/openai-small.svg"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/assets/openai.png",
-        contents: include_bytes!("../bundled-skills/openai-docs/assets/openai.png"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/codex-self-knowledge.md",
-        contents: include_bytes!(
-            "../bundled-skills/openai-docs/references/codex-self-knowledge.md"
-        ),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/latest-model.md",
-        contents: include_bytes!("../bundled-skills/openai-docs/references/latest-model.md"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/mcp-diagnostics.md",
-        contents: include_bytes!("../bundled-skills/openai-docs/references/mcp-diagnostics.md"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/model-migration.md",
-        contents: include_bytes!("../bundled-skills/openai-docs/references/model-migration.md"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/model-selection.md",
-        contents: include_bytes!("../bundled-skills/openai-docs/references/model-selection.md"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/official-docs.md",
-        contents: include_bytes!("../bundled-skills/openai-docs/references/official-docs.md"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/prompting-guide.md",
-        contents: include_bytes!("../bundled-skills/openai-docs/references/prompting-guide.md"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/upgrade-guide.md",
-        contents: include_bytes!("../bundled-skills/openai-docs/references/upgrade-guide.md"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/references/upgrading-to-gpt-5p6-sol.md",
-        contents: include_bytes!(
-            "../bundled-skills/openai-docs/references/upgrading-to-gpt-5p6-sol.md"
-        ),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/scripts/fetch-codex-manual.mjs",
-        contents: include_bytes!("../bundled-skills/openai-docs/scripts/fetch-codex-manual.mjs"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/scripts/resolve-latest-model-info",
-        contents: include_bytes!("../bundled-skills/openai-docs/scripts/resolve-latest-model-info"),
-    },
-    EmbeddedFile {
-        relative_path: "openai-docs/scripts/resolve-latest-model-info.cjs",
-        contents: include_bytes!(
-            "../bundled-skills/openai-docs/scripts/resolve-latest-model-info.cjs"
-        ),
-    },
-    EmbeddedFile {
-        relative_path: "papercut/SKILL.md",
-        contents: include_bytes!("../bundled-skills/papercut/SKILL.md"),
-    },
-    EmbeddedFile {
-        relative_path: "papercut/agents/openai.yaml",
-        contents: include_bytes!("../bundled-skills/papercut/agents/openai.yaml"),
-    },
-    EmbeddedFile {
-        relative_path: "review/SKILL.md",
-        contents: include_bytes!("../bundled-skills/review/SKILL.md"),
-    },
-    EmbeddedFile {
-        relative_path: "review/agents/openai.yaml",
-        contents: include_bytes!("../bundled-skills/review/agents/openai.yaml"),
-    },
-];
 
 pub(crate) fn root(home: &Path) -> PathBuf {
     home.join(SKILLS_DIRECTORY).join(SYSTEM_DIRECTORY)
@@ -125,307 +21,142 @@ pub(crate) fn root(home: &Path) -> PathBuf {
 
 /// Installs embedded system skills under the bettercodex home.
 ///
-/// This follows Codex's on-disk progressive-disclosure design: the catalogue can
-/// advertise a real `SKILL.md` path while the full body stays out of model context
-/// until the model or operator selects it.
+/// The fingerprint marker avoids rewriting an unchanged cache. A missing or
+/// stale marker causes the disposable cache to be rematerialized from the
+/// embedded source, matching current upstream Codex behavior.
 pub(crate) fn install(home: &Path) -> Result<PathBuf> {
     let skills_root = home.join(SKILLS_DIRECTORY);
-    create_private_directory(&skills_root).with_context(|| {
+    std::fs::create_dir_all(&skills_root).with_context(|| {
         format!(
             "could not create the system skills parent {}",
             skills_root.display()
         )
     })?;
 
-    let lock_path = skills_root.join(LOCK_FILE_NAME);
-    let mut lock_options = OpenOptions::new();
-    lock_options.create(true).read(true).write(true);
-    crate::platform_fs::configure_private_file_nofollow(&mut lock_options, false);
-    let lock = lock_options.open(&lock_path).with_context(|| {
-        format!(
-            "could not open the system skills lock {}",
-            lock_path.display()
-        )
-    })?;
-    let lock_metadata = lock.metadata().with_context(|| {
-        format!(
-            "could not inspect system skills lock {}",
-            lock_path.display()
-        )
-    })?;
-    if !lock_metadata.is_file() || crate::platform_fs::is_link(&lock_metadata) {
-        return Err(anyhow!(
-            "system skills lock {} is not a regular file",
-            lock_path.display()
-        ));
-    }
-    File::lock(&lock)
-        .with_context(|| format!("could not lock system skills at {}", skills_root.display()))?;
-
     let destination = root(home);
-    let staging = skills_root.join(STAGING_DIRECTORY_NAME);
-    let backup = skills_root.join(BACKUP_DIRECTORY_NAME);
-    recover_interrupted_install(&skills_root, &destination, &staging, &backup)?;
-
+    let marker = destination.join(MARKER_FILE_NAME);
     let expected_fingerprint = embedded_fingerprint();
-    let destination_is_directory = match std::fs::symlink_metadata(&destination) {
-        Ok(metadata) if metadata.is_dir() && !crate::platform_fs::is_link(&metadata) => true,
-        Ok(_) => {
-            return Err(anyhow!(
-                "system skills path {} exists but is not a regular directory",
-                destination.display()
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "could not inspect the system skills path {}",
-                    destination.display()
-                )
-            });
-        }
-    };
-    if destination_is_directory && installation_matches(&destination, &expected_fingerprint)? {
+    if destination.is_dir()
+        && read_marker(&marker).is_ok_and(|fingerprint| fingerprint == expected_fingerprint)
+    {
         return Ok(destination);
     }
 
-    let install_result = (|| -> Result<()> {
-        remove_work_path(&staging)?;
-        create_private_directory(&staging)?;
-        for embedded in EMBEDDED_FILES {
-            let path = staging.join(embedded.relative_path);
-            let parent = path.parent().ok_or_else(|| {
-                anyhow!(
-                    "embedded system skill path has no parent: {}",
-                    path.display()
-                )
-            })?;
-            create_private_directory(parent)?;
-            write_private_file(&path, embedded.contents)?;
-        }
-        let marker = staging.join(MARKER_FILE_NAME);
-        write_private_file(&marker, format!("{expected_fingerprint}\n").as_bytes())?;
-        crate::platform_fs::sync_directory(&staging)?;
-
-        if destination_is_directory {
-            std::fs::rename(&destination, &backup).with_context(|| {
-                format!(
-                    "could not stage the previous system skills directory {}",
-                    destination.display()
-                )
-            })?;
-        }
-        if let Err(error) = std::fs::rename(&staging, &destination) {
-            if destination_is_directory {
-                let _ = std::fs::rename(&backup, &destination);
-            }
-            return Err(error).with_context(|| {
-                format!(
-                    "could not activate system skills at {}",
-                    destination.display()
-                )
-            });
-        }
-        crate::platform_fs::sync_directory(&skills_root)?;
-        remove_work_path(&backup)?;
-        crate::platform_fs::sync_directory(&skills_root)?;
-        Ok(())
-    })();
-    if install_result.is_err() {
-        let _ = remove_work_path(&staging);
+    if destination.exists() {
+        std::fs::remove_dir_all(&destination).with_context(|| {
+            format!(
+                "could not remove the stale system skills cache {}",
+                destination.display()
+            )
+        })?;
     }
-    install_result.with_context(|| {
-        format!(
-            "could not materialize embedded system skills at {}",
-            destination.display()
-        )
-    })?;
 
+    write_embedded_dir(&SYSTEM_SKILLS_DIR, &destination)?;
+    std::fs::write(&marker, format!("{expected_fingerprint}\n"))
+        .with_context(|| format!("could not write system skills marker {}", marker.display()))?;
     Ok(destination)
 }
 
-fn recover_interrupted_install(
-    skills_root: &Path,
-    destination: &Path,
-    staging: &Path,
-    backup: &Path,
-) -> Result<()> {
-    let destination_metadata = std::fs::symlink_metadata(destination);
-    match destination_metadata {
-        Ok(metadata) if metadata.is_dir() && !crate::platform_fs::is_link(&metadata) => {
-            remove_work_path(backup)?;
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(backup) {
-                Ok(metadata) if metadata.is_dir() && !crate::platform_fs::is_link(&metadata) => {
-                    std::fs::rename(backup, destination).with_context(|| {
-                        format!(
-                            "could not restore interrupted system skills install at {}",
-                            destination.display()
-                        )
-                    })?;
-                    crate::platform_fs::sync_directory(skills_root)?;
-                }
-                Ok(_) => {
-                    return Err(anyhow!(
-                        "system skills backup path {} is not a regular directory",
-                        backup.display()
-                    ));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "could not inspect system skills backup {}",
-                            backup.display()
-                        )
-                    });
-                }
-            }
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "could not inspect the system skills path {}",
-                    destination.display()
-                )
-            });
-        }
-    }
-    remove_work_path(staging)
-}
-
-fn installation_matches(destination: &Path, expected_fingerprint: &str) -> Result<bool> {
-    let marker = destination.join(MARKER_FILE_NAME);
-    if !regular_file_matches(&marker, format!("{expected_fingerprint}\n").as_bytes())? {
-        return Ok(false);
-    }
-    for embedded in EMBEDDED_FILES {
-        if !regular_file_matches(&destination.join(embedded.relative_path), embedded.contents)? {
-            return Ok(false);
-        }
-    }
-
-    let mut expected_files = BTreeSet::from([PathBuf::from(MARKER_FILE_NAME)]);
-    let mut expected_directories = BTreeSet::from([PathBuf::new()]);
-    for embedded in EMBEDDED_FILES {
-        let path = PathBuf::from(embedded.relative_path);
-        expected_files.insert(path.clone());
-        let mut parent = path.parent();
-        while let Some(directory) = parent {
-            expected_directories.insert(directory.to_path_buf());
-            parent = directory.parent();
-        }
-    }
-    exact_tree_matches(
-        destination,
-        Path::new(""),
-        &expected_files,
-        &expected_directories,
-    )
-}
-
-fn regular_file_matches(path: &Path, expected: &[u8]) -> Result<bool> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not inspect {}", path.display()));
-        }
-    };
-    if !metadata.is_file()
-        || crate::platform_fs::is_link(&metadata)
-        || !crate::platform_fs::private_file_permissions(&metadata)
-    {
-        return Ok(false);
-    }
-    std::fs::read(path)
-        .map(|contents| contents == expected)
-        .with_context(|| format!("could not read {}", path.display()))
-}
-
-fn exact_tree_matches(
-    root: &Path,
-    relative: &Path,
-    expected_files: &BTreeSet<PathBuf>,
-    expected_directories: &BTreeSet<PathBuf>,
-) -> Result<bool> {
-    let directory = root.join(relative);
-    let metadata = std::fs::symlink_metadata(&directory)
-        .with_context(|| format!("could not inspect {}", directory.display()))?;
-    if !metadata.is_dir()
-        || crate::platform_fs::is_link(&metadata)
-        || !crate::platform_fs::private_directory_permissions(&metadata)
-    {
-        return Ok(false);
-    }
-    for entry in std::fs::read_dir(&directory)
-        .with_context(|| format!("could not read {}", directory.display()))?
-    {
-        let entry = entry.with_context(|| format!("could not read {}", directory.display()))?;
-        let child_relative = relative.join(entry.file_name());
-        let child_metadata = std::fs::symlink_metadata(entry.path())
-            .with_context(|| format!("could not inspect {}", entry.path().display()))?;
-        if child_metadata.is_dir() && !crate::platform_fs::is_link(&child_metadata) {
-            if !expected_directories.contains(&child_relative)
-                || !exact_tree_matches(root, &child_relative, expected_files, expected_directories)?
-            {
-                return Ok(false);
-            }
-        } else if child_metadata.is_file() && !crate::platform_fs::is_link(&child_metadata) {
-            if !expected_files.contains(&child_relative) {
-                return Ok(false);
-            }
-        } else {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn remove_work_path(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !crate::platform_fs::is_link(&metadata) => {
-            std::fs::remove_dir_all(path)
-                .with_context(|| format!("could not remove {}", path.display()))
-        }
-        Ok(_) => std::fs::remove_file(path)
-            .with_context(|| format!("could not remove {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("could not inspect {}", path.display())),
-    }
+fn read_marker(path: &Path) -> Result<String> {
+    Ok(std::fs::read_to_string(path)
+        .with_context(|| format!("could not read system skills marker {}", path.display()))?
+        .trim()
+        .to_string())
 }
 
 fn embedded_fingerprint() -> String {
+    let mut items = Vec::new();
+    collect_fingerprint_items(&SYSTEM_SKILLS_DIR, &mut items);
+    items.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
     let mut hasher = DefaultHasher::new();
     FINGERPRINT_SALT.hash(&mut hasher);
-    for embedded in EMBEDDED_FILES {
-        embedded.relative_path.hash(&mut hasher);
-        embedded.contents.hash(&mut hasher);
+    for (path, contents_hash) in items {
+        path.hash(&mut hasher);
+        contents_hash.hash(&mut hasher);
     }
     format!("{:x}", hasher.finish())
 }
 
-fn create_private_directory(path: &Path) -> Result<()> {
-    crate::platform_fs::create_private_directory_all(path)
-        .with_context(|| format!("could not create directory {}", path.display()))
+fn collect_fingerprint_items(directory: &Dir<'_>, items: &mut Vec<(String, Option<u64>)>) {
+    for entry in directory.entries() {
+        match entry {
+            include_dir::DirEntry::Dir(child) => {
+                items.push((child.path().to_string_lossy().to_string(), None));
+                collect_fingerprint_items(child, items);
+            }
+            include_dir::DirEntry::File(file) => {
+                let mut hasher = DefaultHasher::new();
+                file.contents().hash(&mut hasher);
+                items.push((
+                    file.path().to_string_lossy().to_string(),
+                    Some(hasher.finish()),
+                ));
+            }
+        }
+    }
 }
 
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    crate::platform_fs::configure_private_file(&mut options);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("could not create {}", path.display()))?;
-    file.write_all(contents)
-        .with_context(|| format!("could not write {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("could not sync {}", path.display()))
+fn write_embedded_dir(directory: &Dir<'_>, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "could not create system skills directory {}",
+            destination.display()
+        )
+    })?;
+
+    for entry in directory.entries() {
+        match entry {
+            include_dir::DirEntry::Dir(child) => {
+                let child_destination = destination.join(child.path());
+                std::fs::create_dir_all(&child_destination).with_context(|| {
+                    format!(
+                        "could not create system skills directory {}",
+                        child_destination.display()
+                    )
+                })?;
+                write_embedded_dir(child, destination)?;
+            }
+            include_dir::DirEntry::File(file) => {
+                let path = destination.join(file.path());
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "could not create system skills directory {}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                std::fs::write(&path, file.contents()).with_context(|| {
+                    format!("could not write embedded system skill {}", path.display())
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
-#[path = "system_skills_tests.rs"]
-mod tests;
+mod tests {
+    use super::SYSTEM_SKILLS_DIR;
+    use super::collect_fingerprint_items;
+
+    #[test]
+    fn fingerprint_traverses_nested_entries() {
+        let mut items = Vec::new();
+        collect_fingerprint_items(&SYSTEM_SKILLS_DIR, &mut items);
+        let mut paths = items.into_iter().map(|(path, _)| path).collect::<Vec<_>>();
+        paths.sort_unstable();
+
+        assert!(
+            paths
+                .binary_search(&"openai-docs/SKILL.md".to_string())
+                .is_ok()
+        );
+        assert!(
+            paths
+                .binary_search(&"openai-docs/scripts/fetch-codex-manual.mjs".to_string())
+                .is_ok()
+        );
+    }
+}

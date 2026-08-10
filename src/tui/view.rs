@@ -12,6 +12,8 @@ use super::file_search::FileSearchUpdate;
 use super::file_search::is_horizontal_whitespace;
 use super::markdown;
 use super::markdown_cache::MarkdownRenderCache;
+use super::model_picker::ModelPicker;
+use super::model_picker::ModelPickerAction;
 use super::palette;
 use super::palette::TerminalColors;
 #[cfg(windows)]
@@ -30,21 +32,20 @@ use super::skills_view::SkillsViewAction;
 use super::startup_art;
 use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
-use super::tool_catalogue::CatalogueAction;
-use super::tool_catalogue::ToolCatalogueView;
-use crate::MODEL;
 use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
 use crate::ansi_escape::ansi_escape_line;
 use crate::assistant_message::AssistantMessage;
 use crate::context::ContextSnapshot;
-use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
+use crate::model::ModelPreset;
+use crate::model::ModelSelection;
 use crate::protocol::MessagePhase;
 use crate::protocol::ParsedCommand;
 use crate::rollout::SessionTranscriptItem;
+use crate::service_tier::ServiceTier;
 use crate::shell_command::parse_command::parse_command;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
@@ -134,6 +135,21 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "summarize conversation to prevent hitting the context limit",
     },
     SlashCommand {
+        name: "model",
+        aliases: &[],
+        description: "choose what model and reasoning effort to use",
+    },
+    SlashCommand {
+        name: "fast",
+        aliases: &[],
+        description: "toggle faster inference with increased plan usage",
+    },
+    SlashCommand {
+        name: "changelog",
+        aliases: &[],
+        description: "show released patch notes",
+    },
+    SlashCommand {
         name: "resume",
         aliases: &[],
         description: "resume a saved session",
@@ -160,11 +176,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "move this live session into tmux",
     },
     SlashCommand {
-        name: "tools",
-        aliases: &[],
-        description: "inspect the active tool catalogue",
-    },
-    SlashCommand {
         name: "stop",
         aliases: &[],
         description: "stop all background terminals",
@@ -188,6 +199,8 @@ pub(super) enum Action {
     Queue(ComposerSubmission),
     Cancel,
     Compact,
+    ToggleFast,
+    SelectModel(ModelSelection),
     Copy(String),
     Clear(ComposerSubmission),
     Fork(ComposerSubmission),
@@ -258,6 +271,9 @@ pub(super) struct View {
     skill_popup: SkillPopup,
     skills: Vec<Skill>,
     context_tokens: Option<u64>,
+    model_selection: ModelSelection,
+    models: Vec<ModelPreset>,
+    service_tier: ServiceTier,
     background_processes: Vec<BackgroundProcess>,
     busy: bool,
     action_required: bool,
@@ -313,6 +329,10 @@ enum TranscriptEntry {
         sealed: bool,
     },
     Notice(String),
+    PatchNotes {
+        markdown: String,
+        rendered: MarkdownRenderCache,
+    },
     UpdateAvailable(AvailableUpdate),
     Error(String),
     Diff(String),
@@ -528,9 +548,9 @@ impl SlashCommand {
 enum Overlay {
     Shortcuts,
     Context(ContextWindowView),
+    Model(Box<ModelPicker>),
     Resume(ResumePicker),
     Skills(SkillsView),
-    Tools(ToolCatalogueView),
 }
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -557,6 +577,9 @@ impl View {
             skill_popup: SkillPopup::default(),
             skills,
             context_tokens: None,
+            model_selection: ModelSelection::default(),
+            models: crate::model::bundled_models().to_vec(),
+            service_tier: ServiceTier::default(),
             background_processes: Vec::new(),
             busy: false,
             action_required: false,
@@ -627,6 +650,13 @@ impl View {
 
     pub(super) fn add_notice(&mut self, notice: impl Into<String>) {
         self.entries.push(TranscriptEntry::Notice(notice.into()));
+    }
+
+    pub(super) fn add_patch_notes(&mut self, markdown: impl Into<String>) {
+        self.entries.push(TranscriptEntry::PatchNotes {
+            markdown: markdown.into(),
+            rendered: MarkdownRenderCache::default(),
+        });
     }
 
     pub(super) fn add_error(&mut self, error: impl AsRef<str>) {
@@ -873,6 +903,30 @@ impl View {
         self.context_tokens = tokens;
     }
 
+    pub(super) fn set_model_selection(&mut self, selection: ModelSelection) {
+        self.model_selection = selection;
+    }
+
+    pub(super) fn set_models(&mut self, models: Vec<ModelPreset>) {
+        if !models.is_empty() {
+            self.models = models;
+        }
+    }
+
+    pub(super) fn selection_with_catalog_metadata(
+        &self,
+        selection: &ModelSelection,
+    ) -> Option<ModelSelection> {
+        self.models
+            .iter()
+            .find(|preset| preset.model == selection.model)
+            .map(|preset| preset.selection_with_reasoning_fallback(&selection.reasoning_effort))
+    }
+
+    pub(super) fn set_service_tier(&mut self, service_tier: ServiceTier) {
+        self.service_tier = service_tier;
+    }
+
     pub(super) fn set_background_processes(&mut self, processes: Vec<BackgroundProcess>) -> bool {
         if self.background_processes == processes {
             return false;
@@ -939,7 +993,10 @@ impl View {
     }
 
     pub(super) fn show_context(&mut self, snapshot: ContextSnapshot) {
-        self.overlay = Some(Overlay::Context(ContextWindowView::new(snapshot)));
+        self.overlay = Some(Overlay::Context(ContextWindowView::new(
+            snapshot,
+            self.model_selection.model.clone(),
+        )));
     }
 
     pub(super) fn show_resume_picker(&mut self) {
@@ -1010,8 +1067,10 @@ impl View {
         skills: Vec<Skill>,
     ) {
         let user_message_style = self.user_message_style;
+        let models = self.models.clone();
         *self = Self::with_state(cwd, skills);
         self.user_message_style = user_message_style;
+        self.models = models;
         self.context_tokens = context_tokens;
         self.replay_transcript(transcript);
         self.editor.seed_history(prompt_history);
@@ -1436,6 +1495,19 @@ impl View {
                 },
             };
         }
+        if let Some(Overlay::Model(picker)) = self.overlay.as_mut() {
+            return match picker.handle_key(key) {
+                ModelPickerAction::None => Action::None,
+                ModelPickerAction::Close => {
+                    self.overlay = None;
+                    Action::None
+                }
+                ModelPickerAction::Select(selection) => {
+                    self.overlay = None;
+                    Action::SelectModel(selection)
+                }
+            };
+        }
         if control && key.code == KeyCode::Char('o') {
             return self.copy_latest_final_action();
         }
@@ -1473,11 +1545,9 @@ impl View {
             let close = match overlay {
                 Overlay::Shortcuts => true,
                 Overlay::Context(context) => context.handle_key(key.code) == ContextAction::Close,
+                Overlay::Model(_) => unreachable!("model picker keys are handled above"),
                 Overlay::Resume(_) => unreachable!("resume picker keys are handled above"),
                 Overlay::Skills(_) => unreachable!("skills keys are handled above"),
-                Overlay::Tools(catalogue) => {
-                    catalogue.handle_key(key.code) == CatalogueAction::Close
-                }
             };
             if close {
                 self.overlay = None;
@@ -1849,6 +1919,24 @@ impl View {
                 ),
             ),
             "/compact" => Action::Compact,
+            "/model" => {
+                self.overlay = Some(Overlay::Model(Box::new(ModelPicker::new(
+                    self.models.clone(),
+                    self.model_selection.clone(),
+                ))));
+                Action::None
+            }
+            "/fast" => Action::ToggleFast,
+            "/changelog" => {
+                match crate::patch_notes::released() {
+                    Ok(Some(markdown)) => self.add_patch_notes(markdown),
+                    Ok(None) => {
+                        self.add_notice("No released patch notes are available for this build")
+                    }
+                    Err(error) => self.add_error(format!("Could not load patch notes: {error:#}")),
+                }
+                Action::None
+            }
             "/copy" => self.copy_latest_final_action(),
             "/diff" => Action::ShowDiff,
             "/fork" if self.busy => self.reject_local_submission(
@@ -1879,10 +1967,6 @@ impl View {
             ),
             "/skills" => {
                 self.overlay = Some(Overlay::Skills(SkillsView::new()));
-                Action::None
-            }
-            "/tools" => {
-                self.overlay = Some(Overlay::Tools(ToolCatalogueView::new()));
                 Action::None
             }
             "/stop" => Action::StopBackgroundProcesses,
@@ -1984,6 +2068,7 @@ impl View {
                 TranscriptEntry::Tool(_)
                 | TranscriptEntry::Exploration { .. }
                 | TranscriptEntry::Notice(_)
+                | TranscriptEntry::PatchNotes { .. }
                 | TranscriptEntry::UpdateAvailable(_)
                 | TranscriptEntry::Error(_)
                 | TranscriptEntry::Diff(_)
@@ -2155,6 +2240,8 @@ impl View {
                     &self.cwd,
                     width,
                     screen_height,
+                    &self.model_selection,
+                    self.service_tier,
                 )),
                 &mut lines,
                 &mut self.history_emitted,
@@ -2212,6 +2299,8 @@ impl View {
                 &self.cwd,
                 width,
                 screen_height,
+                &self.model_selection,
+                self.service_tier,
             )),
             &mut lines,
             &mut emitted,
@@ -2389,9 +2478,9 @@ impl View {
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => shortcuts_height(width),
             Some(Overlay::Context(context)) => context.preferred_height(width),
+            Some(Overlay::Model(picker)) => picker.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills, width),
-            Some(Overlay::Tools(catalogue)) => catalogue.preferred_height(),
             None => 0,
         };
         let transcript_chrome_height = bottom_spacing
@@ -2531,12 +2620,10 @@ impl View {
         match self.overlay.as_mut() {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
             Some(Overlay::Context(context)) => context.render(frame, area, self.user_message_style),
+            Some(Overlay::Model(picker)) => picker.render(frame, area, self.user_message_style),
             Some(Overlay::Resume(picker)) => picker.render(frame, area),
             Some(Overlay::Skills(skills)) => {
                 skills.render(frame, area, &self.skills, self.user_message_style)
-            }
-            Some(Overlay::Tools(catalogue)) => {
-                catalogue.render(frame, area, self.user_message_style)
             }
             None => {}
         }
@@ -2950,14 +3037,22 @@ impl View {
             return truncate_line(Line::from(spans), usize::from(width));
         }
         let mut spans = vec![
-            Span::from(MODEL),
-            Span::styled(" max", Style::default().fg(MUTED)),
+            Span::from(self.model_selection.model.clone()),
+            Span::styled(
+                format!(" {}", self.model_selection.reasoning_effort),
+                Style::default().fg(MUTED),
+            ),
+        ];
+        if self.service_tier.is_fast() && self.model_selection.supports_fast {
+            spans.push(Span::styled(" fast", Style::default().fg(Color::Magenta)));
+        }
+        spans.extend([
             Span::styled(" │ ", Style::default().fg(MUTED)),
             Span::styled(
                 self.repository.name.clone(),
                 Style::default().fg(Color::Cyan),
             ),
-        ];
+        ]);
         if let Some(branch) = &self.repository.branch {
             spans.push(Span::styled(
                 format!(" / {branch}"),
@@ -2966,7 +3061,10 @@ impl View {
         }
         spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
         spans.push(Span::styled(
-            format_context_usage(self.context_tokens),
+            format_context_usage(
+                self.context_tokens,
+                self.model_selection.effective_context_window(),
+            ),
             Style::default().fg(MUTED),
         ));
         truncate_line(Line::from(spans), usize::from(width))
@@ -3013,6 +3111,9 @@ fn is_local_command(command: &str) -> bool {
         "/q" | "/quit"
             | "/exit"
             | "/compact"
+            | "/model"
+            | "/fast"
+            | "/changelog"
             | "/copy"
             | "/diff"
             | "/clear"
@@ -3021,7 +3122,6 @@ fn is_local_command(command: &str) -> bool {
             | "/help"
             | "/ps"
             | "/skills"
-            | "/tools"
             | "/stop"
             | "/logout"
     )
@@ -3032,6 +3132,7 @@ impl TranscriptEntry {
         match self {
             Self::User(_)
             | Self::Notice(_)
+            | Self::PatchNotes { .. }
             | Self::UpdateAvailable(_)
             | Self::Error(_)
             | Self::Diff(_)
@@ -3120,6 +3221,9 @@ impl TranscriptEntry {
                 Span::from("• ").dim(),
                 Span::from(message.clone()).dim(),
             ])],
+            Self::PatchNotes { markdown, rendered } => {
+                return patch_notes_lines(markdown, width, cwd, rendered);
+            }
             Self::UpdateAvailable(update) => update_available_lines(update, width),
             Self::Error(message) => vec![Line::from(vec![
                 Span::styled("■ ", Style::default().fg(Color::Red)),
@@ -3987,8 +4091,14 @@ fn command_output(cwd: &Path, arguments: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn welcome_lines(cwd: &Path, available_width: u16, available_height: u16) -> Vec<Line<'static>> {
-    let card = welcome_card_lines(cwd, available_width);
+fn welcome_lines(
+    cwd: &Path,
+    available_width: u16,
+    available_height: u16,
+    model_selection: &ModelSelection,
+    service_tier: ServiceTier,
+) -> Vec<Line<'static>> {
+    let card = welcome_card_lines(cwd, available_width, model_selection, service_tier);
     let mut artwork = startup_art::lines(available_width, available_height);
     if artwork.is_empty() || card.is_empty() {
         return card;
@@ -3998,7 +4108,12 @@ fn welcome_lines(cwd: &Path, available_width: u16, available_height: u16) -> Vec
     artwork
 }
 
-fn welcome_card_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
+fn welcome_card_lines(
+    cwd: &Path,
+    available_width: u16,
+    model_selection: &ModelSelection,
+    service_tier: ServiceTier,
+) -> Vec<Line<'static>> {
     if available_width < 4 {
         return Vec::new();
     }
@@ -4009,11 +4124,15 @@ fn welcome_card_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
         Span::from(format!(" (v{})", env!("CARGO_PKG_VERSION"))).dim(),
     ])];
     content.push(Line::default());
-    content.push(Line::from(vec![
+    let mut model_spans = vec![
         Span::from("model:       ").dim(),
-        Span::from(MODEL),
-        Span::from(" max").dim(),
-    ]));
+        Span::from(model_selection.model.clone()),
+        Span::from(format!(" {}", model_selection.reasoning_effort)).dim(),
+    ];
+    if service_tier.is_fast() && model_selection.supports_fast {
+        model_spans.push(Span::from(" fast").magenta());
+    }
+    content.push(Line::from(model_spans));
     content.push(Line::from(vec![
         Span::from("directory:   ").dim(),
         Span::from(display_directory(cwd)),
@@ -4027,6 +4146,53 @@ fn welcome_card_lines(cwd: &Path, available_width: u16) -> Vec<Line<'static>> {
         .map(|line| truncate_line(line, maximum_content_width))
         .collect::<Vec<_>>();
     with_card_border(content)
+}
+
+fn patch_notes_lines(
+    source: &str,
+    available_width: u16,
+    cwd: &Path,
+    rendered: &mut MarkdownRenderCache,
+) -> Vec<HyperlinkLine> {
+    let available_width = available_width.max(1);
+    let inset = usize::from(available_width > 2);
+    let content_width = usize::from(available_width)
+        .saturating_sub(inset.saturating_mul(2))
+        .max(1);
+    let border = || {
+        HyperlinkLine::new(Line::from(Span::styled(
+            "─".repeat(usize::from(available_width)),
+            Style::default().fg(RULE),
+        )))
+    };
+    let with_inset = |lines| {
+        terminal_hyperlinks::prefix_hyperlink_lines(
+            lines,
+            Span::from(" ".repeat(inset)),
+            Span::from(" ".repeat(inset)),
+        )
+    };
+
+    let heading = Line::from(Span::styled(
+        "What's New",
+        Style::default().fg(Color::Cyan).bold(),
+    ));
+    let heading = word_wrap_line(&heading, content_width)
+        .iter()
+        .map(line_to_static)
+        .collect::<Vec<_>>();
+    let markdown = rendered.render(source, content_width, cwd, false).to_vec();
+
+    let mut lines = Vec::with_capacity(heading.len().saturating_add(markdown.len() + 4));
+    lines.push(border());
+    lines.extend(with_inset(terminal_hyperlinks::plain_hyperlink_lines(
+        heading,
+    )));
+    lines.push(HyperlinkLine::default());
+    lines.extend(with_inset(markdown));
+    lines.push(HyperlinkLine::default());
+    lines.push(border());
+    lines
 }
 
 fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec<Line<'static>> {
@@ -4942,12 +5108,12 @@ fn editor_line(
     Line::from(spans)
 }
 
-fn format_context_usage(tokens: Option<u64>) -> String {
-    let context_window_k = EFFECTIVE_CONTEXT_WINDOW / 1_000;
+fn format_context_usage(tokens: Option<u64>, context_window: u64) -> String {
+    let context_window_k = context_window / 1_000;
     let Some(tokens) = tokens else {
         return format!("? of {context_window_k}K");
     };
-    let percent = (tokens as f64 / EFFECTIVE_CONTEXT_WINDOW as f64 * 100.0).clamp(0.0, 100.0);
+    let percent = (tokens as f64 / context_window as f64 * 100.0).clamp(0.0, 100.0);
     if percent > 0.0 && percent < 1.0 {
         format!("{percent:.1}% of {context_window_k}K")
     } else {
@@ -5080,6 +5246,27 @@ mod tests {
 
         assert_eq!(rendered_len, full.len());
         assert_eq!(suffix, full[start..]);
+    }
+
+    #[test]
+    fn patch_notes_render_as_a_bordered_markdown_history_block() {
+        const WIDTH: u16 = 40;
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.add_patch_notes("## [0.1.4]\n\n- Added `/model` selector");
+
+        let lines = view.take_pending_history_lines(WIDTH, 24);
+        let rows = lines.iter().map(plain).collect::<Vec<_>>();
+
+        assert_eq!(rows.first().unwrap(), &"─".repeat(usize::from(WIDTH)));
+        assert_eq!(rows.last(), rows.first());
+        assert!(rows.iter().any(|row| row.trim() == "What's New"));
+        assert!(rows.iter().any(|row| row.contains("[0.1.4]")));
+        assert!(rows.iter().any(|row| row.contains("Added /model selector")));
+        assert!(
+            rows.iter()
+                .all(|row| line_width(&Line::from(row.clone())) <= usize::from(WIDTH))
+        );
     }
 
     #[test]
@@ -5278,10 +5465,11 @@ mod tests {
 
     #[test]
     fn context_usage_matches_the_preserved_contract() {
-        assert_eq!(format_context_usage(None), "? of 258K");
-        assert_eq!(format_context_usage(Some(1_000)), "0.4% of 258K");
-        assert_eq!(format_context_usage(Some(51_680)), "20% of 258K");
-        assert_eq!(format_context_usage(Some(u64::MAX)), "100% of 258K");
+        let window = ModelSelection::default().effective_context_window();
+        assert_eq!(format_context_usage(None, window), "? of 258K");
+        assert_eq!(format_context_usage(Some(1_000), window), "0.4% of 258K");
+        assert_eq!(format_context_usage(Some(51_680), window), "20% of 258K");
+        assert_eq!(format_context_usage(Some(u64::MAX), window), "100% of 258K");
     }
 
     #[test]
@@ -5295,6 +5483,101 @@ mod tests {
         assert_eq!(
             plain(&view.status_line(80)),
             "gpt-5.6-sol max │ pi / main │ 20% of 258K"
+        );
+    }
+
+    #[test]
+    fn fast_command_and_rendered_footer_show_fast_beside_reasoning() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/fast");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::ToggleFast
+        );
+
+        view.welcome_pending = false;
+        view.repository = Repository {
+            name: "bettercodex".to_string(),
+            branch: Some("main".to_string()),
+        };
+        view.set_service_tier(ServiceTier::Fast);
+        assert_eq!(
+            plain(&view.status_line(80)),
+            "gpt-5.6-sol max fast │ bettercodex / main │ ? of 258K"
+        );
+
+        let height = view.desired_height(80, 24);
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        assert!(
+            rendered.contains("gpt-5.6-sol max fast │ bettercodex / main"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn model_command_opens_the_codex_picker_locally() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/model");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert!(matches!(&view.overlay, Some(Overlay::Model(_))));
+        assert!(view.editor.is_empty());
+    }
+
+    #[test]
+    fn fast_status_is_hidden_for_a_model_that_does_not_support_it() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.set_model_selection(
+            crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::XHigh),
+        );
+        view.set_service_tier(ServiceTier::Fast);
+
+        assert_eq!(
+            plain(&view.status_line(80)),
+            "gpt-5.2 xhigh │ bettercodex │ ? of 258K"
+        );
+    }
+
+    #[test]
+    fn catalog_metadata_refresh_preserves_supported_effort_and_falls_back_to_default() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let current =
+            crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::XHigh);
+        let mut refreshed_preset = crate::model::bundled_models()[4].clone();
+        refreshed_preset.raw_context_window = 100_000;
+        refreshed_preset.effective_context_window_percent = 80;
+        refreshed_preset.configured_auto_compact_token_limit = Some(70_000);
+        refreshed_preset.supports_fast = true;
+        view.set_models(vec![refreshed_preset]);
+
+        let refreshed = view.selection_with_catalog_metadata(&current).unwrap();
+
+        assert_eq!(
+            refreshed.reasoning_effort,
+            crate::model::ReasoningEffort::XHigh
+        );
+        assert_eq!(refreshed.effective_context_window(), 80_000);
+        assert_eq!(refreshed.auto_compact_token_limit(), 70_000);
+        assert!(refreshed.supports_fast);
+
+        let mut unsupported = current;
+        unsupported.reasoning_effort = crate::model::ReasoningEffort::Minimal;
+        let refreshed = view.selection_with_catalog_metadata(&unsupported).unwrap();
+        assert_eq!(
+            refreshed.reasoning_effort,
+            crate::model::ReasoningEffort::Medium
         );
     }
 
@@ -5419,7 +5702,7 @@ mod tests {
             .saturating_add(1);
         let footer_y = rows
             .iter()
-            .position(|row| row.contains(MODEL))
+            .position(|row| row.contains(view.model_selection.model.as_str()))
             .expect("rendered footer") as u16;
 
         assert!(
@@ -5497,7 +5780,12 @@ mod tests {
 
     #[test]
     fn welcome_card_uses_codex_content_width_instead_of_terminal_width() {
-        let lines = welcome_card_lines(Path::new("/tmp/bettercodex"), 100);
+        let lines = welcome_card_lines(
+            Path::new("/tmp/bettercodex"),
+            100,
+            &ModelSelection::default(),
+            ServiceTier::default(),
+        );
         let widest_content = lines[1..lines.len() - 1]
             .iter()
             .map(line_width)
@@ -5508,10 +5796,43 @@ mod tests {
     }
 
     #[test]
+    fn welcome_card_shows_fast_beside_reasoning_when_resuming_fast_session() {
+        let lines = welcome_card_lines(
+            Path::new("/tmp/bettercodex"),
+            80,
+            &ModelSelection::default(),
+            ServiceTier::Fast,
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| plain(line).contains("gpt-5.6-sol max fast"))
+        );
+    }
+
+    #[test]
     fn roomy_welcome_includes_art_and_small_layouts_keep_the_card() {
-        let roomy = welcome_lines(Path::new("/tmp/bettercodex"), 80, 42);
-        let short = welcome_lines(Path::new("/tmp/bettercodex"), 80, 27);
-        let narrow = welcome_lines(Path::new("/tmp/bettercodex"), 29, 42);
+        let roomy = welcome_lines(
+            Path::new("/tmp/bettercodex"),
+            80,
+            42,
+            &ModelSelection::default(),
+            ServiceTier::default(),
+        );
+        let short = welcome_lines(
+            Path::new("/tmp/bettercodex"),
+            80,
+            27,
+            &ModelSelection::default(),
+            ServiceTier::default(),
+        );
+        let narrow = welcome_lines(
+            Path::new("/tmp/bettercodex"),
+            29,
+            42,
+            &ModelSelection::default(),
+            ServiceTier::default(),
+        );
 
         assert!(
             roomy
@@ -5523,11 +5844,23 @@ mod tests {
         );
         assert_eq!(
             short.len(),
-            welcome_card_lines(Path::new("/tmp/bettercodex"), 80).len()
+            welcome_card_lines(
+                Path::new("/tmp/bettercodex"),
+                80,
+                &ModelSelection::default(),
+                ServiceTier::default(),
+            )
+            .len()
         );
         assert_eq!(
             narrow.len(),
-            welcome_card_lines(Path::new("/tmp/bettercodex"), 29).len()
+            welcome_card_lines(
+                Path::new("/tmp/bettercodex"),
+                29,
+                &ModelSelection::default(),
+                ServiceTier::default(),
+            )
+            .len()
         );
         assert!(short.iter().any(|line| plain(line).contains("bettercodex")));
         assert!(

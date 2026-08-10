@@ -19,7 +19,6 @@ use super::code_runtime::RuntimeResponse;
 use super::code_runtime::ToolInvocationFuture;
 use super::code_runtime::WaitRequest;
 use super::image_preparation::prepare_tool_output_images;
-use crate::audio::estimate_audio_token_count;
 use crate::events::AgentEvent;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::protocol::DEFAULT_IMAGE_DETAIL;
@@ -231,7 +230,6 @@ impl ToolRuntime {
             .filter_map(|item| match item {
                 FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
                 FunctionCallOutputContentItem::InputImage { .. }
-                | FunctionCallOutputContentItem::InputAudio { .. }
                 | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
             })
             .collect::<Vec<_>>()
@@ -434,7 +432,7 @@ fn truncate_items(
         return formatted_truncate_text_content_items(&items, max_tokens).0;
     }
 
-    truncate_function_output_items(&items, max_tokens, estimate_audio_token_count)
+    truncate_function_output_items(&items, max_tokens)
 }
 
 fn output_token_budget(requested: Option<usize>) -> usize {
@@ -480,9 +478,6 @@ fn into_protocol_items(
                     }),
                 }
             }
-            code_runtime::FunctionCallOutputContentItem::InputAudio { audio_url } => {
-                FunctionCallOutputContentItem::InputAudio { audio_url }
-            }
         })
         .collect()
 }
@@ -512,6 +507,7 @@ mod tests {
                 crate::auth::SharedAuth::new(crate::auth::Auth::for_test("test-token")),
                 "http://127.0.0.1:1".to_string(),
                 "test-session".to_string(),
+                crate::model::SharedModelSelection::new(crate::model::ModelSelection::default()),
             ),
             crate::openai_docs::OpenAiDocsClient::with_endpoint(
                 http_client(),

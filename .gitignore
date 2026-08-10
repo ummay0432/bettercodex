@@ -1,5 +1,9 @@
 /target/
 
+# Local planning and writing guidance.
+/TODO.md
+/docs/writing-instructions.md
+
 # Local credentials and runtime state must never enter repository history.
 .bcodex/
 .codex/

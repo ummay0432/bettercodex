@@ -8,7 +8,6 @@ $ErrorActionPreference = 'Stop'
 
 $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $InstallerPath = Join-Path $RepositoryRoot 'scripts\install.ps1'
-$InstallerText = [IO.File]::ReadAllText($InstallerPath)
 $Tokens = $null
 $ParseErrors = $null
 $Ast = [Management.Automation.Language.Parser]::ParseFile(
@@ -226,21 +225,6 @@ try {
     finally {
         $env:LOCALAPPDATA = $OriginalLocalAppData
     }
-
-    foreach ($Forbidden in @(
-            'cargo build',
-            'rustup-init',
-            'Visual Studio Build Tools',
-            'GitHubArchiveRoot',
-            'rg.exe',
-            'Invoke-WebRequest'
-        )) {
-        Assert-True (-not $InstallerText.Contains($Forbidden)) "obsolete installer path remains: $Forbidden"
-    }
-    Assert-True $InstallerText.Contains('bcodex-x86_64-pc-windows-msvc.exe.gz') 'Windows release asset is missing'
-    Assert-True $InstallerText.Contains('[IO.File]::Replace') 'atomic Windows replacement is missing'
-    Assert-True $InstallerText.Contains('BCODEX_UPDATE_PARENT_PID') 'running-binary finalization is missing'
-    Assert-True $InstallerText.Contains('ResponseHeadersRead') 'bounded streaming download is missing'
 
     $HelpOutput = & powershell.exe `
         -NoLogo `

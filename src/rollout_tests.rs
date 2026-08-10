@@ -43,6 +43,7 @@ fn rollout_replays_replacements_usage_and_turn_state() {
         ..TokenUsage::default()
     };
     rollout.record_usage(&usage, 9, true).unwrap();
+    rollout.record_service_tier(ServiceTier::Fast).unwrap();
     drop(rollout);
 
     let loaded = Rollout::resume_in(
@@ -57,8 +58,107 @@ fn rollout_replays_replacements_usage_and_turn_state() {
     assert!(loaded.server_reasoning_included);
     assert_eq!(loaded.unfinished_turn.as_deref(), Some("turn-1"));
     assert_eq!(loaded.compaction_count, 0);
+    assert_eq!(loaded.service_tier, ServiceTier::Fast);
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rollout_replays_the_latest_service_tier_selection() {
+    let root = temporary_directory("rollout-service-tier");
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    rollout.record_service_tier(ServiceTier::Fast).unwrap();
+    rollout.record_service_tier(ServiceTier::Standard).unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.service_tier, ServiceTier::Standard);
+    drop(loaded);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rollout_replays_selected_and_history_models_independently() {
+    let root = temporary_directory("rollout-model-selection");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let initial = crate::model::bundled_models()[0].selection(ReasoningEffort::Low);
+    let mut rollout = Rollout::create_in_with_selection(&root, &cwd, &initial).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    rollout
+        .record_history_model_selection(Some(&initial))
+        .unwrap();
+    let selected = crate::model::bundled_models()[4].selection(ReasoningEffort::XHigh);
+    rollout.record_model_selection(&selected).unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.model_selection, selected);
+    assert_eq!(loaded.history_model_selection, Some(initial));
+}
+
+#[test]
+fn rollout_replays_initial_remote_model_metadata() {
+    let root = temporary_directory("rollout-initial-remote-model");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let initial = ModelSelection {
+        model: "remote-model".to_string(),
+        reasoning_effort: ReasoningEffort::Custom("future".to_string()),
+        raw_context_window: 456_000,
+        effective_context_window_percent: 80,
+        configured_auto_compact_token_limit: Some(350_000),
+        use_responses_lite: true,
+        prefer_websocket: false,
+        supports_fast: true,
+        comp_hash: Some("remote-v3".to_string()),
+    };
+    let rollout = Rollout::create_in_with_selection(&root, &cwd, &initial).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.model_selection, initial);
+    assert_eq!(loaded.history_model_selection, None);
+}
+
+#[test]
+fn legacy_unfinished_turn_restores_its_history_model() {
+    let root = temporary_directory("rollout-legacy-unfinished-model");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let path = rollout.path.clone();
+    rollout.start_turn("turn-1").unwrap();
+    drop(rollout);
+
+    let journal = std::fs::read_to_string(&path).unwrap();
+    let legacy_journal = journal
+        .lines()
+        .filter(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            !matches!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some("model_changed" | "history_model_changed")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&path, format!("{legacy_journal}\n")).unwrap();
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(
+        loaded.history_model_selection,
+        Some(ModelSelection::default())
+    );
+    assert_eq!(loaded.unfinished_turn.as_deref(), Some("turn-1"));
 }
 
 #[test]

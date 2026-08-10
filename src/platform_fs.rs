@@ -64,32 +64,6 @@ pub(crate) fn protect_file(file: &File) -> io::Result<()> {
     }
 }
 
-pub(crate) fn private_file_permissions(metadata: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o777 == 0o600
-    }
-    #[cfg(windows)]
-    {
-        let _ = metadata;
-        true
-    }
-}
-
-pub(crate) fn private_directory_permissions(metadata: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o777 == 0o700
-    }
-    #[cfg(windows)]
-    {
-        let _ = metadata;
-        true
-    }
-}
-
 /// True for symbolic links and for Windows junctions/other reparse points.
 pub(crate) fn is_link(metadata: &Metadata) -> bool {
     if metadata.file_type().is_symlink() {
@@ -155,24 +129,5 @@ pub(crate) fn replace_file(source: &Path, destination: &Path) -> io::Result<()> 
         } else {
             Ok(())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ordinary_file_is_not_a_link() {
-        let root = std::env::temp_dir().join(format!(
-            "bettercodex-platform-fs-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("file");
-        std::fs::write(&path, b"value").unwrap();
-        assert!(!is_link(&std::fs::symlink_metadata(&path).unwrap()));
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -92,6 +92,40 @@ fn normalization_preserves_exec_notifications_and_final_output() {
 }
 
 #[test]
+fn conversation_repairs_only_malformed_call_output_appends() {
+    let (root, cwd) = temporary_repository("incremental-normalization");
+    let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let call = json!({
+        "id": "fc_incremental",
+        "type": "function_call",
+        "call_id": "call_incremental",
+        "name": "example",
+        "arguments": "{}",
+    });
+    let output = json!({
+        "type": "function_call_output",
+        "call_id": "call_incremental",
+        "output": "done",
+    });
+
+    conversation.extend([call, output.clone()]).unwrap();
+    assert!(!conversation.normalize().unwrap());
+
+    conversation.extend([output]).unwrap();
+    assert!(conversation.normalize().unwrap());
+    assert_eq!(
+        conversation
+            .items()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output"
+                && item["call_id"] == "call_incremental")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn webp_extended_dimensions_are_included_in_image_budgeting() {
     let mut webp = vec![0_u8; 30];
     webp[..4].copy_from_slice(b"RIFF");
@@ -205,16 +239,13 @@ fn project_root_stops_agents_discovery_at_git_boundary() {
     assert_eq!(repository_item["role"], "user");
     assert_eq!(repository_item["content"][0]["type"], "input_text");
     let context = message_text(repository_item).unwrap();
-    assert!(context.starts_with(&format!(
-        "<repository_context>\n{REPOSITORY_CONTEXT_INSTRUCTION}\n\n<repository_instructions path=\""
-    )));
+    assert!(context.starts_with("<repository_context>\n<repository_instructions path=\""));
     assert!(context.ends_with("</repository_context>"));
     assert!(context.contains("<repository_instructions path=\""));
     assert!(context.contains("<![CDATA["));
     assert!(context.contains("root rule"));
     assert!(context.contains("nested rule"));
     assert!(!context.contains("outside"));
-    assert_eq!(context.matches(REPOSITORY_CONTEXT_INSTRUCTION).count(), 1);
 }
 
 #[test]

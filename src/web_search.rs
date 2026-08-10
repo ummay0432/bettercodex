@@ -1,4 +1,4 @@
-//! Standalone Codex web search for Responses Lite.
+//! Standalone Codex web search for the selected Responses model.
 //!
 //! The wire client and request types come from OpenAI Codex commit
 //! `1669c2403f793d0230065397dfc25f52b844244e`. The focused adapter here mirrors
@@ -6,9 +6,9 @@
 //! sends search, fetch/navigation, image, finance, weather, sports, and time
 //! commands to the same `alpha/search` endpoint used by Codex.
 
-use crate::MODEL;
 use crate::auth::SharedAuth;
 use crate::http_client::backoff;
+use crate::model::SharedModelSelection;
 use crate::protocol::ContentItem;
 use crate::protocol::ImageDetail;
 use crate::protocol::InternalChatMessageMetadataPassthrough;
@@ -60,6 +60,7 @@ pub(crate) struct WebSearchClient {
     auth: SharedAuth,
     base_url: String,
     session_id: String,
+    model_selection: SharedModelSelection,
 }
 
 #[derive(Clone, Default)]
@@ -71,7 +72,7 @@ pub(crate) struct ToolTurnContext {
 #[derive(Debug, Serialize)]
 struct SearchRequest<'a> {
     id: &'a str,
-    model: &'static str,
+    model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<&'a SearchInput>,
     commands: &'a SearchCommands,
@@ -86,10 +87,15 @@ struct SearchSettings {
 }
 
 impl<'a> SearchRequest<'a> {
-    fn new(id: &'a str, input: Option<&'a SearchInput>, commands: &'a SearchCommands) -> Self {
+    fn new(
+        id: &'a str,
+        model: &'a str,
+        input: Option<&'a SearchInput>,
+        commands: &'a SearchCommands,
+    ) -> Self {
         Self {
             id,
-            model: MODEL,
+            model,
             input,
             commands,
             settings: SearchSettings {
@@ -134,9 +140,6 @@ enum HistoryContent<'a> {
         image_url: &'a str,
         #[serde(default)]
         detail: Option<ImageDetail>,
-    },
-    InputAudio {
-        audio_url: &'a str,
     },
     OutputText {
         text: &'a str,
@@ -379,12 +382,14 @@ impl WebSearchClient {
         auth: SharedAuth,
         base_url: String,
         session_id: String,
+        model_selection: SharedModelSelection,
     ) -> Self {
         Self {
             client,
             auth,
             base_url,
             session_id,
+            model_selection,
         }
     }
 
@@ -398,7 +403,13 @@ impl WebSearchClient {
             return Err(anyhow!("web search cancelled"));
         }
         let commands = parse_commands(input)?;
-        let request = SearchRequest::new(&self.session_id, context.input.as_deref(), &commands);
+        let model_selection = self.model_selection.get();
+        let request = SearchRequest::new(
+            &self.session_id,
+            &model_selection.model,
+            context.input.as_deref(),
+            &commands,
+        );
         let body = Bytes::from(
             serde_json::to_vec(&request)
                 .context("failed to encode standalone web search request")?,
@@ -774,49 +785,45 @@ impl HistoryMessage<'_> {
 
     fn into_search_item(self, assistant_tokens: &mut usize) -> Option<ResponseItem> {
         let is_user = self.role == "user";
-        let content = self
-            .content
-            .into_iter()
-            .filter_map(|item| {
-                if is_user {
-                    return match item {
+        let content =
+            self.content
+                .into_iter()
+                .filter_map(|item| {
+                    if is_user {
+                        return match item {
+                            HistoryContent::InputText { text } => Some(ContentItem::InputText {
+                                text: text.to_string(),
+                            }),
+                            HistoryContent::InputImage { .. }
+                            | HistoryContent::OutputText { .. } => None,
+                        };
+                    }
+                    match item {
                         HistoryContent::InputText { text } => Some(ContentItem::InputText {
                             text: text.to_string(),
                         }),
-                        HistoryContent::InputImage { .. }
-                        | HistoryContent::InputAudio { .. }
-                        | HistoryContent::OutputText { .. } => None,
-                    };
-                }
-                match item {
-                    HistoryContent::InputText { text } => Some(ContentItem::InputText {
-                        text: text.to_string(),
-                    }),
-                    HistoryContent::InputImage { image_url, detail } => {
-                        Some(ContentItem::InputImage {
-                            image_url: image_url.to_string(),
-                            detail,
-                        })
+                        HistoryContent::InputImage { image_url, detail } => {
+                            Some(ContentItem::InputImage {
+                                image_url: image_url.to_string(),
+                                detail,
+                            })
+                        }
+                        HistoryContent::OutputText { .. } if *assistant_tokens == 0 => None,
+                        HistoryContent::OutputText { text } => {
+                            let tokens = approx_token_count(text);
+                            let text = if tokens <= *assistant_tokens {
+                                *assistant_tokens = assistant_tokens.saturating_sub(tokens);
+                                text.to_string()
+                            } else {
+                                let text = truncate_text(text, *assistant_tokens);
+                                *assistant_tokens = 0;
+                                text
+                            };
+                            Some(ContentItem::OutputText { text })
+                        }
                     }
-                    HistoryContent::InputAudio { audio_url } => Some(ContentItem::InputAudio {
-                        audio_url: audio_url.to_string(),
-                    }),
-                    HistoryContent::OutputText { .. } if *assistant_tokens == 0 => None,
-                    HistoryContent::OutputText { text } => {
-                        let tokens = approx_token_count(text);
-                        let text = if tokens <= *assistant_tokens {
-                            *assistant_tokens = assistant_tokens.saturating_sub(tokens);
-                            text.to_string()
-                        } else {
-                            let text = truncate_text(text, *assistant_tokens);
-                            *assistant_tokens = 0;
-                            text
-                        };
-                        Some(ContentItem::OutputText { text })
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
         (!content.is_empty()).then_some(ResponseItem::Message {
             id: None,
             role: self.role.to_string(),

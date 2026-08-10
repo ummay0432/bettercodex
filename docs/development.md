@@ -56,10 +56,17 @@ This package has no library target, so `cargo test --lib` is invalid.
 ## Tests
 
 - Retain upstream tests with retained behavior.
+- Before adding local coverage, inspect current upstream tests and the nearest
+  existing bettercodex test and helpers. Port or extend that coverage rather
+  than creating a parallel harness, fixture family, or validation script.
 - Add a bettercodex-only test only for an intentional product departure or a
   concrete regression that upstream cannot cover.
 - Test observable behavior rather than implementation details, copied text, or
   static values.
+- Do not add a negative test whose only assertion is that removed logic remains
+  absent.
+- Reuse existing test helpers and avoid adding production APIs or functions
+  solely for tests.
 - Prefer complete-value equality over many field assertions.
 - Keep new test modules in sibling `*_tests.rs` files.
 - Do not disguise manual benchmarks as tests.
@@ -77,8 +84,13 @@ check available disk space; a full target can require several gigabytes.
 
 ## Final validation
 
-Run the checks relevant to the changed surface, then the complete local gate
-when feasible:
+Start with the narrowest existing test filter and checks that exercise the
+changed path. Expand validation according to dependency reach, using existing
+commands rather than creating a persistent validation mechanism for a one-off
+task.
+
+For cross-cutting changes, release or installation behavior, or another change
+whose dependency reach warrants it, run the complete local gate when feasible:
 
 ```sh
 just fix

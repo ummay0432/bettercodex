@@ -21,10 +21,10 @@ use std::sync::LazyLock;
 
 const EXEC_SOURCE_GRAMMAR: &str = r#"start: SOURCE
 SOURCE: /[\s\S]+/"#;
-// Upstream also advertises `audio`, `generatedImage`, and `ALL_TOOLS`. bettercodex
-// has no MCP or image-generation integrations, and its fixed nested surface is
-// fully declared below, so those compatibility globals are deliberately omitted
-// from model-facing guidance.
+// Upstream also advertises `generatedImage` and `ALL_TOOLS`. bettercodex has no
+// MCP or image-generation integrations, and its fixed nested surface is fully
+// declared below, so those compatibility globals are deliberately omitted from
+// model-facing guidance.
 const EXEC_RUNTIME_GUIDANCE: &str = r#"Input raw JavaScript directly (no JSON, string, or Markdown wrapper) into fresh V8: top-level `await`; no Node.js/filesystem/network/console. Call `await tools.name(args)`; errors reject. Use `Promise.all` for independent calls and await all work. Emit with `text(value)`/`image(item,detail?)`; `notify` is interim; `yield_control` yields while code continues; `store`/`load` persist serializable values across cells; `exit`, `setTimeout`, and `clearTimeout` exist. Optional first line `// @exec:{"yield_time_ms":10000,"max_output_tokens":1000}`; both default 10000."#;
 const TOOL_DEFAULTS: &str = "Defaults: command cwd=turn, shell=user, `login:true`, `tty:false`, yield=10s; stdin yield=.25s after writes/5s polling; outer exec/wait output=10k tokens; nested command output=collected raw unless `max_output_tokens` is set; image detail=`high`. Nested command and non-empty write yields clamp to .25–30s; empty polls to 5–300s; top-level `exec`/`wait` yields are not clamped. Process: `output`+`wall_time_seconds` always; `session_id`=running, `exit_code`=done, `original_token_count`=before truncation, `chunk_id`=output chunk.";
 const WAIT_DESCRIPTION: &str = "Wait on a yielded top-level `exec` cell using its string `cell_id`; process `session_id` values from `exec_command` belong to `tools.write_stdin`. Returns only new output; repeat while active or use `terminate:true` to stop. `yield_time_ms`/`max_tokens` default 10000.";
@@ -138,66 +138,6 @@ static RUNTIME_TOOLS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
 
 static EXEC_DESCRIPTION: LazyLock<String> = LazyLock::new(build_exec_description);
 
-static CATALOGUE_INSPECTION: LazyLock<CatalogueInspection> = LazyLock::new(|| {
-    let specifications = specifications();
-    let mut tools = specifications
-        .iter()
-        .map(|specification| {
-            let name = specification
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("<unnamed>");
-            CatalogueTool {
-                name: name.to_string(),
-                route: CatalogueRoute::Request,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    tools.extend(core_tools().iter().map(|tool| CatalogueTool {
-        name: tool.name.clone(),
-        route: CatalogueRoute::InsideExec,
-    }));
-    let item = json!({
-        "type": "additional_tools",
-        "role": "developer",
-        "tools": specifications,
-    });
-    let request_bytes = u64::try_from(item.to_string().len()).unwrap_or(u64::MAX);
-    CatalogueInspection {
-        tools,
-        metrics: CatalogueMetrics {
-            description_bytes: u64::try_from(text().len()).unwrap_or(u64::MAX),
-            request_bytes,
-            estimated_tokens: request_bytes.div_ceil(4),
-        },
-    }
-});
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CatalogueRoute {
-    Request,
-    InsideExec,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CatalogueTool {
-    pub(crate) name: String,
-    pub(crate) route: CatalogueRoute,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CatalogueMetrics {
-    pub(crate) description_bytes: u64,
-    pub(crate) request_bytes: u64,
-    pub(crate) estimated_tokens: u64,
-}
-
-struct CatalogueInspection {
-    tools: Vec<CatalogueTool>,
-    metrics: CatalogueMetrics,
-}
-
 pub(super) fn core_tools() -> &'static [ToolDefinition] {
     &CORE_TOOLS
 }
@@ -208,14 +148,6 @@ pub(super) fn runtime_tools() -> &'static [ToolDefinition] {
 
 pub(crate) fn text() -> &'static str {
     &EXEC_DESCRIPTION
-}
-
-pub(crate) fn display_tools() -> &'static [CatalogueTool] {
-    &CATALOGUE_INSPECTION.tools
-}
-
-pub(crate) fn metrics() -> CatalogueMetrics {
-    CATALOGUE_INSPECTION.metrics
 }
 
 pub(crate) fn specifications() -> Vec<Value> {
@@ -616,57 +548,4 @@ fn view_image_output_schema() -> Value {
         "required": ["image_url", "detail"],
         "additionalProperties": false
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exec_schema_contains_only_host_terminal_semantics() {
-        let exec = core_tools()
-            .iter()
-            .find(|tool| tool.name == "exec_command")
-            .unwrap();
-        let schema = exec.input_schema.as_ref().unwrap().to_string();
-        if cfg!(windows) {
-            assert!(schema.contains("PowerShell profile"));
-            assert!(schema.contains("ConPTY"));
-            assert!(!schema.contains("TERM=xterm-256color"));
-            assert!(!schema.contains("-l/-i semantics"));
-        } else {
-            assert!(schema.contains("TERM=xterm-256color"));
-            assert!(schema.contains("-l/-i semantics"));
-            assert!(!schema.contains("PowerShell profile"));
-            assert!(!schema.contains("ConPTY"));
-        }
-    }
-
-    #[test]
-    fn request_exposes_only_exec_and_wait() {
-        let tools = specifications();
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(names, ["exec", "wait"]);
-        assert_eq!(
-            tools[0]["format"]["definition"],
-            "start: SOURCE\nSOURCE: /[\\s\\S]+/"
-        );
-        assert_eq!(
-            tools[1]["parameters"],
-            json!({
-                "type": "object",
-                "properties": {
-                    "cell_id": {"type": "string"},
-                    "yield_time_ms": {"type": "number"},
-                    "max_tokens": {"type": "number"},
-                    "terminate": {"type": "boolean"}
-                },
-                "required": ["cell_id"],
-                "additionalProperties": false
-            })
-        );
-    }
 }

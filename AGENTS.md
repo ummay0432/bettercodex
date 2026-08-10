@@ -13,6 +13,8 @@ Always write the project name as `bettercodex`, never `BetterCodex`.
 
 Do not use emojis, except for Codex's established checkmark status marker.
 
+The startup art is off limits: do not modify or delete it.
+
 Rust builds and tests must clean up task-owned temporary files, fixtures,
 caches, and isolated compiled artifacts, including on failure. Never remove the
 checkout's shared `target/`, another session's artifact root, or a target still
@@ -25,6 +27,26 @@ Do not invent Cargo, build, packaging, release, or test infrastructure; mirror c
 Published bettercodex builds are immutable snapshots of a full public `main` revision encoded in the release tag. Update freshness follows the semantic version of the latest published full release; the encoded revision pins its exact source and installer.
 
 Only the user decides when a release is ready; when explicitly asked to prepare or publish one, follow [`docs/releasing.md`](docs/releasing.md) for binary renewal and final publication.
+
+Never create, edit, or finalize patch notes in `CHANGELOG.md` without the
+user's explicit approval of their exact wording. Before changing
+`CHANGELOG.md`, propose the patch notes to the user and wait for approval; once
+approved, preserve that wording unless the user approves a revision.
+
+## Test and validation discipline
+
+- Before adding a checked-in test, evaluation, fixture, snapshot, or validation
+  script, inspect the nearest existing bettercodex coverage and, for retained
+  behavior, current upstream Codex coverage. Extend existing coverage only when
+  it proves changed observable behavior that is not already covered; a code
+  change does not by itself require a new test artifact.
+- Do not test static or copied values, implementation details, or merely assert
+  that removed logic remains absent. Reuse existing test helpers, and avoid
+  adding production APIs, production functions, or parallel test infrastructure
+  solely for tests.
+- Keep one-off diagnostics and behavioral-evaluation inputs and results in
+  task-owned temporary files and remove them after use. Check them in only when
+  an explicit ongoing bettercodex requirement makes them a maintained gate.
 
 ## Start here
 

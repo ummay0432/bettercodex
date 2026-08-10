@@ -57,6 +57,15 @@ jobs:
             echo "Cargo.toml must contain a plain major.minor.patch package version" >&2
             exit 1
           }
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found && /^- / { note = 1 }
+            END { exit !(found && note) }
+          ' CHANGELOG.md || {
+            echo "CHANGELOG.md must contain user-approved patch notes under ## [$version]" >&2
+            exit 1
+          }
           tag="bcodex-v${version}-${revision}"
 
           latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"

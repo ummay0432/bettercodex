@@ -821,8 +821,8 @@ fn parse_osc_component(value: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MODEL;
     use crate::events::AgentEvent;
+    use crate::model::DEFAULT_MODEL as MODEL;
     use crate::tui::view::View;
     use ratatui::backend::ClearType as BackendClearType;
     use ratatui::backend::WindowSize;

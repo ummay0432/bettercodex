@@ -77,7 +77,7 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
         FunctionCallOutputContentItem::InputText { text: t5 },
     ];
 
-    let output = truncate_function_output_items(&items, limit, |_| 0);
+    let output = truncate_function_output_items(&items, limit);
 
     assert_eq!(output.len(), 5);
 
@@ -172,9 +172,6 @@ fn formatted_truncate_text_content_items_merges_text_and_appends_media() {
         FunctionCallOutputContentItem::InputText {
             text: "efgh".to_string(),
         },
-        FunctionCallOutputContentItem::InputAudio {
-            audio_url: "audio:one".to_string(),
-        },
         FunctionCallOutputContentItem::InputText {
             text: "ijkl".to_string(),
         },
@@ -195,9 +192,6 @@ fn formatted_truncate_text_content_items_merges_text_and_appends_media() {
             FunctionCallOutputContentItem::InputImage {
                 image_url: "img:one".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
-            },
-            FunctionCallOutputContentItem::InputAudio {
-                audio_url: "audio:one".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
                 image_url: "img:two".to_string(),
@@ -233,63 +227,6 @@ fn formatted_truncate_text_content_items_preserves_encrypted_content() {
         ]
     );
     assert_eq!(original_token_count, Some(2));
-}
-
-#[test]
-fn truncate_function_output_items_omits_audio_over_budget() {
-    let items = vec![
-        FunctionCallOutputContentItem::InputText {
-            text: "abcdefgh".to_string(),
-        },
-        FunctionCallOutputContentItem::EncryptedContent {
-            encrypted_content: "enc_opaque".to_string(),
-        },
-        FunctionCallOutputContentItem::InputAudio {
-            audio_url: "audio:one".to_string(),
-        },
-    ];
-
-    let output = truncate_function_output_items(&items, 1, |_| 1);
-
-    assert_eq!(
-        output,
-        vec![
-            FunctionCallOutputContentItem::InputText {
-                text: "ab…1 tokens truncated…gh".to_string(),
-            },
-            FunctionCallOutputContentItem::EncryptedContent {
-                encrypted_content: "enc_opaque".to_string(),
-            },
-            FunctionCallOutputContentItem::InputText {
-                text: "[omitted 1 audio items ...]".to_string(),
-            },
-        ]
-    );
-}
-
-#[test]
-fn truncate_function_output_items_charges_audio_against_token_budget() {
-    let audio = FunctionCallOutputContentItem::InputAudio {
-        audio_url: "audio:one".to_string(),
-    };
-    let items = vec![
-        audio.clone(),
-        FunctionCallOutputContentItem::InputText {
-            text: "abcdefgh".to_string(),
-        },
-    ];
-
-    let output = truncate_function_output_items(&items, 2, |_| 1);
-
-    assert_eq!(
-        output,
-        vec![
-            audio,
-            FunctionCallOutputContentItem::InputText {
-                text: truncate_text("abcdefgh", 1),
-            },
-        ]
-    );
 }
 
 #[test]

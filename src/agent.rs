@@ -1,23 +1,27 @@
 use crate::api::ApiClient;
 use crate::api::ApiError;
+use crate::api::CompactionResult;
 use crate::api::ModelResponse;
 use crate::api::retry_delay;
 use crate::auth::Auth;
 use crate::compaction::CompactionPhase;
 use crate::compaction::CompactionRequest;
 use crate::compaction::InitialContextInjection;
+use crate::compaction::ModelSwitchCompactionReason;
 use crate::context::ActiveTurnContext;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
-use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserInput;
+use crate::model::ModelCatalogClient;
+use crate::model::ModelSelection;
 use crate::rollout::LoadedRollout;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionTranscriptItem;
 use crate::rollout::TurnOutcome;
+use crate::service_tier::ServiceTier;
 use crate::tools::ProcessManager;
 use crate::tools::ToolResult;
 use crate::tools::ToolRuntime;
@@ -174,9 +178,19 @@ impl Agent {
     pub(crate) fn new(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = canonical_directory(cwd.as_ref())?;
         let auth = Auth::load()?;
-        let conversation = Conversation::create(&cwd)?;
+        let model_selection = crate::model::load_default_selection().unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to load saved model selection; using the default");
+            ModelSelection::default()
+        });
+        let conversation = Conversation::create_with_selection(&cwd, model_selection)?;
         let identity = conversation.identity().clone();
-        let api = ApiClient::new(auth, &identity, 0)?;
+        let api = ApiClient::new(
+            auth,
+            &identity,
+            0,
+            conversation.model_selection().clone(),
+            conversation.service_tier(),
+        )?;
         let tools = ToolRuntime::new(
             cwd.clone(),
             api.web_search_client(),
@@ -199,13 +213,20 @@ impl Agent {
 
     pub(crate) fn fork(&self, transcript: Vec<SessionTranscriptItem>) -> Result<Self> {
         let auth = Auth::load()?;
-        let mut rollout = Rollout::create(&self.cwd)?;
+        let mut rollout =
+            Rollout::create_with_selection(&self.cwd, self.conversation.model_selection())?;
         let identity = rollout.identity().clone();
         let compaction_count = self.api.compaction_count();
         rollout.record_fork(self.session_id(), compaction_count)?;
         rollout.snapshot_transcript(transcript)?;
         let conversation = self.conversation.fork(rollout)?;
-        let api = ApiClient::new(auth, &identity, compaction_count)?;
+        let api = ApiClient::new(
+            auth,
+            &identity,
+            compaction_count,
+            conversation.model_selection().clone(),
+            conversation.service_tier(),
+        )?;
         let tools = ToolRuntime::new(
             self.cwd.clone(),
             api.web_search_client(),
@@ -227,7 +248,13 @@ impl Agent {
         let resumed_transcript = std::mem::take(&mut loaded.transcript);
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
-        let api = ApiClient::new(auth, &identity, compaction_count)?;
+        let api = ApiClient::new(
+            auth,
+            &identity,
+            compaction_count,
+            conversation.model_selection().clone(),
+            conversation.service_tier(),
+        )?;
         let tools = ToolRuntime::new(
             cwd.clone(),
             api.web_search_client(),
@@ -248,6 +275,30 @@ impl Agent {
 
     pub(crate) fn session_id(&self) -> &str {
         self.conversation.session_id()
+    }
+
+    pub(crate) fn model_selection(&self) -> &ModelSelection {
+        self.conversation.model_selection()
+    }
+
+    pub(crate) fn set_model_selection(&mut self, selection: ModelSelection) -> Result<()> {
+        self.conversation.set_model_selection(selection.clone())?;
+        self.api.set_model_selection(selection);
+        Ok(())
+    }
+
+    pub(crate) fn model_catalog_client(&self) -> ModelCatalogClient {
+        self.api.model_catalog_client()
+    }
+
+    pub(crate) fn service_tier(&self) -> ServiceTier {
+        self.conversation.service_tier()
+    }
+
+    pub(crate) fn set_service_tier(&mut self, service_tier: ServiceTier) -> Result<()> {
+        self.conversation.set_service_tier(service_tier)?;
+        self.api.set_service_tier(service_tier);
+        Ok(())
     }
 
     pub(crate) fn context_tokens(&self) -> Option<u64> {
@@ -327,15 +378,37 @@ impl Agent {
         let turn_id = self.api.begin_turn().to_string();
         self.conversation.start_turn(&turn_id)?;
         let active_turn_context = ActiveTurnContext::default();
+        let target_selection = self.conversation.model_selection().clone();
+        let compaction_selection = self
+            .pending_model_switch_compaction()
+            .and_then(|_| self.conversation.history_model_selection().cloned())
+            .unwrap_or_else(|| target_selection.clone());
+        let compaction_uses_target = compaction_selection == target_selection;
+        let fallback_selection = (compaction_selection.model != target_selection.model)
+            .then_some(target_selection.clone());
+        if compaction_uses_target {
+            self.conversation
+                .record_history_model_selection(&target_selection)?;
+        }
+        self.api.set_model_selection(compaction_selection);
         let result = self
-            .run_compaction(
+            .run_compaction_inner(
                 &Some(events),
                 &control.cancellation,
                 CompactionRequest::Manual,
                 InitialContextInjection::AfterCompaction,
                 &active_turn_context,
+                fallback_selection.as_ref(),
             )
             .await;
+        self.api.set_model_selection(target_selection.clone());
+        let result = match result {
+            Ok(true) => self
+                .conversation
+                .record_history_model_selection(&target_selection)
+                .map(|()| true),
+            result => result,
+        };
         control.close();
         let outcome = match &result {
             Ok(true) => TurnOutcome::Completed,
@@ -384,6 +457,12 @@ impl Agent {
         control: &TurnControl,
     ) -> Result<SubmitOutcome> {
         let mut active_turn_context = ActiveTurnContext::default();
+        if !self
+            .prepare_model_switch(events, &control.cancellation, &active_turn_context)
+            .await?
+        {
+            return Ok(SubmitOutcome::Cancelled);
+        }
         if !self
             .record_incoming_user(
                 IncomingUserInput::Initial(input),
@@ -498,6 +577,64 @@ impl Agent {
         }
     }
 
+    fn pending_model_switch_compaction(&self) -> Option<ModelSwitchCompactionReason> {
+        let previous = self.conversation.history_model_selection()?;
+        let current = self.conversation.model_selection();
+        if previous == current {
+            return None;
+        }
+        if previous
+            .comp_hash
+            .as_deref()
+            .zip(current.comp_hash.as_deref())
+            .is_some_and(|(previous, current)| previous != current)
+        {
+            return Some(ModelSwitchCompactionReason::CompHashChanged);
+        }
+        let downshift_exceeds_limit = previous.model != current.model
+            && previous.raw_context_window > current.raw_context_window
+            && self.conversation.active_context_tokens() >= current.auto_compact_token_limit();
+        downshift_exceeds_limit.then_some(ModelSwitchCompactionReason::ModelDownshift)
+    }
+
+    async fn prepare_model_switch(
+        &mut self,
+        events: &Option<UnboundedSender<AgentEvent>>,
+        cancellation: &CancellationToken,
+        active_turn_context: &ActiveTurnContext,
+    ) -> Result<bool> {
+        let target_selection = self.conversation.model_selection().clone();
+        let Some(reason) = self.pending_model_switch_compaction() else {
+            return Ok(true);
+        };
+        let Some(previous_selection) = self.conversation.history_model_selection().cloned() else {
+            return Ok(true);
+        };
+        let fallback_selection = (previous_selection.model != target_selection.model)
+            .then_some(target_selection.clone());
+        self.api.set_model_selection(previous_selection);
+        let result = self
+            .run_compaction_inner(
+                events,
+                cancellation,
+                CompactionRequest::ModelSwitch(reason),
+                InitialContextInjection::AfterCompaction,
+                active_turn_context,
+                fallback_selection.as_ref(),
+            )
+            .await;
+        // Restoring the selected model must not depend on whether compaction succeeds.
+        self.api.set_model_selection(target_selection.clone());
+        match result {
+            Ok(true) => {
+                self.conversation
+                    .record_history_model_selection(&target_selection)?;
+                Ok(true)
+            }
+            result => result,
+        }
+    }
+
     async fn sample_with_recovery(
         &mut self,
         events: &Option<UnboundedSender<AgentEvent>>,
@@ -505,15 +642,25 @@ impl Agent {
     ) -> Result<SamplingOutcome> {
         let mut retries = 0_usize;
         loop {
+            if control.cancellation.is_cancelled() {
+                return Ok(SamplingOutcome::Cancelled);
+            }
             self.conversation.normalize()?;
             // Preserve the backend usage baseline for old history. Re-estimating the complete
             // rendered input here can substantially overcount a valid long-running session.
             let active_context_tokens = self.conversation.active_context_tokens();
-            if active_context_tokens > EFFECTIVE_CONTEXT_WINDOW {
+            let effective_context_window = self
+                .conversation
+                .model_selection()
+                .effective_context_window();
+            if active_context_tokens > effective_context_window {
                 return Err(anyhow!(
-                    "active conversation requires {active_context_tokens} tokens, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window"
+                    "active conversation requires {active_context_tokens} tokens, exceeding bettercodex's {effective_context_window}-token effective context window"
                 ));
             }
+            let selection = self.conversation.model_selection().clone();
+            self.conversation
+                .record_history_model_selection(&selection)?;
             let (completed_tx, mut completed_rx) = unbounded_channel::<Value>();
             let mut observed_item = false;
             let (history, cursor) = self.conversation.take_history_for_sampling();
@@ -623,19 +770,60 @@ impl Agent {
         if cancellation.is_cancelled() {
             return Ok(false);
         }
+        let selection = self.conversation.model_selection().clone();
+        self.conversation
+            .record_history_model_selection(&selection)?;
+        self.run_compaction_inner(
+            events,
+            cancellation,
+            compaction,
+            initial_context_injection,
+            active_turn_context,
+            None,
+        )
+        .await
+    }
+
+    async fn run_compaction_inner(
+        &mut self,
+        events: &Option<UnboundedSender<AgentEvent>>,
+        cancellation: &CancellationToken,
+        compaction: CompactionRequest,
+        initial_context_injection: InitialContextInjection,
+        active_turn_context: &ActiveTurnContext,
+        fallback_selection: Option<&ModelSelection>,
+    ) -> Result<bool> {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
         emit(events, AgentEvent::CompactionStarted);
         self.conversation.normalize()?;
         let history_cursor = self.conversation.history_cursor();
-        let compacted = {
-            let request =
-                self.api
-                    .compact_append_only(self.conversation.items(), history_cursor, compaction);
-            tokio::pin!(request);
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => None,
-                compacted = &mut request => Some(compacted),
+        let compacted = self
+            .request_compaction(cancellation, compaction, history_cursor)
+            .await;
+        let compacted = match compacted {
+            Some(Err(previous_error)) if let Some(fallback_selection) = fallback_selection => {
+                tracing::warn!(
+                    error = %previous_error,
+                    fallback_model = %fallback_selection.model,
+                    "previous-model compaction failed; retrying with the selected model"
+                );
+                self.api.set_model_selection(fallback_selection.clone());
+                match self
+                    .request_compaction(cancellation, compaction, history_cursor)
+                    .await
+                {
+                    Some(Ok(compacted)) => Some(Ok(compacted)),
+                    Some(Err(fallback_error)) => {
+                        return Err(anyhow!(
+                            "previous-model compaction failed ({previous_error}); selected-model fallback also failed: {fallback_error}"
+                        ));
+                    }
+                    None => None,
+                }
             }
+            compacted => compacted,
         };
         let Some(compacted) = compacted else {
             // Dropping the request future stops polling, but the server still owns the
@@ -661,6 +849,23 @@ impl Agent {
         self.emit_context(events);
         emit(events, AgentEvent::CompactionCompleted);
         Ok(true)
+    }
+
+    async fn request_compaction(
+        &mut self,
+        cancellation: &CancellationToken,
+        compaction: CompactionRequest,
+        history_cursor: crate::context::HistoryCursor,
+    ) -> Option<std::result::Result<CompactionResult, ApiError>> {
+        let request =
+            self.api
+                .compact_append_only(self.conversation.items(), history_cursor, compaction);
+        tokio::pin!(request);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            compacted = &mut request => Some(compacted),
+        }
     }
 
     async fn record_incoming_user(
@@ -692,9 +897,13 @@ impl Agent {
         projected.push(user_message);
         let mut projection = self.conversation.project_append(projected);
         let incoming_tokens = projection.additional_tokens();
-        if incoming_tokens > EFFECTIVE_CONTEXT_WINDOW {
+        let effective_context_window = self
+            .conversation
+            .model_selection()
+            .effective_context_window();
+        if incoming_tokens > effective_context_window {
             return Err(anyhow!(
-                "input alone is estimated at {incoming_tokens} tokens, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
+                "input alone is estimated at {incoming_tokens} tokens, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
         if projection.needs_compaction() {
@@ -714,9 +923,9 @@ impl Agent {
             projection = self.conversation.project_append(projected);
         }
         let projected_tokens = projection.projected_tokens();
-        if projected_tokens > EFFECTIVE_CONTEXT_WINDOW {
+        if projected_tokens > effective_context_window {
             return Err(anyhow!(
-                "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {EFFECTIVE_CONTEXT_WINDOW}-token effective context window; shorten the prompt or attach fewer images"
+                "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
         self.conversation.append_projected(projection)?;
@@ -772,3 +981,7 @@ fn emit(events: &Option<UnboundedSender<AgentEvent>>, event: AgentEvent) {
         let _ = events.send(event);
     }
 }
+
+#[cfg(test)]
+#[path = "agent_tests.rs"]
+mod tests;

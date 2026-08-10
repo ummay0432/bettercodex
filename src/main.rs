@@ -2,7 +2,6 @@ mod agent;
 mod ansi_escape;
 mod api;
 mod assistant_message;
-mod audio;
 mod auth;
 mod cache;
 mod compaction;
@@ -15,7 +14,9 @@ mod image;
 mod input;
 mod login;
 mod managed_session;
+mod model;
 mod openai_docs;
+mod patch_notes;
 mod paths;
 mod platform_fs;
 mod process_runtime;
@@ -23,6 +24,7 @@ mod prompt_history;
 mod protocol;
 mod repository;
 mod rollout;
+mod service_tier;
 mod shell_command;
 mod skill_settings;
 mod skills;
@@ -54,8 +56,6 @@ use std::str::FromStr;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use uuid::Uuid;
-
-const MODEL: &str = "gpt-5.6-sol";
 
 fn main() {
     if let Err(error) = run() {
@@ -108,10 +108,6 @@ fn run() -> Result<()> {
         }
         Command::ToolCatalogue => {
             write_stdout_line(format_args!("{}", tools::catalogue_text()))?;
-            Ok(())
-        }
-        Command::ToolCatalogueStats => {
-            write_stdout_line(format_args!("{}", tool_catalogue_stats()))?;
             Ok(())
         }
         Command::InternalInstallSmoke => {
@@ -272,8 +268,11 @@ async fn run_agent(
 }
 
 async fn run_line_mode(agent: &mut Agent) -> Result<()> {
+    let model_selection = agent.model_selection();
     write_stderr_line(format_args!(
-        "bettercodex · {MODEL} · max · session {}",
+        "bettercodex · {} · {} · session {}",
+        model_selection.model,
+        model_selection.reasoning_effort,
         agent.session_id()
     ))?;
     write_stderr_line(format_args!(
@@ -307,7 +306,6 @@ enum Command {
     Help,
     Version,
     ToolCatalogue,
-    ToolCatalogueStats,
     InternalInstallSmoke,
     InternalReleaseTag,
     InternalSourceRevision,
@@ -389,11 +387,6 @@ impl Command {
             .is_some_and(|argument| argument == "--tool-catalogue" || argument == "--tool-catalog")
         {
             return Ok(Self::ToolCatalogue);
-        }
-        if arguments.peek().is_some_and(|argument| {
-            argument == "--tool-catalogue-stats" || argument == "--tool-catalog-stats"
-        }) {
-            return Ok(Self::ToolCatalogueStats);
         }
         if arguments.peek().is_some_and(|argument| argument == "login") {
             arguments.next();
@@ -510,7 +503,7 @@ fn write_help() -> io::Result<()> {
         ""
     };
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n  bcodex --tool-catalogue-stats\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest published release\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to Sol\n      --tool-catalogue-stats Summarize active tools and model-context cost\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest published release\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  low, high, original, or auto [default: original]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to the selected model\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION"),
     ))
 }
@@ -531,32 +524,6 @@ fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
         "Install the latest published bettercodex release\n\nUsage:\n  bcodex update\n\nThe updater compares this binary's embedded release version with GitHub's latest published full release. If already current, it exits immediately. Otherwise it downloads, verifies, and atomically installs the matching prebuilt binary without compiling."
     ))
-}
-
-fn tool_catalogue_stats() -> String {
-    let tools = tools::display_tools();
-    let names = |route| {
-        tools
-            .iter()
-            .filter(|tool| tool.route == route)
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>()
-    };
-    let request = names(tools::CatalogueRoute::Request);
-    let nested = names(tools::CatalogueRoute::InsideExec);
-    let metrics = tools::catalogue_metrics();
-    let window_share =
-        metrics.estimated_tokens as f64 * 100.0 / context::EFFECTIVE_CONTEXT_WINDOW as f64;
-    format!(
-        "Tool catalogue\n\nRequest tools ({}): {}\nInside exec ({}): {}\n\nExec description: {} bytes\nComplete additional_tools item: {} bytes\nEstimated context cost: {} tokens (bytes/4)\nEffective-window share: {window_share:.2}%",
-        request.len(),
-        request.join(", "),
-        nested.len(),
-        nested.join(", "),
-        metrics.description_bytes,
-        metrics.request_bytes,
-        metrics.estimated_tokens,
-    )
 }
 
 #[cfg(test)]

@@ -24,21 +24,6 @@ where
         }
     }
 
-    pub(crate) fn get_or_insert_with(&self, key: K, value: impl FnOnce() -> V) -> V
-    where
-        V: Clone,
-    {
-        if let Some(mut guard) = lock_if_runtime(&self.inner) {
-            if let Some(value) = guard.get(&key) {
-                return value.clone();
-            }
-            let value = value();
-            guard.put(key, value.clone());
-            return value;
-        }
-        value()
-    }
-
     pub(crate) fn get<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
