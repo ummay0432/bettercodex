@@ -658,7 +658,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn command_can_continue_through_write_stdin() {
         let cwd = std::env::current_dir().unwrap();
         let manager = ProcessManager::new(cwd);
@@ -679,7 +679,7 @@ mod tests {
                 json!({
                     "session_id": session_id,
                     "chars": "hello\n",
-                    "yield_time_ms": 1000,
+                    "yield_time_ms": 2500,
                 }),
                 CancellationToken::new(),
             )
