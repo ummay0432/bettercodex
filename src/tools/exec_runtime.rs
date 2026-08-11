@@ -991,7 +991,7 @@ text(JSON.stringify({
   viewOutput: view.description.includes("image_url: string;"),
   webNamespace: web.description.startsWith("Tools in the web namespace.\n\n"),
   webDeclaration: web.description.includes("declare const tools: { web__run(args:"),
-  webOutput: web.description.includes("): Promise<unknown>; };"),
+  webOutput: web.description.includes("): Promise<string>; };"),
 }));
 "#,
                 None,

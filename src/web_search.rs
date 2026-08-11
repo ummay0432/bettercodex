@@ -3,8 +3,8 @@
 //! The wire client and request types come from OpenAI Codex commit
 //! `1669c2403f793d0230065397dfc25f52b844244e`. The focused adapter here mirrors
 //! `codex-rs/ext/web-search`: it exposes `web.run` inside the exec runtime and
-//! sends search, fetch/navigation, image, finance, weather, sports, and time
-//! commands to the same `alpha/search` endpoint used by Codex.
+//! sends search, fetch/navigation, and image commands to the same `alpha/search`
+//! endpoint used by Codex.
 
 use crate::auth::SharedAuth;
 use crate::http_client::backoff;
@@ -160,7 +160,7 @@ enum HistoryContent<'a> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct SearchCommands {
-    /// Query the internet search engine for a given list of queries.
+    /// Query the internet; at most 4 queries per call.
     #[serde(skip_serializing_if = "Option::is_none")]
     search_query: Option<Vec<SearchQuery>>,
     /// Query the image search engine for a given list of queries.
@@ -178,19 +178,8 @@ struct SearchCommands {
     /// Take screenshots of PDF pages.
     #[serde(skip_serializing_if = "Option::is_none")]
     screenshot: Option<Vec<ScreenshotOperation>>,
-    /// Look up prices for the given stock symbols.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    finance: Option<Vec<FinanceOperation>>,
-    /// Look up weather forecasts.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    weather: Option<Vec<WeatherOperation>>,
-    /// Look up sports schedules and standings.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sports: Option<Vec<SportsOperation>>,
-    /// Get time for the given UTC offsets.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    time: Option<Vec<TimeOperation>>,
-    /// Set the length of the response to be returned.
+    /// Response length; omit for `short`. Use `medium` or `long` when `search_query` contains 4
+    /// queries.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_length: Option<SearchResponseLength>,
 }
@@ -238,100 +227,6 @@ struct ScreenshotOperation {
     ref_id: String,
     /// Zero-indexed PDF page number.
     pageno: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct FinanceOperation {
-    /// Ticker symbol to look up.
-    ticker: String,
-    /// Asset type to look up.
-    r#type: FinanceAssetType,
-    /// ISO 3166-1 alpha-3 country code, "OTC", or "" for cryptocurrency.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    market: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum FinanceAssetType {
-    Equity,
-    Fund,
-    Crypto,
-    Index,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct WeatherOperation {
-    /// Location in "Country, Area, City" format.
-    location: String,
-    /// Start date in YYYY-MM-DD format. Defaults to today.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    start: Option<String>,
-    /// Number of days to return. Defaults to 7.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    duration: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SportsOperation {
-    /// Tool name for sports requests.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool: Option<SportsToolName>,
-    /// Sports function to call.
-    r#fn: SportsFunction,
-    /// League to look up.
-    league: SportsLeague,
-    /// Team to look up, using the common 3 or 4 letter alias used in broadcasts.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    team: Option<String>,
-    /// Opponent to use with `team` when narrowing the lookup.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    opponent: Option<String>,
-    /// Start date in YYYY-MM-DD format.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    date_from: Option<String>,
-    /// End date in YYYY-MM-DD format.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    date_to: Option<String>,
-    /// Number of games to return.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    num_games: Option<u64>,
-    /// Locale for the lookup.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    locale: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum SportsToolName {
-    Sports,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum SportsFunction {
-    Schedule,
-    Standings,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum SportsLeague {
-    Nba,
-    Wnba,
-    Nfl,
-    Nhl,
-    Mlb,
-    Epl,
-    Ncaamb,
-    Ncaawb,
-    Ipl,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct TimeOperation {
-    /// UTC offset formatted like "+03:00".
-    utc_offset: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

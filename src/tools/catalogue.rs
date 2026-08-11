@@ -22,35 +22,30 @@ PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
 NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 "#;
-const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
-- Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
-- All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`. Tool names are exposed as normalized JavaScript identifiers, for example `await tools.mcp__ologs__get_profile(...)`.
-- Nested tool methods take either a string or an object as their input argument.
-- Nested tools return either an object or a string, based on the description.
-- Runs raw JavaScript -- no Node, no file system, no network access, no console.
-- Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
-- You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
-- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
-- `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
-- When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
+const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to call tools and, where appropriate, orchestrate/compose tool calls
+- Submit raw JavaScript source—not JSON, a quoted string, or a Markdown code fence. It runs in a fresh V8 isolate as an async module; the runtime has no Node, file system, network access, or console.
+- All nested tools are available on the global `tools` object under normalized JavaScript identifiers. Call them as `await tools.exec_command(...)`; MCP names normalize to identifiers such as `await tools.mcp__ologs__get_profile(...)`.
+- Nested tool methods accept a string or object and return an object or string, according to the tool description.
+- Await every operation. When JavaScript finishes evaluating, the isolate ends and unawaited promises are silently discarded.
+- Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`. `yield_time_ms` asks `exec` to yield early if the script is still running (default: 10000 ms); `max_output_tokens` sets the token budget for direct `exec` results (default: 10000 tokens).
 
 Choose the smallest safe script:
-- Use one nested call and return its complete output with `text(...)` or `image(...)` when one call is sufficient, its output shape is not reliably documented, fresh model judgment should follow, or the stage is adaptive, write/approval-sensitive, citation-heavy, or carries a native artifact. Do not batch, retry, filter, or chain it in JavaScript.
-- Compose calls only for a bounded, predictable, read-only stage that returns a materially smaller structured result. Use only the documented calls and input/output fields needed by that stage; define emitted fields, call and retry limits, failure behavior, and stopping conditions; then return control to the model.
+- Use one nested call and return its complete output with `text(...)` or `image(...)` when one call is sufficient, its output is already small, its output shape is not reliably documented, fresh model judgment should follow, or the stage is adaptive, write/approval-sensitive, citation-heavy, or carries a native artifact. Do not batch, retry, filter, or chain it in JavaScript.
+- Compose calls only for a bounded, predictable, read-only stage that reduces intermediate output to a materially smaller structured result. Use only documented calls and input/output fields needed by that stage. Define emitted fields and required evidence, call and retry limits, failure behavior, and stopping conditions; then return control to the model.
 - Use `Promise.all(...)` only for independent, side-effect-free reads; keep dependent calls sequential. Nested failures reject their Promise; catch them only for explicit bounded recovery.
 
-- Global helpers:
-- `exit()`: Immediately ends the current script successfully (like an early return from the top level).
-- `text(value: string | number | boolean | undefined | null)`: Appends a text item. Non-string values are stringified with `JSON.stringify(...)` when possible.
-- `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | ImageContent, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. MCP image blocks may request detail with `_meta: { "codex/imageDetail": "original" }`. When provided, the second `detail` argument overrides any detail embedded in the first argument.
-- `generatedImage(result: { image_url: string; output_hint?: string })`: Appends an image-generation result and its optional output hint. HTTP(S) URLs are not supported.
-- `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls in the same session.
-- `load(key: string)`: returns the stored value for a string key, or `undefined` if it is missing.
-- `notify(value: string | number | boolean | undefined | null)`: immediately injects an extra `custom_tool_call_output` for the current `exec` call. Values are stringified like `text(...)`.
-- `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
-- `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
-- `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
-- `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
+Global helpers:
+- `exit()`: Immediately ends the current script successfully, like an early return from the top level.
+- `text(value: string | number | boolean | undefined | null)`: Appends a text item; non-string values are stringified with `JSON.stringify(...)` when possible.
+- `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | ImageContent, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. Forward an MCP tool image by passing an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. MCP image blocks may request detail with `_meta: { "codex/imageDetail": "original" }`; when provided, the second `detail` argument overrides detail embedded in the first argument.
+- `generatedImage(result: { image_url: string; output_hint?: string })`: Appends an image-generation result and its optional output hint; HTTP(S) URLs are not supported.
+- `store(key: string, value: any)`: Stores a serializable value under a string key for later `exec` calls in the same session.
+- `load(key: string)`: Returns the stored value, or `undefined` if missing.
+- `notify(value: string | number | boolean | undefined | null)`: Immediately injects an extra `custom_tool_call_output` for the current `exec` call; values are stringified like `text(...)`.
+- `setTimeout(callback: () => void, delayMs?: number)`: Schedules a callback and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise to wait for one.
+- `clearTimeout(timeoutId?: number)`: Cancels a timeout created by `setTimeout`.
+- `ALL_TOOLS`: Metadata for enabled nested tools as `{ name, description }` entries.
+- `yield_control()`: Yields accumulated output to the model immediately while the script keeps running."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
 - `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
@@ -152,7 +147,7 @@ fn build_core_tools() -> Vec<ToolDefinition> {
         crate::web_search::TOOL_NAME,
         crate::web_search::DESCRIPTION,
         crate::web_search::input_schema().clone(),
-        None,
+        Some(json!({"type": "string"})),
     ));
     tools
 }
@@ -270,9 +265,9 @@ fn wait_specification() -> Value {
 
 fn build_exec_description(core_tools: &[ToolDefinition]) -> String {
     let exec_description = EXEC_DESCRIPTION_TEMPLATE.replace(
-        "Defaults to 10000 ms.",
+        "default: 10000 ms",
         &format!(
-            "Defaults to {} ms.",
+            "default: {} ms",
             code_runtime::DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS
         ),
     );
@@ -305,14 +300,48 @@ fn build_exec_description(core_tools: &[ToolDefinition]) -> String {
         };
         nested_tool_sections.push(format!(
             "{heading}\n{}",
-            render_code_mode_sample_for_definition(tool).trim()
+            render_catalogue_sample_for_definition(tool).trim()
         ));
     }
     let nested_tools = nested_tool_sections.join("\n\n");
-    format!("{exec_description}\n\n{nested_tools}")
+    format!(
+        "{exec_description}\n\nThe following TypeScript blocks are `exec` tool declarations.\n\n{nested_tools}"
+    )
 }
 
 fn render_code_mode_sample_for_definition(tool: &ToolDefinition) -> String {
+    let declaration = render_code_mode_declaration(tool, None);
+    format!(
+        "{}\n\nexec tool declaration:\n```ts\n{declaration}\n```",
+        tool.description
+    )
+}
+
+fn render_catalogue_sample_for_definition(tool: &ToolDefinition) -> String {
+    let uses_command_result = tool.tool_name.namespace.is_none()
+        && matches!(tool.name.as_str(), "exec_command" | "write_stdin");
+    let declaration =
+        render_code_mode_declaration(tool, uses_command_result.then_some("CommandResult"));
+    let type_declaration = if tool.tool_name.namespace.is_none() && tool.name == "exec_command" {
+        let output_type = tool
+            .output_schema
+            .as_ref()
+            .map(code_runtime::render_json_schema_to_typescript)
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("type CommandResult = {output_type};\n\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "{}\n\n```ts\n{type_declaration}{declaration}\n```",
+        tool.description
+    )
+}
+
+fn render_code_mode_declaration(
+    tool: &ToolDefinition,
+    output_type_override: Option<&str>,
+) -> String {
     let (input_name, input_type) = match tool.kind {
         ToolKind::Function => (
             "args",
@@ -323,18 +352,15 @@ fn render_code_mode_sample_for_definition(tool: &ToolDefinition) -> String {
         ),
         ToolKind::Freeform => ("input", "string".to_string()),
     };
-    let output_type = tool
-        .output_schema
-        .as_ref()
-        .map(code_runtime::render_json_schema_to_typescript)
-        .unwrap_or_else(|| "unknown".to_string());
+    let output_type = output_type_override.map(str::to_owned).unwrap_or_else(|| {
+        tool.output_schema
+            .as_ref()
+            .map(code_runtime::render_json_schema_to_typescript)
+            .unwrap_or_else(|| "unknown".to_string())
+    });
     let name = code_runtime::normalize_code_mode_identifier(&tool.name);
-    let declaration = format!(
-        "declare const tools: {{ {name}({input_name}: {input_type}): Promise<{output_type}>; }};"
-    );
     format!(
-        "{}\n\nexec tool declaration:\n```ts\n{declaration}\n```",
-        tool.description
+        "declare const tools: {{ {name}({input_name}: {input_type}): Promise<{output_type}>; }};"
     )
 }
 
