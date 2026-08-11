@@ -117,6 +117,7 @@ fn test_agent(root: &Path, base_url: String, selection: ModelSelection) -> Resul
         tools,
         resumed_transcript: Vec::new(),
         transcript_checkpoint: None,
+        forked_from: None,
     })
 }
 

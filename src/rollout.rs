@@ -119,12 +119,14 @@ pub(crate) struct LoadedRollout {
     pub(crate) transcript: Vec<SessionTranscriptItem>,
     pub(crate) transcript_checkpoint: Option<usize>,
     pub(crate) usage: Option<TokenUsage>,
+    pub(crate) total_usage: TokenUsage,
     pub(crate) usage_history_estimate: Option<u64>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) compaction_count: u64,
     pub(crate) model_selection: ModelSelection,
     pub(crate) service_tier: ServiceTier,
     pub(crate) unfinished_turn: Option<String>,
+    pub(crate) forked_from: Option<String>,
 }
 
 pub(crate) struct Rollout {
@@ -166,6 +168,8 @@ enum RolloutRecordData<Items = Vec<Value>> {
     ForkedFrom {
         session_id: String,
         compaction_count: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prior_usage: Option<TokenUsage>,
     },
     TranscriptSnapshot {
         items: Vec<SessionTranscriptItem>,
@@ -561,10 +565,12 @@ impl Rollout {
         &mut self,
         source_session_id: &str,
         compaction_count: u64,
+        prior_usage: Option<TokenUsage>,
     ) -> Result<()> {
         self.write_record(&RolloutRecord::ForkedFrom {
             session_id: source_session_id.to_string(),
             compaction_count,
+            prior_usage,
         })
     }
 
@@ -695,12 +701,14 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut legacy_transcript_snapshot = false;
     let mut forked_session = false;
     let mut usage = None;
+    let mut total_usage = TokenUsage::default();
     let mut usage_history_estimate = None;
     let mut server_reasoning_included = false;
     let mut compaction_count = 0_u64;
     let mut model_selection = None;
     let mut service_tier = ServiceTier::default();
     let mut unfinished_turn = None;
+    let mut forked_from = None;
     let mut line_number = 0_usize;
     let mut valid_length = 0_u64;
     let mut valid_record_needs_newline = false;
@@ -750,11 +758,16 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 }
             }
             RolloutRecord::ForkedFrom {
-                session_id: _,
+                session_id,
                 compaction_count: source_compaction_count,
+                prior_usage,
             } => {
                 forked_session = true;
+                forked_from = Some(session_id);
                 compaction_count = source_compaction_count;
+                if let Some(prior_usage) = prior_usage {
+                    total_usage.add_assign(&prior_usage);
+                }
             }
             RolloutRecord::TranscriptSnapshot { items, complete } => {
                 transcript = items;
@@ -779,7 +792,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             RolloutRecord::HistoryReplace {
                 reason,
                 items,
-                response_usage: _,
+                response_usage,
             } => {
                 flush_transcript_history(
                     &history,
@@ -801,6 +814,9 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                     compaction_count = compaction_count.saturating_add(1);
                 }
                 history = items;
+                if let Some(response_usage) = response_usage {
+                    total_usage.add_assign(&response_usage);
+                }
                 if !matches!(
                     reason,
                     HistoryReplacement::Normalization | HistoryReplacement::ContextRefresh
@@ -815,6 +831,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 history_estimate,
                 server_reasoning_included: reasoning_included,
             } => {
+                total_usage.add_assign(&new_usage);
                 usage = Some(new_usage);
                 usage_history_estimate = Some(history_estimate);
                 server_reasoning_included = reasoning_included;
@@ -880,12 +897,14 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         transcript,
         transcript_checkpoint,
         usage,
+        total_usage,
         usage_history_estimate,
         server_reasoning_included,
         compaction_count,
         model_selection,
         service_tier,
         unfinished_turn,
+        forked_from,
     })
 }
 

@@ -7,6 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 use serde_json::json;
+use std::borrow::Cow;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 
 pub(crate) const MAX_TOTAL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct UserPrompt {
     text: String,
     skill_mentions: Vec<SkillMention>,
@@ -123,37 +124,63 @@ impl UserPrompt {
         self.image_attachments.len()
     }
 
-    pub(crate) fn text_without_image_placeholders(&self) -> String {
+    pub(crate) fn text_without_image_placeholders(&self) -> Cow<'_, str> {
         if self.image_attachments.is_empty() {
-            return self.text.clone();
+            return Cow::Borrowed(&self.text);
         }
-        let mut text = String::with_capacity(self.text.len());
-        let mut cursor = 0;
-        for attachment in &self.image_attachments {
-            if attachment.range.start < cursor || attachment.range.end > self.text.len() {
-                continue;
-            }
-            text.push_str(&self.text[cursor..attachment.range.start]);
-            cursor = attachment.range.end;
-        }
-        text.push_str(&self.text[cursor..]);
-        text.trim().to_string()
+        Cow::Owned(text_without_image_placeholders(
+            &self.text,
+            &self.image_attachments,
+        ))
     }
 
     pub(crate) fn into_parts(self) -> (String, Vec<SkillSelection>, Vec<PromptImage>) {
-        let text = self.text_without_image_placeholders();
+        let Self {
+            text,
+            skill_mentions,
+            image_attachments,
+        } = self;
+        let text = if image_attachments.is_empty() {
+            // Ordinary text prompts are overwhelmingly common. Move their existing allocation
+            // directly into model input rather than cloning it immediately before submission.
+            text
+        } else {
+            text_without_image_placeholders(&text, &image_attachments)
+        };
         (
             text,
-            self.skill_mentions
+            skill_mentions
                 .into_iter()
                 .map(|mention| mention.selection().clone())
                 .collect(),
-            self.image_attachments
+            image_attachments
                 .into_iter()
                 .map(|attachment| attachment.image)
                 .collect(),
         )
     }
+}
+
+fn text_without_image_placeholders(
+    source: &str,
+    image_attachments: &[PromptImageAttachment],
+) -> String {
+    let mut text = String::with_capacity(source.len());
+    let mut cursor = 0;
+    for attachment in image_attachments {
+        if attachment.range.start < cursor || attachment.range.end > source.len() {
+            continue;
+        }
+        text.push_str(&source[cursor..attachment.range.start]);
+        cursor = attachment.range.end;
+    }
+    text.push_str(&source[cursor..]);
+    // Preserve the existing trim semantics without allocating a second full prompt buffer.
+    let trimmed_start = text.len().saturating_sub(text.trim_start().len());
+    let trimmed_len = text.trim().len();
+    text.truncate(trimmed_start + trimmed_len);
+    text.drain(..trimmed_start);
+    text
 }
 
 impl From<&str> for UserPrompt {
@@ -276,7 +303,7 @@ impl FromStr for ImageDetail {
 #[derive(Debug)]
 pub(crate) struct UserInput {
     text: String,
-    images: Vec<Value>,
+    images: Vec<PromptImage>,
     selected_skills: Vec<SkillSelection>,
 }
 
@@ -293,8 +320,25 @@ impl UserInput {
         let (text, selected_skills, images) = prompt.into_parts();
         Self {
             text,
-            images: images.into_iter().map(PromptImage::into_value).collect(),
+            images,
             selected_skills,
+        }
+    }
+
+    /// Prepare model input while the original prompt remains queued until a steer is committed.
+    pub(crate) fn prompt_ref(prompt: &UserPrompt) -> Self {
+        Self {
+            text: prompt.text_without_image_placeholders().into_owned(),
+            images: prompt
+                .image_attachments()
+                .iter()
+                .map(|attachment| attachment.image().clone())
+                .collect(),
+            selected_skills: prompt
+                .skill_mentions()
+                .iter()
+                .map(|mention| mention.selection().clone())
+                .collect(),
         }
     }
 
@@ -309,7 +353,7 @@ impl UserInput {
             let bytes = read_image(path, MAX_TOTAL_IMAGE_BYTES.saturating_sub(total))?;
             total = total.saturating_add(bytes.len());
             let image = PromptImage::from_bytes(path, bytes, detail)?;
-            images.push(image.into_value());
+            images.push(image);
         }
         let input = Self {
             text: text.into(),
@@ -327,19 +371,24 @@ impl UserInput {
     }
 
     pub(crate) fn into_message_and_skills(self) -> (Value, String, Vec<SkillSelection>) {
-        let mut content = Vec::with_capacity(self.images.len() + 1);
-        if !self.text.trim().is_empty() {
-            content.push(json!({"type": "input_text", "text": &self.text}));
+        let Self {
+            text,
+            images,
+            selected_skills,
+        } = self;
+        let mut content = Vec::with_capacity(images.len() + 1);
+        if !text.trim().is_empty() {
+            content.push(json!({"type": "input_text", "text": &text}));
         }
-        content.extend(self.images);
+        content.extend(images.into_iter().map(PromptImage::into_value));
         (
             json!({
                 "type": "message",
                 "role": "user",
                 "content": content,
             }),
-            self.text,
-            self.selected_skills,
+            text,
+            selected_skills,
         )
     }
 }

@@ -319,6 +319,7 @@ fn compaction_replaces_history_canonically_then_reinjects_world_state() {
             InitialContextInjection::AfterCompaction,
             &ActiveTurnContext::default(),
             Some(compaction_usage.clone()),
+            Vec::new(),
         )
         .unwrap();
     assert_eq!(&conversation.items()[..canonical.len()], canonical);
@@ -380,6 +381,7 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
             InitialContextInjection::BeforeLastUserMessage,
             &active_turn_context,
             None,
+            Vec::new(),
         )
         .unwrap();
     assert_eq!(conversation.items().last(), Some(&summary));

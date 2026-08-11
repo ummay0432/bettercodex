@@ -22,6 +22,7 @@ mod platform_fs;
 mod process_runtime;
 mod prompt_history;
 mod protocol;
+mod rate_limits;
 mod repository;
 mod rollout;
 mod service_tier;

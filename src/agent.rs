@@ -170,6 +170,7 @@ pub(crate) struct Agent {
     tools: ToolRuntime,
     resumed_transcript: Vec<SessionTranscriptItem>,
     transcript_checkpoint: Option<usize>,
+    forked_from: Option<String>,
 }
 
 impl Agent {
@@ -206,6 +207,7 @@ impl Agent {
             tools,
             resumed_transcript: Vec::new(),
             transcript_checkpoint: None,
+            forked_from: None,
         })
     }
 
@@ -221,7 +223,11 @@ impl Agent {
             Rollout::create_with_selection(&self.cwd, self.conversation.model_selection())?;
         let identity = rollout.identity().clone();
         let compaction_count = self.api.compaction_count();
-        rollout.record_fork(self.session_id(), compaction_count)?;
+        rollout.record_fork(
+            self.session_id(),
+            compaction_count,
+            self.conversation.prior_usage_for_fork(),
+        )?;
         let transcript_checkpoint = Some(transcript.len());
         rollout.snapshot_transcript(transcript)?;
         let conversation = self.conversation.fork(rollout)?;
@@ -244,6 +250,7 @@ impl Agent {
             tools,
             resumed_transcript: Vec::new(),
             transcript_checkpoint,
+            forked_from: Some(self.session_id().to_string()),
         })
     }
 
@@ -253,6 +260,7 @@ impl Agent {
         let compaction_count = loaded.compaction_count;
         let resumed_transcript = std::mem::take(&mut loaded.transcript);
         let transcript_checkpoint = loaded.transcript_checkpoint;
+        let forked_from = loaded.forked_from.clone();
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
         let api = ApiClient::new(
@@ -274,6 +282,7 @@ impl Agent {
             tools,
             resumed_transcript,
             transcript_checkpoint,
+            forked_from,
         })
     }
 
@@ -283,6 +292,14 @@ impl Agent {
 
     pub(crate) fn session_id(&self) -> &str {
         self.conversation.session_id()
+    }
+
+    pub(crate) fn forked_from(&self) -> Option<&str> {
+        self.forked_from.as_deref()
+    }
+
+    pub(crate) fn instruction_source_paths(&self) -> &[PathBuf] {
+        self.conversation.instruction_source_paths()
     }
 
     pub(crate) fn model_selection(&self) -> &ModelSelection {
@@ -311,6 +328,10 @@ impl Agent {
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
         self.conversation.context_snapshot()
+    }
+
+    pub(crate) fn rate_limit_client(&self) -> crate::rate_limits::RateLimitClient {
+        self.api.rate_limit_client()
     }
 
     pub(crate) fn background_processes(&self) -> ProcessManager {
@@ -523,8 +544,11 @@ impl Agent {
             let model_needs_follow_up = response.end_turn == Some(false);
             let has_assistant_text = response.has_assistant_text();
             let final_answer = response.final_answer;
-            self.conversation
-                .record_usage(response.usage, response.server_reasoning_included)?;
+            self.conversation.record_usage(
+                response.usage,
+                response.server_reasoning_included,
+                response.rate_limits,
+            )?;
             self.emit_context(events);
             emit(events, AgentEvent::ModelResponseCompleted);
 
@@ -757,6 +781,7 @@ impl Agent {
             initial_context_injection,
             active_turn_context,
             compacted.usage,
+            compacted.rate_limits,
         );
         if let Err(error) = replacement {
             // The server has completed a response that was not installed. Drop

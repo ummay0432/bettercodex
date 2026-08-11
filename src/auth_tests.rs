@@ -9,13 +9,22 @@ fn unsigned_jwt(payload: Value) -> String {
 fn extracts_expiration_and_account_from_chatgpt_claims() {
     let token = unsigned_jwt(serde_json::json!({
         "exp": 1_900_000_000_u64,
+        "email": "user@example.com",
         "https://api.openai.com/auth": {
-            "chatgpt_account_id": "account-123"
+            "chatgpt_account_id": "account-123",
+            "chatgpt_plan_type": "pro"
         }
     }));
 
     assert_eq!(expiration_from_jwt(&token), Some(1_900_000_000));
     assert_eq!(account_id_from_jwt(&token).as_deref(), Some("account-123"));
+    assert_eq!(
+        chatgpt_account_from_tokens(None, &token),
+        ChatGptAccount {
+            email: Some("user@example.com".to_string()),
+            plan: Some("Pro".to_string()),
+        }
+    );
 }
 
 #[test]

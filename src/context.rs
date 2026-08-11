@@ -1,6 +1,7 @@
 use crate::compaction::InitialContextInjection;
 pub(crate) use crate::model::EFFECTIVE_CONTEXT_WINDOW;
 use crate::model::ModelSelection;
+use crate::rate_limits::RateLimitSnapshot;
 use crate::repository;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
@@ -17,6 +18,7 @@ use anyhow::Context;
 use anyhow::Result;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
@@ -81,7 +83,7 @@ pub(crate) struct ContextSection {
     pub(crate) items: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ContextSnapshot {
     pub(crate) used_tokens: u64,
     pub(crate) context_window: u64,
@@ -89,6 +91,8 @@ pub(crate) struct ContextSnapshot {
     /// Whether `used_tokens` came from Responses usage rather than only local estimation.
     pub(crate) measured: bool,
     pub(crate) sections: Vec<ContextSection>,
+    pub(crate) total_usage: TokenUsage,
+    pub(crate) rate_limits: Vec<RateLimitSnapshot>,
 }
 
 pub(crate) struct Conversation {
@@ -97,6 +101,8 @@ pub(crate) struct Conversation {
     history_normalization: HistoryNormalization,
     context_metrics: ContextMetrics,
     usage: Option<TokenUsage>,
+    total_usage: TokenUsage,
+    rate_limits: BTreeMap<String, RateLimitSnapshot>,
     usage_history_estimate: Option<u64>,
     server_reasoning_included: bool,
     model_selection: ModelSelection,
@@ -227,8 +233,22 @@ impl HistoryCursor {
 struct WorldState {
     environment: Value,
     repository_context: Option<Value>,
+    instruction_source_paths: Vec<PathBuf>,
     skills_catalogue: Option<Value>,
     skills: SkillCatalog,
+}
+
+struct RepositoryContext {
+    text: String,
+    source_paths: Vec<PathBuf>,
+}
+
+impl std::ops::Deref for RepositoryContext {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text
+    }
 }
 
 /// Aggregate request accounting kept in lockstep with `Conversation::history`.
@@ -291,6 +311,8 @@ impl Conversation {
             history_normalization,
             context_metrics,
             usage: None,
+            total_usage: TokenUsage::default(),
+            rate_limits: BTreeMap::new(),
             usage_history_estimate: None,
             server_reasoning_included: false,
             model_selection,
@@ -305,6 +327,7 @@ impl Conversation {
             rollout,
             history,
             usage,
+            total_usage,
             usage_history_estimate,
             server_reasoning_included,
             model_selection,
@@ -321,6 +344,8 @@ impl Conversation {
             history_normalization,
             context_metrics,
             usage,
+            total_usage,
+            rate_limits: BTreeMap::new(),
             usage_history_estimate,
             server_reasoning_included,
             model_selection,
@@ -353,6 +378,8 @@ impl Conversation {
             history_normalization: self.history_normalization.clone(),
             context_metrics: self.context_metrics.clone(),
             usage: self.usage.clone(),
+            total_usage: self.total_usage.clone(),
+            rate_limits: self.rate_limits.clone(),
             usage_history_estimate: self.usage_history_estimate,
             server_reasoning_included: self.server_reasoning_included,
             model_selection: self.model_selection.clone(),
@@ -386,6 +413,18 @@ impl Conversation {
 
     pub(crate) fn service_tier(&self) -> ServiceTier {
         self.service_tier
+    }
+
+    pub(crate) fn instruction_source_paths(&self) -> &[PathBuf] {
+        &self.world_state.instruction_source_paths
+    }
+
+    pub(crate) fn prior_usage_for_fork(&self) -> Option<TokenUsage> {
+        let prior = self.usage.as_ref().map_or_else(
+            || self.total_usage.clone(),
+            |last| self.total_usage.saturating_sub(last),
+        );
+        (prior != TokenUsage::default()).then_some(prior)
     }
 
     pub(crate) fn set_service_tier(&mut self, service_tier: ServiceTier) -> Result<()> {
@@ -476,6 +515,7 @@ impl Conversation {
         initial_context_injection: InitialContextInjection,
         active_turn_context: &ActiveTurnContext,
         response_usage: Option<TokenUsage>,
+        rate_limits: Vec<RateLimitSnapshot>,
     ) -> Result<()> {
         let preferred_insertion = match initial_context_injection {
             InitialContextInjection::AfterCompaction => None,
@@ -512,6 +552,12 @@ impl Conversation {
         }
         self.rollout
             .replace_compacted_history(&history, response_usage.as_ref())?;
+        if let Some(response_usage) = &response_usage {
+            self.total_usage.add_assign(response_usage);
+        }
+        for snapshot in rate_limits {
+            self.rate_limits.insert(snapshot.limit_id.clone(), snapshot);
+        }
         self.history_normalization = HistoryNormalization::from_history(&history);
         self.context_metrics = context_metrics;
         self.history = history;
@@ -577,13 +623,18 @@ impl Conversation {
         &mut self,
         usage: Option<TokenUsage>,
         server_reasoning_included: bool,
+        rate_limits: Vec<RateLimitSnapshot>,
     ) -> Result<()> {
+        for snapshot in rate_limits {
+            self.rate_limits.insert(snapshot.limit_id.clone(), snapshot);
+        }
         let Some(usage) = usage else {
             return Ok(());
         };
         let history_estimate = self.context_metrics.estimated_tokens;
         self.rollout
             .record_usage(&usage, history_estimate, server_reasoning_included)?;
+        self.total_usage.add_assign(&usage);
         self.usage = Some(usage);
         self.usage_history_estimate = Some(history_estimate);
         self.server_reasoning_included = server_reasoning_included;
@@ -659,6 +710,8 @@ impl Conversation {
             compact_at_tokens: self.model_selection.auto_compact_token_limit(),
             measured: measured_total.is_some(),
             sections,
+            total_usage: self.total_usage.clone(),
+            rate_limits: self.rate_limits.values().cloned().collect(),
         }
     }
 
@@ -770,9 +823,15 @@ impl WorldState {
     fn load(cwd: &Path) -> Result<Self> {
         let skills = SkillCatalog::load(cwd);
         let skills_catalogue = skills.catalogue_message(EFFECTIVE_CONTEXT_WINDOW);
+        let repository_context = repository_context(cwd)?;
+        let instruction_source_paths = repository_context
+            .as_ref()
+            .map(|context| context.source_paths.clone())
+            .unwrap_or_default();
         Ok(Self {
             environment: message("developer", environment_context(cwd)),
-            repository_context: repository_context(cwd)?.map(|context| message("user", context)),
+            repository_context: repository_context.map(|context| message("user", context.text)),
+            instruction_source_paths,
             skills_catalogue,
             skills,
         })
@@ -1087,7 +1146,7 @@ fn environment_context(cwd: &Path) -> String {
     )
 }
 
-fn repository_context(cwd: &Path) -> Result<Option<String>> {
+fn repository_context(cwd: &Path) -> Result<Option<RepositoryContext>> {
     let cwd = cwd
         .canonicalize()
         .with_context(|| format!("failed to resolve working directory {}", cwd.display()))?;
@@ -1121,6 +1180,7 @@ fn repository_context(cwd: &Path) -> Result<Option<String>> {
     let mut seen = HashSet::new();
     let mut remaining = MAX_REPOSITORY_INSTRUCTIONS_BYTES;
     let mut sections = Vec::new();
+    let mut source_paths = Vec::new();
     for path in candidates {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         if !seen.insert(canonical) || remaining == 0 {
@@ -1137,6 +1197,7 @@ fn repository_context(cwd: &Path) -> Result<Option<String>> {
                 escape_xml(&path.display().to_string()),
                 escape_cdata(content.trim()),
             ));
+            source_paths.push(path);
             remaining = remaining.saturating_sub(bytes.len());
         }
     }
@@ -1144,10 +1205,13 @@ fn repository_context(cwd: &Path) -> Result<Option<String>> {
     if sections.is_empty() {
         return Ok(None);
     }
-    Ok(Some(format!(
-        "<repository_context>\n{}\n</repository_context>",
-        sections.join("\n"),
-    )))
+    Ok(Some(RepositoryContext {
+        text: format!(
+            "<repository_context>\n{}\n</repository_context>",
+            sections.join("\n"),
+        ),
+        source_paths,
+    }))
 }
 
 fn first_instruction_file(directory: &Path) -> Result<Option<PathBuf>> {

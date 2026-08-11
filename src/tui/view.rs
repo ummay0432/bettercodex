@@ -30,6 +30,7 @@ use super::skill_popup::SkillPopup;
 use super::skills_view::SkillsView;
 use super::skills_view::SkillsViewAction;
 use super::startup_art;
+use super::status::StatusSnapshot;
 use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
 use crate::agent::CompactionOutcome;
@@ -131,6 +132,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "visualize current context usage",
     },
     SlashCommand {
+        name: "status",
+        aliases: &[],
+        description: "show current session configuration and token usage",
+    },
+    SlashCommand {
         name: "compact",
         aliases: &[],
         description: "summarize conversation to prevent hitting the context limit",
@@ -217,6 +223,7 @@ pub(super) enum Action {
         history_text: String,
     },
     ShowContext,
+    ShowStatus,
     ShowDiff,
     EnterTmux,
     Logout,
@@ -335,6 +342,7 @@ enum TranscriptEntry {
     UpdateAvailable(AvailableUpdate),
     Error(String),
     Diff(String),
+    Status(Box<StatusSnapshot>),
     Processes(Vec<BackgroundProcess>),
     FinalMessageSeparator {
         elapsed_seconds: Option<u64>,
@@ -354,7 +362,7 @@ impl DisplayedUserPrompt {
     fn from_prompt(prompt: &UserPrompt) -> Self {
         Self {
             text: prompt.as_str().to_string(),
-            model_text: prompt.text_without_image_placeholders(),
+            model_text: prompt.text_without_image_placeholders().into_owned(),
             skill_mentions: prompt.skill_mentions().to_vec(),
             image_ranges: prompt
                 .image_attachments()
@@ -708,14 +716,13 @@ impl View {
         self.action_required
     }
 
-    pub(super) fn start_turn(&mut self, prompt: impl Into<UserPrompt>) {
-        let prompt = prompt.into();
+    pub(super) fn start_turn(&mut self, prompt: &UserPrompt) {
         self.flush_unified_exec_wait_streak();
         self.deferred_interactions.clear();
         self.seal_exploration();
         self.entries
             .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
-                &prompt,
+                prompt,
             )));
         self.busy = true;
         self.action_required = false;
@@ -1047,6 +1054,13 @@ impl View {
             snapshot,
             self.model_selection.model.clone(),
         )));
+    }
+
+    pub(super) fn add_status(&mut self, snapshot: StatusSnapshot) {
+        self.flush_unified_exec_wait_streak();
+        self.seal_exploration();
+        self.entries
+            .push(TranscriptEntry::Status(Box::new(snapshot)));
     }
 
     pub(super) fn show_resume_picker(&mut self) {
@@ -2065,6 +2079,7 @@ impl View {
             ),
             "/clear" => Action::Clear(submission),
             "/context" => Action::ShowContext,
+            "/status" => Action::ShowStatus,
             "/help" => {
                 self.overlay = Some(Overlay::Shortcuts);
                 Action::None
@@ -2181,6 +2196,7 @@ impl View {
                 | TranscriptEntry::UpdateAvailable(_)
                 | TranscriptEntry::Error(_)
                 | TranscriptEntry::Diff(_)
+                | TranscriptEntry::Status(_)
                 | TranscriptEntry::Processes(_)
                 | TranscriptEntry::FinalMessageSeparator { .. } => {}
             }
@@ -3230,6 +3246,7 @@ fn is_local_command(command: &str) -> bool {
             | "/clear"
             | "/fork"
             | "/context"
+            | "/status"
             | "/help"
             | "/ps"
             | "/skills"
@@ -3247,6 +3264,7 @@ impl TranscriptEntry {
             | Self::UpdateAvailable(_)
             | Self::Error(_)
             | Self::Diff(_)
+            | Self::Status(_)
             | Self::Processes(_)
             | Self::FinalMessageSeparator { .. } => true,
             Self::Assistant { streaming, .. } => !streaming,
@@ -3330,6 +3348,7 @@ impl TranscriptEntry {
                 Span::styled(message.clone(), Style::default().fg(Color::Red)),
             ])],
             Self::Diff(diff) => git_diff_lines(diff, width),
+            Self::Status(snapshot) => return snapshot.display_lines(width),
             Self::Processes(processes) => background_process_lines(processes, width),
             Self::FinalMessageSeparator { elapsed_seconds } => {
                 final_message_separator_lines(*elapsed_seconds, width)
@@ -5603,7 +5622,7 @@ mod tests {
         let source = chunks.concat();
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        view.start_turn("test");
+        view.start_turn(&UserPrompt::text("test"));
         let _ = view.take_pending_history_lines(80, 24);
         view.handle_agent_event(AgentEvent::ModelMessageDelta(chunks[0].to_string()));
         let before_control = view
@@ -5693,7 +5712,7 @@ mod tests {
         for (draft, busy) in rejected {
             let mut view = View::new(Path::new("/tmp/bettercodex"));
             if busy {
-                view.start_turn("active turn");
+                view.start_turn(&UserPrompt::text("active turn"));
             }
             view.editor.set_text(draft);
 
@@ -5736,7 +5755,7 @@ mod tests {
     #[test]
     fn logout_cannot_be_queued_as_agent_input() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.start_turn("active turn");
+        view.start_turn(&UserPrompt::text("active turn"));
         view.editor.set_text("/logout ");
 
         assert_eq!(
@@ -5946,7 +5965,7 @@ mod tests {
 
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        view.start_turn("test");
+        view.start_turn(&UserPrompt::text("test"));
         let _ = view.take_pending_history_lines(WIDTH, 24);
         view.status_detail = Some("cargo nextest run".to_string());
         let height_without_background_terminal = view.desired_height(WIDTH, 24);
@@ -6014,7 +6033,7 @@ mod tests {
 
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        view.start_turn("test");
+        view.start_turn(&UserPrompt::text("test"));
         let _ = view.take_pending_history_lines(WIDTH, 24);
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "cell:start".to_string(),
@@ -6237,7 +6256,9 @@ mod tests {
                 .iter()
                 .any(|line| plain(line).contains("bettercodex"))
         );
-        view.start_turn("a user message that wraps at the narrower width");
+        view.start_turn(&UserPrompt::text(
+            "a user message that wraps at the narrower width",
+        ));
         let _ = view.take_pending_history_lines(80, 24);
         view.handle_agent_event(AgentEvent::ModelMessageDelta("assistant reply".to_string()));
         view.handle_agent_event(completed_message("assistant reply"));
@@ -6274,7 +6295,7 @@ mod tests {
 
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        view.start_turn("test");
+        view.start_turn(&UserPrompt::text("test"));
         let _ = view.take_pending_history_lines(WIDTH, HEIGHT);
         view.handle_agent_event(AgentEvent::ModelMessageDelta(source.clone()));
 
@@ -6312,7 +6333,7 @@ mod tests {
     fn submitted_user_message_keeps_its_background_in_scrollback() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        view.start_turn("test");
+        view.start_turn(&UserPrompt::text("test"));
 
         let lines = view.take_pending_history_lines(40, 24);
         let buffer = crate::tui::terminal::render_history_lines(&lines, 40);

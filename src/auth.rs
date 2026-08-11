@@ -36,9 +36,16 @@ pub(crate) struct Auth {
     access_token: String,
     refresh_token: Option<String>,
     account_id: Option<String>,
+    account: ChatGptAccount,
     expires_at: Option<u64>,
     refresh_url: Cow<'static, str>,
     storage: Option<StoredAuth>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChatGptAccount {
+    pub(crate) email: Option<String>,
+    pub(crate) plan: Option<String>,
 }
 
 #[derive(Clone)]
@@ -76,6 +83,7 @@ impl Auth {
             access_token: access_token.into(),
             refresh_token: None,
             account_id: Some("test-account".to_string()),
+            account: ChatGptAccount::default(),
             expires_at: None,
             refresh_url: Cow::Borrowed(REFRESH_URL),
             storage: None,
@@ -90,11 +98,13 @@ impl Auth {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| account_id_from_jwt(&access_token));
+            let account = chatgpt_account_from_tokens(None, &access_token);
             return Ok(Self {
                 expires_at: expiration_from_jwt(&access_token),
                 access_token,
                 refresh_token: None,
                 account_id,
+                account,
                 refresh_url: Cow::Borrowed(REFRESH_URL),
                 storage: None,
             });
@@ -118,16 +128,19 @@ impl Auth {
             .ok_or_else(|| anyhow!("{} does not contain a ChatGPT access token", path.display()))?
             .to_string();
         let refresh_token = nonempty_string(tokens.get("refresh_token")).map(str::to_string);
+        let id_token = nonempty_string(tokens.get("id_token"));
         let account_id = nonempty_string(tokens.get("account_id"))
             .map(str::to_string)
-            .or_else(|| nonempty_string(tokens.get("id_token")).and_then(account_id_from_jwt))
+            .or_else(|| id_token.and_then(account_id_from_jwt))
             .or_else(|| account_id_from_jwt(&access_token));
+        let account = chatgpt_account_from_tokens(id_token, &access_token);
 
         Ok(Self {
             expires_at: expiration_from_jwt(&access_token),
             access_token,
             refresh_token,
             account_id,
+            account,
             refresh_url: Cow::Borrowed(REFRESH_URL),
             storage: Some(StoredAuth { path, document }),
         })
@@ -202,6 +215,10 @@ impl Auth {
             .and_then(account_id_from_jwt)
             .or_else(|| account_id_from_jwt(&access_token))
             .or_else(|| self.account_id.clone());
+        self.account = merge_chatgpt_account(
+            chatgpt_account_from_tokens(refreshed.id_token.as_deref(), &access_token),
+            &self.account,
+        );
         self.access_token = access_token;
         self.refresh_token = refresh_token;
         self.persist(refreshed.id_token.as_deref())?;
@@ -274,6 +291,10 @@ impl Auth {
             account_id,
         })
     }
+
+    pub(crate) fn account(&self) -> ChatGptAccount {
+        self.account.clone()
+    }
 }
 
 fn read_auth_document(path: &Path) -> Result<Value> {
@@ -324,6 +345,14 @@ impl SharedAuth {
         client: &reqwest::Client,
     ) -> Result<AuthSnapshot> {
         self.refresh_snapshot(client, true).await
+    }
+
+    pub(crate) fn account(&self) -> Result<ChatGptAccount> {
+        self.inner
+            .auth
+            .read()
+            .map(|auth| auth.account())
+            .map_err(|_| anyhow!("ChatGPT credential cache lock was poisoned"))
     }
 
     async fn refresh_snapshot(
@@ -414,6 +443,68 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| claims.get("chatgpt_account_id").and_then(Value::as_str))
         .map(str::to_string)
+}
+
+fn chatgpt_account_from_tokens(id_token: Option<&str>, access_token: &str) -> ChatGptAccount {
+    let id_claims = id_token.and_then(jwt_claims);
+    let access_claims = jwt_claims(access_token);
+    let email = id_claims
+        .as_ref()
+        .and_then(account_email_from_claims)
+        .or_else(|| access_claims.as_ref().and_then(account_email_from_claims));
+    let plan = id_claims
+        .as_ref()
+        .and_then(account_plan_from_claims)
+        .or_else(|| access_claims.as_ref().and_then(account_plan_from_claims));
+    ChatGptAccount { email, plan }
+}
+
+fn account_email_from_claims(claims: &Value) -> Option<String> {
+    claims
+        .get("email")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|profile| profile.get("email"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(str::to_string)
+}
+
+fn account_plan_from_claims(claims: &Value) -> Option<String> {
+    let plan = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_plan_type"))
+        .and_then(Value::as_str)?;
+    Some(
+        match plan.to_ascii_lowercase().as_str() {
+            "free" => "Free",
+            "go" => "Go",
+            "plus" => "Plus",
+            "pro" => "Pro",
+            "prolite" => "Pro Lite",
+            "team" | "self_serve_business_prolite" | "self_serve_business_usage_based" => {
+                "Business"
+            }
+            "enterprise_cbp_automation" => "Enterprise (Automation)",
+            "business" | "ent26" | "enterprise_cbp_usage_based" | "enterprise" | "hc" => {
+                "Enterprise"
+            }
+            "edu" | "education" => "Edu",
+            _ => "Unknown",
+        }
+        .to_string(),
+    )
+}
+
+fn merge_chatgpt_account(current: ChatGptAccount, previous: &ChatGptAccount) -> ChatGptAccount {
+    ChatGptAccount {
+        email: current.email.or_else(|| previous.email.clone()),
+        plan: current.plan.or_else(|| previous.plan.clone()),
+    }
 }
 
 fn unix_timestamp() -> Result<u64> {

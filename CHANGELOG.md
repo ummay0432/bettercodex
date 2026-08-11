@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.7] - 2026-08-11
+
+- terminal resizing and UI repainting are fixed
+- added `/status` to check usage and shit
+
 ## [0.1.6] - 2026-08-11
 
 - sysprompt and tool catalogue are good now (trust me)

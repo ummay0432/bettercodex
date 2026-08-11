@@ -143,6 +143,7 @@ fn websocket_incremental_input_requires_matching_request_properties() {
         final_answer: None,
         end_turn: None,
         usage: None,
+        rate_limits: Vec::new(),
         server_reasoning_included: false,
         response_id: "response-first".to_string(),
         output_item_count: 0,
@@ -271,6 +272,134 @@ fn completed_event_records_full_cache_usage() {
             total_tokens: 50,
         })
     );
+}
+
+#[test]
+fn response_rate_limit_events_are_retained_for_status() {
+    let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::new(OutputItemMode::Retain);
+    let mut server_model_warning_emitted = false;
+    process_event_value(
+        json!({
+            "type": "codex.rate_limits",
+            "metered_limit_name": "codex_other",
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 12.5,
+                    "window_minutes": 300,
+                    "reset_at": 1_704_069_000_i64,
+                },
+            },
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "42.4",
+            },
+        }),
+        &mut collected,
+        &completed_items,
+        None,
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    process_event_value(
+        completed_event("resp_limits", &assistant_item("done")),
+        &mut collected,
+        &completed_items,
+        None,
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+
+    let response = collected.finish().unwrap();
+    let snapshot = response.rate_limits.first().expect("rate-limit snapshot");
+    assert_eq!(snapshot.limit_id, "codex_other");
+    assert_eq!(snapshot.primary.as_ref().unwrap().used_percent, 12.5);
+    assert_eq!(snapshot.primary.as_ref().unwrap().window_minutes, Some(300));
+    assert_eq!(
+        snapshot.credits.as_ref().unwrap().balance.as_deref(),
+        Some("42.4")
+    );
+}
+
+#[test]
+fn response_rate_limit_headers_are_parsed_for_status() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-codex-primary-used-percent",
+        reqwest::header::HeaderValue::from_static("19"),
+    );
+    headers.insert(
+        "x-codex-primary-window-minutes",
+        reqwest::header::HeaderValue::from_static("300"),
+    );
+    headers.insert(
+        "x-codex-primary-reset-at",
+        reqwest::header::HeaderValue::from_static("1704069000"),
+    );
+
+    let snapshots = crate::rate_limits::parse_all_rate_limits(&headers);
+
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].limit_id, "codex");
+    assert_eq!(snapshots[0].primary.as_ref().unwrap().used_percent, 19.0);
+    assert_eq!(
+        snapshots[0].primary.as_ref().unwrap().window_minutes,
+        Some(300)
+    );
+}
+
+#[tokio::test]
+async fn status_rate_limit_prefetch_reads_chatgpt_usage_with_account_auth() {
+    let body = json!({
+        "plan_type": "pro",
+        "rate_limit": {
+            "secondary_window": {
+                "used_percent": 9,
+                "limit_window_seconds": 604_800,
+                "reset_after_seconds": 0,
+                "reset_at": 1_704_069_000,
+            }
+        },
+        "additional_rate_limits": [{
+            "limit_name": "GPT-5.3-Codex-Spark",
+            "metered_feature": "codex_spark",
+            "rate_limit": {
+                "secondary_window": {
+                    "used_percent": 0,
+                    "limit_window_seconds": 604_800,
+                    "reset_after_seconds": 0,
+                    "reset_at": 1_704_069_900,
+                }
+            }
+        }]
+    })
+    .to_string();
+    let (origin, requests, server) =
+        spawn_http_server(vec![HttpReply::ok("application/json", body)]);
+    let client = test_client(format!("{origin}/backend-api/codex"));
+
+    let snapshots = client.rate_limit_client().fetch().await.unwrap();
+
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].limit_id, "codex");
+    assert_eq!(
+        snapshots[0].secondary.as_ref().unwrap().window_minutes,
+        Some(10_080)
+    );
+    assert_eq!(snapshots[1].limit_id, "codex_spark");
+    assert_eq!(
+        snapshots[1].limit_name.as_deref(),
+        Some("GPT-5.3-Codex-Spark")
+    );
+    let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(request.path, "/backend-api/wham/usage");
+    let headers = request.headers.to_ascii_lowercase();
+    assert!(headers.contains("authorization: bearer token-test"));
+    assert!(headers.contains("chatgpt-account-id: test-account"));
+    server.join().unwrap();
 }
 
 #[test]

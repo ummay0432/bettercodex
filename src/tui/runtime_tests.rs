@@ -12,10 +12,16 @@ use std::path::Path;
 use tokio::sync::mpsc::unbounded_channel;
 
 fn runtime_without_agent() -> Runtime {
+    crate::http_client::ensure_rustls_crypto_provider();
     let cwd = PathBuf::from("/tmp/bettercodex");
     let (diff_updates_tx, diff_updates) = unbounded_channel();
     let (file_search_updates_tx, file_search_updates) = unbounded_channel();
     let (operator_command_updates_tx, operator_command_updates) = unbounded_channel();
+    let rate_limit_client = RateLimitClient::new(
+        reqwest::Client::new(),
+        crate::auth::SharedAuth::new(crate::auth::Auth::for_test("test-token")),
+        "http://127.0.0.1",
+    );
     Runtime {
         clipboard_lease: None,
         cwd: cwd.clone(),
@@ -30,7 +36,16 @@ fn runtime_without_agent() -> Runtime {
             compact_at_tokens: 0,
             measured: false,
             sections: Vec::new(),
+            total_usage: Default::default(),
+            rate_limits: Vec::new(),
         },
+        session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+        forked_from: None,
+        instruction_source_paths: Vec::new(),
+        rate_limit_client,
+        rate_limit_task: None,
+        rate_limit_prefetch_started: false,
+        status_rate_limits: BTreeMap::new(),
         diff_task: None,
         diff_updates,
         diff_updates_tx,
@@ -87,7 +102,7 @@ fn completed_turn_drain_renders_events_beyond_the_fairness_batch() {
     const WIDTH: u16 = 80;
     const HEIGHT: u16 = 24;
     let mut view = View::new(Path::new("/tmp/bettercodex"));
-    view.start_turn("render every queued delta");
+    view.start_turn(&UserPrompt::text("render every queued delta"));
     let _ = view.take_pending_history_lines(WIDTH, HEIGHT);
     let (events, mut ready) = unbounded_channel();
     let mut answer = "x".repeat(MAX_READY_AGENT_EVENTS);

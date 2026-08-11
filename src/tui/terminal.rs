@@ -228,11 +228,11 @@ where
         Ok(value)
     }
 
-    /// Apply geometry already carried by a terminal resize event.
+    /// Update geometry from one size resolved for the whole frame.
     ///
-    /// Ordinary redraws use this cached value. The event loop performs one delayed backend query
-    /// after resize activity settles so a coalesced or early event cannot leave the cache stale.
-    pub(super) fn set_screen_size(&mut self, size: Size) -> bool {
+    /// Ordinary redraws reuse this cached value. Resize, focus, and maintenance boundaries sample
+    /// the backend so coalesced or missed notifications cannot leave it stale.
+    fn set_screen_size(&mut self, size: Size) -> bool {
         if size == self.screen_size {
             return false;
         }
@@ -1093,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_redraws_reuse_cached_screen_size() {
+    fn redraws_reuse_cached_screen_size_until_explicit_refresh() {
         let (mut terminal, _) = test_terminal(
             /*width*/ 80, /*screen_height*/ 24, /*viewport_height*/ 1,
         );
@@ -1122,6 +1122,15 @@ mod tests {
         assert_eq!(terminal.terminal.backend().size_call_count.get(), 1);
         assert!(!terminal.refresh_screen_size().unwrap());
         assert_eq!(terminal.terminal.backend().size_call_count.get(), 2);
+
+        // A queued resize notification can describe an earlier, wider layout after the backend
+        // has already reached its final split size. The event boundary's explicit refresh must
+        // restore the current physical geometry before the next frame is prepared.
+        let stale_notification = Size::new(/*width*/ 144, /*height*/ 20);
+        assert!(terminal.set_screen_size(stale_notification));
+        assert!(terminal.refresh_screen_size().unwrap());
+        assert_eq!(terminal.screen_size(), resized);
+        assert_eq!(terminal.terminal.backend().size_call_count.get(), 3);
     }
 
     #[test]
@@ -1169,7 +1178,9 @@ mod tests {
         let (mut terminal, output) =
             test_terminal(WIDTH, SCREEN_HEIGHT, /*viewport_height*/ 1);
         redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
-        view.start_turn("stream beyond the viewport after a tool");
+        view.start_turn(&crate::input::UserPrompt::text(
+            "stream beyond the viewport after a tool",
+        ));
         redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "tool-before-stream".to_string(),
@@ -1214,7 +1225,9 @@ mod tests {
         let (mut terminal, output) =
             test_terminal(WIDTH, SCREEN_HEIGHT, /*viewport_height*/ 1);
         redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
-        view.start_turn("stream an overwide code line followed by a live tail");
+        view.start_turn(&crate::input::UserPrompt::text(
+            "stream an overwide code line followed by a live tail",
+        ));
         redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "tool-before-wrapped-stream".to_string(),

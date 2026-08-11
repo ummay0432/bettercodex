@@ -33,6 +33,10 @@ mod startup_art;
 #[cfg(test)]
 #[path = "startup_art_tests.rs"]
 mod startup_art_tests;
+mod status;
+#[cfg(test)]
+#[path = "status_tests.rs"]
+mod status_tests;
 mod table_detect;
 mod terminal;
 mod terminal_hyperlinks;
@@ -54,6 +58,8 @@ use crate::input::UserPrompt;
 use crate::model::ModelSelection;
 use crate::prompt_history::PromptHistory;
 use crate::prompt_history::PromptHistoryReader;
+use crate::rate_limits::RateLimitClient;
+use crate::rate_limits::RateLimitSnapshot;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionSummary;
@@ -70,8 +76,9 @@ use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures_util::StreamExt;
 use notifications::Notifier;
-use ratatui::layout::Size;
 use serde_json::Value;
+use status::StatusSnapshot;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::pending;
@@ -99,15 +106,17 @@ type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
 type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
 type PromptHistoryTask = JoinHandle<(PromptHistoryReader, Result<Vec<String>>)>;
+type RateLimitTask = JoinHandle<Result<Vec<RateLimitSnapshot>>>;
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(32);
 // Match Codex's 120 FPS ceiling for streamed output. Agent events request frames independently
 // from the slower status-animation clock, so fresh text is presented promptly without repainting
 // an unchanged busy view four times as often.
 const STREAM_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
-// Match Codex's settled-size recheck delay. Resize events are applied immediately; one backend
-// sample after this quiet period catches terminals whose reported dimensions settle late.
+// Match Codex's settled-size recheck delay. Resize signals are reconciled with the backend
+// immediately; one more sample after this quiet period catches terminals whose dimensions settle
+// late.
 const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(75);
-const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(windows)]
 const PASTE_BURST_TICK_INTERVAL: Duration = Duration::from_millis(9);
 const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
@@ -196,6 +205,13 @@ struct Runtime {
     turn_handle: Option<TurnHandle>,
     exit_after_turn: bool,
     context_snapshot: ContextSnapshot,
+    session_id: String,
+    forked_from: Option<String>,
+    instruction_source_paths: Vec<PathBuf>,
+    rate_limit_client: RateLimitClient,
+    rate_limit_task: Option<RateLimitTask>,
+    rate_limit_prefetch_started: bool,
+    status_rate_limits: BTreeMap<String, RateLimitSnapshot>,
     diff_task: Option<JoinHandle<()>>,
     diff_updates: UnboundedReceiver<std::result::Result<String, String>>,
     diff_updates_tx: tokio::sync::mpsc::UnboundedSender<std::result::Result<String, String>>,
@@ -290,6 +306,10 @@ impl Runtime {
             view.add_notice(format!("Skill warning: {warning}"));
         }
         view.set_context_tokens(agent.context_tokens());
+        let session_id = agent.session_id().to_string();
+        let forked_from = agent.forked_from().map(str::to_string);
+        let instruction_source_paths = agent.instruction_source_paths().to_vec();
+        let rate_limit_client = agent.rate_limit_client();
         let SessionPromptHistory {
             writer: prompt_history,
             reader: prompt_history_reader,
@@ -302,6 +322,12 @@ impl Runtime {
         }
         view.seed_prompt_history(composer_history, has_persistent_history);
         let context_snapshot = agent.context_snapshot();
+        let status_rate_limits = context_snapshot
+            .rate_limits
+            .iter()
+            .cloned()
+            .map(|snapshot| (snapshot.limit_id.clone(), snapshot))
+            .collect();
         let processes = agent.background_processes();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
@@ -317,6 +343,13 @@ impl Runtime {
             turn_handle: None,
             exit_after_turn: false,
             context_snapshot,
+            session_id,
+            forked_from,
+            instruction_source_paths,
+            rate_limit_client,
+            rate_limit_task: None,
+            rate_limit_prefetch_started: false,
+            status_rate_limits,
             diff_task: None,
             diff_updates,
             diff_updates_tx,
@@ -351,8 +384,8 @@ impl Runtime {
             ANIMATION_FRAME_INTERVAL,
         );
         animation_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut process_ticks = tokio::time::interval(PROCESS_STATUS_INTERVAL);
-        process_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut maintenance_ticks = tokio::time::interval(MAINTENANCE_INTERVAL);
+        maintenance_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         #[cfg(windows)]
         let mut paste_ticks = tokio::time::interval(PASTE_BURST_TICK_INTERVAL);
         #[cfg(windows)]
@@ -402,6 +435,7 @@ impl Runtime {
                 })?;
                 redraw = false;
                 self.start_update_check_after_startup();
+                self.start_rate_limit_prefetch_after_startup();
             }
             let animate = self.has_foreground_activity();
 
@@ -415,14 +449,22 @@ impl Runtime {
                     match &event {
                         Event::FocusGained => self.terminal_focused = true,
                         Event::FocusLost => self.terminal_focused = false,
-                        Event::Resize(width, height) => {
-                            session
-                                .terminal_mut()
-                                .set_screen_size(Size::new(*width, *height));
+                        Event::Resize(_, _) => {
                             screen_size_recheck_at =
                                 Some(tokio::time::Instant::now() + RESIZE_SETTLE_DELAY);
                         }
                         _ => {}
+                    }
+                    if matches!(
+                        &event,
+                        Event::FocusGained | Event::FocusLost | Event::Resize(_, _)
+                    ) {
+                        // A rapid grow followed by a shrink can leave both notifications queued
+                        // after the terminal has already reached its final size. Rendering the
+                        // stale grow dimensions into the narrower surface wraps full-width rows
+                        // and scrolls the inline viewport. Treat resize and adjacent focus changes
+                        // as surface-change signals, then sample one current size for the frame.
+                        self.reconcile_terminal_geometry(session)?;
                     }
                     let action = self.view.handle_terminal_event(event);
                     self.file_search
@@ -470,6 +512,18 @@ impl Runtime {
                     if let Ok(Some(update)) = completion {
                         self.view.add_update_available(update);
                         redraw = true;
+                    }
+                }
+                completion = receive_rate_limit_refresh(&mut self.rate_limit_task) => {
+                    self.rate_limit_task = None;
+                    match completion {
+                        Ok(Ok(snapshots)) => self.cache_status_rate_limits(snapshots),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "account rate-limit refresh failed");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "account rate-limit refresh task stopped unexpectedly");
+                        }
                     }
                 }
                 completion = receive_prompt_history(&mut self.prompt_history_task) => {
@@ -540,6 +594,7 @@ impl Runtime {
                     self.sync_model_selection_to_agent(&mut agent);
                     self.sync_service_tier_to_agent(&mut agent);
                     self.context_snapshot = agent.context_snapshot();
+                    self.cache_status_rate_limits(self.context_snapshot.rate_limits.clone());
                     self.turn_handle = None;
                     let elapsed = self.turn_started_at.take().map(|started| started.elapsed());
                     let notification = match &completion {
@@ -615,7 +670,11 @@ impl Runtime {
                         redraw = true;
                     }
                 }
-                _ = process_ticks.tick() => {
+                _ = maintenance_ticks.tick() => {
+                    // Resize notifications may be coalesced or missed while a terminal rearranges
+                    // panes. A cheap maintenance sample bounds stale geometry without restoring a
+                    // backend query to every animation or streaming frame.
+                    redraw |= self.reconcile_terminal_geometry(session)?;
                     redraw |= self.refresh_background_processes();
                 }
                 _ = receive_paste_tick(self.view.paste_burst_active(), &mut paste_ticks) => {
@@ -623,10 +682,7 @@ impl Runtime {
                 }
                 _ = receive_deadline(screen_size_recheck_at) => {
                     screen_size_recheck_at = None;
-                    if session.terminal_mut().refresh_screen_size()? {
-                        self.view.request_terminal_reflow();
-                        redraw = true;
-                    }
+                    redraw |= self.reconcile_terminal_geometry(session)?;
                 }
                 _ = receive_deadline(stream_frames.scheduled_at()) => {
                     stream_frames.clear_schedule();
@@ -638,6 +694,17 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+
+    fn reconcile_terminal_geometry(
+        &mut self,
+        session: &mut terminal::TerminalSession,
+    ) -> Result<bool> {
+        let changed = session.terminal_mut().refresh_screen_size()?;
+        if changed {
+            self.view.request_terminal_reflow();
+        }
+        Ok(changed)
     }
 
     async fn enter_tmux(&mut self, session: &mut terminal::TerminalSession) -> Result<()> {
@@ -717,8 +784,8 @@ impl Runtime {
             Action::None => {}
             Action::LoadPromptHistory => self.start_prompt_history_load(),
             Action::Submit(submission) => {
-                let history_text = submission.prompt().text_without_image_placeholders();
                 if self.turn.is_some() {
+                    let history_text = submission.prompt().text_without_image_placeholders();
                     match active_submission_route(submission.prompt()) {
                         ActiveSubmissionRoute::QueueNextTurn => {
                             self.persist_prompt(&history_text);
@@ -727,26 +794,27 @@ impl Runtime {
                         ActiveSubmissionRoute::SteerOrdinary => {
                             self.persist_prompt(&history_text);
                             let prompt = submission.into_prompt();
-                            let steering = self.turn_handle.as_ref().and_then(|turn| {
-                                turn.steer(UserInput::prompt(prompt.clone())).ok()
-                            });
+                            let steering = self
+                                .turn_handle
+                                .as_ref()
+                                .and_then(|turn| turn.steer(UserInput::prompt_ref(&prompt)).ok());
                             match steering {
                                 Some(id) => self.view.add_pending_steer(id, prompt),
                                 None => self.view.queue_follow_up(prompt),
                             }
                         }
                     }
-                } else if self.start_composer_turn(submission) {
-                    self.persist_prompt(&history_text);
+                } else {
+                    self.start_composer_turn(submission);
                 }
             }
             Action::Queue(submission) => {
-                let history_text = submission.prompt().text_without_image_placeholders();
                 if self.turn.is_some() {
+                    let history_text = submission.prompt().text_without_image_placeholders();
                     self.persist_prompt(&history_text);
                     self.view.queue_follow_up(submission.into_prompt());
-                } else if self.start_composer_turn(submission) {
-                    self.persist_prompt(&history_text);
+                } else {
+                    self.start_composer_turn(submission);
                 }
             }
             Action::Cancel => self.interrupt_turn(),
@@ -840,6 +908,31 @@ impl Runtime {
                     self.context_snapshot = agent.context_snapshot();
                 }
                 self.view.show_context(self.context_snapshot.clone());
+            }
+            Action::ShowStatus => {
+                if let Some(agent) = &self.agent {
+                    self.context_snapshot = agent.context_snapshot();
+                    self.session_id = agent.session_id().to_string();
+                    self.forked_from = agent.forked_from().map(str::to_string);
+                    self.instruction_source_paths = agent.instruction_source_paths().to_vec();
+                }
+                self.cache_status_rate_limits(self.context_snapshot.rate_limits.clone());
+                let account = self.rate_limit_client.account().unwrap_or_else(|error| {
+                    tracing::warn!(%error, "failed to read ChatGPT account metadata");
+                    crate::auth::ChatGptAccount::default()
+                });
+                self.view.add_status(StatusSnapshot {
+                    model: self.model_selection.clone(),
+                    directory: self.cwd.clone(),
+                    instruction_source_paths: self.instruction_source_paths.clone(),
+                    session_id: self.session_id.clone(),
+                    forked_from: self.forked_from.clone(),
+                    account,
+                    context: self.context_snapshot.clone(),
+                    rate_limits: self.status_rate_limits.values().cloned().collect(),
+                    refreshing_rate_limits: true,
+                });
+                self.start_rate_limit_refresh();
             }
             Action::ShowDiff => self.start_git_diff(),
             Action::StopBackgroundProcesses => {
@@ -1001,12 +1094,18 @@ impl Runtime {
         let prompt_history = PromptHistory::open(agent.session_id())?;
         let processes = agent.background_processes();
         let context_snapshot = agent.context_snapshot();
+        let session_id = agent.session_id().to_string();
+        let forked_from = agent.forked_from().map(str::to_string);
+        let instruction_source_paths = agent.instruction_source_paths().to_vec();
         let skills = agent.skills().to_vec();
         let skill_warnings = agent.skill_warnings().to_vec();
 
         self.processes.stop_all_background_processes();
         self.processes = processes;
         self.context_snapshot = context_snapshot;
+        self.session_id = session_id;
+        self.forked_from = forked_from;
+        self.instruction_source_paths = instruction_source_paths;
         self.agent = Some(agent);
         self.prompt_history = Some(prompt_history);
         self.view.clear();
@@ -1025,9 +1124,14 @@ impl Runtime {
         let agent = source.fork(self.view.session_transcript())?;
         let prompt_history = PromptHistory::open(agent.session_id())?;
         let session_id = agent.session_id().to_string();
+        let forked_from = agent.forked_from().map(str::to_string);
+        let instruction_source_paths = agent.instruction_source_paths().to_vec();
         self.processes.stop_all_background_processes();
         self.processes = agent.background_processes();
         self.context_snapshot = agent.context_snapshot();
+        self.session_id.clone_from(&session_id);
+        self.forked_from = forked_from;
+        self.instruction_source_paths = instruction_source_paths;
         self.view.set_context_tokens(agent.context_tokens());
         self.view.set_skills(agent.skills().to_vec());
         self.view.set_background_processes(Vec::new());
@@ -1132,6 +1236,9 @@ impl Runtime {
         let service_tier = agent.service_tier();
         let cwd = agent.cwd().to_path_buf();
         let context_snapshot = agent.context_snapshot();
+        let session_id = agent.session_id().to_string();
+        let forked_from = agent.forked_from().map(str::to_string);
+        let instruction_source_paths = agent.instruction_source_paths().to_vec();
         let context_tokens = agent.context_tokens();
         let skills = agent.skills().to_vec();
         let skill_warnings = agent.skill_warnings().to_vec();
@@ -1143,6 +1250,9 @@ impl Runtime {
         self.processes.stop_all_background_processes();
         self.processes = processes;
         self.context_snapshot = context_snapshot;
+        self.session_id = session_id;
+        self.forked_from = forked_from;
+        self.instruction_source_paths = instruction_source_paths;
         self.agent = Some(agent);
         self.exit_after_turn = false;
         self.file_search = file_search;
@@ -1172,15 +1282,15 @@ impl Runtime {
         }
     }
 
-    fn start_composer_turn(&mut self, submission: ComposerSubmission) -> bool {
+    fn start_composer_turn(&mut self, submission: ComposerSubmission) {
         match self.prepare_turn_start() {
             Ok(agent) => {
+                let history_text = submission.prompt().text_without_image_placeholders();
+                self.persist_prompt(&history_text);
                 self.spawn_turn(agent, submission.into_prompt());
-                true
             }
             Err(error) => {
                 self.view.reject_composer_submission(submission, error);
-                false
             }
         }
     }
@@ -1201,7 +1311,7 @@ impl Runtime {
     fn spawn_turn(&mut self, mut agent: Agent, prompt: UserPrompt) {
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::channel();
-        self.view.start_turn(prompt.clone());
+        self.view.start_turn(&prompt);
         self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
@@ -1270,6 +1380,7 @@ impl Runtime {
     fn apply_agent_event(&mut self, event: AgentEvent) {
         if let AgentEvent::ContextUpdated(snapshot) = &event {
             self.context_snapshot = snapshot.clone();
+            self.cache_status_rate_limits(snapshot.rate_limits.clone());
         }
         self.view.handle_agent_event(event);
     }
@@ -1310,6 +1421,29 @@ impl Runtime {
         self.update_check_started = true;
         self.update_check = Some(tokio::spawn(crate::update::check_for_update()));
     }
+
+    fn start_rate_limit_prefetch_after_startup(&mut self) {
+        if self.rate_limit_prefetch_started {
+            return;
+        }
+        self.rate_limit_prefetch_started = true;
+        self.start_rate_limit_refresh();
+    }
+
+    fn start_rate_limit_refresh(&mut self) {
+        if self.rate_limit_task.is_some() {
+            return;
+        }
+        let client = self.rate_limit_client.clone();
+        self.rate_limit_task = Some(tokio::spawn(async move { client.fetch().await }));
+    }
+
+    fn cache_status_rate_limits(&mut self, snapshots: impl IntoIterator<Item = RateLimitSnapshot>) {
+        for snapshot in snapshots {
+            self.status_rate_limits
+                .insert(snapshot.limit_id.clone(), snapshot);
+        }
+    }
 }
 
 impl Drop for Runtime {
@@ -1321,6 +1455,7 @@ impl Drop for Runtime {
         abort_join_task(&mut self.session_scan);
         abort_join_task(&mut self.resume_task);
         abort_join_task(&mut self.update_check);
+        abort_join_task(&mut self.rate_limit_task);
         abort_join_task(&mut self.prompt_history_task);
         for (_, task) in self.operator_command_tasks.drain() {
             task.abort();
@@ -1506,6 +1641,15 @@ async fn receive_resume_completion(
 async fn receive_update_check(
     task: &mut Option<UpdateCheckTask>,
 ) -> std::result::Result<Option<AvailableUpdate>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => pending().await,
+    }
+}
+
+async fn receive_rate_limit_refresh(
+    task: &mut Option<RateLimitTask>,
+) -> std::result::Result<Result<Vec<RateLimitSnapshot>>, tokio::task::JoinError> {
     match task {
         Some(task) => task.await,
         None => pending().await,

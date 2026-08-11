@@ -187,6 +187,7 @@ pub(crate) struct ApiClient {
     websocket: Option<WebSocketConnection>,
     websocket_reasoning_included: bool,
     websocket_server_model: Option<String>,
+    websocket_rate_limits: Vec<crate::rate_limits::RateLimitSnapshot>,
     websocket_baseline: Option<WebSocketBaseline>,
     server_model_warning_emitted: bool,
     stream_idle_timeout: Duration,
@@ -452,6 +453,7 @@ pub(crate) struct ModelResponse {
     pub(crate) final_answer: Option<String>,
     pub(crate) end_turn: Option<bool>,
     pub(crate) usage: Option<TokenUsage>,
+    pub(crate) rate_limits: Vec<crate::rate_limits::RateLimitSnapshot>,
     pub(crate) server_reasoning_included: bool,
     response_id: String,
     output_item_count: usize,
@@ -468,6 +470,7 @@ impl ModelResponse {
 pub(crate) struct CompactionResult {
     pub(crate) items: Vec<Value>,
     pub(crate) usage: Option<TokenUsage>,
+    pub(crate) rate_limits: Vec<crate::rate_limits::RateLimitSnapshot>,
 }
 
 impl ApiClient {
@@ -524,6 +527,7 @@ impl ApiClient {
             websocket: None,
             websocket_reasoning_included: false,
             websocket_server_model: None,
+            websocket_rate_limits: Vec::new(),
             websocket_baseline: None,
             server_model_warning_emitted: false,
             stream_idle_timeout: STREAM_IDLE_TIMEOUT,
@@ -585,6 +589,14 @@ impl ApiClient {
         OpenAiDocsClient::new(self.client.clone())
     }
 
+    pub(crate) fn rate_limit_client(&self) -> crate::rate_limits::RateLimitClient {
+        crate::rate_limits::RateLimitClient::new(
+            self.client.clone(),
+            self.auth.clone(),
+            &self.base_url,
+        )
+    }
+
     pub(crate) fn tool_turn_context(&self, history: &[Value]) -> ToolTurnContext {
         let selection = self.model_selection.get();
         ToolTurnContext::from_history(
@@ -598,6 +610,7 @@ impl ApiClient {
         self.websocket = None;
         self.websocket_reasoning_included = false;
         self.websocket_server_model = None;
+        self.websocket_rate_limits.clear();
         self.websocket_baseline = None;
     }
 
@@ -775,6 +788,7 @@ impl ApiClient {
         let response = self
             .post("responses", request, "text/event-stream", request_kind)
             .await?;
+        let rate_limits = crate::rate_limits::parse_all_rate_limits(response.headers());
         observe_server_model(
             response
                 .headers()
@@ -799,6 +813,7 @@ impl ApiClient {
         )
         .await?;
         response.server_reasoning_included = server_reasoning_included;
+        response.rate_limits = rate_limits;
         Ok(response)
     }
 
@@ -893,6 +908,12 @@ impl ApiClient {
         }
         let mut response = collected.finish()?;
         response.server_reasoning_included = self.websocket_reasoning_included;
+        let streamed_rate_limits = std::mem::take(&mut response.rate_limits);
+        response.rate_limits.clone_from(&self.websocket_rate_limits);
+        for snapshot in streamed_rate_limits {
+            upsert_rate_limit(&mut response.rate_limits, snapshot);
+        }
+        self.websocket_rate_limits.clone_from(&response.rate_limits);
         Ok(response)
     }
 
@@ -915,6 +936,7 @@ impl ApiClient {
             .get("openai-model")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        self.websocket_rate_limits = crate::rate_limits::parse_all_rate_limits(&response_headers);
         self.capture_turn_state(&response_headers);
         self.websocket = Some(websocket);
         Ok(())
@@ -1137,6 +1159,7 @@ impl ApiClient {
         Ok(CompactionResult {
             items,
             usage: response.usage,
+            rate_limits: response.rate_limits,
         })
     }
 
@@ -1714,6 +1737,7 @@ struct CollectedResponse {
     pending_items: BTreeMap<usize, Value>,
     item_summary: ResponseItemSummary,
     usage: Option<TokenUsage>,
+    rate_limits: Vec<crate::rate_limits::RateLimitSnapshot>,
     end_turn: Option<bool>,
     response_id: Option<String>,
     completed: bool,
@@ -1744,6 +1768,7 @@ impl CollectedResponse {
             pending_items: BTreeMap::new(),
             item_summary: ResponseItemSummary::default(),
             usage: None,
+            rate_limits: Vec::new(),
             end_turn: None,
             response_id: None,
             completed: false,
@@ -1756,6 +1781,10 @@ impl CollectedResponse {
             | CollectedOutputItems::Retained(items) => items.len(),
             CollectedOutputItems::Transferred { count } => *count,
         }
+    }
+
+    fn upsert_rate_limit(&mut self, snapshot: crate::rate_limits::RateLimitSnapshot) {
+        upsert_rate_limit(&mut self.rate_limits, snapshot);
     }
 
     fn push_item(
@@ -1844,6 +1873,7 @@ impl CollectedResponse {
             final_answer: self.item_summary.final_answer,
             end_turn: self.end_turn,
             usage: self.usage,
+            rate_limits: self.rate_limits,
             server_reasoning_included: false,
             response_id: self
                 .response_id
@@ -1851,6 +1881,20 @@ impl CollectedResponse {
             output_item_count,
             has_assistant_text: self.item_summary.has_assistant_text,
         })
+    }
+}
+
+fn upsert_rate_limit(
+    snapshots: &mut Vec<crate::rate_limits::RateLimitSnapshot>,
+    snapshot: crate::rate_limits::RateLimitSnapshot,
+) {
+    if let Some(existing) = snapshots
+        .iter_mut()
+        .find(|existing| existing.limit_id == snapshot.limit_id)
+    {
+        *existing = snapshot;
+    } else {
+        snapshots.push(snapshot);
     }
 }
 
@@ -1908,6 +1952,10 @@ fn process_event_value(
     expected_model: &str,
     server_model_warning_emitted: &mut bool,
 ) -> ApiResult<()> {
+    if let Some(snapshot) = crate::rate_limits::parse_rate_limit_event(&event) {
+        collected.upsert_rate_limit(snapshot);
+        return Ok(());
+    }
     observe_server_model(
         event_server_model(&event),
         expected_model,

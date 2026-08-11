@@ -120,7 +120,7 @@ fn legacy_fork_snapshot_recovers_tools_from_matching_history() {
         text: "Inspection complete.".to_string(),
         phase: Some(MessagePhase::FinalAnswer),
     };
-    rollout.record_fork("source-session", 0).unwrap();
+    rollout.record_fork("source-session", 0, None).unwrap();
     rollout
         .write_record(&RolloutRecord::TranscriptSnapshot {
             items: vec![user.clone(), assistant.clone()],
@@ -268,6 +268,14 @@ fn rollout_replays_replacements_usage_and_turn_state() {
         ..TokenUsage::default()
     };
     rollout.record_usage(&usage, 9, true).unwrap();
+    let latest_usage = TokenUsage {
+        input_tokens: 20,
+        cached_input_tokens: 5,
+        output_tokens: 6,
+        total_tokens: 26,
+        ..TokenUsage::default()
+    };
+    rollout.record_usage(&latest_usage, 18, false).unwrap();
     rollout.record_service_tier(ServiceTier::Fast).unwrap();
     drop(rollout);
 
@@ -278,14 +286,68 @@ fn rollout_replays_replacements_usage_and_turn_state() {
     )
     .unwrap();
     assert_eq!(loaded.history.len(), 2);
-    assert_eq!(loaded.usage, Some(usage));
-    assert_eq!(loaded.usage_history_estimate, Some(9));
-    assert!(loaded.server_reasoning_included);
+    assert_eq!(loaded.usage, Some(latest_usage));
+    assert_eq!(loaded.usage_history_estimate, Some(18));
+    assert!(!loaded.server_reasoning_included);
+    assert_eq!(
+        loaded.total_usage,
+        TokenUsage {
+            input_tokens: 30,
+            cached_input_tokens: 5,
+            output_tokens: 10,
+            total_tokens: 40,
+            ..TokenUsage::default()
+        }
+    );
     assert_eq!(loaded.unfinished_turn.as_deref(), Some("turn-1"));
     assert_eq!(loaded.compaction_count, 0);
     assert_eq!(loaded.service_tier, ServiceTier::Fast);
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fork_rollout_replays_parent_identity_and_cumulative_usage() {
+    let root = temporary_directory("rollout-fork-usage");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let prior_usage = TokenUsage {
+        input_tokens: 100,
+        cached_input_tokens: 80,
+        output_tokens: 10,
+        total_tokens: 110,
+        ..TokenUsage::default()
+    };
+    let latest_usage = TokenUsage {
+        input_tokens: 40,
+        cached_input_tokens: 20,
+        output_tokens: 5,
+        total_tokens: 45,
+        ..TokenUsage::default()
+    };
+    rollout
+        .record_fork("parent-session", 2, Some(prior_usage))
+        .unwrap();
+    rollout.record_usage(&latest_usage, 35, true).unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+
+    assert_eq!(loaded.forked_from.as_deref(), Some("parent-session"));
+    assert_eq!(loaded.compaction_count, 2);
+    assert_eq!(
+        loaded.total_usage,
+        TokenUsage {
+            input_tokens: 140,
+            cached_input_tokens: 100,
+            output_tokens: 15,
+            total_tokens: 155,
+            ..TokenUsage::default()
+        }
+    );
 }
 
 #[test]

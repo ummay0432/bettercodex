@@ -15,6 +15,11 @@ Do not use emojis, except for Codex's established checkmark status marker.
 
 The startup art is off limits: do not modify or delete it.
 
+Do not create, edit, regenerate, or otherwise tweak model-facing context without
+the user's explicit approval, including `AGENTS.md`, `prompts/system.md`,
+`prompts/tool-catalogue.md`, other `prompts/*.md`, tool descriptions, and
+model-visible errors.
+
 Do not add audio or video support, dependencies, protocol items, runtime helpers,
 tool descriptions, fixtures, or tests; bettercodex does not use either modality.
 
