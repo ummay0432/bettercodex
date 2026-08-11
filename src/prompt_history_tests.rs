@@ -142,3 +142,30 @@ fn oversized_history_rows_make_forward_progress() {
     assert_eq!(reader.read_older().unwrap(), ["oldest"]);
     assert!(!reader.has_more());
 }
+
+#[test]
+fn appends_follow_history_rotation() {
+    let history_file = TemporaryHistory::new();
+    let mut history = PromptHistory::open_in(&history_file.path, "rotation-session").unwrap();
+    history.append("before rotation").unwrap();
+
+    let archived = history_file.directory.join("history.previous.jsonl");
+    std::fs::rename(&history_file.path, &archived).unwrap();
+    std::fs::write(
+        &history_file.path,
+        format!("{}\n", encoded_entry(1, "replacement entry")),
+    )
+    .unwrap();
+
+    history.append("after rotation").unwrap();
+    let (_current, reader) =
+        PromptHistory::open_with_reader_in(&history_file.path, "current-session").unwrap();
+    assert_eq!(
+        read_all_newest_first(reader),
+        ["after rotation", "replacement entry"]
+    );
+
+    let archived_text = std::fs::read_to_string(archived).unwrap();
+    let archived_entry: serde_json::Value = serde_json::from_str(archived_text.trim()).unwrap();
+    assert_eq!(archived_entry["text"], "before rotation");
+}

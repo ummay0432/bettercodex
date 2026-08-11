@@ -7,14 +7,12 @@ use crate::auth::Auth;
 use crate::compaction::CompactionPhase;
 use crate::compaction::CompactionRequest;
 use crate::compaction::InitialContextInjection;
-use crate::compaction::ModelSwitchCompactionReason;
 use crate::context::ActiveTurnContext;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserInput;
-use crate::model::ModelCatalogClient;
 use crate::model::ModelSelection;
 use crate::rollout::LoadedRollout;
 use crate::rollout::ResumeSelector;
@@ -27,15 +25,12 @@ use crate::tools::ToolRuntime;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use futures_util::StreamExt;
-use futures_util::stream::FuturesOrdered;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
@@ -300,10 +295,6 @@ impl Agent {
         Ok(())
     }
 
-    pub(crate) fn model_catalog_client(&self) -> ModelCatalogClient {
-        self.api.model_catalog_client()
-    }
-
     pub(crate) fn service_tier(&self) -> ServiceTier {
         self.conversation.service_tier()
     }
@@ -421,19 +412,6 @@ impl Agent {
         let turn_id = self.api.begin_turn().to_string();
         self.conversation.start_turn(&turn_id)?;
         let active_turn_context = ActiveTurnContext::default();
-        let target_selection = self.conversation.model_selection().clone();
-        let compaction_selection = self
-            .pending_model_switch_compaction()
-            .and_then(|_| self.conversation.history_model_selection().cloned())
-            .unwrap_or_else(|| target_selection.clone());
-        let compaction_uses_target = compaction_selection == target_selection;
-        let fallback_selection = (compaction_selection.model != target_selection.model)
-            .then_some(target_selection.clone());
-        if compaction_uses_target {
-            self.conversation
-                .record_history_model_selection(&target_selection)?;
-        }
-        self.api.set_model_selection(compaction_selection);
         let result = self
             .run_compaction_inner(
                 &Some(events),
@@ -441,17 +419,8 @@ impl Agent {
                 CompactionRequest::Manual,
                 InitialContextInjection::AfterCompaction,
                 &active_turn_context,
-                fallback_selection.as_ref(),
             )
             .await;
-        self.api.set_model_selection(target_selection.clone());
-        let result = match result {
-            Ok(true) => self
-                .conversation
-                .record_history_model_selection(&target_selection)
-                .map(|()| true),
-            result => result,
-        };
         control.close();
         let outcome = match &result {
             Ok(true) => TurnOutcome::Completed,
@@ -501,12 +470,6 @@ impl Agent {
     ) -> Result<SubmitOutcome> {
         let mut active_turn_context = ActiveTurnContext::default();
         if !self
-            .prepare_model_switch(events, &control.cancellation, &active_turn_context)
-            .await?
-        {
-            return Ok(SubmitOutcome::Cancelled);
-        }
-        if !self
             .record_incoming_user(
                 IncomingUserInput::Initial(input),
                 events,
@@ -520,15 +483,8 @@ impl Agent {
         }
 
         // Hide the one-time ICU decompression and V8 platform initialization behind the model's
-        // first sampling request without charging direct-only models for an unavailable route.
-        if self
-            .conversation
-            .model_selection()
-            .tool_mode()
-            .includes_code_mode()
-        {
-            self.tools.prewarm();
-        }
+        // first sampling request.
+        self.tools.prewarm();
         let mut pending_steering = VecDeque::new();
         // Sample the fresh turn input first. After a mid-turn compact, sample the
         // compacted tool continuation once before inserting queued steering.
@@ -558,11 +514,8 @@ impl Agent {
             }
             can_record_pending_steering = true;
 
-            let tool_mode = self.conversation.model_selection().tool_mode();
-            let code_mode_step = tool_mode.includes_code_mode().then(|| {
-                let context = self.api.tool_turn_context(self.conversation.items());
-                self.tools.begin_step(context, events.clone())
-            });
+            let context = self.api.tool_turn_context(self.conversation.items());
+            let code_mode_step = self.tools.begin_step(context, events.clone());
             let response = match self.sample_with_recovery(events, control).await? {
                 SamplingOutcome::Response(response) => response,
                 SamplingOutcome::Cancelled => return Ok(SubmitOutcome::Cancelled),
@@ -600,35 +553,16 @@ impl Agent {
             }
 
             let context = self.api.tool_turn_context(self.conversation.items());
-            let execution_gate = Arc::new(RwLock::new(()));
-            let mut in_flight = FuturesOrdered::new();
             for tool_call in tool_calls {
-                let execution_gate = Arc::clone(&execution_gate);
-                let context = context.clone();
                 let cancellation = control.cancellation.clone();
-                let events = events.clone();
-                let tools = &self.tools;
-                in_flight.push_back(async move {
-                    let output = if tool_call.supports_parallel_execution() {
-                        let _execution = execution_gate.read_owned().await;
-                        tool_call
-                            .execute(tools, tool_mode, context, events, cancellation)
-                            .await
-                    } else {
-                        let _execution = execution_gate.write_owned().await;
-                        tool_call
-                            .execute(tools, tool_mode, context, events, cancellation)
-                            .await
-                    };
-                    (tool_call, output)
-                });
-            }
-            while let Some((tool_call, output)) = in_flight.next().await {
+                let tool_events = events.clone();
+                let output = tool_call
+                    .execute(&self.tools, context.clone(), tool_events, cancellation)
+                    .await;
                 self.conversation
                     .extend(tool_call.into_output_items(output))?;
                 self.emit_context(events);
             }
-            drop(in_flight);
             drop(code_mode_step);
             if control.cancellation.is_cancelled() {
                 return Ok(SubmitOutcome::Cancelled);
@@ -648,64 +582,6 @@ impl Agent {
                 }
                 can_record_pending_steering = false;
             }
-        }
-    }
-
-    fn pending_model_switch_compaction(&self) -> Option<ModelSwitchCompactionReason> {
-        let previous = self.conversation.history_model_selection()?;
-        let current = self.conversation.model_selection();
-        if previous == current {
-            return None;
-        }
-        if previous
-            .comp_hash
-            .as_deref()
-            .zip(current.comp_hash.as_deref())
-            .is_some_and(|(previous, current)| previous != current)
-        {
-            return Some(ModelSwitchCompactionReason::CompHashChanged);
-        }
-        let downshift_exceeds_limit = previous.model != current.model
-            && previous.effective_context_window() > current.effective_context_window()
-            && self.conversation.active_context_tokens() >= current.auto_compact_token_limit();
-        downshift_exceeds_limit.then_some(ModelSwitchCompactionReason::ModelDownshift)
-    }
-
-    async fn prepare_model_switch(
-        &mut self,
-        events: &Option<UnboundedSender<AgentEvent>>,
-        cancellation: &CancellationToken,
-        active_turn_context: &ActiveTurnContext,
-    ) -> Result<bool> {
-        let target_selection = self.conversation.model_selection().clone();
-        let Some(reason) = self.pending_model_switch_compaction() else {
-            return Ok(true);
-        };
-        let Some(previous_selection) = self.conversation.history_model_selection().cloned() else {
-            return Ok(true);
-        };
-        let fallback_selection = (previous_selection.model != target_selection.model)
-            .then_some(target_selection.clone());
-        self.api.set_model_selection(previous_selection);
-        let result = self
-            .run_compaction_inner(
-                events,
-                cancellation,
-                CompactionRequest::ModelSwitch(reason),
-                InitialContextInjection::AfterCompaction,
-                active_turn_context,
-                fallback_selection.as_ref(),
-            )
-            .await;
-        // Restoring the selected model must not depend on whether compaction succeeds.
-        self.api.set_model_selection(target_selection.clone());
-        match result {
-            Ok(true) => {
-                self.conversation
-                    .record_history_model_selection(&target_selection)?;
-                Ok(true)
-            }
-            result => result,
         }
     }
 
@@ -732,9 +608,6 @@ impl Agent {
                     "active conversation requires {active_context_tokens} tokens, exceeding bettercodex's {effective_context_window}-token effective context window"
                 ));
             }
-            let selection = self.conversation.model_selection().clone();
-            self.conversation
-                .record_history_model_selection(&selection)?;
             let (completed_tx, mut completed_rx) = unbounded_channel::<Value>();
             let mut observed_item = false;
             let (history, cursor) = self.conversation.take_history_for_sampling();
@@ -844,16 +717,12 @@ impl Agent {
         if cancellation.is_cancelled() {
             return Ok(false);
         }
-        let selection = self.conversation.model_selection().clone();
-        self.conversation
-            .record_history_model_selection(&selection)?;
         self.run_compaction_inner(
             events,
             cancellation,
             compaction,
             initial_context_injection,
             active_turn_context,
-            None,
         )
         .await
     }
@@ -865,7 +734,6 @@ impl Agent {
         compaction: CompactionRequest,
         initial_context_injection: InitialContextInjection,
         active_turn_context: &ActiveTurnContext,
-        fallback_selection: Option<&ModelSelection>,
     ) -> Result<bool> {
         if cancellation.is_cancelled() {
             return Ok(false);
@@ -876,29 +744,6 @@ impl Agent {
         let compacted = self
             .request_compaction(events, cancellation, compaction, history_cursor)
             .await;
-        let compacted = match compacted {
-            Some(Err(previous_error)) if let Some(fallback_selection) = fallback_selection => {
-                tracing::warn!(
-                    error = %previous_error,
-                    fallback_model = %fallback_selection.model,
-                    "previous-model compaction failed; retrying with the selected model"
-                );
-                self.api.set_model_selection(fallback_selection.clone());
-                match self
-                    .request_compaction(events, cancellation, compaction, history_cursor)
-                    .await
-                {
-                    Some(Ok(compacted)) => Some(Ok(compacted)),
-                    Some(Err(fallback_error)) => {
-                        return Err(anyhow!(
-                            "previous-model compaction failed ({previous_error}); selected-model fallback also failed: {fallback_error}"
-                        ));
-                    }
-                    None => None,
-                }
-            }
-            compacted => compacted,
-        };
         let Some(compacted) = compacted else {
             // Dropping the request future stops polling, but the server still owns the
             // in-flight response. A Responses WebSocket cannot carry the next request

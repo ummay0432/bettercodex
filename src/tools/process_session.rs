@@ -43,6 +43,8 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 9] = [
     ("GH_PAGER", "cat"),
     ("CODEX_CI", "1"),
 ];
+const NON_INHERITABLE_ENV_VARS: [&str; 2] =
+    ["OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE"];
 
 #[derive(Clone, Copy)]
 pub(super) enum ProcessMode {
@@ -79,6 +81,13 @@ impl ProcessSession {
         let mut environment = std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
             .collect::<HashMap<_, _>>();
+        // Match current Codex: model-reachable children must not inherit launch identity context.
+        // This is case-insensitive so explicitly mixed-case variants cannot bypass the scrub.
+        environment.retain(|name, _| {
+            !NON_INHERITABLE_ENV_VARS
+                .iter()
+                .any(|restricted| restricted.eq_ignore_ascii_case(name))
+        });
         for (key, value) in UNIFIED_EXEC_ENV {
             environment.insert(key.to_string(), value.to_string());
         }

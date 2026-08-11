@@ -21,23 +21,39 @@ framework, Node workspace, and Bazel build.
 ## Focused choices
 
 - default model: `gpt-5.6-sol`;
-- default reasoning effort: `max`;
-- available models and API reasoning efforts: the authenticated Codex model
-  catalog exposed through `/model`, capped at `max` reasoning, with a bundled
-  snapshot for startup and offline fallback;
-- context and automatic-compaction limits: the selected model's Codex catalog
-  metadata (the default remains 272,000 raw, 258,400 effective, and 244,800 at
-  automatic compaction);
+- default reasoning effort: `xhigh`;
+- available models: exactly `gpt-5.6-sol`, `gpt-5.6-terra`, and
+  `gpt-5.6-luna`, exposed through `/model` with their GPT-5.6 reasoning
+  efforts capped at `max`; bettercodex does not fetch or retain a broader model
+  catalog;
+- context and automatic-compaction limits: the GPT-5.6 Codex metadata shared by
+  all three models: 272,000 raw, 258,400 effective, and 244,800 at automatic
+  compaction;
 - maximum output tokens: 128,000; and
-- tool routing: the selected model's current Codex `tool_mode` selector without
-  reinterpretation. `direct` exposes native tools, `code_mode` adds local
-  `exec`/`wait` while retaining those direct tools, and `code_mode_only` exposes
-  `exec`/`wait` while making the retained implementations available as nested
-  tools.
+- tool routing: the GPT-5.6 Responses Lite `code_mode_only` route. Responses
+  exposes only `exec`/`wait`; retained tool implementations are available only
+  as nested Code Mode tools.
 
 Codex Code Mode is the upstream client-side V8 `exec`/`wait` path, not the
 Responses API's hosted `programmatic_tool_calling` tool. Do not translate
 between them or add hosted-PTC request fields unless current upstream Codex does.
+
+`code_mode_only` is a transport route, not a reason to turn every tool stage
+into a JavaScript workflow. Apply
+[OpenAI's Programmatic Tool Calling selection boundary](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling#choose-when-to-use-programmatic-tool-calling)
+to the shape of each Code Mode cell:
+
+- when one call is sufficient, the result shape is not reliably documented,
+  fresh model judgment should follow a result, or the stage is adaptive,
+  write/approval-sensitive, citation-heavy, or carries a native artifact, make
+  one nested call, preserve its complete result, and return control to the
+  model; and
+- compose or batch nested calls only for a bounded, predictable, read-only stage
+  where code can filter, join, rank, deduplicate, aggregate, or validate
+  structured intermediate results into a materially smaller result. Constrain
+  the eligible calls and make the result fields, call and retry limits, failure
+  behavior, stopping condition, and handoff back to model judgment explicit;
+  parallelize only independent side-effect-free reads.
 
 `/model` is the only model-selection surface. It persists the selection as
 focused bettercodex state without introducing providers, profiles, or a general

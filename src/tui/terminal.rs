@@ -20,8 +20,10 @@ use crossterm::style::Attribute;
 use crossterm::style::ResetColor;
 use crossterm::style::SetAttribute;
 use crossterm::style::SetBackgroundColor;
+use crossterm::terminal::BeginSynchronizedUpdate;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
+use crossterm::terminal::EndSynchronizedUpdate;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
 use ratatui::Terminal;
@@ -184,7 +186,6 @@ where
 {
     pub(super) fn clear_screen(&mut self) -> Result<()> {
         ensure_virtual_terminal_processing()?;
-        self.refresh_screen_size()?;
         // This is the same reset/home/visible-clear/scrollback-purge sequence Codex uses before
         // replaying source-backed transcript cells after a resize.
         write!(
@@ -201,14 +202,60 @@ where
         Ok(())
     }
 
-    pub(super) fn width(&mut self) -> Result<u16> {
-        self.refresh_screen_size()?;
-        Ok(self.screen_size.width)
+    pub(super) fn screen_size(&self) -> Size {
+        self.screen_size
     }
 
-    pub(super) fn height(&mut self) -> Result<u16> {
-        self.refresh_screen_size()?;
-        Ok(self.screen_size.height)
+    /// Keep destructive viewport updates and their replacement frame in one terminal update.
+    ///
+    /// Growing an inline response can resize Ratatui's fixed viewport or move completed rows into
+    /// scrollback. Both operations clear or scroll visible cells before the next draw restores the
+    /// mutable tail. Terminals that implement synchronized updates continue presenting the prior
+    /// frame until the entire transaction is ready, avoiding a visible blank intermediate frame.
+    pub(super) fn synchronized_update<T>(
+        &mut self,
+        update: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)
+            .context("failed to begin synchronized terminal update")?;
+        let update_result = update(self);
+        // Always attempt to release the terminal's presentation lock, including when a clear,
+        // history insertion, or draw failed.
+        let end_result = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate)
+            .context("failed to end synchronized terminal update");
+        let value = update_result?;
+        end_result?;
+        Ok(value)
+    }
+
+    /// Apply geometry already carried by a terminal resize event.
+    ///
+    /// Ordinary redraws use this cached value. The event loop performs one delayed backend query
+    /// after resize activity settles so a coalesced or early event cannot leave the cache stale.
+    pub(super) fn set_screen_size(&mut self, size: Size) -> bool {
+        if size == self.screen_size {
+            return false;
+        }
+        let was_bottom_aligned = self.viewport_area.bottom() == self.screen_size.height;
+        if was_bottom_aligned && size.height > self.screen_size.height {
+            self.viewport_top = self
+                .viewport_top
+                .saturating_add(size.height - self.screen_size.height);
+        }
+        self.viewport_top = self.viewport_top.min(size.height.saturating_sub(1));
+        self.screen_size = size;
+        true
+    }
+
+    /// Reconcile cached geometry with the terminal after a resize settles or the display surface
+    /// may have changed. Returns whether the cached size changed.
+    pub(super) fn refresh_screen_size(&mut self) -> Result<bool> {
+        let size = self
+            .terminal
+            .backend_mut()
+            .size()
+            .context("failed to read terminal size")?;
+        Ok(self.set_screen_size(size))
     }
 
     pub(super) fn insert_history_lines(
@@ -220,7 +267,6 @@ where
             return Ok(());
         }
         ensure_virtual_terminal_processing()?;
-        self.refresh_screen_size()?;
         let width = self.screen_size.width.max(1);
         let next_viewport_height = next_viewport_height.clamp(1, self.screen_size.height.max(1));
         let buffer = render_history_lines(&lines, width);
@@ -280,7 +326,6 @@ where
     }
 
     fn prepare_viewport(&mut self, height: u16) -> Result<()> {
-        self.refresh_screen_size()?;
         let height = height.clamp(1, self.screen_size.height.max(1));
         let overflow = self
             .viewport_top
@@ -326,25 +371,6 @@ where
             let chunk_len = remaining.min(LINE_FEED_CHUNK.len());
             writer.write_all(&LINE_FEED_CHUNK[..chunk_len])?;
             remaining -= chunk_len;
-        }
-        Ok(())
-    }
-
-    fn refresh_screen_size(&mut self) -> Result<()> {
-        let size = self
-            .terminal
-            .backend_mut()
-            .size()
-            .context("failed to read terminal size")?;
-        if size != self.screen_size {
-            let was_bottom_aligned = self.viewport_area.bottom() == self.screen_size.height;
-            if was_bottom_aligned && size.height > self.screen_size.height {
-                self.viewport_top = self
-                    .viewport_top
-                    .saturating_add(size.height - self.screen_size.height);
-            }
-            self.viewport_top = self.viewport_top.min(size.height.saturating_sub(1));
-            self.screen_size = size;
         }
         Ok(())
     }
@@ -909,6 +935,7 @@ mod tests {
         backend: CrosstermBackend<SharedParser>,
         output: SharedParser,
         size: Size,
+        size_call_count: std::cell::Cell<usize>,
     }
 
     impl VtBackend {
@@ -919,6 +946,7 @@ mod tests {
                     backend: CrosstermBackend::new(output.clone()),
                     output: output.clone(),
                     size: Size::new(width, height),
+                    size_call_count: std::cell::Cell::new(0),
                 },
                 output,
             )
@@ -980,6 +1008,8 @@ mod tests {
         }
 
         fn size(&self) -> io::Result<Size> {
+            self.size_call_count
+                .set(self.size_call_count.get().saturating_add(1));
             Ok(self.size)
         }
 
@@ -1060,6 +1090,74 @@ mod tests {
                 view.render_prepared(frame, prepared);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn ordinary_redraws_reuse_cached_screen_size() {
+        let (mut terminal, _) = test_terminal(
+            /*width*/ 80, /*screen_height*/ 24, /*viewport_height*/ 1,
+        );
+        assert_eq!(terminal.terminal.backend().size_call_count.get(), 0);
+        for _ in 0..3 {
+            terminal.draw(/*height*/ 1, |_| {}).unwrap();
+        }
+        assert_eq!(terminal.terminal.backend().size_call_count.get(), 0);
+
+        let resized = Size::new(/*width*/ 72, /*height*/ 20);
+        terminal.terminal.backend_mut().size = resized;
+        assert!(terminal.set_screen_size(resized));
+        for _ in 0..3 {
+            terminal.draw(/*height*/ 1, |_| {}).unwrap();
+        }
+        // Ratatui samples once while clearing a resized fixed viewport. Later frames reuse it.
+        assert_eq!(terminal.terminal.backend().size_call_count.get(), 1);
+        terminal
+            .insert_history_lines(
+                vec!["cached-size history".into()],
+                /*next_viewport_height*/ 1,
+            )
+            .unwrap();
+
+        assert_eq!(terminal.screen_size(), resized);
+        assert_eq!(terminal.terminal.backend().size_call_count.get(), 1);
+        assert!(!terminal.refresh_screen_size().unwrap());
+        assert_eq!(terminal.terminal.backend().size_call_count.get(), 2);
+    }
+
+    #[test]
+    fn viewport_clear_and_repaint_are_one_synchronized_update() {
+        let (mut terminal, output) = test_terminal(
+            /*width*/ 40, /*screen_height*/ 8, /*viewport_height*/ 1,
+        );
+
+        terminal
+            .synchronized_update(|terminal| {
+                terminal.draw(/*height*/ 3, |frame| {
+                    frame.render_widget(Paragraph::new("replacement frame"), frame.area());
+                })
+            })
+            .unwrap();
+
+        let bytes = output.bytes.borrow();
+        let position = |sequence: &[u8]| {
+            bytes
+                .windows(sequence.len())
+                .position(|window| window == sequence)
+                .unwrap_or_else(|| panic!("missing terminal sequence {sequence:?}"))
+        };
+        let begin = position(b"\x1b[?2026h");
+        let clear = position(b"\x1b[J");
+        let end = position(b"\x1b[?2026l");
+        let mut presented =
+            vt100::Parser::new(/*rows*/ 8, /*cols*/ 40, /*scrollback*/ 0);
+        presented.write_all(&bytes[..end]).unwrap();
+
+        assert!(begin < clear, "clear must follow synchronized-update begin");
+        assert!(clear < end, "clear must precede synchronized-update end");
+        assert!(
+            presented.screen().contents().contains("replacement frame"),
+            "replacement frame must be complete before synchronized-update end"
+        );
     }
 
     #[test]

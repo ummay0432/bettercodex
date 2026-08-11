@@ -51,7 +51,6 @@ use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::input::UserInput;
 use crate::input::UserPrompt;
-use crate::model::ModelPreset;
 use crate::model::ModelSelection;
 use crate::prompt_history::PromptHistory;
 use crate::prompt_history::PromptHistoryReader;
@@ -71,6 +70,7 @@ use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures_util::StreamExt;
 use notifications::Notifier;
+use ratatui::layout::Size;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -98,9 +98,15 @@ type TurnTask = JoinHandle<TurnResult>;
 type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
 type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
-type ModelCatalogTask = JoinHandle<Result<Vec<ModelPreset>>>;
 type PromptHistoryTask = JoinHandle<(PromptHistoryReader, Result<Vec<String>>)>;
-const FRAME_INTERVAL: Duration = Duration::from_millis(32);
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(32);
+// Match Codex's 120 FPS ceiling for streamed output. Agent events request frames independently
+// from the slower status-animation clock, so fresh text is presented promptly without repainting
+// an unchanged busy view four times as often.
+const STREAM_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
+// Match Codex's settled-size recheck delay. Resize events are applied immediately; one backend
+// sample after this quiet period catches terminals whose reported dimensions settle late.
+const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(75);
 const PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(windows)]
 const PASTE_BURST_TICK_INTERVAL: Duration = Duration::from_millis(9);
@@ -201,7 +207,6 @@ struct Runtime {
     prompt_history_exclusions: HashSet<String>,
     processes: ProcessManager,
     model_selection: ModelSelection,
-    model_catalog_task: Option<ModelCatalogTask>,
     service_tier: ServiceTier,
     session_scan: Option<SessionScanTask>,
     resume_task: Option<ResumeTask>,
@@ -302,10 +307,6 @@ impl Runtime {
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
         let (operator_command_updates_tx, operator_command_updates) = unbounded_channel();
         let (diff_updates_tx, diff_updates) = unbounded_channel();
-        let model_catalog = agent.model_catalog_client();
-        let model_catalog_task = Some(tokio::spawn(
-            async move { model_catalog.list_models().await },
-        ));
         Ok(Self {
             clipboard_lease: None,
             view,
@@ -327,7 +328,6 @@ impl Runtime {
             prompt_history_exclusions,
             processes,
             model_selection,
-            model_catalog_task,
             service_tier,
             session_scan: None,
             resume_task: None,
@@ -346,9 +346,11 @@ impl Runtime {
 
     async fn event_loop(&mut self, session: &mut terminal::TerminalSession) -> Result<()> {
         let mut input = EventStream::new();
-        let mut ticks =
-            tokio::time::interval_at(tokio::time::Instant::now() + FRAME_INTERVAL, FRAME_INTERVAL);
-        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut animation_ticks = tokio::time::interval_at(
+            tokio::time::Instant::now() + ANIMATION_FRAME_INTERVAL,
+            ANIMATION_FRAME_INTERVAL,
+        );
+        animation_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut process_ticks = tokio::time::interval(PROCESS_STATUS_INTERVAL);
         process_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         #[cfg(windows)]
@@ -357,6 +359,8 @@ impl Runtime {
         paste_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         #[cfg(not(windows))]
         let mut paste_ticks = ();
+        let mut screen_size_recheck_at = None;
+        let mut stream_frames = StreamFramePacer::default();
         let mut redraw = true;
 
         loop {
@@ -369,15 +373,15 @@ impl Runtime {
             };
             self.terminal_title.refresh(title_state)?;
             if redraw {
+                stream_frames.frame_started();
                 let terminal = session.terminal_mut();
                 let clear_requested = self.view.take_clear_request();
                 let mut resize_reflow_requested = self.view.take_resize_reflow_request();
-                let width = terminal.width()?;
-                let screen_height = terminal.height()?;
+                let screen_size = terminal.screen_size();
+                let width = screen_size.width;
+                let screen_height = screen_size.height;
                 resize_reflow_requested |= self.view.streamed_history_needs_reflow(width);
-                if clear_requested || resize_reflow_requested {
-                    terminal.clear_screen()?;
-                }
+                let rebuild_surface = clear_requested || resize_reflow_requested;
                 let mut history = if resize_reflow_requested && !clear_requested {
                     self.view
                         .history_lines_for_resize_reflow(width, screen_height)
@@ -387,8 +391,15 @@ impl Runtime {
                 let mut prepared = self.view.prepare(width, screen_height);
                 history.extend(prepared.take_history_lines());
                 let height = prepared.height();
-                terminal.insert_history_lines(history, height)?;
-                terminal.draw(height, |frame| self.view.render_prepared(frame, prepared))?;
+                terminal.synchronized_update(|terminal| {
+                    if rebuild_surface {
+                        terminal.clear_screen()?;
+                    }
+                    terminal.insert_history_lines(history, height)?;
+                    terminal.draw(height, |frame| {
+                        self.view.render_prepared(frame, prepared);
+                    })
+                })?;
                 redraw = false;
                 self.start_update_check_after_startup();
             }
@@ -401,9 +412,16 @@ impl Runtime {
                         break;
                     };
                     let event = terminal_event.context("failed to read terminal input")?;
-                    match event {
+                    match &event {
                         Event::FocusGained => self.terminal_focused = true,
                         Event::FocusLost => self.terminal_focused = false,
+                        Event::Resize(width, height) => {
+                            session
+                                .terminal_mut()
+                                .set_screen_size(Size::new(*width, *height));
+                            screen_size_recheck_at =
+                                Some(tokio::time::Instant::now() + RESIZE_SETTLE_DELAY);
+                        }
                         _ => {}
                     }
                     let action = self.view.handle_terminal_event(event);
@@ -411,7 +429,7 @@ impl Runtime {
                         .on_query_changed(self.view.file_search_query());
                     redraw = true;
                     if matches!(action, Action::EnterTmux) {
-                        self.enter_tmux(session).await;
+                        self.enter_tmux(session).await?;
                         continue;
                     }
                     if matches!(action, Action::Logout) {
@@ -428,10 +446,12 @@ impl Runtime {
                 event = receive_agent_event(&mut self.turn_events) => {
                     if let Some(event) = event {
                         // Model streams can produce deltas much faster than a terminal can paint
-                        // them. Fold every ready event into this frame and let the existing
-                        // animation clock bound repaint frequency instead of rendering per token.
+                        // them. Fold every ready event into one presentation frame, then coalesce
+                        // later requests behind Codex's 120 FPS ceiling instead of rendering per
+                        // token.
                         self.apply_agent_event(event);
                         self.drain_agent_events();
+                        redraw |= stream_frames.request_frame();
                     } else {
                         self.turn_events = None;
                     }
@@ -451,18 +471,6 @@ impl Runtime {
                         self.view.add_update_available(update);
                         redraw = true;
                     }
-                }
-                completion = receive_model_catalog(&mut self.model_catalog_task) => {
-                    self.model_catalog_task = None;
-                    match completion {
-                        Ok(Ok(models)) => {
-                            self.view.set_models(models);
-                            self.refresh_model_metadata();
-                        }
-                        Ok(Err(error)) => tracing::warn!(%error, "failed to refresh model catalogue; using bundled models"),
-                        Err(error) => tracing::warn!(%error, "model catalogue refresh task stopped unexpectedly"),
-                    }
-                    redraw = true;
                 }
                 completion = receive_prompt_history(&mut self.prompt_history_task) => {
                     self.prompt_history_task = None;
@@ -613,30 +621,42 @@ impl Runtime {
                 _ = receive_paste_tick(self.view.paste_burst_active(), &mut paste_ticks) => {
                     redraw |= self.view.flush_paste_burst();
                 }
-                _ = receive_frame_tick(animate, &mut ticks) => redraw = true,
+                _ = receive_deadline(screen_size_recheck_at) => {
+                    screen_size_recheck_at = None;
+                    if session.terminal_mut().refresh_screen_size()? {
+                        self.view.request_terminal_reflow();
+                        redraw = true;
+                    }
+                }
+                _ = receive_deadline(stream_frames.scheduled_at()) => {
+                    stream_frames.clear_schedule();
+                    redraw = true;
+                }
+                _ = receive_frame_tick(animate, &mut animation_ticks) => {
+                    redraw |= stream_frames.request_frame();
+                }
             }
         }
         Ok(())
     }
 
-    async fn enter_tmux(&mut self, session: &mut terminal::TerminalSession) {
+    async fn enter_tmux(&mut self, session: &mut terminal::TerminalSession) -> Result<()> {
         if crate::managed_session::is_tmux_active() {
             self.view
                 .add_notice("This session is already running in tmux".to_string());
-            return;
+            return Ok(());
         }
         if self.worker_handoff.is_none() {
             self.view.tmux_handoff_failed(
                 "Could not move this session into tmux: the interactive supervisor is unavailable",
             );
-            return;
+            return Ok(());
         }
         let size = {
             let terminal = session.terminal_mut();
-            terminal.width().and_then(|width| {
-                terminal
-                    .height()
-                    .map(|height| (width.max(1), height.max(1)))
+            terminal.refresh_screen_size().map(|_| {
+                let size = terminal.screen_size();
+                (size.width.max(1), size.height.max(1))
             })
         };
         let size = match size {
@@ -645,7 +665,7 @@ impl Runtime {
                 self.view.tmux_handoff_failed(format!(
                     "Could not move this session into tmux: failed to read terminal size: {error:#}"
                 ));
-                return;
+                return Ok(());
             }
         };
         let cwd = self.cwd.clone();
@@ -659,13 +679,13 @@ impl Runtime {
                 self.view.tmux_handoff_failed(format!(
                     "Could not move this session into tmux: {error:#}"
                 ));
-                return;
+                return Ok(());
             }
             Err(error) => {
                 self.view.tmux_handoff_failed(format!(
                     "Could not move this session into tmux: relay setup task failed: {error}"
                 ));
-                return;
+                return Ok(());
             }
         };
 
@@ -673,7 +693,7 @@ impl Runtime {
             self.view.tmux_handoff_failed(
                 "Could not move this session into tmux: the interactive supervisor stopped during setup",
             );
-            return;
+            return Ok(());
         };
         match session.migrate_to_tmux(prepared, worker_handoff) {
             Ok(session_name) => {
@@ -685,7 +705,11 @@ impl Runtime {
                 .view
                 .tmux_handoff_failed(format!("Could not move this session into tmux: {error:#}")),
         }
+        // The handoff can replace the display surface. Reconcile once before replaying source-
+        // backed transcript history instead of reviving per-frame geometry queries.
+        session.terminal_mut().refresh_screen_size()?;
         self.view.request_terminal_reflow();
+        Ok(())
     }
 
     fn handle_action(&mut self, action: Action) -> bool {
@@ -914,28 +938,6 @@ impl Runtime {
         }
     }
 
-    fn refresh_model_metadata(&mut self) {
-        let Some(selection) = self
-            .view
-            .selection_with_catalog_metadata(&self.model_selection)
-        else {
-            return;
-        };
-        if selection == self.model_selection {
-            return;
-        }
-        if let Some(agent) = self.agent.as_mut()
-            && let Err(error) = agent.set_model_selection(selection.clone())
-        {
-            tracing::warn!(%error, "failed to apply refreshed metadata for the selected model");
-            return;
-        }
-        self.apply_model_selection(selection.clone());
-        if let Err(error) = crate::model::save_default_selection(&selection) {
-            tracing::warn!(%error, "failed to persist refreshed model metadata");
-        }
-    }
-
     fn apply_model_selection(&mut self, selection: ModelSelection) {
         self.model_selection = selection.clone();
         self.view.set_model_selection(selection.clone());
@@ -1119,21 +1121,13 @@ impl Runtime {
 
     fn activate_resumed_session(&mut self, session: ResumedSession) {
         let ResumedSession {
-            mut agent,
+            agent,
             prompt_history,
             prompt_history_reader,
             mut prompt_history_exclusions,
             composer_history,
             transcript,
         } = session;
-        if let Some(selection) = self
-            .view
-            .selection_with_catalog_metadata(agent.model_selection())
-            && selection != *agent.model_selection()
-            && let Err(error) = agent.set_model_selection(selection)
-        {
-            tracing::warn!(%error, "failed to apply refreshed metadata to resumed model");
-        }
         let model_selection = agent.model_selection().clone();
         let service_tier = agent.service_tier();
         let cwd = agent.cwd().to_path_buf();
@@ -1327,7 +1321,6 @@ impl Drop for Runtime {
         abort_join_task(&mut self.session_scan);
         abort_join_task(&mut self.resume_task);
         abort_join_task(&mut self.update_check);
-        abort_join_task(&mut self.model_catalog_task);
         abort_join_task(&mut self.prompt_history_task);
         for (_, task) in self.operator_command_tasks.drain() {
             task.abort();
@@ -1374,6 +1367,49 @@ enum ReceiverState {
     Closed,
 }
 
+#[derive(Debug, Default)]
+struct StreamFramePacer {
+    last_frame_started_at: Option<tokio::time::Instant>,
+    scheduled_at: Option<tokio::time::Instant>,
+}
+
+impl StreamFramePacer {
+    fn frame_started(&mut self) {
+        self.last_frame_started_at = Some(tokio::time::Instant::now());
+        self.scheduled_at = None;
+    }
+
+    /// Request the earliest frame allowed by the stream-rate ceiling.
+    ///
+    /// A `true` result means the caller can draw now. Otherwise the request is retained at
+    /// [`Self::scheduled_at`] so repeated deltas coalesce behind the same deadline.
+    fn request_frame(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        let earliest = self
+            .last_frame_started_at
+            .and_then(|started| started.checked_add(STREAM_FRAME_INTERVAL))
+            .unwrap_or(now);
+        if earliest <= now {
+            self.scheduled_at = None;
+            true
+        } else {
+            self.scheduled_at = Some(
+                self.scheduled_at
+                    .map_or(earliest, |scheduled| scheduled.min(earliest)),
+            );
+            false
+        }
+    }
+
+    fn scheduled_at(&self) -> Option<tokio::time::Instant> {
+        self.scheduled_at
+    }
+
+    fn clear_schedule(&mut self) {
+        self.scheduled_at = None;
+    }
+}
+
 fn drain_ready_agent_events(
     receiver: &mut UnboundedReceiver<AgentEvent>,
     mut apply: impl FnMut(AgentEvent),
@@ -1407,6 +1443,13 @@ async fn receive_frame_tick(animate: bool, ticks: &mut Interval) {
         ticks.tick().await;
     } else {
         pending().await
+    }
+}
+
+async fn receive_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending().await,
     }
 }
 
@@ -1463,15 +1506,6 @@ async fn receive_resume_completion(
 async fn receive_update_check(
     task: &mut Option<UpdateCheckTask>,
 ) -> std::result::Result<Option<AvailableUpdate>, tokio::task::JoinError> {
-    match task {
-        Some(task) => task.await,
-        None => pending().await,
-    }
-}
-
-async fn receive_model_catalog(
-    task: &mut Option<ModelCatalogTask>,
-) -> std::result::Result<Result<Vec<ModelPreset>>, tokio::task::JoinError> {
     match task {
         Some(task) => task.await,
         None => pending().await,

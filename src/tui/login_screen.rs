@@ -452,7 +452,10 @@ pub(super) async fn run(session: &mut TerminalSession) -> Result<LoginScreenOutc
 
 fn redraw(session: &mut TerminalSession, screen: &LoginScreen) -> Result<()> {
     let terminal = session.terminal_mut();
-    let height = terminal.height()?;
+    // Login is event-driven rather than animation-driven, so sample here to keep this standalone
+    // surface resize-safe without restoring backend queries to the main redraw loop.
+    terminal.refresh_screen_size()?;
+    let height = terminal.screen_size().height;
     terminal.draw(height, |frame| screen.render(frame))
 }
 

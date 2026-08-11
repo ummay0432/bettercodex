@@ -1,5 +1,4 @@
-//! Fixed tool catalogue following Codex's `Direct`, `CodeMode`, and `CodeModeOnly`
-//! exposure plans at upstream commit 92cbfb4d2431bdc53dc03507aea2dc5b8e932e40.
+//! Fixed tool catalogue following Codex's GPT-5.6 `code_mode_only` exposure.
 //!
 //! The schemas mirror `core/src/tools/handlers/{apply_patch_spec,plan_spec,
 //! shell_spec,view_image_spec}.rs`; the `exec` and `wait` wrappers mirror
@@ -9,11 +8,9 @@
 use super::code_runtime;
 use super::code_runtime::CodeModeToolKind as ToolKind;
 use super::code_runtime::ToolDefinition;
-use crate::model::ToolMode;
 use crate::protocol::ToolName;
 use serde_json::Value;
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 const EXEC_SOURCE_GRAMMAR: &str = r#"
@@ -24,26 +21,6 @@ plain_source: SOURCE
 PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
 NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
-"#;
-const APPLY_PATCH_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
-begin_patch: "*** Begin Patch" LF
-end_patch: "*** End Patch" LF?
-
-hunk: add_hunk | delete_hunk | update_hunk
-add_hunk: "*** Add File: " filename LF add_line+
-delete_hunk: "*** Delete File: " filename LF
-update_hunk: "*** Update File: " filename LF change_move? change?
-
-filename: /(.+)/
-add_line: "+" /(.*)/ LF -> line
-
-change_move: "*** Move to: " filename LF
-change: (change_context | change_line)+ eof_line?
-change_context: ("@@" | "@@ " /(.+)/) LF
-change_line: ("+" | "-" | " ") /(.*)/ LF
-eof_line: "*** End of File" LF
-
-%import common.LF
 "#;
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
 - Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
@@ -56,6 +33,11 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
 - `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
 - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
+
+Choose the smallest safe script:
+- Use one nested call and return its complete output with `text(...)` or `image(...)` when one call is sufficient, its output shape is not reliably documented, fresh model judgment should follow, or the stage is adaptive, write/approval-sensitive, citation-heavy, or carries a native artifact. Do not batch, retry, filter, or chain it in JavaScript.
+- Compose calls only for a bounded, predictable, read-only stage that returns a materially smaller structured result. Use only the documented calls and input/output fields needed by that stage; define emitted fields, call and retry limits, failure behavior, and stopping conditions; then return control to the model.
+- Use `Promise.all(...)` only for independent, side-effect-free reads; keep dependent calls sequential. Nested failures reject their Promise; catch them only for explicit bounded recovery.
 
 - Global helpers:
 - `exit()`: Immediately ends the current script successfully (like an early return from the top level).
@@ -99,30 +81,25 @@ const EXEC_YIELD_TIME_DESCRIPTION: &str =
 #[cfg(windows)]
 const EXEC_YIELD_TIME_DESCRIPTION: &str = "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms.";
 
-struct ModelToolCatalogue {
-    core_tools: Vec<ToolDefinition>,
+struct ToolCatalogue {
     runtime_tools: Vec<ToolDefinition>,
-    code_mode_only_exec_description: String,
+    exec_description: String,
+    request_specifications: Vec<Value>,
 }
 
-static TOOL_CATALOGUES: LazyLock<[ModelToolCatalogue; 2]> = LazyLock::new(|| {
-    [false, true].map(|supports_image_detail_original| {
-        let core_tools = build_core_tools(supports_image_detail_original);
-        let runtime_tools = build_runtime_tools(&core_tools);
-        let code_mode_only_exec_description =
-            build_exec_description(/*code_mode_only*/ true, &core_tools);
-        ModelToolCatalogue {
-            core_tools,
-            runtime_tools,
-            code_mode_only_exec_description,
-        }
-    })
+static TOOL_CATALOGUE: LazyLock<ToolCatalogue> = LazyLock::new(|| {
+    let core_tools = build_core_tools();
+    let runtime_tools = build_runtime_tools(&core_tools);
+    let exec_description = build_exec_description(&core_tools);
+    let request_specifications = build_responses_lite_specifications(&exec_description);
+    ToolCatalogue {
+        runtime_tools,
+        exec_description,
+        request_specifications,
+    }
 });
 
-static CODE_MODE_EXEC_DESCRIPTION: LazyLock<String> =
-    LazyLock::new(|| build_exec_description(/*code_mode_only*/ false, &[]));
-
-fn build_core_tools(supports_image_detail_original: bool) -> Vec<ToolDefinition> {
+fn build_core_tools() -> Vec<ToolDefinition> {
     let mut tools = vec![
         function_tool(
             "exec_command",
@@ -149,7 +126,7 @@ fn build_core_tools(supports_image_detail_original: bool) -> Vec<ToolDefinition>
         function_tool(
             "view_image",
             "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.",
-            view_image_input_schema(supports_image_detail_original),
+            view_image_input_schema(),
             Some(view_image_output_schema()),
         ),
         function_tool(
@@ -188,9 +165,8 @@ fn build_runtime_tools(core_tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
     let mut tools = core_tools
         .iter()
         .map(|tool| {
-            // `collect_code_mode_tool_definitions` augments every runtime definition even when
-            // CodeModeOnly already carries the same declaration in the outer exec description.
-            // Namespaced definitions additionally inherit their namespace guidance.
+            // Each runtime definition carries the schema-derived declaration used by a Code Mode
+            // cell. Namespaced definitions additionally inherit their namespace guidance.
             let description = render_code_mode_sample_for_definition(tool);
             let description = if let Some(namespace) = tool.tool_name.namespace.as_deref() {
                 format!(
@@ -215,132 +191,35 @@ fn build_runtime_tools(core_tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
     tools
 }
 
-fn catalogue(supports_image_detail_original: bool) -> &'static ModelToolCatalogue {
-    &TOOL_CATALOGUES[usize::from(supports_image_detail_original)]
-}
-
-pub(super) fn core_tools(supports_image_detail_original: bool) -> &'static [ToolDefinition] {
-    &catalogue(supports_image_detail_original).core_tools
-}
-
-pub(super) fn runtime_tools(supports_image_detail_original: bool) -> &'static [ToolDefinition] {
-    &catalogue(supports_image_detail_original).runtime_tools
+pub(super) fn runtime_tools() -> &'static [ToolDefinition] {
+    &TOOL_CATALOGUE.runtime_tools
 }
 
 pub(crate) fn text() -> &'static str {
-    &catalogue(/*supports_image_detail_original*/ true).code_mode_only_exec_description
+    &TOOL_CATALOGUE.exec_description
 }
 
-pub(crate) fn specifications(
-    tool_mode: ToolMode,
-    supports_image_detail_original: bool,
-) -> Vec<Value> {
-    match tool_mode {
-        ToolMode::Direct => core_specifications(
-            /*augment_for_code_mode*/ false,
-            supports_image_detail_original,
-        ),
-        ToolMode::CodeMode => {
-            let mut specifications = vec![
-                exec_specification(
-                    /*code_mode_only*/ false,
-                    supports_image_detail_original,
-                ),
-                wait_specification(),
-            ];
-            specifications.extend(core_specifications(
-                /*augment_for_code_mode*/ true,
-                supports_image_detail_original,
-            ));
-            specifications
-        }
-        ToolMode::CodeModeOnly => vec![
-            exec_specification(/*code_mode_only*/ true, supports_image_detail_original),
+pub(crate) fn responses_lite_specifications() -> Vec<Value> {
+    TOOL_CATALOGUE.request_specifications.clone()
+}
+
+fn build_responses_lite_specifications(exec_description: &str) -> Vec<Value> {
+    vec![json!({
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": [
+            exec_specification(exec_description),
             wait_specification(),
         ],
-    }
-}
-
-pub(crate) fn responses_lite_specifications(
-    tool_mode: ToolMode,
-    supports_image_detail_original: bool,
-) -> Vec<Value> {
-    let mut tools = Vec::new();
-    let mut functions = Vec::new();
-    let mut functions_index = None;
-    for specification in specifications(tool_mode, supports_image_detail_original) {
-        match specification.get("type").and_then(Value::as_str) {
-            Some("function" | "custom") => {
-                functions_index.get_or_insert(tools.len());
-                functions.push(specification);
-            }
-            _ => tools.push(specification),
-        }
-    }
-    if let Some(functions_index) = functions_index
-        && !functions.is_empty()
-    {
-        tools.insert(
-            functions_index,
-            json!({
-                "type": "namespace",
-                "name": "functions",
-                "description": "",
-                "tools": functions,
-            }),
-        );
-    }
-    tools
-}
-
-fn core_specifications(
-    augment_for_code_mode: bool,
-    supports_image_detail_original: bool,
-) -> Vec<Value> {
-    enum Group<'a> {
-        Tool(Value),
-        Namespace(&'a str),
-    }
-
-    let mut groups = Vec::new();
-    let mut namespace_tools = BTreeMap::<&str, Vec<Value>>::new();
-    for tool in core_tools(supports_image_detail_original) {
-        let specification = direct_specification(tool, augment_for_code_mode);
-        let Some(namespace) = tool.tool_name.namespace.as_deref() else {
-            groups.push(Group::Tool(specification));
-            continue;
-        };
-        if let Some(tools) = namespace_tools.get_mut(namespace) {
-            tools.push(specification);
-        } else {
-            namespace_tools.insert(namespace, vec![specification]);
-            groups.push(Group::Namespace(namespace));
-        }
-    }
-    groups
-        .into_iter()
-        .map(|group| match group {
-            Group::Tool(specification) => specification,
-            Group::Namespace(namespace) => json!({
-                "type": "namespace",
-                "name": namespace,
-                "description": default_namespace_description(namespace),
-                "tools": namespace_tools.remove(namespace).unwrap_or_default(),
-            }),
-        })
-        .collect()
+    })]
 }
 
 fn default_namespace_description(namespace: &str) -> String {
     format!("Tools in the {namespace} namespace.")
 }
 
-fn exec_specification(code_mode_only: bool, supports_image_detail_original: bool) -> Value {
-    let description = if code_mode_only {
-        &catalogue(supports_image_detail_original).code_mode_only_exec_description
-    } else {
-        &CODE_MODE_EXEC_DESCRIPTION
-    };
+fn exec_specification(description: &str) -> Value {
     json!({
         "type": "custom",
         "name": code_runtime::PUBLIC_TOOL_NAME,
@@ -389,34 +268,7 @@ fn wait_specification() -> Value {
     })
 }
 
-fn direct_specification(tool: &ToolDefinition, augment_for_code_mode: bool) -> Value {
-    let description = if augment_for_code_mode {
-        render_code_mode_sample_for_definition(tool)
-    } else {
-        tool.description.clone()
-    };
-    match tool.kind {
-        ToolKind::Function => json!({
-            "type": "function",
-            "name": tool.tool_name.name,
-            "description": description,
-            "strict": false,
-            "parameters": tool.input_schema.clone().unwrap_or_else(empty_object_output_schema),
-        }),
-        ToolKind::Freeform => json!({
-            "type": "custom",
-            "name": tool.tool_name.name,
-            "description": description,
-            "format": {
-                "type": "grammar",
-                "syntax": "lark",
-                "definition": APPLY_PATCH_GRAMMAR,
-            }
-        }),
-    }
-}
-
-fn build_exec_description(code_mode_only: bool, core_tools: &[ToolDefinition]) -> String {
+fn build_exec_description(core_tools: &[ToolDefinition]) -> String {
     let exec_description = EXEC_DESCRIPTION_TEMPLATE.replace(
         "Defaults to 10000 ms.",
         &format!(
@@ -424,9 +276,6 @@ fn build_exec_description(code_mode_only: bool, core_tools: &[ToolDefinition]) -
             code_runtime::DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS
         ),
     );
-    if !code_mode_only {
-        return exec_description;
-    }
     let mut tools = core_tools.iter().collect::<Vec<_>>();
     tools.sort_by(|left, right| {
         left.tool_name
@@ -532,14 +381,6 @@ fn freeform_tool(name: &str, description: &str) -> ToolDefinition {
         input_schema: None,
         output_schema: None,
     }
-}
-
-fn empty_object_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {},
-        "additionalProperties": false
-    })
 }
 
 fn exec_command_input_schema() -> Value {
@@ -703,28 +544,20 @@ fn update_plan_input_schema() -> Value {
     })
 }
 
-fn view_image_input_schema(supports_image_detail_original: bool) -> Value {
-    let mut properties = serde_json::Map::new();
-    properties.insert(
-        "path".to_string(),
-        json!({
-            "type": "string",
-            "description": "Local filesystem path to an image file."
-        }),
-    );
-    if supports_image_detail_original {
-        properties.insert(
-            "detail".to_string(),
-            json!({
+fn view_image_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Local filesystem path to an image file."
+            },
+            "detail": {
                 "type": "string",
                 "enum": ["high", "original"],
                 "description": "Image detail level. Defaults to `high`; use `original` to preserve exact resolution."
-            }),
-        );
-    }
-    json!({
-        "type": "object",
-        "properties": properties,
+            }
+        },
         "required": ["path"],
         "additionalProperties": false
     })

@@ -25,6 +25,8 @@ referenced by a live Cargo or rustc process.
 
 bettercodex is a focused port of [OpenAI Codex](https://github.com/openai/codex), not an independent implementation. For every retained behavior Codex already implements, inspect and port the current upstream source before editing; unexplained reimplementation or drift is forbidden unless [`product-direction.md`](docs/product-direction.md) explicitly requires the departure.
 
+When comparing bettercodex with upstream Codex, temporarily clone the upstream repository into the workspace, compare against that local checkout instead of making repeated remote Git calls, and remove the clone afterward.
+
 Do not invent Cargo, build, packaging, release, or test infrastructure; mirror current upstream Codex for retained workflows unless an explicit bettercodex requirement makes a deviation necessary.
 
 Published bettercodex builds are immutable snapshots of a full public `main` revision encoded in the release tag. Update freshness follows the semantic version of the latest published full release; the encoded revision pins its exact source and installer.

@@ -21,20 +21,13 @@ pub(crate) enum CompactionPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactionRequest {
     Automatic(CompactionPhase),
-    ModelSwitch(ModelSwitchCompactionReason),
     Manual,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ModelSwitchCompactionReason {
-    CompHashChanged,
-    ModelDownshift,
 }
 
 impl CompactionRequest {
     pub(crate) fn trigger(self) -> &'static str {
         match self {
-            Self::Automatic(_) | Self::ModelSwitch(_) => "auto",
+            Self::Automatic(_) => "auto",
             Self::Manual => "manual",
         }
     }
@@ -42,8 +35,6 @@ impl CompactionRequest {
     pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::Automatic(_) => "context_limit",
-            Self::ModelSwitch(ModelSwitchCompactionReason::CompHashChanged) => "comp_hash_changed",
-            Self::ModelSwitch(ModelSwitchCompactionReason::ModelDownshift) => "model_downshift",
             Self::Manual => "user_requested",
         }
     }
@@ -52,7 +43,6 @@ impl CompactionRequest {
         match self {
             Self::Automatic(CompactionPhase::PreTurn) => "pre_turn",
             Self::Automatic(CompactionPhase::MidTurn) => "mid_turn",
-            Self::ModelSwitch(_) => "pre_turn",
             Self::Manual => "standalone_turn",
         }
     }

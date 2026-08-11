@@ -9,10 +9,8 @@ use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
 use crate::http_client::backoff;
 use crate::http_client::bounded_error_body;
-use crate::model::ModelCatalogClient;
 use crate::model::ModelSelection;
 use crate::model::SharedModelSelection;
-use crate::model::ToolMode;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
 use crate::service_tier::ServiceTier;
@@ -29,13 +27,20 @@ use reqwest::header::CONTENT_ENCODING;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
+use serde::Serialize;
+use serde::ser::SerializeMap;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
+use std::io;
+use std::io::Write;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
@@ -79,51 +84,8 @@ const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
 static SYSTEM_PROMPT: LazyLock<String> =
     LazyLock::new(|| render_system_prompt(SYSTEM_PROMPT_TEMPLATE, PLATFORM_SHELL_GUIDANCE));
-static STABLE_INPUT_PREFIX_ITEMS: LazyLock<[[[Value; 2]; 3]; 2]> = LazyLock::new(|| {
-    [false, true].map(|supports_image_detail_original| {
-        ToolMode::ALL.map(|tool_mode| {
-            [
-                json!({
-                    "type": "additional_tools",
-                    "role": "developer",
-                    "tools": tools::responses_lite_specifications(
-                        tool_mode,
-                        supports_image_detail_original,
-                    ),
-                }),
-                developer_instructions_item(),
-            ]
-        })
-    })
-});
-static STABLE_HARNESS_TOKEN_ESTIMATES: LazyLock<[[[[u64; 2]; 3]; 2]; 2]> = LazyLock::new(|| {
-    [false, true].map(|use_responses_lite| {
-        [false, true].map(|supports_image_detail_original| {
-            ToolMode::ALL.map(|tool_mode| {
-                if use_responses_lite {
-                    let [tools_item, instructions_item] =
-                        stable_input_prefix_items(tool_mode, supports_image_detail_original);
-                    [
-                        estimated_tokens(std::slice::from_ref(tools_item)),
-                        estimated_tokens(std::slice::from_ref(instructions_item)),
-                    ]
-                } else {
-                    [
-                        estimated_tokens(&[json!({
-                            "tools": tools::specifications(
-                                tool_mode,
-                                supports_image_detail_original,
-                            ),
-                        })]),
-                        estimated_tokens(&[json!({
-                            "instructions": harness_instructions(),
-                        })]),
-                    ]
-                }
-            })
-        })
-    })
-});
+static STABLE_INPUT_PREFIX_ITEMS: OnceLock<[Value; 2]> = OnceLock::new();
+static STABLE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
 
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -231,10 +193,17 @@ pub(crate) struct ApiClient {
 }
 
 struct WebSocketBaseline {
-    properties: Map<String, Value>,
+    properties_fingerprint: RequestPropertiesFingerprint,
     input: WebSocketBaselineInput,
     response_id: String,
 }
+
+/// Collision-resistant identity for fields that must stay fixed across an incremental request.
+///
+/// A digest keeps baseline changes conservative without retaining another full property tree for
+/// the active WebSocket connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RequestPropertiesFingerprint([u8; 32]);
 
 enum WebSocketBaselineInput {
     Exact {
@@ -269,7 +238,6 @@ enum OutputItemMode {
 
 struct ResponseValidation<'a> {
     expected_model: &'a str,
-    use_responses_lite: bool,
     server_model_warning_emitted: &'a mut bool,
 }
 
@@ -305,7 +273,6 @@ struct WebSocketRequestRestoration {
     input_prefix: Option<Vec<Value>>,
     stream: Option<Value>,
     client_turn_state: Option<Value>,
-    client_responses_lite: Option<Value>,
 }
 
 impl WebSocketRequestRestoration {
@@ -328,12 +295,6 @@ impl WebSocketRequestRestoration {
             client_metadata.insert(X_CODEX_TURN_STATE.to_string(), turn_state);
         }
         client_metadata.remove(WS_RESPONSES_LITE_CLIENT_METADATA);
-        if let Some(responses_lite) = self.client_responses_lite {
-            client_metadata.insert(
-                WS_RESPONSES_LITE_CLIENT_METADATA.to_string(),
-                responses_lite,
-            );
-        }
         if let Some(mut input_prefix) = self.input_prefix {
             let incremental_input = object
                 .remove("input")
@@ -386,7 +347,6 @@ impl Drop for WebSocketRequestGuard<'_> {
 }
 
 struct SamplingInputRestoration {
-    inserted_prefix: Option<(ToolMode, bool)>,
     stripped_image_details: Vec<StrippedImageDetail>,
 }
 
@@ -428,7 +388,7 @@ impl WebSocketBaseline {
             }
         };
         Ok(Self {
-            properties: reusable_request_properties(request)?,
+            properties_fingerprint: reusable_request_properties_fingerprint(request)?,
             input,
             response_id: response.response_id.clone(),
         })
@@ -451,15 +411,13 @@ impl SamplingRequest {
 
 impl SamplingInputRestoration {
     fn restore(self, mut input: Vec<Value>) -> ApiResult<Vec<Value>> {
-        if let Some((tool_mode, supports_image_detail_original)) = self.inserted_prefix {
-            let expected = stable_input_prefix_items(tool_mode, supports_image_detail_original);
-            if input.get(..expected.len()) != Some(expected.as_slice()) {
-                return Err(ApiError::fatal(
-                    "sampling request lost its inserted Responses Lite prefix",
-                ));
-            }
-            input.drain(..expected.len());
+        let expected = stable_input_prefix_items();
+        if input.get(..expected.len()) != Some(expected.as_slice()) {
+            return Err(ApiError::fatal(
+                "sampling request lost its inserted Responses Lite prefix",
+            ));
         }
+        input.drain(..expected.len());
         for stripped in self.stripped_image_details {
             let content = input
                 .get_mut(stripped.item_index)
@@ -548,7 +506,6 @@ impl ApiClient {
                 .connect_timeout(Duration::from_secs(20)),
         )
         .context("failed to create HTTP client")?;
-        let prefer_websocket = model_selection.prefer_websocket;
         Ok(Self {
             client,
             auth: SharedAuth::new(auth),
@@ -562,7 +519,7 @@ impl ApiClient {
             window: compaction_count,
             model_selection: SharedModelSelection::new(model_selection),
             service_tier,
-            prefer_websocket,
+            prefer_websocket: true,
             websocket_prewarm_attempted: false,
             websocket: None,
             websocket_reasoning_included: false,
@@ -599,7 +556,7 @@ impl ApiClient {
         if self.model_selection.get() == selection {
             return;
         }
-        self.prefer_websocket = selection.prefer_websocket;
+        self.prefer_websocket = true;
         self.model_selection.set(selection);
         self.websocket_prewarm_attempted = false;
         // Model, tool transport, reasoning fields, and routing headers are all
@@ -624,14 +581,6 @@ impl ApiClient {
         )
     }
 
-    pub(crate) fn model_catalog_client(&self) -> ModelCatalogClient {
-        ModelCatalogClient::new(
-            self.client.clone(),
-            self.auth.clone(),
-            self.base_url.clone(),
-        )
-    }
-
     pub(crate) fn openai_docs_client(&self) -> OpenAiDocsClient {
         OpenAiDocsClient::new(self.client.clone())
     }
@@ -642,7 +591,6 @@ impl ApiClient {
             history,
             self.turn_metadata(RequestKind::Turn).to_string(),
             selection.truncation_policy(),
-            selection.supports_image_detail_original(),
         )
     }
 
@@ -824,7 +772,6 @@ impl ApiClient {
         request_kind: RequestKind,
     ) -> ApiResult<ModelResponse> {
         let expected_model = request_model(request)?.to_string();
-        let use_responses_lite = self.model_selection.get().use_responses_lite;
         let response = self
             .post("responses", request, "text/event-stream", request_kind)
             .await?;
@@ -846,7 +793,6 @@ impl ApiClient {
             self.stream_idle_timeout,
             ResponseValidation {
                 expected_model: &expected_model,
-                use_responses_lite,
                 server_model_warning_emitted: &mut self.server_model_warning_emitted,
             },
             OutputItemMode::for_http(request_kind),
@@ -887,7 +833,6 @@ impl ApiClient {
         input_identity: RequestInputIdentity,
     ) -> ApiResult<ModelResponse> {
         let expected_model = request_model(logical_request)?.to_string();
-        let use_responses_lite = self.model_selection.get().use_responses_lite;
         self.ensure_websocket(request_kind).await?;
         let websocket_server_model = self.websocket_server_model.clone();
         observe_server_model(
@@ -940,7 +885,6 @@ impl ApiClient {
                 completed_items,
                 events,
                 &expected_model,
-                use_responses_lite,
                 &mut self.server_model_warning_emitted,
             )?;
             if collected.completed {
@@ -986,7 +930,7 @@ impl ApiClient {
             WebSocketRequestMode::Warmup => None,
             WebSocketRequestMode::Inference => {
                 if let Some(baseline) = &self.websocket_baseline {
-                    if !request_properties_match(&baseline.properties, request) {
+                    if !request_properties_match(&baseline.properties_fingerprint, request)? {
                         None
                     } else {
                         let current_input = request
@@ -1062,13 +1006,11 @@ impl ApiClient {
                 Value::String(turn_state.clone()),
             );
         }
-        let client_responses_lite = client_metadata.remove(WS_RESPONSES_LITE_CLIENT_METADATA);
-        if self.model_selection.get().use_responses_lite {
-            client_metadata.insert(
-                WS_RESPONSES_LITE_CLIENT_METADATA.to_string(),
-                Value::String("true".to_string()),
-            );
-        }
+        client_metadata.remove(WS_RESPONSES_LITE_CLIENT_METADATA);
+        client_metadata.insert(
+            WS_RESPONSES_LITE_CLIENT_METADATA.to_string(),
+            Value::String("true".to_string()),
+        );
         object.insert(
             "type".to_string(),
             Value::String("response.create".to_string()),
@@ -1081,7 +1023,6 @@ impl ApiClient {
                 input_prefix: None,
                 stream,
                 client_turn_state,
-                client_responses_lite,
             });
         };
         let full_input = object
@@ -1100,7 +1041,6 @@ impl ApiClient {
             input_prefix: Some(input_prefix),
             stream,
             client_turn_state,
-            client_responses_lite,
         })
     }
 
@@ -1135,11 +1075,7 @@ impl ApiClient {
         }
         let trigger = compaction::compaction_trigger();
         let selection = self.model_selection.get();
-        let [tool_prefix_tokens, instruction_tokens] = estimated_harness_tokens(
-            selection.use_responses_lite,
-            selection.tool_mode(),
-            selection.supports_image_detail_original(),
-        );
+        let [tool_prefix_tokens, instruction_tokens] = estimated_harness_tokens();
         let prefix_tokens = tool_prefix_tokens
             .saturating_add(instruction_tokens)
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
@@ -1206,12 +1142,7 @@ impl ApiClient {
 
     fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> Value {
         let selection = self.model_selection.get();
-        let input = compose_input(
-            history,
-            selection.use_responses_lite,
-            selection.tool_mode(),
-            selection.supports_image_detail_original(),
-        );
+        let input = compose_input(history);
         self.build_request_from_input(input, request_kind, &selection)
     }
 
@@ -1221,12 +1152,7 @@ impl ApiClient {
         cursor: HistoryCursor,
     ) -> SamplingRequest {
         let selection = self.model_selection.get();
-        let (input, input_restoration) = compose_sampling_input(
-            history,
-            selection.use_responses_lite,
-            selection.tool_mode(),
-            selection.supports_image_detail_original(),
-        );
+        let (input, input_restoration) = compose_sampling_input(history);
         SamplingRequest {
             request: self.build_request_from_input(input, RequestKind::Turn, &selection),
             cursor,
@@ -1240,18 +1166,15 @@ impl ApiClient {
         request_kind: RequestKind,
         selection: &ModelSelection,
     ) -> Value {
-        let mut reasoning = json!({
+        let reasoning = json!({
             "effort": selection.reasoning_effort.as_str(),
             "summary": "auto",
+            "context": "all_turns",
         });
-        if selection.use_responses_lite {
-            reasoning["context"] = Value::String("all_turns".to_string());
-        }
         let mut request = json!({
             "model": selection.model,
             "tool_choice": "auto",
-            "parallel_tool_calls": selection.supports_parallel_tool_calls
-                && !selection.use_responses_lite,
+            "parallel_tool_calls": false,
             "reasoning": reasoning,
             "store": false,
             "stream": true,
@@ -1260,15 +1183,7 @@ impl ApiClient {
             "text": {"verbosity": "low"},
             "client_metadata": self.client_metadata(request_kind),
         });
-        // Responses Lite receives both tools and base instructions as developer input items.
-        if !selection.use_responses_lite {
-            request["instructions"] = Value::String(harness_instructions().to_string());
-            request["tools"] = Value::Array(tools::specifications(
-                selection.tool_mode(),
-                selection.supports_image_detail_original(),
-            ));
-        }
-        if let Some(service_tier) = self.effective_service_tier(selection) {
+        if let Some(service_tier) = self.effective_service_tier() {
             request["service_tier"] = Value::String(service_tier.to_string());
         }
         request["input"] = Value::Array(input);
@@ -1329,12 +1244,8 @@ impl ApiClient {
         format!("{}:{}", self.thread_id, self.window)
     }
 
-    fn effective_service_tier(&self, selection: &ModelSelection) -> Option<&'static str> {
-        if selection.supports_fast {
-            self.service_tier.request_value()
-        } else {
-            None
-        }
+    fn effective_service_tier(&self) -> Option<&'static str> {
+        self.service_tier.request_value()
     }
 
     fn request_headers(
@@ -1364,18 +1275,16 @@ impl ApiClient {
             &self.turn_metadata(request_kind).to_string(),
         )?;
         let selection = self.model_selection.get();
-        let routing_hint = match self.effective_service_tier(&selection) {
+        let routing_hint = match self.effective_service_tier() {
             Some(service_tier) => format!("model={};tier={service_tier}", selection.model),
             None => format!("model={}", selection.model),
         };
         insert_header(&mut headers, X_CODEX_ROUTING_HINT, &routing_hint)?;
-        if selection.use_responses_lite {
-            insert_header(
-                &mut headers,
-                "x-openai-internal-codex-responses-lite",
-                "true",
-            )?;
-        }
+        insert_header(
+            &mut headers,
+            "x-openai-internal-codex-responses-lite",
+            "true",
+        )?;
         insert_header(
             &mut headers,
             "x-codex-beta-features",
@@ -1534,45 +1443,16 @@ impl RequestKind {
     }
 }
 
-fn compose_input(
-    history: Vec<Value>,
-    use_responses_lite: bool,
-    tool_mode: ToolMode,
-    supports_image_detail_original: bool,
-) -> Vec<Value> {
-    compose_sampling_input(
-        history,
-        use_responses_lite,
-        tool_mode,
-        supports_image_detail_original,
-    )
-    .0
+fn compose_input(history: Vec<Value>) -> Vec<Value> {
+    compose_sampling_input(history).0
 }
 
-fn compose_sampling_input(
-    mut history: Vec<Value>,
-    use_responses_lite: bool,
-    tool_mode: ToolMode,
-    supports_image_detail_original: bool,
-) -> (Vec<Value>, SamplingInputRestoration) {
-    if !use_responses_lite {
-        return (
-            history,
-            SamplingInputRestoration {
-                inserted_prefix: None,
-                stripped_image_details: Vec::new(),
-            },
-        );
-    }
+fn compose_sampling_input(mut history: Vec<Value>) -> (Vec<Value>, SamplingInputRestoration) {
     let stripped_image_details = strip_image_details(&mut history);
-    history.splice(
-        0..0,
-        stable_request_prefix(tool_mode, supports_image_detail_original),
-    );
+    history.splice(0..0, stable_request_prefix());
     (
         history,
         SamplingInputRestoration {
-            inserted_prefix: Some((tool_mode, supports_image_detail_original)),
             stripped_image_details,
         },
     )
@@ -1620,41 +1500,49 @@ fn image_content_items_mut(item: &mut Value) -> Option<&mut Vec<Value>> {
     }
 }
 
-pub(crate) fn stable_input_prefix_items(
-    tool_mode: ToolMode,
-    supports_image_detail_original: bool,
-) -> &'static [Value; 2] {
-    &STABLE_INPUT_PREFIX_ITEMS[usize::from(supports_image_detail_original)][tool_mode.index()]
+pub(crate) fn stable_input_prefix_items() -> &'static [Value; 2] {
+    STABLE_INPUT_PREFIX_ITEMS.get_or_init(|| {
+        [
+            json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": tools::responses_lite_specifications(),
+            }),
+            developer_instructions_item(),
+        ]
+    })
 }
 
-pub(crate) fn stable_request_prefix(
-    tool_mode: ToolMode,
-    supports_image_detail_original: bool,
-) -> [Value; 2] {
-    (*stable_input_prefix_items(tool_mode, supports_image_detail_original)).clone()
+pub(crate) fn stable_request_prefix() -> [Value; 2] {
+    (*stable_input_prefix_items()).clone()
 }
 
 pub(crate) fn is_stable_tools_prefix_item(item: &Value) -> bool {
-    [false, true]
-        .into_iter()
-        .flat_map(|supports_image_detail_original| {
-            ToolMode::ALL.map(|tool_mode| (tool_mode, supports_image_detail_original))
-        })
-        .any(|(tool_mode, supports_image_detail_original)| {
-            is_additional_tools_item(
-                item,
-                &stable_input_prefix_items(tool_mode, supports_image_detail_original)[0],
-            )
-        })
+    if item.get("type").and_then(Value::as_str) != Some("additional_tools")
+        || item.get("role").and_then(Value::as_str) != Some("developer")
+    {
+        return false;
+    }
+    is_additional_tools_item(item, &stable_input_prefix_items()[0])
 }
 
 pub(crate) fn is_stable_instructions_prefix_item(item: &Value) -> bool {
-    ToolMode::ALL.into_iter().any(|tool_mode| {
-        let expected =
-            &stable_input_prefix_items(tool_mode, /*supports_image_detail_original*/ true)[1];
-        ["type", "role", "content"]
-            .into_iter()
-            .all(|field| item.get(field) == expected.get(field))
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("developer")
+    {
+        return false;
+    }
+    let Some([content]) = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+    else {
+        return false;
+    };
+    content.as_object().is_some_and(|content| {
+        content.len() == 2
+            && content.get("type").and_then(Value::as_str) == Some("input_text")
+            && content.get("text").and_then(Value::as_str) == Some(harness_instructions())
     })
 }
 
@@ -1685,42 +1573,81 @@ fn render_system_prompt(template: &str, platform_shell_guidance: &str) -> String
     )
 }
 
-pub(crate) fn estimated_harness_tokens(
-    use_responses_lite: bool,
-    tool_mode: ToolMode,
-    supports_image_detail_original: bool,
-) -> [u64; 2] {
-    STABLE_HARNESS_TOKEN_ESTIMATES[usize::from(use_responses_lite)]
-        [usize::from(supports_image_detail_original)][tool_mode.index()]
+pub(crate) fn estimated_harness_tokens() -> [u64; 2] {
+    *STABLE_HARNESS_TOKEN_ESTIMATES.get_or_init(|| {
+        let [tools_item, instructions_item] = stable_input_prefix_items();
+        [
+            estimated_tokens(std::slice::from_ref(tools_item)),
+            estimated_tokens(std::slice::from_ref(instructions_item)),
+        ]
+    })
 }
 
 fn is_reusable_request_property(name: &str) -> bool {
     !matches!(name, "input" | "client_metadata" | "stream_options")
 }
 
-fn reusable_request_properties(request: &Value) -> ApiResult<Map<String, Value>> {
+struct ReusableRequestProperties<'a>(&'a [(&'a str, &'a Value)]);
+
+impl Serialize for ReusableRequestProperties<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut properties = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, value) in self.0 {
+            properties.serialize_entry(name, value)?;
+        }
+        properties.end()
+    }
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn reusable_request_properties_fingerprint(
+    request: &Value,
+) -> ApiResult<RequestPropertiesFingerprint> {
     let request = request
         .as_object()
         .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
-    Ok(request
+    // WebSocket request restoration can reinsert fields in a different order, and serde_json's
+    // preserve_order feature is enabled in the application dependency graph. Canonicalize only
+    // the small reference list rather than cloning the potentially large property values.
+    let mut properties = request
         .iter()
         .filter(|(name, _)| is_reusable_request_property(name))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect())
+        .map(|(name, value)| (name.as_str(), value))
+        .collect::<Vec<_>>();
+    properties.sort_unstable_by_key(|(name, _)| *name);
+    let mut digest = Sha256::new();
+    serde_json::to_writer(
+        DigestWriter(&mut digest),
+        &ReusableRequestProperties(&properties),
+    )
+    .map_err(|error| {
+        ApiError::fatal(format!(
+            "failed to fingerprint reusable Responses request properties: {error}"
+        ))
+    })?;
+    Ok(RequestPropertiesFingerprint(digest.finalize().into()))
 }
 
-fn request_properties_match(previous: &Map<String, Value>, current: &Value) -> bool {
-    let Some(current) = current.as_object() else {
-        return false;
-    };
-    let current_count = current
-        .keys()
-        .filter(|name| is_reusable_request_property(name))
-        .count();
-    previous.len() == current_count
-        && previous
-            .iter()
-            .all(|(name, value)| current.get(name) == Some(value))
+fn request_properties_match(
+    previous: &RequestPropertiesFingerprint,
+    current: &Value,
+) -> ApiResult<bool> {
+    Ok(*previous == reusable_request_properties_fingerprint(current)?)
 }
 
 async fn collect_http_stream(
@@ -1751,7 +1678,6 @@ async fn collect_http_stream(
                     completed_items,
                     events,
                     validation.expected_model,
-                    validation.use_responses_lite,
                     &mut *validation.server_model_warning_emitted,
                 )?;
             }
@@ -1768,7 +1694,6 @@ async fn collect_http_stream(
                 completed_items,
                 events,
                 validation.expected_model,
-                validation.use_responses_lite,
                 &mut *validation.server_model_warning_emitted,
             )?;
         }
@@ -1958,7 +1883,6 @@ fn process_event(
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
     expected_model: &str,
-    use_responses_lite: bool,
     server_model_warning_emitted: &mut bool,
 ) -> ApiResult<()> {
     if data == "[DONE]" {
@@ -1972,7 +1896,6 @@ fn process_event(
         completed_items,
         events,
         expected_model,
-        use_responses_lite,
         server_model_warning_emitted,
     )
 }
@@ -1983,7 +1906,6 @@ fn process_event_value(
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
     expected_model: &str,
-    use_responses_lite: bool,
     server_model_warning_emitted: &mut bool,
 ) -> ApiResult<()> {
     observe_server_model(
@@ -2044,7 +1966,7 @@ fn process_event_value(
                 .get_mut("response")
                 .map(Value::take)
                 .ok_or_else(|| ApiError::fatal("response.completed omitted its response"))?;
-            validate_completed_response(&response, use_responses_lite)?;
+            validate_completed_response(&response)?;
             let mut response = response;
             if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
                 for (index, item) in std::mem::take(output).into_iter().enumerate() {
@@ -2158,11 +2080,10 @@ fn classify_stream_error(code: &str, message: &str) -> ApiError {
     }
 }
 
-fn validate_completed_response(response: &Value, use_responses_lite: bool) -> ApiResult<()> {
-    if use_responses_lite
-        && let Some(context) = response
-            .pointer("/reasoning/context")
-            .and_then(Value::as_str)
+fn validate_completed_response(response: &Value) -> ApiResult<()> {
+    if let Some(context) = response
+        .pointer("/reasoning/context")
+        .and_then(Value::as_str)
         && context != "all_turns"
     {
         return Err(ApiError::fatal(format!(

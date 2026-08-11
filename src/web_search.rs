@@ -68,7 +68,6 @@ pub(crate) struct ToolTurnContext {
     input: Option<Arc<SearchInput>>,
     turn_metadata: String,
     truncation_policy: TruncationPolicy,
-    supports_image_detail_original: bool,
 }
 
 impl Default for ToolTurnContext {
@@ -77,7 +76,6 @@ impl Default for ToolTurnContext {
             input: None,
             turn_metadata: String::new(),
             truncation_policy: TruncationPolicy::Tokens(10_000),
-            supports_image_detail_original: true,
         }
     }
 }
@@ -460,38 +458,16 @@ impl ToolTurnContext {
         history: &[Value],
         turn_metadata: String,
         truncation_policy: TruncationPolicy,
-        supports_image_detail_original: bool,
     ) -> Self {
         Self {
             input: recent_input(history).map(Arc::new),
             turn_metadata,
             truncation_policy,
-            supports_image_detail_original,
         }
     }
 
     pub(crate) fn truncation_policy(&self) -> TruncationPolicy {
         self.truncation_policy
-    }
-
-    pub(crate) fn supports_image_detail_original(&self) -> bool {
-        self.supports_image_detail_original
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_truncation_policy(truncation_policy: TruncationPolicy) -> Self {
-        Self {
-            truncation_policy,
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn without_original_image_detail() -> Self {
-        Self {
-            supports_image_detail_original: false,
-            ..Self::default()
-        }
     }
 }
 

@@ -76,88 +76,6 @@ fn user_message(text: &str) -> Value {
     })
 }
 
-fn tool_names(tools: &Value) -> Vec<String> {
-    let mut names = Vec::new();
-    for tool in tools.as_array().unwrap() {
-        let name = tool["name"].as_str().unwrap();
-        if tool["type"] != "namespace" {
-            names.push(name.to_string());
-            continue;
-        }
-        for nested in tool["tools"].as_array().unwrap() {
-            let nested_name = nested["name"].as_str().unwrap();
-            names.push(if name == "functions" {
-                nested_name.to_string()
-            } else {
-                format!("{name}__{nested_name}")
-            });
-        }
-    }
-    names
-}
-
-fn namespace_tools<'a>(tools: &'a Value, namespace: &str) -> &'a Value {
-    tools
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["type"] == "namespace" && tool["name"] == namespace)
-        .and_then(|namespace| namespace.get("tools"))
-        .unwrap()
-}
-
-fn responses_lite_function_tools(additional_tools: &Value) -> &Value {
-    namespace_tools(additional_tools, "functions")
-}
-
-fn expected_direct_tool_names() -> Vec<&'static str> {
-    vec![
-        "exec_command",
-        "write_stdin",
-        "update_plan",
-        "apply_patch",
-        "view_image",
-        "log_papercut",
-        "openaiDeveloperDocs__fetch_openai_doc",
-        "openaiDeveloperDocs__get_openapi_spec",
-        "openaiDeveloperDocs__list_api_endpoints",
-        "openaiDeveloperDocs__list_openai_docs",
-        "openaiDeveloperDocs__search_openai_docs",
-        "web__run",
-    ]
-}
-
-fn expected_direct_function_tool_names() -> Vec<&'static str> {
-    vec![
-        "exec_command",
-        "write_stdin",
-        "update_plan",
-        "apply_patch",
-        "view_image",
-        "log_papercut",
-    ]
-}
-
-fn expected_openai_docs_tool_names() -> Vec<&'static str> {
-    vec![
-        "fetch_openai_doc",
-        "get_openapi_spec",
-        "list_api_endpoints",
-        "list_openai_docs",
-        "search_openai_docs",
-    ]
-}
-
-fn expected_code_mode_tool_names() -> Vec<&'static str> {
-    let mut names = vec!["exec", "wait"];
-    names.extend(expected_direct_tool_names());
-    names
-}
-
-fn expected_code_mode_only_tool_names() -> Vec<&'static str> {
-    vec!["exec", "wait"]
-}
-
 #[test]
 fn harness_instructions_match_the_host_platform_prompt() {
     let platform_shell_guidance = if cfg!(windows) {
@@ -203,6 +121,70 @@ fn system_prompt_renderer_replaces_one_platform_fragment() {
         render_system_prompt("before\n{{platform_shell_guidance}}\nafter", "- host shell"),
         "before\n- host shell\nafter"
     );
+}
+
+#[test]
+fn websocket_incremental_input_requires_matching_request_properties() {
+    let mut client = test_client("http://127.0.0.1:1".to_string());
+    let first = user_message("first");
+    let second = user_message("second");
+    let mut first_request = client.build_request(vec![first.clone()], RequestKind::Turn);
+    let restoration = client
+        .prepare_websocket_request(
+            &mut first_request,
+            WebSocketRequestMode::Warmup,
+            RequestInputIdentity::Exact,
+        )
+        .unwrap();
+    restoration.restore(&mut first_request).unwrap();
+    let response = ModelResponse {
+        items: Vec::new(),
+        tool_calls: Vec::new(),
+        final_answer: None,
+        end_turn: None,
+        usage: None,
+        server_reasoning_included: false,
+        response_id: "response-first".to_string(),
+        output_item_count: 0,
+        has_assistant_text: false,
+    };
+    client.websocket_baseline = Some(
+        WebSocketBaseline::new(&first_request, &response, RequestInputIdentity::Exact).unwrap(),
+    );
+
+    let mut incremental_request =
+        client.build_request(vec![first.clone(), second.clone()], RequestKind::Turn);
+    let logical_incremental_request = incremental_request.clone();
+    let restoration = client
+        .prepare_websocket_request(
+            &mut incremental_request,
+            WebSocketRequestMode::Inference,
+            RequestInputIdentity::Exact,
+        )
+        .unwrap();
+    assert_eq!(
+        incremental_request["previous_response_id"],
+        "response-first"
+    );
+    assert_eq!(incremental_request["input"], json!([second]));
+    restoration.restore(&mut incremental_request).unwrap();
+    assert_eq!(incremental_request, logical_incremental_request);
+
+    let mut changed_request =
+        client.build_request(vec![first, user_message("changed")], RequestKind::Turn);
+    changed_request["instructions"] = Value::String("changed instructions".to_string());
+    let logical_changed_request = changed_request.clone();
+    let restoration = client
+        .prepare_websocket_request(
+            &mut changed_request,
+            WebSocketRequestMode::Inference,
+            RequestInputIdentity::Exact,
+        )
+        .unwrap();
+    assert!(changed_request.get("previous_response_id").is_none());
+    assert_eq!(changed_request["input"], logical_changed_request["input"]);
+    restoration.restore(&mut changed_request).unwrap();
+    assert_eq!(changed_request, logical_changed_request);
 }
 
 fn assistant_item(text: &str) -> Value {
@@ -273,7 +255,6 @@ fn completed_event_records_full_cache_usage() {
         &completed_items,
         None,
         MODEL,
-        true,
         &mut server_model_warning_emitted,
     )
     .unwrap();
@@ -313,7 +294,6 @@ fn completed_items_are_emitted_once_in_api_order() {
         &completed_items,
         Some(&events),
         MODEL,
-        true,
         &mut server_model_warning_emitted,
     )
     .unwrap();
@@ -324,7 +304,6 @@ fn completed_items_are_emitted_once_in_api_order() {
         &completed_items,
         Some(&events),
         MODEL,
-        true,
         &mut server_model_warning_emitted,
     )
     .unwrap();
@@ -336,7 +315,6 @@ fn completed_items_are_emitted_once_in_api_order() {
         &completed_items,
         Some(&events),
         MODEL,
-        true,
         &mut server_model_warning_emitted,
     )
     .unwrap();
@@ -352,7 +330,6 @@ fn completed_items_are_emitted_once_in_api_order() {
         &completed_items,
         Some(&events),
         MODEL,
-        true,
         &mut server_model_warning_emitted,
     )
     .unwrap();
@@ -375,10 +352,8 @@ fn completed_items_are_emitted_once_in_api_order() {
     let response = collected.finish().unwrap();
     assert_eq!(
         response.tool_calls,
-        vec![ToolCall::Custom {
+        vec![ToolCall::Exec {
             call_id: "call_1".to_string(),
-            namespace: None,
-            name: "exec".to_string(),
             input: "text('done')".to_string(),
         }]
     );
@@ -398,7 +373,6 @@ fn extracts_text_and_forwards_streaming_events() {
         &completed_items,
         Some(&events),
         MODEL,
-        true,
         &mut server_model_warning_emitted,
     )
     .unwrap();
@@ -408,7 +382,6 @@ fn extracts_text_and_forwards_streaming_events() {
         &completed_items,
         Some(&events),
         MODEL,
-        true,
         &mut server_model_warning_emitted,
     )
     .unwrap();
@@ -418,7 +391,6 @@ fn extracts_text_and_forwards_streaming_events() {
         &completed_items,
         Some(&events),
         MODEL,
-        true,
         &mut server_model_warning_emitted,
     )
     .unwrap();
@@ -514,6 +486,7 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
     assert!(body.get("tools").is_none());
     assert!(body.get("instructions").is_none());
     assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(body["reasoning"]["effort"], "xhigh");
     assert_eq!(body["reasoning"]["context"], "all_turns");
     assert_eq!(body["input"][0]["type"], "additional_tools");
     assert_eq!(body["input"][0]["role"], "developer");
@@ -533,8 +506,16 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
     assert_eq!(additional_tools[0]["type"], "namespace");
     assert_eq!(additional_tools[0]["name"], "functions");
     assert_eq!(additional_tools[0]["description"], "");
-    let tools = responses_lite_function_tools(&body["input"][0]["tools"]);
-    assert_eq!(tool_names(tools), expected_code_mode_only_tool_names());
+    let tools = &additional_tools[0]["tools"];
+    assert_eq!(
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["exec", "wait"]
+    );
     let exec = tools
         .as_array()
         .unwrap()
@@ -574,7 +555,6 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
         client_turn_metadata["turn_started_at_unix_ms"],
         1_700_000_000_123_u64
     );
-    assert!(client_turn_metadata.get("code_mode_tool_names").is_none());
     let header_turn_metadata: Value = serde_json::from_str(
         request
             .headers
@@ -597,7 +577,7 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
 
 #[tokio::test]
 async fn model_rerouting_warns_once_per_turn_without_rejecting_payload_aliases() {
-    const FALLBACK_MODEL: &str = "gpt-5.2";
+    const FALLBACK_MODEL: &str = "safety-fallback";
     let first_item = assistant_item("first");
     let mut first_completed = completed_event("resp_rerouted_event", &first_item);
     first_completed["response"]["model"] = Value::String("backend-payload-alias".to_string());
@@ -654,166 +634,6 @@ async fn model_rerouting_warns_once_per_turn_without_rejecting_payload_aliases()
 }
 
 #[test]
-fn standard_responses_models_use_their_native_request_contract() {
-    let mut client = test_client("http://127.0.0.1:1".to_string());
-    let selection =
-        crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::XHigh);
-    client.set_model_selection(selection);
-    client.set_service_tier(ServiceTier::Fast);
-    let message = user_message("hello standard Responses");
-
-    let request = client.build_request(vec![message.clone()], RequestKind::Turn);
-
-    assert_eq!(request["model"], "gpt-5.2");
-    assert_eq!(request["reasoning"]["effort"], "xhigh");
-    assert!(request["reasoning"].get("context").is_none());
-    assert_eq!(request["parallel_tool_calls"], true);
-    assert_eq!(tool_names(&request["tools"]), expected_direct_tool_names());
-    let tools = request["tools"].as_array().unwrap();
-    assert_eq!(
-        tool_names(namespace_tools(&request["tools"], "openaiDeveloperDocs")),
-        expected_openai_docs_tool_names()
-    );
-    assert_eq!(
-        tool_names(namespace_tools(&request["tools"], "web")),
-        vec!["run"]
-    );
-    assert!(tools.iter().all(|tool| tool.get("output_schema").is_none()));
-    assert!(tools.iter().all(|tool| tool["name"] != "exec"));
-    assert!(tools.iter().all(|tool| tool["name"] != "wait"));
-    let patch = tools
-        .iter()
-        .find(|tool| tool["name"] == "apply_patch")
-        .unwrap();
-    assert_eq!(patch["type"], "custom");
-    assert_eq!(patch["format"]["type"], "grammar");
-    assert!(
-        patch["format"]["definition"]
-            .as_str()
-            .unwrap()
-            .contains("*** Begin Patch")
-    );
-    let view_image = tools
-        .iter()
-        .find(|tool| tool["name"] == "view_image")
-        .unwrap();
-    assert!(
-        view_image["parameters"]["properties"]
-            .get("detail")
-            .is_none()
-    );
-    assert_eq!(request["input"], json!([message]));
-    assert!(request.get("service_tier").is_none());
-}
-
-#[test]
-fn standard_code_mode_is_hybrid_and_code_mode_only_hides_nested_tools() {
-    let mut client = test_client("http://127.0.0.1:1".to_string());
-    let mut selection =
-        crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::Medium);
-    selection.tool_mode = Some(ToolMode::CodeMode);
-    client.set_model_selection(selection.clone());
-
-    let hybrid = client.build_request(vec![user_message("hybrid")], RequestKind::Turn);
-    assert_eq!(
-        tool_names(&hybrid["tools"]),
-        expected_code_mode_tool_names()
-    );
-    let hybrid_tools = hybrid["tools"].as_array().unwrap();
-    let hybrid_exec = hybrid_tools
-        .iter()
-        .find(|tool| tool["name"] == "exec")
-        .unwrap();
-    assert!(
-        hybrid_exec["description"]
-            .as_str()
-            .unwrap()
-            .contains("Defaults to 30000 ms.")
-    );
-    assert!(
-        !hybrid_exec["description"]
-            .as_str()
-            .unwrap()
-            .contains("### `apply_patch`")
-    );
-    let hybrid_patch = hybrid_tools
-        .iter()
-        .find(|tool| tool["name"] == "apply_patch")
-        .unwrap();
-    assert!(
-        hybrid_patch["description"]
-            .as_str()
-            .unwrap()
-            .contains("exec tool declaration:")
-    );
-
-    selection.tool_mode = Some(ToolMode::CodeModeOnly);
-    client.set_model_selection(selection);
-    let code_mode_only =
-        client.build_request(vec![user_message("code mode only")], RequestKind::Turn);
-    assert_eq!(
-        tool_names(&code_mode_only["tools"]),
-        expected_code_mode_only_tool_names()
-    );
-    let exec = code_mode_only["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "exec")
-        .unwrap();
-    assert!(
-        exec["description"]
-            .as_str()
-            .unwrap()
-            .contains("### `apply_patch`")
-    );
-    assert!(
-        !exec["description"]
-            .as_str()
-            .unwrap()
-            .contains("detail?: \"high\" | \"original\";")
-    );
-}
-
-#[test]
-fn responses_lite_uses_the_selected_direct_catalogue() {
-    let mut client = test_client("http://127.0.0.1:1".to_string());
-    let mut selection =
-        crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::Medium);
-    selection.use_responses_lite = true;
-    client.set_model_selection(selection);
-
-    let request = client.build_request(vec![user_message("direct lite")], RequestKind::Turn);
-
-    assert!(request.get("tools").is_none());
-    assert!(request.get("instructions").is_none());
-    assert_eq!(request["input"][0]["type"], "additional_tools");
-    let tools = &request["input"][0]["tools"];
-    assert_eq!(tool_names(tools), expected_direct_tool_names());
-    assert_eq!(
-        tool_names(responses_lite_function_tools(tools)),
-        expected_direct_function_tool_names()
-    );
-    let view_image = responses_lite_function_tools(tools)
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "view_image")
-        .unwrap();
-    assert!(
-        view_image["parameters"]["properties"]
-            .get("detail")
-            .is_none()
-    );
-    assert_eq!(
-        tool_names(namespace_tools(tools, "openaiDeveloperDocs")),
-        expected_openai_docs_tool_names()
-    );
-    assert_eq!(tool_names(namespace_tools(tools, "web")), vec!["run"]);
-    assert_eq!(request["input"][1]["role"], "developer");
-}
-
-#[test]
 fn responses_lite_strips_image_details_only_from_the_request_copy() {
     let history = vec![
         json!({
@@ -845,12 +665,7 @@ fn responses_lite_strips_image_details_only_from_the_request_copy() {
         }),
     ];
 
-    let (request_input, restoration) = compose_sampling_input(
-        history.clone(),
-        true,
-        ToolMode::CodeModeOnly,
-        /*supports_image_detail_original*/ true,
-    );
+    let (request_input, restoration) = compose_sampling_input(history.clone());
 
     assert!(
         request_input
@@ -869,14 +684,14 @@ fn responses_lite_strips_image_details_only_from_the_request_copy() {
 }
 
 #[test]
-fn standard_responses_accept_completed_events_without_lite_reasoning_context() {
+fn completed_events_may_omit_reasoning_context() {
     let response = json!({
-        "id": "resp_standard",
-        "model": "gpt-5.2",
+        "id": "resp_without_context",
+        "model": MODEL,
         "output": [],
     });
 
-    validate_completed_response(&response, false).unwrap();
+    validate_completed_response(&response).unwrap();
 }
 
 #[tokio::test]

@@ -1,9 +1,4 @@
-//! Codex-compatible `/model` picker.
-//!
-//! The menu hierarchy, copy, row markers, keyboard behavior, and layout are
-//! ported from OpenAI Codex's current `model_popups.rs` and generic selection
-//! view. bettercodex keeps the focused state machine local because its TUI does
-//! not carry Codex's general bottom-pane view stack.
+//! Fixed GPT-5.6 `/model` picker.
 
 use super::bottom_pane::scroll_state::ScrollState;
 use super::bottom_pane::selection_popup_common::GenericDisplayRow;
@@ -13,9 +8,12 @@ use super::bottom_pane::selection_popup_common::measure_text_height;
 use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
 use super::bottom_pane::selection_popup_common::render_menu_surface;
 use super::bottom_pane::selection_popup_common::render_rows;
+use crate::model::DEFAULT_MODEL;
 use crate::model::ModelPreset;
 use crate::model::ModelSelection;
-use crate::model::ReasoningEffort;
+use crate::model::advanced_reasoning_efforts;
+use crate::model::available_models;
+use crate::model::standard_reasoning_efforts;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -31,32 +29,20 @@ use ratatui::widgets::Wrap;
 const FOOTER_HEIGHT: u16 = 1;
 
 #[derive(Clone, Copy)]
-enum ModelReturn {
-    Quick(ScrollState),
-    Models {
-        state: ScrollState,
-        quick_state: Option<ScrollState>,
-    },
-}
-
 enum PickerStage {
-    Quick {
-        state: ScrollState,
-    },
     Models {
         state: ScrollState,
-        quick_state: Option<ScrollState>,
     },
     Reasoning {
         preset: ModelPreset,
         state: ScrollState,
-        model_return: ModelReturn,
+        model_state: ScrollState,
     },
     Advanced {
         preset: ModelPreset,
         state: ScrollState,
         reasoning_state: ScrollState,
-        model_return: ModelReturn,
+        model_state: ScrollState,
     },
 }
 
@@ -68,29 +54,17 @@ pub(super) enum ModelPickerAction {
 }
 
 pub(super) struct ModelPicker {
-    models: Vec<ModelPreset>,
     current: ModelSelection,
     stage: PickerStage,
 }
 
 impl ModelPicker {
-    pub(super) fn new(models: Vec<ModelPreset>, current: ModelSelection) -> Self {
-        let auto_models = auto_models(&models);
-        let stage = if auto_models.is_empty() {
-            PickerStage::Models {
-                state: initial_model_state(&non_auto_models(&models), &current),
-                quick_state: None,
-            }
-        } else {
-            let has_all_models = !non_auto_models(&models).is_empty();
-            PickerStage::Quick {
-                state: initial_quick_state(&auto_models, &current, has_all_models),
-            }
-        };
+    pub(super) fn new(current: ModelSelection) -> Self {
         Self {
-            models,
+            stage: PickerStage::Models {
+                state: initial_model_state(&current),
+            },
             current,
-            stage,
         }
     }
 
@@ -203,8 +177,7 @@ impl ModelPicker {
 
     fn state(&self) -> &ScrollState {
         match &self.stage {
-            PickerStage::Quick { state }
-            | PickerStage::Models { state, .. }
+            PickerStage::Models { state }
             | PickerStage::Reasoning { state, .. }
             | PickerStage::Advanced { state, .. } => state,
         }
@@ -212,8 +185,7 @@ impl ModelPicker {
 
     fn state_mut(&mut self) -> &mut ScrollState {
         match &mut self.stage {
-            PickerStage::Quick { state }
-            | PickerStage::Models { state, .. }
+            PickerStage::Models { state }
             | PickerStage::Reasoning { state, .. }
             | PickerStage::Advanced { state, .. } => state,
         }
@@ -221,28 +193,20 @@ impl ModelPicker {
 
     fn row_count(&self) -> usize {
         match &self.stage {
-            PickerStage::Quick { .. } => {
-                let auto_count = auto_models(&self.models).len();
-                auto_count + usize::from(!non_auto_models(&self.models).is_empty())
+            PickerStage::Models { .. } => available_models().len(),
+            PickerStage::Reasoning { .. } => {
+                standard_reasoning_efforts().len()
+                    + usize::from(!advanced_reasoning_efforts().is_empty())
             }
-            PickerStage::Models { .. } => non_auto_models(&self.models).len(),
-            PickerStage::Reasoning { preset, .. } => {
-                let normal = normal_efforts(preset).len();
-                normal + usize::from(!advanced_efforts(preset).is_empty())
-            }
-            PickerStage::Advanced { preset, .. } => advanced_efforts(preset).len(),
+            PickerStage::Advanced { .. } => advanced_reasoning_efforts().len(),
         }
     }
 
     fn header_lines(&self) -> Vec<Line<'static>> {
         match &self.stage {
-            PickerStage::Quick { .. } => vec![
-                Line::from("Select Model").bold(),
-                Line::from("Pick a quick auto mode or browse all models.").dim(),
-            ],
             PickerStage::Models { .. } => vec![
                 Line::from("Select Model and Effort").bold(),
-                Line::from("Choose a model and reasoning level available to your account.").dim(),
+                Line::from("Choose a GPT-5.6 model and reasoning level.").dim(),
             ],
             PickerStage::Reasoning { preset, .. } => {
                 vec![Line::from(format!("Select Reasoning Level for {}", preset.model)).bold()]
@@ -256,289 +220,145 @@ impl ModelPicker {
 
     fn rows(&self) -> Vec<GenericDisplayRow> {
         match &self.stage {
-            PickerStage::Quick { state } => self.quick_rows(state),
-            PickerStage::Models { state, .. } => {
-                model_rows(&non_auto_models(&self.models), state, &self.current)
-            }
+            PickerStage::Models { state } => model_rows(state, &self.current),
             PickerStage::Reasoning { preset, state, .. } => {
-                reasoning_rows(preset, state, &self.current)
+                reasoning_rows(*preset, state, &self.current)
             }
             PickerStage::Advanced { preset, state, .. } => {
-                advanced_rows(preset, state, &self.current)
+                advanced_rows(*preset, state, &self.current)
             }
         }
-    }
-
-    fn quick_rows(&self, state: &ScrollState) -> Vec<GenericDisplayRow> {
-        let autos = auto_models(&self.models);
-        let mut rows = model_rows(&autos, state, &self.current);
-        let others = non_auto_models(&self.models);
-        if !others.is_empty() {
-            let index = rows.len();
-            let selected = state.selected_idx == Some(index);
-            let current_is_auto = autos
-                .iter()
-                .any(|preset| preset.model == self.current.model);
-            rows.push(display_row(
-                index,
-                selected,
-                format!(
-                    "All models{}",
-                    if current_is_auto { "" } else { " (current)" }
-                ),
-                Some(format!(
-                    "Choose a specific model and reasoning level (current: {})",
-                    self.current.model
-                )),
-            ));
-        }
-        rows
     }
 
     fn accept(&mut self) -> ModelPickerAction {
         let selected = self.state().selected_idx.unwrap_or_default();
-        match &self.stage {
-            PickerStage::Quick { state } => {
-                let autos = auto_models(&self.models);
-                if let Some(preset) = autos.get(selected).map(|preset| (*preset).clone()) {
-                    if preset
-                        .supported_reasoning_efforts
-                        .iter()
-                        .any(|option| option.effort.is_advanced())
-                        || preset.default_reasoning_effort.is_advanced()
-                    {
-                        return self.open_reasoning(preset, ModelReturn::Quick(*state));
-                    }
-                    return ModelPickerAction::Select(
-                        preset.selection(preset.default_reasoning_effort.clone()),
-                    );
-                }
-                let models = non_auto_models(&self.models);
-                if !models.is_empty() && selected == autos.len() {
-                    self.stage = PickerStage::Models {
-                        state: initial_model_state(&models, &self.current),
-                        quick_state: Some(*state),
-                    };
-                }
-                ModelPickerAction::None
-            }
-            PickerStage::Models { state, quick_state } => {
-                let models = non_auto_models(&self.models);
-                let Some(preset) = models.get(selected).map(|preset| (*preset).clone()) else {
+        match self.stage {
+            PickerStage::Models { state } => {
+                let Some(preset) = available_models().get(selected).copied() else {
                     return ModelPickerAction::None;
                 };
-                self.open_reasoning(
+                let mut reasoning_state = ScrollState::new();
+                reasoning_state.selected_idx = Some(initial_reasoning_index(preset, &self.current));
+                reasoning_state.clamp_selection(
+                    standard_reasoning_efforts().len()
+                        + usize::from(!advanced_reasoning_efforts().is_empty()),
+                );
+                self.stage = PickerStage::Reasoning {
                     preset,
-                    ModelReturn::Models {
-                        state: *state,
-                        quick_state: *quick_state,
-                    },
-                )
+                    state: reasoning_state,
+                    model_state: state,
+                };
+                ModelPickerAction::None
             }
             PickerStage::Reasoning {
                 preset,
                 state,
-                model_return,
+                model_state,
             } => {
-                let normal = normal_efforts(preset);
+                let normal = standard_reasoning_efforts();
                 if let Some(effort) = normal.get(selected) {
-                    return ModelPickerAction::Select(preset.selection((*effort).clone()));
+                    return ModelPickerAction::Select(preset.selection(*effort));
                 }
-                if selected == normal.len() && !advanced_efforts(preset).is_empty() {
+                let advanced = advanced_reasoning_efforts();
+                if selected == normal.len() && !advanced.is_empty() {
                     let mut advanced_state = ScrollState::new();
-                    let advanced = advanced_efforts(preset);
                     let initial = if preset.model == self.current.model {
                         advanced
                             .iter()
-                            .position(|effort| *effort == &self.current.reasoning_effort)
+                            .position(|effort| *effort == self.current.reasoning_effort)
                     } else {
                         None
                     };
                     advanced_state.selected_idx = Some(initial.unwrap_or_default());
                     advanced_state.clamp_selection(advanced.len());
                     self.stage = PickerStage::Advanced {
-                        preset: preset.clone(),
+                        preset,
                         state: advanced_state,
-                        reasoning_state: *state,
-                        model_return: *model_return,
+                        reasoning_state: state,
+                        model_state,
                     };
                 }
                 ModelPickerAction::None
             }
-            PickerStage::Advanced { preset, .. } => advanced_efforts(preset)
+            PickerStage::Advanced { preset, .. } => advanced_reasoning_efforts()
                 .get(selected)
-                .map(|effort| ModelPickerAction::Select(preset.selection((*effort).clone())))
+                .map(|effort| ModelPickerAction::Select(preset.selection(*effort)))
                 .unwrap_or(ModelPickerAction::None),
         }
     }
 
-    fn open_reasoning(
-        &mut self,
-        preset: ModelPreset,
-        model_return: ModelReturn,
-    ) -> ModelPickerAction {
-        let mut efforts = preset
-            .supported_reasoning_efforts
-            .iter()
-            .map(|option| option.effort.clone())
-            .collect::<Vec<_>>();
-        if efforts.is_empty() {
-            efforts.push(preset.default_reasoning_effort.clone());
-        }
-        if efforts.len() == 1 && !efforts[0].is_advanced() {
-            return ModelPickerAction::Select(preset.selection(efforts.remove(0)));
-        }
-        let mut state = ScrollState::new();
-        state.selected_idx = Some(initial_reasoning_index(&preset, &self.current));
-        state.clamp_selection(
-            normal_efforts(&preset).len() + usize::from(!advanced_efforts(&preset).is_empty()),
-        );
-        self.stage = PickerStage::Reasoning {
-            preset,
-            state,
-            model_return,
-        };
-        ModelPickerAction::None
-    }
-
     fn go_back(&mut self) -> ModelPickerAction {
-        match &self.stage {
-            PickerStage::Quick { .. } => ModelPickerAction::Close,
-            PickerStage::Models {
-                quick_state: Some(quick_state),
-                ..
-            } => {
-                self.stage = PickerStage::Quick {
-                    state: *quick_state,
-                };
-                ModelPickerAction::None
-            }
-            PickerStage::Models {
-                quick_state: None, ..
-            } => ModelPickerAction::Close,
-            PickerStage::Reasoning { model_return, .. } => {
-                self.restore_model_stage(*model_return);
+        match self.stage {
+            PickerStage::Models { .. } => ModelPickerAction::Close,
+            PickerStage::Reasoning { model_state, .. } => {
+                self.stage = PickerStage::Models { state: model_state };
                 ModelPickerAction::None
             }
             PickerStage::Advanced {
                 preset,
                 reasoning_state,
-                model_return,
+                model_state,
                 ..
             } => {
                 self.stage = PickerStage::Reasoning {
-                    preset: preset.clone(),
-                    state: *reasoning_state,
-                    model_return: *model_return,
+                    preset,
+                    state: reasoning_state,
+                    model_state,
                 };
                 ModelPickerAction::None
             }
         }
     }
-
-    fn restore_model_stage(&mut self, model_return: ModelReturn) {
-        self.stage = match model_return {
-            ModelReturn::Quick(state) => PickerStage::Quick { state },
-            ModelReturn::Models { state, quick_state } => {
-                PickerStage::Models { state, quick_state }
-            }
-        };
-    }
 }
 
-fn auto_models(models: &[ModelPreset]) -> Vec<&ModelPreset> {
-    let mut models = models
-        .iter()
-        .filter(|preset| preset.model.starts_with("codex-auto-"))
-        .collect::<Vec<_>>();
-    models.sort_by_key(|preset| match preset.model.as_str() {
-        "codex-auto-fast" => 0,
-        "codex-auto-balanced" => 1,
-        "codex-auto-thorough" => 2,
-        _ => 3,
-    });
-    models
-}
-
-fn non_auto_models(models: &[ModelPreset]) -> Vec<&ModelPreset> {
-    models
-        .iter()
-        .filter(|preset| !preset.model.starts_with("codex-auto-"))
-        .collect()
-}
-
-fn initial_quick_state(
-    models: &[&ModelPreset],
-    current: &ModelSelection,
-    has_all_models: bool,
-) -> ScrollState {
+fn initial_model_state(current: &ModelSelection) -> ScrollState {
+    let models = available_models();
     let mut state = ScrollState::new();
     state.selected_idx = Some(
         models
             .iter()
             .position(|preset| preset.model == current.model)
-            .unwrap_or_else(|| {
-                if has_all_models {
-                    models.len()
-                } else {
-                    models
-                        .iter()
-                        .position(|preset| preset.is_default)
-                        .unwrap_or_default()
-                }
-            }),
-    );
-    state.clamp_selection(models.len() + usize::from(has_all_models));
-    state
-}
-
-fn initial_model_state(models: &[&ModelPreset], current: &ModelSelection) -> ScrollState {
-    let mut state = ScrollState::new();
-    state.selected_idx = Some(
-        models
-            .iter()
-            .position(|preset| preset.model == current.model)
-            .or_else(|| models.iter().position(|preset| preset.is_default))
+            .or_else(|| {
+                models
+                    .iter()
+                    .position(|preset| preset.model == DEFAULT_MODEL)
+            })
             .unwrap_or_default(),
     );
     state.clamp_selection(models.len());
     state
 }
 
-fn initial_reasoning_index(preset: &ModelPreset, current: &ModelSelection) -> usize {
-    let normal = normal_efforts(preset);
+fn initial_reasoning_index(preset: ModelPreset, current: &ModelSelection) -> usize {
+    let normal = standard_reasoning_efforts();
     let selected = if preset.model == current.model {
-        &current.reasoning_effort
+        current.reasoning_effort
     } else {
-        &preset.default_reasoning_effort
+        preset.default_reasoning_effort
     };
     normal
         .iter()
         .position(|effort| *effort == selected)
         .unwrap_or_else(|| {
-            if selected.is_advanced() && !advanced_efforts(preset).is_empty() {
+            if advanced_reasoning_efforts().contains(&selected) {
                 normal.len()
             } else {
                 normal
                     .iter()
-                    .position(|effort| *effort == &preset.default_reasoning_effort)
+                    .position(|effort| *effort == preset.default_reasoning_effort)
                     .unwrap_or_default()
             }
         })
 }
 
-fn model_rows(
-    models: &[&ModelPreset],
-    state: &ScrollState,
-    current: &ModelSelection,
-) -> Vec<GenericDisplayRow> {
-    models
+fn model_rows(state: &ScrollState, current: &ModelSelection) -> Vec<GenericDisplayRow> {
+    available_models()
         .iter()
         .enumerate()
         .map(|(index, preset)| {
             let marker = if preset.model == current.model {
                 " (current)"
-            } else if preset.is_default {
+            } else if preset.model == DEFAULT_MODEL {
                 " (default)"
             } else {
                 ""
@@ -547,53 +367,42 @@ fn model_rows(
                 index,
                 state.selected_idx == Some(index),
                 format!("{}{marker}", preset.model),
-                (!preset.description.is_empty()).then(|| preset.description.clone()),
+                Some(preset.description.to_string()),
             )
         })
         .collect()
 }
 
 fn reasoning_rows(
-    preset: &ModelPreset,
+    preset: ModelPreset,
     state: &ScrollState,
     current: &ModelSelection,
 ) -> Vec<GenericDisplayRow> {
-    let normal = normal_efforts(preset);
+    let normal = standard_reasoning_efforts();
     let mut rows = normal
         .iter()
         .enumerate()
         .map(|(index, effort)| {
-            let default_marker = if effort == &&preset.default_reasoning_effort {
+            let default_marker = if *effort == preset.default_reasoning_effort {
                 " (default)"
             } else {
                 ""
             };
             let current_marker =
-                if preset.model == current.model && effort == &&current.reasoning_effort {
+                if preset.model == current.model && *effort == current.reasoning_effort {
                     " (current)"
                 } else {
                     ""
                 };
-            let mut description = effort_description(preset, effort);
-            if state.selected_idx == Some(index) && reasoning_warning_effort(preset) == Some(effort)
-            {
-                let warning = format!(
-                    "Warning: {} reasoning effort can quickly consume Plus plan rate limits.",
-                    effort.label()
-                );
-                description = Some(description.map_or(warning.clone(), |description| {
-                    format!("{description}\n{warning}")
-                }));
-            }
             display_row(
                 index,
                 state.selected_idx == Some(index),
                 format!("{}{default_marker}{current_marker}", effort.label()),
-                description,
+                Some(effort.description().to_string()),
             )
         })
         .collect::<Vec<_>>();
-    let advanced = advanced_efforts(preset);
+    let advanced = advanced_reasoning_efforts();
     if !advanced.is_empty() {
         let index = rows.len();
         let names = advanced
@@ -607,7 +416,7 @@ fn reasoning_rows(
             "consume"
         };
         let current_marker =
-            if preset.model == current.model && current.reasoning_effort.is_advanced() {
+            if preset.model == current.model && advanced.contains(&current.reasoning_effort) {
                 " (current)"
             } else {
                 ""
@@ -623,27 +432,28 @@ fn reasoning_rows(
 }
 
 fn advanced_rows(
-    preset: &ModelPreset,
+    preset: ModelPreset,
     state: &ScrollState,
     current: &ModelSelection,
 ) -> Vec<GenericDisplayRow> {
-    advanced_efforts(preset)
-        .into_iter()
+    advanced_reasoning_efforts()
+        .iter()
         .enumerate()
         .map(|(index, effort)| {
             let current_marker =
-                if preset.model == current.model && effort == &current.reasoning_effort {
+                if preset.model == current.model && *effort == current.reasoning_effort {
                     " (current)"
                 } else {
                     ""
                 };
-            let description =
-                "For difficult problems when quality matters more than speed · higher usage";
             display_row(
                 index,
                 state.selected_idx == Some(index),
                 format!("{}{current_marker}", effort.label()),
-                Some(description.to_string()),
+                Some(
+                    "For difficult problems when quality matters more than speed · higher usage"
+                        .to_string(),
+                ),
             )
         })
         .collect()
@@ -662,58 +472,6 @@ fn display_row(
     }
 }
 
-fn normal_efforts(preset: &ModelPreset) -> Vec<&ReasoningEffort> {
-    preset
-        .supported_reasoning_efforts
-        .iter()
-        .map(|option| &option.effort)
-        .filter(|effort| !effort.is_advanced())
-        .collect()
-}
-
-fn advanced_efforts(preset: &ModelPreset) -> Vec<&ReasoningEffort> {
-    let mut efforts = preset
-        .supported_reasoning_efforts
-        .iter()
-        .map(|option| &option.effort)
-        .filter(|effort| effort.is_advanced())
-        .collect::<Vec<_>>();
-    if efforts.is_empty() && preset.default_reasoning_effort.is_advanced() {
-        efforts.push(&preset.default_reasoning_effort);
-    }
-    efforts
-}
-
-fn effort_description(preset: &ModelPreset, effort: &ReasoningEffort) -> Option<String> {
-    preset
-        .supported_reasoning_efforts
-        .iter()
-        .find(|option| &option.effort == effort)
-        .map(|option| option.description.clone())
-        .filter(|description| !description.is_empty())
-}
-
-fn reasoning_warning_effort(preset: &ModelPreset) -> Option<&ReasoningEffort> {
-    let warn_for_model = preset.model.starts_with("gpt-5.1-codex")
-        || preset.model.starts_with("gpt-5.1-codex-max")
-        || preset.model.starts_with("gpt-5.2");
-    if !warn_for_model {
-        return None;
-    }
-    preset
-        .supported_reasoning_efforts
-        .iter()
-        .map(|option| &option.effort)
-        .find(|effort| matches!(effort, ReasoningEffort::XHigh))
-        .or_else(|| {
-            preset
-                .supported_reasoning_efforts
-                .iter()
-                .map(|option| &option.effort)
-                .find(|effort| matches!(effort, ReasoningEffort::High))
-        })
-}
-
 fn standard_popup_hint() -> Line<'static> {
     Line::from(vec![
         "Press ".into(),
@@ -727,28 +485,24 @@ fn standard_popup_hint() -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::bundled_models;
+    use crate::model::ReasoningEffort;
     use pretty_assertions::assert_eq;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn model_picker_describes_the_supported_selection_surface() {
-        let current = bundled_models()[4].selection(ReasoningEffort::XHigh);
-        let picker = ModelPicker::new(bundled_models().to_vec(), current);
+    fn model_picker_exposes_only_the_gpt_5_6_family() {
+        let current = available_models()[2].selection(ReasoningEffort::XHigh);
+        let picker = ModelPicker::new(current);
         assert_eq!(
             render_trimmed(&picker, 80),
             concat!(
                 "  Select Model and Effort\n",
-                "  Choose a model and reasoning level available to your account.\n",
+                "  Choose a GPT-5.6 model and reasoning level.\n",
                 "\n",
-                "  1. gpt-5.6-sol (default)  Latest frontier agentic coding model.\n",
-                "  2. gpt-5.6-terra          Balanced agentic coding model for everyday work.\n",
-                "  3. gpt-5.6-luna           Fast and affordable agentic coding model.\n",
-                "  4. gpt-5.5                Frontier model for complex coding, research, and\n",
-                "                            real-world work.\n",
-                "› 5. gpt-5.2 (current)      Optimized for professional work and long-running\n",
-                "                            agents.\n",
+                "  1. gpt-5.6-sol (default)   Latest frontier agentic coding model.\n",
+                "  2. gpt-5.6-terra           Balanced agentic coding model for everyday work.\n",
+                "› 3. gpt-5.6-luna (current)  Fast and affordable agentic coding model.\n",
                 "\n",
                 "  Press enter to confirm or esc to go back",
             )
@@ -756,12 +510,10 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_surface_shows_max_as_the_only_advanced_effort() {
-        let mut preset = bundled_models()[0].clone();
-        preset.model = "gpt-5.4".to_string();
-        preset.default_reasoning_effort = ReasoningEffort::Medium;
+    fn reasoning_surface_keeps_max_behind_advanced_reasoning() {
+        let preset = available_models()[1];
         let current = preset.selection(ReasoningEffort::High);
-        let mut picker = ModelPicker::new(vec![preset], current);
+        let mut picker = ModelPicker::new(current);
         assert_eq!(
             picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ModelPickerAction::None
@@ -769,7 +521,7 @@ mod tests {
         assert_eq!(
             render_trimmed(&picker, 80),
             concat!(
-                "  Select Reasoning Level for gpt-5.4\n",
+                "  Select Reasoning Level for gpt-5.6-terra\n",
                 "\n",
                 "  1. Low               Fast responses with lighter reasoning\n",
                 "  2. Medium (default)  Balances speed and reasoning depth for everyday tasks\n",
@@ -780,19 +532,6 @@ mod tests {
                 "  Press enter to confirm or esc to go back",
             )
         );
-    }
-
-    #[test]
-    fn advanced_reasoning_surface_shows_max() {
-        let mut preset = bundled_models()[0].clone();
-        preset.model = "gpt-5.4".to_string();
-        preset.default_reasoning_effort = ReasoningEffort::Medium;
-        let current = preset.selection(ReasoningEffort::Max);
-        let mut picker = ModelPicker::new(vec![preset], current);
-        assert_eq!(
-            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            ModelPickerAction::None
-        );
 
         let row_count = picker.row_count();
         picker.state_mut().jump_bottom(row_count, MAX_POPUP_ROWS);
@@ -800,67 +539,12 @@ mod tests {
             picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ModelPickerAction::None
         );
-        assert_eq!(
-            render_trimmed(&picker, 80),
-            concat!(
-                "  Advanced Reasoning\n",
-                "  Warning: Consumes usage limits faster\n",
-                "\n",
-                "› 1. Max (current)  For difficult problems when quality matters more than\n",
-                "                    speed · higher usage\n",
-                "\n",
-                "  Press enter to confirm or esc to go back",
-            )
-        );
-
+        assert!(render_trimmed(&picker, 80).contains("Max"));
         assert_eq!(
             picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             ModelPickerAction::None
         );
         assert!(render_trimmed(&picker, 80).contains("Select Reasoning Level"));
-    }
-
-    #[test]
-    fn extra_high_warning_surface_matches_codex() {
-        let preset = bundled_models()[4].clone();
-        let current = preset.selection(ReasoningEffort::XHigh);
-        let mut picker = ModelPicker::new(vec![preset], current);
-        assert_eq!(
-            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            ModelPickerAction::None
-        );
-        assert_eq!(
-            render_trimmed(&picker, 80),
-            concat!(
-                "  Select Reasoning Level for gpt-5.2\n",
-                "\n",
-                "  1. Low                   Balances speed with some reasoning; useful for\n",
-                "                           straightforward queries and short explanations\n",
-                "  2. Medium (default)      Provides a solid balance of reasoning depth and\n",
-                "                           latency for general-purpose tasks\n",
-                "  3. High                  Maximizes reasoning depth for complex or ambiguous\n",
-                "                           problems\n",
-                "› 4. Extra high (current)  Extra high reasoning for complex problems\n",
-                "                           Warning: Extra high reasoning effort can quickly\n",
-                "                           consume Plus plan rate limits.\n",
-                "\n",
-                "  Press enter to confirm or esc to go back",
-            )
-        );
-    }
-
-    #[test]
-    fn quick_picker_with_only_auto_models_keeps_a_valid_initial_selection() {
-        let mut auto = bundled_models()[0].clone();
-        auto.model = "codex-auto-fast".to_string();
-        auto.supported_reasoning_efforts.truncate(1);
-        let expected = auto.selection(auto.default_reasoning_effort.clone());
-        let current = ModelSelection::from_identity("missing", ReasoningEffort::Medium);
-        let mut picker = ModelPicker::new(vec![auto], current);
-
-        let action = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(action, ModelPickerAction::Select(expected));
     }
 
     fn render_trimmed(picker: &ModelPicker, width: u16) -> String {

@@ -40,7 +40,6 @@ use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
-use crate::model::ModelPreset;
 use crate::model::ModelSelection;
 use crate::protocol::MessagePhase;
 use crate::protocol::ParsedCommand;
@@ -275,7 +274,6 @@ pub(super) struct View {
     skills: Vec<Skill>,
     context_tokens: Option<u64>,
     model_selection: ModelSelection,
-    models: Vec<ModelPreset>,
     service_tier: ServiceTier,
     background_processes: Vec<BackgroundProcess>,
     busy: bool,
@@ -320,10 +318,9 @@ impl PreparedView {
 enum TranscriptEntry {
     User(DisplayedUserPrompt),
     Assistant {
-        text: String,
+        content: MarkdownRenderCache,
         phase: Option<MessagePhase>,
         streaming: bool,
-        rendered: MarkdownRenderCache,
         history: StreamedAssistantHistory,
     },
     Tool(ToolEntry),
@@ -333,8 +330,7 @@ enum TranscriptEntry {
     },
     Notice(String),
     PatchNotes {
-        markdown: String,
-        rendered: MarkdownRenderCache,
+        content: MarkdownRenderCache,
     },
     UpdateAvailable(AvailableUpdate),
     Error(String),
@@ -583,7 +579,6 @@ impl View {
             skills,
             context_tokens: None,
             model_selection: ModelSelection::default(),
-            models: crate::model::bundled_models().to_vec(),
             service_tier: ServiceTier::default(),
             background_processes: Vec::new(),
             busy: false,
@@ -679,8 +674,7 @@ impl View {
 
     pub(super) fn add_patch_notes(&mut self, markdown: impl Into<String>) {
         self.entries.push(TranscriptEntry::PatchNotes {
-            markdown: markdown.into(),
-            rendered: MarkdownRenderCache::default(),
+            content: MarkdownRenderCache::new(markdown.into()),
         });
     }
 
@@ -852,10 +846,9 @@ impl View {
             Ok(SubmitOutcome::Completed(answer)) => {
                 if !self.terminal_assistant_received_this_turn && !answer.trim().is_empty() {
                     self.entries.push(TranscriptEntry::Assistant {
-                        text: answer,
+                        content: MarkdownRenderCache::new(answer),
                         phase: Some(MessagePhase::FinalAnswer),
                         streaming: false,
-                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     });
                 }
@@ -933,27 +926,9 @@ impl View {
         self.refresh_open_model_picker();
     }
 
-    pub(super) fn set_models(&mut self, models: Vec<ModelPreset>) {
-        if !models.is_empty() {
-            self.models = models;
-            self.refresh_open_model_picker();
-        }
-    }
-
-    pub(super) fn selection_with_catalog_metadata(
-        &self,
-        selection: &ModelSelection,
-    ) -> Option<ModelSelection> {
-        self.models
-            .iter()
-            .find(|preset| preset.model == selection.model)
-            .map(|preset| preset.selection(selection.reasoning_effort.clone()))
-    }
-
     fn refresh_open_model_picker(&mut self) {
         if matches!(self.overlay, Some(Overlay::Model(_))) {
             self.overlay = Some(Overlay::Model(Box::new(ModelPicker::new(
-                self.models.clone(),
                 self.model_selection.clone(),
             ))));
         }
@@ -1021,10 +996,10 @@ impl View {
             let included = match entry {
                 TranscriptEntry::User(_) | TranscriptEntry::Tool(_) => true,
                 TranscriptEntry::Assistant {
-                    text,
+                    content,
                     streaming: false,
                     ..
-                } => !text.trim().is_empty(),
+                } => !content.source().trim().is_empty(),
                 TranscriptEntry::Exploration { tools, .. } => !tools.is_empty(),
                 _ => false,
             };
@@ -1037,9 +1012,9 @@ impl View {
                         text: prompt.model_text.clone(),
                         image_count: prompt.image_count,
                     },
-                    TranscriptEntry::Assistant { text, phase, .. } => {
+                    TranscriptEntry::Assistant { content, phase, .. } => {
                         SessionTranscriptItem::Assistant {
-                            text: text.clone(),
+                            text: content.source().to_string(),
                             phase: phase.clone(),
                         }
                     }
@@ -1132,10 +1107,9 @@ impl View {
                 SessionTranscriptItem::Assistant { text, phase } => {
                     replaying_legacy_exploration = false;
                     self.entries.push(TranscriptEntry::Assistant {
-                        text,
+                        content: MarkdownRenderCache::new(text),
                         phase,
                         streaming: false,
-                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     });
                 }
@@ -1198,10 +1172,8 @@ impl View {
         skills: Vec<Skill>,
     ) {
         let user_message_style = self.user_message_style;
-        let models = self.models.clone();
         *self = Self::with_state(cwd, skills);
         self.user_message_style = user_message_style;
-        self.models = models;
         self.context_tokens = context_tokens;
         self.replay_transcript(transcript);
         self.editor.seed_history(prompt_history);
@@ -1251,10 +1223,9 @@ impl View {
                 self.active_message_phase = message.phase;
                 if !message.text.is_empty() {
                     self.entries.push(TranscriptEntry::Assistant {
-                        text: message.text,
+                        content: MarkdownRenderCache::new(message.text),
                         phase: self.active_message_phase.clone(),
                         streaming: true,
-                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     });
                 }
@@ -1265,15 +1236,14 @@ impl View {
                 self.seal_exploration();
                 match self.entries.last_mut() {
                     Some(TranscriptEntry::Assistant {
-                        text, streaming, ..
+                        content, streaming, ..
                     }) if *streaming => {
-                        text.push_str(&delta);
+                        content.append(&delta);
                     }
                     _ => self.entries.push(TranscriptEntry::Assistant {
-                        text: delta,
+                        content: MarkdownRenderCache::new(delta),
                         phase: self.active_message_phase.clone(),
                         streaming: true,
-                        rendered: MarkdownRenderCache::default(),
                         history: StreamedAssistantHistory::default(),
                     }),
                 }
@@ -2063,7 +2033,6 @@ impl View {
             "/compact" => Action::Compact,
             "/model" => {
                 self.overlay = Some(Overlay::Model(Box::new(ModelPicker::new(
-                    self.models.clone(),
                     self.model_selection.clone(),
                 ))));
                 Action::None
@@ -2153,10 +2122,10 @@ impl View {
                 ..
             } => None,
             TranscriptEntry::Assistant {
-                text,
+                content,
                 streaming: false,
                 ..
-            } if !text.trim().is_empty() => Some(text.clone()),
+            } if !content.source().trim().is_empty() => Some(content.source().to_string()),
             _ => None,
         });
         match markdown {
@@ -2177,22 +2146,20 @@ impl View {
             message.is_terminal() && !message.text.trim().is_empty();
         match self.entries.last_mut() {
             Some(TranscriptEntry::Assistant {
-                text,
+                content,
                 phase,
                 streaming,
-                rendered,
                 ..
             }) if *streaming => {
-                *text = message.text;
+                content.replace(message.text);
                 *phase = message.phase;
                 *streaming = false;
             }
             _ if !message.text.trim().is_empty() => {
                 self.entries.push(TranscriptEntry::Assistant {
-                    text: message.text,
+                    content: MarkdownRenderCache::new(message.text),
                     phase: message.phase,
                     streaming: false,
-                    rendered: MarkdownRenderCache::default(),
                     history: StreamedAssistantHistory::default(),
                 });
             }
@@ -2480,9 +2447,8 @@ impl View {
     fn spill_streaming_history(&mut self, width: u16, live_capacity: usize) -> Vec<HyperlinkLine> {
         let history_was_emitted = self.history_emitted;
         let Some(TranscriptEntry::Assistant {
-            text,
+            content,
             streaming: true,
-            rendered,
             history,
             ..
         }) = self.entries.get_mut(self.committed_entries)
@@ -2495,7 +2461,7 @@ impl View {
         }
         let start = history.lines.len();
         let (rendered_len, remaining) =
-            assistant_lines_after(text, width, &self.cwd, true, rendered, start);
+            assistant_lines_after(content, width, &self.cwd, true, start);
         if start > rendered_len {
             return Vec::new();
         }
@@ -3188,7 +3154,7 @@ impl View {
                 Style::default().fg(MUTED),
             ),
         ];
-        if self.service_tier.is_fast() && self.model_selection.supports_fast {
+        if self.service_tier.is_fast() {
             spans.push(Span::styled(" fast", Style::default().fg(Color::Magenta)));
         }
         spans.extend([
@@ -3299,20 +3265,13 @@ impl TranscriptEntry {
     ) -> (Vec<HyperlinkLine>, bool) {
         match self {
             Self::Assistant {
-                text,
+                content,
                 streaming,
-                rendered,
                 history,
                 ..
             } if history.started && history.width == Some(width) => {
-                let (_, output) = assistant_lines_after(
-                    text,
-                    width,
-                    cwd,
-                    *streaming,
-                    rendered,
-                    history.lines.len(),
-                );
+                let (_, output) =
+                    assistant_lines_after(content, width, cwd, *streaming, history.lines.len());
                 (output, true)
             }
             _ => (self.display_lines(width, user_style, cwd), false),
@@ -3321,9 +3280,8 @@ impl TranscriptEntry {
 
     fn streamed_history_needs_reflow(&mut self, width: u16, cwd: &Path) -> bool {
         let Self::Assistant {
-            text,
+            content,
             streaming,
-            rendered,
             history,
             ..
         } = self
@@ -3342,7 +3300,7 @@ impl TranscriptEntry {
         if *streaming {
             return false;
         }
-        !assistant_lines(text, width, cwd, false, rendered).starts_with(&history.lines)
+        !assistant_lines(content, width, cwd, false).starts_with(&history.lines)
     }
 
     fn reset_streamed_history(&mut self) {
@@ -3355,19 +3313,16 @@ impl TranscriptEntry {
         let plain_lines = match self {
             Self::User(message) => user_message_lines(message, width, user_style),
             Self::Assistant {
-                text,
-                streaming,
-                rendered,
-                ..
-            } => return assistant_lines(text, width, cwd, *streaming, rendered),
+                content, streaming, ..
+            } => return assistant_lines(content, width, cwd, *streaming),
             Self::Tool(tool) => tool.display_lines(width, user_style),
             Self::Exploration { tools, .. } => exploration_lines(tools, width),
             Self::Notice(message) => vec![Line::from(vec![
                 Span::from("• ").dim(),
                 Span::from(message.clone()).dim(),
             ])],
-            Self::PatchNotes { markdown, rendered } => {
-                return patch_notes_lines(markdown, width, cwd, rendered);
+            Self::PatchNotes { content } => {
+                return patch_notes_lines(content, width, cwd);
             }
             Self::UpdateAvailable(update) => update_available_lines(update, width),
             Self::Error(message) => vec![Line::from(vec![
@@ -4337,7 +4292,7 @@ fn welcome_card_lines(
         Span::from(model_selection.model.clone()),
         Span::from(format!(" {}", model_selection.reasoning_effort)).dim(),
     ];
-    if service_tier.is_fast() && model_selection.supports_fast {
+    if service_tier.is_fast() {
         model_spans.push(Span::from(" fast").magenta());
     }
     content.push(Line::from(model_spans));
@@ -4357,10 +4312,9 @@ fn welcome_card_lines(
 }
 
 fn patch_notes_lines(
-    source: &str,
+    content: &mut MarkdownRenderCache,
     available_width: u16,
     cwd: &Path,
-    rendered: &mut MarkdownRenderCache,
 ) -> Vec<HyperlinkLine> {
     let available_width = available_width.max(1);
     let inset = usize::from(available_width > 2);
@@ -4389,7 +4343,7 @@ fn patch_notes_lines(
         .iter()
         .map(line_to_static)
         .collect::<Vec<_>>();
-    let markdown = rendered.render(source, content_width, cwd, false).to_vec();
+    let markdown = content.render_finalized(content_width, cwd).to_vec();
 
     let mut lines = Vec::with_capacity(heading.len().saturating_add(markdown.len() + 4));
     lines.push(border());
@@ -4596,13 +4550,12 @@ fn styled_skill_mentions(
 }
 
 fn assistant_lines(
-    message: &str,
+    content: &mut MarkdownRenderCache,
     width: u16,
     cwd: &Path,
     streaming: bool,
-    cache: &mut MarkdownRenderCache,
 ) -> Vec<HyperlinkLine> {
-    assistant_lines_after(message, width, cwd, streaming, cache, 0).1
+    assistant_lines_after(content, width, cwd, streaming, 0).1
 }
 
 /// Clone and decorate only the rendered suffix that is still live in the viewport.
@@ -4611,15 +4564,18 @@ fn assistant_lines(
 /// long stream, however, the prefix before `start` is already in terminal scrollback and must not
 /// be cloned on every repaint.
 fn assistant_lines_after(
-    message: &str,
+    content: &mut MarkdownRenderCache,
     width: u16,
     cwd: &Path,
     streaming: bool,
-    cache: &mut MarkdownRenderCache,
     start: usize,
 ) -> (usize, Vec<HyperlinkLine>) {
     let content_width = usize::from(width.saturating_sub(2).max(1));
-    let rendered = cache.render(message, content_width, cwd, streaming);
+    let rendered = if streaming {
+        content.render_streaming(content_width, cwd)
+    } else {
+        content.render_finalized(content_width, cwd)
+    };
     let rendered_len = rendered.len();
     let start = start.min(rendered_len);
     let initial_prefix = if start == 0 {
@@ -5622,17 +5578,65 @@ mod tests {
 
     #[test]
     fn assistant_live_suffix_matches_the_full_render() {
-        let source = "first paragraph\n\nsecond paragraph\n\nthird paragraph";
-        let mut cache = MarkdownRenderCache::default();
-        let full = assistant_lines(source, 80, Path::new("/tmp"), true, &mut cache);
+        let mut content = MarkdownRenderCache::new("first paragraph\n\n".to_string());
+        content.append("second paragraph\n\n");
+        content.append("third paragraph");
+        let full = assistant_lines(&mut content, 80, Path::new("/tmp"), true);
         assert!(full.len() >= 3);
 
         let start = 2;
         let (rendered_len, suffix) =
-            assistant_lines_after(source, 80, Path::new("/tmp"), true, &mut cache, start);
+            assistant_lines_after(&mut content, 80, Path::new("/tmp"), true, start);
 
         assert_eq!(rendered_len, full.len());
         assert_eq!(suffix, full[start..]);
+    }
+
+    #[test]
+    fn streamed_assistant_filters_control_sequences_split_across_deltas() {
+        let chunks = [
+            "before ",
+            "\x1b[",
+            "31mred \x1b]0;secret",
+            " continuation\x1b\\after",
+        ];
+        let source = chunks.concat();
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn("test");
+        let _ = view.take_pending_history_lines(80, 24);
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(chunks[0].to_string()));
+        let before_control = view
+            .prepare(80, 24)
+            .active_lines
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(before_control, "\n• before");
+
+        for chunk in &chunks[1..] {
+            view.handle_agent_event(AgentEvent::ModelMessageDelta(chunk.to_string()));
+        }
+
+        let streamed = view
+            .prepare(80, 24)
+            .active_lines
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(streamed, "\n• before red after");
+
+        view.handle_agent_event(completed_message(source));
+        let finalized = view
+            .prepare(80, 24)
+            .active_lines
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(finalized, streamed);
     }
 
     #[test]
@@ -5882,7 +5886,7 @@ mod tests {
         view.context_tokens = Some(51_680);
         assert_eq!(
             plain(&view.status_line(80)),
-            "gpt-5.6-sol max │ pi / main │ 20% of 258K"
+            "gpt-5.6-sol xhigh │ pi / main │ 20% of 258K"
         );
     }
 
@@ -5906,7 +5910,7 @@ mod tests {
         view.set_service_tier(ServiceTier::Fast);
         assert_eq!(
             plain(&view.status_line(80)),
-            "gpt-5.6-sol max fast │ bettercodex / main │ ? of 258K"
+            "gpt-5.6-sol xhigh fast │ bettercodex / main │ ? of 258K"
         );
 
         let height = view.desired_height(80, 24);
@@ -5915,13 +5919,13 @@ mod tests {
         terminal.draw(|frame| view.render(frame)).unwrap();
         let rendered = render_buffer(terminal.backend().buffer());
         assert!(
-            rendered.contains("gpt-5.6-sol max fast │ bettercodex / main"),
+            rendered.contains("gpt-5.6-sol xhigh fast │ bettercodex / main"),
             "{rendered}"
         );
     }
 
     #[test]
-    fn model_command_uses_live_catalog_when_refresh_completes_while_open() {
+    fn model_command_opens_the_fixed_picker() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.editor.set_text("/model");
 
@@ -5934,66 +5938,6 @@ mod tests {
         );
         assert!(matches!(&view.overlay, Some(Overlay::Model(_))));
         assert!(view.editor.is_empty());
-
-        let mut refreshed_preset = crate::model::bundled_models()[0].clone();
-        refreshed_preset.raw_context_window = 100_000;
-        refreshed_preset.supported_reasoning_efforts.truncate(1);
-        let expected = refreshed_preset.selection(crate::model::ReasoningEffort::Low);
-        view.set_models(vec![refreshed_preset]);
-
-        assert_eq!(
-            view.handle_terminal_event(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            ))),
-            Action::SelectModel(expected)
-        );
-    }
-
-    #[test]
-    fn fast_status_is_hidden_for_a_model_that_does_not_support_it() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.set_model_selection(
-            crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::XHigh),
-        );
-        view.set_service_tier(ServiceTier::Fast);
-
-        assert_eq!(
-            plain(&view.status_line(80)),
-            "gpt-5.2 xhigh │ bettercodex │ ? of 258K"
-        );
-    }
-
-    #[test]
-    fn catalog_metadata_refresh_preserves_explicit_effort() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        let current =
-            crate::model::bundled_models()[4].selection(crate::model::ReasoningEffort::XHigh);
-        let mut refreshed_preset = crate::model::bundled_models()[4].clone();
-        refreshed_preset.raw_context_window = 100_000;
-        refreshed_preset.effective_context_window_percent = 80;
-        refreshed_preset.configured_auto_compact_token_limit = Some(70_000);
-        refreshed_preset.supports_fast = true;
-        view.set_models(vec![refreshed_preset]);
-
-        let refreshed = view.selection_with_catalog_metadata(&current).unwrap();
-
-        assert_eq!(
-            refreshed.reasoning_effort,
-            crate::model::ReasoningEffort::XHigh
-        );
-        assert_eq!(refreshed.effective_context_window(), 80_000);
-        assert_eq!(refreshed.auto_compact_token_limit(), 70_000);
-        assert!(refreshed.supports_fast);
-
-        let mut unsupported = current;
-        unsupported.reasoning_effort = crate::model::ReasoningEffort::Minimal;
-        let refreshed = view.selection_with_catalog_metadata(&unsupported).unwrap();
-        assert_eq!(
-            refreshed.reasoning_effort,
-            crate::model::ReasoningEffort::Minimal
-        );
-        assert_eq!(refreshed.effective_context_window(), 80_000);
     }
 
     #[test]
@@ -6154,7 +6098,7 @@ mod tests {
         assert!(!rendered.contains(">_ bettercodex"));
         assert!(!rendered.contains("Ask bettercodex to do anything"));
         assert!(rendered.lines().any(|line| line.trim() == "›"));
-        assert!(rendered.contains("gpt-5.6-sol max"));
+        assert!(rendered.contains("gpt-5.6-sol xhigh"));
     }
 
     #[test]
@@ -6221,7 +6165,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| plain(line).contains("gpt-5.6-sol max fast"))
+                .any(|line| plain(line).contains("gpt-5.6-sol xhigh fast"))
         );
     }
 

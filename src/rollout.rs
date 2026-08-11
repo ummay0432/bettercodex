@@ -123,7 +123,6 @@ pub(crate) struct LoadedRollout {
     pub(crate) server_reasoning_included: bool,
     pub(crate) compaction_count: u64,
     pub(crate) model_selection: ModelSelection,
-    pub(crate) history_model_selection: Option<ModelSelection>,
     pub(crate) service_tier: ServiceTier,
     pub(crate) unfinished_turn: Option<String>,
 }
@@ -197,9 +196,6 @@ enum RolloutRecordData<Items = Vec<Value>> {
     },
     ModelChanged {
         selection: ModelSelection,
-    },
-    HistoryModelChanged {
-        selection: Option<ModelSelection>,
     },
     TurnStarted {
         turn_id: String,
@@ -494,10 +490,6 @@ impl Rollout {
             metadata: metadata.clone(),
         };
         rollout.write_record(&RolloutRecord::Session { metadata })?;
-        // The session header keeps its compact, backwards-compatible model identity, while this
-        // record preserves the complete catalogue metadata needed to resume remote models exactly.
-        rollout.record_model_selection(selection)?;
-        rollout.record_history_model_selection(None)?;
         Ok(rollout)
     }
 
@@ -640,18 +632,6 @@ impl Rollout {
         })
     }
 
-    pub(crate) fn record_history_model_selection(
-        &mut self,
-        selection: Option<&ModelSelection>,
-    ) -> Result<()> {
-        if let Some(selection) = selection {
-            selection.validate()?;
-        }
-        self.write_record(&RolloutRecord::HistoryModelChanged {
-            selection: selection.cloned(),
-        })
-    }
-
     pub(crate) fn start_turn(&mut self, turn_id: &str) -> Result<()> {
         self.write_record(&RolloutRecord::TurnStarted {
             turn_id: turn_id.to_string(),
@@ -719,9 +699,6 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut server_reasoning_included = false;
     let mut compaction_count = 0_u64;
     let mut model_selection = None;
-    let mut history_model_selection = None;
-    let mut turn_model_selection = None;
-    let mut has_explicit_history_model = false;
     let mut service_tier = ServiceTier::default();
     let mut unfinished_turn = None;
     let mut line_number = 0_usize;
@@ -760,9 +737,9 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             RolloutRecord::Session {
                 metadata: session_metadata,
             } => {
-                let initial_selection = model_selection_from_metadata(&session_metadata)
+                let (_, initial_selection) = validate_session_metadata(&path, &session_metadata)
                     .with_context(|| {
-                        format!("invalid session model at {}:{line_number}", path.display())
+                        format!("invalid session header at {}:{line_number}", path.display())
                     })?;
                 model_selection = Some(initial_selection);
                 if metadata.replace(session_metadata).is_some() {
@@ -846,7 +823,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 service_tier: updated_service_tier,
             } => service_tier = updated_service_tier,
             RolloutRecord::ModelChanged { mut selection } => {
-                selection.migrate_legacy_tool_mode_selector();
+                selection.normalize();
                 selection.validate().with_context(|| {
                     format!(
                         "invalid model selection at {}:{line_number}",
@@ -855,29 +832,10 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 })?;
                 model_selection = Some(selection);
             }
-            RolloutRecord::HistoryModelChanged { mut selection } => {
-                if let Some(selection) = &mut selection {
-                    selection.migrate_legacy_tool_mode_selector();
-                }
-                if let Some(selection) = &selection {
-                    selection.validate().with_context(|| {
-                        format!("invalid history model at {}:{line_number}", path.display())
-                    })?;
-                }
-                history_model_selection = selection;
-                has_explicit_history_model = true;
-            }
             RolloutRecord::TurnStarted { turn_id } => {
                 unfinished_turn = Some(turn_id);
-                turn_model_selection = model_selection.clone();
             }
             RolloutRecord::TurnFinished { turn_id, .. } => {
-                if !has_explicit_history_model && let Some(selection) = turn_model_selection.take()
-                {
-                    // Older rollouts can only identify the history model at turn granularity.
-                    // Preserve that best available compatibility baseline.
-                    history_model_selection = Some(selection);
-                }
                 if unfinished_turn.as_deref() == Some(turn_id.as_str()) {
                     unfinished_turn = None;
                 }
@@ -888,11 +846,6 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
 
     drop(reader);
 
-    if !has_explicit_history_model && unfinished_turn.is_some() {
-        // An older rollout may end during a turn before it has an explicit history-model marker.
-        // The model captured at turn start is the best available compatibility baseline.
-        history_model_selection = turn_model_selection;
-    }
     flush_transcript_history(
         &history,
         &mut transcript_tail_history_start,
@@ -908,19 +861,9 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     )?;
 
     let metadata = metadata.ok_or_else(|| anyhow!("{} has no session header", path.display()))?;
-    if metadata.version != ROLLOUT_VERSION {
-        return Err(anyhow!(
-            "{} uses unsupported session version {}",
-            path.display(),
-            metadata.version
-        ));
-    }
     let model_selection =
         model_selection.ok_or_else(|| anyhow!("{} has no valid session model", path.display()))?;
     model_selection.validate()?;
-    if let Some(history_model_selection) = &history_model_selection {
-        history_model_selection.validate()?;
-    }
     let transcript_checkpoint =
         (has_transcript_checkpoint && transcript_tail.is_empty()).then_some(transcript.len());
     transcript.append(&mut transcript_tail);
@@ -941,7 +884,6 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         server_reasoning_included,
         compaction_count,
         model_selection,
-        history_model_selection,
         service_tier,
         unfinished_turn,
     })
@@ -954,6 +896,32 @@ fn model_selection_from_metadata(metadata: &SessionMetadata) -> Result<ModelSele
         metadata.model.clone(),
         effort,
     ))
+}
+
+fn validate_session_metadata(
+    path: &Path,
+    metadata: &SessionMetadata,
+) -> Result<(Uuid, ModelSelection)> {
+    if metadata.version != ROLLOUT_VERSION {
+        return Err(anyhow!(
+            "saved session uses unsupported version {}",
+            metadata.version
+        ));
+    }
+    let session_id = Uuid::parse_str(&metadata.identity.session_id)
+        .context("saved session has an invalid session ID")?;
+    if path.file_stem().and_then(|stem| stem.to_str())
+        != Some(metadata.identity.session_id.as_str())
+    {
+        return Err(anyhow!(
+            "saved session ID {} does not match journal filename {}",
+            metadata.identity.session_id,
+            path.display()
+        ));
+    }
+    let selection = model_selection_from_metadata(metadata)?;
+    selection.validate()?;
+    Ok((session_id, selection))
 }
 
 fn append_transcript_items(
@@ -1438,17 +1406,9 @@ fn skip_to_record_prefix(reader: &mut impl BufRead, prefix: &[u8]) -> std::io::R
 }
 
 fn compatible_session_id(path: &Path, metadata: &SessionMetadata) -> Option<Uuid> {
-    let selection = ReasoningEffort::from_str(&metadata.reasoning_effort)
+    validate_session_metadata(path, metadata)
         .ok()
-        .map(|effort| ModelSelection::from_identity(metadata.model.clone(), effort));
-    if metadata.version != ROLLOUT_VERSION
-        || selection.is_none_or(|selection| selection.validate().is_err())
-        || path.file_stem().and_then(|stem| stem.to_str())
-            != Some(metadata.identity.session_id.as_str())
-    {
-        return None;
-    }
-    Uuid::parse_str(&metadata.identity.session_id).ok()
+        .map(|(session_id, _)| session_id)
 }
 
 fn preview_from_items(items: &[PreviewItem]) -> Option<String> {

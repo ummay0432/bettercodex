@@ -9,6 +9,8 @@ mod process_session;
 
 const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize =
     code_runtime::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
+const VIEW_IMAGE_INVALID_MESSAGE: &str =
+    "unable to process image: invalid or unsupported image data";
 
 pub(crate) use code_runtime::package_smoke_test;
 pub(crate) use exec_runtime::ToolRuntime;
@@ -20,7 +22,6 @@ use self::code_runtime::CodeModeNestedToolCall as NestedToolCall;
 use self::code_runtime::CodeModeToolKind as NestedToolKind;
 use crate::events::AgentEvent;
 use crate::image::data_url_from_bytes;
-use crate::model::ToolMode;
 use crate::openai_docs::OpenAiDocsClient;
 use crate::protocol::UpdatePlanArgs;
 use crate::truncation::TruncationPolicy;
@@ -45,45 +46,28 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ToolCall {
-    Function {
-        call_id: String,
-        namespace: Option<String>,
-        name: String,
-        arguments: String,
-    },
-    Custom {
-        call_id: String,
-        namespace: Option<String>,
-        name: String,
-        input: String,
-    },
+    Exec { call_id: String, input: String },
+    Wait { call_id: String, arguments: String },
 }
 
 impl ToolCall {
     pub(crate) fn from_response_item(item: &Value) -> Option<Self> {
         let item_type = item.get("type")?.as_str()?;
         let call_id = item.get("call_id")?.as_str()?.to_string();
-        let namespace = match item.get("namespace") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(namespace)) if namespace.is_empty() || namespace == "functions" => {
-                None
-            }
-            Some(Value::String(namespace)) => Some(namespace.clone()),
+        match item.get("namespace") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(namespace)) if namespace.is_empty() || namespace == "functions" => {}
             Some(_) => return None,
         };
-        let name = item.get("name")?.as_str()?.to_string();
-        match item_type {
-            "function_call" => Some(Self::Function {
+        let name = item.get("name")?.as_str()?;
+        match (item_type, name) {
+            ("custom_tool_call", "exec") => Some(Self::Exec {
                 call_id,
-                namespace,
-                name,
-                arguments: item.get("arguments")?.as_str()?.to_string(),
-            }),
-            "custom_tool_call" => Some(Self::Custom {
-                call_id,
-                namespace,
-                name,
                 input: item.get("input")?.as_str()?.to_string(),
+            }),
+            ("function_call", "wait") => Some(Self::Wait {
+                call_id,
+                arguments: item.get("arguments")?.as_str()?.to_string(),
             }),
             _ => None,
         }
@@ -92,24 +76,28 @@ impl ToolCall {
     pub(crate) async fn execute(
         &self,
         runtime: &ToolRuntime,
-        tool_mode: ToolMode,
         context: ToolTurnContext,
         events: Option<UnboundedSender<AgentEvent>>,
         cancellation: CancellationToken,
     ) -> ToolResult {
         let truncation_policy = context.truncation_policy();
-        self.try_execute(runtime, tool_mode, context, events, cancellation)
-            .await
-            .unwrap_or_else(|error| {
-                ToolResult::text_with_policy(format!("{error:#}"), truncation_policy)
-            })
+        runtime.prepare_turn(context);
+        let result = match self {
+            Self::Exec { call_id, input } => {
+                runtime.execute(call_id, input, events, cancellation).await
+            }
+            Self::Wait { arguments, .. } => runtime.wait(arguments, events, cancellation).await,
+        };
+        result.unwrap_or_else(|error| {
+            ToolResult::text_with_policy(format!("{error:#}"), truncation_policy)
+        })
     }
 
     pub(crate) fn into_output_items(self, output: ToolResult) -> Vec<Value> {
         let ToolResult { body, .. } = output;
         let (item_type, call_id) = match self {
-            Self::Function { call_id, .. } => ("function_call_output", call_id),
-            Self::Custom { call_id, .. } => ("custom_tool_call_output", call_id),
+            Self::Exec { call_id, .. } => ("custom_tool_call_output", call_id),
+            Self::Wait { call_id, .. } => ("function_call_output", call_id),
         };
         let mut item = Map::new();
         item.insert("type".to_string(), Value::String(item_type.to_string()));
@@ -117,117 +105,6 @@ impl ToolCall {
         item.insert("output".to_string(), body);
         vec![Value::Object(item)]
     }
-
-    pub(crate) fn supports_parallel_execution(&self) -> bool {
-        match self {
-            Self::Function {
-                namespace, name, ..
-            } => find_direct_tool_definition(namespace.as_deref(), name, NestedToolKind::Function)
-                .is_some_and(|tool| {
-                    tool.tool_name.namespace.is_some()
-                        || matches!(name.as_str(), "exec_command" | "view_image" | "write_stdin")
-                }),
-            Self::Custom { .. } => false,
-        }
-    }
-
-    async fn try_execute(
-        &self,
-        runtime: &ToolRuntime,
-        tool_mode: ToolMode,
-        context: ToolTurnContext,
-        events: Option<UnboundedSender<AgentEvent>>,
-        cancellation: CancellationToken,
-    ) -> Result<ToolResult> {
-        let truncation_policy = context.truncation_policy();
-        runtime.prepare_turn(context);
-        match self {
-            Self::Custom {
-                call_id,
-                namespace,
-                name,
-                input,
-            } if namespace.is_none() && name == "exec" && tool_mode.includes_code_mode() => {
-                runtime.execute(call_id, input, events, cancellation).await
-            }
-            Self::Function {
-                namespace,
-                name,
-                arguments,
-                ..
-            } if namespace.is_none() && name == "wait" && tool_mode.includes_code_mode() => {
-                runtime.wait(arguments, events, cancellation).await
-            }
-            Self::Function {
-                call_id,
-                namespace,
-                name,
-                arguments,
-            } => {
-                let input = serde_json::from_str(arguments)
-                    .map_err(|error| anyhow!("failed to parse function arguments: {error}"))?;
-                let definition =
-                    direct_tool_definition(namespace.as_deref(), name, NestedToolKind::Function)?;
-                runtime
-                    .execute_direct(
-                        call_id,
-                        definition,
-                        Some(input),
-                        truncation_policy,
-                        events,
-                        cancellation,
-                    )
-                    .await
-            }
-            Self::Custom {
-                call_id,
-                namespace,
-                name,
-                input,
-            } => {
-                let definition =
-                    direct_tool_definition(namespace.as_deref(), name, NestedToolKind::Freeform)?;
-                runtime
-                    .execute_direct(
-                        call_id,
-                        definition,
-                        Some(Value::String(input.clone())),
-                        truncation_policy,
-                        events,
-                        cancellation,
-                    )
-                    .await
-            }
-        }
-    }
-}
-
-fn direct_tool_definition(
-    namespace: Option<&str>,
-    name: &str,
-    kind: NestedToolKind,
-) -> Result<&'static code_runtime::ToolDefinition> {
-    find_direct_tool_definition(namespace, name, kind).ok_or_else(|| {
-        let name = namespace.map_or_else(
-            || name.to_string(),
-            |namespace| format!("{namespace}.{name}"),
-        );
-        anyhow!("unknown top-level tool `{name}`")
-    })
-}
-
-fn find_direct_tool_definition(
-    namespace: Option<&str>,
-    name: &str,
-    kind: NestedToolKind,
-) -> Option<&'static code_runtime::ToolDefinition> {
-    catalogue::core_tools(/*supports_image_detail_original*/ true)
-        .iter()
-        .find(|tool| {
-            tool.tool_name.namespace.as_deref() == namespace
-                && tool.tool_name.name == name
-                && tool.kind == kind
-        })
 }
 
 pub(crate) struct ToolResult {
@@ -288,13 +165,6 @@ impl ToolImplementations {
         self.turn
             .lock()
             .map(|turn| turn.clone())
-            .map_err(|_| anyhow!("tool turn context lock was poisoned"))
-    }
-
-    fn supports_image_detail_original(&self) -> Result<bool> {
-        self.turn
-            .lock()
-            .map(|turn| turn.supports_image_detail_original())
             .map_err(|_| anyhow!("tool turn context lock was poisoned"))
     }
 
@@ -359,12 +229,9 @@ impl ToolImplementations {
             (None, "view_image", NestedToolKind::Function) => {
                 let cwd = self.cwd.clone();
                 let input = function_input(name, input)?;
-                let supports_image_detail_original = self.supports_image_detail_original()?;
-                tokio::task::spawn_blocking(move || {
-                    view_image(&cwd, input, supports_image_detail_original)
-                })
-                .await
-                .context("view_image task failed")?
+                tokio::task::spawn_blocking(move || view_image(&cwd, input))
+                    .await
+                    .context("view_image task failed")?
             }
             _ => Err(anyhow!("unknown tool `{tool_name}`")),
         }
@@ -384,8 +251,7 @@ impl ToolImplementations {
         let result = self
             .invoke(&tool_name, tool_kind, input, cancellation)
             .await?;
-        // Match upstream's Code Mode result contracts for side-effecting tools. Their direct
-        // route reports a human-readable acknowledgement instead.
+        // Match upstream's Code Mode result contract for side-effecting tools.
         if tool_name.namespace.is_none()
             && matches!(tool_name.name.as_str(), "apply_patch" | "update_plan")
         {
@@ -401,13 +267,12 @@ impl ToolImplementations {
     }
 }
 
-fn view_image(cwd: &Path, input: Value, supports_image_detail_original: bool) -> Result<Value> {
+fn view_image(cwd: &Path, input: Value) -> Result<Value> {
     let arguments: ViewImageArgs = serde_json::from_value(input)
         .map_err(|error| anyhow!("failed to parse function arguments: {error}"))?;
     let detail = match arguments.detail.as_deref() {
         None | Some("high") => "high",
-        Some("original") if supports_image_detail_original => "original",
-        Some("original") => "high",
+        Some("original") => "original",
         Some(detail) => {
             return Err(anyhow!(
                 "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `{detail}`"
@@ -443,6 +308,9 @@ fn view_image(cwd: &Path, input: Value, supports_image_detail_original: bool) ->
             limit / (1024 * 1024)
         ));
     }
+    // Match current Codex: prevent arbitrary local file bytes from reaching a Code Mode cell
+    // through view_image while leaving valid image bytes unchanged for centralized preparation.
+    image::load_from_memory(&bytes).map_err(|_| anyhow!(VIEW_IMAGE_INVALID_MESSAGE))?;
     Ok(json!({
         "image_url": data_url_from_bytes("application/octet-stream", &bytes),
         "detail": detail,
@@ -470,18 +338,8 @@ struct ViewImageArgs {
     detail: Option<String>,
 }
 
-pub(crate) fn specifications(
-    tool_mode: crate::model::ToolMode,
-    supports_image_detail_original: bool,
-) -> Vec<Value> {
-    catalogue::specifications(tool_mode, supports_image_detail_original)
-}
-
-pub(crate) fn responses_lite_specifications(
-    tool_mode: crate::model::ToolMode,
-    supports_image_detail_original: bool,
-) -> Vec<Value> {
-    catalogue::responses_lite_specifications(tool_mode, supports_image_detail_original)
+pub(crate) fn responses_lite_specifications() -> Vec<Value> {
+    catalogue::responses_lite_specifications()
 }
 
 pub(crate) fn catalogue_text() -> &'static str {

@@ -97,29 +97,82 @@ pub(super) fn render_streaming_markdown_agent_with_links_and_cwd(
     rendered
 }
 
+/// Stateful control-sequence filter for text split across streaming deltas.
+///
+/// Keeping the parser state between calls ensures an unterminated CSI or OSC sequence cannot leak
+/// its continuation when the next model delta arrives. A one-shot [`sanitize`] call uses the same
+/// implementation so streamed and finalized text have identical filtering semantics.
+#[derive(Debug, Default)]
+pub(super) struct StreamingSanitizer {
+    state: SanitizerState,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum SanitizerState {
+    #[default]
+    Text,
+    Escape,
+    Csi,
+    ControlString,
+    ControlStringEscape,
+}
+
+impl StreamingSanitizer {
+    pub(super) fn push(&mut self, text: &str, sanitized: &mut String) {
+        for character in text.chars() {
+            let mut pending = Some(character);
+            while let Some(character) = pending.take() {
+                match self.state {
+                    SanitizerState::Text => {
+                        if character == '\x1b' {
+                            self.state = SanitizerState::Escape;
+                        } else if matches!(character, '\n' | '\t') || !character.is_control() {
+                            sanitized.push(character);
+                        }
+                    }
+                    SanitizerState::Escape => {
+                        self.state = match character {
+                            '[' => SanitizerState::Csi,
+                            ']' | 'P' | '^' | '_' => SanitizerState::ControlString,
+                            _ => SanitizerState::Text,
+                        };
+                    }
+                    SanitizerState::Csi => {
+                        if ('@'..='~').contains(&character) {
+                            self.state = SanitizerState::Text;
+                        }
+                    }
+                    SanitizerState::ControlString => match character {
+                        '\x07' => self.state = SanitizerState::Text,
+                        '\x1b' => self.state = SanitizerState::ControlStringEscape,
+                        _ => {}
+                    },
+                    SanitizerState::ControlStringEscape => {
+                        if character == '\\' {
+                            self.state = SanitizerState::Text;
+                        } else {
+                            // The one-shot parser leaves a non-terminating character for the
+                            // control-string loop to consume, so do the same across chunk edges.
+                            self.state = SanitizerState::ControlString;
+                            pending = Some(character);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether [`sanitize`] would alter `text` when the parser starts in ordinary text mode.
+pub(super) fn requires_sanitization(text: &str) -> bool {
+    text.chars()
+        .any(|character| !matches!(character, '\n' | '\t') && character.is_control())
+}
+
 /// Remove control sequences before model output reaches Ratatui or a terminal escape writer.
 pub(super) fn sanitize(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\x1b' {
-            match characters.next() {
-                Some('[') => {
-                    let _ = characters.find(|character| ('@'..='~').contains(character));
-                }
-                Some(']') | Some('P' | '^' | '_') => loop {
-                    match characters.next() {
-                        Some('\x07') | None => break,
-                        Some('\x1b') if characters.next_if_eq(&'\\').is_some() => break,
-                        _ => {}
-                    }
-                },
-                Some(_) | None => {}
-            }
-        } else if matches!(character, '\n' | '\t') || !character.is_control() {
-            sanitized.push(character);
-        }
-    }
+    StreamingSanitizer::default().push(text, &mut sanitized);
     sanitized
 }
 

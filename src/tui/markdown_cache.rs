@@ -2,7 +2,8 @@
 //!
 //! Completed top-level blocks remain rendered while only the final mutable block is reparsed.
 //! Reference definitions deliberately fall back to a full parse because they can retroactively
-//! change links elsewhere in the document.
+//! change links elsewhere in the document. The raw transcript source is the sole ordinary-text
+//! buffer; a filtered copy is allocated only after a control character appears.
 
 use super::markdown;
 use super::terminal_hyperlinks::HyperlinkLine;
@@ -12,66 +13,76 @@ use std::path::Path;
 #[derive(Debug, Default)]
 pub(super) struct MarkdownRenderCache {
     raw_source: String,
-    sanitized_source: String,
+    sanitized_source: Option<String>,
+    sanitizer: markdown::StreamingSanitizer,
     width: Option<usize>,
     render: IncrementalMarkdownRender,
     canonical: bool,
 }
 
 impl MarkdownRenderCache {
-    pub(super) fn render(
-        &mut self,
-        raw_source: &str,
-        width: usize,
-        cwd: &Path,
-        streaming: bool,
-    ) -> &[HyperlinkLine] {
-        let source_was_replaced = !raw_source.starts_with(&self.raw_source);
-        if source_was_replaced {
-            self.raw_source.clear();
-            self.sanitized_source.clear();
+    pub(super) fn new(raw_source: String) -> Self {
+        let mut sanitizer = markdown::StreamingSanitizer::default();
+        let sanitized_source = markdown::requires_sanitization(&raw_source).then(|| {
+            let mut sanitized = String::with_capacity(raw_source.len());
+            sanitizer.push(&raw_source, &mut sanitized);
+            sanitized
+        });
+        Self {
+            raw_source,
+            sanitized_source,
+            sanitizer,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn source(&self) -> &str {
+        &self.raw_source
+    }
+
+    pub(super) fn append(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Some(sanitized_source) = self.sanitized_source.as_mut() {
+            self.sanitizer.push(delta, sanitized_source);
+        } else if markdown::requires_sanitization(delta) {
+            let mut sanitized_source =
+                String::with_capacity(self.raw_source.len().saturating_add(delta.len()));
+            sanitized_source.push_str(&self.raw_source);
+            self.sanitizer.push(delta, &mut sanitized_source);
+            self.sanitized_source = Some(sanitized_source);
+        }
+        self.raw_source.push_str(delta);
+        self.canonical = false;
+    }
+
+    pub(super) fn replace(&mut self, raw_source: String) {
+        if self.raw_source != raw_source {
+            *self = Self::new(raw_source);
+        }
+    }
+
+    pub(super) fn render_finalized(&mut self, width: usize, cwd: &Path) -> &[HyperlinkLine] {
+        if self.width != Some(width) || !self.canonical {
+            self.width = Some(width);
             self.render.clear();
-            self.canonical = false;
+            let source = self.sanitized_source.as_deref().unwrap_or(&self.raw_source);
+            self.render.lines =
+                markdown::render_markdown_agent_with_links_and_cwd(source, Some(width), Some(cwd));
+            self.canonical = true;
         }
+        &self.render.lines
+    }
 
-        if raw_source.len() > self.raw_source.len() {
-            let appended = &raw_source[self.raw_source.len()..];
-            self.sanitized_source
-                .push_str(&markdown::sanitize(appended));
-            self.raw_source.push_str(appended);
-            self.canonical = false;
-        }
-
-        if !streaming {
-            let fully_sanitized = markdown::sanitize(raw_source);
-            if fully_sanitized != self.sanitized_source {
-                self.sanitized_source = fully_sanitized;
-                self.canonical = false;
-            }
-            self.raw_source.clear();
-            self.raw_source.push_str(raw_source);
-
-            if self.width != Some(width) || !self.canonical {
-                self.width = Some(width);
-                self.render.clear();
-                self.render.lines = markdown::render_markdown_agent_with_links_and_cwd(
-                    &self.sanitized_source,
-                    Some(width),
-                    Some(cwd),
-                );
-                self.canonical = true;
-            }
-
-            return &self.render.lines;
-        }
-
+    pub(super) fn render_streaming(&mut self, width: usize, cwd: &Path) -> &[HyperlinkLine] {
+        let source = self.sanitized_source.as_deref().unwrap_or(&self.raw_source);
         if self.width != Some(width) {
             self.width = Some(width);
-            self.render
-                .recompute(&self.sanitized_source, Some(width), cwd);
+            self.render.recompute(source, Some(width), cwd);
             self.canonical = false;
         } else if !self.canonical {
-            self.render.append(&self.sanitized_source, Some(width), cwd);
+            self.render.append(source, Some(width), cwd);
         }
 
         &self.render.lines

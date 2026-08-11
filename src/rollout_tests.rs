@@ -306,89 +306,53 @@ fn rollout_replays_the_latest_service_tier_selection() {
 }
 
 #[test]
-fn rollout_replays_selected_and_history_models_independently() {
+fn rollout_replays_the_latest_gpt_5_6_selection() {
     let root = temporary_directory("rollout-model-selection");
     let _cleanup = DirectoryCleanup(root.clone());
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
-    let initial = crate::model::bundled_models()[0].selection(ReasoningEffort::Low);
+    let initial = crate::model::available_models()[0].selection(ReasoningEffort::Low);
     let mut rollout = Rollout::create_in_with_selection(&root, &cwd, &initial).unwrap();
     let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
-    rollout
-        .record_history_model_selection(Some(&initial))
-        .unwrap();
-    let selected = crate::model::bundled_models()[4].selection(ReasoningEffort::XHigh);
+    let selected = crate::model::available_models()[1].selection(ReasoningEffort::XHigh);
     rollout.record_model_selection(&selected).unwrap();
     drop(rollout);
 
     let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert_eq!(loaded.model_selection, selected);
-    assert_eq!(loaded.history_model_selection, Some(initial));
 }
 
 #[test]
-fn rollout_replays_initial_remote_model_metadata() {
-    let root = temporary_directory("rollout-initial-remote-model");
+fn legacy_non_gpt_5_6_selection_normalizes_to_sol() {
+    let root = temporary_directory("rollout-legacy-model");
     let _cleanup = DirectoryCleanup(root.clone());
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
-    let initial = ModelSelection {
-        model: "remote-model".to_string(),
-        reasoning_effort: ReasoningEffort::Custom("future".to_string()),
-        raw_context_window: 456_000,
-        effective_context_window_percent: 80,
-        configured_auto_compact_token_limit: Some(350_000),
-        use_responses_lite: true,
-        supports_parallel_tool_calls: true,
-        truncation_policy: Some(crate::truncation::TruncationPolicy::Bytes(12_345)),
-        supports_image_detail_original: Some(true),
-        tool_mode: Some(crate::model::ToolMode::CodeMode),
-        tool_mode_selector_version: 1,
-        prefer_websocket: false,
-        supports_fast: true,
-        comp_hash: Some("remote-v3".to_string()),
-    };
-    let rollout = Rollout::create_in_with_selection(&root, &cwd, &initial).unwrap();
-    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
-    drop(rollout);
-
-    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
-    assert_eq!(loaded.model_selection, initial);
-    assert_eq!(loaded.history_model_selection, None);
-}
-
-#[test]
-fn legacy_unfinished_turn_restores_its_history_model() {
-    let root = temporary_directory("rollout-legacy-unfinished-model");
-    let _cleanup = DirectoryCleanup(root.clone());
-    let cwd = root.join("repo");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let rollout = Rollout::create_in(&root, &cwd).unwrap();
     let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
     let path = rollout.path.clone();
-    rollout.start_turn("turn-1").unwrap();
     drop(rollout);
-
-    let journal = std::fs::read_to_string(&path).unwrap();
-    let legacy_journal = journal
-        .lines()
-        .filter(|line| {
-            let value: serde_json::Value = serde_json::from_str(line).unwrap();
-            !matches!(
-                value.get("type").and_then(serde_json::Value::as_str),
-                Some("model_changed" | "history_model_changed")
-            )
+    let mut journal = OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(
+        journal,
+        "{}",
+        json!({
+            "type": "model_changed",
+            "selection": {
+                "model": "retired-model",
+                "reasoning_effort": "high",
+            }
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(&path, format!("{legacy_journal}\n")).unwrap();
+    )
+    .unwrap();
+    drop(journal);
 
     let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.model_selection.model, crate::model::DEFAULT_MODEL);
     assert_eq!(
-        loaded.history_model_selection,
-        Some(ModelSelection::default())
+        loaded.model_selection.reasoning_effort,
+        ReasoningEffort::High
     );
-    assert_eq!(loaded.unfinished_turn.as_deref(), Some("turn-1"));
 }
 
 #[test]
@@ -478,6 +442,29 @@ fn latest_resume_prefers_the_most_recently_used_matching_session() {
     assert_eq!(loaded.metadata.identity.session_id, first_id);
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn explicit_resume_rejects_a_journal_with_a_mismatched_session_id() {
+    let root = temporary_directory("rollout-mismatched-id");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let original_path = rollout.path.clone();
+    drop(rollout);
+
+    let mismatched_id = Uuid::new_v4();
+    let mismatched_path = root
+        .join(SESSIONS_DIRECTORY)
+        .join(format!("{mismatched_id}.jsonl"));
+    std::fs::rename(original_path, mismatched_path).unwrap();
+
+    let error = Rollout::resume_in(&root, ResumeSelector::Id(mismatched_id), &cwd)
+        .err()
+        .expect("explicit resume must reject a journal whose header has another session ID");
+    assert!(format!("{error:#}").contains("does not match journal filename"));
+    assert!(list_sessions_in(&root).unwrap().is_empty());
 }
 
 #[test]

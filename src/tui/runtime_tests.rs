@@ -42,7 +42,6 @@ fn runtime_without_agent() -> Runtime {
         prompt_history_exclusions: HashSet::new(),
         processes: ProcessManager::new(cwd.clone()),
         model_selection: ModelSelection::default(),
-        model_catalog_task: None,
         service_tier: ServiceTier::default(),
         session_scan: None,
         resume_task: None,

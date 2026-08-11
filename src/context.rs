@@ -1,4 +1,5 @@
 use crate::compaction::InitialContextInjection;
+pub(crate) use crate::model::EFFECTIVE_CONTEXT_WINDOW;
 use crate::model::ModelSelection;
 use crate::repository;
 use crate::rollout::HistoryReplacement;
@@ -34,10 +35,6 @@ const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 const MAX_CONTEXT_NOTICE_TEXT_TOKENS: usize = 9_900;
 const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
 const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;
-// Match Codex's gpt-5.6-sol model metadata. Codex derives these independently from
-// the raw window: 95% is usable, while automatic compaction starts at 90%.
-pub(crate) const RAW_CONTEXT_WINDOW: u64 = 272_000;
-pub(crate) const EFFECTIVE_CONTEXT_WINDOW: u64 = RAW_CONTEXT_WINDOW * 95 / 100;
 const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
 const CRASH_GUIDANCE: &str = "The previous bettercodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
@@ -103,7 +100,6 @@ pub(crate) struct Conversation {
     usage_history_estimate: Option<u64>,
     server_reasoning_included: bool,
     model_selection: ModelSelection,
-    history_model_selection: Option<ModelSelection>,
     service_tier: ServiceTier,
     rollout: Rollout,
     world_state: WorldState,
@@ -297,7 +293,6 @@ impl Conversation {
             usage: None,
             usage_history_estimate: None,
             server_reasoning_included: false,
-            history_model_selection: None,
             model_selection,
             service_tier: ServiceTier::default(),
             rollout,
@@ -313,7 +308,6 @@ impl Conversation {
             usage_history_estimate,
             server_reasoning_included,
             model_selection,
-            history_model_selection,
             service_tier,
             unfinished_turn,
             ..
@@ -329,7 +323,6 @@ impl Conversation {
             usage,
             usage_history_estimate,
             server_reasoning_included,
-            history_model_selection,
             model_selection,
             service_tier,
             rollout,
@@ -354,9 +347,6 @@ impl Conversation {
         if self.service_tier != ServiceTier::default() {
             rollout.record_service_tier(self.service_tier)?;
         }
-        if let Some(selection) = &self.history_model_selection {
-            rollout.record_history_model_selection(Some(selection))?;
-        }
         Ok(Self {
             history: self.history.clone(),
             history_lineage: uuid::Uuid::new_v4(),
@@ -366,7 +356,6 @@ impl Conversation {
             usage_history_estimate: self.usage_history_estimate,
             server_reasoning_included: self.server_reasoning_included,
             model_selection: self.model_selection.clone(),
-            history_model_selection: self.history_model_selection.clone(),
             service_tier: self.service_tier,
             rollout,
             world_state: self.world_state.clone(),
@@ -385,10 +374,6 @@ impl Conversation {
         &self.model_selection
     }
 
-    pub(crate) fn history_model_selection(&self) -> Option<&ModelSelection> {
-        self.history_model_selection.as_ref()
-    }
-
     pub(crate) fn set_model_selection(&mut self, selection: ModelSelection) -> Result<()> {
         selection.validate()?;
         if self.model_selection == selection {
@@ -396,20 +381,6 @@ impl Conversation {
         }
         self.rollout.record_model_selection(&selection)?;
         self.model_selection = selection;
-        Ok(())
-    }
-
-    pub(crate) fn record_history_model_selection(
-        &mut self,
-        selection: &ModelSelection,
-    ) -> Result<()> {
-        selection.validate()?;
-        if self.history_model_selection.as_ref() == Some(selection) {
-            return Ok(());
-        }
-        self.rollout
-            .record_history_model_selection(Some(selection))?;
-        self.history_model_selection = Some(selection.clone());
         Ok(())
     }
 
@@ -645,11 +616,7 @@ impl Conversation {
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
-        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens(
-            self.model_selection.use_responses_lite,
-            self.model_selection.tool_mode(),
-            self.model_selection.supports_image_detail_original(),
-        );
+        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens();
         let mut tokens = self.context_metrics.tokens;
         let mut items = self.context_metrics.items;
         if !self.context_metrics.has_tools {
@@ -701,11 +668,7 @@ impl Conversation {
     }
 
     fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
-        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens(
-            self.model_selection.use_responses_lite,
-            self.model_selection.tool_mode(),
-            self.model_selection.supports_image_detail_original(),
-        );
+        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens();
         let mut estimate = metrics.estimated_tokens;
         if !metrics.has_tools {
             estimate = estimate.saturating_add(tools_tokens);
