@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.6] - 2026-08-11
+
+- sysprompt and tool catalogue are good now (trust me)
+- xhigh is now default, max is only 2% better for 200% the price
+- message streaming in terminal now supports 120fps (for whatever reason)
+
 ## [0.1.5] - 2026-08-10
 
 - Fixed programmatic tool calling drift (dw about it)
