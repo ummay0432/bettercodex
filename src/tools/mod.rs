@@ -89,12 +89,10 @@ impl ToolCall {
     pub(crate) async fn execute(
         &self,
         runtime: &ToolRuntime,
-        context: ToolTurnContext,
+        truncation_policy: TruncationPolicy,
         events: Option<UnboundedSender<AgentEvent>>,
         cancellation: CancellationToken,
     ) -> ToolResult {
-        let truncation_policy = context.truncation_policy();
-        runtime.prepare_turn(context);
         let result = match self {
             Self::Exec { call_id, input } => {
                 runtime.execute(call_id, input, events, cancellation).await

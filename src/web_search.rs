@@ -66,7 +66,7 @@ pub(crate) struct WebSearchClient {
 #[derive(Clone)]
 pub(crate) struct ToolTurnContext {
     input: Option<Arc<SearchInput>>,
-    turn_metadata: String,
+    turn_metadata: Arc<str>,
     truncation_policy: TruncationPolicy,
 }
 
@@ -74,7 +74,7 @@ impl Default for ToolTurnContext {
     fn default() -> Self {
         Self {
             input: None,
-            turn_metadata: String::new(),
+            turn_metadata: Arc::from(""),
             truncation_policy: TruncationPolicy::Tokens(10_000),
         }
     }
@@ -356,7 +356,7 @@ impl ToolTurnContext {
     ) -> Self {
         Self {
             input: recent_input(history).map(Arc::new),
-            turn_metadata,
+            turn_metadata: turn_metadata.into(),
             truncation_policy,
         }
     }

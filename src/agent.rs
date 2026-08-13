@@ -621,11 +621,15 @@ impl Agent {
         // Hide the one-time ICU decompression and V8 platform initialization behind the model's
         // first sampling request.
         self.tools.prewarm();
+        // Standalone search excludes model and tool output after the newest operator input. Keep
+        // that potentially large projection until steering or compaction changes its visible tail.
+        let mut tool_context = self.api.tool_turn_context(self.conversation.items());
         let mut pending_steering = VecDeque::new();
         // Sample the fresh turn input first. After a mid-turn compact, sample the
         // compacted tool continuation once before inserting queued steering.
         let mut can_record_pending_steering = false;
         loop {
+            let mut tool_context_changed = false;
             if can_record_pending_steering {
                 let notifications = self.tools.take_notifications()?;
                 if !notifications.is_empty() {
@@ -646,12 +650,16 @@ impl Agent {
                     {
                         return Ok(SubmitOutcome::Cancelled);
                     }
+                    tool_context_changed = true;
                 }
             }
             can_record_pending_steering = true;
+            if tool_context_changed {
+                tool_context = self.api.tool_turn_context(self.conversation.items());
+            }
 
-            let context = self.api.tool_turn_context(self.conversation.items());
-            let code_mode_step = self.tools.begin_step(context, events.clone());
+            let tool_truncation_policy = tool_context.truncation_policy();
+            let code_mode_step = self.tools.begin_step(tool_context.clone(), events.clone());
             let response = match self.sample_with_recovery(events, control).await? {
                 SamplingOutcome::Response(response) => response,
                 SamplingOutcome::Cancelled => return Ok(SubmitOutcome::Cancelled),
@@ -691,12 +699,16 @@ impl Agent {
                 return Err(anyhow!("model returned no text or tool call"));
             }
 
-            let context = self.api.tool_turn_context(self.conversation.items());
             for tool_call in tool_calls {
                 let cancellation = control.cancellation.clone();
                 let tool_events = events.clone();
                 let output = tool_call
-                    .execute(&self.tools, context.clone(), tool_events, cancellation)
+                    .execute(
+                        &self.tools,
+                        tool_truncation_policy,
+                        tool_events,
+                        cancellation,
+                    )
                     .await;
                 self.conversation
                     .extend(tool_call.into_output_items(output))?;
@@ -719,6 +731,7 @@ impl Agent {
                 {
                     return Ok(SubmitOutcome::Cancelled);
                 }
+                tool_context = self.api.tool_turn_context(self.conversation.items());
                 can_record_pending_steering = false;
             }
         }

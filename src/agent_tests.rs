@@ -51,7 +51,7 @@ async fn code_mode_notify_follows_the_terminal_exec_output_in_model_history() ->
     );
 
     let _first_request = requests.recv_timeout(Duration::from_secs(2))?;
-    let second_request = requests.recv_timeout(Duration::from_secs(2))?;
+    let second_request = requests.recv_timeout(Duration::from_secs(2))?.body;
     server
         .join()
         .map_err(|_| anyhow!("code mode notify test server panicked"))?;
@@ -80,6 +80,96 @@ async fn code_mode_notify_follows_the_terminal_exec_output_in_model_history() ->
     assert!(
         terminal_index < notification_index,
         "notify output must follow the terminal exec output: {input:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_web_search_receives_the_operator_context_from_before_model_output() -> Result<()>
+{
+    let root = temporary_root("standalone-web-search-context");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let prior_answer = json!({
+        "type": "message",
+        "id": "msg_prior_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "prior answer"}],
+    });
+    let current_commentary = json!({
+        "type": "message",
+        "id": "msg_current_commentary",
+        "role": "assistant",
+        "phase": "commentary",
+        "content": [{"type": "output_text", "text": "current commentary"}],
+    });
+    let tool_call = json!({
+        "type": "custom_tool_call",
+        "id": "ctc_search",
+        "call_id": "call_search",
+        "name": "exec",
+        "input": "const result = await tools.web__run({search_query: [{q: 'cached context'}]}); text(result);",
+    });
+    let final_answer = json!({
+        "type": "message",
+        "id": "msg_search_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "search complete"}],
+    });
+    let (base_url, requests, server) = serve_agent_http(vec![
+        AgentHttpReply::responses(completed_sse("resp_prior", &selection.model, &prior_answer)),
+        AgentHttpReply::responses(completed_sse_items(
+            "resp_search_exec",
+            &selection.model,
+            &[current_commentary, tool_call],
+        )),
+        AgentHttpReply {
+            expected_path: "/alpha/search",
+            status: 200,
+            content_type: "application/json",
+            body: json!({"output": "search result"}).to_string(),
+        },
+        AgentHttpReply::responses(completed_sse(
+            "resp_search_answer",
+            &selection.model,
+            &final_answer,
+        )),
+    ]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+
+    assert_eq!(agent.submit("previous question").await?, "prior answer");
+    assert_eq!(agent.submit("current question").await?, "search complete");
+
+    let captured = (0..4)
+        .map(|_| requests.recv_timeout(Duration::from_secs(2)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    server
+        .join()
+        .map_err(|_| anyhow!("standalone web search test server panicked"))?;
+    let search = captured
+        .iter()
+        .find(|request| request.path == "/alpha/search")
+        .ok_or_else(|| anyhow!("standalone web search request was not captured"))?;
+    let messages = search.body["input"]
+        .as_array()
+        .ok_or_else(|| anyhow!("standalone web search request omitted input"))?
+        .iter()
+        .map(|message| {
+            (
+                message["role"].as_str().unwrap_or_default(),
+                message["content"][0]["text"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [
+            ("user", "previous question"),
+            ("assistant", "prior answer"),
+            ("user", "current question"),
+        ]
     );
     Ok(())
 }
@@ -395,17 +485,25 @@ fn websocket_server_config() -> tungstenite::protocol::WebSocketConfig {
 }
 
 fn completed_sse(response_id: &str, model: &str, item: &Value) -> String {
-    let item_done = json!({
-        "type": "response.output_item.done",
-        "output_index": 0,
-        "item": item,
-    });
+    completed_sse_items(response_id, model, std::slice::from_ref(item))
+}
+
+fn completed_sse_items(response_id: &str, model: &str, items: &[Value]) -> String {
+    let mut stream = String::new();
+    for (output_index, item) in items.iter().enumerate() {
+        let item_done = json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        });
+        stream.push_str(&format!("data: {item_done}\n\n"));
+    }
     let response = json!({
         "type": "response.completed",
         "response": {
             "id": response_id,
             "model": model,
-            "output": [item],
+            "output": items,
             "reasoning": {"context": "all_turns"},
             "usage": {
                 "input_tokens": 10,
@@ -414,21 +512,71 @@ fn completed_sse(response_id: &str, model: &str, item: &Value) -> String {
             },
         },
     });
-    format!("data: {item_done}\n\ndata: {response}\n\n")
+    stream.push_str(&format!("data: {response}\n\n"));
+    stream
 }
 
 fn serve_responses(
     replies: Vec<(u16, String)>,
-) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+) -> (
+    String,
+    mpsc::Receiver<CapturedAgentRequest>,
+    thread::JoinHandle<()>,
+) {
+    serve_agent_http(
+        replies
+            .into_iter()
+            .map(|(status, body)| AgentHttpReply {
+                expected_path: "/responses",
+                status,
+                content_type: "text/event-stream",
+                body,
+            })
+            .collect(),
+    )
+}
+
+struct AgentHttpReply {
+    expected_path: &'static str,
+    status: u16,
+    content_type: &'static str,
+    body: String,
+}
+
+impl AgentHttpReply {
+    fn responses(body: String) -> Self {
+        Self {
+            expected_path: "/responses",
+            status: 200,
+            content_type: "text/event-stream",
+            body,
+        }
+    }
+}
+
+struct CapturedAgentRequest {
+    path: String,
+    body: Value,
+}
+
+fn serve_agent_http(
+    replies: Vec<AgentHttpReply>,
+) -> (
+    String,
+    mpsc::Receiver<CapturedAgentRequest>,
+    thread::JoinHandle<()>,
+) {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("bind test server");
     let address = server.server_addr().to_ip().expect("test server address");
     let (requests_tx, requests_rx) = mpsc::channel();
     let task = thread::spawn(move || {
-        for (status, reply) in replies {
+        for reply in replies {
             let mut request = server
                 .recv_timeout(Duration::from_secs(5))
-                .expect("receive Responses request")
-                .expect("Responses request timed out");
+                .expect("receive agent HTTP request")
+                .expect("agent HTTP request timed out");
+            let path = request.url().to_string();
+            assert_eq!(path, reply.expected_path);
             let compressed = request.headers().iter().any(|header| {
                 header.field.equiv("content-encoding") && header.value.as_str() == "zstd"
             });
@@ -439,23 +587,26 @@ fn serve_responses(
                 .expect("read Responses request");
             if compressed {
                 body = zstd::stream::decode_all(std::io::Cursor::new(body))
-                    .expect("decode Responses request");
+                    .expect("decode compressed agent HTTP request");
             }
             requests_tx
-                .send(serde_json::from_slice(&body).expect("decode Responses request JSON"))
-                .expect("capture Responses request");
+                .send(CapturedAgentRequest {
+                    path,
+                    body: serde_json::from_slice(&body).expect("decode agent HTTP request JSON"),
+                })
+                .expect("capture agent HTTP request");
             let content_type = tiny_http::Header::from_bytes(
                 b"content-type".as_slice(),
-                b"text/event-stream".as_slice(),
+                reply.content_type.as_bytes(),
             )
             .expect("build content-type header");
             request
                 .respond(
-                    tiny_http::Response::from_string(reply)
-                        .with_status_code(tiny_http::StatusCode(status))
+                    tiny_http::Response::from_string(reply.body)
+                        .with_status_code(tiny_http::StatusCode(reply.status))
                         .with_header(content_type),
                 )
-                .expect("send Responses reply");
+                .expect("send agent HTTP reply");
         }
     });
     (format!("http://{address}"), requests_rx, task)

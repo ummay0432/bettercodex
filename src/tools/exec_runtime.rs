@@ -71,10 +71,6 @@ impl ToolRuntime {
         self.configuration = configuration;
     }
 
-    pub(super) fn prepare_turn(&self, context: ToolTurnContext) {
-        self.state.tools.prepare_turn(context);
-    }
-
     pub(crate) fn begin_step(
         &self,
         context: ToolTurnContext,
