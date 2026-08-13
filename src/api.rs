@@ -77,6 +77,7 @@ const MAX_ERROR_BODY_CHARS: usize = 4_000;
 // CPU time versus zstd's level-3 default.
 const REQUEST_COMPRESSION_LEVEL: i32 = 1;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+const RESPONSES_WEBSOCKET_TIMING_HEADER: &str = "x-responsesapi-include-timing-metrics";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
@@ -995,7 +996,7 @@ impl ApiClient {
                 break;
             }
         }
-        let mut response = collected.finish()?;
+        let mut response = collected.finish(events)?;
         response.server_reasoning_included = self.websocket_reasoning_included;
         let streamed_rate_limits = std::mem::take(&mut response.rate_limits);
         response.rate_limits.clone_from(&self.websocket_rate_limits);
@@ -1018,6 +1019,7 @@ impl ApiClient {
         let mut headers = self.request_headers("*/*", request_kind, &auth)?;
         insert_header(&mut headers, "originator", "codex_cli_rs")?;
         insert_header(&mut headers, "openai-beta", RESPONSES_WEBSOCKET_BETA)?;
+        insert_header(&mut headers, RESPONSES_WEBSOCKET_TIMING_HEADER, "true")?;
         let url = websocket_url(&self.base_url, "responses")?;
         let (websocket, response_headers) = WebSocketConnection::connect(&url, &headers).await?;
         self.websocket_reasoning_included = response_headers.contains_key("x-reasoning-included");
@@ -1831,7 +1833,7 @@ async fn collect_http_stream(
             "model stream closed before response.completed",
         ));
     }
-    collected.finish()
+    collected.finish(events)
 }
 
 struct CollectedResponse {
@@ -1839,6 +1841,7 @@ struct CollectedResponse {
     pending_items: BTreeMap<usize, Value>,
     item_summary: ResponseItemSummary,
     usage: Option<TokenUsage>,
+    tokens_per_second: Option<f64>,
     rate_limits: Vec<crate::rate_limits::RateLimitSnapshot>,
     end_turn: Option<bool>,
     response_id: Option<String>,
@@ -1870,6 +1873,7 @@ impl CollectedResponse {
             pending_items: BTreeMap::new(),
             item_summary: ResponseItemSummary::default(),
             usage: None,
+            tokens_per_second: None,
             rate_limits: Vec::new(),
             end_turn: None,
             response_id: None,
@@ -1957,13 +1961,19 @@ impl CollectedResponse {
         }
     }
 
-    fn finish(self) -> ApiResult<ModelResponse> {
+    fn finish(self, events: Option<&UnboundedSender<AgentEvent>>) -> ApiResult<ModelResponse> {
         if !self.pending_items.is_empty() {
             return Err(ApiError::fatal(
                 "model response completed with a gap in output item indexes",
             ));
         }
         let output_item_count = self.item_count();
+        let response_id = self
+            .response_id
+            .ok_or_else(|| ApiError::fatal("response.completed omitted the response ID"))?;
+        if let Some(events) = events {
+            let _ = events.send(AgentEvent::ModelResponseThroughput(self.tokens_per_second));
+        }
         let items = match self.output_items {
             CollectedOutputItems::RetainedAndEmitted(items)
             | CollectedOutputItems::Retained(items) => items,
@@ -1977,9 +1987,7 @@ impl CollectedResponse {
             usage: self.usage,
             rate_limits: self.rate_limits,
             server_reasoning_included: false,
-            response_id: self
-                .response_id
-                .ok_or_else(|| ApiError::fatal("response.completed omitted the response ID"))?,
+            response_id,
             output_item_count,
             has_assistant_text: self.item_summary.has_assistant_text,
         })
@@ -2109,6 +2117,11 @@ fn process_event_value(
         Some("response.reasoning_summary_part.added") => {
             if let Some(events) = events {
                 let _ = events.send(AgentEvent::ReasoningSummarySectionStarted);
+            }
+        }
+        Some("responsesapi.websocket_timing") => {
+            if let Some(tokens_per_second) = websocket_tokens_per_second(&event) {
+                collected.tokens_per_second = Some(tokens_per_second);
             }
         }
         Some("response.completed") => {
@@ -2345,6 +2358,14 @@ fn parse_usage(usage: &Value) -> Option<TokenUsage> {
                     )
             }),
     })
+}
+
+fn websocket_tokens_per_second(event: &Value) -> Option<f64> {
+    let time_between_tokens_ms = event
+        .pointer("/timing_metrics/engine_service_tbt_across_engine_calls_ms")?
+        .as_f64()?;
+    (time_between_tokens_ms.is_finite() && time_between_tokens_ms > 0.0)
+        .then_some(1_000.0 / time_between_tokens_ms)
 }
 
 fn websocket_url(base_url: &str, path: &str) -> ApiResult<String> {

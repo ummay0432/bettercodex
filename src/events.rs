@@ -13,6 +13,7 @@ pub(crate) enum AgentEvent {
     ReasoningSummarySectionStarted,
     ReasoningSummaryDelta(String),
     ModelMessageCompleted(AssistantMessage),
+    ModelResponseThroughput(Option<f64>),
     ModelResponseCompleted,
     ToolStarted {
         call_id: String,

@@ -289,6 +289,7 @@ pub(super) struct View {
     working_since: Option<Instant>,
     turn_had_work: bool,
     reasoning_status: ReasoningStatus,
+    tokens_per_second: Option<f64>,
     status_detail: Option<String>,
     pending_input: PendingInput,
     terminal_assistant_received_this_turn: bool,
@@ -346,6 +347,7 @@ enum TranscriptEntry {
     Processes(Vec<BackgroundProcess>),
     FinalMessageSeparator {
         elapsed_seconds: Option<u64>,
+        tokens_per_second: Option<f64>,
     },
 }
 
@@ -587,6 +589,7 @@ impl View {
             working_since: None,
             turn_had_work: false,
             reasoning_status: ReasoningStatus::default(),
+            tokens_per_second: None,
             status_detail: None,
             pending_input: PendingInput::default(),
             terminal_assistant_received_this_turn: false,
@@ -722,6 +725,7 @@ impl View {
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
+        self.tokens_per_second = None;
         self.status_detail = None;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
@@ -736,6 +740,7 @@ impl View {
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
+        self.tokens_per_second = None;
         self.status_detail = Some("Compacting conversation".to_string());
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
@@ -836,6 +841,7 @@ impl View {
             .take()
             .map(|started| started.elapsed().as_secs());
         let turn_had_work = std::mem::take(&mut self.turn_had_work);
+        let tokens_per_second = self.tokens_per_second.take();
         self.busy = false;
         let interrupt_intent = self.interrupting.take();
         self.reasoning_status.reset();
@@ -851,9 +857,11 @@ impl View {
                         history: StreamedAssistantHistory::default(),
                     });
                 }
-                if turn_had_work {
-                    self.entries
-                        .push(TranscriptEntry::FinalMessageSeparator { elapsed_seconds });
+                if turn_had_work || tokens_per_second.is_some() {
+                    self.entries.push(TranscriptEntry::FinalMessageSeparator {
+                        elapsed_seconds: elapsed_seconds.filter(|_| turn_had_work),
+                        tokens_per_second,
+                    });
                 }
                 None
             }
@@ -891,6 +899,7 @@ impl View {
         self.busy = false;
         self.interrupting = None;
         self.reasoning_status.reset();
+        self.tokens_per_second = None;
         self.status_detail = None;
         self.action_required = result.is_err();
         match result {
@@ -1207,6 +1216,7 @@ impl View {
         self.background_processes.clear();
         self.action_required = false;
         self.reasoning_status.reset();
+        self.tokens_per_second = None;
         self.pending_input.clear();
         self.overlay = None;
         self.file_search = FileSearchPopup::default();
@@ -1267,9 +1277,10 @@ impl View {
             AgentEvent::ReasoningSummaryDelta(delta) => {
                 self.reasoning_status.push_delta(&delta);
             }
-            AgentEvent::ModelResponseCompleted => {
-                self.close_streaming_entries();
+            AgentEvent::ModelResponseThroughput(tokens_per_second) => {
+                self.tokens_per_second = tokens_per_second;
             }
+            AgentEvent::ModelResponseCompleted => self.close_streaming_entries(),
             AgentEvent::ToolStarted {
                 call_id,
                 name,
@@ -3045,13 +3056,12 @@ impl View {
         };
         let mut spans = vec![activity_marker(self.working_since), " ".into()];
         spans.extend(shimmer_spans(heading));
-        spans.push(
-            format!(
-                " ({} • esc to interrupt)",
-                format_elapsed(elapsed.as_secs())
-            )
-            .dim(),
-        );
+        spans.push(format!(" ({}", format_elapsed(elapsed.as_secs())).dim());
+        if let Some(tokens_per_second) = self.tokens_per_second {
+            spans.push(Span::from(" • ").dim());
+            spans.push(Span::from(format_tokens_per_second(tokens_per_second)).dim());
+        }
+        spans.push(Span::from(" • esc to interrupt)").dim());
         let pending_steers = self.pending_input.steer_count();
         let queued_follow_ups = self.pending_input.follow_up_count();
         if pending_steers > 0 {
@@ -3344,9 +3354,10 @@ impl TranscriptEntry {
             Self::Diff(diff) => git_diff_lines(diff, width),
             Self::Status(snapshot) => return snapshot.display_lines(width),
             Self::Processes(processes) => background_process_lines(processes, width),
-            Self::FinalMessageSeparator { elapsed_seconds } => {
-                final_message_separator_lines(*elapsed_seconds, width)
-            }
+            Self::FinalMessageSeparator {
+                elapsed_seconds,
+                tokens_per_second,
+            } => final_message_separator_lines(*elapsed_seconds, *tokens_per_second, width),
         };
         terminal_hyperlinks::plain_hyperlink_lines(plain_lines)
     }
@@ -4601,15 +4612,26 @@ fn git_diff_lines(diff: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Vec<Line<'static>> {
-    let Some(elapsed) = elapsed_seconds
+fn final_message_separator_lines(
+    elapsed_seconds: Option<u64>,
+    tokens_per_second: Option<f64>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut parts = Vec::new();
+    if let Some(elapsed) = elapsed_seconds
         .filter(|seconds| *seconds > 60)
         .map(format_elapsed)
-    else {
+    {
+        parts.push(format!("Worked for {elapsed}"));
+    }
+    if let Some(tokens_per_second) = tokens_per_second {
+        parts.push(format_tokens_per_second(tokens_per_second));
+    }
+    if parts.is_empty() {
         return vec![Line::from("─".repeat(usize::from(width))).dim()];
-    };
+    }
 
-    let label = format!("─ Worked for {elapsed} ─")
+    let label = format!("─ {} ─", parts.join(" • "))
         .chars()
         .take(usize::from(width))
         .collect::<String>();
@@ -4621,6 +4643,10 @@ fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Ve
         ])
         .dim(),
     ]
+}
+
+fn format_tokens_per_second(tokens_per_second: f64) -> String {
+    format!("{tokens_per_second:.1} tok/s")
 }
 
 fn code_mode_lines(tool: &ToolEntry, source: &str, width: u16) -> Vec<Line<'static>> {
@@ -6010,6 +6036,32 @@ mod tests {
             1,
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn backend_token_throughput_moves_from_activity_to_completed_turn() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("test throughput"));
+        view.handle_agent_event(AgentEvent::ModelResponseThroughput(Some(80.0)));
+
+        let activity = plain(&view.working_line());
+        assert!(
+            activity.contains(" • 80.0 tok/s • esc to interrupt)"),
+            "{activity}"
+        );
+
+        assert!(
+            view.finish_turn(Ok(SubmitOutcome::Completed("done".to_string())))
+                .is_none()
+        );
+        let rendered = view
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("─ 80.0 tok/s ─"), "{rendered}");
     }
 
     #[test]

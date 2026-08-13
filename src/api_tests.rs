@@ -325,7 +325,7 @@ fn response_rate_limit_events_are_retained_for_status() {
     )
     .unwrap();
 
-    let response = collected.finish().unwrap();
+    let response = collected.finish(None).unwrap();
     let snapshot = response.rate_limits.first().expect("rate-limit snapshot");
     assert_eq!(snapshot.limit_id, "codex_other");
     assert_eq!(snapshot.primary.as_ref().unwrap().used_percent, 12.5);
@@ -490,7 +490,7 @@ fn completed_items_are_emitted_once_in_api_order() {
         })
     );
     assert!(received_events.try_recv().is_err());
-    let response = collected.finish().unwrap();
+    let response = collected.finish(None).unwrap();
     assert_eq!(
         response.tool_calls,
         vec![ToolCall::Exec {
@@ -548,6 +548,44 @@ fn extracts_text_and_forwards_streaming_events() {
         received.try_recv().unwrap(),
         AgentEvent::ReasoningSummaryDelta("checking".to_string())
     );
+}
+
+#[test]
+fn extracts_backend_websocket_token_throughput() {
+    let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::new(OutputItemMode::Retain);
+    let mut server_model_warning_emitted = false;
+    process_event_value(
+        json!({
+            "type": "responsesapi.websocket_timing",
+            "timing_metrics": {
+                "engine_service_tbt_across_engine_calls_ms": 12.5,
+            },
+        }),
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    process_event_value(
+        completed_event("resp_timing", &Value::Null),
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+
+    collected.finish(Some(&events)).unwrap();
+    assert_eq!(
+        received.try_recv().unwrap(),
+        AgentEvent::ModelResponseThroughput(Some(80.0))
+    );
+    assert!(received.try_recv().is_err());
 }
 
 #[test]
