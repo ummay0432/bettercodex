@@ -169,3 +169,25 @@ fn appends_follow_history_rotation() {
     let archived_entry: serde_json::Value = serde_json::from_str(archived_text.trim()).unwrap();
     assert_eq!(archived_entry["text"], "before rotation");
 }
+
+#[cfg(unix)]
+#[test]
+fn appends_reject_a_symbolic_link_substituted_after_rotation() {
+    use std::os::unix::fs::symlink;
+
+    let history_file = TemporaryHistory::new();
+    let mut history = PromptHistory::open_in(&history_file.path, "rotation-session").unwrap();
+    history.append("before rotation").unwrap();
+
+    let archived = history_file.directory.join("history.previous.jsonl");
+    std::fs::rename(&history_file.path, &archived).unwrap();
+    let target = history_file.directory.join("unrelated.jsonl");
+    std::fs::write(&target, "must remain unchanged\n").unwrap();
+    symlink(&target, &history_file.path).unwrap();
+
+    assert!(history.append("must not be redirected").is_err());
+    assert_eq!(
+        std::fs::read_to_string(target).unwrap(),
+        "must remain unchanged\n"
+    );
+}

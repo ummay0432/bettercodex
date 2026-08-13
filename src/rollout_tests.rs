@@ -470,10 +470,24 @@ fn latest_resume_is_scoped_to_the_canonical_working_directory() {
     let second_cwd = root.join("second");
     std::fs::create_dir_all(&first_cwd).unwrap();
     std::fs::create_dir_all(&second_cwd).unwrap();
-    let first = Rollout::create_in(&root, &first_cwd).unwrap();
+    let mut first = Rollout::create_in(&root, &first_cwd).unwrap();
     let first_id = first.identity().session_id.clone();
+    first
+        .append_history(&[json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first repository"}],
+        })])
+        .unwrap();
     drop(first);
-    let second = Rollout::create_in(&root, &second_cwd).unwrap();
+    let mut second = Rollout::create_in(&root, &second_cwd).unwrap();
+    second
+        .append_history(&[json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second repository"}],
+        })])
+        .unwrap();
     drop(second);
 
     let loaded = Rollout::resume_in(&root, ResumeSelector::LatestForCwd, &first_cwd).unwrap();
@@ -487,11 +501,25 @@ fn latest_resume_prefers_the_most_recently_used_matching_session() {
     let root = temporary_directory("rollout-recent");
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
-    let first = Rollout::create_in(&root, &cwd).unwrap();
+    let mut first = Rollout::create_in(&root, &cwd).unwrap();
     let first_id = first.identity().session_id.clone();
     let first_path = first.path.clone();
+    first
+        .append_history(&[json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "older session"}],
+        })])
+        .unwrap();
     drop(first);
-    let second = Rollout::create_in(&root, &cwd).unwrap();
+    let mut second = Rollout::create_in(&root, &cwd).unwrap();
+    second
+        .append_history(&[json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "newer session"}],
+        })])
+        .unwrap();
     drop(second);
 
     let file = OpenOptions::new().write(true).open(first_path).unwrap();
@@ -530,6 +558,49 @@ fn explicit_resume_rejects_a_journal_with_a_mismatched_session_id() {
 }
 
 #[test]
+fn sessions_without_substantive_user_history_are_not_discovered() {
+    let root = temporary_directory("rollout-empty");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let conversation = crate::context::Conversation::new(&cwd, rollout).unwrap();
+    drop(conversation);
+
+    assert!(list_sessions_in(&root).unwrap().is_empty());
+    assert!(
+        latest_rollout_for_cwd(&root.join(SESSIONS_DIRECTORY), &cwd)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn session_listing_finds_an_inherited_user_message_in_replaced_history() {
+    let root = temporary_directory("rollout-replaced-preview");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    rollout
+        .replace_history(
+            &[json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inherited fork prompt"}],
+            })],
+            HistoryReplacement::Initial,
+        )
+        .unwrap();
+    drop(rollout);
+
+    let summaries = list_sessions_in(&root).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].preview.as_str(), "inherited fork prompt");
+}
+
+#[test]
 fn session_listing_streams_past_large_ignored_payloads_to_the_user_preview() {
     let root = temporary_directory("rollout-preview");
     let cwd = root.join("repo");
@@ -560,8 +631,8 @@ fn session_listing_streams_past_large_ignored_payloads_to_the_user_preview() {
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].id, session_id);
     assert_eq!(
-        summaries[0].preview.as_deref(),
-        Some("inspect the persisted session without loading tool payloads")
+        summaries[0].preview.as_str(),
+        "inspect the persisted session without loading tool payloads"
     );
     std::fs::remove_dir_all(root).unwrap();
 }

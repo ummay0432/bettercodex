@@ -2,7 +2,6 @@ mod catalogue;
 mod code_runtime;
 mod exec_runtime;
 mod executor;
-mod image_preparation;
 mod papercuts;
 mod patch;
 mod process_session;

@@ -224,23 +224,7 @@ pub(crate) struct PromptImage {
 
 impl PromptImage {
     pub(crate) fn from_path(path: &Path, detail: ImageDetail) -> Result<Self> {
-        let mut file =
-            File::open(path).with_context(|| format!("failed to read image {}", path.display()))?;
-        let declared_len = file
-            .metadata()
-            .with_context(|| format!("failed to inspect image {}", path.display()))?
-            .len();
-        if declared_len > MAX_TOTAL_IMAGE_BYTES as u64 {
-            return Err(image_size_error());
-        }
-        let mut bytes = Vec::with_capacity(declared_len.try_into().unwrap_or(0));
-        file.by_ref()
-            .take(MAX_TOTAL_IMAGE_BYTES.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("failed to read image {}", path.display()))?;
-        if bytes.len() > MAX_TOTAL_IMAGE_BYTES {
-            return Err(image_size_error());
-        }
+        let bytes = read_image(path, MAX_TOTAL_IMAGE_BYTES)?;
         Self::from_bytes(path, bytes, detail)
     }
 
@@ -526,9 +510,8 @@ mod tests {
 
     #[test]
     fn user_images_apply_upstream_detail_budgets_before_serialization() {
-        let source = png_bytes(2048, 2048);
-        let message_for = |detail| {
-            let image = PromptImage::from_bytes(Path::new("fixture.png"), source.clone(), detail)
+        let message_for = |source: &[u8], detail| {
+            let image = PromptImage::from_bytes(Path::new("fixture.png"), source.to_vec(), detail)
                 .expect("load image");
             UserInput {
                 text: String::new(),
@@ -540,13 +523,18 @@ mod tests {
             .0
         };
 
-        let high = message_for(ImageDetail::default());
+        let square = png_bytes(2048, 2048);
+        let high = message_for(&square, ImageDetail::default());
         assert_eq!(high["content"][0]["detail"], "high");
         assert_eq!(image_dimensions(&high), (1600, 1600));
 
-        let original = message_for(ImageDetail::Original);
+        let original = message_for(&square, ImageDetail::Original);
         assert_eq!(original["content"][0]["detail"], "original");
         assert_eq!(image_dimensions(&original), (2048, 2048));
+
+        let wide = png_bytes(6401, 100);
+        let bounded_original = message_for(&wide, ImageDetail::Original);
+        assert_eq!(image_dimensions(&bounded_original), (6000, 94));
     }
 
     #[test]

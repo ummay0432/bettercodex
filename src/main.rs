@@ -3,7 +3,6 @@ mod ansi_escape;
 mod api;
 mod assistant_message;
 mod auth;
-mod cache;
 mod compaction;
 mod context;
 mod events;
@@ -11,6 +10,7 @@ mod file_search;
 mod fuzzy_match;
 mod http_client;
 mod image;
+mod image_preparation;
 mod input;
 mod login;
 mod managed_session;
@@ -235,12 +235,21 @@ async fn run_agent(
     tui_startup: Option<tui::Startup>,
     tui_login_status: Option<login::LoginStatus>,
 ) -> Result<()> {
-    let input = if !options.prompt.is_empty() || !options.images.is_empty() {
-        Some(UserInput::from_paths(
-            options.prompt,
-            &options.images,
-            options.image_detail,
-        )?)
+    let RunOptions {
+        prompt,
+        images,
+        image_detail,
+    } = options;
+    let input = if !images.is_empty() {
+        Some(
+            tokio::task::spawn_blocking(move || {
+                UserInput::from_paths(prompt, &images, image_detail)
+            })
+            .await
+            .context("image attachment loading task failed")??,
+        )
+    } else if !prompt.is_empty() {
+        Some(UserInput::from_paths(prompt, &images, image_detail)?)
     } else {
         None
     };
@@ -258,7 +267,11 @@ async fn run_agent(
     }
 
     let mut agent = match resume {
-        Some(selector) => Agent::resume(&requested_cwd, selector)?,
+        Some(selector) => {
+            tokio::task::spawn_blocking(move || Agent::resume(&requested_cwd, selector))
+                .await
+                .context("agent resume task failed")??
+        }
         None => Agent::new(&requested_cwd)?,
     };
     if let Some(input) = input {

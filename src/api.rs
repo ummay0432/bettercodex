@@ -351,7 +351,7 @@ impl Drop for WebSocketRequestGuard<'_> {
 }
 
 struct SamplingInputRestoration {
-    expected_prefix: [Value; 2],
+    tool_configuration: tools::ToolConfiguration,
     stripped_image_details: Vec<StrippedImageDetail>,
 }
 
@@ -416,7 +416,7 @@ impl SamplingRequest {
 
 impl SamplingInputRestoration {
     fn restore(self, mut input: Vec<Value>) -> ApiResult<Vec<Value>> {
-        let expected = &self.expected_prefix;
+        let expected = stable_input_prefix_items(self.tool_configuration);
         if input.get(..expected.len()) != Some(expected.as_slice()) {
             return Err(ApiError::fatal(
                 "sampling request lost its inserted Responses Lite prefix",
@@ -426,7 +426,7 @@ impl SamplingInputRestoration {
         for stripped in self.stripped_image_details {
             let content = input
                 .get_mut(stripped.item_index)
-                .and_then(image_content_items_mut)
+                .and_then(crate::image_preparation::image_content_items_mut)
                 .ok_or_else(|| {
                     ApiError::fatal("sampling request lost image content while it was in flight")
                 })?;
@@ -1565,12 +1565,11 @@ fn compose_sampling_input(
     tool_configuration: tools::ToolConfiguration,
 ) -> (Vec<Value>, SamplingInputRestoration) {
     let stripped_image_details = strip_image_details(&mut history);
-    let expected_prefix = stable_request_prefix(tool_configuration);
-    history.splice(0..0, expected_prefix.clone());
+    history.splice(0..0, stable_request_prefix(tool_configuration));
     (
         history,
         SamplingInputRestoration {
-            expected_prefix,
+            tool_configuration,
             stripped_image_details,
         },
     )
@@ -1585,7 +1584,7 @@ fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
 fn strip_image_details(history: &mut [Value]) -> Vec<StrippedImageDetail> {
     let mut stripped = Vec::new();
     for (item_index, item) in history.iter_mut().enumerate() {
-        let Some(content) = image_content_items_mut(item) else {
+        let Some(content) = crate::image_preparation::image_content_items_mut(item) else {
             continue;
         };
         for (content_index, content_item) in content.iter_mut().enumerate() {
@@ -1606,16 +1605,6 @@ fn strip_image_details(history: &mut [Value]) -> Vec<StrippedImageDetail> {
         }
     }
     stripped
-}
-
-fn image_content_items_mut(item: &mut Value) -> Option<&mut Vec<Value>> {
-    match item.get("type").and_then(Value::as_str) {
-        Some("message") => item.get_mut("content")?.as_array_mut(),
-        Some("function_call_output" | "custom_tool_call_output") => {
-            item.get_mut("output")?.as_array_mut()
-        }
-        _ => None,
-    }
 }
 
 pub(crate) fn stable_input_prefix_items(

@@ -325,7 +325,7 @@ impl Conversation {
     pub(crate) fn resume(cwd: &Path, loaded: LoadedRollout) -> Result<Self> {
         let LoadedRollout {
             rollout,
-            history,
+            mut history,
             usage,
             total_usage,
             usage_history_estimate,
@@ -336,6 +336,9 @@ impl Conversation {
             ..
         } = loaded;
         let world_state = WorldState::load(cwd)?;
+        // Match current Codex reconstruction behavior: bound legacy media in memory while keeping
+        // the source rollout unchanged. Newly recorded images are already prepared at insertion.
+        crate::image_preparation::prepare_history_images(&mut history);
         let context_metrics = ContextMetrics::from_history(&history, &world_state);
         let history_normalization = HistoryNormalization::from_history(&history);
         let mut conversation = Self {

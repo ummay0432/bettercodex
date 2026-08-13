@@ -36,6 +36,18 @@ fn temporary_repository(name: &str) -> (TemporaryDirectory, PathBuf) {
     (root, cwd)
 }
 
+fn first_image_url(items: &[Value]) -> Option<&str> {
+    items.iter().find_map(|item| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|content| content.get("type").and_then(Value::as_str) == Some("input_image"))
+            .and_then(|image| image.get("image_url"))
+            .and_then(Value::as_str)
+    })
+}
+
 #[test]
 fn normalization_inserts_stable_outputs_and_removes_orphans() {
     let mut history = vec![
@@ -202,6 +214,65 @@ fn projected_append_commits_precomputed_context_metrics_and_history() {
 
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert_eq!(&loaded.history[initial_len..], items);
+}
+
+#[test]
+fn resume_prepares_legacy_images_without_rewriting_the_rollout() {
+    use base64::Engine as _;
+    use image::DynamicImage;
+    use image::GenericImageView;
+    use image::ImageBuffer;
+    use image::ImageFormat;
+    use image::Rgba;
+    use std::io::Cursor;
+
+    let (root, cwd) = temporary_repository("legacy-image-resume");
+    let rollout_root = root.join("state");
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+
+    let source = ImageBuffer::from_pixel(2048, 2048, Rgba([10_u8, 20, 30, 255]));
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(source)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .unwrap();
+    let original_url = crate::image::data_url_from_bytes("image/png", &encoded.into_inner());
+    conversation
+        .extend([json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": &original_url,
+                "detail": "high",
+            }],
+        })])
+        .unwrap();
+    drop(conversation);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(
+        first_image_url(&loaded.history),
+        Some(original_url.as_str())
+    );
+    let resumed = Conversation::resume(&cwd, loaded).unwrap();
+    let prepared_url = first_image_url(resumed.items()).unwrap();
+    let (_, payload) = prepared_url.split_once(',').unwrap();
+    let prepared = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .unwrap();
+    assert_eq!(
+        image::load_from_memory(&prepared).unwrap().dimensions(),
+        (1600, 1600)
+    );
+    drop(resumed);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(
+        first_image_url(&loaded.history),
+        Some(original_url.as_str())
+    );
 }
 
 #[test]

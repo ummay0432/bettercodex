@@ -295,7 +295,7 @@ pub(super) struct View {
     active_message_phase: Option<MessagePhase>,
     composer_text_width: u16,
     overlay: Option<Overlay>,
-    slash_selection: usize,
+    slash_selection: Option<usize>,
     dismissed_slash: Option<String>,
     user_message_style: Style,
     process_commands: HashMap<i64, String>,
@@ -593,7 +593,7 @@ impl View {
             active_message_phase: None,
             composer_text_width: 1,
             overlay: None,
-            slash_selection: 0,
+            slash_selection: None,
             dismissed_slash: None,
             user_message_style: user_message_style_for(Some((31, 31, 31))),
             process_commands: HashMap::new(),
@@ -819,7 +819,7 @@ impl View {
         self.file_search.dismiss();
         self.skill_popup.hide();
         self.dismissed_slash = None;
-        self.slash_selection = 0;
+        self.slash_selection = None;
     }
 
     pub(super) fn finish_turn(
@@ -1211,7 +1211,7 @@ impl View {
         self.overlay = None;
         self.file_search = FileSearchPopup::default();
         self.skill_popup = SkillPopup::default();
-        self.slash_selection = 0;
+        self.slash_selection = None;
         self.dismissed_slash = None;
         self.process_commands.clear();
         self.deferred_interactions.clear();
@@ -1426,7 +1426,7 @@ impl View {
             self.editor.insert_paste(text);
         }
         self.dismissed_slash = None;
-        self.slash_selection = 0;
+        self.slash_selection = None;
     }
 
     pub(super) fn paste_burst_active(&self) -> bool {
@@ -1770,25 +1770,33 @@ impl View {
         if !slash_matches.is_empty() {
             let plain = key.modifiers == KeyModifiers::NONE;
             let control_only = key.modifiers == KeyModifiers::CONTROL;
-            let selected = self.slash_selection.min(slash_matches.len() - 1);
+            let selected = self
+                .slash_selection
+                .unwrap_or_default()
+                .min(slash_matches.len() - 1);
             if (plain && key.code == KeyCode::Up)
                 || (control_only && key.code == KeyCode::Char('p'))
             {
-                self.slash_selection = if selected == 0 {
+                self.slash_selection = Some(if selected == 0 {
                     slash_matches.len() - 1
                 } else {
                     selected - 1
-                };
+                });
                 return Action::None;
             }
             if (plain && key.code == KeyCode::Down)
                 || (control_only && key.code == KeyCode::Char('n'))
             {
-                self.slash_selection = (selected + 1) % slash_matches.len();
+                self.slash_selection = Some((selected + 1) % slash_matches.len());
                 return Action::None;
             }
             match key.code {
                 KeyCode::Enter if !shift && !alt && !control => {
+                    // The first row is selected automatically; do not dispatch it until the user
+                    // types a command prefix or explicitly moves the selection.
+                    if self.editor.text() == "/" && self.slash_selection.is_none() {
+                        return Action::None;
+                    }
                     let command = slash_matches[selected];
                     self.complete_slash_command(command, selected);
                     return self.submit_action();
@@ -1859,7 +1867,7 @@ impl View {
         }
         if self.editor.text() != previous_text {
             self.dismissed_slash = None;
-            self.slash_selection = 0;
+            self.slash_selection = None;
         }
         Action::None
     }
@@ -1900,7 +1908,7 @@ impl View {
         let name = command.completion_name(query);
         self.editor.set_text(format!("/{name}"));
         self.dismissed_slash = None;
-        self.slash_selection = selection;
+        self.slash_selection = Some(selection);
     }
 
     fn insert_selected_file(&mut self) -> bool {
@@ -1950,7 +1958,7 @@ impl View {
         self.file_search.dismiss();
         self.skill_popup.hide();
         self.dismissed_slash = None;
-        self.slash_selection = 0;
+        self.slash_selection = None;
     }
 
     fn submit_action(&mut self) -> Action {
@@ -2930,7 +2938,10 @@ impl View {
             area.width.saturating_sub(LIVE_PREFIX_COLS),
             area.height,
         );
-        let selected = self.slash_selection.min(matches.len() - 1);
+        let selected = self
+            .slash_selection
+            .unwrap_or_default()
+            .min(matches.len() - 1);
         let visible = MAX_POPUP_ROWS.min(matches.len());
         let start = selected
             .saturating_add(1)
@@ -5593,6 +5604,77 @@ mod tests {
             KeyModifiers::NONE,
         ))) else {
             panic!("review completion should submit a turn");
+        };
+        assert_eq!(
+            submission.prompt().text_without_image_placeholders(),
+            "/review"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_bare_slash_waits_for_a_command() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn enter_on_a_bare_slash_submits_an_explicit_keyboard_selection() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        let Action::Clear(submission) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("explicit selection should submit /clear");
+        };
+        assert_eq!(
+            submission.prompt().text_without_image_placeholders(),
+            "/clear"
+        );
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/");
+        for key in [KeyCode::Down, KeyCode::Up] {
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE,))),
+                Action::None
+            );
+        }
+        let Action::Submit(submission) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("selection cycled back to /review should still be explicit");
         };
         assert_eq!(
             submission.prompt().text_without_image_placeholders(),

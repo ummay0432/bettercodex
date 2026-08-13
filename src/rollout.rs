@@ -39,7 +39,7 @@ const SESSIONS_DIRECTORY: &str = "sessions";
 const INSTALLATION_ID_FILE: &str = "installation_id";
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 160;
-const HISTORY_APPEND_PREFIX: &[u8] = br#"{"type":"history_append""#;
+const HISTORY_RECORD_PREFIX: &[u8] = br#"{"type":"history_"#;
 const SESSION_LIST_MAX_WORKERS: usize = 4;
 const SESSION_LIST_MIN_FILES_PER_WORKER: usize = 64;
 
@@ -72,7 +72,7 @@ pub(crate) struct SessionSummary {
     pub(crate) cwd: PathBuf,
     pub(crate) created_at_unix_ms: u64,
     pub(crate) updated_at_unix_ms: u64,
-    pub(crate) preview: Option<String>,
+    pub(crate) preview: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -243,7 +243,7 @@ struct PreviewContent {
 #[derive(Debug)]
 enum PreviewRolloutRecord {
     Session { metadata: SessionMetadata },
-    HistoryAppend { items: Vec<PreviewItem> },
+    History { items: Vec<PreviewItem> },
     Other,
 }
 
@@ -252,6 +252,7 @@ enum PreviewRolloutRecord {
 enum PreviewRecordKind {
     Session,
     HistoryAppend,
+    HistoryReplace,
     #[serde(other)]
     Other,
 }
@@ -299,7 +300,10 @@ impl<'de> Visitor<'de> for PreviewRolloutRecordVisitor {
                     metadata = Some(map.next_value::<SessionMetadata>()?);
                 }
                 PreviewRecordField::Items
-                    if matches!(kind, Some(PreviewRecordKind::HistoryAppend)) =>
+                    if matches!(
+                        kind,
+                        Some(PreviewRecordKind::HistoryAppend | PreviewRecordKind::HistoryReplace)
+                    ) =>
                 {
                     if items.is_some() {
                         return Err(serde::de::Error::duplicate_field("items"));
@@ -318,9 +322,11 @@ impl<'de> Visitor<'de> for PreviewRolloutRecordVisitor {
             PreviewRecordKind::Session => Ok(PreviewRolloutRecord::Session {
                 metadata: metadata.ok_or_else(|| serde::de::Error::missing_field("metadata"))?,
             }),
-            PreviewRecordKind::HistoryAppend => Ok(PreviewRolloutRecord::HistoryAppend {
-                items: items.unwrap_or_default(),
-            }),
+            PreviewRecordKind::HistoryAppend | PreviewRecordKind::HistoryReplace => {
+                Ok(PreviewRolloutRecord::History {
+                    items: items.unwrap_or_default(),
+                })
+            }
             PreviewRecordKind::Other => Ok(PreviewRolloutRecord::Other),
         }
     }
@@ -518,14 +524,20 @@ impl Rollout {
         for entry in entries {
             let entry =
                 entry.with_context(|| format!("failed to inspect {}", sessions.display()))?;
-            if entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
-                && entry
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+                || !entry
                     .file_type()
-                    .with_context(|| {
-                        format!("failed to inspect saved session {}", entry.path().display())
-                    })?
+                    .with_context(|| format!("failed to inspect saved session {}", path.display()))?
                     .is_file()
             {
+                continue;
+            }
+            let modified_at = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            if read_session_summary(&path, modified_at)?.is_some() {
                 return Ok(true);
             }
         }
@@ -1208,20 +1220,21 @@ fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
             continue;
         }
-        let Some(metadata) = read_metadata(&path)? else {
-            continue;
-        };
-        if metadata.cwd != cwd || compatible_session_id(&path, &metadata).is_none() {
-            continue;
-        }
         let modified_at = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
-            .ok()
+            .ok();
+        let Some(summary) = read_session_summary(&path, modified_at)? else {
+            continue;
+        };
+        if summary.cwd != cwd {
+            continue;
+        }
+        let modified_at = modified_at
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos())
-            .unwrap_or_else(|| u128::from(metadata.created_at_unix_ms) * 1_000_000);
-        let candidate = (modified_at, metadata.created_at_unix_ms, path);
+            .unwrap_or_else(|| u128::from(summary.created_at_unix_ms) * 1_000_000);
+        let candidate = (modified_at, summary.created_at_unix_ms, path);
         if latest
             .as_ref()
             .is_none_or(|current| (candidate.0, candidate.1) > (current.0, current.1))
@@ -1327,7 +1340,7 @@ fn read_session_summary(
         JsonLineContent::Record(Ok(PreviewRolloutRecord::Session { metadata })) => metadata,
         JsonLineContent::Blank
         | JsonLineContent::Record(Ok(
-            PreviewRolloutRecord::HistoryAppend { .. } | PreviewRolloutRecord::Other,
+            PreviewRolloutRecord::History { .. } | PreviewRolloutRecord::Other,
         )) => {
             return Ok(None);
         }
@@ -1342,11 +1355,11 @@ fn read_session_summary(
     };
 
     let mut preview = None;
-    while let Some(record) = read_next_history_append_record(&mut reader)
+    while let Some(record) = read_next_preview_history_record(&mut reader)
         .with_context(|| format!("failed to inspect saved session {}", path.display()))?
     {
         match record {
-            Ok(PreviewRolloutRecord::HistoryAppend { items }) => {
+            Ok(PreviewRolloutRecord::History { items }) => {
                 if let Some(found) = preview_from_items(&items) {
                     preview = Some(found);
                     break;
@@ -1361,6 +1374,9 @@ fn read_session_summary(
             Err(_) => break,
         }
     }
+    let Some(preview) = preview else {
+        return Ok(None);
+    };
 
     let updated_at_unix_ms = modified_at
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -1375,21 +1391,21 @@ fn read_session_summary(
     }))
 }
 
-/// Finds and streams the next history append without parsing unrelated journal records.
+/// Finds and streams the next history record without parsing unrelated journal records.
 ///
 /// Rollout serialization writes the externally tagged record type first. Inspecting that fixed
 /// prefix lets session discovery discard model, usage, reasoning, and tool records directly from
 /// the buffered input while matching records retain the line-framed, bounded-memory JSON parser.
-fn read_next_history_append_record(
+fn read_next_preview_history_record(
     reader: &mut impl BufRead,
 ) -> std::io::Result<Option<serde_json::Result<PreviewRolloutRecord>>> {
-    if !skip_to_record_prefix(reader, HISTORY_APPEND_PREFIX)? {
+    if !skip_to_record_prefix(reader, HISTORY_RECORD_PREFIX)? {
         return Ok(None);
     }
 
     let mut line = JsonLineReader::new(reader);
     let record = {
-        let prefix = std::io::Cursor::new(HISTORY_APPEND_PREFIX).chain(&mut line);
+        let prefix = std::io::Cursor::new(HISTORY_RECORD_PREFIX).chain(&mut line);
         let mut buffered = BufReader::with_capacity(JOURNAL_BUFFER_BYTES, prefix);
         serde_json::from_reader(&mut buffered)
     };
@@ -1528,32 +1544,6 @@ fn repair_rollout_tail(
     }
     file.sync_data()
         .with_context(|| format!("failed to persist repaired session {}", path.display()))
-}
-
-fn read_metadata(path: &Path) -> Result<Option<SessionMetadata>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let Some(record) = read_json_line::<PreviewRolloutRecord>(&mut reader)
-        .with_context(|| format!("failed to inspect saved session {}", path.display()))?
-    else {
-        return Ok(None);
-    };
-    let metadata = match record.content {
-        JsonLineContent::Record(Ok(PreviewRolloutRecord::Session { metadata })) => metadata,
-        JsonLineContent::Blank
-        | JsonLineContent::Record(Ok(
-            PreviewRolloutRecord::HistoryAppend { .. } | PreviewRolloutRecord::Other,
-        )) => {
-            return Ok(None);
-        }
-        JsonLineContent::Record(Err(error)) if error.is_io() => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect saved session {}", path.display()));
-        }
-        JsonLineContent::Record(Err(_)) => return Ok(None),
-    };
-    Ok(Some(metadata))
 }
 
 fn state_root() -> Result<PathBuf> {

@@ -124,10 +124,13 @@ impl PromptHistory {
 
 impl PromptHistoryReader {
     fn open(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
+        let mut options = OpenOptions::new();
+        options.read(true);
+        crate::platform_fs::configure_private_file_nofollow(&mut options, true);
+        let mut file = options
             .open(path)
             .with_context(|| format!("failed to open prompt history {}", path.display()))?;
+        validate_history_file(path, &file)?;
         let (position, anchor) = {
             let mut locked = FileLock::shared_with_retry(&mut file)
                 .with_context(|| format!("failed to lock prompt history {}", path.display()))?;
@@ -363,13 +366,27 @@ fn open_history_writer(path: &Path) -> Result<File> {
     }
     let mut options = OpenOptions::new();
     options.read(true).append(true).create(true);
-    crate::platform_fs::configure_private_file(&mut options);
+    crate::platform_fs::configure_private_file_nofollow(&mut options, true);
     let file = options
         .open(path)
         .with_context(|| format!("failed to open prompt history {}", path.display()))?;
+    validate_history_file(path, &file)?;
     crate::platform_fs::protect_file(&file)
         .with_context(|| format!("failed to protect prompt history {}", path.display()))?;
     Ok(file)
+}
+
+fn validate_history_file(path: &Path, file: &File) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect prompt history {}", path.display()))?;
+    if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
+        return Err(anyhow!(
+            "prompt history {} is not a regular file",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 struct FileLock<'a>(&'a mut File);

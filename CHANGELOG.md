@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.8] - 2026-08-13
+
+- openai had dedicated tools being injected into agent context just for fetching docs from their website. this shit is gone now; the agent can websearch it if needed
+
+- empty chats no longer take up rows in `/resume`
+
+- papercut logging is now opt-in instead of enabled by default, improving long-horizon task adherence
+
+- startup now prewarms the first Responses connection
+
+- pressing Enter on a bare `/` no longer accidentally starts `/review`
+
 ## [0.1.7] - 2026-08-11
 
 - terminal resizing and UI repainting are fixed

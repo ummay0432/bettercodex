@@ -4,8 +4,6 @@
 //! bettercodex snapshots user attachments before submission and receives tool
 //! images as data URLs, so the upstream utility's path-reading API is omitted.
 
-use crate::cache::BlockingLruCache;
-use crate::cache::sha1_digest;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use image::ColorType;
@@ -19,10 +17,15 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
+use lru::LruCache;
+use sha1::Digest;
+use sha1::Sha1;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 use thiserror::Error;
 
 const DATA_URL_PREFIX: &str = "data:";
@@ -105,10 +108,61 @@ struct ImageCacheKey {
     limits: PromptImageResizeLimits,
 }
 
-type ImageCache = BlockingLruCache<ImageCacheKey, EncodedImage>;
+// Upstream shares a Tokio-aware cache utility across several crates. bettercodex has one
+// synchronous image cache, so a dedicated standard mutex keeps this path independent of runtime
+// context while holding the lock only for short LRU operations.
+struct ImageCache {
+    inner: Mutex<LruCache<ImageCacheKey, EncodedImage>>,
+}
+
+impl ImageCache {
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            inner: Mutex::new(LruCache::new(capacity)),
+        }
+    }
+
+    fn get(&self, key: &ImageCacheKey) -> Option<EncodedImage> {
+        self.lock().get(key).cloned()
+    }
+
+    fn insert_bounded(&self, key: ImageCacheKey, image: EncodedImage, byte_capacity: usize) {
+        if image.bytes.len() > byte_capacity {
+            return;
+        }
+
+        let mut cache = self.lock();
+        cache.put(key, image);
+        let mut cached_bytes = cache
+            .iter()
+            .map(|(_, image)| image.bytes.len())
+            .sum::<usize>();
+        while cached_bytes > byte_capacity {
+            let Some((_, evicted)) = cache.pop_lru() else {
+                break;
+            };
+            cached_bytes -= evicted.bytes.len();
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, LruCache<ImageCacheKey, EncodedImage>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 static IMAGE_CACHE: LazyLock<ImageCache> =
     LazyLock::new(|| ImageCache::new(NonZeroUsize::new(32).unwrap_or(NonZeroUsize::MIN)));
+
+fn sha1_digest(bytes: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    let result = hasher.finalize();
+    let mut output = [0; 20];
+    output.copy_from_slice(&result);
+    output
+}
 
 pub(crate) fn load_data_url_for_prompt(
     image_url: &str,
@@ -225,27 +279,8 @@ pub(crate) fn load_for_prompt_bytes(
         Ok(encoded)
     })()?;
 
-    cache_image(&IMAGE_CACHE, key, image.clone(), MAX_IMAGE_CACHE_BYTES);
+    IMAGE_CACHE.insert_bounded(key, image.clone(), MAX_IMAGE_CACHE_BYTES);
     Ok(image)
-}
-
-fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte_capacity: usize) {
-    if image.bytes.len() > byte_capacity {
-        return;
-    }
-    cache.with_mut(|cache| {
-        cache.put(key, image);
-        let mut cached_bytes = cache
-            .iter()
-            .map(|(_, image)| image.bytes.len())
-            .sum::<usize>();
-        while cached_bytes > byte_capacity {
-            let Some((_, evicted)) = cache.pop_lru() else {
-                break;
-            };
-            cached_bytes -= evicted.bytes.len();
-        }
-    });
 }
 
 fn prompt_image_output_dimensions_for_limits(
@@ -413,20 +448,41 @@ mod tests {
         encoded.into_inner()
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn preserves_supported_image_within_limits() {
+    #[test]
+    fn preserves_supported_image_within_limits() {
         let original = image_bytes(64, 32, ImageFormat::Png);
         let image = load_for_prompt_bytes(original.clone().into(), LIMITS).expect("process image");
         assert_eq!(image.mime, "image/png");
         assert_eq!(image.bytes.as_ref(), original);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn enforces_dimension_and_patch_budgets() {
+    #[test]
+    fn enforces_dimension_and_patch_budgets() {
         let original = image_bytes(2048, 2048, ImageFormat::Png);
         let image = load_for_prompt_bytes(original.into(), LIMITS).expect("process image");
         let decoded = image::load_from_memory(&image.bytes).expect("decode output");
         assert_eq!(decoded.dimensions(), (1600, 1600));
+    }
+
+    #[test]
+    fn bounds_cache_by_encoded_byte_size() {
+        let cache = ImageCache::new(NonZeroUsize::new(4).expect("non-zero cache capacity"));
+        let key = |digest_byte| ImageCacheKey {
+            digest: [digest_byte; 20],
+            limits: LIMITS,
+        };
+        let image = |size| EncodedImage {
+            bytes: vec![0; size].into(),
+            mime: "image/png".to_string(),
+        };
+
+        cache.insert_bounded(key(1), image(3), /*byte_capacity*/ 5);
+        cache.insert_bounded(key(2), image(3), /*byte_capacity*/ 5);
+        cache.insert_bounded(key(3), image(6), /*byte_capacity*/ 5);
+
+        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(2)).is_some());
+        assert!(cache.get(&key(3)).is_none());
     }
 
     #[test]

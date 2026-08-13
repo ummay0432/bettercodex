@@ -1,10 +1,10 @@
-//! Model-facing tool image preparation ported from Codex at
+//! Model-facing image preparation ported from Codex at
 //! `902bd9e06b3ecb32cbf7f8e64cd23b956be3e7fe`,
 //! `codex-rs/core/src/image_preparation.rs`.
 //!
-//! Codex deliberately leaves `view_image` results as opaque data URLs inside
-//! the exec runtime, then validates and prepares any image the JavaScript
-//! program chooses to return before inserting the outer tool result into history.
+//! Images are prepared before entering live history. Reconstructed history is
+//! prepared once in memory on resume so rollouts created by older bettercodex
+//! versions receive the same bounds without rewriting the saved source records.
 
 use crate::image::HIGH_DETAIL_LIMITS;
 use crate::image::ImageProcessingError;
@@ -12,6 +12,8 @@ use crate::image::ORIGINAL_DETAIL_LIMITS;
 use crate::image::load_data_url_for_prompt;
 use crate::protocol::FunctionCallOutputContentItem;
 use crate::protocol::ImageDetail;
+use serde_json::Value;
+use serde_json::json;
 
 const IMAGE_PROCESSING_ERROR_PLACEHOLDER: &str =
     "image content omitted because it could not be processed";
@@ -40,7 +42,7 @@ impl ImagePreparationError {
     }
 }
 
-pub(super) fn prepare_tool_output_images(items: &mut [FunctionCallOutputContentItem]) {
+pub(crate) fn prepare_tool_output_images(items: &mut [FunctionCallOutputContentItem]) {
     for item in items {
         if let FunctionCallOutputContentItem::InputImage { image_url, detail } = item
             && let Err(error) = prepare_image(image_url, *detail)
@@ -49,6 +51,56 @@ pub(super) fn prepare_tool_output_images(items: &mut [FunctionCallOutputContentI
                 text: error.placeholder().to_string(),
             };
         }
+    }
+}
+
+pub(crate) fn prepare_history_images(items: &mut [Value]) {
+    for item in items {
+        let Some(content) = image_content_items_mut(item) else {
+            continue;
+        };
+        for content_item in content {
+            if content_item.get("type").and_then(Value::as_str) != Some("input_image") {
+                continue;
+            }
+            let detail = match history_image_detail(content_item.get("detail")) {
+                Some(detail) => detail,
+                None => continue,
+            };
+            let Some(Value::String(image_url)) = content_item.get_mut("image_url") else {
+                continue;
+            };
+            if let Err(error) = prepare_image(image_url, detail) {
+                *content_item = json!({
+                    "type": "input_text",
+                    "text": error.placeholder(),
+                });
+            }
+        }
+    }
+}
+
+pub(crate) fn image_content_items_mut(item: &mut Value) -> Option<&mut Vec<Value>> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => item.get_mut("content")?.as_array_mut(),
+        Some("function_call_output" | "custom_tool_call_output") => {
+            item.get_mut("output")?.as_array_mut()
+        }
+        _ => None,
+    }
+}
+
+fn history_image_detail(detail: Option<&Value>) -> Option<Option<ImageDetail>> {
+    match detail {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(detail)) => match detail.as_str() {
+            "auto" => Some(Some(ImageDetail::Auto)),
+            "low" => Some(Some(ImageDetail::Low)),
+            "high" => Some(Some(ImageDetail::High)),
+            "original" => Some(Some(ImageDetail::Original)),
+            _ => None,
+        },
+        Some(_) => None,
     }
 }
 

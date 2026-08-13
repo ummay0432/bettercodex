@@ -773,11 +773,7 @@ fn session_metadata_line(
 }
 
 fn session_title(session: &SessionSummary) -> String {
-    session
-        .preview
-        .as_deref()
-        .map(markdown::sanitize)
-        .unwrap_or_else(|| "New session".to_string())
+    markdown::sanitize(&session.preview)
 }
 
 fn session_timestamp(session: &SessionSummary, sort: SessionSort) -> u64 {
@@ -872,10 +868,7 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
     query.is_empty()
         || session.id.to_string().to_lowercase().contains(query)
         || session.cwd.to_string_lossy().to_lowercase().contains(query)
-        || session
-            .preview
-            .as_ref()
-            .is_some_and(|preview| preview.to_lowercase().contains(query))
+        || session.preview.to_lowercase().contains(query)
 }
 
 fn format_relative_time(now_unix_ms: u64, timestamp_unix_ms: u64) -> String {

@@ -161,11 +161,11 @@ pub(crate) async fn run(
             return Ok(());
         }
         session.terminal_mut().clear_screen()?;
-        let loaded = load_agent(&requested_cwd, resume)?;
+        let loaded = load_agent(&requested_cwd, resume).await?;
         let cwd = loaded.agent.cwd().to_path_buf();
         (Runtime::new(loaded, cwd, worker_handoff)?, session)
     } else {
-        let loaded = load_agent(&requested_cwd, resume)?;
+        let loaded = load_agent(&requested_cwd, resume).await?;
         let cwd = loaded.agent.cwd().to_path_buf();
         let runtime = Runtime::new(loaded, cwd, worker_handoff)?;
         (runtime, startup.0.enter()?)
@@ -183,13 +183,23 @@ struct LoadedAgent {
     patch_notes: Result<Option<String>>,
 }
 
-fn load_agent(requested_cwd: &Path, resume: Option<ResumeSelector>) -> Result<LoadedAgent> {
-    let had_saved_sessions = resume
-        .is_none()
-        .then(Rollout::has_saved_sessions)
-        .transpose()?;
+async fn load_agent(requested_cwd: &Path, resume: Option<ResumeSelector>) -> Result<LoadedAgent> {
+    let had_saved_sessions = if resume.is_none() {
+        Some(
+            tokio::task::spawn_blocking(Rollout::has_saved_sessions)
+                .await
+                .context("saved session discovery task failed")??,
+        )
+    } else {
+        None
+    };
     let agent = match resume {
-        Some(selector) => Agent::resume(requested_cwd, selector)?,
+        Some(selector) => {
+            let requested_cwd = requested_cwd.to_path_buf();
+            tokio::task::spawn_blocking(move || Agent::resume(requested_cwd, selector))
+                .await
+                .context("agent resume task failed")??
+        }
         None => Agent::new(requested_cwd)?,
     };
     let patch_notes = had_saved_sessions.map_or(Ok(None), crate::patch_notes::for_startup);
