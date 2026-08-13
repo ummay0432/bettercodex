@@ -4752,18 +4752,14 @@ fn git_diff_lines(diff: &str, width: u16) -> Vec<Line<'static>> {
 }
 
 fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Vec<Line<'static>> {
-    let mut parts = Vec::new();
-    if let Some(elapsed) = elapsed_seconds
+    let Some(elapsed) = elapsed_seconds
         .filter(|seconds| *seconds > 60)
         .map(format_elapsed)
-    {
-        parts.push(format!("Worked for {elapsed}"));
-    }
-    if parts.is_empty() {
+    else {
         return vec![Line::from("─".repeat(usize::from(width))).dim()];
-    }
+    };
 
-    let label = format!("─ {} ─", parts.join(" • "))
+    let label = format!("─ Worked for {elapsed} ─")
         .chars()
         .take(usize::from(width))
         .collect::<String>();
