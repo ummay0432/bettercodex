@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.9] - 2026-08-13
+
+- agents given more freedom with tool use
+
+- terminal performance improved
+
+- message streaming made smooth
+
 ## [0.1.8] - 2026-08-13
 
 - openai had dedicated tools being injected into agent context just for fetching docs from their website. this shit is gone now; the agent can websearch it if needed
