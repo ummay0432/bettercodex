@@ -161,7 +161,6 @@ dependencies = [
  "portable-pty",
  "pretty_assertions",
  "pulldown-cmark",
- "quick-xml",
  "rand",
  "ratatui",
  "regex-lite",

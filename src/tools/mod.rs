@@ -22,7 +22,6 @@ use self::code_runtime::CodeModeNestedToolCall as NestedToolCall;
 use self::code_runtime::CodeModeToolKind as NestedToolKind;
 use crate::events::AgentEvent;
 use crate::image::data_url_from_bytes;
-use crate::openai_docs::OpenAiDocsClient;
 use crate::protocol::UpdatePlanArgs;
 use crate::truncation::TruncationPolicy;
 use crate::truncation::formatted_truncate_text;
@@ -43,6 +42,21 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolConfiguration {
+    papercut: bool,
+}
+
+impl ToolConfiguration {
+    pub(crate) const fn with_papercut() -> Self {
+        Self { papercut: true }
+    }
+
+    pub(crate) const fn papercut_enabled(self) -> bool {
+        self.papercut
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ToolCall {
@@ -138,18 +152,16 @@ impl ToolResult {
 
 struct ToolImplementations {
     cwd: PathBuf,
-    openai_docs: OpenAiDocsClient,
     processes: ProcessManager,
     web_search: WebSearchClient,
     turn: Mutex<ToolTurnContext>,
 }
 
 impl ToolImplementations {
-    fn new(cwd: PathBuf, web_search: WebSearchClient, openai_docs: OpenAiDocsClient) -> Self {
+    fn new(cwd: PathBuf, web_search: WebSearchClient) -> Self {
         Self {
             processes: ProcessManager::new(cwd.clone()),
             cwd,
-            openai_docs,
             web_search,
             turn: Mutex::new(ToolTurnContext::default()),
         }
@@ -178,13 +190,6 @@ impl ToolImplementations {
         let namespace = tool_name.namespace.as_deref();
         let name = tool_name.name.as_str();
         match (namespace, name, tool_kind) {
-            (Some(crate::openai_docs::NAMESPACE), name, NestedToolKind::Function)
-                if crate::openai_docs::is_tool(name) =>
-            {
-                self.openai_docs
-                    .call(name, function_input(name, input)?, cancellation)
-                    .await
-            }
             (
                 Some(crate::web_search::NAMESPACE),
                 crate::web_search::TOOL_NAME,
@@ -338,12 +343,12 @@ struct ViewImageArgs {
     detail: Option<String>,
 }
 
-pub(crate) fn responses_lite_specifications() -> Vec<Value> {
-    catalogue::responses_lite_specifications()
+pub(crate) fn responses_lite_specifications(configuration: ToolConfiguration) -> Vec<Value> {
+    catalogue::responses_lite_specifications(configuration)
 }
 
-pub(crate) fn catalogue_text() -> &'static str {
-    catalogue::text()
+pub(crate) fn catalogue_text(configuration: ToolConfiguration) -> &'static str {
+    catalogue::text(configuration)
 }
 
 #[cfg(test)]

@@ -1,13 +1,14 @@
 //! Model-facing tool image preparation ported from Codex at
-//! `1669c2403f793d0230065397dfc25f52b844244e`,
+//! `902bd9e06b3ecb32cbf7f8e64cd23b956be3e7fe`,
 //! `codex-rs/core/src/image_preparation.rs`.
 //!
 //! Codex deliberately leaves `view_image` results as opaque data URLs inside
 //! the exec runtime, then validates and prepares any image the JavaScript
 //! program chooses to return before inserting the outer tool result into history.
 
+use crate::image::HIGH_DETAIL_LIMITS;
 use crate::image::ImageProcessingError;
-use crate::image::PromptImageResizeLimits;
+use crate::image::ORIGINAL_DETAIL_LIMITS;
 use crate::image::load_data_url_for_prompt;
 use crate::protocol::FunctionCallOutputContentItem;
 use crate::protocol::ImageDetail;
@@ -19,15 +20,6 @@ const IMAGE_TOO_LARGE_PLACEHOLDER: &str =
 const UNSUPPORTED_LOW_DETAIL_PLACEHOLDER: &str = "image content omitted because detail 'low' is not supported; use 'high', 'original', or 'auto'";
 const REMOTE_IMAGE_URL_PLACEHOLDER: &str =
     "image content omitted because remote image URLs are not supported";
-
-const HIGH_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
-    max_dimension: 2048,
-    max_patches: 2_500,
-};
-const ORIGINAL_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
-    max_dimension: 6000,
-    max_patches: 10_000,
-};
 
 enum ImagePreparationError {
     RemoteUrlUnsupported,

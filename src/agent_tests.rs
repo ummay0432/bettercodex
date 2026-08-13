@@ -1,4 +1,6 @@
 use super::*;
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::mpsc;
 use std::thread;
@@ -82,6 +84,135 @@ async fn code_mode_notify_follows_the_terminal_exec_output_in_model_history() ->
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_warmup_starts_before_first_submission() -> Result<()> {
+    let root = temporary_root("startup-websocket-prewarm");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let (base_url, mut requests_rx, server) =
+        spawn_successful_startup_websocket_server(selection.model.clone()).await?;
+    let mut agent = test_agent_with_transport(&root, base_url, selection, true)?;
+    let warmup = tokio::time::timeout(Duration::from_secs(2), requests_rx.recv())
+        .await
+        .context("startup warmup did not begin before submission")?;
+    let Some(warmup) = warmup else {
+        return match server.await.context("startup warmup server task failed")? {
+            Ok(()) => Err(anyhow!(
+                "startup warmup server closed before receiving a request"
+            )),
+            Err(error) => Err(error.context("startup warmup server failed before receiving")),
+        };
+    };
+    assert_eq!(warmup["type"], "response.create");
+    assert_eq!(warmup["generate"], false);
+
+    assert_eq!(agent.submit("hello").await?, "ready");
+    let turn = tokio::time::timeout(Duration::from_secs(2), requests_rx.recv())
+        .await
+        .context("first turn did not reuse the startup connection")?
+        .context("startup warmup server closed before the first turn")?;
+    assert_eq!(turn["type"], "response.create");
+    assert_eq!(turn["previous_response_id"], "warm-1");
+    assert_eq!(
+        turn["client_metadata"]["x-codex-turn-state"],
+        "startup-turn-state"
+    );
+    server
+        .await
+        .context("startup warmup server task failed")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_first_turn_uses_updated_fast_tier_after_startup_prewarm() -> Result<()> {
+    let root = temporary_root("startup-websocket-prewarm-fast");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let (base_url, mut requests_rx, server) =
+        spawn_successful_startup_websocket_server(selection.model.clone()).await?;
+    let mut agent = test_agent_with_transport(&root, base_url, selection, true)?;
+
+    let warmup = tokio::time::timeout(Duration::from_secs(2), requests_rx.recv())
+        .await
+        .context("startup warmup did not begin before Fast mode changed")?
+        .context("startup warmup server closed before Fast mode changed")?;
+    assert!(warmup.get("service_tier").is_none());
+    agent.set_service_tier(ServiceTier::Fast)?;
+
+    assert_eq!(agent.submit("hello").await?, "ready");
+    let turn = tokio::time::timeout(Duration::from_secs(2), requests_rx.recv())
+        .await
+        .context("first Fast mode turn did not reuse the startup connection")?
+        .context("startup warmup server closed before the first Fast mode turn")?;
+    assert_eq!(turn["service_tier"], "priority");
+    assert!(turn.get("previous_response_id").is_none());
+    assert!(
+        turn["input"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    server
+        .await
+        .context("startup warmup Fast mode server task failed")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_warmup_failure_is_not_retried_on_first_submission() -> Result<()> {
+    let root = temporary_root("startup-websocket-prewarm-failure");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server_model = selection.model.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut websocket =
+            tokio_tungstenite::accept_async_with_config(stream, Some(websocket_server_config()))
+                .await?;
+        let warmup = receive_websocket_json(&mut websocket).await?;
+        if warmup["generate"] != false {
+            return Err(anyhow!("startup request was not a warmup: {warmup}"));
+        }
+        send_websocket_json(
+            &mut websocket,
+            &json!({
+                "type": "response.failed",
+                "response": {
+                    "error": {"code": "server_error", "message": "warmup failed"},
+                },
+            }),
+        )
+        .await?;
+        drop(websocket);
+
+        let (stream, _) = listener.accept().await?;
+        let mut websocket =
+            tokio_tungstenite::accept_async_with_config(stream, Some(websocket_server_config()))
+                .await?;
+        let turn = receive_websocket_json(&mut websocket).await?;
+        if turn.get("generate").is_some() {
+            return Err(anyhow!("first turn retried startup warmup: {turn}"));
+        }
+        send_websocket_answer(
+            &mut websocket,
+            &server_model,
+            "resp-after-failed-prewarm",
+            "msg_after_failed_prewarm",
+            "recovered",
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let mut agent = test_agent_with_transport(&root, format!("http://{address}"), selection, true)?;
+    assert_eq!(agent.submit("hello").await?, "recovered");
+    server
+        .await
+        .context("startup warmup failure server task failed")??;
+    Ok(())
+}
+
 fn temporary_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "bettercodex-agent-{name}-{}-{}",
@@ -91,6 +222,15 @@ fn temporary_root(name: &str) -> PathBuf {
 }
 
 fn test_agent(root: &Path, base_url: String, selection: ModelSelection) -> Result<Agent> {
+    test_agent_with_transport(root, base_url, selection, false)
+}
+
+fn test_agent_with_transport(
+    root: &Path,
+    base_url: String,
+    selection: ModelSelection,
+    websocket: bool,
+) -> Result<Agent> {
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd)?;
     let rollout = Rollout::create_in_with_selection(root, &cwd, &selection)?;
@@ -102,23 +242,156 @@ fn test_agent(root: &Path, base_url: String, selection: ModelSelection) -> Resul
         0,
         selection,
         ServiceTier::default(),
+        crate::tools::ToolConfiguration::default(),
         base_url,
     )?;
-    api.fall_back_to_http();
+    if !websocket {
+        api.fall_back_to_http();
+    }
     let tools = ToolRuntime::new(
         cwd.clone(),
         api.web_search_client(),
-        api.openai_docs_client(),
+        crate::tools::ToolConfiguration::default(),
     );
+    let startup_prewarm = StartupPrewarm::schedule(&api);
     Ok(Agent {
         cwd,
         api,
+        startup_prewarm,
         conversation,
         tools,
         resumed_transcript: Vec::new(),
         transcript_checkpoint: None,
         forked_from: None,
     })
+}
+
+async fn spawn_successful_startup_websocket_server(
+    server_model: String,
+) -> Result<(
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<Value>,
+    tokio::task::JoinHandle<Result<()>>,
+)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut websocket =
+            tokio_tungstenite::accept_async_with_config(stream, Some(websocket_server_config()))
+                .await?;
+
+        requests_tx
+            .send(receive_websocket_json(&mut websocket).await?)
+            .map_err(|_| anyhow!("startup warmup receiver closed"))?;
+        send_websocket_json(
+            &mut websocket,
+            &json!({
+                "type": "response.metadata",
+                "headers": {"x-codex-turn-state": "startup-turn-state"},
+            }),
+        )
+        .await?;
+        send_websocket_json(
+            &mut websocket,
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "warm-1",
+                    "model": server_model,
+                    "output": [],
+                    "reasoning": {"context": "all_turns"},
+                },
+            }),
+        )
+        .await?;
+
+        requests_tx
+            .send(receive_websocket_json(&mut websocket).await?)
+            .map_err(|_| anyhow!("first-turn request receiver closed"))?;
+        send_websocket_answer(
+            &mut websocket,
+            &server_model,
+            "resp-1",
+            "msg_startup_prewarm",
+            "ready",
+        )
+        .await
+    });
+    Ok((format!("http://{address}"), requests_rx, server))
+}
+
+async fn receive_websocket_json(
+    websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) -> Result<Value> {
+    let message = websocket
+        .next()
+        .await
+        .context("websocket closed before the next request")??;
+    let tungstenite::Message::Text(text) = message else {
+        return Err(anyhow!(
+            "expected a text websocket request, got {message:?}"
+        ));
+    };
+    serde_json::from_str(text.as_str()).context("failed to decode websocket request")
+}
+
+async fn send_websocket_answer(
+    websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    server_model: &str,
+    response_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<()> {
+    let answer = json!({
+        "type": "message",
+        "id": message_id,
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": text}],
+    });
+    send_websocket_json(
+        websocket,
+        &json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": answer,
+        }),
+    )
+    .await?;
+    send_websocket_json(
+        websocket,
+        &json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "model": server_model,
+                "output": [answer],
+                "reasoning": {"context": "all_turns"},
+            },
+        }),
+    )
+    .await
+}
+
+async fn send_websocket_json(
+    websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    event: &Value,
+) -> Result<()> {
+    websocket
+        .send(tungstenite::Message::Text(event.to_string().into()))
+        .await
+        .context("failed to send websocket event")
+}
+
+fn websocket_server_config() -> tungstenite::protocol::WebSocketConfig {
+    let mut extensions = tungstenite::extensions::ExtensionsConfig::default();
+    extensions.permessage_deflate =
+        Some(tungstenite::extensions::compression::deflate::DeflateConfig::default());
+    let mut config = tungstenite::protocol::WebSocketConfig::default();
+    config.extensions = extensions;
+    config
 }
 
 fn completed_sse(response_id: &str, model: &str, item: &Value) -> String {

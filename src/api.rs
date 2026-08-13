@@ -11,7 +11,6 @@ use crate::http_client::backoff;
 use crate::http_client::bounded_error_body;
 use crate::model::ModelSelection;
 use crate::model::SharedModelSelection;
-use crate::openai_docs::OpenAiDocsClient;
 use crate::rollout::SessionIdentity;
 use crate::service_tier::ServiceTier;
 use crate::time::unix_timestamp_millis;
@@ -69,6 +68,7 @@ const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: usize = 2;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WEBSOCKET_PREWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STREAM_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16_000;
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
@@ -84,8 +84,10 @@ const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
 static SYSTEM_PROMPT: LazyLock<String> =
     LazyLock::new(|| render_system_prompt(SYSTEM_PROMPT_TEMPLATE, PLATFORM_SHELL_GUIDANCE));
-static STABLE_INPUT_PREFIX_ITEMS: OnceLock<[Value; 2]> = OnceLock::new();
-static STABLE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
+static DEFAULT_STABLE_INPUT_PREFIX_ITEMS: OnceLock<[Value; 2]> = OnceLock::new();
+static PAPERCUT_STABLE_INPUT_PREFIX_ITEMS: OnceLock<[Value; 2]> = OnceLock::new();
+static DEFAULT_STABLE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
+static PAPERCUT_STABLE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
 
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -182,6 +184,7 @@ pub(crate) struct ApiClient {
     window: u64,
     model_selection: SharedModelSelection,
     service_tier: ServiceTier,
+    tool_configuration: tools::ToolConfiguration,
     prefer_websocket: bool,
     websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
@@ -348,6 +351,7 @@ impl Drop for WebSocketRequestGuard<'_> {
 }
 
 struct SamplingInputRestoration {
+    expected_prefix: [Value; 2],
     stripped_image_details: Vec<StrippedImageDetail>,
 }
 
@@ -412,7 +416,7 @@ impl SamplingRequest {
 
 impl SamplingInputRestoration {
     fn restore(self, mut input: Vec<Value>) -> ApiResult<Vec<Value>> {
-        let expected = stable_input_prefix_items();
+        let expected = &self.expected_prefix;
         if input.get(..expected.len()) != Some(expected.as_slice()) {
             return Err(ApiError::fatal(
                 "sampling request lost its inserted Responses Lite prefix",
@@ -443,6 +447,11 @@ impl SamplingInputRestoration {
 enum WebSocketRequestMode {
     Inference,
     Warmup,
+}
+
+enum WebSocketPrewarmOutcome {
+    Ready { refreshed_auth: bool },
+    Failed(ApiError),
 }
 
 pub(crate) struct ModelResponse {
@@ -480,6 +489,7 @@ impl ApiClient {
         compaction_count: u64,
         model_selection: ModelSelection,
         service_tier: ServiceTier,
+        tool_configuration: tools::ToolConfiguration,
     ) -> anyhow::Result<Self> {
         Self::new_with_base_url(
             auth,
@@ -487,6 +497,7 @@ impl ApiClient {
             compaction_count,
             model_selection,
             service_tier,
+            tool_configuration,
             BASE_URL.to_string(),
         )
     }
@@ -497,6 +508,7 @@ impl ApiClient {
         compaction_count: u64,
         model_selection: ModelSelection,
         service_tier: ServiceTier,
+        tool_configuration: tools::ToolConfiguration,
         base_url: String,
     ) -> anyhow::Result<Self> {
         crate::http_client::ensure_rustls_crypto_provider();
@@ -522,6 +534,7 @@ impl ApiClient {
             window: compaction_count,
             model_selection: SharedModelSelection::new(model_selection),
             service_tier,
+            tool_configuration,
             prefer_websocket: true,
             websocket_prewarm_attempted: false,
             websocket: None,
@@ -532,6 +545,55 @@ impl ApiClient {
             server_model_warning_emitted: false,
             stream_idle_timeout: STREAM_IDLE_TIMEOUT,
         })
+    }
+
+    pub(crate) fn startup_prewarm_client(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            auth: self.auth.clone(),
+            base_url: self.base_url.clone(),
+            installation_id: self.installation_id.clone(),
+            session_id: self.session_id.clone(),
+            thread_id: self.thread_id.clone(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            turn_started_at_unix_ms: unix_timestamp_millis(),
+            turn_state: None,
+            window: self.window,
+            model_selection: self.model_selection.clone(),
+            service_tier: self.service_tier,
+            tool_configuration: self.tool_configuration,
+            prefer_websocket: self.prefer_websocket,
+            websocket_prewarm_attempted: false,
+            websocket: None,
+            websocket_reasoning_included: false,
+            websocket_server_model: None,
+            websocket_rate_limits: Vec::new(),
+            websocket_baseline: None,
+            server_model_warning_emitted: false,
+            stream_idle_timeout: self.stream_idle_timeout,
+        }
+    }
+
+    pub(crate) async fn prewarm_for_startup(mut self) -> ApiResult<Self> {
+        match self.attempt_websocket_prewarm(None).await {
+            Ok(WebSocketPrewarmOutcome::Ready { .. }) => Ok(self),
+            Ok(WebSocketPrewarmOutcome::Failed(error)) | Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn adopt_startup_prewarm(&mut self, mut prewarmed: Self) {
+        self.prefer_websocket = prewarmed.prefer_websocket;
+        self.websocket_prewarm_attempted = prewarmed.websocket_prewarm_attempted;
+        self.websocket = prewarmed.websocket.take();
+        self.websocket_reasoning_included = prewarmed.websocket_reasoning_included;
+        self.websocket_server_model = prewarmed.websocket_server_model.take();
+        self.websocket_rate_limits = std::mem::take(&mut prewarmed.websocket_rate_limits);
+        self.websocket_baseline = prewarmed.websocket_baseline.take();
+        self.turn_state = prewarmed.turn_state.take();
+    }
+
+    pub(crate) fn mark_websocket_prewarm_attempted(&mut self) {
+        self.websocket_prewarm_attempted = true;
     }
 
     pub(crate) fn begin_turn(&mut self) -> &str {
@@ -553,6 +615,14 @@ impl ApiClient {
         self.service_tier = service_tier;
         // A routing change invalidates both the incremental request baseline and the routing hint
         // attached to the existing WebSocket handshake. Reconnect on the next request.
+        self.abandon_response();
+    }
+
+    pub(crate) fn set_tool_configuration(&mut self, tool_configuration: tools::ToolConfiguration) {
+        if self.tool_configuration == tool_configuration {
+            return;
+        }
+        self.tool_configuration = tool_configuration;
         self.abandon_response();
     }
 
@@ -583,10 +653,6 @@ impl ApiClient {
             self.session_id.clone(),
             self.model_selection.clone(),
         )
-    }
-
-    pub(crate) fn openai_docs_client(&self) -> OpenAiDocsClient {
-        OpenAiDocsClient::new(self.client.clone())
     }
 
     pub(crate) fn rate_limit_client(&self) -> crate::rate_limits::RateLimitClient {
@@ -684,35 +750,11 @@ impl ApiClient {
         request_kind: RequestKind,
         input_identity: RequestInputIdentity,
     ) -> ApiResult<ModelResponse> {
-        let mut refreshed_websocket_auth = false;
+        let mut refreshed_websocket_auth = match self.attempt_websocket_prewarm(events).await? {
+            WebSocketPrewarmOutcome::Ready { refreshed_auth } => refreshed_auth,
+            WebSocketPrewarmOutcome::Failed(_) => false,
+        };
         let mut retried_full_websocket_request = false;
-        if self.prefer_websocket && !self.websocket_prewarm_attempted {
-            self.websocket_prewarm_attempted = true;
-            match self.prewarm_websocket().await {
-                Ok(()) => {}
-                Err(error) if error.kind == ApiErrorKind::Unauthorized => {
-                    self.auth
-                        .force_refreshed_snapshot(&self.client)
-                        .await
-                        .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
-                    refreshed_websocket_auth = true;
-                    self.abandon_response();
-                }
-                Err(error) if error.kind == ApiErrorKind::WebSocketUnavailable => {
-                    self.fall_back_to_http();
-                }
-                Err(error) if error.is_stream_idle() => {
-                    if !self.recover_websocket_inactivity(events) {
-                        return Err(error);
-                    }
-                }
-                Err(_) => {
-                    // Warmup is an optimization. A normal full request remains the
-                    // authoritative path when the connection or warmup response fails.
-                    self.abandon_response();
-                }
-            }
-        }
         loop {
             if self.prefer_websocket {
                 match self
@@ -774,6 +816,53 @@ impl ApiClient {
             return self
                 .respond_http(request, completed_items, events, request_kind)
                 .await;
+        }
+    }
+
+    async fn attempt_websocket_prewarm(
+        &mut self,
+        events: Option<&UnboundedSender<AgentEvent>>,
+    ) -> ApiResult<WebSocketPrewarmOutcome> {
+        if !self.prefer_websocket || self.websocket_prewarm_attempted {
+            return Ok(WebSocketPrewarmOutcome::Ready {
+                refreshed_auth: false,
+            });
+        }
+        self.websocket_prewarm_attempted = true;
+        match self.prewarm_websocket().await {
+            Ok(()) => Ok(WebSocketPrewarmOutcome::Ready {
+                refreshed_auth: false,
+            }),
+            Err(error) if error.kind == ApiErrorKind::Unauthorized => {
+                self.auth
+                    .force_refreshed_snapshot(&self.client)
+                    .await
+                    .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
+                self.abandon_response();
+                Ok(WebSocketPrewarmOutcome::Ready {
+                    refreshed_auth: true,
+                })
+            }
+            Err(error) if error.kind == ApiErrorKind::WebSocketUnavailable => {
+                self.fall_back_to_http();
+                Ok(WebSocketPrewarmOutcome::Ready {
+                    refreshed_auth: false,
+                })
+            }
+            Err(error) if error.is_stream_idle() => {
+                if !self.recover_websocket_inactivity(events) {
+                    return Err(error);
+                }
+                Ok(WebSocketPrewarmOutcome::Ready {
+                    refreshed_auth: false,
+                })
+            }
+            Err(error) => {
+                // Warmup is an optimization. A normal full request remains the
+                // authoritative path when the connection or warmup response fails.
+                self.abandon_response();
+                Ok(WebSocketPrewarmOutcome::Failed(error))
+            }
         }
     }
 
@@ -1097,7 +1186,8 @@ impl ApiClient {
         }
         let trigger = compaction::compaction_trigger();
         let selection = self.model_selection.get();
-        let [tool_prefix_tokens, instruction_tokens] = estimated_harness_tokens();
+        let [tool_prefix_tokens, instruction_tokens] =
+            estimated_harness_tokens(self.tool_configuration);
         let prefix_tokens = tool_prefix_tokens
             .saturating_add(instruction_tokens)
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
@@ -1165,7 +1255,7 @@ impl ApiClient {
 
     fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> Value {
         let selection = self.model_selection.get();
-        let input = compose_input(history);
+        let input = compose_input(history, self.tool_configuration);
         self.build_request_from_input(input, request_kind, &selection)
     }
 
@@ -1175,7 +1265,7 @@ impl ApiClient {
         cursor: HistoryCursor,
     ) -> SamplingRequest {
         let selection = self.model_selection.get();
-        let (input, input_restoration) = compose_sampling_input(history);
+        let (input, input_restoration) = compose_sampling_input(history, self.tool_configuration);
         SamplingRequest {
             request: self.build_request_from_input(input, RequestKind::Turn, &selection),
             cursor,
@@ -1466,16 +1556,21 @@ impl RequestKind {
     }
 }
 
-fn compose_input(history: Vec<Value>) -> Vec<Value> {
-    compose_sampling_input(history).0
+fn compose_input(history: Vec<Value>, tool_configuration: tools::ToolConfiguration) -> Vec<Value> {
+    compose_sampling_input(history, tool_configuration).0
 }
 
-fn compose_sampling_input(mut history: Vec<Value>) -> (Vec<Value>, SamplingInputRestoration) {
+fn compose_sampling_input(
+    mut history: Vec<Value>,
+    tool_configuration: tools::ToolConfiguration,
+) -> (Vec<Value>, SamplingInputRestoration) {
     let stripped_image_details = strip_image_details(&mut history);
-    history.splice(0..0, stable_request_prefix());
+    let expected_prefix = stable_request_prefix(tool_configuration);
+    history.splice(0..0, expected_prefix.clone());
     (
         history,
         SamplingInputRestoration {
+            expected_prefix,
             stripped_image_details,
         },
     )
@@ -1523,21 +1618,28 @@ fn image_content_items_mut(item: &mut Value) -> Option<&mut Vec<Value>> {
     }
 }
 
-pub(crate) fn stable_input_prefix_items() -> &'static [Value; 2] {
-    STABLE_INPUT_PREFIX_ITEMS.get_or_init(|| {
+pub(crate) fn stable_input_prefix_items(
+    tool_configuration: tools::ToolConfiguration,
+) -> &'static [Value; 2] {
+    let items = if tool_configuration.papercut_enabled() {
+        &PAPERCUT_STABLE_INPUT_PREFIX_ITEMS
+    } else {
+        &DEFAULT_STABLE_INPUT_PREFIX_ITEMS
+    };
+    items.get_or_init(|| {
         [
             json!({
                 "type": "additional_tools",
                 "role": "developer",
-                "tools": tools::responses_lite_specifications(),
+                "tools": tools::responses_lite_specifications(tool_configuration),
             }),
             developer_instructions_item(),
         ]
     })
 }
 
-pub(crate) fn stable_request_prefix() -> [Value; 2] {
-    (*stable_input_prefix_items()).clone()
+pub(crate) fn stable_request_prefix(tool_configuration: tools::ToolConfiguration) -> [Value; 2] {
+    stable_input_prefix_items(tool_configuration).clone()
 }
 
 pub(crate) fn is_stable_tools_prefix_item(item: &Value) -> bool {
@@ -1546,7 +1648,13 @@ pub(crate) fn is_stable_tools_prefix_item(item: &Value) -> bool {
     {
         return false;
     }
-    is_additional_tools_item(item, &stable_input_prefix_items()[0])
+    is_additional_tools_item(
+        item,
+        &stable_input_prefix_items(tools::ToolConfiguration::default())[0],
+    ) || is_additional_tools_item(
+        item,
+        &stable_input_prefix_items(tools::ToolConfiguration::with_papercut())[0],
+    )
 }
 
 pub(crate) fn is_stable_instructions_prefix_item(item: &Value) -> bool {
@@ -1596,9 +1704,14 @@ fn render_system_prompt(template: &str, platform_shell_guidance: &str) -> String
     )
 }
 
-pub(crate) fn estimated_harness_tokens() -> [u64; 2] {
-    *STABLE_HARNESS_TOKEN_ESTIMATES.get_or_init(|| {
-        let [tools_item, instructions_item] = stable_input_prefix_items();
+pub(crate) fn estimated_harness_tokens(tool_configuration: tools::ToolConfiguration) -> [u64; 2] {
+    let estimates = if tool_configuration.papercut_enabled() {
+        &PAPERCUT_STABLE_HARNESS_TOKEN_ESTIMATES
+    } else {
+        &DEFAULT_STABLE_HARNESS_TOKEN_ESTIMATES
+    };
+    *estimates.get_or_init(|| {
+        let [tools_item, instructions_item] = stable_input_prefix_items(tool_configuration);
         [
             estimated_tokens(std::slice::from_ref(tools_item)),
             estimated_tokens(std::slice::from_ref(instructions_item)),

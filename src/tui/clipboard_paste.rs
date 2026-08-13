@@ -35,7 +35,7 @@ pub(super) fn image_from_pasted_path(pasted: &str) -> Option<Result<PromptImage,
     if image_mime(&path, &signature[..signature_len]).is_err() {
         return None;
     }
-    Some(PromptImage::from_path(&path, ImageDetail::Original).map_err(|error| error.to_string()))
+    Some(PromptImage::from_path(&path, ImageDetail::default()).map_err(|error| error.to_string()))
 }
 
 fn normalize_pasted_path(pasted: &str) -> Option<PathBuf> {

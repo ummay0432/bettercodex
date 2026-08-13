@@ -1,6 +1,7 @@
 //! The local Code Mode `exec`/`wait` runtime.
 
 use super::ProcessManager;
+use super::ToolConfiguration;
 use super::ToolImplementations;
 use super::ToolResult;
 use super::catalogue;
@@ -16,7 +17,6 @@ use super::code_runtime::ToolInvocationFuture;
 use super::code_runtime::WaitRequest;
 use super::image_preparation::prepare_tool_output_images;
 use crate::events::AgentEvent;
-use crate::openai_docs::OpenAiDocsClient;
 use crate::protocol::DEFAULT_IMAGE_DETAIL;
 use crate::protocol::FunctionCallOutputContentItem;
 use crate::protocol::ImageDetail;
@@ -43,23 +43,32 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct ToolRuntime {
     session: JavaScriptSession,
     state: Arc<RuntimeState>,
+    configuration: ToolConfiguration,
 }
 
 impl ToolRuntime {
     pub(crate) fn new(
         cwd: PathBuf,
         web_search: WebSearchClient,
-        openai_docs: OpenAiDocsClient,
+        configuration: ToolConfiguration,
     ) -> Self {
         let state = Arc::new(RuntimeState {
-            tools: ToolImplementations::new(cwd, web_search, openai_docs),
+            tools: ToolImplementations::new(cwd, web_search),
             step_dispatch: StepDispatch::default(),
             notifications: Notifications::default(),
             ui_events: UiEvents::default(),
         });
         let delegate: Arc<dyn SessionDelegate> = state.clone();
         let session = JavaScriptSession::with_delegate(delegate);
-        Self { session, state }
+        Self {
+            session,
+            state,
+            configuration,
+        }
+    }
+
+    pub(crate) fn set_configuration(&mut self, configuration: ToolConfiguration) {
+        self.configuration = configuration;
     }
 
     pub(super) fn prepare_turn(&self, context: ToolTurnContext) {
@@ -115,7 +124,7 @@ impl ToolRuntime {
         self.state.ui_events.prepare(events);
         let request = ExecuteRequest {
             tool_call_id: call_id.to_string(),
-            enabled_tools: catalogue::runtime_tools().to_vec(),
+            enabled_tools: catalogue::runtime_tools(self.configuration).to_vec(),
             source: parsed.code,
             yield_time_ms: parsed.yield_time_ms,
             max_output_tokens: Some(max_output_tokens),
@@ -743,10 +752,7 @@ mod tests {
                 "test-session".to_string(),
                 crate::model::SharedModelSelection::new(crate::model::ModelSelection::default()),
             ),
-            crate::openai_docs::OpenAiDocsClient::with_endpoint(
-                http_client(),
-                "http://127.0.0.1:1",
-            ),
+            ToolConfiguration::default(),
         )
     }
 
@@ -977,8 +983,8 @@ text(`${JSON.stringify(patch)}:${JSON.stringify(plan)}`);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_exposes_the_fixed_catalogue() {
-        let runtime = runtime(PathBuf::from("."));
+    async fn runtime_exposes_the_configured_catalogue() {
+        let mut runtime = runtime(PathBuf::from("."));
         let result = runtime
             .execute(
                 "call-tools",
@@ -1001,8 +1007,29 @@ text(JSON.stringify({
             .unwrap();
         assert!(
             result.preview.contains(
-                r#"{"names":"apply_patch,exec_command,log_papercut,openaiDeveloperDocs__fetch_openai_doc,openaiDeveloperDocs__get_openapi_spec,openaiDeveloperDocs__list_api_endpoints,openaiDeveloperDocs__list_openai_docs,openaiDeveloperDocs__search_openai_docs,update_plan,view_image,web__run,write_stdin","viewDeclaration":true,"viewOutput":true,"webNamespace":true,"webDeclaration":true,"webOutput":true}"#
+                r#"{"names":"apply_patch,exec_command,update_plan,view_image,web__run,write_stdin","viewDeclaration":true,"viewOutput":true,"webNamespace":true,"webDeclaration":true,"webOutput":true}"#
             ),
+            "{}",
+            result.preview
+        );
+
+        runtime.set_configuration(ToolConfiguration::with_papercut());
+        let result = runtime
+            .execute(
+                "call-papercut-tool",
+                r#"text(JSON.stringify({
+  listed: ALL_TOOLS.some(({ name }) => name === "log_papercut"),
+  callable: typeof tools.log_papercut === "function",
+}));"#,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result
+                .preview
+                .contains(r#"{"listed":true,"callable":true}"#),
             "{}",
             result.preview
         );

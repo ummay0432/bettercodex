@@ -361,7 +361,10 @@ fn mid_turn_compaction_keeps_the_opaque_summary_last() {
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     let world_state = conversation.world_state.items();
-    let current_user = UserInput::text("current turn").into_message_and_skills().0;
+    let current_user = UserInput::text("current turn")
+        .into_message_and_skills()
+        .unwrap()
+        .0;
     let active_skill = message(
         "user",
         "<skill_context>\n<instructions>exact active workflow</instructions>\n</skill_context>"

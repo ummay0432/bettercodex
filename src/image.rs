@@ -1,8 +1,8 @@
 //! Focused prompt-image preparation retained from OpenAI Codex commit
-//! 1669c2403f793d0230065397dfc25f52b844244e.
+//! 902bd9e06b3ecb32cbf7f8e64cd23b956be3e7fe.
 //!
-//! bettercodex receives tool images as data URLs, so the upstream utility's
-//! file-reading and path-based MIME guessing APIs are intentionally omitted.
+//! bettercodex snapshots user attachments before submission and receives tool
+//! images as data URLs, so the upstream utility's path-reading API is omitted.
 
 use crate::cache::BlockingLruCache;
 use crate::cache::sha1_digest;
@@ -29,6 +29,15 @@ const DATA_URL_PREFIX: &str = "data:";
 const PROMPT_IMAGE_PATCH_SIZE: u32 = 32;
 const MAX_PROMPT_IMAGE_INPUT_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) const HIGH_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
+    max_dimension: 2048,
+    max_patches: 2_500,
+};
+pub(crate) const ORIGINAL_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
+    max_dimension: 6000,
+    max_patches: 10_000,
+};
 
 #[derive(Debug, Error)]
 pub(crate) enum ImageProcessingError {
@@ -146,11 +155,11 @@ pub(crate) fn load_data_url_for_prompt(
         });
     }
 
-    load_for_prompt_bytes(file_bytes, limits)
+    load_for_prompt_bytes(file_bytes.into(), limits)
 }
 
-fn load_for_prompt_bytes(
-    file_bytes: Vec<u8>,
+pub(crate) fn load_for_prompt_bytes(
+    file_bytes: Arc<[u8]>,
     limits: PromptImageResizeLimits,
 ) -> Result<EncodedImage, ImageProcessingError> {
     let key = ImageCacheKey {
@@ -192,7 +201,7 @@ fn load_for_prompt_bytes(
             if let Some(format) = source_format.filter(|format| can_preserve_source_bytes(*format))
             {
                 EncodedImage {
-                    bytes: file_bytes.into(),
+                    bytes: file_bytes,
                     mime: format_to_mime(format),
                 }
             } else {
@@ -407,7 +416,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn preserves_supported_image_within_limits() {
         let original = image_bytes(64, 32, ImageFormat::Png);
-        let image = load_for_prompt_bytes(original.clone(), LIMITS).expect("process image");
+        let image = load_for_prompt_bytes(original.clone().into(), LIMITS).expect("process image");
         assert_eq!(image.mime, "image/png");
         assert_eq!(image.bytes.as_ref(), original);
     }
@@ -415,7 +424,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn enforces_dimension_and_patch_budgets() {
         let original = image_bytes(2048, 2048, ImageFormat::Png);
-        let image = load_for_prompt_bytes(original, LIMITS).expect("process image");
+        let image = load_for_prompt_bytes(original.into(), LIMITS).expect("process image");
         let decoded = image::load_from_memory(&image.bytes).expect("decode output");
         assert_eq!(decoded.dimensions(), (1600, 1600));
     }

@@ -1119,6 +1119,8 @@ fn transcript_tool_output_from_history(name: &str, output: Value) -> SessionTran
         "exec" | "wait" => Value::String(text),
         "exec_command" | "write_stdin" => project_process_output(output, &text),
         "apply_patch" | "update_plan" | "view_image" | "web.run" => Value::Null,
+        // Older rollouts can contain results from the removed OpenAI Docs namespace. Keep those
+        // document bodies out of resumed transcript snapshots.
         name if name.starts_with("openaiDeveloperDocs.") => Value::Null,
         "log_papercut" => serde_json::from_str(&text).unwrap_or(output),
         _ => output,

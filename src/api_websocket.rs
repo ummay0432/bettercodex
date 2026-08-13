@@ -19,8 +19,6 @@ use tungstenite::extensions::ExtensionsConfig;
 use tungstenite::extensions::compression::deflate::DeflateConfig;
 use tungstenite::protocol::WebSocketConfig;
 
-const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-
 pub(super) struct WebSocketConnection {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
@@ -32,7 +30,7 @@ impl WebSocketConnection {
         })?;
         request.headers_mut().extend(headers.clone());
         let (stream, response) = timeout(
-            WEBSOCKET_CONNECT_TIMEOUT,
+            super::WEBSOCKET_CONNECT_TIMEOUT,
             connect_async_with_config(request, Some(websocket_config()), false),
         )
         .await

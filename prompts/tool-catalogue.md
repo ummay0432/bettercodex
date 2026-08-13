@@ -69,19 +69,6 @@ declare const tools: { exec_command(args: {
 }): Promise<CommandResult>; };
 ```
 
-### `log_papercut`
-Appends one repository-root `PAPERCUTS.md` note: 1–2 sentences on friction and likely fix.
-
-```ts
-declare const tools: { log_papercut(args: {
-  // One or two sentences describing what caused friction and the likely fix when known.
-  message: string;
-}): Promise<{
-  // Repository-relative path to the papercut log.
-  path: string;
-}>; };
-```
-
 ### `update_plan`
 Updates the task plan.
 Provide an optional explanation and a list of plan items, each with a step and status.
@@ -133,44 +120,6 @@ declare const tools: { write_stdin(args: {
   // Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.
   yield_time_ms?: number;
 }): Promise<CommandResult>; };
-```
-
-## openaiDeveloperDocs
-Tools in the openaiDeveloperDocs namespace.
-
-### `openaiDeveloperDocs__fetch_openai_doc`
-Fetch exact Markdown for an official OpenAI documentation URL; `anchor` can select one section. Search or list first when the URL is unknown. Returns the server's text payload.
-
-```ts
-declare const tools: { openaiDeveloperDocs__fetch_openai_doc(args: { anchor?: string; url: string; }): Promise<string>; };
-```
-
-### `openaiDeveloperDocs__get_openapi_spec`
-Return the OpenAPI specification for one URL from `list_api_endpoints`; optionally filter code samples by language or return only examples. Returns the server's text payload.
-
-```ts
-declare const tools: { openaiDeveloperDocs__get_openapi_spec(args: { codeExamplesOnly?: boolean; languages?: Array<string>; url: string; }): Promise<string>; };
-```
-
-### `openaiDeveloperDocs__list_api_endpoints`
-List all OpenAI API endpoint URLs available in the current OpenAPI specification. Returns the server's text payload.
-
-```ts
-declare const tools: { openaiDeveloperDocs__list_api_endpoints(args: {}): Promise<string>; };
-```
-
-### `openaiDeveloperDocs__list_openai_docs`
-Browse official pages from `platform.openai.com`, `developers.openai.com`, and `learn.chatgpt.com`; use fetch on a result URL for exact Markdown. Returns the server's text payload.
-
-```ts
-declare const tools: { openaiDeveloperDocs__list_openai_docs(args: { cursor?: string; limit?: number; }): Promise<string>; };
-```
-
-### `openaiDeveloperDocs__search_openai_docs`
-Search official OpenAI, ChatGPT, and Codex documentation; then use fetch on the best result URL before quoting or relying on it. Returns the server's text payload.
-
-```ts
-declare const tools: { openaiDeveloperDocs__search_openai_docs(args: { cursor?: string; limit?: number; query: string; }): Promise<string>; };
 ```
 
 ## web

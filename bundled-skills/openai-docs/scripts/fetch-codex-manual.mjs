@@ -400,7 +400,7 @@ const fetchCodexManual = async ({
   const resolvedCacheDir = await resolveCacheDir(cacheDir);
   if (!resolvedCacheDir) {
     throw new ManualFetchError(
-      "Manual cache directory is unavailable; pass --cache-dir to override or use OpenAI Docs MCP fallback."
+      "Manual cache directory is unavailable; pass --cache-dir to override or use official-domain web fallback."
     );
   }
   await mkdir(resolvedCacheDir, { recursive: true });

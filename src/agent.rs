@@ -31,9 +31,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const MAX_STREAM_RETRIES_PER_TRANSPORT: usize = 5;
@@ -70,6 +73,72 @@ struct SteeringState {
 struct SteeringInput {
     id: SteerId,
     input: UserInput,
+}
+
+struct StartupPrewarm {
+    task: Option<JoinHandle<std::result::Result<ApiClient, ApiError>>>,
+    started_at: Instant,
+}
+
+enum StartupPrewarmResolution {
+    Cancelled,
+    Ready(Box<ApiClient>),
+    Unavailable,
+}
+
+impl StartupPrewarm {
+    fn schedule(api: &ApiClient) -> Option<Self> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let client = api.startup_prewarm_client();
+        Some(Self {
+            task: Some(runtime.spawn(client.prewarm_for_startup())),
+            started_at: Instant::now(),
+        })
+    }
+
+    async fn resolve(mut self, cancellation: &CancellationToken) -> StartupPrewarmResolution {
+        let Some(mut task) = self.task.take() else {
+            tracing::warn!("startup websocket prewarm task was unavailable");
+            return StartupPrewarmResolution::Unavailable;
+        };
+        let remaining =
+            crate::api::WEBSOCKET_CONNECT_TIMEOUT.saturating_sub(self.started_at.elapsed());
+        let result = if task.is_finished() {
+            Ok((&mut task).await)
+        } else {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    task.abort();
+                    return StartupPrewarmResolution::Cancelled;
+                }
+                result = timeout(remaining, &mut task) => result,
+            }
+        };
+        match result {
+            Ok(Ok(Ok(api))) => StartupPrewarmResolution::Ready(Box::new(api)),
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(%error, "startup websocket prewarm failed");
+                StartupPrewarmResolution::Unavailable
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "startup websocket prewarm task failed");
+                StartupPrewarmResolution::Unavailable
+            }
+            Err(_) => {
+                task.abort();
+                tracing::info!("startup websocket prewarm timed out before the first turn");
+                StartupPrewarmResolution::Unavailable
+            }
+        }
+    }
+}
+
+impl Drop for StartupPrewarm {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 impl TurnHandle {
@@ -166,6 +235,7 @@ impl TurnControl {
 pub(crate) struct Agent {
     cwd: PathBuf,
     api: ApiClient,
+    startup_prewarm: Option<StartupPrewarm>,
     conversation: Conversation,
     tools: ToolRuntime,
     resumed_transcript: Vec<SessionTranscriptItem>,
@@ -188,21 +258,21 @@ impl Agent {
         let mut conversation = Conversation::create_with_selection(&cwd, model_selection)?;
         conversation.set_service_tier(service_tier)?;
         let identity = conversation.identity().clone();
+        let tool_configuration = conversation.tool_configuration();
         let api = ApiClient::new(
             auth,
             &identity,
             0,
             conversation.model_selection().clone(),
             conversation.service_tier(),
+            tool_configuration,
         )?;
-        let tools = ToolRuntime::new(
-            cwd.clone(),
-            api.web_search_client(),
-            api.openai_docs_client(),
-        );
+        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client(), tool_configuration);
+        let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd,
             api,
+            startup_prewarm,
             conversation,
             tools,
             resumed_transcript: Vec::new(),
@@ -231,21 +301,25 @@ impl Agent {
         let transcript_checkpoint = Some(transcript.len());
         rollout.snapshot_transcript(transcript)?;
         let conversation = self.conversation.fork(rollout)?;
+        let tool_configuration = conversation.tool_configuration();
         let api = ApiClient::new(
             auth,
             &identity,
             compaction_count,
             conversation.model_selection().clone(),
             conversation.service_tier(),
+            tool_configuration,
         )?;
         let tools = ToolRuntime::new(
             self.cwd.clone(),
             api.web_search_client(),
-            api.openai_docs_client(),
+            tool_configuration,
         );
+        let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd: self.cwd.clone(),
             api,
+            startup_prewarm,
             conversation,
             tools,
             resumed_transcript: Vec::new(),
@@ -263,21 +337,21 @@ impl Agent {
         let forked_from = loaded.forked_from.clone();
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
+        let tool_configuration = conversation.tool_configuration();
         let api = ApiClient::new(
             auth,
             &identity,
             compaction_count,
             conversation.model_selection().clone(),
             conversation.service_tier(),
+            tool_configuration,
         )?;
-        let tools = ToolRuntime::new(
-            cwd.clone(),
-            api.web_search_client(),
-            api.openai_docs_client(),
-        );
+        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client(), tool_configuration);
+        let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd,
             api,
+            startup_prewarm,
             conversation,
             tools,
             resumed_transcript,
@@ -395,7 +469,28 @@ impl Agent {
         crate::skills::save_skill_update(path, update)?;
         self.conversation
             .reload_skills(&self.cwd)
-            .context("skill setting was saved, but the active session could not reload skills")
+            .context("skill setting was saved, but the active session could not reload skills")?;
+        let configuration = self.conversation.tool_configuration();
+        self.api.set_tool_configuration(configuration);
+        self.tools.set_configuration(configuration);
+        Ok(())
+    }
+
+    async fn resolve_startup_prewarm(&mut self, cancellation: &CancellationToken) -> bool {
+        let Some(startup_prewarm) = self.startup_prewarm.take() else {
+            return true;
+        };
+        // Startup already spent the one warmup attempt. If it fails or times out, the first turn
+        // should proceed with a normal full request rather than paying for a second warmup.
+        self.api.mark_websocket_prewarm_attempted();
+        match startup_prewarm.resolve(cancellation).await {
+            StartupPrewarmResolution::Cancelled => false,
+            StartupPrewarmResolution::Ready(api) => {
+                self.api.adopt_startup_prewarm(*api);
+                true
+            }
+            StartupPrewarmResolution::Unavailable => true,
+        }
     }
 
     pub(crate) async fn submit(&mut self, prompt: &str) -> Result<String> {
@@ -430,6 +525,11 @@ impl Agent {
         events: UnboundedSender<AgentEvent>,
         control: TurnControl,
     ) -> Result<CompactionOutcome> {
+        if self.startup_prewarm.take().is_some() {
+            // Manual compaction does not consume the startup session, but it must not repeat the
+            // discarded warmup inline before sending its own request.
+            self.api.mark_websocket_prewarm_attempted();
+        }
         let turn_id = self.api.begin_turn().to_string();
         self.conversation.start_turn(&turn_id)?;
         let active_turn_context = ActiveTurnContext::default();
@@ -469,7 +569,22 @@ impl Agent {
         }
         let turn_id = self.api.begin_turn().to_string();
         self.conversation.start_turn(&turn_id)?;
-        let result = self.run_turn(input, &events, &control).await;
+        let startup_ready = self.resolve_startup_prewarm(&control.cancellation).await;
+        let result = if startup_ready {
+            self.run_turn(input, &events, &control).await
+        } else {
+            let mut active_turn_context = ActiveTurnContext::default();
+            let _ = self
+                .record_incoming_user(
+                    IncomingUserInput::Initial(input),
+                    &events,
+                    &control.cancellation,
+                    CompactionPhase::PreTurn,
+                    &mut active_turn_context,
+                )
+                .await?;
+            Ok(SubmitOutcome::Cancelled)
+        };
         control.close();
         let outcome = match &result {
             Ok(SubmitOutcome::Completed(_)) => TurnOutcome::Completed,
@@ -831,7 +946,13 @@ impl Agent {
         if input.is_empty() {
             return Err(anyhow!("prompt and image list are both empty"));
         }
-        let (user_message, prompt_text, selected_skills) = input.into_message_and_skills();
+        let (user_message, prompt_text, selected_skills) = if input.has_images() {
+            tokio::task::spawn_blocking(move || input.into_message_and_skills())
+                .await
+                .context("attached image preprocessing task failed")??
+        } else {
+            input.into_message_and_skills()?
+        };
         let injections = self
             .conversation
             .skill_catalog()

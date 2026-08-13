@@ -611,6 +611,10 @@ impl Conversation {
         &self.world_state.skills
     }
 
+    pub(crate) fn tool_configuration(&self) -> crate::tools::ToolConfiguration {
+        self.world_state.skills.tool_configuration()
+    }
+
     pub(crate) fn reload_skills(&mut self, cwd: &Path) -> Result<()> {
         let skills = SkillCatalog::load(cwd);
         let mut world_state = self.world_state.clone();
@@ -667,7 +671,8 @@ impl Conversation {
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
-        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens();
+        let [tools_tokens, system_prompt_tokens] =
+            crate::api::estimated_harness_tokens(self.tool_configuration());
         let mut tokens = self.context_metrics.tokens;
         let mut items = self.context_metrics.items;
         if !self.context_metrics.has_tools {
@@ -721,7 +726,8 @@ impl Conversation {
     }
 
     fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
-        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens();
+        let [tools_tokens, system_prompt_tokens] =
+            crate::api::estimated_harness_tokens(self.tool_configuration());
         let mut estimate = metrics.estimated_tokens;
         if !metrics.has_tools {
             estimate = estimate.saturating_add(tools_tokens);

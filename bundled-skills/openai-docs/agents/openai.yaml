@@ -7,4 +7,4 @@ interface:
   default_prompt: "Use OpenAI Docs for official documentation lookup, upstream Codex questions, model selection, migration, and prompt-upgrade work."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

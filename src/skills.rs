@@ -4,6 +4,7 @@ use crate::skill_settings;
 use crate::system_skills;
 use crate::text::escape_cdata;
 use crate::text::escape_xml_text;
+use crate::tools::ToolConfiguration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -24,6 +25,7 @@ use std::path::PathBuf;
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const SKILLS_DIRECTORY: &str = "skills";
 const PROJECT_DIRECTORY: &str = ".bcodex";
+const PAPERCUT_SYSTEM_SKILL_NAME: &str = "papercut";
 const MAX_NAME_CHARS: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 1_024;
 const MAX_METADATA_BYTES: usize = 64 * 1024;
@@ -319,6 +321,18 @@ impl SkillCatalog {
 
     pub(crate) fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    pub(crate) fn tool_configuration(&self) -> ToolConfiguration {
+        if self.skills.iter().any(|skill| {
+            skill.scope == SkillScope::System
+                && skill.name == PAPERCUT_SYSTEM_SKILL_NAME
+                && skill.enabled
+        }) {
+            ToolConfiguration::with_papercut()
+        } else {
+            ToolConfiguration::default()
+        }
     }
 
     pub(crate) fn catalogue_message(&self, context_window: u64) -> Option<Value> {
@@ -690,6 +704,7 @@ fn load_skill(path: &Path, scope: SkillScope) -> Result<(Skill, Option<String>)>
         .policy
         .and_then(|policy| policy.allow_implicit_invocation)
         .unwrap_or(true);
+    let enabled = scope != SkillScope::System || name.as_str() != PAPERCUT_SYSTEM_SKILL_NAME;
 
     Ok((
         Skill {
@@ -699,7 +714,7 @@ fn load_skill(path: &Path, scope: SkillScope) -> Result<(Skill, Option<String>)>
             display_name,
             path: path.to_path_buf(),
             scope,
-            enabled: true,
+            enabled,
             allow_implicit_invocation,
         },
         metadata_warning,

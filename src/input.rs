@@ -3,8 +3,6 @@ use crate::skills::SkillSelection;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 use serde_json::json;
 use std::borrow::Cow;
@@ -197,20 +195,16 @@ impl From<String> for UserPrompt {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ImageDetail {
-    Low,
-    High,
     #[default]
+    High,
     Original,
-    Auto,
 }
 
 impl ImageDetail {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Low => "low",
             Self::High => "high",
             Self::Original => "original",
-            Self::Auto => "auto",
         }
     }
 }
@@ -224,7 +218,7 @@ impl fmt::Display for ImageDetail {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PromptImage {
     bytes: Arc<[u8]>,
-    mime: &'static str,
+    source: PathBuf,
     detail: ImageDetail,
 }
 
@@ -251,10 +245,10 @@ impl PromptImage {
     }
 
     pub(crate) fn from_bytes(path: &Path, bytes: Vec<u8>, detail: ImageDetail) -> Result<Self> {
-        let mime = image_mime(path, &bytes)?;
+        image_mime(path, &bytes)?;
         Ok(Self {
             bytes: Arc::from(bytes),
-            mime,
+            source: path.to_path_buf(),
             detail,
         })
     }
@@ -263,17 +257,19 @@ impl PromptImage {
         self.bytes.len()
     }
 
-    fn into_value(self) -> Value {
-        let image_url = format!(
-            "data:{};base64,{}",
-            self.mime,
-            STANDARD.encode(self.bytes.as_ref())
-        );
-        json!({
+    fn into_value(self) -> Result<Value> {
+        let limits = match self.detail {
+            ImageDetail::High => crate::image::HIGH_DETAIL_LIMITS,
+            ImageDetail::Original => crate::image::ORIGINAL_DETAIL_LIMITS,
+        };
+        let image_url = crate::image::load_for_prompt_bytes(self.bytes, limits)
+            .with_context(|| format!("failed to prepare image {}", self.source.display()))?
+            .into_data_url();
+        Ok(json!({
             "type": "input_image",
             "image_url": image_url,
             "detail": self.detail.as_str(),
-        })
+        }))
     }
 }
 
@@ -289,12 +285,10 @@ impl FromStr for ImageDetail {
 
     fn from_str(value: &str) -> Result<Self> {
         match value {
-            "low" => Ok(Self::Low),
             "high" => Ok(Self::High),
             "original" => Ok(Self::Original),
-            "auto" => Ok(Self::Auto),
             _ => Err(anyhow!(
-                "invalid image detail `{value}`; use low, high, original, or auto"
+                "invalid image detail `{value}`; use high or original"
             )),
         }
     }
@@ -370,7 +364,11 @@ impl UserInput {
         self.text.trim().is_empty() && self.images.is_empty()
     }
 
-    pub(crate) fn into_message_and_skills(self) -> (Value, String, Vec<SkillSelection>) {
+    pub(crate) fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+
+    pub(crate) fn into_message_and_skills(self) -> Result<(Value, String, Vec<SkillSelection>)> {
         let Self {
             text,
             images,
@@ -380,8 +378,10 @@ impl UserInput {
         if !text.trim().is_empty() {
             content.push(json!({"type": "input_text", "text": &text}));
         }
-        content.extend(images.into_iter().map(PromptImage::into_value));
-        (
+        for image in images {
+            content.push(image.into_value()?);
+        }
+        Ok((
             json!({
                 "type": "message",
                 "role": "user",
@@ -389,7 +389,7 @@ impl UserInput {
             }),
             text,
             selected_skills,
-        )
+        ))
     }
 }
 
@@ -442,19 +442,53 @@ pub(crate) fn image_mime(path: &Path, bytes: &[u8]) -> Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use image::DynamicImage;
+    use image::GenericImageView;
+    use image::ImageBuffer;
+    use image::ImageFormat;
+    use image::Rgba;
+    use std::io::Cursor;
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_pixel(width, height, Rgba([10_u8, 20, 30, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode test image");
+        encoded.into_inner()
+    }
+
+    fn image_dimensions(message: &Value) -> (u32, u32) {
+        let image_url = message["content"][0]["image_url"]
+            .as_str()
+            .expect("image data URL");
+        let (_, payload) = image_url.split_once(',').expect("image data URL payload");
+        let bytes = STANDARD.decode(payload).expect("decode image data URL");
+        image::load_from_memory(&bytes)
+            .expect("decode prepared image")
+            .dimensions()
+    }
 
     #[test]
-    fn image_detail_parses_every_supported_wire_value() {
-        for value in ["low", "high", "original", "auto"] {
+    fn image_detail_defaults_to_high_and_parses_user_selectable_values() {
+        assert_eq!(ImageDetail::default(), ImageDetail::High);
+        for value in ["high", "original"] {
             assert_eq!(value.parse::<ImageDetail>().unwrap().to_string(), value);
         }
-        assert!("full".parse::<ImageDetail>().is_err());
+        for value in ["low", "auto", "full"] {
+            assert!(value.parse::<ImageDetail>().is_err());
+        }
     }
 
     #[test]
     fn text_input_uses_the_responses_message_shape() {
         assert_eq!(
-            UserInput::text("inspect").into_message_and_skills().0,
+            UserInput::text("inspect")
+                .into_message_and_skills()
+                .unwrap()
+                .0,
             json!({
                 "type": "message",
                 "role": "user",
@@ -470,11 +504,12 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        std::fs::write(&path, png_bytes(1, 1)).unwrap();
 
         let message = UserInput::from_paths("", std::slice::from_ref(&path), ImageDetail::High)
             .unwrap()
             .into_message_and_skills()
+            .unwrap()
             .0;
         assert_eq!(message["role"], "user");
         assert_eq!(message["content"][0]["type"], "input_image");
@@ -490,6 +525,31 @@ mod tests {
     }
 
     #[test]
+    fn user_images_apply_upstream_detail_budgets_before_serialization() {
+        let source = png_bytes(2048, 2048);
+        let message_for = |detail| {
+            let image = PromptImage::from_bytes(Path::new("fixture.png"), source.clone(), detail)
+                .expect("load image");
+            UserInput {
+                text: String::new(),
+                images: vec![image],
+                selected_skills: Vec::new(),
+            }
+            .into_message_and_skills()
+            .expect("prepare image")
+            .0
+        };
+
+        let high = message_for(ImageDetail::default());
+        assert_eq!(high["content"][0]["detail"], "high");
+        assert_eq!(image_dimensions(&high), (1600, 1600));
+
+        let original = message_for(ImageDetail::Original);
+        assert_eq!(original["content"][0]["detail"], "original");
+        assert_eq!(image_dimensions(&original), (2048, 2048));
+    }
+
+    #[test]
     fn unknown_image_bytes_are_rejected_before_the_request() {
         let path = std::env::temp_dir().join(format!(
             "bettercodex-image-{}-{}.bin",
@@ -497,8 +557,9 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"not an image").unwrap();
-        let error = UserInput::from_paths("inspect", std::slice::from_ref(&path), ImageDetail::Low)
-            .unwrap_err();
+        let error =
+            UserInput::from_paths("inspect", std::slice::from_ref(&path), ImageDetail::High)
+                .unwrap_err();
         assert!(error.to_string().contains("not a supported"));
         std::fs::remove_file(path).unwrap();
     }

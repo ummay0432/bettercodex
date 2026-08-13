@@ -1,10 +1,11 @@
-//! Fixed tool catalogue following Codex's GPT-5.6 `code_mode_only` exposure.
+//! Tool catalogue following Codex's GPT-5.6 `code_mode_only` exposure.
 //!
 //! The schemas mirror `core/src/tools/handlers/{apply_patch_spec,plan_spec,
 //! shell_spec,view_image_spec}.rs`; the `exec` and `wait` wrappers mirror
 //! `core/src/tools/code_mode/{execute_spec,wait_spec}.rs`. The model-facing Code
 //! Mode descriptions retain upstream's schema-derived declaration format.
 
+use super::ToolConfiguration;
 use super::code_runtime;
 use super::code_runtime::CodeModeToolKind as ToolKind;
 use super::code_runtime::ToolDefinition;
@@ -82,8 +83,13 @@ struct ToolCatalogue {
     request_specifications: Vec<Value>,
 }
 
-static TOOL_CATALOGUE: LazyLock<ToolCatalogue> = LazyLock::new(|| {
-    let core_tools = build_core_tools();
+static DEFAULT_TOOL_CATALOGUE: LazyLock<ToolCatalogue> =
+    LazyLock::new(|| build_tool_catalogue(ToolConfiguration::default()));
+static PAPERCUT_TOOL_CATALOGUE: LazyLock<ToolCatalogue> =
+    LazyLock::new(|| build_tool_catalogue(ToolConfiguration::with_papercut()));
+
+fn build_tool_catalogue(configuration: ToolConfiguration) -> ToolCatalogue {
+    let core_tools = build_core_tools(configuration);
     let runtime_tools = build_runtime_tools(&core_tools);
     let exec_description = build_exec_description(&core_tools);
     let request_specifications = build_responses_lite_specifications(&exec_description);
@@ -92,9 +98,17 @@ static TOOL_CATALOGUE: LazyLock<ToolCatalogue> = LazyLock::new(|| {
         exec_description,
         request_specifications,
     }
-});
+}
 
-fn build_core_tools() -> Vec<ToolDefinition> {
+fn tool_catalogue(configuration: ToolConfiguration) -> &'static ToolCatalogue {
+    if configuration.papercut_enabled() {
+        &PAPERCUT_TOOL_CATALOGUE
+    } else {
+        &DEFAULT_TOOL_CATALOGUE
+    }
+}
+
+fn build_core_tools(configuration: ToolConfiguration) -> Vec<ToolDefinition> {
     let mut tools = vec![
         function_tool(
             "exec_command",
@@ -124,23 +138,15 @@ fn build_core_tools() -> Vec<ToolDefinition> {
             view_image_input_schema(),
             Some(view_image_output_schema()),
         ),
-        function_tool(
+    ];
+    if configuration.papercut_enabled() {
+        tools.push(function_tool(
             "log_papercut",
             "Appends one repository-root `PAPERCUTS.md` note: 1–2 sentences on friction and likely fix.",
             log_papercut_input_schema(),
             Some(log_papercut_output_schema()),
-        ),
-    ];
-    tools.extend(crate::openai_docs::TOOLS.iter().copied().map(|tool| {
-        namespaced_function_tool(
-            tool.javascript_name(),
-            crate::openai_docs::NAMESPACE,
-            tool.name(),
-            tool.description(),
-            tool.input_schema(),
-            Some(json!({"type": "string"})),
-        )
-    }));
+        ));
+    }
     tools.push(namespaced_function_tool(
         crate::web_search::JAVASCRIPT_NAME,
         crate::web_search::NAMESPACE,
@@ -186,16 +192,16 @@ fn build_runtime_tools(core_tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
     tools
 }
 
-pub(super) fn runtime_tools() -> &'static [ToolDefinition] {
-    &TOOL_CATALOGUE.runtime_tools
+pub(super) fn runtime_tools(configuration: ToolConfiguration) -> &'static [ToolDefinition] {
+    &tool_catalogue(configuration).runtime_tools
 }
 
-pub(crate) fn text() -> &'static str {
-    &TOOL_CATALOGUE.exec_description
+pub(crate) fn text(configuration: ToolConfiguration) -> &'static str {
+    &tool_catalogue(configuration).exec_description
 }
 
-pub(crate) fn responses_lite_specifications() -> Vec<Value> {
-    TOOL_CATALOGUE.request_specifications.clone()
+pub(crate) fn responses_lite_specifications(configuration: ToolConfiguration) -> Vec<Value> {
+    tool_catalogue(configuration).request_specifications.clone()
 }
 
 fn build_responses_lite_specifications(exec_description: &str) -> Vec<Value> {

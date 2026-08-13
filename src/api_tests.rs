@@ -22,6 +22,7 @@ fn test_client(base_url: String) -> ApiClient {
         0,
         ModelSelection::default(),
         ServiceTier::default(),
+        tools::ToolConfiguration::default(),
         base_url,
     )
     .unwrap()
@@ -105,6 +106,17 @@ fn system_prompt_renderer_keeps_platform_guidance_separate() {
         WINDOWS_PLATFORM_SHELL_GUIDANCE,
         UNIX_PLATFORM_SHELL_GUIDANCE,
     );
+}
+
+#[test]
+fn responses_lite_catalogue_tracks_papercut_skill_enablement() {
+    let mut api = test_client("http://127.0.0.1:1".to_string());
+    let request = api.build_request(Vec::new(), RequestKind::Turn);
+    assert!(!request["input"][0].to_string().contains("log_papercut"));
+
+    api.set_tool_configuration(tools::ToolConfiguration::with_papercut());
+    let request = api.build_request(Vec::new(), RequestKind::Turn);
+    assert!(request["input"][0].to_string().contains("log_papercut"));
 }
 
 fn assert_prompt_has_only_platform_guidance(prompt: &str, expected: &str, excluded: &str) {
@@ -794,7 +806,8 @@ fn responses_lite_strips_image_details_only_from_the_request_copy() {
         }),
     ];
 
-    let (request_input, restoration) = compose_sampling_input(history.clone());
+    let (request_input, restoration) =
+        compose_sampling_input(history.clone(), tools::ToolConfiguration::default());
 
     assert!(
         request_input
