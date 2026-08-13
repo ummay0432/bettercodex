@@ -56,7 +56,7 @@ use std::os::fd::FromRawFd;
 use std::sync::Once;
 #[cfg(unix)]
 use std::time::Duration;
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use std::time::Instant;
 
 #[cfg(unix)]

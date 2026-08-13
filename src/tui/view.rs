@@ -6050,7 +6050,7 @@ mod tests {
 
     #[test]
     fn rejected_local_commands_keep_the_draft_editable() {
-        let mut rejected = vec![
+        let rejected = vec![
             ("!", false),
             ("/resume not-a-session-id", false),
             ("/compact", true),
@@ -6060,7 +6060,11 @@ mod tests {
             ("/logout", true),
         ];
         #[cfg(unix)]
-        rejected.push(("/tmux unexpected", false));
+        let rejected = {
+            let mut rejected = rejected;
+            rejected.push(("/tmux unexpected", false));
+            rejected
+        };
         for (draft, busy) in rejected {
             let mut view = View::new(Path::new("/tmp/bettercodex"));
             if busy {
