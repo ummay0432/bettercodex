@@ -18,6 +18,7 @@ mod palette;
 #[cfg(windows)]
 mod paste_burst;
 mod pending_input;
+mod presentation;
 mod reasoning_status;
 mod render;
 mod resume_picker;
@@ -76,6 +77,7 @@ use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures_util::StreamExt;
 use notifications::Notifier;
+use presentation::MIN_FRAME_INTERVAL;
 use serde_json::Value;
 use status::StatusSnapshot;
 use std::collections::BTreeMap;
@@ -108,10 +110,6 @@ type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
 type PromptHistoryTask = JoinHandle<(PromptHistoryReader, Result<Vec<String>>)>;
 type RateLimitTask = JoinHandle<Result<Vec<RateLimitSnapshot>>>;
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(32);
-// Match Codex's 120 FPS ceiling for streamed output. Agent events request frames independently
-// from the slower status-animation clock, so fresh text is presented promptly without repainting
-// an unchanged busy view four times as often.
-const STREAM_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
 // Match Codex's settled-size recheck delay. Resize signals are reconciled with the backend
 // immediately; one more sample after this quiet period catches terminals whose dimensions settle
 // late.
@@ -120,7 +118,10 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(windows)]
 const PASTE_BURST_TICK_INTERVAL: Duration = Duration::from_millis(9);
 const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
-const MAX_READY_AGENT_EVENTS: usize = 4_096;
+// Keep ingress batching large enough to amortize channel polling, but return to `select!` before a
+// burst can noticeably delay terminal input. Model events are retained in the presentation queue,
+// so this is a scheduling budget rather than a throughput limit.
+const MAX_READY_AGENT_EVENTS: usize = 256;
 
 pub(crate) struct Startup(terminal::TerminalStartup);
 
@@ -131,6 +132,31 @@ pub(crate) fn begin_startup() -> Result<Startup> {
 enum TurnCompletion {
     Submission(Result<SubmitOutcome>),
     Compaction(Result<CompactionOutcome>),
+}
+
+enum TurnTaskState {
+    Idle,
+    Running(TurnTask),
+    Presenting(Box<TurnResult>),
+}
+
+impl TurnTaskState {
+    fn is_active(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    fn take_presenting(&mut self) -> TurnResult {
+        match std::mem::replace(self, Self::Idle) {
+            Self::Presenting(completion) => *completion,
+            Self::Idle | Self::Running(_) => {
+                unreachable!("a ready turn always owns its deferred result")
+            }
+        }
+    }
 }
 
 impl TurnCompletion {
@@ -210,7 +236,7 @@ struct Runtime {
     clipboard_lease: Option<ClipboardLease>,
     cwd: PathBuf,
     agent: Option<Agent>,
-    turn: Option<TurnTask>,
+    turn: TurnTaskState,
     turn_events: Option<UnboundedReceiver<AgentEvent>>,
     turn_handle: Option<TurnHandle>,
     exit_after_turn: bool,
@@ -348,7 +374,7 @@ impl Runtime {
             view,
             cwd,
             agent: Some(agent),
-            turn: None,
+            turn: TurnTaskState::Idle,
             turn_events: None,
             turn_handle: None,
             exit_after_turn: false,
@@ -446,6 +472,12 @@ impl Runtime {
                 redraw = false;
                 self.start_update_check_after_startup();
                 self.start_rate_limit_prefetch_after_startup();
+                if self.view.has_pending_presentation() {
+                    // Route even an already-due follow-up frame through `select!`. Chaining draws
+                    // here would bypass terminal input whenever rendering itself occupied the
+                    // minimum frame interval, precisely when the UI is under the most pressure.
+                    stream_frames.schedule_frame();
+                }
             }
             let animate = self.has_foreground_activity();
 
@@ -497,13 +529,15 @@ impl Runtime {
                 }
                 event = receive_agent_event(&mut self.turn_events) => {
                     if let Some(event) = event {
-                        // Model streams can produce deltas much faster than a terminal can paint
-                        // them. Fold every ready event into one presentation frame, then coalesce
-                        // later requests behind Codex's 120 FPS ceiling instead of rendering per
-                        // token.
+                        // Ingress remains fully drained and ordered, but presentation advances at
+                        // most once for each terminal frame. This keeps input responsive without
+                        // collapsing a burst of model deltas into one visible plop.
                         self.apply_agent_event(event);
                         self.drain_agent_events();
-                        redraw |= stream_frames.request_frame();
+                        if stream_frames.request_frame() {
+                            self.view.advance_presentation(Instant::now());
+                            redraw = true;
+                        }
                     } else {
                         self.turn_events = None;
                     }
@@ -597,10 +631,17 @@ impl Runtime {
                     }
                     redraw = true;
                 }
-                completion = receive_turn_completion(&mut self.turn) => {
-                    let (mut agent, completion) = completion.context("agent task stopped unexpectedly")?;
-                    self.turn = None;
-                    self.drain_completed_turn_events();
+                completion = receive_turn_completion(&mut self.turn), if !self.view.has_pending_presentation() => {
+                    let task_just_completed = completion.context("agent task stopped unexpectedly")?;
+                    if task_just_completed {
+                        self.drain_completed_turn_events();
+                        if self.view.has_pending_presentation() {
+                            self.view.advance_presentation(Instant::now());
+                            redraw = true;
+                            continue;
+                        }
+                    }
+                    let (mut agent, completion) = self.turn.take_presenting();
                     self.sync_model_selection_to_agent(&mut agent);
                     self.sync_service_tier_to_agent(&mut agent);
                     self.context_snapshot = agent.context_snapshot();
@@ -696,10 +737,14 @@ impl Runtime {
                 }
                 _ = receive_deadline(stream_frames.scheduled_at()) => {
                     stream_frames.clear_schedule();
+                    self.view.advance_presentation(Instant::now());
                     redraw = true;
                 }
                 _ = receive_frame_tick(animate, &mut animation_ticks) => {
-                    redraw |= stream_frames.request_frame();
+                    if stream_frames.request_frame() {
+                        self.view.advance_presentation(Instant::now());
+                        redraw = true;
+                    }
                 }
             }
         }
@@ -794,7 +839,7 @@ impl Runtime {
             Action::None => {}
             Action::LoadPromptHistory => self.start_prompt_history_load(),
             Action::Submit(submission) => {
-                if self.turn.is_some() {
+                if self.turn.is_active() {
                     let history_text = submission.prompt().text_without_image_placeholders();
                     match active_submission_route(submission.prompt()) {
                         ActiveSubmissionRoute::QueueNextTurn => {
@@ -819,7 +864,7 @@ impl Runtime {
                 }
             }
             Action::Queue(submission) => {
-                if self.turn.is_some() {
+                if self.turn.is_active() {
                     let history_text = submission.prompt().text_without_image_placeholders();
                     self.persist_prompt(&history_text);
                     self.view.queue_follow_up(submission.into_prompt());
@@ -866,7 +911,7 @@ impl Runtime {
                         submission,
                         "Wait for the local command or Git diff before clearing".to_string(),
                     );
-                } else if self.turn.is_some() {
+                } else if self.turn.is_active() {
                     self.view.defer_composer_action(
                         submission,
                         "Interrupt the active turn before starting a fresh session".to_string(),
@@ -979,7 +1024,7 @@ impl Runtime {
                 ),
             },
             Action::Quit => {
-                if self.turn.is_some() {
+                if self.turn.is_active() {
                     self.exit_after_turn = true;
                     self.cancel_turn(InterruptIntent::StopTurn);
                 } else {
@@ -998,7 +1043,7 @@ impl Runtime {
                     .add_error(format!("Could not change Fast mode: {error:#}"));
                 return;
             }
-        } else if self.turn.is_none() {
+        } else if self.turn.is_idle() {
             self.view
                 .add_error("Could not change Fast mode: the active agent is unavailable");
             return;
@@ -1024,7 +1069,7 @@ impl Runtime {
                     .add_error(format!("Could not change model: {error:#}"));
                 return;
             }
-        } else if self.turn.is_none() {
+        } else if self.turn.is_idle() {
             self.view
                 .add_error("Could not change model: the active agent is unavailable");
             return;
@@ -1325,7 +1370,7 @@ impl Runtime {
         self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
-        self.turn = Some(tokio::spawn(async move {
+        self.turn = TurnTaskState::Running(tokio::spawn(async move {
             let input = UserInput::prompt(prompt);
             let result = agent
                 .submit_with_control(input, events_tx, turn_control)
@@ -1347,7 +1392,7 @@ impl Runtime {
         self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
-        self.turn = Some(tokio::spawn(async move {
+        self.turn = TurnTaskState::Running(tokio::spawn(async move {
             let result = agent.compact_with_control(events_tx, turn_control).await;
             (agent, TurnCompletion::Compaction(result))
         }));
@@ -1461,7 +1506,10 @@ impl Drop for Runtime {
         if let Some(turn) = self.turn_handle.take() {
             turn.cancel();
         }
-        abort_join_task(&mut self.turn);
+        if let TurnTaskState::Running(task) = std::mem::replace(&mut self.turn, TurnTaskState::Idle)
+        {
+            task.abort();
+        }
         abort_join_task(&mut self.session_scan);
         abort_join_task(&mut self.resume_task);
         abort_join_task(&mut self.update_check);
@@ -1530,20 +1578,34 @@ impl StreamFramePacer {
     /// [`Self::scheduled_at`] so repeated deltas coalesce behind the same deadline.
     fn request_frame(&mut self) -> bool {
         let now = tokio::time::Instant::now();
-        let earliest = self
-            .last_frame_started_at
-            .and_then(|started| started.checked_add(STREAM_FRAME_INTERVAL))
-            .unwrap_or(now);
+        let earliest = self.earliest_frame_at(now);
         if earliest <= now {
             self.scheduled_at = None;
             true
         } else {
-            self.scheduled_at = Some(
-                self.scheduled_at
-                    .map_or(earliest, |scheduled| scheduled.min(earliest)),
-            );
+            self.retain_schedule(earliest);
             false
         }
+    }
+
+    /// Retain a follow-up frame request for event-loop arbitration, even when it is already due.
+    fn schedule_frame(&mut self) {
+        let now = tokio::time::Instant::now();
+        let earliest = self.earliest_frame_at(now);
+        self.retain_schedule(earliest);
+    }
+
+    fn retain_schedule(&mut self, deadline: tokio::time::Instant) {
+        self.scheduled_at = Some(
+            self.scheduled_at
+                .map_or(deadline, |scheduled| scheduled.min(deadline)),
+        );
+    }
+
+    fn earliest_frame_at(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        self.last_frame_started_at
+            .and_then(|started| started.checked_add(MIN_FRAME_INTERVAL))
+            .unwrap_or(now)
     }
 
     fn scheduled_at(&self) -> Option<tokio::time::Instant> {
@@ -1622,12 +1684,17 @@ async fn receive_agent_event(
 }
 
 async fn receive_turn_completion(
-    turn: &mut Option<TurnTask>,
-) -> std::result::Result<TurnResult, tokio::task::JoinError> {
-    match turn {
-        Some(turn) => turn.await,
-        None => pending().await,
-    }
+    turn: &mut TurnTaskState,
+) -> std::result::Result<bool, tokio::task::JoinError> {
+    let completion = match turn {
+        TurnTaskState::Running(turn) => turn.await?,
+        TurnTaskState::Presenting(_) => return Ok(false),
+        TurnTaskState::Idle => return pending().await,
+    };
+    // Store the joined result before this future becomes ready. If another `tokio::select!`
+    // branch wins while the task is still pending, dropping this future remains a no-op.
+    *turn = TurnTaskState::Presenting(Box::new(completion));
+    Ok(true)
 }
 
 async fn receive_session_scan(

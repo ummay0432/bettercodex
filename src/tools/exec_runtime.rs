@@ -650,10 +650,10 @@ fn truncate_items(
         .iter()
         .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
     {
-        return formatted_truncate_text_content_items(&items, max_tokens).0;
+        return formatted_truncate_text_content_items(items, max_tokens).0;
     }
 
-    truncate_function_output_items(&items, max_tokens)
+    truncate_function_output_items(items, max_tokens)
 }
 
 fn resolve_max_tokens(requested: Option<usize>) -> usize {

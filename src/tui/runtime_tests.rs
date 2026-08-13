@@ -2,6 +2,7 @@ use super::*;
 use crate::assistant_message::AssistantMessage;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
+use crate::events::ModelTextDelta;
 use crate::protocol::MessagePhase;
 use crate::skills::SkillUpdate;
 use crossterm::event::Event;
@@ -26,7 +27,7 @@ fn runtime_without_agent() -> Runtime {
         clipboard_lease: None,
         cwd: cwd.clone(),
         agent: None,
-        turn: None,
+        turn: TurnTaskState::Idle,
         turn_events: None,
         turn_handle: None,
         exit_after_turn: false,
@@ -109,11 +110,13 @@ fn completed_turn_drain_renders_events_beyond_the_fairness_batch() {
     answer.push_str(" tail-marker");
     for _ in 0..MAX_READY_AGENT_EVENTS {
         events
-            .send(AgentEvent::ModelMessageDelta("x".to_string()))
+            .send(AgentEvent::ModelMessageDelta(ModelTextDelta::now("x")))
             .unwrap();
     }
     events
-        .send(AgentEvent::ModelMessageDelta(" tail-marker".to_string()))
+        .send(AgentEvent::ModelMessageDelta(ModelTextDelta::now(
+            " tail-marker",
+        )))
         .unwrap();
     events
         .send(AgentEvent::ModelMessageCompleted(AssistantMessage {
@@ -124,6 +127,10 @@ fn completed_turn_drain_renders_events_beyond_the_fairness_batch() {
     drop(events);
 
     drain_completed_agent_events(&mut ready, |event| view.handle_agent_event(event));
+    assert!(view.has_pending_presentation());
+    view.advance_presentation(Instant::now());
+    assert!(view.has_pending_presentation());
+    view.flush_presentation();
 
     let rendered = view
         .take_pending_history_lines(WIDTH, HEIGHT)

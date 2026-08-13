@@ -15,7 +15,6 @@ Use `commentary` for useful progress updates and non-blocking questions. Use `fi
 
 ## Tool execution
 
-- Resolve requests in the fewest useful tool loops without sacrificing correctness, required evidence, or validation. After each result, stop if the request can be completed; otherwise take the smallest useful next step.
 - Use `rg` or `rg --files` first for local text and file search; fall back when unavailable.
 - Run independent, side-effect-free reads concurrently. Keep dependent calls and state-changing actions sequential, and synthesize retrieved results before acting.
 - Keep shell commands narrow and readable; do not add commands solely to label output.

@@ -83,107 +83,92 @@ pub(crate) fn truncate_text_with_policy(content: &str, policy: TruncationPolicy)
 }
 
 pub(crate) fn formatted_truncate_text_content_items(
-    items: &[FunctionCallOutputContentItem],
+    items: Vec<FunctionCallOutputContentItem>,
     max_tokens: usize,
 ) -> (Vec<FunctionCallOutputContentItem>, Option<usize>) {
-    let text_segments = items
-        .iter()
-        .filter_map(|item| match item {
-            FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
-            FunctionCallOutputContentItem::InputImage { .. }
-            | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
-        })
-        .collect::<Vec<_>>();
-
-    if text_segments.is_empty() {
-        return (items.to_vec(), None);
+    // Unlike upstream's shared borrowed helper, bettercodex has one owned call site. Keep that
+    // ownership so ordinary under-limit output and retained non-text payloads need not be copied.
+    let mut has_text = false;
+    let mut combined_len = 0_usize;
+    for item in &items {
+        if let FunctionCallOutputContentItem::InputText { text } = item {
+            has_text = true;
+            if combined_len > 0 {
+                combined_len = combined_len.saturating_add(1);
+            }
+            combined_len = combined_len.saturating_add(text.len());
+        }
     }
 
-    let mut combined = String::new();
-    for text in &text_segments {
+    if !has_text || combined_len <= approx_bytes_for_tokens(max_tokens) {
+        return (items, None);
+    }
+
+    let mut combined = String::with_capacity(combined_len);
+    for item in &items {
+        let FunctionCallOutputContentItem::InputText { text } = item else {
+            continue;
+        };
         if !combined.is_empty() {
             combined.push('\n');
         }
         combined.push_str(text);
     }
 
-    if combined.len() <= approx_bytes_for_tokens(max_tokens) {
-        return (items.to_vec(), None);
-    }
-
     let original_token_count = approx_token_count(&combined);
     let mut out = vec![FunctionCallOutputContentItem::InputText {
         text: formatted_truncate_text(&combined, max_tokens),
     }];
-    out.extend(items.iter().filter_map(|item| match item {
-        FunctionCallOutputContentItem::InputImage { image_url, detail } => {
-            Some(FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.clone(),
-                detail: *detail,
-            })
-        }
-        FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
-            Some(FunctionCallOutputContentItem::EncryptedContent {
-                encrypted_content: encrypted_content.clone(),
-            })
-        }
-        FunctionCallOutputContentItem::InputText { .. } => None,
-    }));
+    out.extend(
+        items
+            .into_iter()
+            .filter(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. })),
+    );
 
     (out, Some(original_token_count))
 }
 
 pub(crate) fn truncate_function_output_items(
-    items: &[FunctionCallOutputContentItem],
+    mut items: Vec<FunctionCallOutputContentItem>,
     max_tokens: usize,
 ) -> Vec<FunctionCallOutputContentItem> {
-    let mut out: Vec<FunctionCallOutputContentItem> = Vec::with_capacity(items.len());
     let mut remaining_budget = max_tokens;
     let mut omitted_text_items = 0usize;
 
-    for item in items {
-        match item {
-            FunctionCallOutputContentItem::InputText { text } => {
-                if remaining_budget == 0 {
-                    omitted_text_items += 1;
-                    continue;
-                }
-
+    items.retain_mut(|item| match item {
+        FunctionCallOutputContentItem::InputText { text } => {
+            if remaining_budget == 0 {
+                omitted_text_items += 1;
+                false
+            } else {
                 let cost = approx_token_count(text);
 
                 if cost <= remaining_budget {
-                    out.push(FunctionCallOutputContentItem::InputText { text: text.clone() });
                     remaining_budget = remaining_budget.saturating_sub(cost);
+                    true
                 } else {
                     let snippet = truncate_text(text, remaining_budget);
+                    remaining_budget = 0;
                     if snippet.is_empty() {
                         omitted_text_items += 1;
+                        false
                     } else {
-                        out.push(FunctionCallOutputContentItem::InputText { text: snippet });
+                        *text = snippet;
+                        true
                     }
-                    remaining_budget = 0;
                 }
             }
-            FunctionCallOutputContentItem::InputImage { image_url, detail } => {
-                out.push(FunctionCallOutputContentItem::InputImage {
-                    image_url: image_url.clone(),
-                    detail: *detail,
-                });
-            }
-            FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
-                out.push(FunctionCallOutputContentItem::EncryptedContent {
-                    encrypted_content: encrypted_content.clone(),
-                });
-            }
         }
-    }
+        FunctionCallOutputContentItem::InputImage { .. }
+        | FunctionCallOutputContentItem::EncryptedContent { .. } => true,
+    });
 
     if omitted_text_items > 0 {
-        out.push(FunctionCallOutputContentItem::InputText {
+        items.push(FunctionCallOutputContentItem::InputText {
             text: format!("[omitted {omitted_text_items} text items ...]"),
         });
     }
-    out
+    items
 }
 
 #[cfg(test)]

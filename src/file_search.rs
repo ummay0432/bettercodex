@@ -18,6 +18,7 @@ use std::num::NonZero;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -128,12 +129,23 @@ pub struct FileSearchSession {
 }
 
 impl FileSearchSession {
-    /// Update the query. This should be cheap relative to re-walking.
+    /// Update the query. Rapid successive updates are coalesced so matching stays current.
     pub fn update_query(&self, pattern_text: &str) {
-        let _ = self
-            .inner
-            .work_tx
-            .send(WorkSignal::QueryUpdated(pattern_text.to_string()));
+        let should_notify = {
+            let mut pending_query = self
+                .inner
+                .pending_query
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending_query.text.clear();
+            pending_query.text.push_str(pattern_text);
+            let should_notify = !pending_query.notification_queued;
+            pending_query.notification_queued = true;
+            should_notify
+        };
+        if should_notify {
+            let _ = self.inner.work_tx.send(WorkSignal::QueryUpdated);
+        }
     }
 }
 
@@ -196,6 +208,7 @@ pub fn create_session(
         reporter,
         work_tx,
         nucleo_tick_queued,
+        pending_query: Mutex::new(PendingQuery::default()),
     });
 
     let matcher_inner = inner.clone();
@@ -218,10 +231,18 @@ struct SessionInner {
     reporter: Arc<dyn SessionReporter>,
     work_tx: Sender<WorkSignal>,
     nucleo_tick_queued: Arc<AtomicBool>,
+    pending_query: Mutex<PendingQuery>,
+}
+
+/// A latest-value slot that bounds queued query work while preserving a wake-up for the matcher.
+#[derive(Default)]
+struct PendingQuery {
+    text: String,
+    notification_queued: bool,
 }
 
 enum WorkSignal {
-    QueryUpdated(String),
+    QueryUpdated,
     NucleoNotify,
     WalkComplete,
     Shutdown,
@@ -430,16 +451,22 @@ fn matcher_worker(
                     break;
                 };
                 match signal {
-                    WorkSignal::QueryUpdated(query) => {
-                        let append = query.starts_with(&last_query);
+                    WorkSignal::QueryUpdated => {
+                        let mut pending_query = inner
+                            .pending_query
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let append = pending_query.text.starts_with(&last_query);
                         nucleo.pattern.reparse(
                             0,
-                            &query,
+                            &pending_query.text,
                             CaseMatching::Ignore,
                             Normalization::Smart,
                             append,
                         );
-                        last_query = query;
+                        last_query.clone_from(&pending_query.text);
+                        pending_query.notification_queued = false;
+                        drop(pending_query);
                         will_notify = true;
                         next_notify = after(Duration::from_millis(0));
                     }

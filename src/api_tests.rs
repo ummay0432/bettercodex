@@ -2,6 +2,8 @@ use super::*;
 use crate::compaction::CompactionPhase;
 use crate::compaction::CompactionRequest;
 use crate::model::DEFAULT_MODEL as MODEL;
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
@@ -9,6 +11,8 @@ use std::net::TcpStream;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
+use tokio::io::AsyncReadExt as _;
+use tokio::io::AsyncWriteExt as _;
 
 fn test_client(base_url: String) -> ApiClient {
     let identity = SessionIdentity {
@@ -325,7 +329,7 @@ fn response_rate_limit_events_are_retained_for_status() {
     )
     .unwrap();
 
-    let response = collected.finish(None).unwrap();
+    let response = collected.finish().unwrap();
     let snapshot = response.rate_limits.first().expect("rate-limit snapshot");
     assert_eq!(snapshot.limit_id, "codex_other");
     assert_eq!(snapshot.primary.as_ref().unwrap().used_percent, 12.5);
@@ -490,7 +494,7 @@ fn completed_items_are_emitted_once_in_api_order() {
         })
     );
     assert!(received_events.try_recv().is_err());
-    let response = collected.finish(None).unwrap();
+    let response = collected.finish().unwrap();
     assert_eq!(
         response.tool_calls,
         vec![ToolCall::Exec {
@@ -536,10 +540,10 @@ fn extracts_text_and_forwards_streaming_events() {
     )
     .unwrap();
 
-    assert_eq!(
-        received.try_recv().unwrap(),
-        AgentEvent::ModelMessageDelta("hello".to_string())
-    );
+    let AgentEvent::ModelMessageDelta(delta) = received.try_recv().unwrap() else {
+        panic!("expected model text delta");
+    };
+    assert_eq!(delta.text, "hello");
     assert_eq!(
         received.try_recv().unwrap(),
         AgentEvent::ReasoningSummarySectionStarted
@@ -548,44 +552,6 @@ fn extracts_text_and_forwards_streaming_events() {
         received.try_recv().unwrap(),
         AgentEvent::ReasoningSummaryDelta("checking".to_string())
     );
-}
-
-#[test]
-fn extracts_backend_websocket_token_throughput() {
-    let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let mut collected = CollectedResponse::new(OutputItemMode::Retain);
-    let mut server_model_warning_emitted = false;
-    process_event_value(
-        json!({
-            "type": "responsesapi.websocket_timing",
-            "timing_metrics": {
-                "engine_service_tbt_across_engine_calls_ms": 12.5,
-            },
-        }),
-        &mut collected,
-        &completed_items,
-        Some(&events),
-        MODEL,
-        &mut server_model_warning_emitted,
-    )
-    .unwrap();
-    process_event_value(
-        completed_event("resp_timing", &Value::Null),
-        &mut collected,
-        &completed_items,
-        Some(&events),
-        MODEL,
-        &mut server_model_warning_emitted,
-    )
-    .unwrap();
-
-    collected.finish(Some(&events)).unwrap();
-    assert_eq!(
-        received.try_recv().unwrap(),
-        AgentEvent::ModelResponseThroughput(Some(80.0))
-    );
-    assert!(received.try_recv().is_err());
 }
 
 #[test]
@@ -951,6 +917,64 @@ async fn websocket_upgrade_failure_falls_back_to_http() {
 }
 
 #[tokio::test]
+async fn inactive_startup_websocket_falls_back_to_http_promptly() {
+    let (base_url, mut websocket_requests, mut http_requests, server) =
+        spawn_inactive_startup_websocket_server().await;
+    let mut client = test_client(base_url);
+    let prewarmed = client
+        .startup_prewarm_client()
+        .prewarm_for_startup()
+        .await
+        .unwrap();
+    client.adopt_startup_prewarm(prewarmed);
+    let (completed_items, _completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let warmup = websocket_requests.recv().await.unwrap();
+    assert_eq!(warmup["generate"], false);
+    let mut response_task = tokio::spawn(async move {
+        let response = client
+            .respond(vec![user_message("hello")], &completed_items)
+            .await;
+        (client, response)
+    });
+    let first_turn = tokio::time::timeout(Duration::from_secs(2), websocket_requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_turn["previous_response_id"], "warm-inactive");
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+    let (client, response) =
+        match tokio::time::timeout(Duration::from_secs(2), &mut response_task).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => {
+                response_task.abort();
+                server.abort();
+                let _ = response_task.await;
+                let _ = server.await;
+                panic!("startup WebSocket recovery exceeded its bounded idle timeout");
+            }
+        };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            server.abort();
+            let _ = server.await;
+            panic!("startup WebSocket recovery failed: {error}");
+        }
+    };
+
+    assert_eq!(response.final_answer.as_deref(), Some("https recovery"));
+    assert!(!client.prefer_websocket);
+    let fallback = http_requests.recv().await.unwrap();
+    assert_eq!(fallback.path, "/responses");
+    let fallback: Value = serde_json::from_slice(&fallback.body).unwrap();
+    assert!(fallback["input"].to_string().contains("hello"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn compaction_sends_the_trigger_and_returns_only_retained_history() {
     let retained = user_message("retain this operator message");
     let discarded = assistant_item("discard this completed answer");
@@ -1091,6 +1115,127 @@ fn spawn_http_server(
         }
     });
     (format!("http://{address}"), requests_rx, server)
+}
+
+async fn spawn_inactive_startup_websocket_server() -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<Value>,
+    tokio::sync::mpsc::UnboundedReceiver<CapturedRequest>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (websocket_requests_tx, websocket_requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (http_requests_tx, http_requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut extensions = tungstenite::extensions::ExtensionsConfig::default();
+        extensions.permessage_deflate =
+            Some(tungstenite::extensions::compression::deflate::DeflateConfig::default());
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.extensions = extensions;
+        let mut websocket = tokio_tungstenite::accept_async_with_config(stream, Some(config))
+            .await
+            .unwrap();
+
+        let tungstenite::Message::Text(warmup) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected a text WebSocket warmup request");
+        };
+        websocket_requests_tx
+            .send(serde_json::from_str(warmup.as_str()).unwrap())
+            .unwrap();
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "warm-inactive",
+                        "model": MODEL,
+                        "output": [],
+                        "reasoning": {"context": "all_turns"},
+                    },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let tungstenite::Message::Text(first_turn) = websocket.next().await.unwrap().unwrap()
+        else {
+            panic!("expected a text first-turn WebSocket request");
+        };
+        websocket_requests_tx
+            .send(serde_json::from_str(first_turn.as_str()).unwrap())
+            .unwrap();
+
+        // Keep the accepted WebSocket open but never answer the first turn. This models a
+        // half-open warmed connection whose write succeeds locally while no server events arrive.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_async_request(&mut stream).await;
+        http_requests_tx.send(request).unwrap();
+        let body = completed_sse("resp-https-recovery", &assistant_item("https recovery"));
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        drop(websocket);
+    });
+    (
+        format!("http://{address}"),
+        websocket_requests_rx,
+        http_requests_rx,
+        server,
+    )
+}
+
+async fn read_async_request(stream: &mut tokio::net::TcpStream) -> CapturedRequest {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let header_end = loop {
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert!(read > 0, "request closed before its headers completed");
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    while bytes.len() - header_end < content_length {
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert!(read > 0, "request closed before its body completed");
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    let path = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap()
+        .to_string();
+    let mut body = bytes[header_end..header_end + content_length].to_vec();
+    if headers.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding") && value.trim() == "zstd"
+        })
+    }) {
+        body = zstd::stream::decode_all(std::io::Cursor::new(body)).unwrap();
+    }
+    CapturedRequest {
+        path,
+        headers,
+        body,
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> CapturedRequest {

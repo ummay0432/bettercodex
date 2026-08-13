@@ -23,6 +23,10 @@ use super::paste_burst::FlushResult;
 #[cfg(windows)]
 use super::paste_burst::PasteBurst;
 use super::pending_input::PendingInput;
+use super::presentation::AssistantPresentation;
+#[cfg(test)]
+use super::presentation::MIN_FRAME_INTERVAL;
+use super::presentation::item_reveal_budget;
 use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
 use super::resume_picker::ResumePickerAction;
@@ -39,6 +43,8 @@ use crate::ansi_escape::ansi_escape_line;
 use crate::assistant_message::AssistantMessage;
 use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
+#[cfg(test)]
+use crate::events::ModelTextDelta;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
 use crate::model::ModelSelection;
@@ -77,6 +83,7 @@ use ratatui::widgets::Wrap;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
@@ -96,6 +103,7 @@ const COMMAND_CONTINUATION_MAX_ROWS: usize = 2;
 const MAX_PATCH_PREVIEW_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PATCH_PREVIEW_ROWS: usize = 1_000;
 const MAX_PATCH_PREVIEW_ROW_BYTES: usize = 2 * 1024;
+const PENDING_INPUT_GAP: u16 = 1;
 const ACTIVITY_COMPOSER_GAP: u16 = 1;
 const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
@@ -289,7 +297,8 @@ pub(super) struct View {
     working_since: Option<Instant>,
     turn_had_work: bool,
     reasoning_status: ReasoningStatus,
-    tokens_per_second: Option<f64>,
+    assistant_presentation: AssistantPresentation,
+    deferred_agent_events: VecDeque<QueuedAgentEvent>,
     status_detail: Option<String>,
     pending_input: PendingInput,
     terminal_assistant_received_this_turn: bool,
@@ -347,8 +356,13 @@ enum TranscriptEntry {
     Processes(Vec<BackgroundProcess>),
     FinalMessageSeparator {
         elapsed_seconds: Option<u64>,
-        tokens_per_second: Option<f64>,
     },
+}
+
+#[derive(Debug)]
+struct QueuedAgentEvent {
+    event: AgentEvent,
+    enqueued_at: Instant,
 }
 
 #[derive(Debug)]
@@ -589,7 +603,8 @@ impl View {
             working_since: None,
             turn_had_work: false,
             reasoning_status: ReasoningStatus::default(),
-            tokens_per_second: None,
+            assistant_presentation: AssistantPresentation::default(),
+            deferred_agent_events: VecDeque::new(),
             status_detail: None,
             pending_input: PendingInput::default(),
             terminal_assistant_received_this_turn: false,
@@ -725,7 +740,8 @@ impl View {
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
-        self.tokens_per_second = None;
+        self.assistant_presentation.clear();
+        self.deferred_agent_events.clear();
         self.status_detail = None;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
@@ -740,7 +756,8 @@ impl View {
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
         self.reasoning_status.reset();
-        self.tokens_per_second = None;
+        self.assistant_presentation.clear();
+        self.deferred_agent_events.clear();
         self.status_detail = Some("Compacting conversation".to_string());
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
@@ -831,6 +848,7 @@ impl View {
         &mut self,
         result: anyhow::Result<SubmitOutcome>,
     ) -> Option<UserPrompt> {
+        self.flush_presentation();
         self.flush_unified_exec_wait_streak();
         self.deferred_interactions.clear();
         self.close_streaming_entries();
@@ -841,7 +859,6 @@ impl View {
             .take()
             .map(|started| started.elapsed().as_secs());
         let turn_had_work = std::mem::take(&mut self.turn_had_work);
-        let tokens_per_second = self.tokens_per_second.take();
         self.busy = false;
         let interrupt_intent = self.interrupting.take();
         self.reasoning_status.reset();
@@ -857,11 +874,9 @@ impl View {
                         history: StreamedAssistantHistory::default(),
                     });
                 }
-                if turn_had_work || tokens_per_second.is_some() {
-                    self.entries.push(TranscriptEntry::FinalMessageSeparator {
-                        elapsed_seconds: elapsed_seconds.filter(|_| turn_had_work),
-                        tokens_per_second,
-                    });
+                if turn_had_work {
+                    self.entries
+                        .push(TranscriptEntry::FinalMessageSeparator { elapsed_seconds });
                 }
                 None
             }
@@ -899,7 +914,8 @@ impl View {
         self.busy = false;
         self.interrupting = None;
         self.reasoning_status.reset();
-        self.tokens_per_second = None;
+        self.assistant_presentation.clear();
+        self.deferred_agent_events.clear();
         self.status_detail = None;
         self.action_required = result.is_err();
         match result {
@@ -1216,7 +1232,8 @@ impl View {
         self.background_processes.clear();
         self.action_required = false;
         self.reasoning_status.reset();
-        self.tokens_per_second = None;
+        self.assistant_presentation.clear();
+        self.deferred_agent_events.clear();
         self.pending_input.clear();
         self.overlay = None;
         self.file_search = FileSearchPopup::default();
@@ -1231,6 +1248,123 @@ impl View {
     }
 
     pub(super) fn handle_agent_event(&mut self, event: AgentEvent) {
+        if !self.deferred_agent_events.is_empty() {
+            self.defer_agent_event(event);
+            return;
+        }
+        match event {
+            AgentEvent::ModelMessageDelta(delta) => {
+                self.assistant_presentation
+                    .enqueue(delta.text, delta.received_at);
+            }
+            event if self.busy && starts_presentation_item(&event) => {
+                self.defer_agent_event(event);
+            }
+            event if self.assistant_presentation.is_pending() => {
+                self.defer_agent_event(event);
+            }
+            event => self.apply_agent_event(event),
+        }
+    }
+
+    fn defer_agent_event(&mut self, event: AgentEvent) {
+        self.deferred_agent_events.push_back(QueuedAgentEvent {
+            event,
+            enqueued_at: Instant::now(),
+        });
+    }
+
+    pub(super) fn has_pending_presentation(&self) -> bool {
+        self.assistant_presentation.is_pending() || !self.deferred_agent_events.is_empty()
+    }
+
+    pub(super) fn advance_presentation(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        let item_budget = item_reveal_budget(
+            now,
+            self.deferred_agent_events.iter().filter_map(|queued| {
+                starts_presentation_item(&queued.event).then_some(queued.enqueued_at)
+            }),
+        );
+        let mut revealed_items = 0_usize;
+        loop {
+            let revealed = self.assistant_presentation.reveal(now);
+            if !revealed.is_empty() {
+                self.append_model_message_delta(&revealed);
+                // Keep the transition from model-authored text to a discrete transcript item on
+                // its own frame, even when this reveal happened to empty the text queue.
+                return true;
+            }
+            if self.assistant_presentation.is_pending() {
+                return changed;
+            }
+
+            if revealed_items >= item_budget
+                && self
+                    .deferred_agent_events
+                    .front()
+                    .is_some_and(|queued| starts_presentation_item(&queued.event))
+            {
+                return changed;
+            }
+            let Some(queued) = self.deferred_agent_events.pop_front() else {
+                return changed;
+            };
+            match queued.event {
+                AgentEvent::ModelMessageDelta(delta) => {
+                    self.assistant_presentation
+                        .enqueue(delta.text, delta.received_at);
+                    if changed {
+                        return true;
+                    }
+                }
+                event => {
+                    revealed_items += usize::from(starts_presentation_item(&event));
+                    self.apply_agent_event(event);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    pub(super) fn flush_presentation(&mut self) {
+        loop {
+            let revealed = self.assistant_presentation.take_all();
+            if !revealed.is_empty() {
+                self.append_model_message_delta(&revealed);
+            }
+            let Some(queued) = self.deferred_agent_events.pop_front() else {
+                break;
+            };
+            match queued.event {
+                AgentEvent::ModelMessageDelta(delta) => self
+                    .assistant_presentation
+                    .enqueue(delta.text, delta.received_at),
+                event => self.apply_agent_event(event),
+            }
+        }
+    }
+
+    fn append_model_message_delta(&mut self, delta: &str) {
+        self.flush_unified_exec_wait_streak();
+        self.seal_exploration();
+        match self.entries.last_mut() {
+            Some(TranscriptEntry::Assistant {
+                content, streaming, ..
+            }) if *streaming => {
+                content.append(delta);
+            }
+            _ => self.entries.push(TranscriptEntry::Assistant {
+                content: MarkdownRenderCache::new(delta.to_string()),
+                phase: self.active_message_phase.clone(),
+                streaming: true,
+                history: StreamedAssistantHistory::default(),
+            }),
+        }
+        self.status_detail = None;
+    }
+
+    fn apply_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::ModelMessageStarted(message) => {
                 self.flush_unified_exec_wait_streak();
@@ -1247,24 +1381,7 @@ impl View {
                 }
                 self.status_detail = None;
             }
-            AgentEvent::ModelMessageDelta(delta) => {
-                self.flush_unified_exec_wait_streak();
-                self.seal_exploration();
-                match self.entries.last_mut() {
-                    Some(TranscriptEntry::Assistant {
-                        content, streaming, ..
-                    }) if *streaming => {
-                        content.append(&delta);
-                    }
-                    _ => self.entries.push(TranscriptEntry::Assistant {
-                        content: MarkdownRenderCache::new(delta),
-                        phase: self.active_message_phase.clone(),
-                        streaming: true,
-                        history: StreamedAssistantHistory::default(),
-                    }),
-                }
-                self.status_detail = None;
-            }
+            AgentEvent::ModelMessageDelta(delta) => self.append_model_message_delta(&delta.text),
             AgentEvent::ModelMessageCompleted(message) => {
                 self.complete_assistant_message(message);
             }
@@ -1277,9 +1394,6 @@ impl View {
             AgentEvent::ReasoningSummaryDelta(delta) => {
                 self.reasoning_status.push_delta(&delta);
             }
-            AgentEvent::ModelResponseThroughput(tokens_per_second) => {
-                self.tokens_per_second = tokens_per_second;
-            }
             AgentEvent::ModelResponseCompleted => self.close_streaming_entries(),
             AgentEvent::ToolStarted {
                 call_id,
@@ -1288,14 +1402,23 @@ impl View {
             } => {
                 self.close_streaming_entries();
                 let entry = ToolEntry::new(call_id, name, input, &self.cwd, &self.process_commands);
-                self.status_detail = Some(entry.activity_label());
+                let is_exploration = entry.is_exploration();
+                // Exploration commands already render their live action in the active tool cell.
+                // Duplicating that action below the status header adds a row at start and removes
+                // it at completion, making the inline viewport pulse as each command joins the
+                // tree. Keep details for tools that do not have that in-cell live surface.
+                self.status_detail = if is_exploration {
+                    self.latest_tool_activity()
+                } else {
+                    Some(entry.activity_label())
+                };
                 if entry.is_interaction() {
                     if entry.has_interaction_input() {
                         self.flush_unified_exec_wait_streak();
                     }
                     self.deferred_interactions
                         .insert(entry.call_id.clone(), entry);
-                } else if entry.is_exploration() {
+                } else if is_exploration {
                     self.flush_unified_exec_wait_streak();
                     let last_is_uncommitted = self.entries.len() > self.committed_entries;
                     match self.entries.last_mut() {
@@ -2333,11 +2456,10 @@ impl View {
                 TranscriptEntry::Tool(tool) if tool.outcome.is_none() => {
                     Some(tool.activity_label())
                 }
-                TranscriptEntry::Exploration { tools, .. } => tools
-                    .iter()
-                    .rev()
-                    .find(|tool| tool.outcome.is_none())
-                    .map(ToolEntry::activity_label),
+                // Exploration activity is already visible in its live transcript cell. Mirroring
+                // it in the status details would make that transient row disappear on completion
+                // while the cell remains active, shrinking the viewport by one row.
+                TranscriptEntry::Exploration { .. } => None,
                 _ => None,
             });
         let deferred_tool = self
@@ -2586,6 +2708,11 @@ impl View {
             .max(1)
             .saturating_add(2);
         let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
+        let pending_gap = if pending_height > 0 {
+            PENDING_INPUT_GAP
+        } else {
+            0
+        };
         let activity_height = self.activity_height(width);
         let activity_gap = if activity_height > 0 {
             ACTIVITY_COMPOSER_GAP
@@ -2611,6 +2738,7 @@ impl View {
         };
         let transcript_chrome_height = bottom_spacing
             .saturating_add(pending_height)
+            .saturating_add(pending_gap)
             .saturating_add(activity_height)
             .saturating_add(activity_gap)
             .saturating_add(composer_height)
@@ -2662,14 +2790,21 @@ impl View {
             .min(height_above_trailing.saturating_sub(minimum_composer_height));
         let pending_lines = self.pending_input.lines();
         let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
-        let pending_height = requested_pending_height.min(
+        let requested_pending_gap = if requested_pending_height > 0 {
+            PENDING_INPUT_GAP
+        } else {
+            0
+        };
+        let requested_pending_block_height =
+            requested_pending_height.saturating_add(requested_pending_gap);
+        let pending_block_height = requested_pending_block_height.min(
             height_above_trailing
                 .saturating_sub(activity_block_height)
                 .saturating_sub(minimum_composer_height),
         );
         let composer_height_limit = height_above_trailing
             .saturating_sub(activity_block_height)
-            .saturating_sub(pending_height);
+            .saturating_sub(pending_block_height);
         let editor_height_limit = composer_height_limit.saturating_sub(2).max(1);
         let editor_layout = self
             .editor
@@ -2694,19 +2829,16 @@ impl View {
         let activity_top = composer_y.saturating_sub(activity_block_height);
         let activity_height = requested_activity_height.min(activity_block_height);
         let activity_area = Rect::new(area.x, activity_top, area.width, activity_height);
-        let pending_bottom = if activity_block_height > 0 {
+        let pending_block_bottom = if activity_block_height > 0 {
             activity_top
         } else {
             composer_area.y
         };
-        let pending_area = Rect::new(
-            area.x,
-            pending_bottom.saturating_sub(pending_height),
-            area.width,
-            pending_height,
-        );
-        let content_bottom = if pending_height > 0 {
-            pending_area.y
+        let pending_block_top = pending_block_bottom.saturating_sub(pending_block_height);
+        let pending_height = requested_pending_height.min(pending_block_height);
+        let pending_area = Rect::new(area.x, pending_block_top, area.width, pending_height);
+        let content_bottom = if pending_block_height > 0 {
+            pending_block_top
         } else if activity_block_height > 0 {
             activity_top
         } else {
@@ -3056,12 +3188,13 @@ impl View {
         };
         let mut spans = vec![activity_marker(self.working_since), " ".into()];
         spans.extend(shimmer_spans(heading));
-        spans.push(format!(" ({}", format_elapsed(elapsed.as_secs())).dim());
-        if let Some(tokens_per_second) = self.tokens_per_second {
-            spans.push(Span::from(" • ").dim());
-            spans.push(Span::from(format_tokens_per_second(tokens_per_second)).dim());
-        }
-        spans.push(Span::from(" • esc to interrupt)").dim());
+        spans.push(
+            format!(
+                " ({} • esc to interrupt)",
+                format_elapsed(elapsed.as_secs())
+            )
+            .dim(),
+        );
         let pending_steers = self.pending_input.steer_count();
         let queued_follow_ups = self.pending_input.follow_up_count();
         if pending_steers > 0 {
@@ -3082,6 +3215,13 @@ impl View {
                 .values()
                 .any(ToolEntry::is_empty_interaction)
     }
+}
+
+fn starts_presentation_item(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::ToolStarted { .. } | AgentEvent::Warning(_) | AgentEvent::SteeringCommitted(_)
+    )
 }
 
 impl View {
@@ -3354,10 +3494,9 @@ impl TranscriptEntry {
             Self::Diff(diff) => git_diff_lines(diff, width),
             Self::Status(snapshot) => return snapshot.display_lines(width),
             Self::Processes(processes) => background_process_lines(processes, width),
-            Self::FinalMessageSeparator {
-                elapsed_seconds,
-                tokens_per_second,
-            } => final_message_separator_lines(*elapsed_seconds, *tokens_per_second, width),
+            Self::FinalMessageSeparator { elapsed_seconds } => {
+                final_message_separator_lines(*elapsed_seconds, width)
+            }
         };
         terminal_hyperlinks::plain_hyperlink_lines(plain_lines)
     }
@@ -4612,20 +4751,13 @@ fn git_diff_lines(diff: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn final_message_separator_lines(
-    elapsed_seconds: Option<u64>,
-    tokens_per_second: Option<f64>,
-    width: u16,
-) -> Vec<Line<'static>> {
+fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Vec<Line<'static>> {
     let mut parts = Vec::new();
     if let Some(elapsed) = elapsed_seconds
         .filter(|seconds| *seconds > 60)
         .map(format_elapsed)
     {
         parts.push(format!("Worked for {elapsed}"));
-    }
-    if let Some(tokens_per_second) = tokens_per_second {
-        parts.push(format_tokens_per_second(tokens_per_second));
     }
     if parts.is_empty() {
         return vec![Line::from("─".repeat(usize::from(width))).dim()];
@@ -4643,10 +4775,6 @@ fn final_message_separator_lines(
         ])
         .dim(),
     ]
-}
-
-fn format_tokens_per_second(tokens_per_second: f64) -> String {
-    format!("{tokens_per_second:.1} tok/s")
 }
 
 fn code_mode_lines(tool: &ToolEntry, source: &str, width: u16) -> Vec<Line<'static>> {
@@ -5565,7 +5693,10 @@ mod tests {
         view.welcome_pending = false;
         view.start_turn(&UserPrompt::text("test"));
         let _ = view.take_pending_history_lines(80, 24);
-        view.handle_agent_event(AgentEvent::ModelMessageDelta(chunks[0].to_string()));
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::now(
+            chunks[0],
+        )));
+        view.flush_presentation();
         let before_control = view
             .prepare(80, 24)
             .active_lines
@@ -5576,8 +5707,9 @@ mod tests {
         assert_eq!(before_control, "\n• before");
 
         for chunk in &chunks[1..] {
-            view.handle_agent_event(AgentEvent::ModelMessageDelta(chunk.to_string()));
+            view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::now(*chunk)));
         }
+        view.flush_presentation();
 
         let streamed = view
             .prepare(80, 24)
@@ -5597,6 +5729,218 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(finalized, streamed);
+    }
+
+    #[test]
+    fn large_delta_is_revealed_progressively_and_catches_up_within_latency_bound() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("stream smoothly"));
+        let _ = view.take_pending_history_lines(80, 24);
+        let received_at = Instant::now();
+        let source = "x".repeat(100);
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::new(
+            source.clone(),
+            received_at,
+        )));
+
+        assert!(view.prepare(80, 24).active_lines.is_empty());
+        assert!(view.advance_presentation(received_at));
+        let first_frame = view
+            .prepare(80, 24)
+            .active_lines
+            .iter()
+            .map(plain)
+            .collect::<String>();
+        let first_frame_chars = first_frame.matches('x').count();
+        assert!(first_frame_chars > 0 && first_frame_chars < source.len());
+
+        for frame in 1..=24 {
+            view.advance_presentation(received_at + MIN_FRAME_INTERVAL * frame);
+        }
+        let final_frame = view
+            .prepare(80, 24)
+            .active_lines
+            .iter()
+            .map(plain)
+            .collect::<String>();
+        assert_eq!(final_frame.matches('x').count(), source.len());
+        assert!(!view.has_pending_presentation());
+    }
+
+    #[test]
+    fn rapid_deltas_stay_ordered_and_graphemes_are_not_split() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("preserve stream order"));
+        let received_at = Instant::now();
+        let chunks = ["A", "👨‍", "👩‍👧‍👦", "e", "\u{301}BCDEFGHIJKLMNOP"];
+        let complete = chunks.concat();
+        for text in chunks {
+            view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::new(
+                text.to_string(),
+                received_at,
+            )));
+        }
+
+        view.advance_presentation(received_at);
+        let Some(TranscriptEntry::Assistant { content, .. }) = view.entries.last() else {
+            panic!("expected visible assistant text");
+        };
+        let visible = content.source();
+        assert!(visible.len() < complete.len());
+        assert!(complete.starts_with(visible));
+        assert!(
+            complete
+                .grapheme_indices(/*is_extended*/ true)
+                .any(|(start, _)| start == visible.len()),
+            "presentation split an extended grapheme at byte {}",
+            visible.len(),
+        );
+        view.flush_presentation();
+        let Some(TranscriptEntry::Assistant { content, .. }) = view.entries.last() else {
+            panic!("expected completed assistant text");
+        };
+        assert_eq!(content.source(), complete);
+    }
+
+    #[test]
+    fn tool_boundary_waits_for_presented_assistant_text_without_losing_events() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("keep transcript order"));
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::now(
+            "assistant text before the tool",
+        )));
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "call-1".to_string(),
+            name: "exec_command".to_string(),
+            input: Some(json!({"cmd": "printf done"})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "call-1".to_string(),
+            output: Ok(json!({"exit_code": 0, "output": "done"})),
+            duration: Duration::from_millis(1),
+        });
+
+        let mut frame_at = Instant::now();
+        while view.assistant_presentation.is_pending() {
+            assert!(view.advance_presentation(frame_at));
+            frame_at += MIN_FRAME_INTERVAL;
+        }
+        assert!(matches!(
+            view.entries.last(),
+            Some(TranscriptEntry::Assistant { .. })
+        ));
+        assert!(view.has_pending_presentation());
+        assert!(view.advance_presentation(frame_at));
+        assert!(matches!(
+            view.entries.last(),
+            Some(TranscriptEntry::Tool(_))
+        ));
+        let transcript = view.session_transcript();
+        assert!(matches!(
+            transcript.first(),
+            Some(SessionTranscriptItem::User { .. })
+        ));
+        assert!(matches!(
+            transcript.get(1),
+            Some(SessionTranscriptItem::Assistant { text, .. })
+                if text == "assistant text before the tool"
+        ));
+        assert!(matches!(
+            transcript.get(2),
+            Some(SessionTranscriptItem::Tool { tool }) if tool.call_id == "call-1"
+        ));
+    }
+
+    #[test]
+    fn rapidly_arriving_exploration_tools_are_revealed_across_frames() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("inspect several areas"));
+        let _ = view.take_pending_history_lines(80, 24);
+        for index in 0..30 {
+            let call_id = format!("search-{index}");
+            view.handle_agent_event(AgentEvent::ToolStarted {
+                call_id: call_id.clone(),
+                name: "exec_command".to_string(),
+                input: Some(json!({"cmd": format!("rg needle-{index} src")})),
+            });
+            view.handle_agent_event(AgentEvent::ToolCompleted {
+                call_id,
+                output: Ok(json!({"exit_code": 0, "output": ""})),
+                duration: Duration::from_millis(1),
+            });
+        }
+
+        let first_frame_at = Instant::now();
+        assert!(view.advance_presentation(first_frame_at));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let first_frame = render_buffer(terminal.backend().buffer());
+        assert!(first_frame.contains("needle-0"), "{first_frame}");
+        assert!(!first_frame.contains("needle-1"), "{first_frame}");
+        assert!(view.has_pending_presentation());
+
+        assert!(view.advance_presentation(first_frame_at + MIN_FRAME_INTERVAL));
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let second_frame = render_buffer(terminal.backend().buffer());
+        assert!(second_frame.contains("needle-1"), "{second_frame}");
+        assert!(!second_frame.contains("needle-2"), "{second_frame}");
+
+        for frame in 2..=24 {
+            view.advance_presentation(first_frame_at + MIN_FRAME_INTERVAL * frame);
+        }
+        assert!(!view.has_pending_presentation());
+        let completed = view
+            .active_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for index in 0..30 {
+            assert!(
+                completed.contains(&format!("needle-{index}")),
+                "{completed}"
+            );
+        }
+    }
+
+    #[test]
+    fn rapidly_arriving_notices_are_revealed_across_frames() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("show notices fluently"));
+        let _ = view.take_pending_history_lines(80, 24);
+        view.handle_agent_event(AgentEvent::Warning("first notice".to_string()));
+        view.handle_agent_event(AgentEvent::Warning("second notice".to_string()));
+
+        let first_frame_at = Instant::now();
+        assert!(view.advance_presentation(first_frame_at));
+        let first_frame = view
+            .prepare(80, 24)
+            .active_lines
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(first_frame.contains("first notice"), "{first_frame}");
+        assert!(!first_frame.contains("second notice"), "{first_frame}");
+        assert!(view.has_pending_presentation());
+
+        assert!(view.advance_presentation(first_frame_at + MIN_FRAME_INTERVAL));
+        let second_frame = view
+            .prepare(80, 24)
+            .active_lines
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(second_frame.contains("first notice"), "{second_frame}");
+        assert!(second_frame.contains("second notice"), "{second_frame}");
+        assert!(!view.has_pending_presentation());
     }
 
     #[test]
@@ -6039,32 +6383,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_token_throughput_moves_from_activity_to_completed_turn() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn(&UserPrompt::text("test throughput"));
-        view.handle_agent_event(AgentEvent::ModelResponseThroughput(Some(80.0)));
-
-        let activity = plain(&view.working_line());
-        assert!(
-            activity.contains(" • 80.0 tok/s • esc to interrupt)"),
-            "{activity}"
-        );
-
-        assert!(
-            view.finish_turn(Ok(SubmitOutcome::Completed("done".to_string())))
-                .is_none()
-        );
-        let rendered = view
-            .take_pending_history_lines(80, 24)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("─ 80.0 tok/s ─"), "{rendered}");
-    }
-
-    #[test]
     fn background_wait_command_uses_a_detail_row_between_status_and_composer() {
         const WIDTH: u16 = 48;
         const COMMAND: &str = "cargo test -p bettercodex -- --exact some::very::long::test::name";
@@ -6083,6 +6401,7 @@ mod tests {
             output: Ok(json!({"session_id": 42, "output": ""})),
             duration: Duration::from_millis(10),
         });
+        view.advance_presentation(Instant::now());
         let _ = view.take_pending_history_lines(WIDTH, 24);
         let height_without_wait = view.desired_height(WIDTH, 24);
 
@@ -6091,6 +6410,7 @@ mod tests {
             name: "write_stdin".to_string(),
             input: Some(json!({"session_id": 42})),
         });
+        view.advance_presentation(Instant::now());
 
         let height = view.desired_height(WIDTH, 24);
         assert_eq!(height, height_without_wait + 1);
@@ -6134,6 +6454,38 @@ mod tests {
         assert_eq!(footer_y, composer_bottom, "{rendered}");
         assert_eq!(rendered.matches("cargo test").count(), 1, "{rendered}");
         assert!(rows[usize::from(detail_y)].contains('…'), "{rendered}");
+    }
+
+    #[test]
+    fn pending_steering_is_separated_from_activity() {
+        const WIDTH: u16 = 80;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("test"));
+        let _ = view.take_pending_history_lines(WIDTH, 24);
+        view.add_pending_steer(
+            SteerId(0),
+            UserPrompt::text("include my second prompt in the spec.md verbatim."),
+        );
+
+        let height = view.desired_height(WIDTH, 24);
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let steer_y = rows
+            .iter()
+            .position(|row| row.contains("↳ include my second prompt"))
+            .expect("rendered pending steer");
+        let activity_y = rows
+            .iter()
+            .position(|row| row.contains("Working ("))
+            .expect("rendered activity status");
+
+        assert!(rows[steer_y + 1].trim().is_empty(), "{rendered}");
+        assert_eq!(activity_y, steer_y + 2, "{rendered}");
     }
 
     #[test]
@@ -6298,7 +6650,10 @@ mod tests {
             "a user message that wraps at the narrower width",
         ));
         let _ = view.take_pending_history_lines(80, 24);
-        view.handle_agent_event(AgentEvent::ModelMessageDelta("assistant reply".to_string()));
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::now(
+            "assistant reply",
+        )));
+        view.flush_presentation();
         view.handle_agent_event(completed_message("assistant reply"));
         let _ = view.take_pending_history_lines(80, 24);
 
@@ -6335,7 +6690,10 @@ mod tests {
         view.welcome_pending = false;
         view.start_turn(&UserPrompt::text("test"));
         let _ = view.take_pending_history_lines(WIDTH, HEIGHT);
-        view.handle_agent_event(AgentEvent::ModelMessageDelta(source.clone()));
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::now(
+            source.clone(),
+        )));
+        view.flush_presentation();
 
         let prepared = view.prepare(WIDTH, HEIGHT);
         assert!(!prepared.history_lines.is_empty());

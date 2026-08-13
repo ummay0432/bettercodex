@@ -38,23 +38,6 @@ Codex Code Mode is the upstream client-side V8 `exec`/`wait` path, not the
 Responses API's hosted `programmatic_tool_calling` tool. Do not translate
 between them or add hosted-PTC request fields unless current upstream Codex does.
 
-`code_mode_only` is a transport route, not a reason to turn every tool stage
-into a JavaScript workflow. Apply
-[OpenAI's Programmatic Tool Calling selection boundary](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling#choose-when-to-use-programmatic-tool-calling)
-to the shape of each Code Mode cell:
-
-- when one call is sufficient, the result shape is not reliably documented,
-  fresh model judgment should follow a result, or the stage is adaptive,
-  write/approval-sensitive, citation-heavy, or carries a native artifact, make
-  one nested call, preserve its complete result, and return control to the
-  model; and
-- compose or batch nested calls only for a bounded, predictable, read-only stage
-  where code can filter, join, rank, deduplicate, aggregate, or validate
-  structured intermediate results into a materially smaller result. Constrain
-  the eligible calls and make the result fields, call and retry limits, failure
-  behavior, stopping condition, and handoff back to model judgment explicit;
-  parallelize only independent side-effect-free reads.
-
 `/model` is the only model-selection surface. It persists the selection as
 focused bettercodex state without introducing providers, profiles, or a general
 configuration framework. `/fast` is the only service-tier surface and persists

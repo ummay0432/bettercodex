@@ -848,6 +848,7 @@ fn parse_osc_component(value: &str) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::events::AgentEvent;
+    use crate::events::ModelTextDelta;
     use crate::model::DEFAULT_MODEL as MODEL;
     use crate::tui::view::View;
     use ratatui::backend::ClearType as BackendClearType;
@@ -1170,6 +1171,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_exploration_keeps_inline_viewport_height_stable() {
+        const WIDTH: u16 = 80;
+        const SCREEN_HEIGHT: u16 = 24;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let (mut terminal, output) =
+            test_terminal(WIDTH, SCREEN_HEIGHT, /*viewport_height*/ 1);
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+        view.start_turn(&crate::input::UserPrompt::text("inspect the repository"));
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "search".to_string(),
+            name: "exec_command".to_string(),
+            input: Some(json!({"cmd": "rg needle src"})),
+        });
+        assert!(view.advance_presentation(Instant::now()));
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+        let running_height = terminal.viewport_area.height;
+        assert!(output.screen().contains("Exploring"));
+
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "search".to_string(),
+            output: Ok(json!({"exit_code": 0, "output": ""})),
+            duration: Duration::from_millis(1),
+        });
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+
+        assert!(output.screen().contains("Explored"));
+        assert_eq!(terminal.viewport_area.height, running_height);
+    }
+
+    #[test]
     fn incremental_live_response_preserves_preceding_tool_and_stream_prefix() {
         const WIDTH: u16 = 48;
         const SCREEN_HEIGHT: u16 = 12;
@@ -1194,11 +1228,14 @@ mod tests {
         });
 
         for index in 0..40 {
-            view.handle_agent_event(AgentEvent::ModelMessageDelta(format!(
+            view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::now(format!(
                 "response-row-{index:02}\n"
-            )));
+            ))));
+            view.advance_presentation(Instant::now());
             redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
         }
+        view.flush_presentation();
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
 
         let screen = output.screen();
         assert!(screen.contains("response-row-39"), "{screen}");
@@ -1245,11 +1282,14 @@ mod tests {
             "x".repeat(800)
         );
         for chunk in response.as_bytes().chunks(37) {
-            view.handle_agent_event(AgentEvent::ModelMessageDelta(
-                std::str::from_utf8(chunk).unwrap().to_string(),
-            ));
+            view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::now(
+                std::str::from_utf8(chunk).unwrap(),
+            )));
+            view.advance_presentation(Instant::now());
             redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
         }
+        view.flush_presentation();
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
 
         let screen = output.screen();
         assert!(screen.contains("stream-tail-marker"), "{screen}");

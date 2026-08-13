@@ -32,6 +32,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 use textwrap::Options;
 use textwrap::WordSeparator;
+use textwrap::core::Fragment;
 use textwrap::core::Word;
 use textwrap::word_splitters::split_words;
 use unicode_segmentation::UnicodeSegmentation;
@@ -838,15 +839,22 @@ fn word_wrap_flattened_line<'a>(
         .width
         .saturating_sub(line_width(&rt_opts.initial_indent))
         .max(1);
-    let initial_wrapped = wrap_ranges_trim(flat, opts.clone().width(initial_width_available));
-    let Some(first_line_range) = initial_wrapped.first() else {
+    let initial_opts = opts.clone().width(initial_width_available);
+    let first_line_range = if initial_opts.wrap_algorithm == textwrap::WrapAlgorithm::FirstFit
+        && !flat.contains(['\u{FF9E}', '\u{FF9F}'])
+    {
+        Some(first_fit_first_range(flat, &initial_opts))
+    } else {
+        wrap_ranges_trim(flat, initial_opts).into_iter().next()
+    };
+    let Some(first_line_range) = first_line_range else {
         return vec![rt_opts.initial_indent.clone()];
     };
 
     // Build first wrapped line with initial indent.
     let mut first_line = rt_opts.initial_indent.clone().style(line.style);
     {
-        let sliced = slice_line_spans(line, span_bounds, first_line_range);
+        let sliced = slice_line_spans(line, span_bounds, &first_line_range);
         let mut spans = first_line.spans;
         spans.append(
             &mut sliced
@@ -888,6 +896,52 @@ fn word_wrap_flattened_line<'a>(
     }
 
     out
+}
+
+/// Finds the first range produced by textwrap's greedy algorithm without wrapping the tail.
+///
+/// `word_wrap_flattened_line` wraps the tail with a different width. Asking textwrap to wrap the
+/// complete input at the first-line width only to discard every range after the first would scan
+/// and allocate for long lines twice. This is the same first-fit loop, stopped at its first break.
+fn first_fit_first_range(text: &str, opts: &Options<'_>) -> Range<usize> {
+    if text.len() < opts.width {
+        return 0..text.trim_end_matches(' ').len();
+    }
+
+    let words = opts.word_separator.find_words(text);
+    let split_words = split_words(words, &opts.word_splitter);
+    let mut fragment_count = 0usize;
+    let mut width = 0.0;
+    let mut bytes = 0usize;
+    let mut trailing_whitespace_bytes = 0usize;
+
+    {
+        let mut include = |word: Word<'_>| {
+            if fragment_count > 0 && width + word.width() + word.penalty_width() > opts.width as f64
+            {
+                return Err(bytes.saturating_sub(trailing_whitespace_bytes));
+            }
+            fragment_count += 1;
+            width += word.width() + word.whitespace_width();
+            bytes += word.word.len() + word.whitespace.len();
+            trailing_whitespace_bytes = word.whitespace.len();
+            Ok(())
+        };
+
+        for word in split_words {
+            if opts.break_words && word.width() > opts.width as f64 {
+                for piece in word.break_apart(opts.width) {
+                    if let Err(end) = include(piece) {
+                        return 0..end;
+                    }
+                }
+            } else if let Err(end) = include(word) {
+                return 0..end;
+            }
+        }
+    }
+
+    0..bytes.saturating_sub(trailing_whitespace_bytes)
 }
 
 #[derive(Clone, Debug)]

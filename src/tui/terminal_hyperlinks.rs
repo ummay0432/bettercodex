@@ -448,16 +448,28 @@ pub(crate) fn mark_buffer_hyperlinks(
     lines: &[HyperlinkLine],
     scroll_rows: usize,
 ) {
-    if area.width == 0 {
+    if area.is_empty() {
         return;
     }
+    // Hyperlink marking is this pass's only side effect. Most transcript frames contain ordinary
+    // prose or code, so do not run Ratatui's word wrapper over every line a second time when there
+    // is nothing to annotate. Lines after the final hyperlink cannot affect linked row offsets.
+    let Some(last_linked_line) = lines.iter().rposition(|line| !line.hyperlinks.is_empty()) else {
+        return;
+    };
+
+    let viewport_end = scroll_rows.saturating_add(usize::from(area.height));
     let mut logical_row = 0usize;
-    for line in lines {
+    for line in &lines[..=last_linked_line] {
+        if logical_row >= viewport_end {
+            break;
+        }
         let paragraph =
             Paragraph::new(Text::from(line_to_borrowed(&line.line))).wrap(Wrap { trim: false });
         let rendered_height = paragraph.line_count(area.width).max(/*other*/ 1);
-        if line.hyperlinks.is_empty() {
-            logical_row += rendered_height;
+        let next_logical_row = logical_row.saturating_add(rendered_height);
+        if line.hyperlinks.is_empty() || next_logical_row <= scroll_rows {
+            logical_row = next_logical_row;
             continue;
         }
 
@@ -491,6 +503,7 @@ pub(crate) fn mark_buffer_hyperlinks(
             .collect();
         for (row, rendered) in remap_wrapped_line(line, rendered_lines).iter().enumerate() {
             for link in &rendered.hyperlinks {
+                let terminal_destination = link.terminal_destination();
                 let mut trailing_columns = 0usize;
                 for column in link.columns.clone() {
                     if trailing_columns > 0 {
@@ -508,7 +521,7 @@ pub(crate) fn mark_buffer_hyperlinks(
                         continue;
                     }
                     trailing_columns = usize::from(cell.cell_width()).saturating_sub(1);
-                    let symbol = link.terminal_destination().map_or_else(
+                    let symbol = terminal_destination.as_ref().map_or_else(
                         || cell.symbol().to_string(),
                         |destination| {
                             format!("\x1b]8;;{destination}\x07{}\x1b]8;;\x07", cell.symbol())
@@ -520,7 +533,7 @@ pub(crate) fn mark_buffer_hyperlinks(
                 }
             }
         }
-        logical_row += rendered_height;
+        logical_row = next_logical_row;
     }
 }
 

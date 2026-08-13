@@ -77,7 +77,7 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
         FunctionCallOutputContentItem::InputText { text: t5 },
     ];
 
-    let output = truncate_function_output_items(&items, limit);
+    let output = truncate_function_output_items(items, limit);
 
     assert_eq!(output.len(), 5);
 
@@ -131,9 +131,10 @@ fn formatted_truncate_text_content_items_returns_original_under_limit() {
         },
     ];
 
-    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 8);
+    let expected = items.clone();
+    let (output, original_token_count) = formatted_truncate_text_content_items(items, 8);
 
-    assert_eq!(output, items);
+    assert_eq!(output, expected);
     assert_eq!(original_token_count, None);
 }
 
@@ -148,7 +149,7 @@ fn formatted_truncate_text_content_items_preserves_empty_leading_text_behavior()
         },
     ];
 
-    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 0);
+    let (output, original_token_count) = formatted_truncate_text_content_items(items, 0);
 
     assert_eq!(
         output,
@@ -181,7 +182,7 @@ fn formatted_truncate_text_content_items_merges_text_and_appends_media() {
         },
     ];
 
-    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 2);
+    let (output, original_token_count) = formatted_truncate_text_content_items(items, 2);
 
     assert_eq!(
         output,
@@ -213,7 +214,7 @@ fn formatted_truncate_text_content_items_preserves_encrypted_content() {
         },
     ];
 
-    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 1);
+    let (output, original_token_count) = formatted_truncate_text_content_items(items, 1);
 
     assert_eq!(
         output,
@@ -240,7 +241,7 @@ fn formatted_truncate_text_content_items_merges_all_text_for_token_budget() {
         },
     ];
 
-    let (output, original_token_count) = formatted_truncate_text_content_items(&items, 2);
+    let (output, original_token_count) = formatted_truncate_text_content_items(items, 2);
 
     assert_eq!(
         output,

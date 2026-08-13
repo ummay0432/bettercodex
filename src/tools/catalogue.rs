@@ -23,17 +23,12 @@ PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
 NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 "#;
-const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to call tools and, where appropriate, orchestrate/compose tool calls
+const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
 - Submit raw JavaScript source—not JSON, a quoted string, or a Markdown code fence. It runs in a fresh V8 isolate as an async module; the runtime has no Node, file system, network access, or console.
 - All nested tools are available on the global `tools` object under normalized JavaScript identifiers. Call them as `await tools.exec_command(...)`; MCP names normalize to identifiers such as `await tools.mcp__ologs__get_profile(...)`.
 - Nested tool methods accept a string or object and return an object or string, according to the tool description.
 - Await every operation. When JavaScript finishes evaluating, the isolate ends and unawaited promises are silently discarded.
 - Optional first line: `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`. `yield_time_ms` asks `exec` to yield early if the script is still running (default: 10000 ms); `max_output_tokens` sets the token budget for direct `exec` results (default: 10000 tokens).
-
-Choose the smallest safe script:
-- Use one nested call and return its complete output with `text(...)` or `image(...)` when one call is sufficient, its output is already small, its output shape is not reliably documented, fresh model judgment should follow, or the stage is adaptive, write/approval-sensitive, citation-heavy, or carries a native artifact. Do not batch, retry, filter, or chain it in JavaScript.
-- Compose calls only for a bounded, predictable, read-only stage that reduces intermediate output to a materially smaller structured result. Use only documented calls and input/output fields needed by that stage. Define emitted fields and required evidence, call and retry limits, failure behavior, and stopping conditions; then return control to the model.
-- Use `Promise.all(...)` only for independent, side-effect-free reads; keep dependent calls sequential. Nested failures reject their Promise; catch them only for explicit bounded recovery.
 
 Global helpers:
 - `exit()`: Immediately ends the current script successfully, like an early return from the top level.

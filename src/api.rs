@@ -7,6 +7,7 @@ use crate::compaction::CompactionRequest;
 use crate::context::HistoryCursor;
 use crate::context::estimated_tokens;
 use crate::events::AgentEvent;
+use crate::events::ModelTextDelta;
 use crate::http_client::backoff;
 use crate::http_client::bounded_error_body;
 use crate::model::ModelSelection;
@@ -41,6 +42,7 @@ use std::io::Write;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
@@ -77,7 +79,6 @@ const MAX_ERROR_BODY_CHARS: usize = 4_000;
 // CPU time versus zstd's level-3 default.
 const REQUEST_COMPRESSION_LEVEL: i32 = 1;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
-const RESPONSES_WEBSOCKET_TIMING_HEADER: &str = "x-responsesapi-include-timing-metrics";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
@@ -189,6 +190,7 @@ pub(crate) struct ApiClient {
     prefer_websocket: bool,
     websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
+    startup_websocket_pending_first_event: bool,
     websocket_reasoning_included: bool,
     websocket_server_model: Option<String>,
     websocket_rate_limits: Vec<crate::rate_limits::RateLimitSnapshot>,
@@ -539,6 +541,7 @@ impl ApiClient {
             prefer_websocket: true,
             websocket_prewarm_attempted: false,
             websocket: None,
+            startup_websocket_pending_first_event: false,
             websocket_reasoning_included: false,
             websocket_server_model: None,
             websocket_rate_limits: Vec::new(),
@@ -566,6 +569,7 @@ impl ApiClient {
             prefer_websocket: self.prefer_websocket,
             websocket_prewarm_attempted: false,
             websocket: None,
+            startup_websocket_pending_first_event: false,
             websocket_reasoning_included: false,
             websocket_server_model: None,
             websocket_rate_limits: Vec::new(),
@@ -583,6 +587,7 @@ impl ApiClient {
     }
 
     pub(crate) fn adopt_startup_prewarm(&mut self, mut prewarmed: Self) {
+        self.startup_websocket_pending_first_event = prewarmed.websocket.is_some();
         self.prefer_websocket = prewarmed.prefer_websocket;
         self.websocket_prewarm_attempted = prewarmed.websocket_prewarm_attempted;
         self.websocket = prewarmed.websocket.take();
@@ -675,6 +680,7 @@ impl ApiClient {
 
     pub(crate) fn abandon_response(&mut self) {
         self.websocket = None;
+        self.startup_websocket_pending_first_event = false;
         self.websocket_reasoning_included = false;
         self.websocket_server_model = None;
         self.websocket_rate_limits.clear();
@@ -946,7 +952,12 @@ impl ApiClient {
             events,
             &mut self.server_model_warning_emitted,
         );
-        let idle_timeout = match mode {
+        let startup_websocket_pending_first_event = matches!(mode, WebSocketRequestMode::Inference)
+            && self.startup_websocket_pending_first_event;
+        let initial_idle_timeout = match mode {
+            WebSocketRequestMode::Inference if startup_websocket_pending_first_event => {
+                self.stream_idle_timeout.min(WEBSOCKET_PREWARM_IDLE_TIMEOUT)
+            }
             WebSocketRequestMode::Inference => self.stream_idle_timeout,
             WebSocketRequestMode::Warmup => {
                 self.stream_idle_timeout.min(WEBSOCKET_PREWARM_IDLE_TIMEOUT)
@@ -960,13 +971,18 @@ impl ApiClient {
             .websocket
             .as_mut()
             .ok_or_else(|| ApiError::websocket_unavailable("Responses WebSocket is unavailable"))?
-            .send(guard.request(), idle_timeout)
+            .send(guard.request(), initial_idle_timeout)
             .await;
         guard.restore()?;
         send_result?;
 
         let mut collected =
             CollectedResponse::new(OutputItemMode::for_websocket(request_kind, input_identity));
+        // A socket completed during startup can become half-open before the operator submits the
+        // first turn. Bound only its first real send/event by the startup timeout; after any server
+        // event proves the connection active, retain the ordinary timeout for long inference.
+        let mut awaiting_startup_first_event = startup_websocket_pending_first_event;
+        let mut next_event_idle_timeout = initial_idle_timeout;
         loop {
             let text = self
                 .websocket
@@ -974,9 +990,14 @@ impl ApiClient {
                 .ok_or_else(|| {
                     ApiError::websocket_unavailable("Responses WebSocket is unavailable")
                 })?
-                .next_text(idle_timeout)
+                .next_text(next_event_idle_timeout)
                 .await?
                 .ok_or_else(|| ApiError::retryable("Responses WebSocket ended unexpectedly"))?;
+            if awaiting_startup_first_event {
+                awaiting_startup_first_event = false;
+                self.startup_websocket_pending_first_event = false;
+                next_event_idle_timeout = self.stream_idle_timeout;
+            }
             if text.len() > MAX_STREAM_EVENT_BYTES {
                 return Err(ApiError::fatal("model sent an oversized WebSocket event"));
             }
@@ -996,7 +1017,7 @@ impl ApiClient {
                 break;
             }
         }
-        let mut response = collected.finish(events)?;
+        let mut response = collected.finish()?;
         response.server_reasoning_included = self.websocket_reasoning_included;
         let streamed_rate_limits = std::mem::take(&mut response.rate_limits);
         response.rate_limits.clone_from(&self.websocket_rate_limits);
@@ -1019,7 +1040,6 @@ impl ApiClient {
         let mut headers = self.request_headers("*/*", request_kind, &auth)?;
         insert_header(&mut headers, "originator", "codex_cli_rs")?;
         insert_header(&mut headers, "openai-beta", RESPONSES_WEBSOCKET_BETA)?;
-        insert_header(&mut headers, RESPONSES_WEBSOCKET_TIMING_HEADER, "true")?;
         let url = websocket_url(&self.base_url, "responses")?;
         let (websocket, response_headers) = WebSocketConnection::connect(&url, &headers).await?;
         self.websocket_reasoning_included = response_headers.contains_key("x-reasoning-included");
@@ -1798,30 +1818,34 @@ async fn collect_http_stream(
             })?;
         let Some(chunk) = chunk else {
             decoder.finish(&mut decoded)?;
+            let received_at = Instant::now();
             for data in decoded.drain(..) {
-                process_event(
+                process_event_at(
                     &data,
                     &mut collected,
                     completed_items,
                     events,
                     validation.expected_model,
                     &mut *validation.server_model_warning_emitted,
+                    received_at,
                 )?;
             }
             break;
         };
+        let received_at = Instant::now();
         decoder.push(&chunk, &mut decoded)?;
         if !decoded.is_empty() {
             event_deadline = tokio::time::Instant::now() + idle_timeout;
         }
         for data in decoded.drain(..) {
-            process_event(
+            process_event_at(
                 &data,
                 &mut collected,
                 completed_items,
                 events,
                 validation.expected_model,
                 &mut *validation.server_model_warning_emitted,
+                received_at,
             )?;
         }
         if collected.completed {
@@ -1833,7 +1857,7 @@ async fn collect_http_stream(
             "model stream closed before response.completed",
         ));
     }
-    collected.finish(events)
+    collected.finish()
 }
 
 struct CollectedResponse {
@@ -1841,7 +1865,6 @@ struct CollectedResponse {
     pending_items: BTreeMap<usize, Value>,
     item_summary: ResponseItemSummary,
     usage: Option<TokenUsage>,
-    tokens_per_second: Option<f64>,
     rate_limits: Vec<crate::rate_limits::RateLimitSnapshot>,
     end_turn: Option<bool>,
     response_id: Option<String>,
@@ -1873,7 +1896,6 @@ impl CollectedResponse {
             pending_items: BTreeMap::new(),
             item_summary: ResponseItemSummary::default(),
             usage: None,
-            tokens_per_second: None,
             rate_limits: Vec::new(),
             end_turn: None,
             response_id: None,
@@ -1961,7 +1983,7 @@ impl CollectedResponse {
         }
     }
 
-    fn finish(self, events: Option<&UnboundedSender<AgentEvent>>) -> ApiResult<ModelResponse> {
+    fn finish(self) -> ApiResult<ModelResponse> {
         if !self.pending_items.is_empty() {
             return Err(ApiError::fatal(
                 "model response completed with a gap in output item indexes",
@@ -1971,9 +1993,6 @@ impl CollectedResponse {
         let response_id = self
             .response_id
             .ok_or_else(|| ApiError::fatal("response.completed omitted the response ID"))?;
-        if let Some(events) = events {
-            let _ = events.send(AgentEvent::ModelResponseThroughput(self.tokens_per_second));
-        }
         let items = match self.output_items {
             CollectedOutputItems::RetainedAndEmitted(items)
             | CollectedOutputItems::Retained(items) => items,
@@ -2031,6 +2050,7 @@ impl ResponseItemSummary {
     }
 }
 
+#[cfg(test)]
 fn process_event(
     data: &str,
     collected: &mut CollectedResponse,
@@ -2039,28 +2059,69 @@ fn process_event(
     expected_model: &str,
     server_model_warning_emitted: &mut bool,
 ) -> ApiResult<()> {
+    process_event_at(
+        data,
+        collected,
+        completed_items,
+        events,
+        expected_model,
+        server_model_warning_emitted,
+        Instant::now(),
+    )
+}
+
+fn process_event_at(
+    data: &str,
+    collected: &mut CollectedResponse,
+    completed_items: &UnboundedSender<Value>,
+    events: Option<&UnboundedSender<AgentEvent>>,
+    expected_model: &str,
+    server_model_warning_emitted: &mut bool,
+    received_at: Instant,
+) -> ApiResult<()> {
     if data == "[DONE]" {
         return Ok(());
     }
     let event: Value = serde_json::from_str(data)
         .map_err(|error| ApiError::fatal(format!("failed to decode SSE event: {error}")))?;
-    process_event_value(
+    process_event_value_at(
         event,
         collected,
         completed_items,
         events,
         expected_model,
         server_model_warning_emitted,
+        received_at,
     )
 }
 
 fn process_event_value(
+    event: Value,
+    collected: &mut CollectedResponse,
+    completed_items: &UnboundedSender<Value>,
+    events: Option<&UnboundedSender<AgentEvent>>,
+    expected_model: &str,
+    server_model_warning_emitted: &mut bool,
+) -> ApiResult<()> {
+    process_event_value_at(
+        event,
+        collected,
+        completed_items,
+        events,
+        expected_model,
+        server_model_warning_emitted,
+        Instant::now(),
+    )
+}
+
+fn process_event_value_at(
     mut event: Value,
     collected: &mut CollectedResponse,
     completed_items: &UnboundedSender<Value>,
     events: Option<&UnboundedSender<AgentEvent>>,
     expected_model: &str,
     server_model_warning_emitted: &mut bool,
+    received_at: Instant,
 ) -> ApiResult<()> {
     if let Some(snapshot) = crate::rate_limits::parse_rate_limit_event(&event) {
         collected.upsert_rate_limit(snapshot);
@@ -2104,7 +2165,10 @@ fn process_event_value(
             if let Some(Value::String(delta)) = event.get_mut("delta")
                 && let Some(events) = events
             {
-                let _ = events.send(AgentEvent::ModelMessageDelta(std::mem::take(delta)));
+                let _ = events.send(AgentEvent::ModelMessageDelta(ModelTextDelta::new(
+                    std::mem::take(delta),
+                    received_at,
+                )));
             }
         }
         Some("response.reasoning_summary_text.delta") => {
@@ -2117,11 +2181,6 @@ fn process_event_value(
         Some("response.reasoning_summary_part.added") => {
             if let Some(events) = events {
                 let _ = events.send(AgentEvent::ReasoningSummarySectionStarted);
-            }
-        }
-        Some("responsesapi.websocket_timing") => {
-            if let Some(tokens_per_second) = websocket_tokens_per_second(&event) {
-                collected.tokens_per_second = Some(tokens_per_second);
             }
         }
         Some("response.completed") => {
@@ -2358,14 +2417,6 @@ fn parse_usage(usage: &Value) -> Option<TokenUsage> {
                     )
             }),
     })
-}
-
-fn websocket_tokens_per_second(event: &Value) -> Option<f64> {
-    let time_between_tokens_ms = event
-        .pointer("/timing_metrics/engine_service_tbt_across_engine_calls_ms")?
-        .as_f64()?;
-    (time_between_tokens_ms.is_finite() && time_between_tokens_ms > 0.0)
-        .then_some(1_000.0 / time_between_tokens_ms)
 }
 
 fn websocket_url(base_url: &str, path: &str) -> ApiResult<String> {

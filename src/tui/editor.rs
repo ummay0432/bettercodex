@@ -4,11 +4,14 @@ use crate::input::PromptImageAttachment;
 use crate::input::UserPrompt;
 use crate::skills::SkillMention;
 use crate::skills::SkillSelection;
+use crate::tui::width::display_width;
+use std::borrow::Cow;
+use std::cell::Ref;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 /// Match Codex's threshold for replacing a paste with a compact composer element.
@@ -18,6 +21,7 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 pub(super) struct Editor {
     text: String,
     cursor: usize,
+    wrap_cache: RefCell<Option<WrapCache>>,
     preferred_column: Option<usize>,
     history: VecDeque<EditorHistoryEntry>,
     history_index: Option<usize>,
@@ -29,6 +33,12 @@ pub(super) struct Editor {
     history_has_older: bool,
     history_load_in_flight: bool,
     pending_history_load: Option<HistoryLoadIntent>,
+}
+
+#[derive(Debug)]
+struct WrapCache {
+    width: usize,
+    ranges: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,6 +267,7 @@ impl Editor {
         self.history_search = None;
         self.pending_history_load = None;
         self.text = text.into();
+        self.invalidate_wrapping();
         self.cursor = self.text.len();
         self.preferred_column = None;
         self.pending_pastes.clear();
@@ -417,6 +428,7 @@ impl Editor {
 
     fn apply_history_entry(&mut self, entry: EditorHistoryEntry) {
         self.text = entry.text;
+        self.invalidate_wrapping();
         self.cursor = self.text.len();
         self.preferred_column = None;
         self.pending_pastes = entry.pending_pastes;
@@ -620,24 +632,26 @@ impl Editor {
     }
 
     pub(super) fn move_vertical(&mut self, delta: isize, width: u16) {
-        let ranges = visual_ranges(&self.text, width.max(1) as usize);
+        let ranges = self.wrapped_ranges(usize::from(width.max(1)));
         let current = line_for_cursor(&ranges, self.cursor);
         let target = current.saturating_add_signed(delta).min(ranges.len() - 1);
         if target == current {
+            drop(ranges);
             self.cursor = if delta < 0 { 0 } else { self.text.len() };
             self.preferred_column = None;
             return;
         }
-        let column = self
-            .preferred_column
-            .unwrap_or_else(|| display_width(&self.text[ranges[current].start..self.cursor]));
-        self.preferred_column = Some(column);
+        let column = self.preferred_column.unwrap_or_else(|| {
+            editable_display_width(&self.text[ranges[current].start..self.cursor])
+        });
         let position = byte_at_column(&self.text, &ranges[target], column);
+        drop(ranges);
+        self.preferred_column = Some(column);
         self.cursor = self.nearest_atomic_boundary(position);
     }
 
     pub(super) fn desired_height(&self, width: u16) -> u16 {
-        visual_ranges(&self.text, usize::from(width.max(1)))
+        self.wrapped_ranges(usize::from(width.max(1)))
             .len()
             .try_into()
             .unwrap_or(u16::MAX)
@@ -645,7 +659,7 @@ impl Editor {
 
     pub(super) fn layout(&self, width: u16, max_height: u16) -> EditorLayout {
         let width = width.max(1) as usize;
-        let ranges = visual_ranges(&self.text, width);
+        let ranges = self.wrapped_ranges(width);
         let cursor_line = line_for_cursor(&ranges, self.cursor);
         let max_height = max_height.max(1) as usize;
         let first = cursor_line
@@ -727,7 +741,9 @@ impl Editor {
             image_ranges,
             history_search_ranges,
             cursor_row: (cursor_line - first) as u16,
-            cursor_column: display_width(&self.text[ranges[cursor_line].start..self.cursor]) as u16,
+            cursor_column: editable_display_width(
+                &self.text[ranges[cursor_line].start..self.cursor],
+            ) as u16,
             total_lines: ranges.len().try_into().unwrap_or(u16::MAX),
         }
     }
@@ -769,6 +785,7 @@ impl Editor {
             false
         });
         self.text.replace_range(range, value);
+        self.invalidate_wrapping();
         self.cursor = start + inserted_len;
         self.preferred_column = None;
     }
@@ -1136,6 +1153,7 @@ impl Editor {
 
     pub(super) fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
         self.text = snapshot.text;
+        self.invalidate_wrapping();
         self.cursor = snapshot.cursor;
         self.preferred_column = snapshot.preferred_column;
         self.history_index = snapshot.history_index;
@@ -1234,10 +1252,32 @@ impl Editor {
             expanded
         };
         self.cursor = 0;
+        self.invalidate_wrapping();
         self.preferred_column = None;
         self.history_index = None;
         self.saved_draft = None;
         (text, mentions, images)
+    }
+
+    fn wrapped_ranges(&self, width: usize) -> Ref<'_, Vec<Range<usize>>> {
+        {
+            let mut cache = self.wrap_cache.borrow_mut();
+            if cache.as_ref().is_none_or(|cache| cache.width != width) {
+                *cache = Some(WrapCache {
+                    width,
+                    ranges: visual_ranges(&self.text, width),
+                });
+            }
+        }
+
+        Ref::map(self.wrap_cache.borrow(), |cache| match cache {
+            Some(cache) => &cache.ranges,
+            None => unreachable!("editor wrap cache was populated above"),
+        })
+    }
+
+    fn invalidate_wrapping(&mut self) {
+        *self.wrap_cache.get_mut() = None;
     }
 }
 
@@ -1387,6 +1427,11 @@ fn end_of_next_word(text: &str, cursor: usize) -> usize {
 }
 
 pub(super) fn visual_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
+    let display_text = text_for_display(text);
+    visual_ranges_for_display(&display_text, width)
+}
+
+fn visual_ranges_for_display(text: &str, width: usize) -> Vec<Range<usize>> {
     if text.is_empty() {
         return std::iter::once(0..0).collect();
     }
@@ -1513,8 +1558,18 @@ fn next_boundary(text: &str, cursor: usize) -> usize {
         .map_or(text.len(), |(index, _)| cursor + index)
 }
 
-fn display_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text.replace('\t', " ").as_str())
+/// Tabs occupy one rendered column. Since a tab and a space are both one byte, wrapping the
+/// display copy preserves ranges into the editable source.
+fn text_for_display(text: &str) -> Cow<'_, str> {
+    if text.contains('\t') {
+        Cow::Owned(text.replace('\t', " "))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+fn editable_display_width(text: &str) -> usize {
+    display_width(text_for_display(text).as_ref())
 }
 
 #[cfg(test)]
@@ -1539,6 +1594,38 @@ mod tests {
         assert_eq!(layout.lines, ["three ", "four"]);
         assert_eq!(layout.cursor_row, 1);
         assert_eq!(layout.cursor_column, 4);
+    }
+
+    #[test]
+    fn layout_matches_rendered_tabs_and_halfwidth_sound_marks_after_edits() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::style::Style;
+
+        let mut editor = Editor::default();
+        for (text, width, expected_lines, cursor) in [
+            ("1234\t5", 5, &["1234 ", "5"][..], (1, 1)),
+            ("12ｶﾞx", 4, &["12ｶﾞ", "x"][..], (1, 1)),
+        ] {
+            editor.set_text(text);
+            assert_eq!(editor.desired_height(width), 2);
+            let layout = editor.layout(width, 2);
+            assert_eq!(layout.lines, expected_lines);
+            assert_eq!((layout.cursor_column, layout.cursor_row), cursor);
+
+            let area = Rect::new(0, 0, width, 2);
+            let mut buffer = Buffer::empty(area);
+            for (row, line) in layout.lines.iter().enumerate() {
+                buffer.set_string(0, row as u16, line, Style::default());
+            }
+            assert_eq!(buffer[(0, 1)].symbol(), expected_lines[1]);
+            if text.contains('ｶ') {
+                assert_eq!(buffer[(2, 0)].symbol(), "ｶﾞ");
+            }
+        }
+
+        editor.insert("y");
+        assert_eq!(editor.layout(4, 2).lines, ["12ｶﾞ", "xy"]);
     }
 
     #[test]
