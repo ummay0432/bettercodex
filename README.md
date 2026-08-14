@@ -16,19 +16,12 @@ permissions.
 ## Install
 
 bettercodex supports Apple silicon macOS 12+, Ubuntu 22.04+ x86-64, and Debian
-12+ x86-64. Native Windows 11 x64 is available as a developer preview while the
-native automated and interactive terminal matrices are completed.
+12+ x86-64.
 
 On macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
-```
-
-In Windows PowerShell 5.1 or newer:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.ps1' | iex"
 ```
 
 Open a new terminal, then run:

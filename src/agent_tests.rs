@@ -2,6 +2,7 @@ use super::*;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -14,163 +15,641 @@ impl Drop for DirectoryCleanup {
     }
 }
 
+fn png(width: u32, height: u32) -> Vec<u8> {
+    let image = image::ImageBuffer::from_pixel(width, height, image::Rgba([10_u8, 20, 30, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    bytes.into_inner()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_notify_follows_the_terminal_exec_output_in_model_history() -> Result<()> {
-    let root = temporary_root("code-mode-notify-order");
+async fn direct_bash_output_is_returned_in_ordinary_function_history() -> Result<()> {
+    let root = temporary_root("direct-bash-output");
     let _cleanup = DirectoryCleanup(root.clone());
     let tool_call = json!({
-        "type": "custom_tool_call",
-        "id": "ctc_notify",
-        "call_id": "call_notify",
-        "name": "exec",
-        "input": "await tools.update_plan({plan: [{step: 'exercise nested dispatch', status: 'completed'}]}); notify('notification marker'); text('terminal marker');",
+        "type": "function_call",
+        "id": "fc_bash",
+        "call_id": "call_bash",
+        "namespace": "functions",
+        "name": "bash",
+        "arguments": r#"{"command":"printf terminal-marker"}"#,
     });
     let answer = json!({
         "type": "message",
-        "id": "msg_notify_answer",
+        "id": "msg_bash_answer",
         "role": "assistant",
         "phase": "final_answer",
-        "content": [{"type": "output_text", "text": "notification observed"}],
+        "content": [{"type": "output_text", "text": "command observed"}],
     });
     let selection = ModelSelection::default();
     let (base_url, requests, server) = serve_responses(vec![
         (
             200,
-            completed_sse("resp_notify_exec", &selection.model, &tool_call),
+            completed_sse("resp_bash", &selection.model, &tool_call),
+        ),
+        (200, completed_sse("resp_answer", &selection.model, &answer)),
+    ]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+
+    assert_eq!(agent.submit("run a command").await?, "command observed");
+
+    let _first_request = requests.recv_timeout(Duration::from_secs(2))?;
+    let second_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    server
+        .join()
+        .map_err(|_| anyhow!("direct bash test server panicked"))?;
+
+    let output = second_request["input"]
+        .as_array()
+        .and_then(|input| {
+            input.iter().find(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "call_bash"
+            })
+        })
+        .and_then(|item| item["output"].as_str())
+        .ok_or_else(|| anyhow!("follow-up request omitted direct bash output"))?;
+    let output: Value = serde_json::from_str(output)?;
+    assert_eq!(output["stdout"], "terminal-marker");
+    assert_eq!(output["stderr"], "");
+    assert_eq!(output["exit_code"], 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_turn_repairs_an_unhandled_function_call() -> Result<()> {
+    let root = temporary_root("failed-turn-function-repair");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let malformed_call = json!({
+        "type": "function_call",
+        "id": "fc_unhandled",
+        "call_id": "call_unhandled",
+        "namespace": "functions",
+        "name": "bash",
+    });
+    let selection = ModelSelection::default();
+    let (base_url, requests, server) = serve_responses(vec![(
+        200,
+        completed_sse("resp_unhandled", &selection.model, &malformed_call),
+    )]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+
+    let error = agent.submit("run an invalid call").await.unwrap_err();
+    assert!(error.to_string().contains("no text or tool call"));
+    let call_index = agent
+        .conversation
+        .items()
+        .iter()
+        .position(|item| item["call_id"] == "call_unhandled")
+        .unwrap();
+    let output = &agent.conversation.items()[call_index + 1];
+    assert_eq!(output["type"], "function_call_output");
+    assert_eq!(output["call_id"], "call_unhandled");
+    assert_eq!(output["output"], "aborted");
+
+    let _request = requests.recv_timeout(Duration::from_secs(2))?;
+    server
+        .join()
+        .map_err(|_| anyhow!("failed-turn repair test server panicked"))?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hosted_web_search_and_citations_survive_the_next_responses_request() -> Result<()> {
+    let root = temporary_root("hosted-web-search-history");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let search_call = json!({
+        "type": "web_search_call",
+        "id": "ws_history",
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "queries": ["current source"],
+        },
+    });
+    let cited_answer = json!({
+        "type": "message",
+        "id": "msg_cited_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{
+            "type": "output_text",
+            "text": "A current answer.[1]",
+            "annotations": [{
+                "type": "url_citation",
+                "start_index": 17,
+                "end_index": 20,
+                "url": "https://example.com/source",
+                "title": "Example source",
+            }],
+        }],
+    });
+    let follow_up_answer = json!({
+        "type": "message",
+        "id": "msg_follow_up",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "history observed"}],
+    });
+    let selection = ModelSelection::default();
+    let (base_url, requests, server) = serve_responses(vec![
+        (
+            200,
+            completed_sse_items(
+                "resp_hosted_search",
+                &selection.model,
+                &[search_call.clone(), cited_answer.clone()],
+            ),
         ),
         (
             200,
-            completed_sse("resp_notify_answer", &selection.model, &answer),
+            completed_sse(
+                "resp_hosted_search_follow_up",
+                &selection.model,
+                &follow_up_answer,
+            ),
         ),
     ]);
     let mut agent = test_agent(&root, base_url, selection)?;
 
     assert_eq!(
-        agent.submit("exercise exec notify").await?,
-        "notification observed"
+        agent.submit("find a current source").await?,
+        "A current answer.[1]\n\nSources:\n1. Example source: https://example.com/source"
+    );
+    assert_eq!(
+        agent.submit("use the same source").await?,
+        "history observed"
     );
 
     let _first_request = requests.recv_timeout(Duration::from_secs(2))?;
     let second_request = requests.recv_timeout(Duration::from_secs(2))?.body;
     server
         .join()
-        .map_err(|_| anyhow!("code mode notify test server panicked"))?;
-
+        .map_err(|_| anyhow!("hosted web search history test server panicked"))?;
     let input = second_request["input"]
         .as_array()
-        .ok_or_else(|| anyhow!("code mode follow-up request omitted input"))?;
-    let terminal_index = input
+        .ok_or_else(|| anyhow!("web search follow-up request omitted input"))?;
+    let search_index = input
+        .iter()
+        .position(|item| item == &search_call)
+        .ok_or_else(|| anyhow!("follow-up request rewrote or omitted the web search call"))?;
+    let answer_index = input
+        .iter()
+        .position(|item| item == &cited_answer)
+        .ok_or_else(|| anyhow!("follow-up request rewrote or omitted citation annotations"))?;
+    let follow_up_index = input
         .iter()
         .position(|item| {
-            item["type"] == "custom_tool_call_output"
-                && item["call_id"] == "call_notify"
-                && item.get("name").is_none()
-                && item["output"].to_string().contains("terminal marker")
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|content| {
+                        content.get("text").and_then(Value::as_str) == Some("use the same source")
+                    })
         })
-        .ok_or_else(|| anyhow!("code mode follow-up omitted terminal exec output"))?;
-    let notification_index = input
+        .ok_or_else(|| anyhow!("web search follow-up request omitted the new prompt"))?;
+    assert!(search_index < answer_index && answer_index < follow_up_index);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_shell_output_reaches_the_next_model_turn_as_context() -> Result<()> {
+    let root = temporary_root("operator-shell-context");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let output = Ok(json!({
+        "stdout": "operator stdout",
+        "stderr": "operator stderr",
+        "exit_code": 7,
+    }));
+    let context = crate::context::user_shell_command_context(
+        "printf operator",
+        &output,
+        selection.truncation_policy(),
+    );
+    let answer = json!({
+        "type": "message",
+        "id": "msg_operator_context_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "operator output observed"}],
+    });
+    let (base_url, requests, server) = serve_responses(vec![(
+        200,
+        completed_sse("resp_operator_context", &selection.model, &answer),
+    )]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+
+    agent.record_operator_shell_context(context.clone())?;
+    assert!(agent.prompt_history().is_empty());
+    assert_eq!(
+        agent.submit("explain the operator command").await?,
+        "operator output observed"
+    );
+
+    let request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    server
+        .join()
+        .map_err(|_| anyhow!("operator context test server panicked"))?;
+    let input = request["input"]
+        .as_array()
+        .ok_or_else(|| anyhow!("operator context request omitted input"))?;
+    let contains_text = |item: &Value, expected: &str| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|content| content.get("text").and_then(Value::as_str) == Some(expected))
+    };
+    let context_index = input
         .iter()
-        .position(|item| {
-            item["type"] == "custom_tool_call_output"
-                && item["call_id"] == "call_notify"
-                && item["name"] == "exec"
-                && item["output"] == "notification marker"
-        })
-        .ok_or_else(|| anyhow!("code mode follow-up omitted notify output"))?;
-    assert!(
-        terminal_index < notification_index,
-        "notify output must follow the terminal exec output: {input:?}"
+        .position(|item| contains_text(item, &context))
+        .ok_or_else(|| anyhow!("operator shell output was absent from model context"))?;
+    let prompt_index = input
+        .iter()
+        .position(|item| contains_text(item, "explain the operator command"))
+        .ok_or_else(|| anyhow!("operator context request omitted the user prompt"))?;
+    assert!(context_index < prompt_index);
+    assert!(context.contains("Exit code: 7"));
+    assert!(context.contains("Stdout:\noperator stdout"));
+    assert!(context.contains("Stderr:\noperator stderr"));
+    assert_eq!(
+        agent.prompt_history(),
+        vec!["explain the operator command".to_string()]
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_web_search_receives_the_operator_context_from_before_model_output() -> Result<()>
-{
-    let root = temporary_root("standalone-web-search-context");
+async fn direct_tool_calls_execute_concurrently_with_ordered_exclusive_barriers() -> Result<()> {
+    let root = temporary_root("parallel-direct-tools");
     let _cleanup = DirectoryCleanup(root.clone());
+    let first_call = json!({
+        "type": "function_call",
+        "id": "fc_first",
+        "call_id": "call_first",
+        "name": "bash",
+        "arguments": r#"{"command":"touch first.started; while [ ! -e second.started ]; do sleep 0.01; done; printf first","timeout":5}"#,
+    });
+    let second_call = json!({
+        "type": "function_call",
+        "id": "fc_second",
+        "call_id": "call_second",
+        "name": "bash",
+        "arguments": r#"{"command":"touch second.started; while [ ! -e first.started ]; do sleep 0.01; done; printf second","timeout":5}"#,
+    });
+    let answer = json!({
+        "type": "message",
+        "id": "msg_parallel_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "both observed"}],
+    });
+    let before_mutation = json!({
+        "type": "function_call",
+        "id": "fc_before_mutation",
+        "call_id": "call_before_mutation",
+        "name": "bash",
+        "arguments": r#"{"command":"sleep 0.2; if [ -e mutation.txt ]; then printf overlap; else printf before; fi","timeout":5}"#,
+    });
+    let mutation = json!({
+        "type": "function_call",
+        "id": "fc_mutation",
+        "call_id": "call_mutation",
+        "name": "write",
+        "arguments": r#"{"path":"mutation.txt","content":"done"}"#,
+    });
+    let after_mutation = json!({
+        "type": "function_call",
+        "id": "fc_after_mutation",
+        "call_id": "call_after_mutation",
+        "name": "bash",
+        "arguments": r#"{"command":"if [ -e mutation.txt ]; then printf after; else printf bypassed; fi","timeout":5}"#,
+    });
+    let barrier_answer = json!({
+        "type": "message",
+        "id": "msg_barrier_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "barrier observed"}],
+    });
     let selection = ModelSelection::default();
-    let prior_answer = json!({
-        "type": "message",
-        "id": "msg_prior_answer",
-        "role": "assistant",
-        "phase": "final_answer",
-        "content": [{"type": "output_text", "text": "prior answer"}],
-    });
-    let current_commentary = json!({
-        "type": "message",
-        "id": "msg_current_commentary",
-        "role": "assistant",
-        "phase": "commentary",
-        "content": [{"type": "output_text", "text": "current commentary"}],
-    });
-    let tool_call = json!({
-        "type": "custom_tool_call",
-        "id": "ctc_search",
-        "call_id": "call_search",
-        "name": "exec",
-        "input": "const result = await tools.web__run({search_query: [{q: 'cached context'}]}); text(result);",
-    });
-    let final_answer = json!({
-        "type": "message",
-        "id": "msg_search_answer",
-        "role": "assistant",
-        "phase": "final_answer",
-        "content": [{"type": "output_text", "text": "search complete"}],
-    });
-    let (base_url, requests, server) = serve_agent_http(vec![
-        AgentHttpReply::responses(completed_sse("resp_prior", &selection.model, &prior_answer)),
-        AgentHttpReply::responses(completed_sse_items(
-            "resp_search_exec",
-            &selection.model,
-            &[current_commentary, tool_call],
-        )),
-        AgentHttpReply {
-            expected_path: "/alpha/search",
-            status: 200,
-            content_type: "application/json",
-            body: json!({"output": "search result"}).to_string(),
-        },
-        AgentHttpReply::responses(completed_sse(
-            "resp_search_answer",
-            &selection.model,
-            &final_answer,
-        )),
+    let (base_url, requests, server) = serve_responses(vec![
+        (
+            200,
+            completed_sse_items(
+                "resp_parallel",
+                &selection.model,
+                &[first_call, second_call],
+            ),
+        ),
+        (
+            200,
+            completed_sse("resp_parallel_answer", &selection.model, &answer),
+        ),
+        (
+            200,
+            completed_sse_items(
+                "resp_barrier",
+                &selection.model,
+                &[before_mutation, mutation, after_mutation],
+            ),
+        ),
+        (
+            200,
+            completed_sse("resp_barrier_answer", &selection.model, &barrier_answer),
+        ),
     ]);
     let mut agent = test_agent(&root, base_url, selection)?;
 
-    assert_eq!(agent.submit("previous question").await?, "prior answer");
-    assert_eq!(agent.submit("current question").await?, "search complete");
+    assert_eq!(agent.submit("run both probes").await?, "both observed");
 
-    let captured = (0..4)
-        .map(|_| requests.recv_timeout(Duration::from_secs(2)))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let _first_request = requests.recv_timeout(Duration::from_secs(2))?;
+    let second_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+
+    let outputs = second_request["input"]
+        .as_array()
+        .ok_or_else(|| anyhow!("parallel follow-up omitted input"))?
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| {
+            let output = item["output"]
+                .as_str()
+                .ok_or_else(|| anyhow!("parallel tool output was not text"))?;
+            Ok((
+                item["call_id"].clone(),
+                serde_json::from_str::<Value>(output)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].0, "call_first");
+    assert_eq!(outputs[0].1["stdout"], "first");
+    assert_eq!(outputs[0].1["exit_code"], 0);
+    assert_eq!(outputs[1].0, "call_second");
+    assert_eq!(outputs[1].1["stdout"], "second");
+    assert_eq!(outputs[1].1["exit_code"], 0);
+
+    assert_eq!(
+        agent.submit("run around one file mutation").await?,
+        "barrier observed"
+    );
+    let _third_request = requests.recv_timeout(Duration::from_secs(2))?;
+    let fourth_request = requests.recv_timeout(Duration::from_secs(2))?.body;
     server
         .join()
-        .map_err(|_| anyhow!("standalone web search test server panicked"))?;
-    let search = captured
-        .iter()
-        .find(|request| request.path == "/alpha/search")
-        .ok_or_else(|| anyhow!("standalone web search request was not captured"))?;
-    let messages = search.body["input"]
+        .map_err(|_| anyhow!("parallel direct tool test server panicked"))?;
+    let outputs = fourth_request["input"]
         .as_array()
-        .ok_or_else(|| anyhow!("standalone web search request omitted input"))?
+        .ok_or_else(|| anyhow!("exclusive follow-up omitted input"))?
         .iter()
-        .map(|message| {
-            (
-                message["role"].as_str().unwrap_or_default(),
-                message["content"][0]["text"].as_str().unwrap_or_default(),
-            )
+        .filter(|item| item["type"] == "function_call_output")
+        .collect::<Vec<_>>();
+    let before: Value = serde_json::from_str(
+        outputs[2]["output"]
+            .as_str()
+            .ok_or_else(|| anyhow!("before-mutation output was not text"))?,
+    )?;
+    assert_eq!(before["stdout"], "before");
+    assert!(
+        outputs[3]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("mutation.txt"))
+    );
+    let after: Value = serde_json::from_str(
+        outputs[4]["output"]
+            .as_str()
+            .ok_or_else(|| anyhow!("after-mutation output was not text"))?,
+    )?;
+    assert_eq!(after["stdout"], "after");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_parallel_tools_records_every_output_in_model_order() -> Result<()> {
+    let root = temporary_root("cancelled-parallel-direct-tools");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let first_call = json!({
+        "type": "function_call",
+        "id": "fc_cancel_first",
+        "call_id": "call_cancel_first",
+        "name": "bash",
+        "arguments": r#"{"command":"touch cancel-first.started; while :; do sleep 1; done"}"#,
+    });
+    let second_call = json!({
+        "type": "function_call",
+        "id": "fc_cancel_second",
+        "call_id": "call_cancel_second",
+        "name": "bash",
+        "arguments": r#"{"command":"touch cancel-second.started; while :; do sleep 1; done"}"#,
+    });
+    let trailing_mutation = json!({
+        "type": "function_call",
+        "id": "fc_cancel_mutation",
+        "call_id": "call_cancel_mutation",
+        "name": "write",
+        "arguments": r#"{"path":"must-not-exist.txt","content":"unexpected"}"#,
+    });
+    let selection = ModelSelection::default();
+    let (base_url, requests, server) = serve_responses(vec![(
+        200,
+        completed_sse_items(
+            "resp_cancel_parallel",
+            &selection.model,
+            &[first_call, second_call, trailing_mutation],
+        ),
+    )]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+    let session_id = agent.session_id().parse::<uuid::Uuid>()?;
+    let (handle, control) = TurnControl::channel();
+    let cancellation = handle.clone();
+    let repo = root.join("repo");
+    let cancel_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if repo.join("cancel-first.started").exists()
+                    && repo.join("cancel-second.started").exists()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("parallel tools did not both start before cancellation"))?;
+        cancellation.cancel();
+        Ok::<_, anyhow::Error>(())
+    });
+    let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    assert_eq!(
+        agent
+            .submit_with_control(UserInput::text("run until interrupted"), events, control)
+            .await?,
+        SubmitOutcome::Cancelled
+    );
+    cancel_task.await.context("cancellation task failed")??;
+    let _request = requests.recv_timeout(Duration::from_secs(2))?;
+    server
+        .join()
+        .map_err(|_| anyhow!("cancelled parallel tool test server panicked"))?;
+
+    let outputs = agent
+        .conversation
+        .items()
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .collect::<Vec<_>>();
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(outputs[0]["call_id"], "call_cancel_first");
+    assert_eq!(outputs[1]["call_id"], "call_cancel_second");
+    assert_eq!(outputs[2]["call_id"], "call_cancel_mutation");
+    for output in &outputs[..2] {
+        let body: Value = serde_json::from_str(
+            output["output"]
+                .as_str()
+                .ok_or_else(|| anyhow!("cancelled Bash output was not text"))?,
+        )?;
+        assert_eq!(body["exit_code"], 130);
+    }
+    assert!(
+        outputs[2]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("interrupted"))
+    );
+    assert!(!root.join("repo/must-not-exist.txt").exists());
+    assert!(
+        agent
+            .conversation
+            .items()
+            .last()
+            .and_then(|item| item.pointer("/content/0/text"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("<turn_aborted>"))
+    );
+
+    drop(agent);
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &root.join("repo"))?;
+    assert!(loaded.unfinished_turn.is_none());
+    let resumed_tools = loaded
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            SessionTranscriptItem::Tool { tool } => Some(tool.call_id.as_str()),
+            _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        messages,
+        resumed_tools,
         [
-            ("user", "previous question"),
-            ("assistant", "prior answer"),
-            ("user", "current question"),
+            "call_cancel_first",
+            "call_cancel_second",
+            "call_cancel_mutation"
         ]
     );
+    let resumed_outputs = loaded
+        .history
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["call_id"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resumed_outputs,
+        [
+            "call_cancel_first",
+            "call_cancel_second",
+            "call_cancel_mutation"
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_read_image_output_reaches_responses_and_retains_history_detail() -> Result<()> {
+    let root = temporary_root("direct-read-image-output");
+    let _cleanup = DirectoryCleanup(root.clone());
+    std::fs::create_dir_all(root.join("repo"))?;
+    std::fs::write(root.join("repo/visual.dat"), png(6401, 1))?;
+    let tool_call = json!({
+        "type": "function_call",
+        "id": "fc_read_image",
+        "call_id": "call_read_image",
+        "namespace": "functions",
+        "name": "read",
+        "arguments": r#"{"path":"visual.dat","detail":"original"}"#,
+    });
+    let answer = json!({
+        "type": "message",
+        "id": "msg_read_image_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "image observed"}],
+    });
+    let selection = ModelSelection::default();
+    let (base_url, requests, server) = serve_responses(vec![
+        (
+            200,
+            completed_sse("resp_read_image", &selection.model, &tool_call),
+        ),
+        (
+            200,
+            completed_sse("resp_read_image_answer", &selection.model, &answer),
+        ),
+    ]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+
+    assert_eq!(agent.submit("inspect the image").await?, "image observed");
+
+    let _first_request = requests.recv_timeout(Duration::from_secs(2))?;
+    let second_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    server
+        .join()
+        .map_err(|_| anyhow!("direct read image test server panicked"))?;
+
+    let request_image = second_request["input"]
+        .as_array()
+        .and_then(|input| {
+            input.iter().find(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "call_read_image"
+            })
+        })
+        .and_then(|item| item["output"].as_array())
+        .and_then(|items| items.first())
+        .ok_or_else(|| anyhow!("follow-up request omitted direct read image output"))?;
+    assert_eq!(request_image["type"], "input_image");
+    assert_eq!(request_image["detail"], "original");
+    let request_image_url = request_image["image_url"]
+        .as_str()
+        .filter(|url| url.starts_with("data:image/png;base64,"))
+        .ok_or_else(|| anyhow!("direct read image output was not a PNG data URL"))?;
+    let (_, request_image_payload) = request_image_url
+        .split_once(',')
+        .ok_or_else(|| anyhow!("direct read image output omitted its payload"))?;
+    use base64::Engine as _;
+    use image::GenericImageView as _;
+    let request_image_bytes = base64::engine::general_purpose::STANDARD
+        .decode(request_image_payload)
+        .context("decode direct read image output")?;
+    assert_eq!(
+        image::load_from_memory(&request_image_bytes)
+            .context("decode direct read prepared image")?
+            .dimensions(),
+        (6401, 1)
+    );
+
+    let history_image = agent
+        .conversation
+        .items()
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_read_image")
+        .and_then(|item| item["output"].as_array())
+        .and_then(|items| items.first())
+        .ok_or_else(|| anyhow!("conversation history omitted direct read image output"))?;
+    assert_eq!(history_image["detail"], "original");
     Ok(())
 }
 
@@ -303,6 +782,98 @@ async fn websocket_warmup_failure_is_not_retried_on_first_submission() -> Result
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_input_after_cancelled_startup_prewarm_closes_the_saved_turn() -> Result<()> {
+    let root = temporary_root("cancelled-prewarm-input-failure");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let mut agent = test_agent(&root, "http://127.0.0.1:1".to_string(), selection)?;
+    agent.startup_prewarm = Some(StartupPrewarm {
+        task: Some(tokio::spawn(std::future::pending::<
+            std::result::Result<ApiClient, ApiError>,
+        >())),
+        started_at: Instant::now(),
+    });
+    let image = crate::input::PromptImage::from_bytes(
+        Path::new("corrupt.png"),
+        b"\x89PNG\r\n\x1a\ncorrupt".to_vec(),
+        crate::input::ImageDetail::High,
+    )?;
+    let prompt = crate::input::UserPrompt::with_attachments(
+        "[image]",
+        Vec::new(),
+        vec![crate::input::PromptImageAttachment::new(image, 0..7)],
+    );
+    let session_id = agent.session_id().parse::<uuid::Uuid>()?;
+    let (handle, control) = TurnControl::channel();
+    handle.cancel();
+    let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    assert!(
+        agent
+            .submit_with_control(UserInput::prompt(prompt), events, control)
+            .await
+            .is_err()
+    );
+    assert!(handle.steer(UserInput::text("late steering")).is_err());
+
+    drop(agent);
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &root.join("repo"))?;
+    assert!(loaded.unfinished_turn.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_pre_turn_compaction_retains_the_submitted_input() -> Result<()> {
+    let root = temporary_root("cancelled-pre-turn-compaction-input");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let mut agent = test_agent(&root, "http://127.0.0.1:1".to_string(), selection)?;
+    agent.startup_prewarm = None;
+    let compact_at = agent
+        .conversation
+        .model_selection()
+        .auto_compact_token_limit();
+    agent.conversation.record_usage(
+        Some(crate::usage::TokenUsage {
+            input_tokens: compact_at,
+            total_tokens: compact_at,
+            ..crate::usage::TokenUsage::default()
+        }),
+        false,
+        Vec::new(),
+    )?;
+    assert!(agent.conversation.needs_compaction());
+
+    let session_id = agent.session_id().parse::<uuid::Uuid>()?;
+    let (handle, control) = TurnControl::channel();
+    handle.cancel();
+    let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let submitted = "retain this input after interrupted compaction";
+
+    assert_eq!(
+        agent
+            .submit_with_control(UserInput::text(submitted), events, control)
+            .await?,
+        SubmitOutcome::Cancelled
+    );
+    assert!(agent.prompt_history().iter().any(|text| text == submitted));
+
+    drop(agent);
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &root.join("repo"))?;
+    assert!(loaded.unfinished_turn.is_none());
+    assert!(loaded.history.iter().any(|item| {
+        item.get("role").and_then(Value::as_str) == Some("user")
+            && item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|content| content.get("text").and_then(Value::as_str) == Some(submitted))
+    }));
+    Ok(())
+}
+
 fn temporary_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "bettercodex-agent-{name}-{}-{}",
@@ -332,17 +903,12 @@ fn test_agent_with_transport(
         0,
         selection,
         ServiceTier::default(),
-        crate::tools::ToolConfiguration::default(),
         base_url,
     )?;
     if !websocket {
         api.fall_back_to_http();
     }
-    let tools = ToolRuntime::new(
-        cwd.clone(),
-        api.web_search_client(),
-        crate::tools::ToolConfiguration::default(),
-    );
+    let tools = ToolRuntime::new(cwd.clone());
     let startup_prewarm = StartupPrewarm::schedule(&api);
     Ok(Agent {
         cwd,
@@ -543,19 +1109,7 @@ struct AgentHttpReply {
     body: String,
 }
 
-impl AgentHttpReply {
-    fn responses(body: String) -> Self {
-        Self {
-            expected_path: "/responses",
-            status: 200,
-            content_type: "text/event-stream",
-            body,
-        }
-    }
-}
-
 struct CapturedAgentRequest {
-    path: String,
     body: Value,
 }
 
@@ -577,9 +1131,19 @@ fn serve_agent_http(
                 .expect("agent HTTP request timed out");
             let path = request.url().to_string();
             assert_eq!(path, reply.expected_path);
-            let compressed = request.headers().iter().any(|header| {
-                header.field.equiv("content-encoding") && header.value.as_str() == "zstd"
-            });
+            let headers = request
+                .headers()
+                .iter()
+                .map(|header| {
+                    (
+                        header.field.as_str().to_string().to_ascii_lowercase(),
+                        header.value.as_str().to_string(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let compressed = headers
+                .get("content-encoding")
+                .is_some_and(|value| value == "zstd");
             let mut body = Vec::new();
             request
                 .as_reader()
@@ -591,7 +1155,6 @@ fn serve_agent_http(
             }
             requests_tx
                 .send(CapturedAgentRequest {
-                    path,
                     body: serde_json::from_slice(&body).expect("decode agent HTTP request JSON"),
                 })
                 .expect("capture agent HTTP request");

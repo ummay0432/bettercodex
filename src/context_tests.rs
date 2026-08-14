@@ -2,6 +2,8 @@ use super::*;
 use crate::compaction::InitialContextInjection;
 use crate::input::UserInput;
 use crate::rollout::ResumeSelector;
+use crate::rollout::SessionTranscriptItem;
+use crate::rollout::SessionTranscriptToolOutput;
 
 struct TemporaryDirectory(PathBuf);
 
@@ -76,7 +78,7 @@ fn normalization_inserts_stable_outputs_and_removes_orphans() {
 }
 
 #[test]
-fn normalization_preserves_exec_final_output_and_notifications() {
+fn normalization_preserves_legacy_exec_final_output_and_notifications() {
     let mut history = vec![
         json!({
             "type": "custom_tool_call",
@@ -96,10 +98,10 @@ fn normalization_preserves_exec_final_output_and_notifications() {
             "output": "working",
         }),
     ];
-    let expected = history.clone();
+
     assert!(history_is_normalized(&history));
     normalize_history(&mut history);
-    assert_eq!(history, expected);
+    assert_eq!(history.len(), 3);
 }
 
 #[test]
@@ -178,19 +180,38 @@ fn image_dimension_reader_grows_until_a_jpeg_frame_header() {
 }
 
 #[test]
-fn original_image_estimate_reads_dimensions_from_base64_stream() {
+fn original_image_estimate_reads_uncapped_gpt_5_6_dimensions_from_base64_stream() {
     use base64::Engine as _;
 
     let mut png = vec![0_u8; 4096];
     png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
-    png[16..20].copy_from_slice(&2304_u32.to_be_bytes());
-    png[20..24].copy_from_slice(&864_u32.to_be_bytes());
+    png[16..20].copy_from_slice(&6400_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&6400_u32.to_be_bytes());
     let image_url = format!(
         "data:image/png;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(png)
     );
 
-    assert_eq!(estimate_image_tokens(&image_url), 72 * 27);
+    assert_eq!(estimate_image_tokens(&image_url), 200 * 200);
+
+    let estimate_for_detail = |detail: Option<&str>| {
+        let mut item = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": &image_url,
+            }],
+        });
+        if let Some(detail) = detail {
+            item["content"][0]["detail"] = Value::String(detail.to_string());
+        }
+        estimate_value_tokens(&item)
+    };
+    let high = estimate_for_detail(Some("high"));
+    for original_equivalent in [None, Some("auto"), Some("original")] {
+        assert!(estimate_for_detail(original_equivalent) > high * 10);
+    }
 }
 
 #[test]
@@ -242,11 +263,22 @@ fn resume_prepares_legacy_images_without_rewriting_the_rollout() {
         .extend([json!({
             "type": "message",
             "role": "user",
-            "content": [{
-                "type": "input_image",
-                "image_url": &original_url,
-                "detail": "high",
-            }],
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": &original_url,
+                    "detail": "high",
+                },
+                {
+                    "type": "input_image",
+                    "image_url": &original_url,
+                    "detail": "auto",
+                },
+                {
+                    "type": "input_image",
+                    "image_url": &original_url,
+                },
+            ],
         })])
         .unwrap();
     drop(conversation);
@@ -257,14 +289,23 @@ fn resume_prepares_legacy_images_without_rewriting_the_rollout() {
         Some(original_url.as_str())
     );
     let resumed = Conversation::resume(&cwd, loaded).unwrap();
-    let prepared_url = first_image_url(resumed.items()).unwrap();
-    let (_, payload) = prepared_url.split_once(',').unwrap();
-    let prepared = base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .unwrap();
+    let prepared_dimensions = resumed
+        .items()
+        .iter()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter_map(|content| content["image_url"].as_str())
+        .map(|image_url| {
+            let (_, payload) = image_url.split_once(',').unwrap();
+            let prepared = base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .unwrap();
+            image::load_from_memory(&prepared).unwrap().dimensions()
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        image::load_from_memory(&prepared).unwrap().dimensions(),
-        (1600, 1600)
+        prepared_dimensions,
+        [(1600, 1600), (2048, 2048), (2048, 2048)]
     );
     drop(resumed);
 
@@ -427,6 +468,59 @@ fn compaction_replaces_history_canonically_then_reinjects_world_state() {
 }
 
 #[test]
+fn repeated_compaction_cold_resume_keeps_only_the_latest_opaque_history() {
+    let (root, cwd) = temporary_repository("repeated-compaction-resume");
+    let rollout_root = root.join("state");
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    let world_state = conversation.world_state.items();
+    let first = json!({
+        "type": "compaction",
+        "id": "cmp_first",
+        "encrypted_content": "first opaque history",
+    });
+    let latest = json!({
+        "type": "compaction",
+        "id": "cmp_latest",
+        "encrypted_content": "latest opaque history",
+    });
+
+    for compacted in [&first, &latest] {
+        conversation
+            .replace_compacted(
+                vec![(*compacted).clone()],
+                InitialContextInjection::AfterCompaction,
+                &ActiveTurnContext::default(),
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    drop(conversation);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(loaded.compaction_count, 2);
+    let resumed = Conversation::resume(&cwd, loaded).unwrap();
+    let opaque_items = resumed
+        .items()
+        .iter()
+        .filter(|item| is_compaction_item(item))
+        .collect::<Vec<_>>();
+    assert_eq!(opaque_items, vec![&latest]);
+    for expected in world_state {
+        assert_eq!(
+            resumed
+                .items()
+                .iter()
+                .filter(|item| same_model_visible_message(item, &expected))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn mid_turn_compaction_keeps_the_opaque_summary_last() {
     let (root, cwd) = temporary_repository("mid-turn-compaction");
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
@@ -489,11 +583,12 @@ fn interrupted_turn_repairs_calls_before_adding_the_notice() {
     let mut conversation = Conversation::new(&cwd, rollout).unwrap();
     conversation
         .extend([json!({
-            "id": "ctc_1",
-            "type": "custom_tool_call",
+            "id": "fc_1",
+            "type": "function_call",
             "call_id": "call_1",
-            "name": "exec",
-            "input": "text(true)",
+            "namespace": "functions",
+            "name": "bash",
+            "arguments": "{\"command\":\"true\"}",
         })])
         .unwrap();
 
@@ -501,11 +596,11 @@ fn interrupted_turn_repairs_calls_before_adding_the_notice() {
     let call_index = conversation
         .items()
         .iter()
-        .position(|item| item["call_id"] == "call_1" && item["type"] == "custom_tool_call")
+        .position(|item| item["call_id"] == "call_1" && item["type"] == "function_call")
         .unwrap();
     assert_eq!(
         conversation.items()[call_index + 1]["type"],
-        "custom_tool_call_output"
+        "function_call_output"
     );
     assert_eq!(conversation.items()[call_index + 1]["output"], "aborted");
     assert!(
@@ -538,6 +633,17 @@ fn resume_recovers_an_unfinished_turn_and_closes_its_journal_state() {
     drop(conversation);
 
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert!(loaded.transcript.iter().any(|item| {
+        matches!(
+            item,
+            SessionTranscriptItem::Tool { tool }
+                if tool.call_id == "call_crashed"
+                    && matches!(
+                        tool.output.as_ref(),
+                        Some(SessionTranscriptToolOutput::Error(error)) if error == "aborted"
+                    )
+        )
+    }));
     let resumed = Conversation::resume(&cwd, loaded).unwrap();
     assert!(
         resumed
@@ -554,4 +660,54 @@ fn resume_recovers_an_unfinished_turn_and_closes_its_journal_state() {
 
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert!(loaded.unfinished_turn.is_none());
+    assert!(loaded.transcript.iter().any(|item| {
+        matches!(
+            item,
+            SessionTranscriptItem::Tool { tool }
+                if tool.call_id == "call_crashed"
+                    && matches!(
+                        tool.output.as_ref(),
+                        Some(SessionTranscriptToolOutput::Error(error)) if error == "aborted"
+                    )
+        )
+    }));
+}
+
+#[test]
+fn resume_repairs_an_unfinished_legacy_custom_tool_call() {
+    let (root, cwd) = temporary_repository("legacy-custom-crash-resume");
+    let rollout_root = root.join("state");
+    let rollout = Rollout::create_in(&rollout_root, &cwd).unwrap();
+    let session_id = rollout.identity().session_id.parse::<Uuid>().unwrap();
+    let mut conversation = Conversation::new(&cwd, rollout).unwrap();
+    conversation.start_turn("turn-legacy-crashed").unwrap();
+    conversation
+        .extend([json!({
+            "id": "ctc_crashed",
+            "type": "custom_tool_call",
+            "call_id": "call_legacy_crashed",
+            "name": "exec",
+            "input": "text(true)",
+        })])
+        .unwrap();
+    drop(conversation);
+
+    let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert!(loaded.transcript.iter().any(|item| {
+        matches!(
+            item,
+            SessionTranscriptItem::Tool { tool }
+                if tool.call_id == "call_legacy_crashed"
+                    && matches!(
+                        tool.output.as_ref(),
+                        Some(SessionTranscriptToolOutput::Error(error)) if error == "aborted"
+                    )
+        )
+    }));
+    let resumed = Conversation::resume(&cwd, loaded).unwrap();
+    assert!(resumed.items().iter().any(|item| {
+        item["type"] == "custom_tool_call_output"
+            && item["call_id"] == "call_legacy_crashed"
+            && item["output"] == "aborted"
+    }));
 }

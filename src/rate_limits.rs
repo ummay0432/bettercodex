@@ -66,7 +66,10 @@ impl RateLimitClient {
                 return Ok(rate_limit_snapshots_from_payload(payload));
             }
             if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed_after_unauthorized {
-                auth = self.auth.force_refreshed_snapshot(&self.client).await?;
+                auth = self
+                    .auth
+                    .refreshed_snapshot_after_unauthorized(&self.client, &auth)
+                    .await?;
                 refreshed_after_unauthorized = true;
                 continue;
             }

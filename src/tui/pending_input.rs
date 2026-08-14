@@ -13,10 +13,30 @@ struct PendingSteer {
     prompt: UserPrompt,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum QueuedFollowUp {
+    Prompt(UserPrompt),
+    Shell { prompt: UserPrompt, command: String },
+}
+
+impl QueuedFollowUp {
+    fn prompt(&self) -> &UserPrompt {
+        match self {
+            Self::Prompt(prompt) | Self::Shell { prompt, .. } => prompt,
+        }
+    }
+
+    fn into_prompt(self) -> UserPrompt {
+        match self {
+            Self::Prompt(prompt) | Self::Shell { prompt, .. } => prompt,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct PendingInput {
     steers: VecDeque<PendingSteer>,
-    follow_ups: VecDeque<UserPrompt>,
+    follow_ups: VecDeque<QueuedFollowUp>,
 }
 
 impl PendingInput {
@@ -30,15 +50,20 @@ impl PendingInput {
     }
 
     pub(super) fn queue_follow_up(&mut self, prompt: UserPrompt) {
-        self.follow_ups.push_back(prompt);
+        self.follow_ups.push_back(QueuedFollowUp::Prompt(prompt));
     }
 
-    pub(super) fn pop_next_follow_up(&mut self) -> Option<UserPrompt> {
+    pub(super) fn queue_shell_follow_up(&mut self, prompt: UserPrompt, command: String) {
+        self.follow_ups
+            .push_back(QueuedFollowUp::Shell { prompt, command });
+    }
+
+    pub(super) fn pop_next_follow_up(&mut self) -> Option<QueuedFollowUp> {
         self.follow_ups.pop_front()
     }
 
     pub(super) fn pop_latest_follow_up(&mut self) -> Option<UserPrompt> {
-        self.follow_ups.pop_back()
+        self.follow_ups.pop_back().map(QueuedFollowUp::into_prompt)
     }
 
     pub(super) fn has_steers(&self) -> bool {
@@ -63,7 +88,7 @@ impl PendingInput {
 
     pub(super) fn take_all(&mut self) -> Vec<UserPrompt> {
         let mut prompts = self.take_steers();
-        prompts.extend(self.follow_ups.drain(..));
+        prompts.extend(self.follow_ups.drain(..).map(QueuedFollowUp::into_prompt));
         prompts
     }
 
@@ -97,7 +122,9 @@ impl PendingInput {
             ]));
             append_messages(
                 &mut lines,
-                self.follow_ups.iter().map(UserPrompt::as_str),
+                self.follow_ups
+                    .iter()
+                    .map(|follow_up| follow_up.prompt().as_str()),
                 self.follow_ups.len(),
                 true,
             );

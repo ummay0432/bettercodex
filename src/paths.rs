@@ -4,28 +4,15 @@ use std::path::PathBuf;
 
 /// Returns the current user's home directory on supported targets.
 ///
-/// This preserves `dirs::home_dir`'s `$HOME`/`getpwuid_r` behavior on Unix and
-/// uses the native profile environment on Windows without compiling unrelated
-/// platform-directory APIs.
+/// This preserves `dirs::home_dir`'s `$HOME`/`getpwuid_r` behavior without
+/// compiling unrelated platform-directory APIs.
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-            .or_else(platform_home_dir)
-    }
-    #[cfg(windows)]
-    {
-        platform_home_dir()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        platform_home_dir()
-    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(platform_home_dir)
 }
 
-#[cfg(unix)]
 fn platform_home_dir() -> Option<PathBuf> {
     use std::ffi::CStr;
     use std::ffi::OsString;
@@ -71,25 +58,6 @@ fn platform_home_dir() -> Option<PathBuf> {
         }
         buffer.resize(new_len, 0);
     }
-}
-
-#[cfg(windows)]
-fn platform_home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            let drive = std::env::var_os("HOMEDRIVE").filter(|drive| !drive.is_empty())?;
-            let path = std::env::var_os("HOMEPATH").filter(|path| !path.is_empty())?;
-            let mut home = drive;
-            home.push(path);
-            Some(PathBuf::from(home))
-        })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_home_dir() -> Option<PathBuf> {
-    None
 }
 
 pub(crate) fn bettercodex_home() -> Option<PathBuf> {

@@ -7,7 +7,12 @@
 
 use super::markdown;
 use super::terminal_hyperlinks::HyperlinkLine;
+use super::terminal_hyperlinks::web_destination;
+use crate::web_search::UrlCitation;
+use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Default)]
@@ -15,6 +20,7 @@ pub(super) struct MarkdownRenderCache {
     raw_source: String,
     sanitized_source: Option<String>,
     sanitizer: markdown::StreamingSanitizer,
+    citations: Vec<UrlCitation>,
     width: Option<usize>,
     render: IncrementalMarkdownRender,
     canonical: bool,
@@ -38,6 +44,17 @@ impl MarkdownRenderCache {
 
     pub(super) fn source(&self) -> &str {
         &self.raw_source
+    }
+
+    pub(super) fn citations(&self) -> &[UrlCitation] {
+        &self.citations
+    }
+
+    pub(super) fn set_citations(&mut self, citations: Vec<UrlCitation>) {
+        if self.citations != citations {
+            self.citations = citations;
+            self.canonical = false;
+        }
     }
 
     pub(super) fn append(&mut self, delta: &str) {
@@ -70,6 +87,7 @@ impl MarkdownRenderCache {
             let source = self.sanitized_source.as_deref().unwrap_or(&self.raw_source);
             self.render.lines =
                 markdown::render_markdown_agent_with_links_and_cwd(source, Some(width), Some(cwd));
+            append_citation_lines(&mut self.render.lines, &self.citations);
             self.canonical = true;
         }
         &self.render.lines
@@ -86,6 +104,45 @@ impl MarkdownRenderCache {
         }
 
         &self.render.lines
+    }
+}
+
+fn append_citation_lines(lines: &mut Vec<HyperlinkLine>, citations: &[UrlCitation]) {
+    let mut seen = HashSet::new();
+    let mut sources = Vec::new();
+    for citation in citations {
+        let Some(destination) = web_destination(&citation.url) else {
+            continue;
+        };
+        if !seen.insert(destination.clone()) {
+            continue;
+        }
+        let title = markdown::sanitize(&citation.title)
+            .replace(['\n', '\r'], " ")
+            .trim()
+            .to_string();
+        sources.push((
+            if title.is_empty() {
+                destination.clone()
+            } else {
+                title
+            },
+            destination,
+        ));
+    }
+    if sources.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(HyperlinkLine::default());
+    }
+    lines.push(HyperlinkLine::new(Line::from(
+        Span::from("Sources:").bold(),
+    )));
+    for (index, (title, destination)) in sources.into_iter().enumerate() {
+        let mut line = HyperlinkLine::new(Line::from(Span::from(format!("{}. ", index + 1)).dim()));
+        line.push_span(Span::from(title).cyan().underlined(), Some(&destination));
+        lines.push(line);
     }
 }
 

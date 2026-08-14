@@ -9,11 +9,8 @@ They do not download source code or require Rust, Cargo, or native build tools.
 | --- | --- | --- |
 | macOS 12 or newer | Apple silicon | Supported |
 | Ubuntu 22.04+ and Debian 12+ | x86-64 | Supported |
-| Windows 11 build 22000+ | x86-64 | Developer preview |
 
-Ubuntu and Debian share the `x86_64-unknown-linux-gnu` release binary. WSL uses
-that Linux binary. Native Windows remains a developer preview until the
-[native qualification gate](development.md#native-windows-qualification) passes.
+Ubuntu and Debian share the `x86_64-unknown-linux-gnu` release binary.
 
 ## Install
 
@@ -23,39 +20,24 @@ On macOS or Linux:
 curl -fsSL https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.sh | sh
 ```
 
-On native Windows in PowerShell 5.1 or newer:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/ummay0432/bettercodex/main/scripts/install.ps1' | iex"
-```
-
 Open a new terminal when requested, then run:
 
 ```sh
 bcodex
 ```
 
-Windows gives each process its own copy of `PATH`. The installer updates its
-PowerShell process and the persistent user `PATH`, but an already-open parent
-Command Prompt or PowerShell window keeps its old copy. When the installer
-reports this, open a new terminal rather than retrying `bcodex` in the old one.
-
 On the first interactive launch, bettercodex asks you to sign in only when no
 valid Codex credentials are available. Existing credentials remain valid across
 installs and updates.
 
-The Unix installer requires `curl`, `gzip`, and standard POSIX utilities. The
-Windows installer uses built-in PowerShell and .NET functionality. Both select
-the matching asset from the latest published full release, reject unexpected
-sizes or binary identities, and replace the installed command only after
-verification succeeds. The macOS installer also verifies the binary's code
-signature. Release Actions smoke-test each binary on its native runner before
-it can become a release asset.
+The installer requires `curl`, `gzip`, and standard POSIX utilities. It selects
+the matching asset from the latest published full release, rejects unexpected
+sizes or binary identities, and replaces the installed command only after
+verification succeeds. On macOS it also verifies the binary's code signature.
+Release Actions smoke-test each binary on its native runner before it can become
+a release asset.
 
-The default command locations are:
-
-- `$HOME/.local/bin/bcodex` on macOS and Linux; and
-- `%LOCALAPPDATA%\Programs\bettercodex\bin\bcodex.exe` on Windows.
+The default command location is `$HOME/.local/bin/bcodex`.
 
 Set an absolute `BCODEX_INSTALL_DIR` to choose another directory. The installer
 adds the default directory to the user's `PATH` when needed. It does not remove
@@ -89,9 +71,8 @@ bcodex update
 
 The updater validates the latest release metadata and target asset, fetches the
 installer from the immutable source revision encoded in that release tag, and
-installs the matching prebuilt binary. It never compiles locally. Unix replaces
-the binary atomically; Windows stages a verified replacement that finishes
-after the running process exits.
+installs the matching prebuilt binary. It never compiles locally and replaces
+the binary atomically.
 
 `BCODEX_REPOSITORY` selects another `owner/repository` for development or fork
 testing. `BCODEX_INSTALL_RELEASE_TAG` pins an exact asset and is reserved for the
@@ -100,25 +81,16 @@ updater and release validation.
 ## State directories
 
 `CODEX_HOME` and `BCODEX_HOME` override credential and bettercodex state
-directories on every platform. Without overrides, they are `$HOME/.codex` and
-`$HOME/.bcodex` on Unix, or `%USERPROFILE%\.codex` and
-`%USERPROFILE%\.bcodex` on Windows.
+directories on both supported systems. Without overrides, they are
+`$HOME/.codex` and `$HOME/.bcodex`.
 
 ## Build from a checkout
 
-Source compilation is a developer workflow. Use the checked-in wrapper so the
-V8 archive and Rust binding match:
+Source compilation is a developer workflow:
 
 ```sh
-./scripts/cargo-with-v8.sh build --locked
-./scripts/cargo-with-v8.sh run --bin bcodex
-```
-
-On native Windows:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 build --locked
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-with-v8.ps1 run --bin bcodex
+cargo build --locked
+cargo run --bin bcodex
 ```
 
 Development binaries intentionally have no embedded release tag, so
@@ -133,7 +105,7 @@ just fix
 just fmt
 just test
 just clippy -- -D warnings
-./scripts/cargo-with-v8.sh build --release --locked
+cargo build --release --locked
 ```
 
 The compact installer suites cover bettercodex's intentional prebuilt-release
@@ -141,8 +113,6 @@ departure:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/install_tests.py
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_windows_tests.ps1
 ```
 
-Run the PowerShell suite and the Windows terminal matrix on native Windows.
 See [the development workflow](development.md) for source and artifact rules.

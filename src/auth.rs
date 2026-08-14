@@ -58,9 +58,17 @@ struct SharedAuthInner {
     refresh_lock: Semaphore,
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct AuthSnapshot {
     pub(crate) authorization: reqwest::header::HeaderValue,
     pub(crate) account_id: Option<reqwest::header::HeaderValue>,
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotRefresh<'a> {
+    IfNeeded,
+    Forced,
+    AfterUnauthorized(&'a AuthSnapshot),
 }
 
 #[derive(Clone)]
@@ -337,14 +345,24 @@ impl SharedAuth {
         &self,
         client: &reqwest::Client,
     ) -> Result<AuthSnapshot> {
-        self.refresh_snapshot(client, false).await
+        self.refresh_snapshot(client, SnapshotRefresh::IfNeeded)
+            .await
     }
 
     pub(crate) async fn force_refreshed_snapshot(
         &self,
         client: &reqwest::Client,
     ) -> Result<AuthSnapshot> {
-        self.refresh_snapshot(client, true).await
+        self.refresh_snapshot(client, SnapshotRefresh::Forced).await
+    }
+
+    pub(crate) async fn refreshed_snapshot_after_unauthorized(
+        &self,
+        client: &reqwest::Client,
+        rejected: &AuthSnapshot,
+    ) -> Result<AuthSnapshot> {
+        self.refresh_snapshot(client, SnapshotRefresh::AfterUnauthorized(rejected))
+            .await
     }
 
     pub(crate) fn account(&self) -> Result<ChatGptAccount> {
@@ -358,7 +376,7 @@ impl SharedAuth {
     async fn refresh_snapshot(
         &self,
         client: &reqwest::Client,
-        force: bool,
+        refresh: SnapshotRefresh<'_>,
     ) -> Result<AuthSnapshot> {
         let _refresh_guard = self
             .inner
@@ -372,15 +390,22 @@ impl SharedAuth {
                 .auth
                 .read()
                 .map_err(|_| anyhow!("ChatGPT credential cache lock was poisoned"))?;
-            if !force && !auth.refresh_needed()? {
-                return auth.snapshot();
+            let current = auth.snapshot()?;
+            match refresh {
+                SnapshotRefresh::IfNeeded if !auth.refresh_needed()? => return Ok(current),
+                SnapshotRefresh::AfterUnauthorized(rejected) if &current != rejected => {
+                    return Ok(current);
+                }
+                SnapshotRefresh::IfNeeded
+                | SnapshotRefresh::Forced
+                | SnapshotRefresh::AfterUnauthorized(_) => auth.clone(),
             }
-            auth.clone()
         };
-        if force {
-            auth.force_refresh(client).await?;
-        } else {
-            auth.refresh_if_needed(client).await?;
+        match refresh {
+            SnapshotRefresh::IfNeeded => auth.refresh_if_needed(client).await?,
+            SnapshotRefresh::Forced | SnapshotRefresh::AfterUnauthorized(_) => {
+                auth.force_refresh(client).await?;
+            }
         }
         let snapshot = auth.snapshot();
         *self
@@ -557,7 +582,7 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
-        crate::platform_fs::configure_private_file(&mut options);
+        crate::private_fs::configure_private_file(&mut options);
         let mut file = options.open(&temp).with_context(|| {
             format!(
                 "failed to open temporary credential file {}",
@@ -567,14 +592,14 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        crate::platform_fs::replace_file(&temp, path).with_context(|| {
+        crate::private_fs::replace_file(&temp, path).with_context(|| {
             format!(
                 "failed to replace credential file {} with {}",
                 path.display(),
                 temp.display()
             )
         })?;
-        crate::platform_fs::sync_directory(parent)?;
+        crate::private_fs::sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {

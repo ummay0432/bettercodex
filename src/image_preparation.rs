@@ -1,6 +1,6 @@
 //! Model-facing image preparation ported from Codex at
-//! `902bd9e06b3ecb32cbf7f8e64cd23b956be3e7fe`,
-//! `codex-rs/core/src/image_preparation.rs`.
+//! `5bc8da6d78fe32343dc51eaf73b96fd288ae0e87`,
+//! `codex-rs/core/src/image_preparation.rs`, with GPT-5.6 original-detail sizing.
 //!
 //! Images are prepared before entering live history. Reconstructed history is
 //! prepared once in memory on resume so rollouts created by older bettercodex
@@ -8,9 +8,8 @@
 
 use crate::image::HIGH_DETAIL_LIMITS;
 use crate::image::ImageProcessingError;
-use crate::image::ORIGINAL_DETAIL_LIMITS;
+use crate::image::PromptImageMode;
 use crate::image::load_data_url_for_prompt;
-use crate::protocol::FunctionCallOutputContentItem;
 use crate::protocol::ImageDetail;
 use serde_json::Value;
 use serde_json::json;
@@ -38,18 +37,6 @@ impl ImagePreparationError {
                 IMAGE_TOO_LARGE_PLACEHOLDER
             }
             Self::Processing(_) => IMAGE_PROCESSING_ERROR_PLACEHOLDER,
-        }
-    }
-}
-
-pub(crate) fn prepare_tool_output_images(items: &mut [FunctionCallOutputContentItem]) {
-    for item in items {
-        if let FunctionCallOutputContentItem::InputImage { image_url, detail } = item
-            && let Err(error) = prepare_image(image_url, *detail)
-        {
-            *item = FunctionCallOutputContentItem::InputText {
-                text: error.placeholder().to_string(),
-            };
         }
     }
 }
@@ -83,9 +70,7 @@ pub(crate) fn prepare_history_images(items: &mut [Value]) {
 pub(crate) fn image_content_items_mut(item: &mut Value) -> Option<&mut Vec<Value>> {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => item.get_mut("content")?.as_array_mut(),
-        Some("function_call_output" | "custom_tool_call_output") => {
-            item.get_mut("output")?.as_array_mut()
-        }
+        Some("function_call_output") => item.get_mut("output")?.as_array_mut(),
         _ => None,
     }
 }
@@ -115,13 +100,13 @@ fn prepare_image(
         return Ok(());
     }
 
-    let limits = match detail {
-        None | Some(ImageDetail::Auto | ImageDetail::High) => HIGH_DETAIL_LIMITS,
-        Some(ImageDetail::Original) => ORIGINAL_DETAIL_LIMITS,
+    let mode = match detail {
+        Some(ImageDetail::High) => PromptImageMode::ResizeWithLimits(HIGH_DETAIL_LIMITS),
+        None | Some(ImageDetail::Auto | ImageDetail::Original) => PromptImageMode::Original,
         Some(ImageDetail::Low) => return Err(ImagePreparationError::UnsupportedLowDetail),
     };
     let image =
-        load_data_url_for_prompt(image_url, limits).map_err(ImagePreparationError::Processing)?;
+        load_data_url_for_prompt(image_url, mode).map_err(ImagePreparationError::Processing)?;
     *image_url = image.into_data_url();
     Ok(())
 }

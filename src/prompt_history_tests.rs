@@ -84,18 +84,15 @@ fn codex_history_is_loaded_appended_and_kept_private() {
             "text": "latest prompt",
         })
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&history_file.path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&history_file.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 #[test]
@@ -170,7 +167,6 @@ fn appends_follow_history_rotation() {
     assert_eq!(archived_entry["text"], "before rotation");
 }
 
-#[cfg(unix)]
 #[test]
 fn appends_reject_a_symbolic_link_substituted_after_rotation() {
     use std::os::unix::fs::symlink;

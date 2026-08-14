@@ -10,7 +10,7 @@ use super::shell_detect::detect_shell_type;
 
 /// Parse the provided bash source using tree-sitter-bash, returning a Tree on
 /// success or None if parsing failed.
-pub fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree> {
+pub(super) fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree> {
     let lang = BASH.into();
     let mut parser = Parser::new();
     #[expect(clippy::expect_used)]
@@ -25,7 +25,10 @@ pub fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree> {
 /// command and the parse tree does not contain disallowed constructs
 /// (parentheses, redirections, substitutions, control flow, etc.). Otherwise
 /// returns `None`.
-pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>>> {
+pub(super) fn try_parse_word_only_commands_sequence(
+    tree: &Tree,
+    src: &str,
+) -> Option<Vec<Vec<String>>> {
     if tree.root_node().has_error() {
         return None;
     }
@@ -93,7 +96,7 @@ pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<V
     Some(commands)
 }
 
-pub fn extract_bash_command(command: &[String]) -> Option<(&str, &str)> {
+pub(super) fn extract_bash_command(command: &[String]) -> Option<(&str, &str)> {
     let [shell, flag, script] = command else {
         return None;
     };

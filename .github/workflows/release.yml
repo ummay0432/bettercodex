@@ -114,7 +114,7 @@ jobs:
         run: python3 scripts/install_tests.py
 
       - name: Test bettercodex
-        run: ./scripts/cargo-with-v8.sh test --locked --bin bcodex
+        run: cargo test --locked --bin bcodex
 
       - name: Build and verify release binary
         shell: bash
@@ -124,7 +124,7 @@ jobs:
           EXPECTED_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          ./scripts/cargo-with-v8.sh build --release --locked --target x86_64-unknown-linux-gnu --bin bcodex
+          cargo build --release --locked --target x86_64-unknown-linux-gnu --bin bcodex
           binary="target/x86_64-unknown-linux-gnu/release/bcodex"
           binary_size="$(wc -c <"$binary")"
           [[ "$binary_size" -le 134217728 ]]
@@ -162,7 +162,7 @@ jobs:
         run: python3 scripts/install_tests.py
 
       - name: Test bettercodex
-        run: ./scripts/cargo-with-v8.sh test --locked --bin bcodex
+        run: cargo test --locked --bin bcodex
 
       - name: Build, sign, and verify release binary
         shell: bash
@@ -175,7 +175,7 @@ jobs:
           set -euo pipefail
           [[ "$(uname -m)" == arm64 ]]
           [[ "$(rustc -vV | sed -n 's/^host: //p')" == aarch64-apple-darwin ]]
-          ./scripts/cargo-with-v8.sh build --release --locked --target aarch64-apple-darwin --bin bcodex
+          cargo build --release --locked --target aarch64-apple-darwin --bin bcodex
           binary="target/aarch64-apple-darwin/release/bcodex"
           binary_size="$(wc -c <"$binary")"
           [[ "$binary_size" -le 134217728 ]]
@@ -198,60 +198,6 @@ jobs:
           path: |
             dist/bcodex-aarch64-apple-darwin.gz
             dist/bcodex-aarch64-apple-darwin.zst
-          if-no-files-found: error
-          retention-days: 1
-
-  windows:
-    name: Build Windows x86-64
-    needs: prepare
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ needs.prepare.outputs.revision }}
-          persist-credentials: false
-
-      - name: Test PowerShell installer
-        shell: powershell
-        run: .\scripts\install_windows_tests.ps1
-
-      - name: Test bettercodex release and update paths
-        shell: powershell
-        run: .\scripts\cargo-with-v8.ps1 test --locked --bin bcodex update
-
-      - name: Build and verify release binary
-        shell: powershell
-        env:
-          BCODEX_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
-          EXPECTED_TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          .\scripts\cargo-with-v8.ps1 build --release --locked --target x86_64-pc-windows-msvc --bin bcodex
-          if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
-          $binary = 'target\x86_64-pc-windows-msvc\release\bcodex.exe'
-          if ((Get-Item -LiteralPath $binary).Length -gt 128MB) { throw 'release binary exceeds 128 MiB' }
-          if ((& $binary --version) -cne "bcodex $env:EXPECTED_VERSION") { throw 'version check failed' }
-          if ((& $binary --internal-release-tag) -cne $env:EXPECTED_TAG) { throw 'release tag check failed' }
-          if ((& $binary --internal-source-revision) -cne ($env:EXPECTED_TAG -replace '^.*-', '')) { throw 'source revision check failed' }
-          $smokeRoot = Join-Path $env:RUNNER_TEMP ('bettercodex-smoke.' + [Guid]::NewGuid().ToString('N'))
-          try {
-            $env:BCODEX_HOME = Join-Path $smokeRoot 'bcodex'
-            $env:CODEX_HOME = Join-Path $smokeRoot 'codex'
-            & $binary --internal-install-smoke
-            if ($LASTEXITCODE -ne 0) { throw 'release smoke test failed' }
-          } finally {
-            Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $sourceStream = [IO.File]::OpenRead((Resolve-Path $binary))
-          $archiveStream = [IO.File]::Create((Join-Path (Resolve-Path dist) 'bcodex-x86_64-pc-windows-msvc.exe.gz'))
-          $gzipStream = New-Object IO.Compression.GZipStream($archiveStream, [IO.Compression.CompressionMode]::Compress)
-          try { $sourceStream.CopyTo($gzipStream) } finally { $gzipStream.Dispose(); $archiveStream.Dispose(); $sourceStream.Dispose() }
-
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: windows-release
-          path: dist/bcodex-x86_64-pc-windows-msvc.exe.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -288,7 +234,7 @@ jobs:
 
   draft-release:
     name: Create draft GitHub release
-    needs: [prepare, linux, macos, windows, linux-qualification]
+    needs: [prepare, linux, macos, linux-qualification]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -311,7 +257,6 @@ jobs:
           expected=(
             bcodex-aarch64-apple-darwin.gz
             bcodex-aarch64-apple-darwin.zst
-            bcodex-x86_64-pc-windows-msvc.exe.gz
             bcodex-x86_64-unknown-linux-gnu.gz
             bcodex-x86_64-unknown-linux-gnu.zst
           )
@@ -327,7 +272,6 @@ jobs:
           notes="Source revision: \`$RELEASE_REVISION\`
 
           Prebuilt binaries:
-          - Windows x86-64
           - macOS Apple silicon
           - Linux x86-64 (qualified on Ubuntu and Debian)"
           gh release create "$RELEASE_TAG" dist/* \

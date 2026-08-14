@@ -47,6 +47,9 @@ pub(super) struct FileSearchManager {
 
 struct SearchState {
     latest_query: String,
+    /// Last result set sent for this query. Reset on every query transition so revisiting a query
+    /// still publishes a fresh result after any intermediate edits.
+    reported_matches: Option<Vec<FileMatch>>,
     session: Option<FileSearchSession>,
     session_token: usize,
 }
@@ -56,6 +59,7 @@ impl FileSearchManager {
         Self {
             state: Arc::new(Mutex::new(SearchState {
                 latest_query: String::new(),
+                reported_matches: None,
                 session: None,
                 session_token: 0,
             })),
@@ -75,6 +79,7 @@ impl FileSearchManager {
         }
         state.latest_query.clear();
         state.latest_query.push_str(query);
+        state.reported_matches = None;
 
         if query.is_empty() {
             state.session.take();
@@ -131,7 +136,7 @@ impl SessionReporter for SearchReporter {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let state = state
+        let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.session_token != self.session_token
@@ -140,6 +145,13 @@ impl SessionReporter for SearchReporter {
         {
             return;
         }
+        if state.reported_matches.as_deref() == Some(snapshot.matches.as_slice()) {
+            return;
+        }
+        state
+            .reported_matches
+            .get_or_insert_default()
+            .clone_from(&snapshot.matches);
         drop(state);
         let _ = self.updates.send(FileSearchUpdate::Matches {
             query: snapshot.query.clone(),

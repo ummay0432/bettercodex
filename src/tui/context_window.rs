@@ -14,7 +14,7 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 
 const MUTED: Color = Color::Indexed(245);
-const HEADER_HEIGHT: u16 = 4;
+const HEADER_HEIGHT: u16 = 5;
 const FOOTER_HEIGHT: u16 = 1;
 const MIN_GRID_WIDTH: u16 = 58;
 const GRID_COLUMNS: usize = 10;
@@ -30,6 +30,7 @@ pub(super) struct ContextWindowView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ContextAction {
     StayOpen,
+    OpenTools,
     Close,
 }
 
@@ -55,6 +56,7 @@ impl ContextWindowView {
 
     pub(super) fn handle_key(&self, code: KeyCode) -> ContextAction {
         match code {
+            KeyCode::Char('t' | 'T') => ContextAction::OpenTools,
             KeyCode::Esc => ContextAction::Close,
             _ => ContextAction::StayOpen,
         }
@@ -94,7 +96,8 @@ impl ContextWindowView {
                 footer_area.height,
             );
             frame.render_widget(
-                Paragraph::new("Press esc to go back").style(Style::default().fg(MUTED)),
+                Paragraph::new("Press t for tool details; esc to close")
+                    .style(Style::default().fg(MUTED)),
                 hint_area,
             );
         }
@@ -120,6 +123,7 @@ impl ContextWindowView {
                 format_tokens(self.snapshot.compact_at_tokens)
             ))
             .dim(),
+            tool_summary_line(),
             Line::default(),
         ];
         frame.render_widget(Paragraph::new(lines), area);
@@ -215,6 +219,33 @@ impl ContextWindowView {
     }
 }
 
+fn tool_summary_line() -> Line<'static> {
+    let mut spans = vec![Span::from("Tools  ").cyan().bold()];
+    for (index, specification) in crate::tools::responses_api_specifications()
+        .iter()
+        .enumerate()
+    {
+        if index > 0 {
+            spans.push(Span::from(" · ").dim());
+        }
+        let name = specification
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                (specification
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("web_search"))
+                .then_some("web_search")
+            });
+        if let Some(name) = name {
+            spans.push(Span::from(name).cyan());
+        }
+    }
+    spans.push(Span::from("  ·  t for details").dim());
+    Line::from(spans)
+}
+
 fn panel_height(width: u16, legend_rows: usize) -> u16 {
     let legend_rows = u16::try_from(legend_rows).unwrap_or(u16::MAX);
     let inner_width = width.saturating_sub(4);
@@ -306,7 +337,7 @@ fn context_color(kind: ContextKind) -> Color {
     }
 }
 
-fn format_tokens(tokens: u64) -> String {
+pub(super) fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         let tenths = tokens.saturating_add(50_000) / 100_000;
         if tenths.is_multiple_of(10) {

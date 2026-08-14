@@ -118,31 +118,25 @@ pub(crate) fn trim_tool_outputs_to_fit(history: &mut [Value], max_tokens: u64) -
         if estimated <= max_tokens {
             break;
         }
-        let Some(replacement) = rewritten_output_for_context_window(item) else {
-            break;
-        };
+        // An interruption notice can follow an oversized output. Keep searching backward so a
+        // valid saved session remains compactable on its next turn.
+        if !rewrite_output_for_context_window(item) {
+            continue;
+        }
         estimated = estimated
             .saturating_sub(item_tokens)
-            .saturating_add(estimated_tokens(std::slice::from_ref(&replacement)));
-        *item = replacement;
+            .saturating_add(estimated_tokens(std::slice::from_ref(item)));
         rewritten = rewritten.saturating_add(1);
     }
     rewritten
 }
 
-fn rewritten_output_for_context_window(item: &Value) -> Option<Value> {
-    let mut rewritten = item.clone();
-    match item.get("type").and_then(Value::as_str) {
-        Some("function_call_output" | "custom_tool_call_output") => {
-            rewritten["output"] =
-                Value::String(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.to_string());
-        }
-        Some("tool_search_output") => {
-            rewritten["tools"] = Value::Array(Vec::new());
-        }
-        _ => return None,
+fn rewrite_output_for_context_window(item: &mut Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+        return false;
     }
-    Some(rewritten)
+    item["output"] = Value::String(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.to_string());
+    true
 }
 
 fn is_retained_for_remote_compaction_v2(item: &Value) -> bool {

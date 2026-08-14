@@ -20,8 +20,148 @@ impl Drop for DirectoryCleanup {
 }
 
 #[test]
-fn legacy_resume_reconstructs_user_tool_and_assistant_transcript() {
-    let root = temporary_directory("rollout-complete-transcript");
+fn resume_reconstructs_function_search_and_citation_transcript() {
+    let root = temporary_directory("rollout-tool-search-transcript");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    rollout
+        .append_history(&[
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "run the checks"}],
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call-1",
+                "namespace": "functions",
+                "name": "bash",
+                "arguments": "{\"command\":\"cargo test\"}",
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call-2",
+                "namespace": "functions",
+                "name": "read",
+                "arguments": "{\"path\":\"missing.txt\"}",
+            }),
+        ])
+        .unwrap();
+    rollout
+        .append_tool_results(
+            &[
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "{\"stdout\":\"test result: ok\\n\",\"stderr\":\"\",\"exit_code\":0}",
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call-2",
+                    "output": "unable to read `missing.txt`",
+                }),
+            ],
+            vec![SessionTranscriptToolOutcome {
+                call_id: "call-2".to_string(),
+                output: None,
+                error: Some("unable to read `missing.txt`".to_string()),
+                file_change: None,
+            }],
+        )
+        .unwrap();
+    rollout
+        .append_history(&[
+            json!({
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {"type": "search", "query": "cargo test"},
+            }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{
+                    "type": "output_text",
+                    "text": "All checks pass.[1]",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "start_index": 16,
+                        "end_index": 19,
+                        "url": "https://example.com/checks",
+                        "title": "Checks",
+                    }],
+                }],
+            }),
+        ])
+        .unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+    assert_eq!(
+        loaded.transcript,
+        vec![
+            SessionTranscriptItem::User {
+                text: "run the checks".to_string(),
+                image_count: 0,
+            },
+            SessionTranscriptItem::Tool {
+                tool: SessionTranscriptTool {
+                    call_id: "call-1".to_string(),
+                    origin: SessionTranscriptToolOrigin::Agent,
+                    name: "bash".to_string(),
+                    input: Some(json!({"command": "cargo test"})),
+                    output: Some(SessionTranscriptToolOutput::Success(json!({
+                        "stdout": "test result: ok\n",
+                        "stderr": "",
+                        "exit_code": 0,
+                    }))),
+                    file_change: None,
+                },
+            },
+            SessionTranscriptItem::Tool {
+                tool: SessionTranscriptTool {
+                    call_id: "call-2".to_string(),
+                    origin: SessionTranscriptToolOrigin::Agent,
+                    name: "read".to_string(),
+                    input: Some(json!({"path": "missing.txt"})),
+                    output: Some(SessionTranscriptToolOutput::Error(
+                        "unable to read `missing.txt`".to_string(),
+                    )),
+                    file_change: None,
+                },
+            },
+            SessionTranscriptItem::WebSearch {
+                search: crate::web_search::WebSearchCall {
+                    id: "ws_1".to_string(),
+                    status: Some("completed".to_string()),
+                    action: Some(crate::web_search::WebSearchAction::Search {
+                        query: Some("cargo test".to_string()),
+                        queries: None,
+                    }),
+                },
+            },
+            SessionTranscriptItem::Assistant {
+                text: "All checks pass.[1]".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+                citations: vec![crate::web_search::UrlCitation {
+                    start_index: 16,
+                    end_index: 19,
+                    url: "https://example.com/checks".to_string(),
+                    title: "Checks".to_string(),
+                }],
+            },
+        ]
+    );
+    assert_eq!(loaded.transcript_checkpoint, None);
+}
+
+#[test]
+fn legacy_code_mode_resume_reconstructs_tool_transcript() {
+    let root = temporary_directory("rollout-legacy-code-mode-transcript");
     let _cleanup = DirectoryCleanup(root.clone());
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -30,48 +170,42 @@ fn legacy_resume_reconstructs_user_tool_and_assistant_transcript() {
     let source =
         "const result = await tools.exec_command({cmd:\"cargo test\"}); text(result.output);";
     rollout
-        .append_history(&[json!({
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "run the checks"}],
-        })])
-        .unwrap();
-    rollout
-        .append_history(&[json!({
-            "type": "custom_tool_call",
-            "call_id": "call-1",
-            "name": "exec",
-            "input": source,
-        })])
-        .unwrap();
-    rollout
-        .append_history(&[json!({
-            "type": "custom_tool_call_output",
-            "call_id": "call-1",
-            "name": "exec",
-            "output": "still running",
-        })])
-        .unwrap();
-    rollout
-        .append_history(&[json!({
-            "type": "custom_tool_call_output",
-            "call_id": "call-1",
-            "output": [
-                {
-                    "type": "input_text",
-                    "text": "Script completed\nWall time 0.1 seconds\nOutput:\n",
-                },
-                {"type": "input_text", "text": "test result: ok\n"},
-            ],
-        })])
-        .unwrap();
-    rollout
-        .append_history(&[json!({
-            "type": "message",
-            "role": "assistant",
-            "phase": "final_answer",
-            "content": [{"type": "output_text", "text": "All checks pass."}],
-        })])
+        .append_history(&[
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "run the checks"}],
+            }),
+            json!({
+                "type": "custom_tool_call",
+                "call_id": "call-legacy",
+                "name": "exec",
+                "input": source,
+            }),
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call-legacy",
+                "name": "exec",
+                "output": "still running",
+            }),
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call-legacy",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "Script completed\nWall time 0.1 seconds\nOutput:\n",
+                    },
+                    {"type": "input_text", "text": "test result: ok\n"},
+                ],
+            }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "All checks pass."}],
+            }),
+        ])
         .unwrap();
     drop(rollout);
 
@@ -86,18 +220,21 @@ fn legacy_resume_reconstructs_user_tool_and_assistant_transcript() {
             },
             SessionTranscriptItem::Tool {
                 tool: SessionTranscriptTool {
-                    call_id: "call-1".to_string(),
+                    call_id: "call-legacy".to_string(),
+                    origin: SessionTranscriptToolOrigin::Agent,
                     name: "exec".to_string(),
                     input: Some(Value::String(source.to_string())),
                     output: Some(SessionTranscriptToolOutput::Success(Value::String(
                         "Script completed\nWall time 0.1 seconds\nOutput:\ntest result: ok\n"
                             .to_string(),
                     ))),
+                    file_change: None,
                 },
             },
             SessionTranscriptItem::Assistant {
                 text: "All checks pass.".to_string(),
                 phase: Some(MessagePhase::FinalAnswer),
+                citations: Vec::new(),
             },
         ]
     );
@@ -105,8 +242,8 @@ fn legacy_resume_reconstructs_user_tool_and_assistant_transcript() {
 }
 
 #[test]
-fn legacy_fork_snapshot_recovers_tools_from_matching_history() {
-    let root = temporary_directory("rollout-legacy-fork-transcript");
+fn incomplete_fork_snapshot_recovers_direct_tools_from_matching_history() {
+    let root = temporary_directory("rollout-direct-fork-transcript");
     let _cleanup = DirectoryCleanup(root.clone());
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -119,6 +256,7 @@ fn legacy_fork_snapshot_recovers_tools_from_matching_history() {
     let assistant = SessionTranscriptItem::Assistant {
         text: "Inspection complete.".to_string(),
         phase: Some(MessagePhase::FinalAnswer),
+        citations: Vec::new(),
     };
     rollout.record_fork("source-session", 0, None).unwrap();
     rollout
@@ -138,13 +276,14 @@ fn legacy_fork_snapshot_recovers_tools_from_matching_history() {
                 json!({
                     "type": "function_call",
                     "call_id": "call-1",
-                    "name": "exec_command",
-                    "arguments": "{\"cmd\":\"pwd\"}",
+                    "namespace": "functions",
+                    "name": "bash",
+                    "arguments": "{\"command\":\"pwd\"}",
                 }),
                 json!({
                     "type": "function_call_output",
                     "call_id": "call-1",
-                    "output": "Chunk ID: abc\nWall time: 0.1000 seconds\nProcess exited with code 0\nOutput:\n/repo\n",
+                    "output": "{\"stdout\":\"/repo\\n\",\"stderr\":\"\",\"exit_code\":0}",
                 }),
                 json!({
                     "type": "message",
@@ -167,6 +306,88 @@ fn legacy_fork_snapshot_recovers_tools_from_matching_history() {
             SessionTranscriptItem::Tool {
                 tool: SessionTranscriptTool {
                     call_id: "call-1".to_string(),
+                    origin: SessionTranscriptToolOrigin::Agent,
+                    name: "bash".to_string(),
+                    input: Some(json!({"command": "pwd"})),
+                    output: Some(SessionTranscriptToolOutput::Success(json!({
+                        "stdout": "/repo\n",
+                        "stderr": "",
+                        "exit_code": 0,
+                    }))),
+                    file_change: None,
+                },
+            },
+            assistant,
+        ]
+    );
+    assert_eq!(loaded.transcript_checkpoint, None);
+}
+
+#[test]
+fn legacy_fork_snapshot_recovers_exec_command_from_matching_history() {
+    let root = temporary_directory("rollout-legacy-fork-transcript");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let user = SessionTranscriptItem::User {
+        text: "inspect the repository".to_string(),
+        image_count: 0,
+    };
+    let assistant = SessionTranscriptItem::Assistant {
+        text: "Inspection complete.".to_string(),
+        phase: Some(MessagePhase::FinalAnswer),
+        citations: Vec::new(),
+    };
+    rollout.record_fork("source-session", 0, None).unwrap();
+    rollout
+        .write_record(&RolloutRecord::TranscriptSnapshot {
+            items: vec![user.clone(), assistant.clone()],
+            complete: false,
+        })
+        .unwrap();
+    rollout
+        .replace_history(
+            &[
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect the repository"}],
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call-legacy",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}",
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call-legacy",
+                    "output": "Chunk ID: abc\nWall time: 0.1000 seconds\nProcess exited with code 0\nOutput:\n/repo\n",
+                }),
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Inspection complete."}],
+                }),
+            ],
+            HistoryReplacement::Initial,
+        )
+        .unwrap();
+    drop(rollout);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
+
+    assert_eq!(
+        loaded.transcript,
+        vec![
+            user,
+            SessionTranscriptItem::Tool {
+                tool: SessionTranscriptTool {
+                    call_id: "call-legacy".to_string(),
+                    origin: SessionTranscriptToolOrigin::Agent,
                     name: "exec_command".to_string(),
                     input: Some(json!({"cmd": "pwd"})),
                     output: Some(SessionTranscriptToolOutput::Success(json!({
@@ -175,6 +396,7 @@ fn legacy_fork_snapshot_recovers_tools_from_matching_history() {
                         "output": "/repo\n",
                         "wall_time_seconds": 0.1,
                     }))),
+                    file_change: None,
                 },
             },
             assistant,
@@ -198,7 +420,23 @@ fn explicit_transcript_records_replace_fallback_history_and_append_incrementally
     let assistant = SessionTranscriptItem::Assistant {
         text: "Inspection complete.".to_string(),
         phase: Some(MessagePhase::FinalAnswer),
+        citations: Vec::new(),
     };
+    let operator = SessionTranscriptItem::Tool {
+        tool: SessionTranscriptTool {
+            call_id: "operator:1".to_string(),
+            origin: SessionTranscriptToolOrigin::Operator,
+            name: "bash".to_string(),
+            input: Some(json!({"command": "git status --short"})),
+            output: None,
+            file_change: None,
+        },
+    };
+    let operator_output = SessionTranscriptToolOutput::Success(json!({
+        "stdout": " M src/main.rs\n",
+        "stderr": "",
+        "exit_code": 0,
+    }));
     rollout
         .append_history(&[json!({
             "type": "message",
@@ -216,16 +454,34 @@ fn explicit_transcript_records_replace_fallback_history_and_append_incrementally
         })])
         .unwrap();
     rollout.append_transcript(vec![assistant.clone()]).unwrap();
+    rollout.append_transcript(vec![operator.clone()]).unwrap();
+    rollout
+        .record_tool_outcomes(vec![SessionTranscriptToolOutcome {
+            call_id: "operator:1".to_string(),
+            output: Some(operator_output.clone()),
+            error: None,
+            file_change: None,
+        }])
+        .unwrap();
     drop(rollout);
 
     let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
 
-    assert_eq!(loaded.transcript, vec![user.clone(), assistant.clone()]);
-    assert_eq!(loaded.transcript_checkpoint, Some(2));
+    let mut completed_operator = operator;
+    let SessionTranscriptItem::Tool { tool } = &mut completed_operator else {
+        unreachable!();
+    };
+    tool.output = Some(operator_output);
+    assert_eq!(
+        loaded.transcript,
+        vec![user.clone(), assistant.clone(), completed_operator.clone()]
+    );
+    assert_eq!(loaded.transcript_checkpoint, Some(3));
 
     let recovered = SessionTranscriptItem::Assistant {
         text: "Recovered after interruption.".to_string(),
         phase: Some(MessagePhase::Commentary),
+        citations: Vec::new(),
     };
     let mut rollout = loaded.rollout;
     rollout
@@ -240,7 +496,10 @@ fn explicit_transcript_records_replace_fallback_history_and_append_incrementally
 
     let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd).unwrap();
 
-    assert_eq!(loaded.transcript, vec![user, assistant, recovered]);
+    assert_eq!(
+        loaded.transcript,
+        vec![user, assistant, completed_operator, recovered]
+    );
     assert_eq!(loaded.transcript_checkpoint, None);
 }
 
@@ -430,7 +689,10 @@ fn appended_records_are_visible_while_the_rollout_is_open() {
     let journal = std::fs::read_to_string(&rollout.path).unwrap();
     let record: RolloutRecord = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
     match record {
-        RolloutRecord::HistoryAppend { items } => assert_eq!(items, vec![item]),
+        RolloutRecord::HistoryAppend { items, outcomes } => {
+            assert_eq!(items, vec![item]);
+            assert!(outcomes.is_none());
+        }
         other => panic!("expected a history append, got {other:?}"),
     }
 
@@ -684,25 +946,19 @@ fn installation_identity_is_stable_and_state_is_private() {
     let second = Rollout::create_in(&root, &cwd).unwrap();
     assert_eq!(second.identity().installation_id, installation_id);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(first_path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::metadata(root.join(SESSIONS_DIRECTORY))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-    }
-    #[cfg(windows)]
-    assert!(std::fs::metadata(first_path).unwrap().is_file());
-
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(first_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(root.join(SESSIONS_DIRECTORY))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
     drop(second);
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -3,7 +3,7 @@ mod clipboard;
 mod clipboard_paste;
 mod context_window;
 mod editor;
-mod event_stream;
+mod file_change;
 mod file_search;
 mod git_diff;
 mod login_screen;
@@ -15,11 +15,8 @@ mod markdown_text_merge;
 mod model_picker;
 mod notifications;
 mod palette;
-#[cfg(windows)]
-mod paste_burst;
 mod pending_input;
 mod presentation;
-mod reasoning_status;
 mod render;
 mod resume_picker;
 #[cfg(test)]
@@ -42,10 +39,12 @@ mod table_detect;
 mod terminal;
 mod terminal_hyperlinks;
 mod terminal_title;
+mod tools_view;
+#[cfg(test)]
+#[path = "tools_view_tests.rs"]
+mod tools_view_tests;
 mod view;
 mod width;
-#[cfg(any(windows, test))]
-mod windows_console;
 mod wrapping;
 
 use crate::agent::Agent;
@@ -54,6 +53,7 @@ use crate::agent::SubmitOutcome;
 use crate::agent::TurnHandle;
 use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
+use crate::events::SteerId;
 use crate::input::UserInput;
 use crate::input::UserPrompt;
 use crate::model::ModelSelection;
@@ -65,24 +65,26 @@ use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionSummary;
 use crate::rollout::SessionTranscriptItem;
+use crate::rollout::SessionTranscriptToolOutput;
 use crate::service_tier::ServiceTier;
-use crate::tools::ProcessManager;
 use crate::update::AvailableUpdate;
 use anyhow::Context;
 use anyhow::Result;
 use clipboard::ClipboardLease;
 use crossterm::event::Event;
-use event_stream::EventStream;
+use crossterm::event::EventStream;
 use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures_util::StreamExt;
 use notifications::Notifier;
+use pending_input::QueuedFollowUp;
 use presentation::MIN_FRAME_INTERVAL;
 use serde_json::Value;
 use status::StatusSnapshot;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::future::pending;
 use std::path::Path;
 use std::path::PathBuf;
@@ -96,6 +98,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use tokio::time::Interval;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use view::Action;
 use view::ComposerSubmission;
@@ -115,13 +118,12 @@ const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(32);
 // late.
 const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(75);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
-#[cfg(windows)]
-const PASTE_BURST_TICK_INTERVAL: Duration = Duration::from_millis(9);
 const LONG_TASK_NOTIFICATION_THRESHOLD: Duration = Duration::from_secs(5);
 // Keep ingress batching large enough to amortize channel polling, but return to `select!` before a
 // burst can noticeably delay terminal input. Model events are retained in the presentation queue,
 // so this is a scheduling budget rather than a throughput limit.
 const MAX_READY_AGENT_EVENTS: usize = 256;
+const MAX_OPERATOR_LIVE_OUTPUT_BYTES: usize = 128 * 1024;
 
 pub(crate) struct Startup(terminal::TerminalStartup);
 
@@ -239,7 +241,7 @@ struct Runtime {
     turn: TurnTaskState,
     turn_events: Option<UnboundedReceiver<AgentEvent>>,
     turn_handle: Option<TurnHandle>,
-    exit_after_turn: bool,
+    exit_after_work: bool,
     context_snapshot: ContextSnapshot,
     session_id: String,
     forked_from: Option<String>,
@@ -257,15 +259,17 @@ struct Runtime {
     prompt_history_reader: Option<PromptHistoryReader>,
     prompt_history_task: Option<PromptHistoryTask>,
     prompt_history_exclusions: HashSet<String>,
-    processes: ProcessManager,
     model_selection: ModelSelection,
     service_tier: ServiceTier,
     session_scan: Option<SessionScanTask>,
     resume_task: Option<ResumeTask>,
     notifier: Option<Notifier>,
     operator_command_tasks: HashMap<String, JoinHandle<()>>,
-    operator_command_updates: UnboundedReceiver<OperatorCommandCompletion>,
-    operator_command_updates_tx: tokio::sync::mpsc::UnboundedSender<OperatorCommandCompletion>,
+    operator_command_cancellations: HashMap<String, CancellationToken>,
+    pending_operator_contexts: VecDeque<String>,
+    operator_context_steers: Vec<(SteerId, String)>,
+    operator_command_updates: UnboundedReceiver<OperatorCommandUpdate>,
+    operator_command_updates_tx: tokio::sync::mpsc::UnboundedSender<OperatorCommandUpdate>,
     terminal_focused: bool,
     terminal_title: TerminalTitle,
     turn_started_at: Option<Instant>,
@@ -291,9 +295,16 @@ struct SessionPromptHistory {
     composer_history: Vec<String>,
 }
 
-struct OperatorCommandCompletion {
-    call_id: String,
-    output: std::result::Result<Value, String>,
+enum OperatorCommandUpdate {
+    Output {
+        call_id: String,
+        chunk: String,
+    },
+    Completed {
+        call_id: String,
+        output: std::result::Result<Value, String>,
+        context: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,7 +375,6 @@ impl Runtime {
             .cloned()
             .map(|snapshot| (snapshot.limit_id.clone(), snapshot))
             .collect();
-        let processes = agent.background_processes();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
         let (operator_command_updates_tx, operator_command_updates) = unbounded_channel();
@@ -377,7 +387,7 @@ impl Runtime {
             turn: TurnTaskState::Idle,
             turn_events: None,
             turn_handle: None,
-            exit_after_turn: false,
+            exit_after_work: false,
             context_snapshot,
             session_id,
             forked_from,
@@ -395,13 +405,15 @@ impl Runtime {
             prompt_history_reader: Some(prompt_history_reader),
             prompt_history_task: None,
             prompt_history_exclusions,
-            processes,
             model_selection,
             service_tier,
             session_scan: None,
             resume_task: None,
             notifier: Some(Notifier::detect()),
             operator_command_tasks: HashMap::new(),
+            operator_command_cancellations: HashMap::new(),
+            pending_operator_contexts: VecDeque::new(),
+            operator_context_steers: Vec::new(),
             operator_command_updates,
             operator_command_updates_tx,
             terminal_focused: true,
@@ -422,12 +434,6 @@ impl Runtime {
         animation_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut maintenance_ticks = tokio::time::interval(MAINTENANCE_INTERVAL);
         maintenance_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        #[cfg(windows)]
-        let mut paste_ticks = tokio::time::interval(PASTE_BURST_TICK_INTERVAL);
-        #[cfg(windows)]
-        paste_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        #[cfg(not(windows))]
-        let mut paste_ticks = ();
         let mut screen_size_recheck_at = None;
         let mut stream_frames = StreamFramePacer::default();
         let mut redraw = true;
@@ -507,6 +513,9 @@ impl Runtime {
                         // and scrolls the inline viewport. Treat resize and adjacent focus changes
                         // as surface-change signals, then sample one current size for the frame.
                         self.reconcile_terminal_geometry(session)?;
+                    }
+                    if self.exit_after_work {
+                        continue;
                     }
                     let action = self.view.handle_terminal_event(event);
                     self.file_search
@@ -644,6 +653,18 @@ impl Runtime {
                     let (mut agent, completion) = self.turn.take_presenting();
                     self.sync_model_selection_to_agent(&mut agent);
                     self.sync_service_tier_to_agent(&mut agent);
+                    self.pending_operator_contexts.extend(
+                        self.operator_context_steers
+                            .drain(..)
+                            .map(|(_, context)| context),
+                    );
+                    if let Err(error) =
+                        flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
+                    {
+                        self.view.add_notice(format!(
+                            "Operator shell output could not be added to model context: {error:#}"
+                        ));
+                    }
                     self.context_snapshot = agent.context_snapshot();
                     self.cache_status_rate_limits(self.context_snapshot.rate_limits.clone());
                     self.turn_handle = None;
@@ -673,17 +694,18 @@ impl Runtime {
                     self.agent = Some(agent);
                     redraw = true;
 
-                    if self.exit_after_turn {
+                    if self.exit_ready() {
                         break;
                     }
+                    if self.exit_after_work {
+                        continue;
+                    }
                     if completed {
-                        if let Some(prompt) = self.view.pop_next_queued_follow_up() {
-                            self.start_turn(prompt);
-                        } else if let (Some(message), Some(elapsed)) = (notification, elapsed)
-                            && should_notify_turn_completion(
-                                self.terminal_focused,
-                                elapsed,
-                            )
+                        let started_follow_up = self.operator_command_tasks.is_empty()
+                            && self.start_next_queued_follow_up();
+                        if !started_follow_up
+                            && let (Some(message), Some(elapsed)) = (notification, elapsed)
+                            && should_notify_turn_completion(self.terminal_focused, elapsed)
                         {
                             self.post_notification(&message);
                         }
@@ -693,25 +715,13 @@ impl Runtime {
                         self.view.restore_pending_input_to_composer();
                     }
                 }
-                completion = self.operator_command_updates.recv() => {
-                    if let Some(completion) = completion {
-                        self.operator_command_tasks.remove(&completion.call_id);
-                        self.view.finish_operator_command(
-                            &completion.call_id,
-                            completion.output,
-                        );
-                        if let Some(agent) = self.agent.as_mut() {
-                            // A local command can finish after a model turn checkpointed its
-                            // still-running cell. Replace the checkpoint so the completed outcome
-                            // cannot remain stale on resume.
-                            agent.invalidate_transcript_checkpoint();
-                            if let Err(error) = persist_session_transcript(&self.view, agent) {
-                                self.view.add_notice(format!(
-                                    "Session transcript could not be saved: {error:#}"
-                                ));
-                            }
-                        }
+                update = self.operator_command_updates.recv() => {
+                    if let Some(update) = update {
+                        self.apply_operator_command_update(update);
                         redraw = true;
+                        if self.exit_ready() {
+                            break;
+                        }
                     }
                 }
                 result = self.diff_updates.recv() => {
@@ -726,10 +736,6 @@ impl Runtime {
                     // panes. A cheap maintenance sample bounds stale geometry without restoring a
                     // backend query to every animation or streaming frame.
                     redraw |= self.reconcile_terminal_geometry(session)?;
-                    redraw |= self.refresh_background_processes();
-                }
-                _ = receive_paste_tick(self.view.paste_burst_active(), &mut paste_ticks) => {
-                    redraw |= self.view.flush_paste_burst();
                 }
                 _ = receive_deadline(screen_size_recheck_at) => {
                     screen_size_recheck_at = None;
@@ -835,6 +841,9 @@ impl Runtime {
     }
 
     fn handle_action(&mut self, action: Action) -> bool {
+        if self.exit_after_work {
+            return false;
+        }
         match action {
             Action::None => {}
             Action::LoadPromptHistory => self.start_prompt_history_load(),
@@ -859,20 +868,19 @@ impl Runtime {
                             }
                         }
                     }
-                } else {
+                } else if self.operator_command_tasks.is_empty() {
                     self.start_composer_turn(submission);
+                } else {
+                    self.queue_composer_follow_up(submission);
                 }
             }
             Action::Queue(submission) => {
-                if self.turn.is_active() {
-                    let history_text = submission.prompt().text_without_image_placeholders();
-                    self.persist_prompt(&history_text);
-                    self.view.queue_follow_up(submission.into_prompt());
-                } else {
-                    self.start_composer_turn(submission);
+                self.queue_composer_follow_up(submission);
+                if !self.turn.is_active() && self.operator_command_tasks.is_empty() {
+                    self.start_next_queued_follow_up();
                 }
             }
-            Action::Cancel => self.interrupt_turn(),
+            Action::Cancel => self.cancel_active_work(),
             Action::Copy(text) => match clipboard::copy_to_clipboard(&text) {
                 Ok(lease) => {
                     self.clipboard_lease = lease;
@@ -899,11 +907,6 @@ impl Runtime {
                             .add_error(format!("Could not fork this session: {error:#}"));
                     }
                 }
-            }
-            Action::ListBackgroundProcesses => {
-                let processes = self.processes.list_background_processes();
-                self.view.set_background_processes(processes.clone());
-                self.view.add_background_process_list(processes);
             }
             Action::Clear(submission) => {
                 if self.has_local_session_activity() {
@@ -990,13 +993,6 @@ impl Runtime {
                 self.start_rate_limit_refresh();
             }
             Action::ShowDiff => self.start_git_diff(),
-            Action::StopBackgroundProcesses => {
-                let count = self.processes.stop_all_background_processes();
-                self.view.set_background_processes(Vec::new());
-                let plural = if count == 1 { "" } else { "s" };
-                self.view
-                    .add_notice(format!("Stopped {count} background terminal{plural}"));
-            }
             Action::EnterTmux => unreachable!("tmux handoffs are handled by the event loop"),
             Action::Logout => unreachable!("logout is handled by the event loop"),
             Action::UpdateSkill { path, update } => match self.agent.as_mut() {
@@ -1023,14 +1019,7 @@ impl Runtime {
                     "Could not update skill: skills can only be changed while the agent is idle",
                 ),
             },
-            Action::Quit => {
-                if self.turn.is_active() {
-                    self.exit_after_turn = true;
-                    self.cancel_turn(InterruptIntent::StopTurn);
-                } else {
-                    return true;
-                }
-            }
+            Action::Quit => return self.request_exit(),
         }
         false
     }
@@ -1147,7 +1136,6 @@ impl Runtime {
         agent.set_model_selection(self.model_selection.clone())?;
         agent.set_service_tier(self.service_tier)?;
         let prompt_history = PromptHistory::open(agent.session_id())?;
-        let processes = agent.background_processes();
         let context_snapshot = agent.context_snapshot();
         let session_id = agent.session_id().to_string();
         let forked_from = agent.forked_from().map(str::to_string);
@@ -1155,8 +1143,6 @@ impl Runtime {
         let skills = agent.skills().to_vec();
         let skill_warnings = agent.skill_warnings().to_vec();
 
-        self.processes.stop_all_background_processes();
-        self.processes = processes;
         self.context_snapshot = context_snapshot;
         self.session_id = session_id;
         self.forked_from = forked_from;
@@ -1181,15 +1167,12 @@ impl Runtime {
         let session_id = agent.session_id().to_string();
         let forked_from = agent.forked_from().map(str::to_string);
         let instruction_source_paths = agent.instruction_source_paths().to_vec();
-        self.processes.stop_all_background_processes();
-        self.processes = agent.background_processes();
         self.context_snapshot = agent.context_snapshot();
         self.session_id.clone_from(&session_id);
         self.forked_from = forked_from;
         self.instruction_source_paths = instruction_source_paths;
         self.view.set_context_tokens(agent.context_tokens());
         self.view.set_skills(agent.skills().to_vec());
-        self.view.set_background_processes(Vec::new());
         self.agent = Some(agent);
         self.prompt_history = Some(prompt_history);
         self.view
@@ -1237,22 +1220,149 @@ impl Runtime {
     }
 
     fn start_operator_command(&mut self, command: String) {
+        // Resolve agent events that were already ready when the terminal action won `select!`.
+        // The view then flushes their paced presentation before inserting this local boundary.
+        self.drain_agent_events();
         let call_id = format!("operator:{}", uuid::Uuid::new_v4());
         self.view.start_operator_command(call_id.clone(), &command);
-        let processes = self.processes.clone();
+        if let Some(agent) = self.agent.as_mut()
+            && let Err(error) = persist_session_transcript(&self.view, agent)
+        {
+            self.view
+                .add_notice(format!("Session transcript could not be saved: {error:#}"));
+        }
+        let cwd = self.cwd.clone();
+        let cancellation = CancellationToken::new();
         let updates = self.operator_command_updates_tx.clone();
         let task_call_id = call_id.clone();
+        let task_cancellation = cancellation.clone();
+        let truncation_policy = self.model_selection.truncation_policy();
         let task = tokio::spawn(async move {
-            let output = processes
-                .run_operator_command(command)
-                .await
-                .map_err(|error| format!("{error:#}"));
-            let _ = updates.send(OperatorCommandCompletion {
+            let output_updates = updates.clone();
+            let output_call_id = task_call_id.clone();
+            let mut forwarded_bytes = 0_usize;
+            let mut forward_output = move |_stream, mut chunk: String| {
+                let omitted = crate::process_runtime::fit_live_output_budget(
+                    &mut chunk,
+                    &mut forwarded_bytes,
+                    MAX_OPERATOR_LIVE_OUTPUT_BYTES,
+                );
+                if !chunk.is_empty()
+                    && output_updates
+                        .send(OperatorCommandUpdate::Output {
+                            call_id: output_call_id.clone(),
+                            chunk,
+                        })
+                        .is_err()
+                {
+                    return crate::process_runtime::LiveOutputAction::Stop;
+                }
+                if omitted {
+                    let _ = output_updates.send(OperatorCommandUpdate::Output {
+                        call_id: output_call_id.clone(),
+                        chunk: "\n… additional live output omitted …\n".to_string(),
+                    });
+                    crate::process_runtime::LiveOutputAction::Stop
+                } else {
+                    crate::process_runtime::LiveOutputAction::Continue
+                }
+            };
+            let output = crate::process_runtime::run_user_shell(
+                &command,
+                &cwd,
+                task_cancellation,
+                Some(&mut forward_output),
+            )
+            .await
+            .map(|output| {
+                serde_json::json!({
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                    "exit_code": output.exit_code,
+                })
+            })
+            .map_err(|error| format!("{error:#}"));
+            let context =
+                crate::context::user_shell_command_context(&command, &output, truncation_policy);
+            let _ = updates.send(OperatorCommandUpdate::Completed {
                 call_id: task_call_id,
                 output,
+                context,
             });
         });
+        self.operator_command_cancellations
+            .insert(call_id.clone(), cancellation);
         self.operator_command_tasks.insert(call_id, task);
+    }
+
+    fn apply_operator_command_update(&mut self, update: OperatorCommandUpdate) {
+        match update {
+            OperatorCommandUpdate::Output { call_id, chunk } => {
+                self.view.append_operator_command_output(&call_id, &chunk);
+            }
+            OperatorCommandUpdate::Completed {
+                call_id,
+                output,
+                context,
+            } => {
+                self.operator_command_tasks.remove(&call_id);
+                self.operator_command_cancellations.remove(&call_id);
+                let transcript_output = match &output {
+                    Ok(output) => SessionTranscriptToolOutput::Success(output.clone()),
+                    Err(error) => SessionTranscriptToolOutput::Error(error.clone()),
+                };
+                self.view.finish_operator_command(&call_id, output);
+                self.record_operator_context(context);
+                if let Some(agent) = self.agent.as_mut() {
+                    // Persist the cell first in case its start checkpoint failed, then patch its
+                    // bounded outcome without replacing the complete transcript snapshot.
+                    if let Err(error) = persist_session_transcript(&self.view, agent) {
+                        self.view.add_notice(format!(
+                            "Session transcript could not be saved: {error:#}"
+                        ));
+                    }
+                    if let Err(error) =
+                        agent.persist_transcript_tool_outcome(call_id.clone(), transcript_output)
+                    {
+                        // The saved cell may still be incomplete. Force the next checkpoint to
+                        // replace it from the view instead of appending past stale state.
+                        agent.invalidate_transcript_checkpoint();
+                        self.view.add_notice(format!(
+                            "Session transcript could not be saved: {error:#}"
+                        ));
+                    }
+                }
+                if self.operator_command_tasks.is_empty()
+                    && !self.turn.is_active()
+                    && !self.exit_after_work
+                {
+                    self.start_next_queued_follow_up();
+                }
+            }
+        }
+    }
+
+    fn record_operator_context(&mut self, context: String) {
+        if self.turn.is_active()
+            && let Some(turn) = &self.turn_handle
+            && let Ok(id) = turn.inject_context(context.clone())
+        {
+            self.operator_context_steers.push((id, context));
+            return;
+        }
+
+        self.pending_operator_contexts.push_back(context);
+        let Some(mut agent) = self.agent.take() else {
+            return;
+        };
+        if let Err(error) = flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
+        {
+            self.view.add_notice(format!(
+                "Operator shell output could not be added to model context: {error:#}"
+            ));
+        }
+        self.context_snapshot = agent.context_snapshot();
+        self.agent = Some(agent);
     }
 
     fn start_git_diff(&mut self) {
@@ -1297,19 +1407,16 @@ impl Runtime {
         let context_tokens = agent.context_tokens();
         let skills = agent.skills().to_vec();
         let skill_warnings = agent.skill_warnings().to_vec();
-        let processes = agent.background_processes();
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
 
         self.cwd = cwd.clone();
-        self.processes.stop_all_background_processes();
-        self.processes = processes;
         self.context_snapshot = context_snapshot;
         self.session_id = session_id;
         self.forked_from = forked_from;
         self.instruction_source_paths = instruction_source_paths;
         self.agent = Some(agent);
-        self.exit_after_turn = false;
+        self.exit_after_work = false;
         self.file_search = file_search;
         self.file_search_updates = file_search_updates;
         self.prompt_history = Some(prompt_history);
@@ -1337,6 +1444,49 @@ impl Runtime {
         }
     }
 
+    fn queue_composer_follow_up(&mut self, submission: ComposerSubmission) {
+        let history_text = submission
+            .prompt()
+            .text_without_image_placeholders()
+            .into_owned();
+        let shell_command = (submission.prompt().image_count() == 0)
+            .then(|| history_text.trim().strip_prefix('!'))
+            .flatten()
+            .map(str::trim)
+            .map(str::to_string);
+        if shell_command.as_deref() != Some("") {
+            self.persist_prompt(&history_text);
+        }
+        let prompt = submission.into_prompt();
+        if let Some(command) = shell_command {
+            self.view.queue_shell_follow_up(prompt, command);
+        } else {
+            self.view.queue_follow_up(prompt);
+        }
+    }
+
+    fn start_next_queued_follow_up(&mut self) -> bool {
+        loop {
+            let Some(follow_up) = self.view.pop_next_queued_follow_up() else {
+                return false;
+            };
+            match follow_up {
+                QueuedFollowUp::Prompt(prompt) => {
+                    self.start_turn(prompt);
+                    return true;
+                }
+                QueuedFollowUp::Shell { command, .. } if command.is_empty() => {
+                    self.view
+                        .add_notice("Run an operator shell command with !command".to_string());
+                }
+                QueuedFollowUp::Shell { command, .. } => {
+                    self.start_operator_command(command);
+                    return true;
+                }
+            }
+        }
+    }
+
     fn start_composer_turn(&mut self, submission: ComposerSubmission) {
         match self.prepare_turn_start() {
             Ok(agent) => {
@@ -1358,9 +1508,18 @@ impl Runtime {
     }
 
     fn prepare_turn_start(&mut self) -> std::result::Result<Agent, String> {
-        self.agent
+        let mut agent = self
+            .agent
             .take()
-            .ok_or_else(|| "Could not start turn: the active agent is unavailable".to_string())
+            .ok_or_else(|| "Could not start turn: the active agent is unavailable".to_string())?;
+        if let Err(error) = flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
+        {
+            self.agent = Some(agent);
+            return Err(format!(
+                "Could not start turn: operator shell output could not be added to model context: {error:#}"
+            ));
+        }
+        Ok(agent)
     }
 
     fn spawn_turn(&mut self, mut agent: Agent, prompt: UserPrompt) {
@@ -1386,6 +1545,14 @@ impl Runtime {
             );
             return;
         };
+        if let Err(error) = flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
+        {
+            self.agent = Some(agent);
+            self.view.add_notice(format!(
+                "Could not compact conversation: operator shell output could not be added to model context: {error:#}"
+            ));
+            return;
+        }
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::non_steerable_channel();
         self.view.start_compaction();
@@ -1398,10 +1565,40 @@ impl Runtime {
         }));
     }
 
+    fn request_exit(&mut self) -> bool {
+        if !self.turn.is_active() && self.operator_command_tasks.is_empty() {
+            return true;
+        }
+        self.exit_after_work = true;
+        if self.turn.is_active() {
+            self.cancel_turn(InterruptIntent::StopTurn);
+        }
+        for cancellation in self.operator_command_cancellations.values() {
+            cancellation.cancel();
+        }
+        false
+    }
+
+    fn exit_ready(&self) -> bool {
+        self.exit_after_work && !self.turn.is_active() && self.operator_command_tasks.is_empty()
+    }
+
     fn cancel_turn(&mut self, intent: InterruptIntent) {
         if let Some(turn) = &self.turn_handle {
             turn.cancel();
             self.view.set_interrupting(intent);
+        }
+    }
+
+    fn cancel_active_work(&mut self) {
+        let submitting_steering = self.turn.is_active() && self.view.has_pending_steers();
+        if self.turn.is_active() {
+            self.interrupt_turn();
+        }
+        if !submitting_steering {
+            for cancellation in self.operator_command_cancellations.values() {
+                cancellation.cancel();
+            }
         }
     }
 
@@ -1436,13 +1633,15 @@ impl Runtime {
         if let AgentEvent::ContextUpdated(snapshot) = &event {
             self.context_snapshot = snapshot.clone();
             self.cache_status_rate_limits(snapshot.rate_limits.clone());
+        } else if let AgentEvent::SteeringCommitted(id) = &event
+            && let Some(index) = self
+                .operator_context_steers
+                .iter()
+                .position(|(candidate, _)| candidate == id)
+        {
+            self.operator_context_steers.remove(index);
         }
         self.view.handle_agent_event(event);
-    }
-
-    fn refresh_background_processes(&mut self) -> bool {
-        self.view
-            .set_background_processes(self.processes.list_background_processes())
     }
 
     fn has_foreground_activity(&self) -> bool {
@@ -1515,11 +1714,13 @@ impl Drop for Runtime {
         abort_join_task(&mut self.update_check);
         abort_join_task(&mut self.rate_limit_task);
         abort_join_task(&mut self.prompt_history_task);
+        for (_, cancellation) in self.operator_command_cancellations.drain() {
+            cancellation.cancel();
+        }
         for (_, task) in self.operator_command_tasks.drain() {
             task.abort();
         }
         abort_join_task(&mut self.diff_task);
-        self.processes.stop_all_background_processes();
     }
 }
 
@@ -1540,6 +1741,16 @@ fn persist_session_transcript(view: &View, agent: &mut Agent) -> Result<()> {
 
 fn should_notify_turn_completion(terminal_focused: bool, elapsed: Duration) -> bool {
     !terminal_focused && elapsed >= LONG_TASK_NOTIFICATION_THRESHOLD
+}
+
+fn flush_operator_contexts(pending: &mut VecDeque<String>, agent: &mut Agent) -> Result<()> {
+    while let Some(context) = pending.pop_front() {
+        if let Err(error) = agent.record_operator_shell_context(context.clone()) {
+            pending.push_front(context);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn prompt_history_for_agent(agent: &Agent) -> Result<SessionPromptHistory> {
@@ -1658,20 +1869,6 @@ async fn receive_deadline(deadline: Option<tokio::time::Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => pending().await,
     }
-}
-
-#[cfg(windows)]
-async fn receive_paste_tick(active: bool, ticks: &mut Interval) {
-    if active {
-        ticks.tick().await;
-    } else {
-        pending().await
-    }
-}
-
-#[cfg(not(windows))]
-async fn receive_paste_tick(_active: bool, _ticks: &mut ()) {
-    pending().await
 }
 
 async fn receive_agent_event(

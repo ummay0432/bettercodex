@@ -103,16 +103,6 @@ fn native_copy(text: &str) -> Result<Option<ClipboardLease>, String> {
     Ok(None)
 }
 
-#[cfg(windows)]
-fn native_copy(text: &str) -> Result<Option<ClipboardLease>, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("clipboard unavailable: {error}"))?;
-    clipboard
-        .set_text(text)
-        .map_err(|error| format!("failed to set clipboard text: {error}"))?;
-    Ok(None)
-}
-
 fn tmux_copy(text: &str) -> Result<(), String> {
     let set_clipboard = command_output("tmux", &["show-options", "-gv", "set-clipboard"])?;
     if set_clipboard.trim() == "off" {
@@ -127,16 +117,9 @@ fn tmux_copy(text: &str) -> Result<(), String> {
 
 fn osc52_copy(text: &str) -> Result<(), String> {
     let sequence = osc52_sequence(text, crate::managed_session::is_tmux_active())?;
-    #[cfg(unix)]
-    {
-        match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-            Ok(mut tty) => write_and_flush(&mut tty, sequence.as_bytes()),
-            Err(_) => write_and_flush(&mut std::io::stdout().lock(), sequence.as_bytes()),
-        }
-    }
-    #[cfg(windows)]
-    {
-        write_and_flush(&mut std::io::stdout().lock(), sequence.as_bytes())
+    match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(mut tty) => write_and_flush(&mut tty, sequence.as_bytes()),
+        Err(_) => write_and_flush(&mut std::io::stdout().lock(), sequence.as_bytes()),
     }
 }
 

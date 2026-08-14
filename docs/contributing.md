@@ -35,7 +35,7 @@ just fix
 just fmt
 just test
 just clippy -- -D warnings
-./scripts/cargo-with-v8.sh build --release --locked
+cargo build --release --locked
 ```
 
 Document user-visible behavior and keep commits focused. By submitting a

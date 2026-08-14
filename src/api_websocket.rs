@@ -3,7 +3,7 @@ use super::ApiResult;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
-use serde_json::Value;
+use serde::Serialize;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
@@ -39,7 +39,11 @@ impl WebSocketConnection {
         Ok((Self { stream }, response.headers().clone()))
     }
 
-    pub(super) async fn send(&mut self, request: &Value, idle_timeout: Duration) -> ApiResult<()> {
+    pub(super) async fn send<T: Serialize + ?Sized>(
+        &mut self,
+        request: &T,
+        idle_timeout: Duration,
+    ) -> ApiResult<()> {
         let encoded = serde_json::to_string(request).map_err(|error| {
             ApiError::fatal(format!("failed to encode WebSocket request: {error}"))
         })?;

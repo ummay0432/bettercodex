@@ -101,7 +101,7 @@ fn review_skill_is_reserved_proactive_and_defers_protocol_from_both_entry_points
 }
 
 #[test]
-fn papercut_skill_and_tool_are_opt_in() {
+fn papercut_skill_is_opt_in() {
     let root = TemporaryDirectory::new();
     let home = root.join("home");
     let cwd = root.join("repository");
@@ -116,7 +116,6 @@ fn papercut_skill_and_tool_are_opt_in() {
         })
         .unwrap();
     assert!(!papercut.is_enabled());
-    assert!(!catalog.tool_configuration().papercut_enabled());
     assert!(
         !text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
             .contains("- papercut:")
@@ -143,7 +142,6 @@ fn papercut_skill_and_tool_are_opt_in() {
         })
         .unwrap();
     assert!(papercut.is_enabled());
-    assert!(catalog.tool_configuration().papercut_enabled());
     assert!(
         text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
             .contains("- papercut:")
@@ -152,7 +150,7 @@ fn papercut_skill_and_tool_are_opt_in() {
     let enabled = catalog.explicit_injections("", &[selection]);
     assert!(enabled.warnings.is_empty());
     assert_eq!(enabled.items.len(), 1);
-    assert!(text_of(&enabled.items[0]).contains("tools.log_papercut"));
+    assert!(text_of(&enabled.items[0]).contains("`edit`"));
 }
 
 #[test]
@@ -179,5 +177,5 @@ fn openai_docs_skill_is_explicit_and_uses_web_search() {
     let injection = catalog.explicit_injections("", &[selection]);
     assert!(injection.warnings.is_empty());
     assert_eq!(injection.items.len(), 1);
-    assert!(text_of(&injection.items[0]).contains("tools.web__run"));
+    assert!(text_of(&injection.items[0]).contains("`web_search`"));
 }

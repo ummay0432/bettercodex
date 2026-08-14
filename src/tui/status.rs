@@ -131,11 +131,7 @@ impl StatusSnapshot {
             vec![
                 Span::from(self.model.model.clone()),
                 Span::from(" (").dim(),
-                Span::from(format!(
-                    "reasoning {}, summaries auto",
-                    self.model.reasoning_effort
-                ))
-                .dim(),
+                Span::from(format!("reasoning {}", self.model.reasoning_effort)).dim(),
                 Span::from(")").dim(),
             ],
         ));

@@ -1,8 +1,9 @@
 //! Focused prompt-image preparation retained from OpenAI Codex commit
-//! 902bd9e06b3ecb32cbf7f8e64cd23b956be3e7fe.
+//! 5bc8da6d78fe32343dc51eaf73b96fd288ae0e87.
 //!
 //! bettercodex snapshots user attachments before submission and receives tool
 //! images as data URLs, so the upstream utility's path-reading API is omitted.
+//! GPT-5.6 original-detail inputs intentionally bypass client-side resizing.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -36,10 +37,6 @@ const MAX_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const HIGH_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
     max_dimension: 2048,
     max_patches: 2_500,
-};
-pub(crate) const ORIGINAL_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
-    max_dimension: 6000,
-    max_patches: 10_000,
 };
 
 #[derive(Debug, Error)]
@@ -92,6 +89,12 @@ pub(crate) fn data_url_from_bytes(mime: &str, bytes: &[u8]) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PromptImageMode {
+    Original,
+    ResizeWithLimits(PromptImageResizeLimits),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PromptImageResizeLimits {
     pub(crate) max_dimension: u32,
     pub(crate) max_patches: usize,
@@ -105,7 +108,7 @@ struct ImageMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ImageCacheKey {
     digest: [u8; 20],
-    limits: PromptImageResizeLimits,
+    mode: PromptImageMode,
 }
 
 // Upstream shares a Tokio-aware cache utility across several crates. bettercodex has one
@@ -166,7 +169,7 @@ fn sha1_digest(bytes: &[u8]) -> [u8; 20] {
 
 pub(crate) fn load_data_url_for_prompt(
     image_url: &str,
-    limits: PromptImageResizeLimits,
+    mode: PromptImageMode,
 ) -> Result<EncodedImage, ImageProcessingError> {
     let rest = image_url
         .get(..DATA_URL_PREFIX.len())
@@ -209,16 +212,16 @@ pub(crate) fn load_data_url_for_prompt(
         });
     }
 
-    load_for_prompt_bytes(file_bytes.into(), limits)
+    load_for_prompt_bytes(file_bytes.into(), mode)
 }
 
 pub(crate) fn load_for_prompt_bytes(
     file_bytes: Arc<[u8]>,
-    limits: PromptImageResizeLimits,
+    mode: PromptImageMode,
 ) -> Result<EncodedImage, ImageProcessingError> {
     let key = ImageCacheKey {
         digest: sha1_digest(&file_bytes),
-        limits,
+        mode,
     };
     if let Some(image) = IMAGE_CACHE.get(&key) {
         return Ok(image);
@@ -237,6 +240,17 @@ pub(crate) fn load_for_prompt_bytes(
         let mut decoder = ImageReader::with_format(Cursor::new(&file_bytes), guessed_format)
             .into_decoder()
             .map_err(ImageProcessingError::decode_error)?;
+        // `ImageReader::decode` reserves the output buffer against its allocation limit before
+        // constructing a `DynamicImage`. We need the decoder directly to retain ICC and EXIF
+        // metadata, so perform the same reservation instead of allowing dimensions in a small,
+        // malformed input to trigger an effectively unbounded pixel-buffer allocation.
+        let mut limits = image::Limits::default();
+        limits
+            .reserve(decoder.total_bytes())
+            .map_err(ImageProcessingError::decode_error)?;
+        decoder
+            .set_limits(limits)
+            .map_err(ImageProcessingError::decode_error)?;
         let metadata = ImageMetadata {
             icc_profile: decoder
                 .icc_profile()
@@ -248,29 +262,33 @@ pub(crate) fn load_for_prompt_bytes(
         let dynamic =
             DynamicImage::from_decoder(decoder).map_err(ImageProcessingError::decode_error)?;
         let (width, height) = dynamic.dimensions();
-        let (target_width, target_height) =
-            prompt_image_output_dimensions_for_limits(width, height, limits);
-
-        let encoded = if (target_width, target_height) == (width, height) {
-            if let Some(format) = source_format.filter(|format| can_preserve_source_bytes(*format))
-            {
-                EncodedImage {
-                    bytes: file_bytes,
-                    mime: format_to_mime(format),
-                }
-            } else {
-                let (bytes, format) = encode_image(&dynamic, ImageFormat::Png, metadata)?;
-                EncodedImage {
-                    bytes: bytes.into(),
-                    mime: format_to_mime(format),
-                }
+        let target_dimensions = match mode {
+            PromptImageMode::Original => None,
+            PromptImageMode::ResizeWithLimits(limits) => {
+                let target = prompt_image_output_dimensions_for_limits(width, height, limits);
+                (target != (width, height)).then_some(target)
             }
-        } else {
+        };
+
+        let encoded = if let Some((target_width, target_height)) = target_dimensions {
             let resized = dynamic.resize_exact(target_width, target_height, FilterType::Triangle);
             let target_format = source_format
                 .filter(|format| can_preserve_source_bytes(*format))
                 .unwrap_or(ImageFormat::Png);
             let (bytes, format) = encode_image(&resized, target_format, metadata)?;
+            EncodedImage {
+                bytes: bytes.into(),
+                mime: format_to_mime(format),
+            }
+        } else if let Some(format) =
+            source_format.filter(|format| can_preserve_source_bytes(*format))
+        {
+            EncodedImage {
+                bytes: file_bytes,
+                mime: format_to_mime(format),
+            }
+        } else {
+            let (bytes, format) = encode_image(&dynamic, ImageFormat::Png, metadata)?;
             EncodedImage {
                 bytes: bytes.into(),
                 mime: format_to_mime(format),
@@ -451,7 +469,11 @@ mod tests {
     #[test]
     fn preserves_supported_image_within_limits() {
         let original = image_bytes(64, 32, ImageFormat::Png);
-        let image = load_for_prompt_bytes(original.clone().into(), LIMITS).expect("process image");
+        let image = load_for_prompt_bytes(
+            original.clone().into(),
+            PromptImageMode::ResizeWithLimits(LIMITS),
+        )
+        .expect("process image");
         assert_eq!(image.mime, "image/png");
         assert_eq!(image.bytes.as_ref(), original);
     }
@@ -459,9 +481,27 @@ mod tests {
     #[test]
     fn enforces_dimension_and_patch_budgets() {
         let original = image_bytes(2048, 2048, ImageFormat::Png);
-        let image = load_for_prompt_bytes(original.into(), LIMITS).expect("process image");
+        let image =
+            load_for_prompt_bytes(original.into(), PromptImageMode::ResizeWithLimits(LIMITS))
+                .expect("process image");
         let decoded = image::load_from_memory(&image.bytes).expect("decode output");
         assert_eq!(decoded.dimensions(), (1600, 1600));
+    }
+
+    #[test]
+    fn original_mode_preserves_dimensions_beyond_legacy_limits() {
+        let original = image_bytes(6401, 1, ImageFormat::Png);
+        let image = load_for_prompt_bytes(original.clone().into(), PromptImageMode::Original)
+            .expect("process original-detail image");
+
+        assert_eq!(image.mime, "image/png");
+        assert_eq!(image.bytes.as_ref(), original);
+        assert_eq!(
+            image::load_from_memory(&image.bytes)
+                .expect("decode original-detail image")
+                .dimensions(),
+            (6401, 1)
+        );
     }
 
     #[test]
@@ -469,7 +509,7 @@ mod tests {
         let cache = ImageCache::new(NonZeroUsize::new(4).expect("non-zero cache capacity"));
         let key = |digest_byte| ImageCacheKey {
             digest: [digest_byte; 20],
-            limits: LIMITS,
+            mode: PromptImageMode::ResizeWithLimits(LIMITS),
         };
         let image = |size| EncodedImage {
             bytes: vec![0; size].into(),
@@ -494,7 +534,7 @@ mod tests {
             "data:image/png;base64,not base64",
         ] {
             assert!(matches!(
-                load_data_url_for_prompt(image_url, LIMITS),
+                load_data_url_for_prompt(image_url, PromptImageMode::ResizeWithLimits(LIMITS),),
                 Err(ImageProcessingError::InvalidDataUrl { .. })
             ));
         }

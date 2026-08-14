@@ -6,13 +6,17 @@ use crate::repository;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
 use crate::rollout::Rollout;
+use crate::rollout::SYNTHETIC_ABORT_OUTPUT;
 use crate::rollout::SessionIdentity;
+use crate::rollout::SessionTranscriptToolOutcome;
 use crate::rollout::TurnOutcome;
 use crate::service_tier::ServiceTier;
 use crate::skills::SkillCatalog;
 use crate::text::escape_cdata;
 use crate::text::escape_xml;
+use crate::truncation::TruncationPolicy;
 use crate::truncation::formatted_truncate_text;
+use crate::truncation::formatted_truncate_text_with_policy;
 use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
@@ -35,8 +39,9 @@ use uuid::Uuid;
 // ceiling.
 const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 const MAX_CONTEXT_NOTICE_TEXT_TOKENS: usize = 9_900;
+const OPERATOR_SHELL_COMMAND_BUDGET_SHARE: f64 = 0.1;
+const OPERATOR_SHELL_OUTPUT_BUDGET_SHARE: f64 = 0.9;
 const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
-const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;
 const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
 const CRASH_GUIDANCE: &str = "The previous bettercodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
@@ -259,8 +264,6 @@ struct ContextMetrics {
     items: [usize; CONTEXT_KINDS.len()],
     encrypted_reasoning_tokens: u64,
     encrypted_reasoning_before_last_instruction: u64,
-    has_tools: bool,
-    has_system_prompt: bool,
 }
 
 /// Incremental index of the call/output invariants enforced before sampling.
@@ -461,16 +464,40 @@ impl Conversation {
         self.rollout.append_transcript(items)
     }
 
+    pub(crate) fn record_tool_outcomes(
+        &mut self,
+        outcomes: Vec<SessionTranscriptToolOutcome>,
+    ) -> Result<()> {
+        self.rollout.record_tool_outcomes(outcomes)
+    }
+
     pub(crate) fn extend(&mut self, items: impl IntoIterator<Item = Value>) -> Result<()> {
         let items = items.into_iter().collect::<Vec<_>>();
         if items.is_empty() {
             return Ok(());
         }
         self.rollout.append_history(&items)?;
+        self.commit_history_append(items);
+        Ok(())
+    }
+
+    pub(crate) fn extend_tool_results(
+        &mut self,
+        items: Vec<Value>,
+        outcomes: Vec<SessionTranscriptToolOutcome>,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return self.rollout.record_tool_outcomes(outcomes);
+        }
+        self.rollout.append_tool_results(&items, outcomes)?;
+        self.commit_history_append(items);
+        Ok(())
+    }
+
+    fn commit_history_append(&mut self, items: Vec<Value>) {
         self.context_metrics.extend(&items, &self.world_state);
         self.history_normalization.record_append(&items);
         self.history.extend(items);
-        Ok(())
     }
 
     pub(crate) fn project_append(&self, items: Vec<Value>) -> ContextProjection {
@@ -614,10 +641,6 @@ impl Conversation {
         &self.world_state.skills
     }
 
-    pub(crate) fn tool_configuration(&self) -> crate::tools::ToolConfiguration {
-        self.world_state.skills.tool_configuration()
-    }
-
     pub(crate) fn reload_skills(&mut self, cwd: &Path) -> Result<()> {
         let skills = SkillCatalog::load(cwd);
         let mut world_state = self.world_state.clone();
@@ -674,26 +697,21 @@ impl Conversation {
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
-        let [tools_tokens, system_prompt_tokens] =
-            crate::api::estimated_harness_tokens(self.tool_configuration());
+        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens();
         let mut tokens = self.context_metrics.tokens;
         let mut items = self.context_metrics.items;
-        if !self.context_metrics.has_tools {
-            record_context_estimate(
-                &mut tokens,
-                &mut items,
-                ContextKind::ToolCatalogue,
-                tools_tokens,
-            );
-        }
-        if !self.context_metrics.has_system_prompt {
-            record_context_estimate(
-                &mut tokens,
-                &mut items,
-                ContextKind::SystemPrompt,
-                system_prompt_tokens,
-            );
-        }
+        record_context_estimate(
+            &mut tokens,
+            &mut items,
+            ContextKind::ToolCatalogue,
+            tools_tokens,
+        );
+        record_context_estimate(
+            &mut tokens,
+            &mut items,
+            ContextKind::SystemPrompt,
+            system_prompt_tokens,
+        );
 
         let mut sections = CONTEXT_KINDS
             .into_iter()
@@ -729,16 +747,11 @@ impl Conversation {
     }
 
     fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
-        let [tools_tokens, system_prompt_tokens] =
-            crate::api::estimated_harness_tokens(self.tool_configuration());
-        let mut estimate = metrics.estimated_tokens;
-        if !metrics.has_tools {
-            estimate = estimate.saturating_add(tools_tokens);
-        }
-        if !metrics.has_system_prompt {
-            estimate = estimate.saturating_add(system_prompt_tokens);
-        }
-        estimate
+        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens();
+        metrics
+            .estimated_tokens
+            .saturating_add(tools_tokens)
+            .saturating_add(system_prompt_tokens)
     }
 
     pub(crate) fn needs_compaction(&self) -> bool {
@@ -947,13 +960,7 @@ impl ContextMetrics {
             if is_initial_context_boundary(item) {
                 self.encrypted_reasoning_before_last_instruction = self.encrypted_reasoning_tokens;
             }
-            let kind = if crate::api::is_stable_tools_prefix_item(item) {
-                self.has_tools = true;
-                ContextKind::ToolCatalogue
-            } else if crate::api::is_stable_instructions_prefix_item(item) {
-                self.has_system_prompt = true;
-                ContextKind::SystemPrompt
-            } else if same_model_visible_message(item, &world_state.environment) {
+            let kind = if same_model_visible_message(item, &world_state.environment) {
                 ContextKind::Environment
             } else if world_state
                 .repository_context
@@ -996,6 +1003,9 @@ fn same_model_visible_message(left: &Value, right: &Value) -> bool {
 fn context_kind(item: &Value) -> ContextKind {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => match item.get("role").and_then(Value::as_str) {
+            Some("user") if message_text(item).is_some_and(is_user_shell_command_text) => {
+                ContextKind::ToolActivity
+            }
             Some("user") => ContextKind::UserMessages,
             Some("assistant") => ContextKind::AssistantMessages,
             _ => ContextKind::Other,
@@ -1089,8 +1099,13 @@ pub(crate) fn is_contextual_user_text(text: &str) -> bool {
         || is_complete_context_wrapper(text, "<environment_context>", "</environment_context>")
         || is_complete_context_wrapper(text, "<skill_context>", "</skill_context>")
         || is_complete_context_wrapper(text, LEGACY_SKILL_CONTEXT_PREFIX, "</skill>")
+        || is_user_shell_command_text(text)
         || is_complete_context_wrapper(text, "<turn_aborted>", "</turn_aborted>")
         || is_complete_context_wrapper(text, "<response_interrupted>", "</response_interrupted>")
+}
+
+fn is_user_shell_command_text(text: &str) -> bool {
+    is_complete_context_wrapper(text, "<user_shell_command>", "</user_shell_command>")
 }
 
 fn is_complete_context_wrapper(text: &str, opening: &str, closing: &str) -> bool {
@@ -1142,6 +1157,34 @@ pub(crate) fn message(role: &str, text: String) -> Value {
         "role": role,
         "content": [{"type": "input_text", "text": text}],
     })
+}
+
+pub(crate) fn user_shell_command_context(
+    command: &str,
+    output: &std::result::Result<Value, String>,
+    policy: TruncationPolicy,
+) -> String {
+    let command =
+        formatted_truncate_text_with_policy(command, policy * OPERATOR_SHELL_COMMAND_BUDGET_SHARE);
+    let result = match output {
+        Ok(output) => {
+            let stdout = output.get("stdout").and_then(Value::as_str);
+            let stderr = output.get("stderr").and_then(Value::as_str);
+            let exit_code = output.get("exit_code").and_then(Value::as_i64);
+            match (stdout, stderr, exit_code) {
+                (Some(stdout), Some(stderr), Some(exit_code)) => {
+                    format!("Exit code: {exit_code}\nStdout:\n{stdout}\nStderr:\n{stderr}")
+                }
+                _ => format!("Result:\n{output}"),
+            }
+        }
+        Err(error) => format!("Execution error:\n{error}"),
+    };
+    let result =
+        formatted_truncate_text_with_policy(&result, policy * OPERATOR_SHELL_OUTPUT_BUDGET_SHARE);
+    format!(
+        "<user_shell_command>\n<command>\n{command}\n</command>\n<result>\n{result}\n</result>\n</user_shell_command>"
+    )
 }
 
 fn environment_context(cwd: &Path) -> String {
@@ -1303,7 +1346,7 @@ fn estimate_value_tokens(value: &Value) -> u64 {
                 };
                 let replacement = if matches!(
                     content.get("detail").and_then(Value::as_str),
-                    Some("original" | "auto")
+                    None | Some("original" | "auto")
                 ) {
                     estimate_image_tokens(image_url).saturating_mul(4)
                 } else {
@@ -1385,7 +1428,6 @@ fn estimate_image_tokens(image_url: &str) -> u64 {
         .map(|(width, height)| {
             u64::from(width.div_ceil(32)).saturating_mul(u64::from(height.div_ceil(32)))
         })
-        .map(|patches| patches.min(ORIGINAL_IMAGE_MAX_PATCHES))
         .unwrap_or_else(|| RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4))
 }
 
@@ -1754,14 +1796,14 @@ fn synthetic_output(call: &CallDescriptor) -> Value {
             "type": "custom_tool_call_output",
             "call_id": call.call_id,
             "name": call.name,
-            "output": "aborted",
+            "output": SYNTHETIC_ABORT_OUTPUT,
         })
     } else {
         json!({
             "id": id,
             "type": "function_call_output",
             "call_id": call.call_id,
-            "output": "aborted",
+            "output": SYNTHETIC_ABORT_OUTPUT,
         })
     }
 }

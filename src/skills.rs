@@ -4,7 +4,6 @@ use crate::skill_settings;
 use crate::system_skills;
 use crate::text::escape_cdata;
 use crate::text::escape_xml_text;
-use crate::tools::ToolConfiguration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -321,18 +320,6 @@ impl SkillCatalog {
 
     pub(crate) fn warnings(&self) -> &[String] {
         &self.warnings
-    }
-
-    pub(crate) fn tool_configuration(&self) -> ToolConfiguration {
-        if self.skills.iter().any(|skill| {
-            skill.scope == SkillScope::System
-                && skill.name == PAPERCUT_SYSTEM_SKILL_NAME
-                && skill.enabled
-        }) {
-            ToolConfiguration::with_papercut()
-        } else {
-            ToolConfiguration::default()
-        }
     }
 
     pub(crate) fn catalogue_message(&self, context_window: u64) -> Option<Value> {

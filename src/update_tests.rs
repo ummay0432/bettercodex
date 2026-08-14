@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(windows)]
-use std::fs;
 
 fn release_tag_fixture(version: &str, revision: char) -> String {
     format!("bcodex-v{version}-{}", revision.to_string().repeat(40))
@@ -160,7 +158,6 @@ async fn malformed_failed_oversized_and_timed_out_lookups_are_silent() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn updater_targets_the_running_binary_directory_unless_configured() {
     assert_eq!(
@@ -185,30 +182,6 @@ fn updater_targets_the_running_binary_directory_unless_configured() {
     );
 }
 
-#[cfg(windows)]
-#[test]
-fn updater_targets_the_running_windows_binary_directory_unless_configured() {
-    assert_eq!(
-        update_install_dir(Path::new(r"C:\Programs\bettercodex\bcodex.exe"), None).unwrap(),
-        PathBuf::from(r"C:\Programs\bettercodex")
-    );
-    assert_eq!(
-        update_install_dir(
-            Path::new(r"C:\Programs\bettercodex\bcodex.exe"),
-            Some(OsStr::new(r"D:\Custom bettercodex")),
-        )
-        .unwrap(),
-        PathBuf::from(r"D:\Custom bettercodex")
-    );
-    assert!(
-        update_install_dir(
-            Path::new(r"C:\Programs\bettercodex\bcodex.exe"),
-            Some(OsStr::new("relative")),
-        )
-        .is_err()
-    );
-}
-
 #[test]
 fn updater_selects_the_native_installer_at_the_release_revision() {
     let revision = "2".repeat(40);
@@ -219,13 +192,9 @@ fn updater_selects_the_native_installer_at_the_release_revision() {
             installer_path()
         )
     );
-    #[cfg(unix)]
     assert_eq!(installer_path(), "scripts/install.sh");
-    #[cfg(windows)]
-    assert_eq!(installer_path(), "scripts/install.ps1");
 }
 
-#[cfg(unix)]
 #[test]
 fn updater_passes_only_the_pinned_release_install_contract() {
     let tag = release_tag_fixture("1.3.0", '2');
@@ -263,34 +232,4 @@ fn updater_passes_only_the_pinned_release_install_contract() {
         .to_string()
         .contains("invalid prefix")
     );
-}
-
-#[cfg(windows)]
-#[test]
-fn updater_runs_the_pinned_powershell_installer_from_a_file() {
-    let tag = release_tag_fixture("1.3.0", '2');
-    let install_dir = std::env::temp_dir().join("bettercodex update test");
-    let script = format!(
-        "#Requires -Version 5.1\nif ($env:BCODEX_INSTALL_DIR -cne '{}') {{ exit 2 }}\nif ($env:BCODEX_REPOSITORY -cne 'owner/project') {{ exit 3 }}\nif ($env:BCODEX_INSTALL_RELEASE_TAG -cne '{tag}') {{ exit 4 }}\nif (-not $env:BCODEX_UPDATE_PARENT_PID) {{ exit 5 }}\nexit 0\n",
-        install_dir.display()
-    );
-    run_installer_script(script.as_bytes(), &install_dir, "owner/project", &tag).unwrap();
-}
-
-#[cfg(windows)]
-#[test]
-fn temporary_update_script_is_removed_on_drop() {
-    let path = std::env::temp_dir().join(format!(
-        "bettercodex-update-cleanup-test-{}-{}.ps1",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(&path, b"test").unwrap();
-    let script = TemporaryUpdateScript::new(path.clone());
-
-    drop(script);
-
-    let removed = !path.exists();
-    let _ = fs::remove_file(path);
-    assert!(removed);
 }

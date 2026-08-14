@@ -1,5 +1,12 @@
 # Case study: harness steering confounded the Code Mode evaluation
 
+## Status
+
+This document records an August 2026 evaluation conducted while bettercodex
+still used client-side Code Mode. bettercodex later removed that runtime in
+favor of four direct function tools plus hosted web search. That product decision does not repair the
+confounded comparison or change this document's methodological lesson.
+
 ## Why this document exists
 
 This is a record of a debugging mistake that turned into a useful harness
@@ -28,14 +35,14 @@ to test that possibility before redesigning the product around the result.
 
 ## The initial observation
 
-bettercodex uses Codex's client-side V8 Code Mode. GPT-5.6 Sol sees outer
-`exec` and `wait` tools. The ordinary capabilities—shell execution, patching,
-web access, image inspection, and plan updates—are nested JavaScript tools
-inside `exec`.
+At the time, bettercodex used Codex's client-side V8 Code Mode. GPT-5.6 Sol saw
+outer `exec` and `wait` tools. The ordinary capabilities—shell execution,
+patching, web access, image inspection, and plan updates—were nested JavaScript
+tools inside `exec`.
 
-The apparent benefit is that the model can programmatically call several tools,
-run independent calls concurrently, pass results between calls, and reduce
-large intermediate outputs before returning them to model context.
+The apparent benefit was that the model could programmatically call several
+tools, run independent calls concurrently, pass results between calls, and
+reduce large intermediate outputs before returning them to model context.
 
 Our first corpus analysis looked damning:
 
@@ -382,7 +389,7 @@ unknown.
 > generic prompt differences; report only cases with a plausible causal path
 > to observable behavior.
 
-## Current conclusion
+## Conclusion at the time
 
 We began the session believing that Code Mode was almost entirely unused and
 that bettercodex should probably replace it with direct tools.
@@ -394,6 +401,6 @@ We ended with a narrower and more defensible conclusion:
 > effort, workload, or other simultaneous harness changes.
 
 Removing the downstream routing policy was a reasonable, reversible return to
-upstream-neutral capability guidance—not proof of root cause. The architectural
-question and the policy's causal effect remain open and require a controlled
-evaluation rather than the contaminated 98.7% sample.
+upstream-neutral capability guidance—not proof of root cause. At that point,
+the architectural question and the policy's causal effect remained open and
+required a controlled evaluation rather than the contaminated 98.7% sample.

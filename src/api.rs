@@ -11,6 +11,7 @@ use crate::events::ModelTextDelta;
 use crate::http_client::backoff;
 use crate::http_client::bounded_error_body;
 use crate::model::ModelSelection;
+use crate::model::ReasoningEffort;
 use crate::model::SharedModelSelection;
 use crate::rollout::SessionIdentity;
 use crate::service_tier::ServiceTier;
@@ -18,8 +19,7 @@ use crate::time::unix_timestamp_millis;
 use crate::tools;
 use crate::tools::ToolCall;
 use crate::usage::TokenUsage;
-use crate::web_search::ToolTurnContext;
-use crate::web_search::WebSearchClient;
+use crate::web_search::WebSearchCall;
 use anyhow::Context;
 use bytes::Bytes;
 use reqwest::StatusCode;
@@ -32,14 +32,10 @@ use serde::ser::SerializeMap;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
-use sha2::Digest;
-use sha2::Sha256;
+use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
-use std::io;
-use std::io::Write;
-use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
@@ -55,16 +51,7 @@ mod sse;
 use sse::SseDecoder;
 
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const SYSTEM_PROMPT_TEMPLATE: &str = include_str!("../prompts/system.md");
-const PLATFORM_SHELL_GUIDANCE_MARKER: &str = "{{platform_shell_guidance}}";
-#[cfg(any(not(windows), test))]
-const UNIX_PLATFORM_SHELL_GUIDANCE: &str = include_str!("../prompts/system-unix.md");
-#[cfg(any(windows, test))]
-const WINDOWS_PLATFORM_SHELL_GUIDANCE: &str = include_str!("../prompts/system-windows.md");
-#[cfg(not(windows))]
-const PLATFORM_SHELL_GUIDANCE: &str = UNIX_PLATFORM_SHELL_GUIDANCE;
-#[cfg(windows)]
-const PLATFORM_SHELL_GUIDANCE: &str = WINDOWS_PLATFORM_SHELL_GUIDANCE;
+const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 const MAX_HTTP_RETRIES: usize = 4;
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: usize = 2;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
@@ -74,22 +61,15 @@ pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STREAM_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16_000;
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
-// Encoding is on the critical path before network I/O. Level 1 retains strong compression for the
-// long-context JSON workloads in `benchmark_responses_request_encoding` while materially reducing
-// CPU time versus zstd's level-3 default.
+// Encoding is on the critical path before network I/O. Level 1 retains strong compression for
+// long-context JSON while reducing CPU time versus zstd's level-3 default.
 const REQUEST_COMPRESSION_LEVEL: i32 = 1;
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
-const WS_RESPONSES_LITE_CLIENT_METADATA: &str =
-    "ws_request_header_x_openai_internal_codex_responses_lite";
-static SYSTEM_PROMPT: LazyLock<String> =
-    LazyLock::new(|| render_system_prompt(SYSTEM_PROMPT_TEMPLATE, PLATFORM_SHELL_GUIDANCE));
-static DEFAULT_STABLE_INPUT_PREFIX_ITEMS: OnceLock<[Value; 2]> = OnceLock::new();
-static PAPERCUT_STABLE_INPUT_PREFIX_ITEMS: OnceLock<[Value; 2]> = OnceLock::new();
-static DEFAULT_STABLE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
-static PAPERCUT_STABLE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
+static STABLE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
+static RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
 
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -151,6 +131,7 @@ impl ApiError {
         matches!(
             self.kind,
             ApiErrorKind::Retryable
+                | ApiErrorKind::StreamIdle
                 | ApiErrorKind::PreviousResponseNotFound
                 | ApiErrorKind::WebSocketUnavailable
         )
@@ -158,6 +139,11 @@ impl ApiError {
 
     pub(crate) fn is_stream_idle(&self) -> bool {
         self.kind == ApiErrorKind::StreamIdle
+    }
+
+    fn into_retryable(mut self) -> Self {
+        self.kind = ApiErrorKind::Retryable;
+        self
     }
 
     pub(crate) fn retry_after(&self) -> Option<Duration> {
@@ -186,7 +172,6 @@ pub(crate) struct ApiClient {
     window: u64,
     model_selection: SharedModelSelection,
     service_tier: ServiceTier,
-    tool_configuration: tools::ToolConfiguration,
     prefer_websocket: bool,
     websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
@@ -199,18 +184,190 @@ pub(crate) struct ApiClient {
     stream_idle_timeout: Duration,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HarnessInstructions;
+
+impl Serialize for HarnessInstructions {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(harness_instructions())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ResponsesApiTools;
+
+impl Serialize for ResponsesApiTools {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        responses_api_specifications_json().serialize(serializer)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+struct RequestReasoning {
+    effort: ReasoningEffort,
+    context: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+struct RequestText {
+    verbosity: &'static str,
+}
+
+#[derive(Serialize)]
+struct ResponsesRequest {
+    model: String,
+    instructions: HarnessInstructions,
+    tools: ResponsesApiTools,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    reasoning: RequestReasoning,
+    store: bool,
+    stream: bool,
+    include: [&'static str; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
+    prompt_cache_key: String,
+    text: RequestText,
+    client_metadata: Map<String, Value>,
+    input: Vec<Value>,
+}
+
+/// Small owned identity for the request properties covered by `previous_response_id`.
+///
+/// The input and client metadata vary independently. Everything else is copied without retaining
+/// conversation history; fixed instructions and tools are zero-sized handles to shared data.
+struct RequestPropertyIdentity {
+    model: String,
+    instructions: HarnessInstructions,
+    tools: ResponsesApiTools,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    reasoning: RequestReasoning,
+    store: bool,
+    stream: bool,
+    include: [&'static str; 1],
+    service_tier: Option<&'static str>,
+    prompt_cache_key: String,
+    text: RequestText,
+}
+
+impl RequestPropertyIdentity {
+    fn new(request: &ResponsesRequest) -> Self {
+        Self {
+            model: request.model.clone(),
+            instructions: request.instructions,
+            tools: request.tools,
+            tool_choice: request.tool_choice,
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning: request.reasoning,
+            store: request.store,
+            stream: request.stream,
+            include: request.include,
+            service_tier: request.service_tier,
+            prompt_cache_key: request.prompt_cache_key.clone(),
+            text: request.text,
+        }
+    }
+
+    fn matches(&self, request: &ResponsesRequest) -> bool {
+        let ResponsesRequest {
+            model,
+            instructions,
+            input: _,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+            reasoning,
+            store,
+            stream,
+            include,
+            service_tier,
+            prompt_cache_key,
+            text,
+            client_metadata: _,
+        } = request;
+        self.model == *model
+            && self.instructions == *instructions
+            && self.tools == *tools
+            && self.tool_choice == *tool_choice
+            && self.parallel_tool_calls == *parallel_tool_calls
+            && self.reasoning == *reasoning
+            && self.store == *store
+            && self.stream == *stream
+            && self.include == *include
+            && self.service_tier == *service_tier
+            && self.prompt_cache_key == *prompt_cache_key
+            && self.text == *text
+    }
+}
+
+struct WebSocketClientMetadata<'a> {
+    values: &'a Map<String, Value>,
+    turn_state: Option<String>,
+}
+
+impl Serialize for WebSocketClientMetadata<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let replaced_turn_state = usize::from(self.values.contains_key(X_CODEX_TURN_STATE));
+        let inserted_turn_state = usize::from(self.turn_state.is_some());
+        let mut metadata = serializer.serialize_map(Some(
+            self.values
+                .len()
+                .saturating_sub(replaced_turn_state)
+                .saturating_add(inserted_turn_state),
+        ))?;
+        for (name, value) in self.values {
+            if name != X_CODEX_TURN_STATE {
+                metadata.serialize_entry(name, value)?;
+            }
+        }
+        if let Some(turn_state) = &self.turn_state {
+            metadata.serialize_entry(X_CODEX_TURN_STATE, turn_state)?;
+        }
+        metadata.end()
+    }
+}
+
+// WebSocket `response.create` omits HTTP transport switches such as `stream` and
+// `background`; streaming is implicit in the socket protocol.
+#[derive(Serialize)]
+struct WebSocketRequest<'a> {
+    #[serde(rename = "type")]
+    request_type: &'static str,
+    model: &'a str,
+    instructions: HarnessInstructions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
+    tools: ResponsesApiTools,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    reasoning: RequestReasoning,
+    store: bool,
+    include: [&'static str; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
+    prompt_cache_key: &'a str,
+    text: RequestText,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generate: Option<bool>,
+    client_metadata: WebSocketClientMetadata<'a>,
+    input: &'a [Value],
+}
+
 struct WebSocketBaseline {
-    properties_fingerprint: RequestPropertiesFingerprint,
+    properties: RequestPropertyIdentity,
     input: WebSocketBaselineInput,
     response_id: String,
 }
-
-/// Collision-resistant identity for fields that must stay fixed across an incremental request.
-///
-/// A digest keeps baseline changes conservative without retaining another full property tree for
-/// the active WebSocket connection.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct RequestPropertiesFingerprint([u8; 32]);
 
 enum WebSocketBaselineInput {
     Exact {
@@ -271,116 +428,23 @@ impl OutputItemMode {
 }
 
 pub(crate) struct SamplingRequest {
-    request: Value,
+    request: ResponsesRequest,
     cursor: HistoryCursor,
-    input_restoration: SamplingInputRestoration,
-}
-
-struct WebSocketRequestRestoration {
-    input_prefix: Option<Vec<Value>>,
-    stream: Option<Value>,
-    client_turn_state: Option<Value>,
-}
-
-impl WebSocketRequestRestoration {
-    fn restore(self, request: &mut Value) -> ApiResult<()> {
-        let object = request
-            .as_object_mut()
-            .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
-        object.remove("type");
-        object.remove("generate");
-        object.remove("previous_response_id");
-        if let Some(stream) = self.stream {
-            object.insert("stream".to_string(), stream);
-        }
-        let client_metadata = object
-            .get_mut("client_metadata")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| ApiError::fatal("Responses request omitted client metadata"))?;
-        client_metadata.remove(X_CODEX_TURN_STATE);
-        if let Some(turn_state) = self.client_turn_state {
-            client_metadata.insert(X_CODEX_TURN_STATE.to_string(), turn_state);
-        }
-        client_metadata.remove(WS_RESPONSES_LITE_CLIENT_METADATA);
-        if let Some(mut input_prefix) = self.input_prefix {
-            let incremental_input = object
-                .remove("input")
-                .ok_or_else(|| ApiError::fatal("WebSocket delta request omitted input"))?;
-            let Value::Array(incremental_input) = incremental_input else {
-                return Err(ApiError::fatal(
-                    "WebSocket delta request input was not an array",
-                ));
-            };
-            input_prefix.extend(incremental_input);
-            object.insert("input".to_string(), Value::Array(input_prefix));
-        }
-        Ok(())
-    }
-}
-
-struct WebSocketRequestGuard<'a> {
-    request: &'a mut Value,
-    restoration: Option<WebSocketRequestRestoration>,
-}
-
-impl<'a> WebSocketRequestGuard<'a> {
-    fn new(request: &'a mut Value, restoration: WebSocketRequestRestoration) -> Self {
-        Self {
-            request,
-            restoration: Some(restoration),
-        }
-    }
-
-    fn request(&self) -> &Value {
-        self.request
-    }
-
-    fn restore(mut self) -> ApiResult<()> {
-        self.restore_inner()
-    }
-
-    fn restore_inner(&mut self) -> ApiResult<()> {
-        let Some(restoration) = self.restoration.take() else {
-            return Ok(());
-        };
-        restoration.restore(self.request)
-    }
-}
-
-impl Drop for WebSocketRequestGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.restore_inner();
-    }
-}
-
-struct SamplingInputRestoration {
-    tool_configuration: tools::ToolConfiguration,
-    stripped_image_details: Vec<StrippedImageDetail>,
-}
-
-struct StrippedImageDetail {
-    item_index: usize,
-    content_index: usize,
-    detail: Value,
 }
 
 impl WebSocketBaseline {
     fn new(
-        request: &Value,
+        request: &ResponsesRequest,
         response: &ModelResponse,
         input_identity: RequestInputIdentity,
     ) -> ApiResult<Self> {
-        let request_input = request
-            .get("input")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
         let input = match input_identity {
             RequestInputIdentity::AppendOnly {
                 cursor,
                 trailing_items: 0,
             } => WebSocketBaselineInput::AppendOnly {
                 cursor,
-                request_len: request_input.len(),
+                request_len: request.input.len(),
                 response_items: response.output_item_count,
             },
             RequestInputIdentity::Exact | RequestInputIdentity::AppendOnly { .. } => {
@@ -390,13 +454,13 @@ impl WebSocketBaseline {
                     ));
                 }
                 WebSocketBaselineInput::Exact {
-                    request: request_input.clone(),
+                    request: request.input.clone(),
                     output: response.items.clone(),
                 }
             }
         };
         Ok(Self {
-            properties_fingerprint: reusable_request_properties_fingerprint(request)?,
+            properties: RequestPropertyIdentity::new(request),
             input,
             response_id: response.response_id.clone(),
         })
@@ -404,45 +468,8 @@ impl WebSocketBaseline {
 }
 
 impl SamplingRequest {
-    pub(crate) fn into_history(mut self) -> ApiResult<(Vec<Value>, HistoryCursor)> {
-        let input = self
-            .request
-            .as_object_mut()
-            .and_then(|request| request.remove("input"))
-            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
-        let Value::Array(input) = input else {
-            return Err(ApiError::fatal("Responses request input was not an array"));
-        };
-        Ok((self.input_restoration.restore(input)?, self.cursor))
-    }
-}
-
-impl SamplingInputRestoration {
-    fn restore(self, mut input: Vec<Value>) -> ApiResult<Vec<Value>> {
-        let expected = stable_input_prefix_items(self.tool_configuration);
-        if input.get(..expected.len()) != Some(expected.as_slice()) {
-            return Err(ApiError::fatal(
-                "sampling request lost its inserted Responses Lite prefix",
-            ));
-        }
-        input.drain(..expected.len());
-        for stripped in self.stripped_image_details {
-            let content = input
-                .get_mut(stripped.item_index)
-                .and_then(crate::image_preparation::image_content_items_mut)
-                .ok_or_else(|| {
-                    ApiError::fatal("sampling request lost image content while it was in flight")
-                })?;
-            let image = content
-                .get_mut(stripped.content_index)
-                .and_then(Value::as_object_mut)
-                .filter(|image| image.get("type").and_then(Value::as_str) == Some("input_image"))
-                .ok_or_else(|| {
-                    ApiError::fatal("sampling request changed an image while it was in flight")
-                })?;
-            image.insert("detail".to_string(), stripped.detail);
-        }
-        Ok(input)
+    pub(crate) fn into_history(self) -> (Vec<Value>, HistoryCursor) {
+        (self.request.input, self.cursor)
     }
 }
 
@@ -492,7 +519,6 @@ impl ApiClient {
         compaction_count: u64,
         model_selection: ModelSelection,
         service_tier: ServiceTier,
-        tool_configuration: tools::ToolConfiguration,
     ) -> anyhow::Result<Self> {
         Self::new_with_base_url(
             auth,
@@ -500,7 +526,6 @@ impl ApiClient {
             compaction_count,
             model_selection,
             service_tier,
-            tool_configuration,
             BASE_URL.to_string(),
         )
     }
@@ -511,7 +536,6 @@ impl ApiClient {
         compaction_count: u64,
         model_selection: ModelSelection,
         service_tier: ServiceTier,
-        tool_configuration: tools::ToolConfiguration,
         base_url: String,
     ) -> anyhow::Result<Self> {
         crate::http_client::ensure_rustls_crypto_provider();
@@ -537,7 +561,6 @@ impl ApiClient {
             window: compaction_count,
             model_selection: SharedModelSelection::new(model_selection),
             service_tier,
-            tool_configuration,
             prefer_websocket: true,
             websocket_prewarm_attempted: false,
             websocket: None,
@@ -565,7 +588,6 @@ impl ApiClient {
             window: self.window,
             model_selection: self.model_selection.clone(),
             service_tier: self.service_tier,
-            tool_configuration: self.tool_configuration,
             prefer_websocket: self.prefer_websocket,
             websocket_prewarm_attempted: false,
             websocket: None,
@@ -624,14 +646,6 @@ impl ApiClient {
         self.abandon_response();
     }
 
-    pub(crate) fn set_tool_configuration(&mut self, tool_configuration: tools::ToolConfiguration) {
-        if self.tool_configuration == tool_configuration {
-            return;
-        }
-        self.tool_configuration = tool_configuration;
-        self.abandon_response();
-    }
-
     pub(crate) fn set_model_selection(&mut self, selection: ModelSelection) {
         if self.model_selection.get() == selection {
             return;
@@ -651,30 +665,11 @@ impl ApiClient {
         self.websocket_baseline = None;
     }
 
-    pub(crate) fn web_search_client(&self) -> WebSearchClient {
-        WebSearchClient::new(
-            self.client.clone(),
-            self.auth.clone(),
-            self.base_url.clone(),
-            self.session_id.clone(),
-            self.model_selection.clone(),
-        )
-    }
-
     pub(crate) fn rate_limit_client(&self) -> crate::rate_limits::RateLimitClient {
         crate::rate_limits::RateLimitClient::new(
             self.client.clone(),
             self.auth.clone(),
             &self.base_url,
-        )
-    }
-
-    pub(crate) fn tool_turn_context(&self, history: &[Value]) -> ToolTurnContext {
-        let selection = self.model_selection.get();
-        ToolTurnContext::from_history(
-            history,
-            self.turn_metadata(RequestKind::Turn).to_string(),
-            selection.truncation_policy(),
         )
     }
 
@@ -713,7 +708,7 @@ impl ApiClient {
 
     pub(crate) async fn respond_sampling(
         &mut self,
-        request: &mut SamplingRequest,
+        request: &SamplingRequest,
         completed_items: &UnboundedSender<Value>,
     ) -> ApiResult<ModelResponse> {
         self.respond_sampling_with_events(request, completed_items, None)
@@ -722,7 +717,7 @@ impl ApiClient {
 
     pub(crate) async fn respond_sampling_streaming(
         &mut self,
-        request: &mut SamplingRequest,
+        request: &SamplingRequest,
         completed_items: &UnboundedSender<Value>,
         events: &UnboundedSender<AgentEvent>,
     ) -> ApiResult<ModelResponse> {
@@ -732,12 +727,12 @@ impl ApiClient {
 
     async fn respond_sampling_with_events(
         &mut self,
-        request: &mut SamplingRequest,
+        request: &SamplingRequest,
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
     ) -> ApiResult<ModelResponse> {
         self.respond_request_with_events(
-            &mut request.request,
+            &request.request,
             completed_items,
             events,
             RequestKind::Turn,
@@ -751,7 +746,7 @@ impl ApiClient {
 
     async fn respond_request_with_events(
         &mut self,
-        request: &mut Value,
+        request: &ResponsesRequest,
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
         request_kind: RequestKind,
@@ -875,12 +870,12 @@ impl ApiClient {
 
     async fn respond_http(
         &mut self,
-        request: &Value,
+        request: &ResponsesRequest,
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
         request_kind: RequestKind,
     ) -> ApiResult<ModelResponse> {
-        let expected_model = request_model(request)?.to_string();
+        let expected_model = request.model.clone();
         let response = self
             .post("responses", request, "text/event-stream", request_kind)
             .await?;
@@ -914,11 +909,11 @@ impl ApiClient {
     }
 
     async fn prewarm_websocket(&mut self) -> ApiResult<()> {
-        let mut request = self.build_request(Vec::new(), RequestKind::Prewarm);
+        let request = self.build_request(Vec::new(), RequestKind::Prewarm);
         let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
         let response = self
             .respond_websocket(
-                &mut request,
+                &request,
                 &completed_items,
                 None,
                 RequestKind::Prewarm,
@@ -936,14 +931,14 @@ impl ApiClient {
 
     async fn respond_websocket(
         &mut self,
-        logical_request: &mut Value,
+        logical_request: &ResponsesRequest,
         completed_items: &UnboundedSender<Value>,
         events: Option<&UnboundedSender<AgentEvent>>,
         request_kind: RequestKind,
         mode: WebSocketRequestMode,
         input_identity: RequestInputIdentity,
     ) -> ApiResult<ModelResponse> {
-        let expected_model = request_model(logical_request)?.to_string();
+        let expected_model = logical_request.model.clone();
         self.ensure_websocket(request_kind).await?;
         let websocket_server_model = self.websocket_server_model.clone();
         observe_server_model(
@@ -963,18 +958,15 @@ impl ApiClient {
                 self.stream_idle_timeout.min(WEBSOCKET_PREWARM_IDLE_TIMEOUT)
             }
         };
-        // Serialize a delta in place, then restore the logical request for retries and baseline
-        // retention. Input values move between vectors instead of being deep-cloned.
-        let restoration = self.prepare_websocket_request(logical_request, mode, input_identity)?;
-        let guard = WebSocketRequestGuard::new(logical_request, restoration);
-        let send_result = self
-            .websocket
+        // The wire request borrows either the full input or its incremental suffix. This keeps the
+        // logical request intact for retries and baseline retention without moving or cloning its
+        // potentially near-window history.
+        let request = self.prepare_websocket_request(logical_request, mode, input_identity);
+        self.websocket
             .as_mut()
             .ok_or_else(|| ApiError::websocket_unavailable("Responses WebSocket is unavailable"))?
-            .send(guard.request(), initial_idle_timeout)
-            .await;
-        guard.restore()?;
-        send_result?;
+            .send(&request, initial_idle_timeout)
+            .await?;
 
         let mut collected =
             CollectedResponse::new(OutputItemMode::for_websocket(request_kind, input_identity));
@@ -984,15 +976,24 @@ impl ApiClient {
         let mut awaiting_startup_first_event = startup_websocket_pending_first_event;
         let mut next_event_idle_timeout = initial_idle_timeout;
         loop {
-            let text = self
+            let next_text = self
                 .websocket
                 .as_mut()
                 .ok_or_else(|| {
                     ApiError::websocket_unavailable("Responses WebSocket is unavailable")
                 })?
                 .next_text(next_event_idle_timeout)
-                .await?
-                .ok_or_else(|| ApiError::retryable("Responses WebSocket ended unexpectedly"))?;
+                .await;
+            let text = match next_text {
+                // Replaying the original request over HTTPS is safe only before a completed model
+                // item enters history. After that, let the agent record the interrupted stream and
+                // retry from the updated history instead of merging two generations.
+                Err(error) if error.is_stream_idle() && collected.item_count() != 0 => {
+                    return Err(error.into_retryable());
+                }
+                result => result?,
+            }
+            .ok_or_else(|| ApiError::retryable("Responses WebSocket ended unexpectedly"))?;
             if awaiting_startup_first_event {
                 awaiting_startup_first_event = false;
                 self.startup_websocket_pending_first_event = false;
@@ -1053,23 +1054,20 @@ impl ApiClient {
         Ok(())
     }
 
-    fn prepare_websocket_request(
+    fn prepare_websocket_request<'a>(
         &self,
-        request: &mut Value,
+        request: &'a ResponsesRequest,
         mode: WebSocketRequestMode,
         input_identity: RequestInputIdentity,
-    ) -> ApiResult<WebSocketRequestRestoration> {
+    ) -> WebSocketRequest<'a> {
+        let current_input = request.input.as_slice();
         let incremental = match mode {
             WebSocketRequestMode::Warmup => None,
             WebSocketRequestMode::Inference => {
                 if let Some(baseline) = &self.websocket_baseline {
-                    if !request_properties_match(&baseline.properties_fingerprint, request)? {
+                    if !baseline.properties.matches(request) {
                         None
                     } else {
-                        let current_input = request
-                            .get("input")
-                            .and_then(Value::as_array)
-                            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
                         match &baseline.input {
                             WebSocketBaselineInput::Exact {
                                 request: previous_input,
@@ -1124,57 +1122,34 @@ impl ApiClient {
             }
         };
 
-        let object = request
-            .as_object_mut()
-            .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
-        let stream = object.remove("stream");
-        let client_metadata = object
-            .get_mut("client_metadata")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| ApiError::fatal("Responses request omitted client metadata"))?;
-        let client_turn_state = client_metadata.remove(X_CODEX_TURN_STATE);
-        if let Some(turn_state) = &self.turn_state {
-            client_metadata.insert(
-                X_CODEX_TURN_STATE.to_string(),
-                Value::String(turn_state.clone()),
-            );
-        }
-        client_metadata.remove(WS_RESPONSES_LITE_CLIENT_METADATA);
-        client_metadata.insert(
-            WS_RESPONSES_LITE_CLIENT_METADATA.to_string(),
-            Value::String("true".to_string()),
-        );
-        object.insert(
-            "type".to_string(),
-            Value::String("response.create".to_string()),
-        );
-        if matches!(mode, WebSocketRequestMode::Warmup) {
-            object.insert("generate".to_string(), Value::Bool(false));
-        }
-        let Some((previous_response_id, baseline_length)) = incremental else {
-            return Ok(WebSocketRequestRestoration {
-                input_prefix: None,
-                stream,
-                client_turn_state,
-            });
+        let (previous_response_id, input) = match incremental {
+            Some((response_id, baseline_length)) => {
+                (Some(response_id), &current_input[baseline_length..])
+            }
+            None => (None, current_input),
         };
-        let full_input = object
-            .remove("input")
-            .ok_or_else(|| ApiError::fatal("Responses request omitted input"))?;
-        let Value::Array(mut input_prefix) = full_input else {
-            return Err(ApiError::fatal("Responses request input was not an array"));
+        let client_metadata = WebSocketClientMetadata {
+            values: &request.client_metadata,
+            turn_state: self.turn_state.clone(),
         };
-        let incremental_input = input_prefix.split_off(baseline_length);
-        object.insert("input".to_string(), Value::Array(incremental_input));
-        object.insert(
-            "previous_response_id".to_string(),
-            Value::String(previous_response_id),
-        );
-        Ok(WebSocketRequestRestoration {
-            input_prefix: Some(input_prefix),
-            stream,
-            client_turn_state,
-        })
+        WebSocketRequest {
+            request_type: "response.create",
+            model: &request.model,
+            instructions: request.instructions,
+            previous_response_id,
+            tools: request.tools,
+            tool_choice: request.tool_choice,
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning: request.reasoning,
+            store: request.store,
+            include: request.include,
+            service_tier: request.service_tier,
+            prompt_cache_key: &request.prompt_cache_key,
+            text: request.text,
+            generate: matches!(mode, WebSocketRequestMode::Warmup).then_some(false),
+            client_metadata,
+            input,
+        }
     }
 
     pub(crate) async fn compact_append_only(
@@ -1208,8 +1183,7 @@ impl ApiClient {
         }
         let trigger = compaction::compaction_trigger();
         let selection = self.model_selection.get();
-        let [tool_prefix_tokens, instruction_tokens] =
-            estimated_harness_tokens(self.tool_configuration);
+        let [tool_prefix_tokens, instruction_tokens] = estimated_harness_tokens();
         let prefix_tokens = tool_prefix_tokens
             .saturating_add(instruction_tokens)
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
@@ -1230,11 +1204,11 @@ impl ApiClient {
         let (completed_items, _completed_items_rx) = tokio::sync::mpsc::unbounded_channel();
         let request_kind = RequestKind::Compaction(compaction);
         let mut retries = 0_usize;
-        let mut request = self.build_request(prompt_history, request_kind);
+        let request = self.build_request(prompt_history, request_kind);
         let response = loop {
             match self
                 .respond_request_with_events(
-                    &mut request,
+                    &request,
                     &completed_items,
                     events,
                     request_kind,
@@ -1275,10 +1249,9 @@ impl ApiClient {
         })
     }
 
-    fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> Value {
+    fn build_request(&self, history: Vec<Value>, request_kind: RequestKind) -> ResponsesRequest {
         let selection = self.model_selection.get();
-        let input = compose_input(history, self.tool_configuration);
-        self.build_request_from_input(input, request_kind, &selection)
+        self.build_request_from_input(history, request_kind, selection)
     }
 
     pub(crate) fn build_sampling_request(
@@ -1287,11 +1260,9 @@ impl ApiClient {
         cursor: HistoryCursor,
     ) -> SamplingRequest {
         let selection = self.model_selection.get();
-        let (input, input_restoration) = compose_sampling_input(history, self.tool_configuration);
         SamplingRequest {
-            request: self.build_request_from_input(input, RequestKind::Turn, &selection),
+            request: self.build_request_from_input(history, RequestKind::Turn, selection),
             cursor,
-            input_restoration,
         }
     }
 
@@ -1299,30 +1270,27 @@ impl ApiClient {
         &self,
         input: Vec<Value>,
         request_kind: RequestKind,
-        selection: &ModelSelection,
-    ) -> Value {
-        let reasoning = json!({
-            "effort": selection.reasoning_effort.as_str(),
-            "summary": "auto",
-            "context": "all_turns",
-        });
-        let mut request = json!({
-            "model": selection.model,
-            "tool_choice": "auto",
-            "parallel_tool_calls": false,
-            "reasoning": reasoning,
-            "store": false,
-            "stream": true,
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": self.session_id,
-            "text": {"verbosity": "low"},
-            "client_metadata": self.client_metadata(request_kind),
-        });
-        if let Some(service_tier) = self.effective_service_tier() {
-            request["service_tier"] = Value::String(service_tier.to_string());
+        selection: ModelSelection,
+    ) -> ResponsesRequest {
+        ResponsesRequest {
+            model: selection.model,
+            instructions: HarnessInstructions,
+            tools: ResponsesApiTools,
+            tool_choice: "auto",
+            parallel_tool_calls: true,
+            reasoning: RequestReasoning {
+                effort: selection.reasoning_effort,
+                context: "all_turns",
+            },
+            store: false,
+            stream: true,
+            include: ["reasoning.encrypted_content"],
+            service_tier: self.effective_service_tier(),
+            prompt_cache_key: self.session_id.clone(),
+            text: RequestText { verbosity: "low" },
+            client_metadata: self.client_metadata(request_kind),
+            input,
         }
-        request["input"] = Value::Array(input);
-        request
     }
 
     fn client_metadata(&self, request_kind: RequestKind) -> Map<String, Value> {
@@ -1417,11 +1385,6 @@ impl ApiClient {
         insert_header(&mut headers, X_CODEX_ROUTING_HINT, &routing_hint)?;
         insert_header(
             &mut headers,
-            "x-openai-internal-codex-responses-lite",
-            "true",
-        )?;
-        insert_header(
-            &mut headers,
             "x-codex-beta-features",
             REMOTE_COMPACTION_V2_FEATURE,
         )?;
@@ -1434,7 +1397,7 @@ impl ApiClient {
     async fn post(
         &mut self,
         path: &str,
-        body: &Value,
+        body: &ResponsesRequest,
         accept: &str,
         request_kind: RequestKind,
     ) -> ApiResult<reqwest::Response> {
@@ -1482,7 +1445,7 @@ impl ApiClient {
             if status == StatusCode::UNAUTHORIZED && !refreshed_after_unauthorized {
                 auth = self
                     .auth
-                    .force_refreshed_snapshot(&self.client)
+                    .refreshed_snapshot_after_unauthorized(&self.client, &auth)
                     .await
                     .map_err(|error| ApiError::fatal(format!("{error:#}")))?;
                 refreshed_after_unauthorized = true;
@@ -1541,7 +1504,7 @@ impl ApiClient {
     }
 }
 
-fn encode_request_body(body: &Value) -> ApiResult<Bytes> {
+fn encode_request_body<T: Serialize + ?Sized>(body: &T) -> ApiResult<Bytes> {
     // Keep serde and zstd connected: staging through `serde_json::to_vec` would grow and retain a
     // complete uncompressed request before `encode_all` copied it through `std::io::copy`.
     let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), REQUEST_COMPRESSION_LEVEL)
@@ -1578,223 +1541,29 @@ impl RequestKind {
     }
 }
 
-fn compose_input(history: Vec<Value>, tool_configuration: tools::ToolConfiguration) -> Vec<Value> {
-    compose_sampling_input(history, tool_configuration).0
-}
-
-fn compose_sampling_input(
-    mut history: Vec<Value>,
-    tool_configuration: tools::ToolConfiguration,
-) -> (Vec<Value>, SamplingInputRestoration) {
-    let stripped_image_details = strip_image_details(&mut history);
-    history.splice(0..0, stable_request_prefix(tool_configuration));
-    (
-        history,
-        SamplingInputRestoration {
-            tool_configuration,
-            stripped_image_details,
-        },
-    )
-}
-
-fn is_additional_tools_item(item: &Value, expected: &Value) -> bool {
-    ["type", "role", "tools"]
-        .into_iter()
-        .all(|field| item.get(field) == expected.get(field))
-}
-
-fn strip_image_details(history: &mut [Value]) -> Vec<StrippedImageDetail> {
-    let mut stripped = Vec::new();
-    for (item_index, item) in history.iter_mut().enumerate() {
-        let Some(content) = crate::image_preparation::image_content_items_mut(item) else {
-            continue;
-        };
-        for (content_index, content_item) in content.iter_mut().enumerate() {
-            if content_item.get("type").and_then(Value::as_str) != Some("input_image") {
-                continue;
-            }
-            let Some(detail) = content_item
-                .as_object_mut()
-                .and_then(|image| image.remove("detail"))
-            else {
-                continue;
-            };
-            stripped.push(StrippedImageDetail {
-                item_index,
-                content_index,
-                detail,
-            });
-        }
-    }
-    stripped
-}
-
-pub(crate) fn stable_input_prefix_items(
-    tool_configuration: tools::ToolConfiguration,
-) -> &'static [Value; 2] {
-    let items = if tool_configuration.papercut_enabled() {
-        &PAPERCUT_STABLE_INPUT_PREFIX_ITEMS
-    } else {
-        &DEFAULT_STABLE_INPUT_PREFIX_ITEMS
-    };
-    items.get_or_init(|| {
-        [
-            json!({
-                "type": "additional_tools",
-                "role": "developer",
-                "tools": tools::responses_lite_specifications(tool_configuration),
-            }),
-            developer_instructions_item(),
-        ]
-    })
-}
-
-pub(crate) fn stable_request_prefix(tool_configuration: tools::ToolConfiguration) -> [Value; 2] {
-    stable_input_prefix_items(tool_configuration).clone()
-}
-
-pub(crate) fn is_stable_tools_prefix_item(item: &Value) -> bool {
-    if item.get("type").and_then(Value::as_str) != Some("additional_tools")
-        || item.get("role").and_then(Value::as_str) != Some("developer")
-    {
-        return false;
-    }
-    is_additional_tools_item(
-        item,
-        &stable_input_prefix_items(tools::ToolConfiguration::default())[0],
-    ) || is_additional_tools_item(
-        item,
-        &stable_input_prefix_items(tools::ToolConfiguration::with_papercut())[0],
-    )
-}
-
-pub(crate) fn is_stable_instructions_prefix_item(item: &Value) -> bool {
-    if item.get("type").and_then(Value::as_str) != Some("message")
-        || item.get("role").and_then(Value::as_str) != Some("developer")
-    {
-        return false;
-    }
-    let Some([content]) = item
-        .get("content")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-    else {
-        return false;
-    };
-    content.as_object().is_some_and(|content| {
-        content.len() == 2
-            && content.get("type").and_then(Value::as_str) == Some("input_text")
-            && content.get("text").and_then(Value::as_str) == Some(harness_instructions())
-    })
-}
-
 pub(crate) fn harness_instructions() -> &'static str {
-    SYSTEM_PROMPT.as_str()
+    SYSTEM_PROMPT.trim()
 }
 
-fn developer_instructions_item() -> Value {
-    json!({
-        "type": "message",
-        "role": "developer",
-        "content": [{
-            "type": "input_text",
-            "text": harness_instructions(),
-        }],
+fn responses_api_specifications_json() -> &'static RawValue {
+    // Match Codex's typed request path: serialize the fixed tool catalogue once, then transfer its
+    // raw JSON directly into every HTTP and WebSocket request.
+    RESPONSES_API_SPECIFICATIONS_JSON.get_or_init(|| {
+        serde_json::value::to_raw_value(tools::responses_api_specifications()).unwrap_or_else(
+            |error| panic!("failed to encode Responses tool specifications: {error}"),
+        )
     })
 }
 
-fn render_system_prompt(template: &str, platform_shell_guidance: &str) -> String {
-    assert_eq!(
-        template.matches(PLATFORM_SHELL_GUIDANCE_MARKER).count(),
-        1,
-        "system prompt must contain exactly one platform shell guidance marker"
-    );
-    template.trim().replace(
-        PLATFORM_SHELL_GUIDANCE_MARKER,
-        platform_shell_guidance.trim(),
-    )
-}
-
-pub(crate) fn estimated_harness_tokens(tool_configuration: tools::ToolConfiguration) -> [u64; 2] {
-    let estimates = if tool_configuration.papercut_enabled() {
-        &PAPERCUT_STABLE_HARNESS_TOKEN_ESTIMATES
-    } else {
-        &DEFAULT_STABLE_HARNESS_TOKEN_ESTIMATES
-    };
-    *estimates.get_or_init(|| {
-        let [tools_item, instructions_item] = stable_input_prefix_items(tool_configuration);
+pub(crate) fn estimated_harness_tokens() -> [u64; 2] {
+    *STABLE_HARNESS_TOKEN_ESTIMATES.get_or_init(|| {
         [
-            estimated_tokens(std::slice::from_ref(tools_item)),
-            estimated_tokens(std::slice::from_ref(instructions_item)),
+            estimated_tokens(tools::responses_api_specifications()),
+            estimated_tokens(std::slice::from_ref(&Value::String(
+                harness_instructions().to_string(),
+            ))),
         ]
     })
-}
-
-fn is_reusable_request_property(name: &str) -> bool {
-    !matches!(name, "input" | "client_metadata" | "stream_options")
-}
-
-struct ReusableRequestProperties<'a>(&'a [(&'a str, &'a Value)]);
-
-impl Serialize for ReusableRequestProperties<'_> {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut properties = serializer.serialize_map(Some(self.0.len()))?;
-        for (name, value) in self.0 {
-            properties.serialize_entry(name, value)?;
-        }
-        properties.end()
-    }
-}
-
-struct DigestWriter<'a>(&'a mut Sha256);
-
-impl Write for DigestWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn reusable_request_properties_fingerprint(
-    request: &Value,
-) -> ApiResult<RequestPropertiesFingerprint> {
-    let request = request
-        .as_object()
-        .ok_or_else(|| ApiError::fatal("Responses request was not an object"))?;
-    // WebSocket request restoration can reinsert fields in a different order, and serde_json's
-    // preserve_order feature is enabled in the application dependency graph. Canonicalize only
-    // the small reference list rather than cloning the potentially large property values.
-    let mut properties = request
-        .iter()
-        .filter(|(name, _)| is_reusable_request_property(name))
-        .map(|(name, value)| (name.as_str(), value))
-        .collect::<Vec<_>>();
-    properties.sort_unstable_by_key(|(name, _)| *name);
-    let mut digest = Sha256::new();
-    serde_json::to_writer(
-        DigestWriter(&mut digest),
-        &ReusableRequestProperties(&properties),
-    )
-    .map_err(|error| {
-        ApiError::fatal(format!(
-            "failed to fingerprint reusable Responses request properties: {error}"
-        ))
-    })?;
-    Ok(RequestPropertiesFingerprint(digest.finalize().into()))
-}
-
-fn request_properties_match(
-    previous: &RequestPropertiesFingerprint,
-    current: &Value,
-) -> ApiResult<bool> {
-    Ok(*previous == reusable_request_properties_fingerprint(current)?)
 }
 
 async fn collect_http_stream(
@@ -1967,6 +1736,7 @@ impl CollectedResponse {
         events: Option<&UnboundedSender<AgentEvent>>,
     ) {
         let completed_message = self.item_summary.observe(&item, events.is_some());
+        let completed_web_search = WebSearchCall::from_response_item(&item);
         match &mut self.output_items {
             CollectedOutputItems::RetainedAndEmitted(items) => {
                 let _ = completed_items.send(item.clone());
@@ -1978,8 +1748,13 @@ impl CollectedResponse {
                 let _ = completed_items.send(item);
             }
         }
-        if let (Some(events), Some(message)) = (events, completed_message) {
-            let _ = events.send(AgentEvent::ModelMessageCompleted(message));
+        if let Some(events) = events {
+            if let Some(message) = completed_message {
+                let _ = events.send(AgentEvent::ModelMessageCompleted(message));
+            }
+            if let Some(search) = completed_web_search {
+                let _ = events.send(AgentEvent::WebSearchCompleted(search));
+            }
         }
     }
 
@@ -2038,11 +1813,11 @@ impl ResponseItemSummary {
         self.has_assistant_text |= has_text;
         if emit_completed_message {
             if is_terminal && has_text {
-                self.final_answer = Some(message.text.clone());
+                self.final_answer = Some(message.text_with_citation_sources());
             }
             Some(message)
         } else if is_terminal && has_text {
-            self.final_answer = Some(message.text);
+            self.final_answer = Some(message.text_with_citation_sources());
             None
         } else {
             None
@@ -2153,12 +1928,19 @@ fn process_event_value_at(
             if let Some(item) = event.get("item") {
                 validate_assistant_message_phase(item)?;
             }
-            if let Some(message) = event
-                .get("item")
-                .and_then(AssistantMessage::from_response_item)
-                && let Some(events) = events
-            {
-                let _ = events.send(AgentEvent::ModelMessageStarted(message));
+            if let Some(events) = events {
+                if let Some(message) = event
+                    .get("item")
+                    .and_then(AssistantMessage::from_response_item)
+                {
+                    let _ = events.send(AgentEvent::ModelMessageStarted(message));
+                }
+                if let Some(search) = event
+                    .get("item")
+                    .and_then(WebSearchCall::from_response_item)
+                {
+                    let _ = events.send(AgentEvent::WebSearchStarted(search));
+                }
             }
         }
         Some("response.output_text.delta") => {
@@ -2169,18 +1951,6 @@ fn process_event_value_at(
                     std::mem::take(delta),
                     received_at,
                 )));
-            }
-        }
-        Some("response.reasoning_summary_text.delta") => {
-            if let Some(Value::String(delta)) = event.get_mut("delta")
-                && let Some(events) = events
-            {
-                let _ = events.send(AgentEvent::ReasoningSummaryDelta(std::mem::take(delta)));
-            }
-        }
-        Some("response.reasoning_summary_part.added") => {
-            if let Some(events) = events {
-                let _ = events.send(AgentEvent::ReasoningSummarySectionStarted);
             }
         }
         Some("response.completed") => {
@@ -2271,7 +2041,9 @@ fn error_event(event: &Value) -> ApiError {
                 .get("status")
                 .or_else(|| event.get("status_code"))
                 .and_then(Value::as_u64);
-            if status == Some(429) || status.is_some_and(|status| status >= 500) {
+            if status == Some(401) {
+                ApiError::unauthorized(message)
+            } else if status == Some(429) || status.is_some_and(|status| status >= 500) {
                 ApiError::retryable(message)
             } else {
                 ApiError::fatal(message)
@@ -2373,13 +2145,6 @@ fn observe_server_model(
     let _ = events.send(AgentEvent::Warning(format!(
         "OpenAI routed this request from {requested_model} to {server_model}. This can occur when potentially high-risk cyber activity triggers a safety fallback; the `/model` selection remains {requested_model}."
     )));
-}
-
-fn request_model(request: &Value) -> ApiResult<&str> {
-    request
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::fatal("Responses request omitted its model"))
 }
 
 fn parse_usage(usage: &Value) -> Option<TokenUsage> {

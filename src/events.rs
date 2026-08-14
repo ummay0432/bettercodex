@@ -28,10 +28,10 @@ impl ModelTextDelta {
 pub(crate) enum AgentEvent {
     ModelMessageStarted(AssistantMessage),
     ModelMessageDelta(ModelTextDelta),
-    ReasoningSummarySectionStarted,
-    ReasoningSummaryDelta(String),
     ModelMessageCompleted(AssistantMessage),
     ModelResponseCompleted,
+    WebSearchStarted(crate::web_search::WebSearchCall),
+    WebSearchCompleted(crate::web_search::WebSearchCall),
     ToolStarted {
         call_id: String,
         name: String,
@@ -40,7 +40,13 @@ pub(crate) enum AgentEvent {
     ToolCompleted {
         call_id: String,
         output: Result<Value, String>,
+        file_change: Option<crate::protocol::ToolFileChange>,
         duration: Duration,
+    },
+    ToolOutputDelta {
+        call_id: String,
+        stream: crate::process_runtime::OutputStream,
+        chunk: String,
     },
     ContextUpdated(ContextSnapshot),
     Warning(String),

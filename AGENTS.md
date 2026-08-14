@@ -23,6 +23,8 @@ model-visible errors.
 Do not add audio or video support, dependencies, protocol items, runtime helpers,
 tool descriptions, fixtures, or tests; bettercodex does not use either modality.
 
+Keep Responses API reasoning summaries disabled; they add latency and output-token cost.
+
 Rust builds and tests must clean up task-owned temporary files, fixtures,
 caches, and isolated compiled artifacts, including on failure. Never remove the
 checkout's shared `target/`, another session's artifact root, or a target still
@@ -74,8 +76,8 @@ task-specific context; do not preload the whole folder:
 
 - `src/main.rs`, `src/input.rs`, and `src/auth.rs`: CLI entry, user input, and ChatGPT authentication.
 - `src/agent.rs`, `src/context.rs`, `src/compaction.rs`, and `src/rollout.rs`: turns, context, compaction, saved JSONL sessions, and resume.
-- `src/api.rs`, `src/api_sse.rs`, `src/api_websocket.rs`, and `src/web_search.rs`: Responses requests, transports, streaming, retries, and web search.
-- `src/tools/`: the JavaScript exec runtime, nested tool catalogue, command execution, and patch application.
+- `src/api.rs`, `src/api_sse.rs`, and `src/api_websocket.rs`: Responses requests, transports, streaming, and retries; `src/web_search.rs` projects hosted search items and citations.
+- `src/tools.rs` and `src/process_runtime.rs`: the fixed function catalogue, file operations, and non-PTY Bash execution.
 - `src/skills.rs`, `src/system_skills.rs`, `src/skill_settings.rs`, and `bundled-skills/`: local and embedded skills plus progressive disclosure.
 - `src/tui/`: the Ratatui chat interface and terminal lifecycle.
 - `prompts/`: exact model-facing system and tool context.

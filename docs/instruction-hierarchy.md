@@ -19,14 +19,15 @@ separation must never be presented as a security boundary.
 
 Source is authoritative; verify these paths before relying on this summary.
 
-- `src/api.rs` renders `prompts/system.md` with one target-specific platform
-  fragment and sends it through the Responses API's top-level `instructions`
-  field. It sends the typed tool catalogue as a developer item.
+- `src/api.rs` sends `prompts/system.md` through the normal Responses API's
+  top-level `instructions` field and sends four fixed function definitions plus
+  hosted `web_search` through its top-level `tools` field.
 - `src/context.rs` sends bounded `AGENTS.md` repository context as a user item
   and environment context as a developer item.
 - `src/skills.rs` sends bounded skill metadata and selected `SKILL.md` bodies as
   user items. Harness-owned skill policy remains in `prompts/system.md`.
-- Tool calls and results remain native Responses items.
+- Function calls, function results, and hosted `web_search_call` activity
+  remain native Responses items.
 
 ## Change rules
 

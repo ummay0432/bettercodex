@@ -1,20 +1,19 @@
 use super::bash::extract_bash_command;
 use super::bash::try_parse_shell;
 use super::bash::try_parse_word_only_commands_sequence;
-use super::powershell::extract_powershell_command;
 use crate::protocol::ParsedCommand;
 use shlex::split as shlex_split;
 use shlex::try_join as shlex_try_join;
 use std::path::PathBuf;
 
-pub fn shlex_join(tokens: &[String]) -> String {
+fn shlex_join(tokens: &[String]) -> String {
     shlex_try_join(tokens.iter().map(String::as_str))
         .unwrap_or_else(|_| "<command included NUL byte>".to_string())
 }
 
-/// Extracts the shell and script from a command, regardless of platform
-pub fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
-    extract_bash_command(command).or_else(|| extract_powershell_command(command))
+/// Extracts the Unix shell and script from a command.
+fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
+    extract_bash_command(command)
 }
 
 /// DO NOT REVIEW THIS CODE BY HAND
@@ -27,7 +26,7 @@ pub fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
 /// The parsing is slightly lossy due to the ~infinite expressiveness of an arbitrary command.
 /// The goal of the parsed metadata is to be able to provide the user with a human readable gis
 /// of what it is doing.
-pub fn parse_command(command: &[String]) -> Vec<ParsedCommand> {
+pub(crate) fn parse_command(command: &[String]) -> Vec<ParsedCommand> {
     // Parse and then collapse consecutive duplicate commands to avoid redundant summaries.
     let parsed = parse_command_impl(command);
     let mut deduped: Vec<ParsedCommand> = Vec::with_capacity(parsed.len());
@@ -1222,37 +1221,11 @@ mod tests {
             }],
         );
     }
-
-    #[test]
-    fn pwsh_with_noprofile_and_c_alias_is_stripped() {
-        assert_parsed(
-            &vec_str(&["pwsh", "-NoProfile", "-c", "Write-Host hi"]),
-            vec![ParsedCommand::Unknown {
-                cmd: "Write-Host hi".to_string(),
-            }],
-        );
-    }
-
-    #[test]
-    fn powershell_with_path_is_stripped() {
-        assert_parsed(
-            &vec_str(&["/usr/local/bin/pwsh", "-NoProfile", "-c", "Write-Host hi"]),
-            vec![ParsedCommand::Unknown {
-                cmd: "Write-Host hi".to_string(),
-            }],
-        );
-    }
 }
 
-pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
+fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
     if let Some(commands) = parse_shell_lc_commands(command) {
         return commands;
-    }
-
-    if let Some((_, script)) = extract_powershell_command(command) {
-        return vec![ParsedCommand::Unknown {
-            cmd: script.to_string(),
-        }];
     }
 
     let normalized = normalize_tokens(command);
@@ -1718,7 +1691,7 @@ fn cd_target(args: &[String]) -> Option<String> {
 }
 
 /// Returns whether a command token has an explicit path shape.
-pub fn is_pathish(s: &str) -> bool {
+fn is_pathish(s: &str) -> bool {
     s == "." || s == ".." || s.starts_with("./") || s.starts_with("../") || s.contains('/')
 }
 
@@ -1782,13 +1755,12 @@ fn parse_find_query_and_path(tail: &[String]) -> (Option<String>, Option<String>
 }
 
 fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>> {
-    // Only handle bash/zsh here; PowerShell is stripped separately without bash parsing.
     let (_, script) = extract_bash_command(original)?;
     Some(parse_shell_script(script))
 }
 
 /// Parses command metadata from a Bash-compatible shell script.
-pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
+fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
     if let Some(tree) = try_parse_shell(script)
         && let Some(all_commands) = try_parse_word_only_commands_sequence(&tree, script)
         && !all_commands.is_empty()

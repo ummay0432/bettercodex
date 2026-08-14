@@ -9,7 +9,6 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
-#[cfg(unix)]
 use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyboardEnhancementFlags;
 use crossterm::event::PopKeyboardEnhancementFlags;
@@ -41,28 +40,19 @@ use ratatui::widgets::Clear as WidgetClear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
-#[cfg(unix)]
 use std::fs::File;
-#[cfg(unix)]
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Stdout;
 use std::io::Write;
 use std::io::stdout;
-#[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::sync::Once;
-#[cfg(unix)]
 use std::time::Duration;
-#[cfg(any(unix, test))]
 use std::time::Instant;
 
-#[cfg(unix)]
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(windows)]
-const STARTUP_PROBE_TIMEOUT: () = ();
 const MAX_HISTORY_ROWS_PER_CELL: usize = 30_000;
 const CLEAR_VISIBLE_TERMINAL: &[u8] = b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[H";
 const LINE_FEED_CHUNK: [u8; 256] = [b'\n'; 256];
@@ -100,7 +90,6 @@ impl TerminalStartup {
     }
 
     pub(super) fn enter(mut self) -> Result<TerminalSession> {
-        ensure_virtual_terminal_processing()?;
         let mut output = stdout();
 
         let probe = self.finish_probe();
@@ -185,7 +174,6 @@ where
     B: Backend<Error = io::Error> + Write,
 {
     pub(super) fn clear_screen(&mut self) -> Result<()> {
-        ensure_virtual_terminal_processing()?;
         // This is the same reset/home/visible-clear/scrollback-purge sequence Codex uses before
         // replaying source-backed transcript cells after a resize.
         write!(
@@ -266,7 +254,6 @@ where
         if lines.is_empty() {
             return Ok(());
         }
-        ensure_virtual_terminal_processing()?;
         let width = self.screen_size.width.max(1);
         let next_viewport_height = next_viewport_height.clamp(1, self.screen_size.height.max(1));
         let buffer = render_history_lines(&lines, width);
@@ -317,7 +304,6 @@ where
         height: u16,
         draw: impl FnOnce(&mut ratatui::Frame<'_>),
     ) -> Result<()> {
-        ensure_virtual_terminal_processing()?;
         self.prepare_viewport(height)?;
         self.terminal
             .draw(draw)
@@ -354,7 +340,7 @@ where
 
     /// Scroll the complete normal screen with line feeds so displaced rows enter scrollback.
     ///
-    /// `CSI S` only edits the active page in terminals such as Windows Terminal and xterm.js, so
+    /// `CSI S` only edits the active page in terminal emulators such as xterm.js, so
     /// rows pushed above the screen can be discarded instead of becoming scrollback. A line feed
     /// at the bottom of the full scrolling region uses the same history-producing path as ordinary
     /// shell output. The mutable viewport is repainted after every caller of this helper.
@@ -411,7 +397,6 @@ where
     }
 
     fn finish(&mut self) {
-        let _ = ensure_virtual_terminal_processing();
         let _ = execute!(
             self.terminal.backend_mut(),
             MoveTo(0, self.viewport_top),
@@ -507,15 +492,8 @@ impl Drop for TerminalSession {
 }
 
 fn initialize_terminal_modes() -> Result<()> {
-    ensure_virtual_terminal_processing().context("failed to enable terminal VT output")?;
     enable_raw_mode().context("failed to enable terminal raw mode")?;
-    #[cfg(windows)]
-    if let Err(error) = super::windows_console::set_input_record_mode() {
-        let _ = restore();
-        return Err(error).context("failed to configure Windows console input records");
-    }
 
-    #[cfg(unix)]
     if let Err(error) = execute!(
         stdout(),
         PushKeyboardEnhancementFlags(
@@ -530,27 +508,9 @@ fn initialize_terminal_modes() -> Result<()> {
         return Err(error).context("failed to initialize terminal input modes");
     }
 
-    #[cfg(windows)]
-    {
-        if let Err(error) = execute!(stdout(), EnableBracketedPaste, SetCursorStyle::SteadyBar) {
-            let _ = restore();
-            return Err(error).context("failed to initialize terminal input modes");
-        }
-        // Legacy Windows consoles do not implement the Kitty keyboard protocol.
-        // Crossterm input records still provide the keys bettercodex needs.
-        let _ = execute!(
-            stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            ),
-            DisableFocusChange,
-        );
-    }
     Ok(())
 }
 
-#[cfg(unix)]
 fn restore() -> io::Result<()> {
     let raw_result = disable_raw_mode();
     let mode_result = execute!(
@@ -561,71 +521,6 @@ fn restore() -> io::Result<()> {
         PopKeyboardEnhancementFlags,
     );
     raw_result.and(mode_result)
-}
-
-#[cfg(windows)]
-fn restore() -> io::Result<()> {
-    let mut first_error = ensure_virtual_terminal_processing().err();
-    if let Err(error) = disable_raw_mode() {
-        first_error.get_or_insert(error);
-    }
-    if let Err(error) = execute!(
-        stdout(),
-        SetCursorStyle::DefaultUserShape,
-        DisableBracketedPaste,
-        DisableFocusChange,
-    ) {
-        first_error.get_or_insert(error);
-    }
-    // Keyboard enhancement is best-effort on Windows, so restoration is too.
-    let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-    if let Err(error) = super::windows_console::restore_input_mode() {
-        first_error.get_or_insert(error);
-    }
-    first_error.map_or(Ok(()), Err)
-}
-
-/// Reassert ANSI output processing because another console client can change the shared screen
-/// buffer mode while bettercodex is running. Redirected handles are deliberately ignored.
-#[cfg(windows)]
-fn ensure_virtual_terminal_processing() -> io::Result<()> {
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::System::Console::ENABLE_PROCESSED_OUTPUT;
-    use windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    use windows_sys::Win32::System::Console::GetConsoleMode;
-    use windows_sys::Win32::System::Console::GetStdHandle;
-    use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
-    use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
-    use windows_sys::Win32::System::Console::SetConsoleMode;
-
-    fn enable_for_handle(handle: HANDLE) -> io::Result<()> {
-        if handle == INVALID_HANDLE_VALUE || handle == 0 {
-            return Ok(());
-        }
-
-        let mut mode = 0;
-        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-            return Ok(());
-        }
-
-        let requested = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        if mode & requested == requested {
-            return Ok(());
-        }
-        if unsafe { SetConsoleMode(handle, mode | requested) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    enable_for_handle(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) })?;
-    enable_for_handle(unsafe { GetStdHandle(STD_ERROR_HANDLE) })
-}
-
-#[cfg(not(windows))]
-fn ensure_virtual_terminal_processing() -> io::Result<()> {
-    Ok(())
 }
 
 fn install_panic_hook() {
@@ -645,14 +540,12 @@ struct StartupProbe {
     background: Option<(u8, u8, u8)>,
 }
 
-#[cfg(unix)]
 struct PendingStartupProbe {
     tty: ProbeTty,
     deadline: Instant,
     bytes: Vec<u8>,
 }
 
-#[cfg(unix)]
 impl PendingStartupProbe {
     fn begin(timeout: Duration) -> io::Result<Self> {
         let mut tty = ProbeTty::open()?;
@@ -686,14 +579,12 @@ impl PendingStartupProbe {
     }
 }
 
-#[cfg(unix)]
 struct ProbeTty {
     reader: File,
     writer: File,
     original_flags: libc::c_int,
 }
 
-#[cfg(unix)]
 impl ProbeTty {
     fn open() -> io::Result<Self> {
         let stdio_reader = duplicate_file(libc::STDIN_FILENO);
@@ -773,37 +664,18 @@ impl ProbeTty {
     }
 }
 
-#[cfg(unix)]
 impl Drop for ProbeTty {
     fn drop(&mut self) {
         let _ = unsafe { libc::fcntl(self.reader.as_raw_fd(), libc::F_SETFL, self.original_flags) };
     }
 }
 
-#[cfg(unix)]
 fn duplicate_file(fd: libc::c_int) -> io::Result<File> {
     let duplicated = unsafe { libc::dup(fd) };
     if duplicated == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(duplicated) })
-}
-
-#[cfg(windows)]
-struct PendingStartupProbe;
-
-#[cfg(windows)]
-impl PendingStartupProbe {
-    fn begin(_timeout: ()) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "terminal color probe is unavailable on Windows",
-        ))
-    }
-
-    fn finish(self) -> io::Result<StartupProbe> {
-        Ok(StartupProbe::default())
-    }
 }
 
 fn parse_osc_color(bytes: &[u8], slot: u8) -> Option<(u8, u8, u8)> {
@@ -1171,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_exploration_keeps_inline_viewport_height_stable() {
+    fn live_tool_completion_keeps_the_single_row_status_block_stable() {
         const WIDTH: u16 = 80;
         const SCREEN_HEIGHT: u16 = 24;
 
@@ -1184,23 +1056,46 @@ mod tests {
 
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "search".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "rg needle src"})),
+            name: "bash".to_string(),
+            input: Some(json!({"command": "rg needle src"})),
         });
         assert!(view.advance_presentation(Instant::now()));
         redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
-        let running_height = terminal.viewport_area.height;
-        assert!(output.screen().contains("Exploring"));
+        let active = output.screen();
+        assert!(active.contains("Exploring"), "{active}");
+        let active_working_y = active
+            .lines()
+            .position(|row| row.contains("Working ("))
+            .expect("active working row");
+        let active_composer_y = active
+            .lines()
+            .position(|row| row.trim() == "›")
+            .expect("active composer row");
+        assert_eq!(active_composer_y, active_working_y + 3, "{active}");
 
         view.handle_agent_event(AgentEvent::ToolCompleted {
             call_id: "search".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": ""})),
+            output: Ok(json!({"exit_code": 0, "stdout": "", "stderr": ""})),
+            file_change: None,
             duration: Duration::from_millis(1),
         });
         redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+        let completed = output.screen();
+        assert!(completed.contains("Explored"), "{completed}");
+        let completed_working_y = completed
+            .lines()
+            .position(|row| row.contains("Working ("))
+            .expect("completed working row");
+        let completed_composer_y = completed
+            .lines()
+            .position(|row| row.trim() == "›")
+            .expect("completed composer row");
 
-        assert!(output.screen().contains("Explored"));
-        assert_eq!(terminal.viewport_area.height, running_height);
+        assert_eq!(
+            (completed_working_y, completed_composer_y),
+            (active_working_y, active_composer_y),
+            "{completed}"
+        );
     }
 
     #[test]
@@ -1218,12 +1113,13 @@ mod tests {
         redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "tool-before-stream".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "printf tool-marker"})),
+            name: "bash".to_string(),
+            input: Some(json!({"command": "printf tool-marker"})),
         });
         view.handle_agent_event(AgentEvent::ToolCompleted {
             call_id: "tool-before-stream".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": "tool-marker\n"})),
+            output: Ok(json!({"exit_code": 0, "stdout": "tool-marker\n", "stderr": ""})),
+            file_change: None,
             duration: Duration::from_millis(1),
         });
 
@@ -1268,12 +1164,13 @@ mod tests {
         redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "tool-before-wrapped-stream".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "printf wrapped-tool-marker"})),
+            name: "bash".to_string(),
+            input: Some(json!({"command": "printf wrapped-tool-marker"})),
         });
         view.handle_agent_event(AgentEvent::ToolCompleted {
             call_id: "tool-before-wrapped-stream".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": "wrapped-tool-marker\n"})),
+            output: Ok(json!({"exit_code": 0, "stdout": "wrapped-tool-marker\n", "stderr": ""})),
+            file_change: None,
             duration: Duration::from_millis(1),
         });
 

@@ -30,13 +30,15 @@ framework, Node workspace, and Bazel build.
   all three models: 272,000 raw, 258,400 effective, and 244,800 at automatic
   compaction;
 - maximum output tokens: 128,000; and
-- tool routing: the GPT-5.6 Responses Lite `code_mode_only` route. Responses
-  exposes only `exec`/`wait`; retained tool implementations are available only
-  as nested Code Mode tools.
+- tool routing: ChatGPT-authenticated normal Responses with native parallel
+  tool calls, exactly four ordinary function tools (`bash`, `read`, `write`, and
+  `edit`), and hosted `web_search` with live text and image results; `read`
+  handles both bounded UTF-8 text and local image attachments.
 
-Codex Code Mode is the upstream client-side V8 `exec`/`wait` path, not the
-Responses API's hosted `programmatic_tool_calling` tool. Do not translate
-between them or add hosted-PTC request fields unless current upstream Codex does.
+bettercodex does not expose client-side Code Mode, hosted Programmatic Tool
+Calling, dynamic tool search, or a fallback tool route. Hosted web search is a
+fixed Responses capability, and its URL citations are shown as visible,
+clickable terminal links.
 
 `/model` is the only model-selection surface. It persists the selection as
 focused bettercodex state without introducing providers, profiles, or a general
@@ -53,18 +55,12 @@ Each release tag combines the Cargo package version with the exact public
 Source compilation is a developer workflow, not an installation or update
 path.
 
-Live tool detail and the active background-terminal summary occupy dedicated
-rows between the task status and the composer. bettercodex never folds either
-surface into the busy status line.
+Live tool activity and output stay in transcript entries above the single-row
+task status. Persistent processes belong in the operator's `tmux` session, not
+a model-visible background-process protocol.
 
 Do not add another provider, binary, app server, SDK, MCP layer, plugin system,
 configuration framework, build system, or plugin hook unless the user gives a
 concrete bettercodex use for it. Supported release targets are Apple
-silicon macOS, x86-64 Ubuntu and Debian, and native x86-64 Windows 11. Windows
-support must remain target-gated: it must not add Windows-only instructions,
-tools, or platform prose to the model-facing context on other platforms; Unix
-shell prose must likewise remain absent from native Windows context. Current
-upstream Codex source remains authoritative for retained compatibility behavior,
-and
-[`development.md`](development.md#native-windows-qualification) records the
-native verification gate.
+silicon macOS and x86-64 Ubuntu and Debian. Current upstream Codex source
+remains authoritative for retained compatibility behavior on those targets.

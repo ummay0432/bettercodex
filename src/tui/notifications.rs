@@ -120,18 +120,6 @@ impl Command for PostOsc9Notification {
             write!(output, "\x1b]9;{}\x07", self.message)
         }
     }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::other(
-            "tried to execute an OSC 9 notification using WinAPI; use ANSI instead",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
 }
 
 #[derive(Debug)]
@@ -140,17 +128,5 @@ struct PostBelNotification;
 impl Command for PostBelNotification {
     fn write_ansi(&self, output: &mut impl fmt::Write) -> fmt::Result {
         output.write_str("\x07")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::other(
-            "tried to execute a BEL notification using WinAPI; use ANSI instead",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
     }
 }

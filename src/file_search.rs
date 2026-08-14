@@ -39,7 +39,7 @@ const INDEX_BATCH_SIZE: usize = 256;
 ///   unique and sorted in ascending order so that callers can use
 ///   them directly for highlighting.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct FileMatch {
+pub(crate) struct FileMatch {
     pub score: u32,
     pub path: PathBuf,
     pub match_type: MatchType,
@@ -50,7 +50,7 @@ pub struct FileMatch {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum MatchType {
+pub(crate) enum MatchType {
     File,
     Directory,
 }
@@ -78,7 +78,7 @@ impl SearchRoot {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
-pub struct FileSearchSnapshot {
+pub(crate) struct FileSearchSnapshot {
     pub query: String,
     pub matches: Vec<FileMatch>,
     pub total_match_count: usize,
@@ -87,7 +87,7 @@ pub struct FileSearchSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct FileSearchOptions {
+pub(crate) struct FileSearchOptions {
     pub limit: NonZero<usize>,
     pub exclude: Vec<String>,
     pub threads: NonZero<usize>,
@@ -116,7 +116,7 @@ impl Default for FileSearchOptions {
     }
 }
 
-pub trait SessionReporter: Send + Sync + 'static {
+pub(crate) trait SessionReporter: Send + Sync + 'static {
     /// Called when the debounced top-N changes.
     fn on_update(&self, snapshot: &FileSearchSnapshot);
 
@@ -124,13 +124,13 @@ pub trait SessionReporter: Send + Sync + 'static {
     fn on_complete(&self);
 }
 
-pub struct FileSearchSession {
+pub(crate) struct FileSearchSession {
     inner: Arc<SessionInner>,
 }
 
 impl FileSearchSession {
     /// Update the query. Rapid successive updates are coalesced so matching stays current.
-    pub fn update_query(&self, pattern_text: &str) {
+    pub(crate) fn update_query(&self, pattern_text: &str) {
         let should_notify = {
             let mut pending_query = self
                 .inner
@@ -156,7 +156,7 @@ impl Drop for FileSearchSession {
     }
 }
 
-pub fn create_session(
+pub(crate) fn create_session(
     search_directories: Vec<PathBuf>,
     options: FileSearchOptions,
     reporter: Arc<dyn SessionReporter>,

@@ -17,7 +17,7 @@ mod managed_session;
 mod model;
 mod patch_notes;
 mod paths;
-mod platform_fs;
+mod private_fs;
 mod process_runtime;
 mod prompt_history;
 mod protocol;
@@ -108,13 +108,10 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::ToolCatalogue => {
-            let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-            let configuration = skills::SkillCatalog::load(&cwd).tool_configuration();
-            write_stdout_line(format_args!("{}", tools::catalogue_text(configuration)))?;
+            write_stdout_line(format_args!("{}", tools::catalogue_text()))?;
             Ok(())
         }
         Command::InternalInstallSmoke => {
-            tools::package_smoke_test().map_err(anyhow::Error::msg)?;
             let home = paths::bettercodex_home().ok_or_else(|| {
                 anyhow!("install smoke test requires BCODEX_HOME or a user home directory")
             })?;
@@ -519,7 +516,7 @@ fn write_help() -> io::Result<()> {
         ""
     };
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest published release\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  high or original [default: high]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the exact exec tool catalogue sent to the selected model\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest published release\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  high or original [default: high]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the readable tool catalogue and documented function outputs\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION"),
     ))
 }

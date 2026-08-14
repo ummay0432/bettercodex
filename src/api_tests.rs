@@ -26,7 +26,6 @@ fn test_client(base_url: String) -> ApiClient {
         0,
         ModelSelection::default(),
         ServiceTier::default(),
-        tools::ToolConfiguration::default(),
         base_url,
     )
     .unwrap()
@@ -52,9 +51,9 @@ impl TestApiClient for ApiClient {
         history: Vec<Value>,
         completed_items: &UnboundedSender<Value>,
     ) -> ApiResult<ModelResponse> {
-        let mut request = self.build_request(history, RequestKind::Turn);
+        let request = self.build_request(history, RequestKind::Turn);
         self.respond_request_with_events(
-            &mut request,
+            &request,
             completed_items,
             None,
             RequestKind::Turn,
@@ -81,62 +80,8 @@ fn user_message(text: &str) -> Value {
     })
 }
 
-#[test]
-fn harness_instructions_match_the_host_platform_prompt() {
-    let platform_shell_guidance = if cfg!(windows) {
-        WINDOWS_PLATFORM_SHELL_GUIDANCE
-    } else {
-        UNIX_PLATFORM_SHELL_GUIDANCE
-    };
-    assert_eq!(
-        harness_instructions(),
-        render_system_prompt(SYSTEM_PROMPT_TEMPLATE, platform_shell_guidance)
-    );
-}
-
-#[test]
-fn system_prompt_renderer_keeps_platform_guidance_separate() {
-    let unix_prompt = render_system_prompt(SYSTEM_PROMPT_TEMPLATE, UNIX_PLATFORM_SHELL_GUIDANCE);
-    let windows_prompt =
-        render_system_prompt(SYSTEM_PROMPT_TEMPLATE, WINDOWS_PLATFORM_SHELL_GUIDANCE);
-
-    assert_prompt_has_only_platform_guidance(
-        &unix_prompt,
-        UNIX_PLATFORM_SHELL_GUIDANCE,
-        WINDOWS_PLATFORM_SHELL_GUIDANCE,
-    );
-    assert_prompt_has_only_platform_guidance(
-        &windows_prompt,
-        WINDOWS_PLATFORM_SHELL_GUIDANCE,
-        UNIX_PLATFORM_SHELL_GUIDANCE,
-    );
-}
-
-#[test]
-fn responses_lite_catalogue_tracks_papercut_skill_enablement() {
-    let mut api = test_client("http://127.0.0.1:1".to_string());
-    let request = api.build_request(Vec::new(), RequestKind::Turn);
-    assert!(!request["input"][0].to_string().contains("log_papercut"));
-
-    api.set_tool_configuration(tools::ToolConfiguration::with_papercut());
-    let request = api.build_request(Vec::new(), RequestKind::Turn);
-    assert!(request["input"][0].to_string().contains("log_papercut"));
-}
-
-fn assert_prompt_has_only_platform_guidance(prompt: &str, expected: &str, excluded: &str) {
-    assert!(!prompt.contains(PLATFORM_SHELL_GUIDANCE_MARKER));
-    assert!(prompt.contains(expected.trim()));
-    for excluded_line in excluded.trim().lines() {
-        assert!(!prompt.lines().any(|line| line == excluded_line));
-    }
-}
-
-#[test]
-fn system_prompt_renderer_replaces_one_platform_fragment() {
-    assert_eq!(
-        render_system_prompt("before\n{{platform_shell_guidance}}\nafter", "- host shell"),
-        "before\n- host shell\nafter"
-    );
+fn serialized_value(value: &impl Serialize) -> Value {
+    serde_json::from_slice(&serde_json::to_vec(value).unwrap()).unwrap()
 }
 
 #[test]
@@ -144,15 +89,35 @@ fn websocket_incremental_input_requires_matching_request_properties() {
     let mut client = test_client("http://127.0.0.1:1".to_string());
     let first = user_message("first");
     let second = user_message("second");
-    let mut first_request = client.build_request(vec![first.clone()], RequestKind::Turn);
-    let restoration = client
-        .prepare_websocket_request(
-            &mut first_request,
-            WebSocketRequestMode::Warmup,
-            RequestInputIdentity::Exact,
-        )
-        .unwrap();
-    restoration.restore(&mut first_request).unwrap();
+    let first_request = client.build_request(vec![first.clone()], RequestKind::Turn);
+    let warmup = serialized_value(&client.prepare_websocket_request(
+        &first_request,
+        WebSocketRequestMode::Warmup,
+        RequestInputIdentity::Exact,
+    ));
+    assert_eq!(warmup["type"], "response.create");
+    assert_eq!(warmup["generate"], false);
+    assert_eq!(warmup["instructions"], harness_instructions());
+    assert_eq!(warmup["parallel_tool_calls"], true);
+    assert_eq!(
+        warmup["reasoning"],
+        json!({"effort": "xhigh", "context": "all_turns"})
+    );
+    assert_eq!(
+        warmup["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                tool.get("name")
+                    .or_else(|| tool.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>(),
+        vec!["bash", "read", "write", "edit", "web_search"]
+    );
+    assert!(warmup.get("stream").is_none());
     let response = ModelResponse {
         items: Vec::new(),
         tool_calls: Vec::new(),
@@ -169,39 +134,31 @@ fn websocket_incremental_input_requires_matching_request_properties() {
         WebSocketBaseline::new(&first_request, &response, RequestInputIdentity::Exact).unwrap(),
     );
 
-    let mut incremental_request =
+    let incremental_request =
         client.build_request(vec![first.clone(), second.clone()], RequestKind::Turn);
-    let logical_incremental_request = incremental_request.clone();
-    let restoration = client
-        .prepare_websocket_request(
-            &mut incremental_request,
-            WebSocketRequestMode::Inference,
-            RequestInputIdentity::Exact,
-        )
-        .unwrap();
-    assert_eq!(
-        incremental_request["previous_response_id"],
-        "response-first"
+    let incremental = client.prepare_websocket_request(
+        &incremental_request,
+        WebSocketRequestMode::Inference,
+        RequestInputIdentity::Exact,
     );
-    assert_eq!(incremental_request["input"], json!([second]));
-    restoration.restore(&mut incremental_request).unwrap();
-    assert_eq!(incremental_request, logical_incremental_request);
+    let incremental = serialized_value(&incremental);
+    assert_eq!(incremental["previous_response_id"], "response-first");
+    assert_eq!(incremental["input"], json!([second]));
 
     let mut changed_request =
         client.build_request(vec![first, user_message("changed")], RequestKind::Turn);
-    changed_request["instructions"] = Value::String("changed instructions".to_string());
-    let logical_changed_request = changed_request.clone();
-    let restoration = client
-        .prepare_websocket_request(
-            &mut changed_request,
-            WebSocketRequestMode::Inference,
-            RequestInputIdentity::Exact,
-        )
-        .unwrap();
-    assert!(changed_request.get("previous_response_id").is_none());
-    assert_eq!(changed_request["input"], logical_changed_request["input"]);
-    restoration.restore(&mut changed_request).unwrap();
-    assert_eq!(changed_request, logical_changed_request);
+    changed_request.parallel_tool_calls = false;
+    let changed = client.prepare_websocket_request(
+        &changed_request,
+        WebSocketRequestMode::Inference,
+        RequestInputIdentity::Exact,
+    );
+    let changed = serialized_value(&changed);
+    assert!(changed.get("previous_response_id").is_none());
+    assert_eq!(
+        changed["input"],
+        json!([user_message("first"), user_message("changed")])
+    );
 }
 
 fn assistant_item(text: &str) -> Value {
@@ -425,10 +382,11 @@ fn completed_items_are_emitted_once_in_api_order() {
     let mut collected = CollectedResponse::new(OutputItemMode::Transfer);
     let mut server_model_warning_emitted = false;
     let first = json!({
-        "type": "custom_tool_call",
+        "type": "function_call",
         "call_id": "call_1",
-        "name": "exec",
-        "input": "text('done')",
+        "namespace": "functions",
+        "name": "bash",
+        "arguments": "{\"command\":\"printf done\"}",
     });
     let second = assistant_item_with_phase("working", "commentary");
     let third = assistant_item_with_phase("done", "final_answer");
@@ -484,6 +442,7 @@ fn completed_items_are_emitted_once_in_api_order() {
         AgentEvent::ModelMessageCompleted(AssistantMessage {
             text: "working".to_string(),
             phase: Some(crate::protocol::MessagePhase::Commentary),
+            citations: Vec::new(),
         })
     );
     assert_eq!(
@@ -491,19 +450,110 @@ fn completed_items_are_emitted_once_in_api_order() {
         AgentEvent::ModelMessageCompleted(AssistantMessage {
             text: "done".to_string(),
             phase: Some(crate::protocol::MessagePhase::FinalAnswer),
+            citations: Vec::new(),
         })
     );
     assert!(received_events.try_recv().is_err());
     let response = collected.finish().unwrap();
     assert_eq!(
         response.tool_calls,
-        vec![ToolCall::Exec {
-            call_id: "call_1".to_string(),
-            input: "text('done')".to_string(),
-        }]
+        vec![ToolCall::from_response_item(&first).unwrap()]
     );
     assert_eq!(response.final_answer.as_deref(), Some("done"));
     assert!(response.has_assistant_text());
+}
+
+#[test]
+fn hosted_web_search_and_citations_are_forwarded_without_rewriting_history() {
+    let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
+    let (completed_items, mut received_items) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::new(OutputItemMode::Transfer);
+    let mut server_model_warning_emitted = false;
+    let added = json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "in_progress",
+    });
+    process_event_value(
+        json!({"type": "response.output_item.added", "output_index": 0, "item": added}),
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    assert_eq!(
+        received_events.try_recv().unwrap(),
+        AgentEvent::WebSearchStarted(crate::web_search::WebSearchCall {
+            id: "ws_1".to_string(),
+            status: Some("in_progress".to_string()),
+            action: None,
+        })
+    );
+
+    let completed_search = json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {"type": "search", "query": "current Rust release"},
+    });
+    process_event_value(
+        json!({"type": "response.output_item.done", "output_index": 0, "item": completed_search}),
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    assert_eq!(received_items.try_recv().unwrap(), completed_search);
+    assert_eq!(
+        received_events.try_recv().unwrap(),
+        AgentEvent::WebSearchCompleted(
+            crate::web_search::WebSearchCall::from_response_item(&completed_search).unwrap()
+        )
+    );
+
+    let message = json!({
+        "type": "message",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{
+            "type": "output_text",
+            "text": "Rust is current.[1]",
+            "annotations": [{
+                "type": "url_citation",
+                "start_index": 16,
+                "end_index": 19,
+                "url": "https://www.rust-lang.org/",
+                "title": "Rust",
+            }],
+        }],
+    });
+    process_event_value(
+        json!({"type": "response.output_item.done", "output_index": 1, "item": message}),
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    assert_eq!(received_items.try_recv().unwrap(), message);
+    let AgentEvent::ModelMessageCompleted(message) = received_events.try_recv().unwrap() else {
+        panic!("expected completed assistant message");
+    };
+    assert_eq!(message.text, "Rust is current.[1]");
+    assert_eq!(message.citations.len(), 1);
+    assert_eq!(message.citations[0].url, "https://www.rust-lang.org/");
+    assert!(
+        collected
+            .item_summary
+            .final_answer
+            .as_deref()
+            .is_some_and(|answer| answer.contains("1. Rust: https://www.rust-lang.org/"))
+    );
 }
 
 #[test]
@@ -521,37 +571,11 @@ fn extracts_text_and_forwards_streaming_events() {
         &mut server_model_warning_emitted,
     )
     .unwrap();
-    process_event(
-        r#"{"type":"response.reasoning_summary_part.added","summary_index":0,"part":{"type":"summary_text","text":""}}"#,
-        &mut collected,
-        &completed_items,
-        Some(&events),
-        MODEL,
-        &mut server_model_warning_emitted,
-    )
-    .unwrap();
-    process_event(
-        r#"{"type":"response.reasoning_summary_text.delta","delta":"checking"}"#,
-        &mut collected,
-        &completed_items,
-        Some(&events),
-        MODEL,
-        &mut server_model_warning_emitted,
-    )
-    .unwrap();
-
     let AgentEvent::ModelMessageDelta(delta) = received.try_recv().unwrap() else {
         panic!("expected model text delta");
     };
     assert_eq!(delta.text, "hello");
-    assert_eq!(
-        received.try_recv().unwrap(),
-        AgentEvent::ReasoningSummarySectionStarted
-    );
-    assert_eq!(
-        received.try_recv().unwrap(),
-        AgentEvent::ReasoningSummaryDelta("checking".to_string())
-    );
+    assert!(received.try_recv().is_err());
 }
 
 #[test]
@@ -561,12 +585,21 @@ fn stream_errors_classify_websocket_recovery_cases() {
         "error": {"code": "previous_response_not_found", "message": "expired"},
     }));
     assert_eq!(previous.kind, ApiErrorKind::PreviousResponseNotFound);
+    let unauthorized = error_event(&json!({
+        "type": "error",
+        "status": 401,
+        "error": {"message": "expired token"},
+    }));
+    assert_eq!(unauthorized.kind, ApiErrorKind::Unauthorized);
     let overloaded = error_event(&json!({
         "type": "error",
         "status_code": 503,
         "error": {"message": "busy"},
     }));
     assert!(overloaded.is_retryable());
+    let idle = ApiError::stream_idle("idle timeout");
+    assert!(idle.is_stream_idle());
+    assert!(idle.is_retryable());
     assert!(classify_stream_error("future_transient_error", "try again").is_retryable());
     assert!(!classify_stream_error("insufficient_quota", "quota exhausted").is_retryable());
     assert_eq!(
@@ -613,11 +646,7 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
     let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(request.path, "/responses");
     assert!(request.headers.contains("authorization: Bearer token-test"));
-    assert!(
-        request
-            .headers
-            .contains("x-openai-internal-codex-responses-lite: true")
-    );
+    assert!(!request.headers.contains("codex-responses-lite"));
     assert!(
         request
             .headers
@@ -628,68 +657,89 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
     assert_eq!(body["model"], MODEL);
     assert!(body.get("service_tier").is_none());
     assert!(body.get("max_output_tokens").is_none());
-    assert!(body.get("tools").is_none());
-    assert!(body.get("instructions").is_none());
-    assert_eq!(body["parallel_tool_calls"], false);
-    assert_eq!(body["reasoning"]["effort"], "xhigh");
-    assert_eq!(body["reasoning"]["context"], "all_turns");
-    assert_eq!(body["input"][0]["type"], "additional_tools");
-    assert_eq!(body["input"][0]["role"], "developer");
+    assert_eq!(body["instructions"], harness_instructions());
+    assert_eq!(body["parallel_tool_calls"], true);
     assert_eq!(
-        body["input"][1],
-        json!({
-            "type": "message",
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": harness_instructions(),
-            }],
-        })
+        body["reasoning"],
+        json!({"effort": "xhigh", "context": "all_turns"})
     );
-    let additional_tools = body["input"][0]["tools"].as_array().unwrap();
-    assert_eq!(additional_tools.len(), 1);
-    assert_eq!(additional_tools[0]["type"], "namespace");
-    assert_eq!(additional_tools[0]["name"], "functions");
-    assert_eq!(additional_tools[0]["description"], "");
-    let tools = &additional_tools[0]["tools"];
+    let tools = &body["tools"];
     assert_eq!(
         tools
             .as_array()
             .unwrap()
             .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
+            .map(|tool| {
+                tool.get("name")
+                    .or_else(|| tool.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap()
+            })
             .collect::<Vec<_>>(),
-        vec!["exec", "wait"]
+        vec!["bash", "read", "write", "edit", "web_search"]
     );
-    let exec = tools
+    let bash = tools
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "exec")
+        .find(|tool| tool["name"] == "bash")
         .unwrap();
+    let timeout = &bash["parameters"]["properties"]["timeout"];
+    assert_eq!(timeout["exclusiveMinimum"], 0);
+    assert_eq!(timeout["maximum"], json!(i32::MAX as f64 / 1_000.0));
     assert!(
-        exec["description"]
+        timeout["description"]
             .as_str()
             .unwrap()
-            .contains("### `apply_patch`")
+            .contains("no timeout by default")
     );
-    assert!(exec["description"].as_str().unwrap().contains("ALL_TOOLS"));
-    assert!(
-        exec["description"]
-            .as_str()
-            .unwrap()
-            .contains("declare const tools: { apply_patch(input: string): Promise<")
-    );
-    assert!(
-        exec["description"]
-            .as_str()
-            .unwrap()
-            .contains("detail?: \"high\" | \"original\";")
-    );
+    let read = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "read")
+        .unwrap();
     assert_eq!(
-        body["input"].as_array().unwrap().last().unwrap(),
-        &user_message("hello")
+        read["parameters"]["properties"]["detail"]["enum"],
+        json!(["high", "original"])
     );
+    assert_eq!(read["parameters"]["properties"]["limit"]["maximum"], 2_000);
+    let edit = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "edit")
+        .unwrap();
+    assert_eq!(
+        edit["parameters"]["properties"]["edits"]["items"]["properties"]["oldText"]["minLength"],
+        1
+    );
+    let web_search = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["type"] == "web_search")
+        .unwrap();
+    assert_eq!(web_search["external_web_access"], true);
+    assert_eq!(web_search["search_content_types"], json!(["text", "image"]));
+    assert!(web_search.get("name").is_none());
+    assert!(web_search.get("parameters").is_none());
+    assert!(
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool["type"] == "function")
+            .all(|tool| tool["strict"] == false)
+    );
+    assert!(
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("output_schema").is_none())
+    );
+    assert_eq!(body["input"], json!([user_message("hello")]));
     let client_turn_metadata: Value = serde_json::from_str(
         body["client_metadata"]["x-codex-turn-metadata"]
             .as_str()
@@ -752,10 +802,10 @@ async fn model_rerouting_warns_once_per_turn_without_rejecting_payload_aliases()
     let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
 
     for (prompt, expected) in [("first", "first"), ("second", "second")] {
-        let mut request = client.build_request(vec![user_message(prompt)], RequestKind::Turn);
+        let request = client.build_request(vec![user_message(prompt)], RequestKind::Turn);
         let response = client
             .respond_request_with_events(
-                &mut request,
+                &request,
                 &completed_items,
                 Some(&events),
                 RequestKind::Turn,
@@ -776,57 +826,6 @@ async fn model_rerouting_warns_once_per_turn_without_rejecting_payload_aliases()
     assert!(warnings[0].contains(MODEL));
     assert!(warnings[0].contains(FALLBACK_MODEL));
     server.join().unwrap();
-}
-
-#[test]
-fn responses_lite_strips_image_details_only_from_the_request_copy() {
-    let history = vec![
-        json!({
-            "type": "message",
-            "role": "user",
-            "content": [{
-                "type": "input_image",
-                "image_url": "data:image/png;base64,user",
-                "detail": "original",
-            }],
-        }),
-        json!({
-            "type": "function_call_output",
-            "call_id": "function",
-            "output": [{
-                "type": "input_image",
-                "image_url": "data:image/png;base64,function",
-                "detail": "high",
-            }],
-        }),
-        json!({
-            "type": "custom_tool_call_output",
-            "call_id": "custom",
-            "output": [{
-                "type": "input_image",
-                "image_url": "data:image/png;base64,custom",
-                "detail": "auto",
-            }],
-        }),
-    ];
-
-    let (request_input, restoration) =
-        compose_sampling_input(history.clone(), tools::ToolConfiguration::default());
-
-    assert!(
-        request_input
-            .iter()
-            .flat_map(|item| {
-                item.get("content")
-                    .or_else(|| item.get("output"))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-            })
-            .filter(|item| item["type"] == "input_image")
-            .all(|image| image.get("detail").is_none())
-    );
-    assert_eq!(restoration.restore(request_input).unwrap(), history);
 }
 
 #[test]
@@ -919,7 +918,7 @@ async fn websocket_upgrade_failure_falls_back_to_http() {
 #[tokio::test]
 async fn inactive_startup_websocket_falls_back_to_http_promptly() {
     let (base_url, mut websocket_requests, mut http_requests, server) =
-        spawn_inactive_startup_websocket_server().await;
+        spawn_inactive_startup_websocket_server(InactiveWebSocketResponse::BeforeOutput).await;
     let mut client = test_client(base_url);
     let prewarmed = client
         .startup_prewarm_client()
@@ -975,6 +974,68 @@ async fn inactive_startup_websocket_falls_back_to_http_promptly() {
 }
 
 #[tokio::test]
+async fn partial_websocket_output_is_not_transparently_replayed_over_http() {
+    let partial = assistant_item_with_phase("partial", "commentary");
+    let (base_url, mut websocket_requests, mut http_requests, server) =
+        spawn_inactive_startup_websocket_server(InactiveWebSocketResponse::AfterOutput(
+            partial.clone(),
+        ))
+        .await;
+    let mut client = test_client(base_url);
+    client.stream_idle_timeout = Duration::from_secs(10);
+    let prewarmed = client
+        .startup_prewarm_client()
+        .prewarm_for_startup()
+        .await
+        .unwrap();
+    client.adopt_startup_prewarm(prewarmed);
+    let (completed_items, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let warmup = websocket_requests.recv().await.unwrap();
+    assert_eq!(warmup["generate"], false);
+    let mut response_task = tokio::spawn(async move {
+        let response = client
+            .respond(vec![user_message("hello")], &completed_items)
+            .await;
+        (client, response)
+    });
+    let first_turn = tokio::time::timeout(Duration::from_secs(2), websocket_requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_turn["previous_response_id"], "warm-inactive");
+    let completed = tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed, partial);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+    let (client, response) =
+        match tokio::time::timeout(Duration::from_secs(2), &mut response_task).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => {
+                response_task.abort();
+                server.abort();
+                let _ = response_task.await;
+                let _ = server.await;
+                panic!("partial WebSocket inactivity did not return to the agent");
+            }
+        };
+
+    let error = match response {
+        Err(error) => error,
+        Ok(_) => panic!("partial WebSocket response was transparently replayed"),
+    };
+    assert!(error.is_retryable());
+    assert!(client.prefer_websocket);
+    assert!(completed_rx.try_recv().is_err());
+    assert!(http_requests.try_recv().is_err());
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn compaction_sends_the_trigger_and_returns_only_retained_history() {
     let retained = user_message("retain this operator message");
     let discarded = assistant_item("discard this completed answer");
@@ -1015,6 +1076,60 @@ async fn compaction_sends_the_trigger_and_returns_only_retained_history() {
         input.last().and_then(|item| item["type"].as_str()),
         Some("compaction_trigger")
     );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn compaction_rewrites_an_oversized_tool_output_before_an_interruption_notice() {
+    let oversized = "oversized tool output\n".repeat(60_000);
+    let output = json!({
+        "type": "function_call_output",
+        "call_id": "call_oversized",
+        "output": oversized,
+    });
+    let interruption = user_message("<turn_aborted>interrupted by operator</turn_aborted>");
+    let history = vec![
+        user_message("inspect a large image"),
+        json!({
+            "type": "function_call",
+            "call_id": "call_oversized",
+            "name": "read",
+            "arguments": r#"{"path":"large.png","detail":"original"}"#,
+        }),
+        output,
+        interruption.clone(),
+    ];
+    let opaque = json!({
+        "type": "compaction",
+        "id": "cmp_oversized",
+        "encrypted_content": "opaque summary",
+    });
+    let (base_url, requests, server) = spawn_http_server(vec![HttpReply::ok(
+        "text/event-stream",
+        completed_sse("resp_compacted_oversized", &opaque),
+    )]);
+    let mut client = test_client(base_url);
+    client.prefer_websocket = false;
+
+    client
+        .compact(
+            &history,
+            CompactionRequest::Automatic(CompactionPhase::PreTurn),
+        )
+        .await
+        .unwrap();
+
+    let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    let request: Value = serde_json::from_slice(&request.body).unwrap();
+    let input = request["input"].as_array().unwrap();
+    assert!(input.contains(&interruption));
+    let rewritten = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .and_then(|item| item["output"].as_str())
+        .unwrap();
+    assert!(rewritten.len() < 1_000);
+    assert_eq!(input.last().unwrap()["type"], "compaction_trigger");
     server.join().unwrap();
 }
 
@@ -1117,7 +1232,14 @@ fn spawn_http_server(
     (format!("http://{address}"), requests_rx, server)
 }
 
-async fn spawn_inactive_startup_websocket_server() -> (
+enum InactiveWebSocketResponse {
+    BeforeOutput,
+    AfterOutput(Value),
+}
+
+async fn spawn_inactive_startup_websocket_server(
+    response: InactiveWebSocketResponse,
+) -> (
     String,
     tokio::sync::mpsc::UnboundedReceiver<Value>,
     tokio::sync::mpsc::UnboundedReceiver<CapturedRequest>,
@@ -1169,20 +1291,40 @@ async fn spawn_inactive_startup_websocket_server() -> (
             .send(serde_json::from_str(first_turn.as_str()).unwrap())
             .unwrap();
 
-        // Keep the accepted WebSocket open but never answer the first turn. This models a
-        // half-open warmed connection whose write succeeds locally while no server events arrive.
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request = read_async_request(&mut stream).await;
-        http_requests_tx.send(request).unwrap();
-        let body = completed_sse("resp-https-recovery", &assistant_item("https recovery"));
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(headers.as_bytes()).await.unwrap();
-        stream.write_all(body.as_bytes()).await.unwrap();
-        stream.flush().await.unwrap();
-        drop(websocket);
+        match response {
+            InactiveWebSocketResponse::BeforeOutput => {
+                // Keep the accepted WebSocket open but never answer the first turn. This models a
+                // half-open warmed connection whose write succeeds while no server events arrive.
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_async_request(&mut stream).await;
+                http_requests_tx.send(request).unwrap();
+                let body = completed_sse("resp-https-recovery", &assistant_item("https recovery"));
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(body.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            InactiveWebSocketResponse::AfterOutput(item) => {
+                websocket
+                    .send(tungstenite::Message::Text(
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": item,
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                // The client should return the interrupted stream instead of opening an HTTP
+                // connection, then drop this socket while abandoning the incomplete response.
+                let _ = websocket.next().await;
+            }
+        }
     });
     (
         format!("http://{address}"),

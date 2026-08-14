@@ -728,7 +728,7 @@ pub(crate) fn adaptive_wrap_line<'a>(line: &'a Line<'a>, base: RtOptions<'a>) ->
 }
 
 #[derive(Debug, Clone)]
-pub struct RtOptions<'a> {
+pub(super) struct RtOptions<'a> {
     /// The width in columns at which the text will be wrapped.
     pub width: usize,
     /// Line ending used for breaking lines.
@@ -761,7 +761,7 @@ impl From<usize> for RtOptions<'_> {
 }
 
 impl<'a> RtOptions<'a> {
-    pub fn new(width: usize) -> Self {
+    pub(super) fn new(width: usize) -> Self {
         RtOptions {
             width,
             line_ending: textwrap::LineEnding::LF,
@@ -774,35 +774,35 @@ impl<'a> RtOptions<'a> {
         }
     }
 
-    pub fn initial_indent(self, initial_indent: Line<'a>) -> Self {
+    pub(super) fn initial_indent(self, initial_indent: Line<'a>) -> Self {
         RtOptions {
             initial_indent,
             ..self
         }
     }
 
-    pub fn subsequent_indent(self, subsequent_indent: Line<'a>) -> Self {
+    pub(super) fn subsequent_indent(self, subsequent_indent: Line<'a>) -> Self {
         RtOptions {
             subsequent_indent,
             ..self
         }
     }
 
-    pub fn break_words(self, break_words: bool) -> Self {
+    pub(super) fn break_words(self, break_words: bool) -> Self {
         RtOptions {
             break_words,
             ..self
         }
     }
 
-    pub fn word_separator(self, word_separator: textwrap::WordSeparator) -> RtOptions<'a> {
+    pub(super) fn word_separator(self, word_separator: textwrap::WordSeparator) -> RtOptions<'a> {
         RtOptions {
             word_separator,
             ..self
         }
     }
 
-    pub fn word_splitter(self, word_splitter: textwrap::WordSplitter) -> RtOptions<'a> {
+    pub(super) fn word_splitter(self, word_splitter: textwrap::WordSplitter) -> RtOptions<'a> {
         RtOptions {
             word_splitter,
             ..self

@@ -18,13 +18,16 @@ use crate::rollout::LoadedRollout;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionTranscriptItem;
+use crate::rollout::SessionTranscriptToolOutcome;
+use crate::rollout::SessionTranscriptToolOutput;
 use crate::rollout::TurnOutcome;
 use crate::service_tier::ServiceTier;
-use crate::tools::ProcessManager;
+use crate::tools::ToolCall;
 use crate::tools::ToolRuntime;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use futures_util::future::join_all;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -160,6 +163,10 @@ impl TurnHandle {
         steering.queued.push_back(SteeringInput { id, input });
         Ok(id)
     }
+
+    pub(crate) fn inject_context(&self, text: String) -> Result<SteerId> {
+        self.steer(UserInput::text(text))
+    }
 }
 
 impl TurnControl {
@@ -258,16 +265,14 @@ impl Agent {
         let mut conversation = Conversation::create_with_selection(&cwd, model_selection)?;
         conversation.set_service_tier(service_tier)?;
         let identity = conversation.identity().clone();
-        let tool_configuration = conversation.tool_configuration();
         let api = ApiClient::new(
             auth,
             &identity,
             0,
             conversation.model_selection().clone(),
             conversation.service_tier(),
-            tool_configuration,
         )?;
-        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client(), tool_configuration);
+        let tools = ToolRuntime::new(cwd.clone());
         let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd,
@@ -301,20 +306,14 @@ impl Agent {
         let transcript_checkpoint = Some(transcript.len());
         rollout.snapshot_transcript(transcript)?;
         let conversation = self.conversation.fork(rollout)?;
-        let tool_configuration = conversation.tool_configuration();
         let api = ApiClient::new(
             auth,
             &identity,
             compaction_count,
             conversation.model_selection().clone(),
             conversation.service_tier(),
-            tool_configuration,
         )?;
-        let tools = ToolRuntime::new(
-            self.cwd.clone(),
-            api.web_search_client(),
-            tool_configuration,
-        );
+        let tools = ToolRuntime::new(self.cwd.clone());
         let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd: self.cwd.clone(),
@@ -337,16 +336,14 @@ impl Agent {
         let forked_from = loaded.forked_from.clone();
         let conversation = Conversation::resume(&cwd, loaded)?;
         let auth = Auth::load()?;
-        let tool_configuration = conversation.tool_configuration();
         let api = ApiClient::new(
             auth,
             &identity,
             compaction_count,
             conversation.model_selection().clone(),
             conversation.service_tier(),
-            tool_configuration,
         )?;
-        let tools = ToolRuntime::new(cwd.clone(), api.web_search_client(), tool_configuration);
+        let tools = ToolRuntime::new(cwd.clone());
         let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd,
@@ -408,12 +405,14 @@ impl Agent {
         self.api.rate_limit_client()
     }
 
-    pub(crate) fn background_processes(&self) -> ProcessManager {
-        self.tools.background_processes()
-    }
-
     pub(crate) fn prompt_history(&self) -> Vec<String> {
         self.conversation.prompt_history()
+    }
+
+    pub(crate) fn record_operator_shell_context(&mut self, text: String) -> Result<()> {
+        debug_assert!(crate::context::is_contextual_user_text(&text));
+        self.conversation
+            .extend([crate::context::message("user", text)])
     }
 
     pub(crate) fn take_resumed_transcript(&mut self) -> Vec<SessionTranscriptItem> {
@@ -426,6 +425,20 @@ impl Agent {
 
     pub(crate) fn invalidate_transcript_checkpoint(&mut self) {
         self.transcript_checkpoint = None;
+    }
+
+    pub(crate) fn persist_transcript_tool_outcome(
+        &mut self,
+        call_id: String,
+        output: SessionTranscriptToolOutput,
+    ) -> Result<()> {
+        self.conversation
+            .record_tool_outcomes(vec![SessionTranscriptToolOutcome {
+                call_id,
+                output: Some(output),
+                error: None,
+                file_change: None,
+            }])
     }
 
     pub(crate) fn persist_transcript(
@@ -470,9 +483,6 @@ impl Agent {
         self.conversation
             .reload_skills(&self.cwd)
             .context("skill setting was saved, but the active session could not reload skills")?;
-        let configuration = self.conversation.tool_configuration();
-        self.api.set_tool_configuration(configuration);
-        self.tools.set_configuration(configuration);
         Ok(())
     }
 
@@ -574,16 +584,15 @@ impl Agent {
             self.run_turn(input, &events, &control).await
         } else {
             let mut active_turn_context = ActiveTurnContext::default();
-            let _ = self
-                .record_incoming_user(
-                    IncomingUserInput::Initial(input),
-                    &events,
-                    &control.cancellation,
-                    CompactionPhase::PreTurn,
-                    &mut active_turn_context,
-                )
-                .await?;
-            Ok(SubmitOutcome::Cancelled)
+            self.record_incoming_user(
+                IncomingUserInput::Initial(input),
+                &events,
+                &control.cancellation,
+                CompactionPhase::PreTurn,
+                &mut active_turn_context,
+            )
+            .await
+            .map(|_| SubmitOutcome::Cancelled)
         };
         control.close();
         let outcome = match &result {
@@ -592,7 +601,10 @@ impl Agent {
                 self.conversation.mark_interrupted()?;
                 TurnOutcome::Interrupted
             }
-            Err(_) => TurnOutcome::Failed,
+            Err(_) => {
+                self.conversation.normalize()?;
+                TurnOutcome::Failed
+            }
         };
         self.conversation.finish_turn(&turn_id, outcome)?;
         result
@@ -618,24 +630,12 @@ impl Agent {
             return Ok(SubmitOutcome::Cancelled);
         }
 
-        // Hide the one-time ICU decompression and V8 platform initialization behind the model's
-        // first sampling request.
-        self.tools.prewarm();
-        // Standalone search excludes model and tool output after the newest operator input. Keep
-        // that potentially large projection until steering or compaction changes its visible tail.
-        let mut tool_context = self.api.tool_turn_context(self.conversation.items());
         let mut pending_steering = VecDeque::new();
         // Sample the fresh turn input first. After a mid-turn compact, sample the
         // compacted tool continuation once before inserting queued steering.
         let mut can_record_pending_steering = false;
         loop {
-            let mut tool_context_changed = false;
             if can_record_pending_steering {
-                let notifications = self.tools.take_notifications()?;
-                if !notifications.is_empty() {
-                    self.conversation.extend(notifications)?;
-                    self.emit_context(events);
-                }
                 control.drain_steering(&mut pending_steering);
                 while let Some(input) = pending_steering.pop_front() {
                     if !self
@@ -650,16 +650,11 @@ impl Agent {
                     {
                         return Ok(SubmitOutcome::Cancelled);
                     }
-                    tool_context_changed = true;
                 }
             }
             can_record_pending_steering = true;
-            if tool_context_changed {
-                tool_context = self.api.tool_turn_context(self.conversation.items());
-            }
 
-            let tool_truncation_policy = tool_context.truncation_policy();
-            let code_mode_step = self.tools.begin_step(tool_context.clone(), events.clone());
+            let tool_truncation_policy = self.conversation.model_selection().truncation_policy();
             let response = match self.sample_with_recovery(events, control).await? {
                 SamplingOutcome::Response(response) => response,
                 SamplingOutcome::Cancelled => return Ok(SubmitOutcome::Cancelled),
@@ -674,15 +669,14 @@ impl Agent {
             )?;
             self.emit_context(events);
             emit(events, AgentEvent::ModelResponseCompleted);
+            if control.cancellation.is_cancelled() {
+                return Ok(SubmitOutcome::Cancelled);
+            }
 
             let tool_calls = response.tool_calls;
             if tool_calls.is_empty() && !model_needs_follow_up {
-                drop(code_mode_step);
                 control.drain_steering(&mut pending_steering);
                 if !pending_steering.is_empty() {
-                    continue;
-                }
-                if self.tools.has_notifications()? {
                     continue;
                 }
                 if !control.close_if_idle(&mut pending_steering) {
@@ -699,22 +693,51 @@ impl Agent {
                 return Err(anyhow!("model returned no text or tool call"));
             }
 
-            for tool_call in tool_calls {
+            let tools = &self.tools;
+            let execute = |tool_call: ToolCall| {
                 let cancellation = control.cancellation.clone();
                 let tool_events = events.clone();
-                let output = tool_call
-                    .execute(
-                        &self.tools,
-                        tool_truncation_policy,
-                        tool_events,
-                        cancellation,
-                    )
-                    .await;
-                self.conversation
-                    .extend(tool_call.into_output_items(output))?;
-                self.emit_context(events);
+                async move {
+                    let output = tool_call
+                        .execute(tools, tool_truncation_policy, tool_events, cancellation)
+                        .await;
+                    tool_call.into_output_item(output)
+                }
+            };
+            let mut executed_calls = Vec::with_capacity(tool_calls.len());
+            let mut tool_calls = tool_calls.into_iter().peekable();
+            while let Some(tool_call) = tool_calls.next() {
+                if tool_call.supports_parallel_execution() {
+                    let mut parallel_calls = vec![tool_call];
+                    while let Some(tool_call) =
+                        tool_calls.next_if(ToolCall::supports_parallel_execution)
+                    {
+                        parallel_calls.push(tool_call);
+                    }
+                    executed_calls.extend(join_all(parallel_calls.into_iter().map(&execute)).await);
+                } else {
+                    executed_calls.push(execute(tool_call).await);
+                }
             }
-            drop(code_mode_step);
+            let (output_items, completions): (Vec<_>, Vec<_>) = executed_calls.into_iter().unzip();
+            let outcomes = completions
+                .into_iter()
+                .filter_map(|completion| {
+                    let has_file_change = completion.file_change.is_some();
+                    if completion.error.is_none() && !has_file_change {
+                        return None;
+                    }
+                    Some(SessionTranscriptToolOutcome {
+                        call_id: completion.call_id,
+                        output: None,
+                        error: completion.error,
+                        file_change: completion.file_change,
+                    })
+                })
+                .collect();
+            self.conversation
+                .extend_tool_results(output_items, outcomes)?;
+            self.emit_context(events);
             if control.cancellation.is_cancelled() {
                 return Ok(SubmitOutcome::Cancelled);
             }
@@ -731,7 +754,6 @@ impl Agent {
                 {
                     return Ok(SubmitOutcome::Cancelled);
                 }
-                tool_context = self.api.tool_turn_context(self.conversation.items());
                 can_record_pending_steering = false;
             }
         }
@@ -763,17 +785,17 @@ impl Agent {
             let (completed_tx, mut completed_rx) = unbounded_channel::<Value>();
             let mut observed_item = false;
             let (history, cursor) = self.conversation.take_history_for_sampling();
-            let mut request = self.api.build_sampling_request(history, cursor);
+            let request = self.api.build_sampling_request(history, cursor);
             let wait: Result<SamplingWait> = {
                 let api = &mut self.api;
                 let conversation = &mut self.conversation;
                 let response = async {
                     match events {
                         Some(events) => {
-                            api.respond_sampling_streaming(&mut request, &completed_tx, events)
+                            api.respond_sampling_streaming(&request, &completed_tx, events)
                                 .await
                         }
-                        None => api.respond_sampling(&mut request, &completed_tx).await,
+                        None => api.respond_sampling(&request, &completed_tx).await,
                     }
                 };
                 tokio::pin!(response);
@@ -808,11 +830,23 @@ impl Agent {
                     }
                 }
             }
-            let (history, cursor) = request.into_history()?;
-            self.conversation
-                .restore_history_after_sampling(history, cursor)?;
-            let wait = wait?;
+            let (history, cursor) = request.into_history();
+            if let Err(error) = self
+                .conversation
+                .restore_history_after_sampling(history, cursor)
+            {
+                self.api.abandon_response();
+                return Err(error);
+            }
+            let wait = match wait {
+                Ok(wait) => wait,
+                Err(error) => {
+                    self.api.abandon_response();
+                    return Err(error);
+                }
+            };
             if let Some(error) = trailing_error {
+                self.api.abandon_response();
                 return Err(error);
             }
 
@@ -988,9 +1022,10 @@ impl Agent {
                 "input alone is estimated at {incoming_tokens} tokens, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
+        let mut compaction_cancelled = false;
         if projection.needs_compaction() {
             let projected = projection.into_items();
-            if !self
+            compaction_cancelled = !self
                 .run_compaction(
                     events,
                     cancellation,
@@ -998,14 +1033,11 @@ impl Agent {
                     InitialContextInjection::AfterCompaction,
                     active_turn_context,
                 )
-                .await?
-            {
-                return Ok(false);
-            }
+                .await?;
             projection = self.conversation.project_append(projected);
         }
         let projected_tokens = projection.projected_tokens();
-        if projected_tokens > effective_context_window {
+        if !compaction_cancelled && projected_tokens > effective_context_window {
             return Err(anyhow!(
                 "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer images"
             ));
@@ -1016,7 +1048,10 @@ impl Agent {
             emit(events, AgentEvent::SteeringCommitted(id));
         }
         self.emit_context(events);
-        Ok(true)
+        // Codex retains submitted input when pre-sampling compaction is interrupted. Preserve the
+        // same saved-session invariant here: cancellation may defer compaction, but must not erase
+        // an operator message that the UI already accepted.
+        Ok(!compaction_cancelled)
     }
 
     fn emit_context(&self, events: &Option<UnboundedSender<AgentEvent>>) {

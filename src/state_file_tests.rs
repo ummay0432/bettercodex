@@ -50,7 +50,6 @@ fn unchanged_update_does_not_materialize_a_state_file() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 #[test]
 fn read_rejects_a_symbolic_link_instead_of_following_it() -> Result<()> {
     use std::os::unix::fs::symlink;

@@ -14,16 +14,12 @@ cargo install --locked cargo-nextest
 just install
 ```
 
-Build through the checked-in V8 wrapper. Raw Cargo can request an unpublished
-debug V8 archive.
-
 ```sh
-./scripts/cargo-with-v8.sh build
-./scripts/cargo-with-v8.sh run --bin bcodex -- "explain this codebase"
+cargo build
+cargo run --bin bcodex -- "explain this codebase"
 ```
 
-On native Windows, use `scripts/cargo-with-v8.ps1`. Routine validation mirrors
-upstream Codex:
+Routine validation mirrors upstream Codex:
 
 ```sh
 just fmt
@@ -36,7 +32,7 @@ just clippy -- -D warnings
 available, use:
 
 ```sh
-RUST_MIN_STACK=8388608 ./scripts/cargo-with-v8.sh test --bin bcodex <filter>
+RUST_MIN_STACK=8388608 cargo test --bin bcodex <filter>
 ```
 
 This package has no library target, so `cargo test --lib` is invalid.
@@ -97,31 +93,12 @@ just fix
 just fmt
 just test
 just clippy -- -D warnings
-./scripts/cargo-with-v8.sh build --release --locked
+cargo build --release --locked
 ```
 
-Run the prebuilt installer tests on their native platforms. Windows source and
-terminal validation still requires a native Windows machine with MSVC; a Rust
-target installed on Linux is not a useful substitute.
-
-## Native Windows qualification
-
-Before native Windows leaves developer preview, validate on x86-64 Windows 11
-with MSVC:
-
-- pipe and ConPTY execution, including stream separation or merging, resize,
-  interruption, timeout, descendant cleanup, and non-ASCII paths;
-- Windows Terminal and VS Code's integrated terminal, including keyboard input,
-  ordinary and bracketed paste, IME input, clipboard operations, hyperlinks,
-  resize and reflow, resume, login, and clean shutdown;
-- public installation and updates from clean and existing profiles, including
-  rollback and locked-file failures; and
-- platform-specific model context isolation and cleanup of every task-owned
-  process, stage, cache, lock, and temporary file after failures.
-
 The manual release workflow is the only distribution build path. It must build
-all three targets from one public `main` revision, qualify the shared Linux
-binary on Ubuntu and Debian, and create a draft with exactly the five compressed
+both targets from one public `main` revision, qualify the shared Linux binary
+on Ubuntu and Debian, and create a draft with exactly the four compressed
 assets listed in [`releasing.md`](releasing.md). The two zstd assets are
 compatibility encodings of the macOS and Linux binaries for immutable clients
 older than 0.1.3.

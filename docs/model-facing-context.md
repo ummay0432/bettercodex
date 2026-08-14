@@ -8,17 +8,16 @@ model-visible errors.
 Do not alter Codex-derived agent-facing context in `prompts/*.md`, tool
 descriptions, or model-visible errors without explicit user permission.
 
-`prompts/system.md` is the active harness template. `src/api.rs` renders it with
-exactly one of `prompts/system-unix.md` or `prompts/system-windows.md` and
-prepends it to Responses Lite input as a developer message after the
-`additional_tools` item, matching Codex. It has developer authority; it is not
-OpenAI's root or system layer. Edit these files only when the user explicitly
-asks to edit the system prompt.
+`prompts/system.md` is the active harness template. `src/api.rs` sends it in the
+normal Responses request's top-level `instructions` field alongside the
+fixed top-level tool catalogue. It has developer authority; it is not OpenAI's
+root or system layer. Edit it only when the user explicitly asks to edit the
+system prompt.
 
-`src/tools/catalogue.rs` generates the fixed GPT-5.6 Code Mode catalogue.
-`prompts/tool-catalogue.md` records the exact generated Unix catalogue in
-readable form. Refresh it from `bcodex --tool-catalogue` whenever the generator
-changes; use that command directly to inspect another target platform.
+`src/tools.rs` generates the fixed catalogue of four ordinary functions plus
+hosted `web_search`. `prompts/tool-catalogue.md` records the exact generated
+catalogue in readable form. Refresh it from `bcodex --tool-catalogue` whenever
+the generator changes.
 
 ## Writing and placement
 

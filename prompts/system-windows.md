@@ -1,1 +1,0 @@
-- When using PowerShell, use native PowerShell syntax and cmdlets rather than Bash or Unix syntax.

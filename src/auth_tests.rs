@@ -95,3 +95,64 @@ fn oversized_auth_file_is_rejected_before_loading() {
     assert!(error.to_string().contains("exceed the 1 MiB limit"));
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_unauthorized_recovery_reuses_the_first_refresh() {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let refresh_url = format!("http://{}", server.server_addr());
+    let server_task = std::thread::spawn(move || {
+        let request = server
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .expect("refresh request timed out");
+        let content_type = tiny_http::Header::from_bytes(
+            b"content-type".as_slice(),
+            b"application/json".as_slice(),
+        )
+        .unwrap();
+        request
+            .respond(
+                tiny_http::Response::from_string(
+                    serde_json::json!({
+                        "access_token": "fresh-token",
+                        "refresh_token": "fresh-refresh-token",
+                    })
+                    .to_string(),
+                )
+                .with_header(content_type),
+            )
+            .unwrap();
+    });
+    crate::http_client::ensure_rustls_crypto_provider();
+    let client = reqwest::Client::new();
+    let auth = SharedAuth::new(Auth {
+        access_token: "rejected-token".to_string(),
+        refresh_token: Some("initial-refresh-token".to_string()),
+        account_id: Some("account-test".to_string()),
+        account: ChatGptAccount::default(),
+        expires_at: None,
+        refresh_url: Cow::Owned(refresh_url),
+        storage: None,
+    });
+    let rejected = auth.refreshed_snapshot(&client).await.unwrap();
+
+    let (first, second) = tokio::join!(
+        auth.refreshed_snapshot_after_unauthorized(&client, &rejected),
+        auth.refreshed_snapshot_after_unauthorized(&client, &rejected),
+    );
+    server_task.join().unwrap();
+
+    for snapshot in [first.unwrap(), second.unwrap()] {
+        assert_eq!(
+            snapshot.authorization.to_str().unwrap(),
+            "Bearer fresh-token"
+        );
+        assert_eq!(
+            snapshot
+                .account_id
+                .as_ref()
+                .and_then(|value| value.to_str().ok()),
+            Some("account-test")
+        );
+    }
+}

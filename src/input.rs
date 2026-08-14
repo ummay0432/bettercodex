@@ -7,7 +7,6 @@ use serde_json::Value;
 use serde_json::json;
 use std::borrow::Cow;
 use std::fmt;
-use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
@@ -242,11 +241,13 @@ impl PromptImage {
     }
 
     fn into_value(self) -> Result<Value> {
-        let limits = match self.detail {
-            ImageDetail::High => crate::image::HIGH_DETAIL_LIMITS,
-            ImageDetail::Original => crate::image::ORIGINAL_DETAIL_LIMITS,
+        let mode = match self.detail {
+            ImageDetail::High => {
+                crate::image::PromptImageMode::ResizeWithLimits(crate::image::HIGH_DETAIL_LIMITS)
+            }
+            ImageDetail::Original => crate::image::PromptImageMode::Original,
         };
-        let image_url = crate::image::load_for_prompt_bytes(self.bytes, limits)
+        let image_url = crate::image::load_for_prompt_bytes(self.bytes, mode)
             .with_context(|| format!("failed to prepare image {}", self.source.display()))?
             .into_data_url();
         Ok(json!({
@@ -378,12 +379,23 @@ impl UserInput {
 }
 
 fn read_image(path: &Path, remaining: usize) -> Result<Vec<u8>> {
-    let file =
-        File::open(path).with_context(|| format!("failed to read image {}", path.display()))?;
-    let reported_length = file
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Avoid blocking on a FIFO before the regular-file check; O_NONBLOCK is ignored for ordinary
+    // local files.
+    let mut options = std::fs::OpenOptions::new();
+    let file = options
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("failed to read image {}", path.display()))?;
+    let metadata = file
         .metadata()
-        .with_context(|| format!("failed to inspect image {}", path.display()))?
-        .len();
+        .with_context(|| format!("failed to inspect image {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!("failed to read image {}", path.display()));
+    }
+    let reported_length = metadata.len();
     if reported_length > u64::try_from(remaining).unwrap_or(u64::MAX) {
         return Err(image_size_error());
     }
@@ -433,6 +445,7 @@ mod tests {
     use image::ImageBuffer;
     use image::ImageFormat;
     use image::Rgba;
+    use std::fs::File;
     use std::io::Cursor;
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -509,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn user_images_apply_upstream_detail_budgets_before_serialization() {
+    fn user_images_apply_gpt_5_6_detail_behavior_before_serialization() {
         let message_for = |source: &[u8], detail| {
             let image = PromptImage::from_bytes(Path::new("fixture.png"), source.to_vec(), detail)
                 .expect("load image");
@@ -533,8 +546,8 @@ mod tests {
         assert_eq!(image_dimensions(&original), (2048, 2048));
 
         let wide = png_bytes(6401, 100);
-        let bounded_original = message_for(&wide, ImageDetail::Original);
-        assert_eq!(image_dimensions(&bounded_original), (6000, 94));
+        let original_wide = message_for(&wide, ImageDetail::Original);
+        assert_eq!(image_dimensions(&original_wide), (6401, 100));
     }
 
     #[test]

@@ -12,10 +12,6 @@ use anyhow::bail;
 use reqwest::Client;
 use serde::Deserialize;
 use std::ffi::OsStr;
-#[cfg(windows)]
-use std::fs;
-#[cfg(windows)]
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -39,44 +35,6 @@ const BUILD_RELEASE_TAG: Option<&str> = option_env!("BCODEX_RELEASE_TAG");
 const RELEASE_ASSET_NAME: &str = "bcodex-x86_64-unknown-linux-gnu.gz";
 #[cfg(target_os = "macos")]
 const RELEASE_ASSET_NAME: &str = "bcodex-aarch64-apple-darwin.gz";
-#[cfg(windows)]
-const RELEASE_ASSET_NAME: &str = "bcodex-x86_64-pc-windows-msvc.exe.gz";
-
-#[cfg(windows)]
-struct TemporaryUpdateScript {
-    path: PathBuf,
-    remove_on_drop: bool,
-}
-
-#[cfg(windows)]
-impl TemporaryUpdateScript {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            remove_on_drop: true,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn remove(mut self) -> Result<()> {
-        fs::remove_file(&self.path)
-            .with_context(|| format!("could not remove update script {}", self.path.display()))?;
-        self.remove_on_drop = false;
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl Drop for TemporaryUpdateScript {
-    fn drop(&mut self) {
-        if self.remove_on_drop {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
 
 #[derive(Deserialize)]
 struct GitHubReleaseResponse {
@@ -207,14 +165,7 @@ fn installer_url(repository: &str, revision: &str) -> String {
 }
 
 fn installer_path() -> &'static str {
-    #[cfg(windows)]
-    {
-        "scripts/install.ps1"
-    }
-    #[cfg(unix)]
-    {
-        "scripts/install.sh"
-    }
+    "scripts/install.sh"
 }
 
 fn update_client(timeout: Duration) -> Result<Client> {
@@ -417,15 +368,7 @@ async fn fetch_installer(
 }
 
 fn valid_installer_prefix(script: &[u8]) -> bool {
-    #[cfg(unix)]
-    {
-        script.starts_with(b"#!/bin/sh\n")
-    }
-    #[cfg(windows)]
-    {
-        script.starts_with(b"#Requires -Version 5.1\n")
-            || script.starts_with(b"#Requires -Version 5.1\r\n")
-    }
+    script.starts_with(b"#!/bin/sh\n")
 }
 
 fn update_install_dir(executable: &Path, configured: Option<&OsStr>) -> Result<PathBuf> {
@@ -453,7 +396,6 @@ fn run_installer_script(
     if !valid_installer_prefix(script) {
         bail!("cannot run an invalid bettercodex installer");
     }
-    #[cfg(unix)]
     let mut child = ProcessCommand::new("/bin/sh")
         .arg("-s")
         .env(INSTALL_DIR_ENV, install_dir)
@@ -462,71 +404,19 @@ fn run_installer_script(
         .stdin(Stdio::piped())
         .spawn()
         .context("could not start the bettercodex installer")?;
-    #[cfg(windows)]
-    let (mut child, script_file) = {
-        let script_path = std::env::temp_dir().join(format!(
-            "bettercodex-update-{}-{}.ps1",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        crate::platform_fs::configure_private_file(&mut options);
-        let mut file = options
-            .open(&script_path)
-            .with_context(|| format!("could not create update script {}", script_path.display()))?;
-        let script_file = TemporaryUpdateScript::new(script_path);
-        file.write_all(script).with_context(|| {
-            format!(
-                "could not write update script {}",
-                script_file.path().display()
-            )
-        })?;
-        file.sync_all().with_context(|| {
-            format!(
-                "could not flush update script {}",
-                script_file.path().display()
-            )
-        })?;
-        drop(file);
-        let child = ProcessCommand::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(script_file.path())
-            .env(INSTALL_DIR_ENV, install_dir)
-            .env(INSTALL_RELEASE_TAG_ENV, release_tag)
-            .env("BCODEX_REPOSITORY", repository)
-            .env("BCODEX_UPDATE_PARENT_PID", std::process::id().to_string())
-            .stdin(Stdio::null())
-            .spawn()
-            .context("could not start the bettercodex PowerShell installer")?;
-        (child, script_file)
-    };
-    #[cfg(unix)]
-    {
-        let write_result = child
-            .stdin
-            .take()
-            .context("could not open the bettercodex installer input")?
-            .write_all(script);
-        if let Err(error) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error).context("could not send the bettercodex installer to the shell");
-        }
+    let write_result = child
+        .stdin
+        .take()
+        .context("could not open the bettercodex installer input")?
+        .write_all(script);
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).context("could not send the bettercodex installer to the shell");
     }
-    let wait_result = child.wait();
-    #[cfg(windows)]
-    let remove_result = script_file.remove();
-    let status = wait_result.context("could not wait for the bettercodex installer")?;
-    #[cfg(windows)]
-    remove_result?;
+    let status = child
+        .wait()
+        .context("could not wait for the bettercodex installer")?;
     if !status.success() {
         bail!("bettercodex installer exited with {status}");
     }

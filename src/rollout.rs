@@ -1,6 +1,7 @@
 use crate::model::ModelSelection;
 use crate::model::ReasoningEffort;
 use crate::protocol::MessagePhase;
+use crate::protocol::ToolFileChange;
 use crate::service_tier::ServiceTier;
 use crate::time::unix_timestamp_millis;
 use crate::usage::TokenUsage;
@@ -16,6 +17,7 @@ use serde::de::Visitor;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -42,6 +44,7 @@ const MAX_SESSION_PREVIEW_CHARS: usize = 160;
 const HISTORY_RECORD_PREFIX: &[u8] = br#"{"type":"history_"#;
 const SESSION_LIST_MAX_WORKERS: usize = 4;
 const SESSION_LIST_MIN_FILES_PER_WORKER: usize = 64;
+pub(crate) const SYNTHETIC_ABORT_OUTPUT: &str = "aborted";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionIdentity {
@@ -86,6 +89,11 @@ pub(crate) enum SessionTranscriptItem {
     Assistant {
         text: String,
         phase: Option<MessagePhase>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        citations: Vec<crate::web_search::UrlCitation>,
+    },
+    WebSearch {
+        search: crate::web_search::WebSearchCall,
     },
     Tool {
         tool: SessionTranscriptTool,
@@ -95,14 +103,32 @@ pub(crate) enum SessionTranscriptItem {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionTranscriptToolOrigin {
+    #[default]
+    Agent,
+    Operator,
+}
+
+impl SessionTranscriptToolOrigin {
+    fn is_agent(origin: &Self) -> bool {
+        *origin == Self::Agent
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionTranscriptTool {
     pub(crate) call_id: String,
+    #[serde(default, skip_serializing_if = "SessionTranscriptToolOrigin::is_agent")]
+    pub(crate) origin: SessionTranscriptToolOrigin,
     pub(crate) name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) input: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) output: Option<SessionTranscriptToolOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file_change: Option<ToolFileChange>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -110,6 +136,17 @@ pub(crate) struct SessionTranscriptTool {
 pub(crate) enum SessionTranscriptToolOutput {
     Success(Value),
     Error(String),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionTranscriptToolOutcome {
+    pub(crate) call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output: Option<SessionTranscriptToolOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file_change: Option<ToolFileChange>,
 }
 
 pub(crate) struct LoadedRollout {
@@ -180,8 +217,13 @@ enum RolloutRecordData<Items = Vec<Value>> {
     TranscriptAppend {
         items: Vec<SessionTranscriptItem>,
     },
+    ToolOutcomes {
+        outcomes: Vec<SessionTranscriptToolOutcome>,
+    },
     HistoryAppend {
         items: Items,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcomes: Option<Vec<SessionTranscriptToolOutcome>>,
     },
     HistoryReplace {
         reason: HistoryReplacement,
@@ -569,7 +611,23 @@ impl Rollout {
         if items.is_empty() {
             return Ok(());
         }
-        let record = BorrowedRolloutRecord::HistoryAppend { items };
+        let record = BorrowedRolloutRecord::HistoryAppend {
+            items,
+            outcomes: None,
+        };
+        self.write_record(&record)
+    }
+
+    pub(crate) fn append_tool_results(
+        &mut self,
+        items: &[Value],
+        outcomes: Vec<SessionTranscriptToolOutcome>,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return self.record_tool_outcomes(outcomes);
+        }
+        let outcomes = (!outcomes.is_empty()).then_some(outcomes);
+        let record = BorrowedRolloutRecord::HistoryAppend { items, outcomes };
         self.write_record(&record)
     }
 
@@ -598,6 +656,16 @@ impl Rollout {
             return Ok(());
         }
         self.write_record(&RolloutRecord::TranscriptAppend { items })
+    }
+
+    pub(crate) fn record_tool_outcomes(
+        &mut self,
+        outcomes: Vec<SessionTranscriptToolOutcome>,
+    ) -> Result<()> {
+        if outcomes.is_empty() {
+            return Ok(());
+        }
+        self.write_record(&RolloutRecord::ToolOutcomes { outcomes })
     }
 
     pub(crate) fn replace_history(
@@ -709,6 +777,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut transcript_tail = Vec::new();
     let mut transcript_tail_tools = HashMap::new();
     let mut transcript_tail_history_start = None;
+    let mut normalized_aborted_calls = HashSet::new();
     let mut has_transcript_checkpoint = false;
     let mut legacy_transcript_snapshot = false;
     let mut forked_session = false;
@@ -797,15 +866,41 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 has_transcript_checkpoint = true;
                 legacy_transcript_snapshot = false;
             }
-            RolloutRecord::HistoryAppend { items } => {
+            RolloutRecord::ToolOutcomes { outcomes } => {
+                // Ordinary function output remains the model-history source of truth. This
+                // bounded metadata also patches explicit transcript tools such as operator shell
+                // cells, whose completion has no corresponding Responses history item.
+                flush_transcript_history(
+                    &history,
+                    &mut transcript_tail_history_start,
+                    &mut transcript_tail,
+                    &mut transcript_tail_tools,
+                );
+                apply_transcript_tool_outcomes(&mut transcript, &outcomes);
+                apply_transcript_tool_outcomes(&mut transcript_tail, &outcomes);
+            }
+            RolloutRecord::HistoryAppend { items, outcomes } => {
                 transcript_tail_history_start.get_or_insert(history.len());
                 history.extend(items);
+                if let Some(outcomes) = outcomes {
+                    flush_transcript_history(
+                        &history,
+                        &mut transcript_tail_history_start,
+                        &mut transcript_tail,
+                        &mut transcript_tail_tools,
+                    );
+                    apply_transcript_tool_outcomes(&mut transcript, &outcomes);
+                    apply_transcript_tool_outcomes(&mut transcript_tail, &outcomes);
+                }
             }
             RolloutRecord::HistoryReplace {
                 reason,
                 items,
                 response_usage,
             } => {
+                if reason == HistoryReplacement::Normalization {
+                    normalized_aborted_calls.extend(normalized_abort_call_ids(&history, &items));
+                }
                 flush_transcript_history(
                     &history,
                     &mut transcript_tail_history_start,
@@ -893,9 +988,13 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let model_selection =
         model_selection.ok_or_else(|| anyhow!("{} has no valid session model", path.display()))?;
     model_selection.validate()?;
+    if unfinished_turn.is_some() {
+        normalized_aborted_calls.extend(missing_call_output_ids(&history));
+    }
     let transcript_checkpoint =
         (has_transcript_checkpoint && transcript_tail.is_empty()).then_some(transcript.len());
     transcript.append(&mut transcript_tail);
+    apply_normalized_aborts(&mut transcript, &normalized_aborted_calls);
 
     let rollout = Rollout {
         file,
@@ -957,12 +1056,17 @@ fn validate_session_metadata(
 
 fn append_transcript_items(
     transcript: &mut Vec<SessionTranscriptItem>,
-    pending_tools: &mut HashMap<String, usize>,
+    tool_indices: &mut HashMap<String, usize>,
     items: &[Value],
 ) {
     for item in items {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => append_transcript_message(transcript, item),
+            Some("web_search_call") => {
+                if let Some(search) = crate::web_search::WebSearchCall::from_response_item(item) {
+                    transcript.push(SessionTranscriptItem::WebSearch { search });
+                }
+            }
             Some("function_call" | "custom_tool_call") => {
                 let Some(tool) = transcript_tool_from_history(item) else {
                     continue;
@@ -970,18 +1074,18 @@ fn append_transcript_items(
                 let call_id = tool.call_id.clone();
                 let index = transcript.len();
                 transcript.push(SessionTranscriptItem::Tool { tool });
-                pending_tools.insert(call_id, index);
+                tool_indices.insert(call_id, index);
             }
             Some("function_call_output" | "custom_tool_call_output") => {
                 if item.get("name").and_then(Value::as_str) == Some("exec") {
-                    // Code Mode `notify(...)` records reuse the outer call ID. They are injected
-                    // into model history, not rendered as separate transcript cells.
+                    // Legacy Code Mode `notify(...)` records reuse the outer call ID. They are
+                    // model-history notifications, not the final transcript output for the call.
                     continue;
                 }
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
-                let Some(index) = pending_tools.remove(call_id) else {
+                let Some(index) = tool_indices.get(call_id).copied() else {
                     // Output-only records were not separate transcript cells while live, so they
                     // should not become orphan cells here.
                     continue;
@@ -989,11 +1093,113 @@ fn append_transcript_items(
                 let Some(SessionTranscriptItem::Tool { tool }) = transcript.get_mut(index) else {
                     continue;
                 };
-                let output = item.get("output").cloned().unwrap_or(Value::Null);
-                tool.output = Some(transcript_tool_output_from_history(&tool.name, output));
+                if tool.output.is_none() {
+                    let output = item.get("output").cloned().unwrap_or(Value::Null);
+                    tool.output = Some(transcript_tool_output_from_history(&tool.name, output));
+                }
             }
             _ => {}
         }
+    }
+}
+
+fn apply_transcript_tool_outcomes(
+    transcript: &mut [SessionTranscriptItem],
+    outcomes: &[SessionTranscriptToolOutcome],
+) {
+    for outcome in outcomes {
+        let Some(tool) = transcript.iter_mut().rev().find_map(|item| match item {
+            SessionTranscriptItem::Tool { tool } if tool.call_id == outcome.call_id => Some(tool),
+            SessionTranscriptItem::Exploration { tools } => tools
+                .iter_mut()
+                .rev()
+                .find(|tool| tool.call_id == outcome.call_id),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if let Some(output) = &outcome.output {
+            tool.output = Some(output.clone());
+        } else if let Some(error) = &outcome.error {
+            tool.output = Some(SessionTranscriptToolOutput::Error(error.clone()));
+        }
+        if let Some(file_change) = &outcome.file_change {
+            tool.file_change = Some(file_change.clone());
+        }
+    }
+}
+
+fn normalized_abort_call_ids(previous: &[Value], replacement: &[Value]) -> HashSet<String> {
+    let missing = missing_call_output_ids(previous);
+    replacement
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            ) && item.get("output").and_then(Value::as_str) == Some(SYNTHETIC_ABORT_OUTPUT)
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .filter(|call_id| missing.contains(*call_id))
+        .map(str::to_string)
+        .collect()
+}
+
+fn missing_call_output_ids(items: &[Value]) -> HashSet<String> {
+    let mut missing = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call" | "local_shell_call")
+            )
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for call_id in items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+    {
+        missing.remove(call_id);
+    }
+    missing
+}
+
+fn apply_normalized_aborts(
+    transcript: &mut [SessionTranscriptItem],
+    aborted_calls: &HashSet<String>,
+) {
+    if aborted_calls.is_empty() {
+        return;
+    }
+    for item in transcript {
+        match item {
+            SessionTranscriptItem::Tool { tool } => mark_tool_aborted(tool, aborted_calls),
+            SessionTranscriptItem::Exploration { tools } => {
+                for tool in tools {
+                    mark_tool_aborted(tool, aborted_calls);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn mark_tool_aborted(tool: &mut SessionTranscriptTool, aborted_calls: &HashSet<String>) {
+    if tool.origin == SessionTranscriptToolOrigin::Agent
+        && tool.output.is_none()
+        && aborted_calls.contains(&tool.call_id)
+    {
+        tool.output = Some(SessionTranscriptToolOutput::Error(
+            SYNTHETIC_ABORT_OUTPUT.to_string(),
+        ));
     }
 }
 
@@ -1001,14 +1207,14 @@ fn flush_transcript_history(
     history: &[Value],
     start: &mut Option<usize>,
     transcript: &mut Vec<SessionTranscriptItem>,
-    pending_tools: &mut HashMap<String, usize>,
+    tool_indices: &mut HashMap<String, usize>,
 ) {
     let Some(start) = start.take() else {
         return;
     };
     append_transcript_items(
         transcript,
-        pending_tools,
+        tool_indices,
         &history[start.min(history.len())..],
     );
 }
@@ -1027,10 +1233,12 @@ fn recover_legacy_fork_transcript(
     }
     let mut recovered = Vec::new();
     append_transcript_items(&mut recovered, &mut HashMap::new(), history);
-    if !recovered
-        .iter()
-        .any(|item| matches!(item, SessionTranscriptItem::Tool { .. }))
-    {
+    if !recovered.iter().any(|item| {
+        matches!(
+            item,
+            SessionTranscriptItem::Tool { .. } | SessionTranscriptItem::WebSearch { .. }
+        )
+    }) {
         return None;
     }
     let mut recovered_messages = recovered.iter().filter(|item| {
@@ -1079,10 +1287,16 @@ fn append_transcript_message(transcript: &mut Vec<SessionTranscriptItem>, item: 
             transcript.push(SessionTranscriptItem::User { text, image_count });
         }
         "assistant" if !text.trim().is_empty() => {
-            let phase = item
-                .get("phase")
-                .and_then(|phase| serde_json::from_value(phase.clone()).ok());
-            transcript.push(SessionTranscriptItem::Assistant { text, phase });
+            let Some(message) =
+                crate::assistant_message::AssistantMessage::from_response_item(item)
+            else {
+                return;
+            };
+            transcript.push(SessionTranscriptItem::Assistant {
+                text: message.text,
+                phase: message.phase,
+                citations: message.citations,
+            });
         }
         "assistant" => {}
         _ => unreachable!("message roles were filtered above"),
@@ -1094,7 +1308,7 @@ fn transcript_tool_from_history(item: &Value) -> Option<SessionTranscriptTool> {
     let name = item.get("name")?.as_str()?;
     let namespace = match item.get("namespace") {
         None | Some(Value::Null) => None,
-        Some(Value::String(namespace)) if namespace == "functions" => None,
+        Some(Value::String(namespace)) if namespace.is_empty() || namespace == "functions" => None,
         Some(Value::String(namespace)) => Some(namespace.as_str()),
         Some(_) => return None,
     };
@@ -1116,9 +1330,11 @@ fn transcript_tool_from_history(item: &Value) -> Option<SessionTranscriptTool> {
     };
     Some(SessionTranscriptTool {
         call_id,
+        origin: SessionTranscriptToolOrigin::Agent,
         name,
         input,
         output: None,
+        file_change: None,
     })
 }
 
@@ -1128,6 +1344,11 @@ fn transcript_tool_output_from_history(name: &str, output: Value) -> SessionTran
         return SessionTranscriptToolOutput::Error(text);
     }
     let projected = match name {
+        "bash" => match serde_json::from_str(&text) {
+            Ok(output) => output,
+            Err(_) => return SessionTranscriptToolOutput::Error(text),
+        },
+        "read" | "write" | "edit" => Value::Null,
         "exec" | "wait" => Value::String(text),
         "exec_command" | "write_stdin" => project_process_output(output, &text),
         "apply_patch" | "update_plan" | "view_image" | "web.run" => Value::Null,
@@ -1135,7 +1356,7 @@ fn transcript_tool_output_from_history(name: &str, output: Value) -> SessionTran
         // document bodies out of resumed transcript snapshots.
         name if name.starts_with("openaiDeveloperDocs.") => Value::Null,
         "log_papercut" => serde_json::from_str(&text).unwrap_or(output),
-        _ => output,
+        _ => Value::Null,
     };
     SessionTranscriptToolOutput::Success(projected)
 }
@@ -1574,7 +1795,7 @@ fn installation_id(root: &Path) -> Result<String> {
     let _ = std::fs::remove_file(&temporary);
     match linked {
         Ok(()) => {
-            crate::platform_fs::sync_directory(root)?;
+            crate::private_fs::sync_directory(root)?;
             Ok(value)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1588,7 +1809,7 @@ fn installation_id(root: &Path) -> Result<String> {
 }
 
 fn prepare_private_directory(path: &Path) -> Result<()> {
-    crate::platform_fs::create_private_directory_all(path)
+    crate::private_fs::create_private_directory_all(path)
         .with_context(|| format!("failed to create state directory {}", path.display()))?;
     Ok(())
 }
@@ -1599,18 +1820,18 @@ fn open_private_append(path: &Path, create_new: bool) -> Result<File> {
     if create_new {
         options.create_new(true);
     }
-    crate::platform_fs::configure_private_file_nofollow(&mut options, false);
+    crate::private_fs::configure_private_file_nofollow(&mut options, false);
     let file = options
         .open(path)
         .with_context(|| format!("failed to open session journal {}", path.display()))?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
+    if !metadata.is_file() || crate::private_fs::is_link(&metadata) {
         return Err(anyhow!(
             "session journal {} is not a regular file",
             path.display()
         ));
     }
-    crate::platform_fs::protect_file(&file)?;
+    crate::private_fs::protect_file(&file)?;
     Ok(file)
 }
 
@@ -1632,18 +1853,18 @@ fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
 fn open_private_replace(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
-    crate::platform_fs::configure_private_file_nofollow(&mut options, false);
+    crate::private_fs::configure_private_file_nofollow(&mut options, false);
     let file = options
         .open(path)
         .with_context(|| format!("failed to open private file {}", path.display()))?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
+    if !metadata.is_file() || crate::private_fs::is_link(&metadata) {
         return Err(anyhow!(
             "private path {} is not a regular file",
             path.display()
         ));
     }
-    crate::platform_fs::protect_file(&file)?;
+    crate::private_fs::protect_file(&file)?;
     Ok(file)
 }
 

@@ -7,6 +7,7 @@ use super::context_window::ContextAction;
 use super::context_window::ContextWindowView;
 use super::editor;
 use super::editor::Editor;
+use super::file_change;
 use super::file_search::FileSearchPopup;
 use super::file_search::FileSearchUpdate;
 use super::file_search::is_horizontal_whitespace;
@@ -16,18 +17,12 @@ use super::model_picker::ModelPicker;
 use super::model_picker::ModelPickerAction;
 use super::palette;
 use super::palette::TerminalColors;
-#[cfg(windows)]
-use super::paste_burst::CharDecision;
-#[cfg(windows)]
-use super::paste_burst::FlushResult;
-#[cfg(windows)]
-use super::paste_burst::PasteBurst;
 use super::pending_input::PendingInput;
+use super::pending_input::QueuedFollowUp;
 use super::presentation::AssistantPresentation;
 #[cfg(test)]
 use super::presentation::MIN_FRAME_INTERVAL;
 use super::presentation::item_reveal_budget;
-use super::reasoning_status::ReasoningStatus;
 use super::resume_picker::ResumePicker;
 use super::resume_picker::ResumePickerAction;
 use super::skill_popup::SkillPopup;
@@ -37,10 +32,13 @@ use super::startup_art;
 use super::status::StatusSnapshot;
 use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
+use super::tools_view::ToolsAction;
+use super::tools_view::ToolsView;
 use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
 use crate::ansi_escape::ansi_escape_line;
 use crate::assistant_message::AssistantMessage;
+use crate::assistant_message::with_citation_sources;
 use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 #[cfg(test)]
@@ -48,17 +46,20 @@ use crate::events::ModelTextDelta;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
 use crate::model::ModelSelection;
+#[cfg(test)]
+use crate::protocol::FileChange;
 use crate::protocol::MessagePhase;
 use crate::protocol::ParsedCommand;
+use crate::protocol::ToolFileChange;
 use crate::rollout::SessionTranscriptItem;
 use crate::rollout::SessionTranscriptTool;
+use crate::rollout::SessionTranscriptToolOrigin;
 use crate::rollout::SessionTranscriptToolOutput;
 use crate::service_tier::ServiceTier;
 use crate::shell_command::parse_command::parse_command;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
 use crate::skills::SkillUpdate;
-use crate::tools::BackgroundProcess;
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::wrapping::word_wrap_line;
 use crate::update::AvailableUpdate;
@@ -81,10 +82,7 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use serde_json::Value;
-use std::borrow::Cow;
-use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -99,15 +97,13 @@ const MUTED: Color = Color::Indexed(245);
 const RULE: Color = Color::Indexed(8);
 const LIVE_PREFIX_COLS: u16 = 2;
 const TOOL_OUTPUT_MAX_ROWS: usize = 5;
+const OPERATOR_OUTPUT_MAX_ROWS: usize = 50;
 const COMMAND_CONTINUATION_MAX_ROWS: usize = 2;
-const MAX_PATCH_PREVIEW_SOURCE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_PATCH_PREVIEW_ROWS: usize = 1_000;
-const MAX_PATCH_PREVIEW_ROW_BYTES: usize = 2 * 1024;
+const LIVE_TOOL_OUTPUT_MAX_BYTES: usize = 128 * 1024;
 const PENDING_INPUT_GAP: u16 = 1;
 const ACTIVITY_COMPOSER_GAP: u16 = 1;
 const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
-const STATUS_DETAIL_PREFIX: &str = "  └ ";
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "review",
@@ -138,6 +134,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "context",
         aliases: &[],
         description: "visualize current context usage",
+    },
+    SlashCommand {
+        name: "tools",
+        aliases: &[],
+        description: "inspect available tools and their context cost",
     },
     SlashCommand {
         name: "status",
@@ -175,25 +176,14 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show keyboard shortcuts",
     },
     SlashCommand {
-        name: "ps",
-        aliases: &[],
-        description: "list background terminals",
-    },
-    SlashCommand {
         name: "skills",
         aliases: &[],
         description: "manage installed skills and invocation policy",
     },
-    #[cfg(unix)]
     SlashCommand {
         name: "tmux",
         aliases: &[],
         description: "move this live session into tmux",
-    },
-    SlashCommand {
-        name: "stop",
-        aliases: &[],
-        description: "stop all background terminals",
     },
     SlashCommand {
         name: "logout",
@@ -220,7 +210,6 @@ pub(super) enum Action {
     Copy(String),
     Clear(ComposerSubmission),
     Fork(ComposerSubmission),
-    ListBackgroundProcesses,
     OpenResumePicker(ComposerSubmission),
     ResumeSession {
         id: Uuid,
@@ -235,7 +224,6 @@ pub(super) enum Action {
     ShowDiff,
     EnterTmux,
     Logout,
-    StopBackgroundProcesses,
     UpdateSkill {
         path: PathBuf,
         update: SkillUpdate,
@@ -275,6 +263,7 @@ pub(super) enum InterruptIntent {
 pub(super) struct View {
     cwd: PathBuf,
     repository: Repository,
+    repository_refresh_pending: bool,
     entries: Vec<TranscriptEntry>,
     committed_entries: usize,
     welcome_pending: bool,
@@ -282,24 +271,20 @@ pub(super) struct View {
     clear_requested: bool,
     resize_reflow_requested: bool,
     editor: Editor,
-    #[cfg(windows)]
-    paste_burst: PasteBurst,
     file_search: FileSearchPopup,
     skill_popup: SkillPopup,
     skills: Vec<Skill>,
     context_tokens: Option<u64>,
     model_selection: ModelSelection,
     service_tier: ServiceTier,
-    background_processes: Vec<BackgroundProcess>,
     busy: bool,
     action_required: bool,
     interrupting: Option<InterruptIntent>,
     working_since: Option<Instant>,
     turn_had_work: bool,
-    reasoning_status: ReasoningStatus,
     assistant_presentation: AssistantPresentation,
     deferred_agent_events: VecDeque<QueuedAgentEvent>,
-    status_detail: Option<String>,
+    compacting: bool,
     pending_input: PendingInput,
     terminal_assistant_received_this_turn: bool,
     active_message_phase: Option<MessagePhase>,
@@ -308,9 +293,6 @@ pub(super) struct View {
     slash_selection: Option<usize>,
     dismissed_slash: Option<String>,
     user_message_style: Style,
-    process_commands: HashMap<i64, String>,
-    deferred_interactions: HashMap<String, ToolEntry>,
-    unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
 }
 
 pub(super) struct PreparedView {
@@ -340,6 +322,7 @@ enum TranscriptEntry {
         streaming: bool,
         history: StreamedAssistantHistory,
     },
+    WebSearch(WebSearchEntry),
     Tool(ToolEntry),
     Exploration {
         tools: Vec<ToolEntry>,
@@ -353,7 +336,6 @@ enum TranscriptEntry {
     Error(String),
     Diff(String),
     Status(Box<StatusSnapshot>),
-    Processes(Vec<BackgroundProcess>),
     FinalMessageSeparator {
         elapsed_seconds: Option<u64>,
     },
@@ -433,101 +415,64 @@ struct StreamedAssistantHistory {
     lines: Vec<HyperlinkLine>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebSearchState {
+    Active,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
 #[derive(Debug)]
-struct ToolEntry {
-    call_id: String,
-    name: String,
-    input: Option<Value>,
-    display: ToolDisplay,
-    outcome: Option<ToolOutcome>,
+struct WebSearchEntry {
+    search: crate::web_search::WebSearchCall,
+    state: WebSearchState,
     started_at: Instant,
 }
 
 #[derive(Debug)]
-struct UnifiedExecWaitStreak {
-    session_id: i64,
-    tool: ToolEntry,
+struct ToolEntry {
+    call_id: String,
+    origin: ToolOrigin,
+    name: String,
+    input: Option<Value>,
+    display: ToolDisplay,
+    outcome: Option<ToolOutcome>,
+    file_change: Option<ToolFileChange>,
+    live_output: String,
+    command_output_cache: Option<CommandOutputRenderCache>,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct CommandOutputRenderCache {
+    width: u16,
+    lines: Vec<Line<'static>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolOrigin {
+    Agent,
+    Operator,
 }
 
 #[derive(Debug)]
 enum ToolDisplay {
-    CodeMode(String),
     Command {
         command: String,
         parsed: Vec<ParsedCommand>,
     },
-    Interaction {
-        session_id: i64,
-        command: String,
-        input: String,
+    Read(String),
+    FileChange {
+        path: String,
+        action: &'static str,
     },
-    Patch(PatchDisplay),
-    Papercut,
-    Plan(PlanDisplay),
-    ViewImage(String),
-    WebSearch(crate::web_search::WebSearchAction),
     Other,
 }
 
 #[derive(Debug)]
 struct ToolOutcome {
     output: Result<Value, String>,
-}
-
-#[derive(Debug, Default)]
-struct PatchDisplay {
-    files: Vec<PatchFile>,
-}
-
-#[derive(Debug)]
-struct PatchFile {
-    path: String,
-    move_to: Option<String>,
-    kind: PatchKind,
-    rows: Vec<PatchRow>,
-    added: usize,
-    removed: Option<usize>,
-    omission: Option<PatchPreviewOmission>,
-    source_omission_bytes: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PatchPreviewOmission {
-    Rows(usize),
-    FileBytes(u64),
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PatchKind {
-    Add,
-    Delete,
-    Update,
-}
-
-#[derive(Debug)]
-struct PatchRow {
-    number: usize,
-    kind: PatchRowKind,
-    text: String,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PatchRowKind {
-    Context,
-    Add,
-    Delete,
-}
-
-#[derive(Debug, Default)]
-struct PlanDisplay {
-    explanation: Option<String>,
-    steps: Vec<PlanStep>,
-}
-
-#[derive(Debug)]
-struct PlanStep {
-    text: String,
-    status: String,
 }
 
 struct Repository {
@@ -565,6 +510,10 @@ impl SlashCommand {
 enum Overlay {
     Shortcuts,
     Context(ContextWindowView),
+    Tools {
+        view: ToolsView,
+        parent: Option<Box<ContextWindowView>>,
+    },
     Model(Box<ModelPicker>),
     Resume(ResumePicker),
     Skills(SkillsView),
@@ -581,6 +530,7 @@ impl View {
         Self {
             cwd: cwd.to_path_buf(),
             repository: Repository::discover(cwd),
+            repository_refresh_pending: false,
             entries: Vec::new(),
             committed_entries: 0,
             welcome_pending: true,
@@ -588,24 +538,20 @@ impl View {
             clear_requested: false,
             resize_reflow_requested: false,
             editor: Editor::default(),
-            #[cfg(windows)]
-            paste_burst: PasteBurst::default(),
             file_search: FileSearchPopup::default(),
             skill_popup: SkillPopup::default(),
             skills,
             context_tokens: None,
             model_selection: ModelSelection::default(),
             service_tier: ServiceTier::default(),
-            background_processes: Vec::new(),
             busy: false,
             action_required: false,
             interrupting: None,
             working_since: None,
             turn_had_work: false,
-            reasoning_status: ReasoningStatus::default(),
             assistant_presentation: AssistantPresentation::default(),
             deferred_agent_events: VecDeque::new(),
-            status_detail: None,
+            compacting: false,
             pending_input: PendingInput::default(),
             terminal_assistant_received_this_turn: false,
             active_message_phase: None,
@@ -614,9 +560,6 @@ impl View {
             slash_selection: None,
             dismissed_slash: None,
             user_message_style: user_message_style_for(Some((31, 31, 31))),
-            process_commands: HashMap::new(),
-            deferred_interactions: HashMap::new(),
-            unified_exec_wait_streak: None,
         }
     }
 
@@ -727,8 +670,6 @@ impl View {
     }
 
     pub(super) fn start_turn(&mut self, prompt: &UserPrompt) {
-        self.flush_unified_exec_wait_streak();
-        self.deferred_interactions.clear();
         self.seal_exploration();
         self.entries
             .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
@@ -739,10 +680,9 @@ impl View {
         self.interrupting = None;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
-        self.reasoning_status.reset();
         self.assistant_presentation.clear();
         self.deferred_agent_events.clear();
-        self.status_detail = None;
+        self.compacting = false;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
     }
@@ -755,24 +695,21 @@ impl View {
         self.interrupting = None;
         self.working_since = Some(Instant::now());
         self.turn_had_work = false;
-        self.reasoning_status.reset();
         self.assistant_presentation.clear();
         self.deferred_agent_events.clear();
-        self.status_detail = Some("Compacting conversation".to_string());
+        self.compacting = true;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
     }
 
     pub(super) fn add_user_message(&mut self, prompt: &UserPrompt) {
-        self.flush_unified_exec_wait_streak();
         self.close_streaming_entries();
         self.seal_exploration();
         self.entries
             .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
                 prompt,
             )));
-        self.reasoning_status.reset();
-        self.status_detail = None;
+        self.compacting = false;
     }
 
     pub(super) fn add_pending_steer(&mut self, id: SteerId, prompt: UserPrompt) {
@@ -783,7 +720,11 @@ impl View {
         self.pending_input.queue_follow_up(prompt);
     }
 
-    pub(super) fn pop_next_queued_follow_up(&mut self) -> Option<UserPrompt> {
+    pub(super) fn queue_shell_follow_up(&mut self, prompt: UserPrompt, command: String) {
+        self.pending_input.queue_shell_follow_up(prompt, command);
+    }
+
+    pub(super) fn pop_next_queued_follow_up(&mut self) -> Option<QueuedFollowUp> {
         self.pending_input.pop_next_follow_up()
     }
 
@@ -849,8 +790,7 @@ impl View {
         result: anyhow::Result<SubmitOutcome>,
     ) -> Option<UserPrompt> {
         self.flush_presentation();
-        self.flush_unified_exec_wait_streak();
-        self.deferred_interactions.clear();
+        self.refresh_repository_if_pending();
         self.close_streaming_entries();
         self.seal_exploration();
         self.finish_incomplete_tools();
@@ -861,8 +801,7 @@ impl View {
         let turn_had_work = std::mem::take(&mut self.turn_had_work);
         self.busy = false;
         let interrupt_intent = self.interrupting.take();
-        self.reasoning_status.reset();
-        self.status_detail = None;
+        self.compacting = false;
         self.action_required = result.is_err();
         match result {
             Ok(SubmitOutcome::Completed(answer)) => {
@@ -908,15 +847,12 @@ impl View {
     }
 
     pub(super) fn finish_compaction(&mut self, result: anyhow::Result<CompactionOutcome>) {
-        self.flush_unified_exec_wait_streak();
-        self.deferred_interactions.clear();
         self.working_since = None;
         self.busy = false;
         self.interrupting = None;
-        self.reasoning_status.reset();
         self.assistant_presentation.clear();
         self.deferred_agent_events.clear();
-        self.status_detail = None;
+        self.compacting = false;
         self.action_required = result.is_err();
         match result {
             Ok(CompactionOutcome::Completed) => {
@@ -937,7 +873,6 @@ impl View {
     pub(super) fn set_interrupting(&mut self, intent: InterruptIntent) {
         if self.busy {
             self.interrupting = Some(intent);
-            self.status_detail = None;
         }
     }
 
@@ -962,18 +897,6 @@ impl View {
         self.service_tier = service_tier;
     }
 
-    pub(super) fn set_background_processes(&mut self, processes: Vec<BackgroundProcess>) -> bool {
-        if self.background_processes == processes {
-            return false;
-        }
-        self.background_processes = processes;
-        true
-    }
-
-    pub(super) fn add_background_process_list(&mut self, processes: Vec<BackgroundProcess>) {
-        self.entries.push(TranscriptEntry::Processes(processes));
-    }
-
     pub(super) fn add_git_diff_result(&mut self, result: Result<String, String>) {
         match result {
             Ok(diff) => self.entries.push(TranscriptEntry::Diff(diff)),
@@ -986,23 +909,49 @@ impl View {
     }
 
     pub(super) fn start_operator_command(&mut self, call_id: String, command: &str) {
-        self.flush_unified_exec_wait_streak();
+        // A terminal action is an explicit transcript boundary. Materialize agent events already
+        // accepted by the view before inserting the local command so replay preserves their order.
+        self.flush_presentation();
+        self.close_streaming_entries();
         self.seal_exploration();
-        self.entries.push(TranscriptEntry::Tool(ToolEntry::new(
-            call_id,
-            "exec_command".to_string(),
-            Some(serde_json::json!({"cmd": command})),
-            &self.cwd,
-            &self.process_commands,
+        self.entries.push(TranscriptEntry::Tool(ToolEntry::operator(
+            call_id, command, &self.cwd,
         )));
     }
 
-    pub(super) fn finish_operator_command(&mut self, call_id: &str, output: Result<Value, String>) {
-        if let Some(tool) = self.find_tool_mut(call_id) {
-            tool.outcome = Some(ToolOutcome { output });
+    pub(super) fn append_operator_command_output(&mut self, call_id: &str, chunk: &str) {
+        if let Some(tool) = self.find_tool_mut(call_id)
+            && tool.origin == ToolOrigin::Operator
+        {
+            tool.append_live_output(chunk);
         }
-        self.remember_process_command(call_id);
+    }
+
+    pub(super) fn finish_operator_command(&mut self, call_id: &str, output: Result<Value, String>) {
+        if let Some(tool) = self.find_tool_mut(call_id)
+            && tool.origin == ToolOrigin::Operator
+        {
+            tool.set_outcome(output);
+        }
         self.repository = Repository::discover(&self.cwd);
+        self.repository_refresh_pending = false;
+    }
+
+    fn has_active_task(&self) -> bool {
+        self.busy || self.has_running_operator_command()
+    }
+
+    fn has_running_operator_command(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Tool(ToolEntry {
+                    origin: ToolOrigin::Operator,
+                    outcome: None,
+                    ..
+                })
+            )
+        })
     }
 
     pub(super) fn session_transcript(&self) -> Vec<SessionTranscriptItem> {
@@ -1018,7 +967,9 @@ impl View {
         let mut items = Vec::new();
         for entry in &self.entries {
             let included = match entry {
-                TranscriptEntry::User(_) | TranscriptEntry::Tool(_) => true,
+                TranscriptEntry::User(_)
+                | TranscriptEntry::WebSearch(_)
+                | TranscriptEntry::Tool(_) => true,
                 TranscriptEntry::Assistant {
                     content,
                     streaming: false,
@@ -1040,8 +991,12 @@ impl View {
                         SessionTranscriptItem::Assistant {
                             text: content.source().to_string(),
                             phase: phase.clone(),
+                            citations: content.citations().to_vec(),
                         }
                     }
+                    TranscriptEntry::WebSearch(search) => SessionTranscriptItem::WebSearch {
+                        search: search.search.clone(),
+                    },
                     TranscriptEntry::Tool(tool) => SessionTranscriptItem::Tool {
                         tool: tool.session_transcript_tool(/*retain_success_output*/ true),
                     },
@@ -1074,7 +1029,6 @@ impl View {
     }
 
     pub(super) fn add_status(&mut self, snapshot: StatusSnapshot) {
-        self.flush_unified_exec_wait_streak();
         self.seal_exploration();
         self.entries
             .push(TranscriptEntry::Status(Box::new(snapshot)));
@@ -1135,14 +1089,25 @@ impl View {
                             image_count,
                         )));
                 }
-                SessionTranscriptItem::Assistant { text, phase } => {
+                SessionTranscriptItem::Assistant {
+                    text,
+                    phase,
+                    citations,
+                } => {
                     replaying_legacy_exploration = false;
+                    let mut content = MarkdownRenderCache::new(text);
+                    content.set_citations(citations);
                     self.entries.push(TranscriptEntry::Assistant {
-                        content: MarkdownRenderCache::new(text),
+                        content,
                         phase,
                         streaming: false,
                         history: StreamedAssistantHistory::default(),
                     });
+                }
+                SessionTranscriptItem::WebSearch { search } => {
+                    replaying_legacy_exploration = false;
+                    self.entries
+                        .push(TranscriptEntry::WebSearch(WebSearchEntry::finished(search)));
                 }
                 SessionTranscriptItem::Tool { tool } => {
                     replaying_legacy_exploration =
@@ -1151,23 +1116,14 @@ impl View {
                 SessionTranscriptItem::Exploration { tools } => {
                     replaying_legacy_exploration = false;
                     let mut replayed = Vec::with_capacity(tools.len());
-                    let mut call_ids = Vec::with_capacity(tools.len());
                     for tool in tools {
-                        call_ids.push(tool.call_id.clone());
-                        replayed.push(ToolEntry::from_session_transcript(
-                            tool,
-                            &self.cwd,
-                            &self.process_commands,
-                        ));
+                        replayed.push(ToolEntry::from_session_transcript(tool, &self.cwd));
                     }
                     if !replayed.is_empty() {
                         self.entries.push(TranscriptEntry::Exploration {
                             tools: replayed,
                             sealed: true,
                         });
-                        for call_id in call_ids {
-                            self.remember_process_command(&call_id);
-                        }
                     }
                 }
             }
@@ -1175,8 +1131,7 @@ impl View {
     }
 
     fn replay_tool(&mut self, tool: SessionTranscriptTool, join_legacy_exploration: bool) -> bool {
-        let call_id = tool.call_id.clone();
-        let tool = ToolEntry::from_session_transcript(tool, &self.cwd, &self.process_commands);
+        let tool = ToolEntry::from_session_transcript(tool, &self.cwd);
         let is_exploration = tool.is_exploration();
         if is_exploration {
             match (join_legacy_exploration, self.entries.last_mut()) {
@@ -1189,7 +1144,6 @@ impl View {
         } else {
             self.entries.push(TranscriptEntry::Tool(tool));
         }
-        self.remember_process_command(&call_id);
         is_exploration
     }
 
@@ -1229,9 +1183,7 @@ impl View {
         self.clear_requested = true;
         self.resize_reflow_requested = false;
         self.context_tokens = None;
-        self.background_processes.clear();
         self.action_required = false;
-        self.reasoning_status.reset();
         self.assistant_presentation.clear();
         self.deferred_agent_events.clear();
         self.pending_input.clear();
@@ -1240,9 +1192,6 @@ impl View {
         self.skill_popup = SkillPopup::default();
         self.slash_selection = None;
         self.dismissed_slash = None;
-        self.process_commands.clear();
-        self.deferred_interactions.clear();
-        self.unified_exec_wait_streak = None;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
     }
@@ -1257,7 +1206,7 @@ impl View {
                 self.assistant_presentation
                     .enqueue(delta.text, delta.received_at);
             }
-            event if self.busy && starts_presentation_item(&event) => {
+            event if self.busy && is_presentation_step(&event) => {
                 self.defer_agent_event(event);
             }
             event if self.assistant_presentation.is_pending() => {
@@ -1283,7 +1232,7 @@ impl View {
         let item_budget = item_reveal_budget(
             now,
             self.deferred_agent_events.iter().filter_map(|queued| {
-                starts_presentation_item(&queued.event).then_some(queued.enqueued_at)
+                is_presentation_step(&queued.event).then_some(queued.enqueued_at)
             }),
         );
         let mut revealed_items = 0_usize;
@@ -1303,7 +1252,7 @@ impl View {
                 && self
                     .deferred_agent_events
                     .front()
-                    .is_some_and(|queued| starts_presentation_item(&queued.event))
+                    .is_some_and(|queued| is_presentation_step(&queued.event))
             {
                 return changed;
             }
@@ -1319,7 +1268,7 @@ impl View {
                     }
                 }
                 event => {
-                    revealed_items += usize::from(starts_presentation_item(&event));
+                    revealed_items += usize::from(is_presentation_step(&event));
                     self.apply_agent_event(event);
                     changed = true;
                 }
@@ -1346,7 +1295,6 @@ impl View {
     }
 
     fn append_model_message_delta(&mut self, delta: &str) {
-        self.flush_unified_exec_wait_streak();
         self.seal_exploration();
         match self.entries.last_mut() {
             Some(TranscriptEntry::Assistant {
@@ -1361,13 +1309,12 @@ impl View {
                 history: StreamedAssistantHistory::default(),
             }),
         }
-        self.status_detail = None;
+        self.compacting = false;
     }
 
     fn apply_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::ModelMessageStarted(message) => {
-                self.flush_unified_exec_wait_streak();
                 self.seal_exploration();
                 self.close_streaming_entries();
                 self.active_message_phase = message.phase;
@@ -1379,47 +1326,39 @@ impl View {
                         history: StreamedAssistantHistory::default(),
                     });
                 }
-                self.status_detail = None;
+                self.compacting = false;
             }
             AgentEvent::ModelMessageDelta(delta) => self.append_model_message_delta(&delta.text),
             AgentEvent::ModelMessageCompleted(message) => {
                 self.complete_assistant_message(message);
             }
-            // Reasoning summaries only drive the transient activity heading. They are not a
-            // transcript boundary, so the active exploration cell must remain open across model
-            // samples for later read/list/search calls to join it, matching Codex's ExecCell.
-            AgentEvent::ReasoningSummarySectionStarted => {
-                self.reasoning_status.reset();
-            }
-            AgentEvent::ReasoningSummaryDelta(delta) => {
-                self.reasoning_status.push_delta(&delta);
-            }
             AgentEvent::ModelResponseCompleted => self.close_streaming_entries(),
+            AgentEvent::WebSearchStarted(search) => {
+                self.close_streaming_entries();
+                self.seal_exploration();
+                self.entries
+                    .push(TranscriptEntry::WebSearch(WebSearchEntry::active(search)));
+            }
+            AgentEvent::WebSearchCompleted(search) => {
+                self.close_streaming_entries();
+                self.seal_exploration();
+                if let Some(entry) = self.find_web_search_mut(&search.id) {
+                    entry.finish(search);
+                } else {
+                    self.entries
+                        .push(TranscriptEntry::WebSearch(WebSearchEntry::finished(search)));
+                }
+                self.turn_had_work = true;
+            }
             AgentEvent::ToolStarted {
                 call_id,
                 name,
                 input,
             } => {
                 self.close_streaming_entries();
-                let entry = ToolEntry::new(call_id, name, input, &self.cwd, &self.process_commands);
+                let entry = ToolEntry::new(call_id, name, input, &self.cwd);
                 let is_exploration = entry.is_exploration();
-                // Exploration commands already render their live action in the active tool cell.
-                // Duplicating that action below the status header adds a row at start and removes
-                // it at completion, making the inline viewport pulse as each command joins the
-                // tree. Keep details for tools that do not have that in-cell live surface.
-                self.status_detail = if is_exploration {
-                    self.latest_tool_activity()
-                } else {
-                    Some(entry.activity_label())
-                };
-                if entry.is_interaction() {
-                    if entry.has_interaction_input() {
-                        self.flush_unified_exec_wait_streak();
-                    }
-                    self.deferred_interactions
-                        .insert(entry.call_id.clone(), entry);
-                } else if is_exploration {
-                    self.flush_unified_exec_wait_streak();
+                if is_exploration {
                     let last_is_uncommitted = self.entries.len() > self.committed_entries;
                     match self.entries.last_mut() {
                         Some(TranscriptEntry::Exploration {
@@ -1434,42 +1373,47 @@ impl View {
                         }),
                     }
                 } else {
-                    self.flush_unified_exec_wait_streak();
                     self.seal_exploration();
                     self.entries.push(TranscriptEntry::Tool(entry));
+                }
+            }
+            AgentEvent::ToolOutputDelta {
+                call_id,
+                stream: _,
+                chunk,
+            } => {
+                if let Some(tool) = self.find_tool_mut(&call_id) {
+                    tool.append_live_output(&chunk);
                 }
             }
             AgentEvent::ToolCompleted {
                 call_id,
                 output,
+                file_change,
                 duration: _,
             } => {
-                if let Some(tool) = self.deferred_interactions.remove(&call_id) {
-                    self.complete_deferred_interaction(tool, output);
-                } else {
-                    let completed_work = self.find_tool_mut(&call_id).is_some_and(|tool| {
-                        let completed_work = matches!(
-                            &tool.display,
-                            ToolDisplay::CodeMode(_)
-                                | ToolDisplay::Command { .. }
-                                | ToolDisplay::Patch(_)
-                                | ToolDisplay::Papercut
-                                | ToolDisplay::WebSearch(_)
-                                | ToolDisplay::Other
-                        );
-                        tool.outcome = Some(ToolOutcome { output });
-                        completed_work
-                    });
-                    self.turn_had_work |= completed_work;
-                    self.remember_process_command(&call_id);
-                }
-                self.repository = Repository::discover(&self.cwd);
-                self.status_detail = self.latest_tool_activity();
+                let authoritative_path = file_change
+                    .as_ref()
+                    .map(|change| display_tool_path(&change.path, &self.cwd));
+                let may_change_repository = self.find_tool_mut(&call_id).map(|tool| {
+                    let may_change_repository = tool.may_change_repository();
+                    tool.set_outcome(output);
+                    tool.set_file_change(file_change, authoritative_path);
+                    may_change_repository
+                });
+                self.turn_had_work |= may_change_repository.is_some();
+                self.repository_refresh_pending |= may_change_repository.unwrap_or(false);
             }
             AgentEvent::ContextUpdated(snapshot) => {
+                self.refresh_repository_if_pending();
                 self.context_tokens = snapshot.measured.then_some(snapshot.used_tokens);
-                if let Some(Overlay::Context(context)) = self.overlay.as_mut() {
-                    context.update(snapshot);
+                match self.overlay.as_mut() {
+                    Some(Overlay::Context(context)) => context.update(snapshot),
+                    Some(Overlay::Tools {
+                        parent: Some(context),
+                        ..
+                    }) => context.update(snapshot),
+                    _ => {}
                 }
             }
             AgentEvent::Warning(message) => self.add_notice(format!("Warning: {message}")),
@@ -1480,10 +1424,9 @@ impl View {
             }
             AgentEvent::CompactionStarted => {
                 self.context_tokens = None;
-                self.reasoning_status.reset();
-                self.status_detail = Some("Compacting conversation".to_string());
+                self.compacting = true;
             }
-            AgentEvent::CompactionCompleted => self.status_detail = self.latest_tool_activity(),
+            AgentEvent::CompactionCompleted => self.compacting = false,
         }
     }
 
@@ -1499,11 +1442,7 @@ impl View {
         }
         let action = match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if self.capture_paste_burst_key(key) {
-                    Action::None
-                } else {
-                    self.handle_key(key)
-                }
+                self.handle_key(key)
             }
             Event::Paste(text) if matches!(self.overlay.as_ref(), Some(Overlay::Resume(_))) => {
                 if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
@@ -1513,8 +1452,6 @@ impl View {
             }
             Event::Paste(_) if self.overlay.is_some() => Action::None,
             Event::Paste(text) => {
-                #[cfg(windows)]
-                self.paste_burst.clear_after_explicit_paste();
                 self.apply_pasted_text(text);
                 Action::None
             }
@@ -1561,163 +1498,6 @@ impl View {
         }
         self.dismissed_slash = None;
         self.slash_selection = None;
-    }
-
-    pub(super) fn paste_burst_active(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.paste_burst.is_active()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
-    }
-
-    pub(super) fn flush_paste_burst(&mut self) -> bool {
-        #[cfg(windows)]
-        {
-            let changed = self.handle_paste_burst_flush(Instant::now());
-            if changed {
-                self.sync_composer_popups();
-            }
-            changed
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
-    }
-
-    #[cfg(windows)]
-    fn handle_paste_burst_flush(&mut self, now: Instant) -> bool {
-        match self.paste_burst.flush_if_due(now) {
-            FlushResult::Paste(pasted) => {
-                // Preserve the detector's short Enter-suppression window. An
-                // explicit bracketed paste clears it in handle_terminal_event.
-                self.apply_pasted_text(pasted);
-                true
-            }
-            FlushResult::Typed(character) => {
-                let mut encoded = [0; 4];
-                self.editor.insert(character.encode_utf8(&mut encoded));
-                true
-            }
-            FlushResult::None => false,
-        }
-    }
-
-    fn capture_paste_burst_key(&mut self, key: KeyEvent) -> bool {
-        #[cfg(not(windows))]
-        {
-            let _ = key;
-            false
-        }
-
-        #[cfg(windows)]
-        {
-            if self.overlay.is_some() || self.editor.history_search_active() {
-                if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
-                    self.apply_pasted_text(pasted);
-                }
-                self.paste_burst.clear_window_after_non_char();
-                return false;
-            }
-
-            let now = Instant::now();
-            self.handle_paste_burst_flush(now);
-
-            if key.code == KeyCode::Enter {
-                if self.paste_burst.append_newline_if_active(now) {
-                    return true;
-                }
-                if self.paste_burst.direct_insert_newline_should_insert(now) {
-                    self.editor.insert_newline();
-                    self.paste_burst.extend_window(now);
-                    return true;
-                }
-            }
-
-            if let KeyCode::Char(character) = key.code
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && !character.is_control()
-            {
-                if !character.is_ascii() {
-                    if self.paste_burst.try_append_char_if_active(character, now) {
-                        return true;
-                    }
-                    if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
-                        self.apply_pasted_text(pasted);
-                    }
-                    if let Some(decision) = self.paste_burst.on_plain_char_no_hold(now) {
-                        match decision {
-                            CharDecision::BufferAppend => {
-                                self.paste_burst.append_char_to_buffer(character, now);
-                                return true;
-                            }
-                            CharDecision::BeginBuffer { retro_chars } => {
-                                let cursor = self.editor.cursor();
-                                let before = &self.editor.text()[..cursor];
-                                if let Some(grab) = self.paste_burst.decide_begin_buffer(
-                                    now,
-                                    before,
-                                    usize::from(retro_chars),
-                                ) {
-                                    if !grab.grabbed.is_empty() {
-                                        self.editor.replace_range(grab.start_byte..cursor, "");
-                                    }
-                                    self.paste_burst.append_char_to_buffer(character, now);
-                                    return true;
-                                }
-                            }
-                            CharDecision::RetainFirstChar
-                            | CharDecision::BeginBufferFromPending => {
-                                unreachable!("non-ASCII paste detection returned an ASCII decision")
-                            }
-                        }
-                    }
-                    return false;
-                }
-
-                match self.paste_burst.on_plain_char(character, now) {
-                    CharDecision::BufferAppend => {
-                        self.paste_burst.append_char_to_buffer(character, now);
-                        return true;
-                    }
-                    CharDecision::BeginBuffer { retro_chars } => {
-                        let cursor = self.editor.cursor();
-                        let before = &self.editor.text()[..cursor];
-                        if let Some(grab) = self.paste_burst.decide_begin_buffer(
-                            now,
-                            before,
-                            usize::from(retro_chars),
-                        ) {
-                            if !grab.grabbed.is_empty() {
-                                self.editor.replace_range(grab.start_byte..cursor, "");
-                            }
-                            self.paste_burst.append_char_to_buffer(character, now);
-                            return true;
-                        }
-                    }
-                    CharDecision::BeginBufferFromPending => {
-                        self.paste_burst.append_char_to_buffer(character, now);
-                        return true;
-                    }
-                    CharDecision::RetainFirstChar => return true,
-                }
-                return false;
-            }
-
-            if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
-                self.apply_pasted_text(pasted);
-            }
-            if !matches!(key.code, KeyCode::Char(_) | KeyCode::Enter) {
-                self.paste_burst.clear_window_after_non_char();
-            }
-            false
-        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -1768,7 +1548,7 @@ impl View {
                 self.skill_popup.hide();
                 return Action::None;
             }
-            return if self.busy {
+            return if self.has_active_task() {
                 Action::Cancel
             } else {
                 Action::Quit
@@ -1784,17 +1564,33 @@ impl View {
                 SkillsViewAction::Update { path, update } => Action::UpdateSkill { path, update },
             };
         }
-        if let Some(overlay) = self.overlay.as_mut() {
-            let close = match overlay {
-                Overlay::Shortcuts => true,
-                Overlay::Context(context) => context.handle_key(key.code) == ContextAction::Close,
-                Overlay::Model(_) => unreachable!("model picker keys are handled above"),
-                Overlay::Resume(_) => unreachable!("resume picker keys are handled above"),
-                Overlay::Skills(_) => unreachable!("skills keys are handled above"),
-            };
-            if close {
-                self.overlay = None;
+        if let Some(Overlay::Context(context)) = self.overlay.as_ref() {
+            match context.handle_key(key.code) {
+                ContextAction::StayOpen => {}
+                ContextAction::OpenTools => {
+                    let Some(Overlay::Context(context)) = self.overlay.take() else {
+                        unreachable!("context overlay was matched above");
+                    };
+                    self.overlay = Some(Overlay::Tools {
+                        view: ToolsView::under_context(),
+                        parent: Some(Box::new(context)),
+                    });
+                }
+                ContextAction::Close => self.overlay = None,
             }
+            return Action::None;
+        }
+        if let Some(Overlay::Tools { view, .. }) = self.overlay.as_ref() {
+            if view.handle_key(key.code) == ToolsAction::Close {
+                let Some(Overlay::Tools { parent, .. }) = self.overlay.take() else {
+                    unreachable!("tools overlay was matched above");
+                };
+                self.overlay = parent.map(|context| Overlay::Context(*context));
+            }
+            return Action::None;
+        }
+        if self.overlay.is_some() {
+            self.overlay = None;
             return Action::None;
         }
         if (control && key.code == KeyCode::Char('r'))
@@ -1818,7 +1614,7 @@ impl View {
                 self.dismissed_slash = Some(self.editor.text().to_string());
                 return Action::None;
             }
-            return if self.busy {
+            return if self.has_active_task() {
                 Action::Cancel
             } else {
                 Action::None
@@ -1949,7 +1745,7 @@ impl View {
         }
 
         if key.code == KeyCode::Tab && !shift && !alt && !control {
-            return if self.busy {
+            return if self.has_active_task() {
                 self.queue_action()
             } else {
                 self.submit_action()
@@ -2122,11 +1918,11 @@ impl View {
             && let Some(arguments) = command.strip_prefix("/resume")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
-            if self.busy {
+            if self.has_active_task() {
                 return self.reject_local_submission(
                     submission,
                     TranscriptEntry::Notice(
-                        "Interrupt the active turn before resuming another session".to_string(),
+                        "Interrupt the active task before resuming another session".to_string(),
                     ),
                 );
             }
@@ -2147,7 +1943,6 @@ impl View {
                 ),
             };
         }
-        #[cfg(unix)]
         if local_command
             && let Some(arguments) = command.strip_prefix("/tmux")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
@@ -2163,7 +1958,7 @@ impl View {
         match command {
             _ if !local_command => Action::Submit(submission),
             "/q" | "/quit" | "/exit" => Action::Quit,
-            "/compact" if self.busy => self.reject_local_submission(
+            "/compact" if self.has_active_task() => self.reject_local_submission(
                 submission,
                 TranscriptEntry::Error(
                     "'/compact' is disabled while a task is in progress.".to_string(),
@@ -2189,14 +1984,14 @@ impl View {
             }
             "/copy" => self.copy_latest_final_action(),
             "/diff" => Action::ShowDiff,
-            "/fork" if self.busy => self.reject_local_submission(
+            "/fork" if self.has_active_task() => self.reject_local_submission(
                 submission,
                 TranscriptEntry::Notice(
                     "Interrupt the active turn before forking this session".to_string(),
                 ),
             ),
             "/fork" => Action::Fork(submission),
-            "/clear" if self.busy => self.reject_local_submission(
+            "/clear" if self.has_active_task() => self.reject_local_submission(
                 submission,
                 TranscriptEntry::Notice(
                     "Interrupt the active turn before starting a fresh session".to_string(),
@@ -2204,13 +1999,19 @@ impl View {
             ),
             "/clear" => Action::Clear(submission),
             "/context" => Action::ShowContext,
+            "/tools" => {
+                self.overlay = Some(Overlay::Tools {
+                    view: ToolsView::standalone(),
+                    parent: None,
+                });
+                Action::None
+            }
             "/status" => Action::ShowStatus,
             "/help" => {
                 self.overlay = Some(Overlay::Shortcuts);
                 Action::None
             }
-            "/ps" => Action::ListBackgroundProcesses,
-            "/skills" if self.busy => self.reject_local_submission(
+            "/skills" if self.has_active_task() => self.reject_local_submission(
                 submission,
                 TranscriptEntry::Error(
                     "'/skills' is disabled while a task is in progress.".to_string(),
@@ -2220,8 +2021,7 @@ impl View {
                 self.overlay = Some(Overlay::Skills(SkillsView::new()));
                 Action::None
             }
-            "/stop" => Action::StopBackgroundProcesses,
-            "/logout" if self.busy => self.reject_local_submission(
+            "/logout" if self.has_active_task() => self.reject_local_submission(
                 submission,
                 TranscriptEntry::Notice("Interrupt the active turn before logging out".to_string()),
             ),
@@ -2244,7 +2044,9 @@ impl View {
         if self.editor.text().trim().is_empty() {
             return Action::None;
         }
-        if self.editor.image_count() == 0 && is_local_command(self.editor.text().trim()) {
+        let command = self.editor.text().trim();
+        if self.editor.image_count() == 0 && !command.starts_with('!') && is_local_command(command)
+        {
             self.entries.push(TranscriptEntry::Notice(
                 "Slash commands cannot be queued; use Enter or wait for the active turn"
                     .to_string(),
@@ -2265,7 +2067,9 @@ impl View {
                 content,
                 streaming: false,
                 ..
-            } if !content.source().trim().is_empty() => Some(content.source().to_string()),
+            } if !content.source().trim().is_empty() => {
+                Some(with_citation_sources(content.source(), content.citations()))
+            }
             _ => None,
         });
         match markdown {
@@ -2280,7 +2084,6 @@ impl View {
     }
 
     fn complete_assistant_message(&mut self, message: AssistantMessage) {
-        self.flush_unified_exec_wait_streak();
         self.seal_exploration();
         self.terminal_assistant_received_this_turn |=
             message.is_terminal() && !message.text.trim().is_empty();
@@ -2292,12 +2095,15 @@ impl View {
                 ..
             }) if *streaming => {
                 content.replace(message.text);
+                content.set_citations(message.citations);
                 *phase = message.phase;
                 *streaming = false;
             }
             _ if !message.text.trim().is_empty() => {
+                let mut content = MarkdownRenderCache::new(message.text);
+                content.set_citations(message.citations);
                 self.entries.push(TranscriptEntry::Assistant {
-                    content: MarkdownRenderCache::new(message.text),
+                    content,
                     phase: message.phase,
                     streaming: false,
                     history: StreamedAssistantHistory::default(),
@@ -2306,7 +2112,7 @@ impl View {
             _ => {}
         }
         self.active_message_phase = None;
-        self.status_detail = None;
+        self.compacting = false;
     }
 
     fn close_streaming_entries(&mut self) {
@@ -2314,7 +2120,8 @@ impl View {
             match entry {
                 TranscriptEntry::Assistant { streaming, .. } => *streaming = false,
                 TranscriptEntry::User(_) => break,
-                TranscriptEntry::Tool(_)
+                TranscriptEntry::WebSearch(_)
+                | TranscriptEntry::Tool(_)
                 | TranscriptEntry::Exploration { .. }
                 | TranscriptEntry::Notice(_)
                 | TranscriptEntry::PatchNotes { .. }
@@ -2322,7 +2129,6 @@ impl View {
                 | TranscriptEntry::Error(_)
                 | TranscriptEntry::Diff(_)
                 | TranscriptEntry::Status(_)
-                | TranscriptEntry::Processes(_)
                 | TranscriptEntry::FinalMessageSeparator { .. } => {}
             }
         }
@@ -2338,7 +2144,10 @@ impl View {
     fn finish_incomplete_tools(&mut self) {
         for entry in &mut self.entries[self.committed_entries..] {
             match entry {
-                TranscriptEntry::Tool(tool) => tool.finish_if_incomplete(),
+                TranscriptEntry::WebSearch(search) => search.interrupt(),
+                TranscriptEntry::Tool(tool) if tool.origin == ToolOrigin::Agent => {
+                    tool.finish_if_incomplete();
+                }
                 TranscriptEntry::Exploration { tools, .. } => {
                     for tool in tools {
                         tool.finish_if_incomplete();
@@ -2347,6 +2156,13 @@ impl View {
                 _ => {}
             }
         }
+    }
+
+    fn find_web_search_mut(&mut self, call_id: &str) -> Option<&mut WebSearchEntry> {
+        self.entries.iter_mut().rev().find_map(|entry| match entry {
+            TranscriptEntry::WebSearch(search) if search.search.id == call_id => Some(search),
+            _ => None,
+        })
     }
 
     fn find_tool_mut(&mut self, call_id: &str) -> Option<&mut ToolEntry> {
@@ -2359,121 +2175,10 @@ impl View {
         })
     }
 
-    fn complete_deferred_interaction(
-        &mut self,
-        mut tool: ToolEntry,
-        output: Result<Value, String>,
-    ) {
-        let ToolDisplay::Interaction {
-            session_id, input, ..
-        } = &tool.display
-        else {
-            return;
-        };
-        let session_id = *session_id;
-        let waited_only = input.is_empty();
-        let process_is_still_running = output.as_ref().ok().is_some_and(|output| {
-            output.get("session_id").and_then(Value::as_i64) == Some(session_id)
-        });
-        let process_finished = output
-            .as_ref()
-            .ok()
-            .is_some_and(|output| output.get("session_id").is_none());
-        let unknown_process = output
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.contains(&format!("Unknown process id {session_id}")));
-
-        tool.outcome = Some(ToolOutcome { output });
-        if process_finished || unknown_process {
-            self.process_commands.remove(&session_id);
+    fn refresh_repository_if_pending(&mut self) {
+        if std::mem::take(&mut self.repository_refresh_pending) {
+            self.repository = Repository::discover(&self.cwd);
         }
-
-        if waited_only {
-            // Match current Codex unified-exec events: an empty poll is transcript-worthy only
-            // when it returns while the background process is still alive. Finished and stale
-            // polls remain model-visible but do not create misleading terminal history cells.
-            if process_is_still_running {
-                self.record_unified_exec_wait(session_id, tool);
-            }
-            return;
-        }
-
-        // Codex emits terminal-interaction history only after a successful write. Transport
-        // failures are returned to the model without adding a second user-facing error surface.
-        if tool
-            .outcome
-            .as_ref()
-            .is_some_and(|outcome| outcome.output.is_ok())
-        {
-            self.turn_had_work = true;
-            self.entries.push(TranscriptEntry::Tool(tool));
-        }
-    }
-
-    fn record_unified_exec_wait(&mut self, session_id: i64, tool: ToolEntry) {
-        match self.unified_exec_wait_streak.take() {
-            Some(wait) if wait.session_id == session_id => {
-                self.unified_exec_wait_streak = Some(wait);
-            }
-            Some(wait) => {
-                self.turn_had_work = true;
-                self.entries.push(TranscriptEntry::Tool(wait.tool));
-                self.unified_exec_wait_streak = Some(UnifiedExecWaitStreak { session_id, tool });
-            }
-            None => {
-                self.unified_exec_wait_streak = Some(UnifiedExecWaitStreak { session_id, tool });
-            }
-        }
-    }
-
-    fn flush_unified_exec_wait_streak(&mut self) {
-        if let Some(wait) = self.unified_exec_wait_streak.take() {
-            self.turn_had_work = true;
-            self.entries.push(TranscriptEntry::Tool(wait.tool));
-        }
-    }
-
-    fn remember_process_command(&mut self, call_id: &str) {
-        let remembered = self.find_tool_mut(call_id).and_then(|tool| {
-            let ToolDisplay::Command { command, .. } = &tool.display else {
-                return None;
-            };
-            let output = tool.outcome.as_ref()?.output.as_ref().ok()?;
-            let session_id = output.get("session_id")?.as_i64()?;
-            Some((session_id, command.clone()))
-        });
-        if let Some((session_id, command)) = remembered {
-            self.process_commands.insert(session_id, command);
-        }
-    }
-
-    fn latest_tool_activity(&self) -> Option<String> {
-        let transcript_tool = self.entries[self.committed_entries..]
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                TranscriptEntry::Tool(tool) if tool.outcome.is_none() => {
-                    Some(tool.activity_label())
-                }
-                // Exploration activity is already visible in its live transcript cell. Mirroring
-                // it in the status details would make that transient row disappear on completion
-                // while the cell remains active, shrinking the viewport by one row.
-                TranscriptEntry::Exploration { .. } => None,
-                _ => None,
-            });
-        let deferred_tool = self
-            .deferred_interactions
-            .values()
-            .max_by_key(|tool| tool.started_at)
-            .map(ToolEntry::activity_label);
-        deferred_tool
-            .or_else(|| {
-                self.unified_exec_wait_streak
-                    .as_ref()
-                    .map(|wait| wait.tool.activity_label())
-            })
-            .or(transcript_tool)
     }
 
     pub(super) fn take_pending_history_lines(
@@ -2713,7 +2418,7 @@ impl View {
         } else {
             0
         };
-        let activity_height = self.activity_height(width);
+        let activity_height = self.activity_height();
         let activity_gap = if activity_height > 0 {
             ACTIVITY_COMPOSER_GAP
         } else {
@@ -2731,6 +2436,7 @@ impl View {
         let overlay_height = match self.overlay.as_ref() {
             Some(Overlay::Shortcuts) => shortcuts_height(width),
             Some(Overlay::Context(context)) => context.preferred_height(width),
+            Some(Overlay::Tools { view, .. }) => view.preferred_height(width),
             Some(Overlay::Model(picker)) => picker.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills, width),
@@ -2778,7 +2484,7 @@ impl View {
         let trailing_height =
             requested_trailing_height.min(area.height.saturating_sub(minimum_composer_height));
         let height_above_trailing = area.height.saturating_sub(trailing_height);
-        let requested_activity_height = self.activity_height(area.width);
+        let requested_activity_height = self.activity_height();
         let requested_activity_gap = if requested_activity_height > 0 {
             ACTIVITY_COMPOSER_GAP
         } else {
@@ -2878,6 +2584,7 @@ impl View {
         match self.overlay.as_mut() {
             Some(Overlay::Shortcuts) => self.render_shortcuts(frame, area),
             Some(Overlay::Context(context)) => context.render(frame, area, self.user_message_style),
+            Some(Overlay::Tools { view, .. }) => view.render(frame, area, self.user_message_style),
             Some(Overlay::Model(picker)) => picker.render(frame, area, self.user_message_style),
             Some(Overlay::Resume(picker)) => picker.render(frame, area),
             Some(Overlay::Skills(skills)) => {
@@ -3176,15 +2883,12 @@ impl View {
             .working_since
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        let waiting_for_background_terminal = self.waiting_for_background_terminal();
         let heading = if self.interrupting.is_some() {
             "Interrupting"
-        } else if self.status_detail.as_deref() == Some("Compacting conversation") {
+        } else if self.compacting {
             "Compacting"
-        } else if waiting_for_background_terminal {
-            "Waiting for background terminal"
         } else {
-            self.reasoning_status.heading().unwrap_or("Working")
+            "Working"
         };
         let mut spans = vec![activity_marker(self.working_since), " ".into()];
         spans.extend(shimmer_spans(heading));
@@ -3207,82 +2911,29 @@ impl View {
         }
         Line::from(spans)
     }
-
-    fn waiting_for_background_terminal(&self) -> bool {
-        self.unified_exec_wait_streak.is_some()
-            || self
-                .deferred_interactions
-                .values()
-                .any(ToolEntry::is_empty_interaction)
-    }
 }
 
-fn starts_presentation_item(event: &AgentEvent) -> bool {
+fn is_presentation_step(event: &AgentEvent) -> bool {
     matches!(
         event,
-        AgentEvent::ToolStarted { .. } | AgentEvent::Warning(_) | AgentEvent::SteeringCommitted(_)
+        AgentEvent::WebSearchStarted(_)
+            | AgentEvent::WebSearchCompleted(_)
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::Warning(_)
+            | AgentEvent::SteeringCommitted(_)
     )
 }
 
 impl View {
-    fn activity_height(&self, width: u16) -> u16 {
-        u16::try_from(self.activity_lines(width).len()).unwrap_or(u16::MAX)
+    fn activity_height(&self) -> u16 {
+        u16::from(self.busy)
     }
 
     fn activity_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if !self.busy {
-            return self.background_process_line(width).into_iter().collect();
-        }
-
-        let mut lines = vec![truncate_line(self.working_line(), usize::from(width))];
-        lines.extend(self.status_detail_line(width));
-        // bettercodex deliberately keeps this footer on its own row while busy. Codex folds it
-        // into the status header, which hides both surfaces behind the same truncation boundary.
-        lines.extend(self.background_process_line(width));
-        lines
-    }
-
-    fn status_detail_line(&self, width: u16) -> Option<Line<'static>> {
-        let detail = self
-            .status_detail
-            .as_deref()
-            .filter(|detail| *detail != "Compacting conversation")?
-            .trim();
-        if detail.is_empty() {
-            return None;
-        }
-        let detail = first_display_line(&markdown::sanitize(detail));
-        if detail.is_empty() {
-            return None;
-        }
-        // Match Codex's status-details surface: live tool activity belongs below the header, where
-        // it cannot displace the elapsed time or interrupt affordance.
-        Some(truncate_line(
-            Line::from(vec![STATUS_DETAIL_PREFIX.dim(), detail.dim()]),
-            usize::from(width),
-        ))
-    }
-
-    fn background_process_summary(&self) -> Option<String> {
-        let count = self.background_processes.len();
-        if count == 0 {
-            return None;
-        }
-        let plural = if count == 1 { "" } else { "s" };
-        Some(format!(
-            "{count} background terminal{plural} running · /ps to view · /stop to close"
-        ))
-    }
-
-    fn background_process_line(&self, width: u16) -> Option<Line<'static>> {
-        if width < 4 {
-            return None;
-        }
-        let summary = self.background_process_summary()?;
-        Some(truncate_line(
-            Line::from(vec![Span::from("  ").dim(), Span::from(summary).dim()]),
-            usize::from(width),
-        ))
+        self.busy
+            .then(|| truncate_line(self.working_line(), usize::from(width)))
+            .into_iter()
+            .collect()
     }
 
     fn status_line(&self, width: u16) -> Line<'static> {
@@ -3369,13 +3020,10 @@ fn is_local_command(command: &str) -> bool {
     {
         return true;
     }
-    #[cfg(unix)]
+    if let Some(arguments) = command.strip_prefix("/tmux")
+        && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
     {
-        if let Some(arguments) = command.strip_prefix("/tmux")
-            && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
-        {
-            return true;
-        }
+        return true;
     }
     matches!(
         command,
@@ -3390,11 +3038,10 @@ fn is_local_command(command: &str) -> bool {
             | "/clear"
             | "/fork"
             | "/context"
+            | "/tools"
             | "/status"
             | "/help"
-            | "/ps"
             | "/skills"
-            | "/stop"
             | "/logout"
     )
 }
@@ -3409,9 +3056,9 @@ impl TranscriptEntry {
             | Self::Error(_)
             | Self::Diff(_)
             | Self::Status(_)
-            | Self::Processes(_)
             | Self::FinalMessageSeparator { .. } => true,
             Self::Assistant { streaming, .. } => !streaming,
+            Self::WebSearch(search) => search.state != WebSearchState::Active,
             Self::Tool(tool) => tool.outcome.is_some(),
             Self::Exploration { tools, sealed } => {
                 *sealed && tools.iter().all(|tool| tool.outcome.is_some())
@@ -3477,6 +3124,7 @@ impl TranscriptEntry {
             Self::Assistant {
                 content, streaming, ..
             } => return assistant_lines(content, width, cwd, *streaming),
+            Self::WebSearch(search) => web_search_lines(search, width),
             Self::Tool(tool) => tool.display_lines(width, user_style),
             Self::Exploration { tools, .. } => exploration_lines(tools, width),
             Self::Notice(message) => vec![Line::from(vec![
@@ -3493,7 +3141,6 @@ impl TranscriptEntry {
             ])],
             Self::Diff(diff) => git_diff_lines(diff, width),
             Self::Status(snapshot) => return snapshot.display_lines(width),
-            Self::Processes(processes) => background_process_lines(processes, width),
             Self::FinalMessageSeparator { elapsed_seconds } => {
                 final_message_separator_lines(*elapsed_seconds, width)
             }
@@ -3503,123 +3150,106 @@ impl TranscriptEntry {
 }
 
 impl ToolEntry {
-    fn new(
-        call_id: String,
-        name: String,
-        input: Option<Value>,
-        cwd: &Path,
-        process_commands: &HashMap<i64, String>,
-    ) -> Self {
+    fn new(call_id: String, name: String, input: Option<Value>, cwd: &Path) -> Self {
         let display = match name.as_str() {
-            "exec" => ToolDisplay::CodeMode(
-                input
-                    .as_ref()
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-            "wait" => ToolDisplay::CodeMode(format!(
-                "wait({})",
-                input.as_ref().map(Value::to_string).unwrap_or_default()
-            )),
-            "exec_command" => {
+            "bash" => {
                 let command = input
                     .as_ref()
-                    .and_then(|input| input.get("cmd"))
+                    .and_then(|input| input.get("command"))
                     .and_then(Value::as_str)
-                    .unwrap_or("exec_command")
+                    .unwrap_or("bash")
                     .to_string();
-                let command_argv = input
-                    .as_ref()
-                    .map(crate::tools::command_argv_for_display)
-                    .unwrap_or_default();
+                let argv = vec!["bash".to_string(), "-c".to_string(), command.clone()];
                 ToolDisplay::Command {
                     command,
-                    parsed: parse_command(&command_argv),
+                    parsed: parse_command(&argv),
                 }
             }
-            "write_stdin" => {
-                let session_id = input
-                    .as_ref()
-                    .and_then(|input| input.get("session_id"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                let interaction = input
-                    .as_ref()
-                    .and_then(|input| input.get("chars"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                ToolDisplay::Interaction {
-                    session_id,
-                    command: process_commands
-                        .get(&session_id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("process {session_id}")),
-                    input: interaction,
-                }
-            }
-            "apply_patch" => ToolDisplay::Patch(PatchDisplay::parse(
-                input.as_ref().and_then(Value::as_str).unwrap_or_default(),
-                cwd,
-            )),
-            "log_papercut" => ToolDisplay::Papercut,
-            "update_plan" => ToolDisplay::Plan(PlanDisplay::parse(input.as_ref())),
-            "view_image" => ToolDisplay::ViewImage(
+            "read" => ToolDisplay::Read(
                 input
                     .as_ref()
                     .and_then(|input| input.get("path"))
                     .and_then(Value::as_str)
                     .map(|path| display_tool_path(Path::new(path), cwd))
-                    .unwrap_or_else(|| "image".to_string()),
+                    .unwrap_or_else(|| "file".to_string()),
             ),
-            "web.run" => {
-                ToolDisplay::WebSearch(crate::web_search::action_for_display(input.clone()))
-            }
+            "write" => ToolDisplay::FileChange {
+                path: input
+                    .as_ref()
+                    .and_then(|input| input.get("path"))
+                    .and_then(Value::as_str)
+                    .map(|path| display_tool_path(Path::new(path), cwd))
+                    .unwrap_or_else(|| "file".to_string()),
+                action: "Writing",
+            },
+            "edit" => ToolDisplay::FileChange {
+                path: input
+                    .as_ref()
+                    .and_then(|input| input.get("path"))
+                    .and_then(Value::as_str)
+                    .map(|path| display_tool_path(Path::new(path), cwd))
+                    .unwrap_or_else(|| "file".to_string()),
+                action: "Editing",
+            },
             _ => ToolDisplay::Other,
         };
+        let input = retain_tool_input(&name, input);
         Self {
             call_id,
+            origin: ToolOrigin::Agent,
             name,
             input,
             display,
             outcome: None,
+            file_change: None,
+            live_output: String::new(),
+            command_output_cache: None,
             started_at: Instant::now(),
         }
     }
 
-    fn from_session_transcript(
-        tool: SessionTranscriptTool,
-        cwd: &Path,
-        process_commands: &HashMap<i64, String>,
-    ) -> Self {
+    fn operator(call_id: String, command: &str, cwd: &Path) -> Self {
+        let mut tool = Self::new(
+            call_id,
+            "bash".to_string(),
+            Some(serde_json::json!({"command": command})),
+            cwd,
+        );
+        tool.origin = ToolOrigin::Operator;
+        tool
+    }
+
+    fn from_session_transcript(tool: SessionTranscriptTool, cwd: &Path) -> Self {
         let SessionTranscriptTool {
             call_id,
+            origin,
             name,
             input,
             output,
+            file_change,
         } = tool;
-        let mut tool = Self::new(call_id, name, input, cwd, process_commands);
-        tool.outcome = output.map(|output| ToolOutcome {
-            output: match output {
+        let mut tool = Self::new(call_id, name, input, cwd);
+        tool.origin = match origin {
+            SessionTranscriptToolOrigin::Agent => ToolOrigin::Agent,
+            SessionTranscriptToolOrigin::Operator => ToolOrigin::Operator,
+        };
+        let authoritative_path = file_change
+            .as_ref()
+            .map(|change| display_tool_path(&change.path, cwd));
+        tool.set_file_change(file_change, authoritative_path);
+        if let Some(output) = output {
+            tool.set_outcome(match output {
                 SessionTranscriptToolOutput::Success(output) => Ok(output),
                 SessionTranscriptToolOutput::Error(error) => Err(error),
-            },
-        });
+            });
+        }
         tool.finish_if_incomplete();
         tool
     }
 
     fn session_transcript_tool(&self, retain_success_output: bool) -> SessionTranscriptTool {
-        let retain_success_output = retain_success_output
-            && matches!(
-                &self.display,
-                ToolDisplay::CodeMode(_)
-                    | ToolDisplay::Command { .. }
-                    | ToolDisplay::Interaction { .. }
-                    | ToolDisplay::Papercut
-                    | ToolDisplay::Other
-            );
+        let retain_success_output = matches!(&self.display, ToolDisplay::Command { .. })
+            && (retain_success_output || self.succeeded() == Some(false));
         let output = self.outcome.as_ref().map(|outcome| match &outcome.output {
             Ok(output) => SessionTranscriptToolOutput::Success(if retain_success_output {
                 output.clone()
@@ -3630,14 +3260,20 @@ impl ToolEntry {
         });
         SessionTranscriptTool {
             call_id: self.call_id.clone(),
+            origin: match self.origin {
+                ToolOrigin::Agent => SessionTranscriptToolOrigin::Agent,
+                ToolOrigin::Operator => SessionTranscriptToolOrigin::Operator,
+            },
             name: self.name.clone(),
             input: self.input.clone(),
             output,
+            file_change: self.file_change.clone(),
         }
     }
 
     fn is_exploration(&self) -> bool {
         match &self.display {
+            ToolDisplay::Read(_) => true,
             ToolDisplay::Command { parsed, .. } => {
                 !parsed.is_empty()
                     && parsed
@@ -3648,60 +3284,82 @@ impl ToolEntry {
         }
     }
 
-    fn is_interaction(&self) -> bool {
-        matches!(self.display, ToolDisplay::Interaction { .. })
+    fn may_change_repository(&self) -> bool {
+        matches!(self.name.as_str(), "bash" | "write" | "edit")
     }
 
-    fn is_empty_interaction(&self) -> bool {
-        matches!(
-            &self.display,
-            ToolDisplay::Interaction { input, .. } if input.is_empty()
-        )
-    }
-
-    fn has_interaction_input(&self) -> bool {
-        matches!(
-            &self.display,
-            ToolDisplay::Interaction { input, .. } if !input.is_empty()
-        )
-    }
-
-    fn activity_label(&self) -> String {
-        match &self.display {
-            ToolDisplay::CodeMode(_) => "Running code".to_string(),
-            ToolDisplay::Command { command, .. } => first_display_line(command),
-            ToolDisplay::Interaction { command, .. } => command.clone(),
-            ToolDisplay::Patch(_) => "Applying patch".to_string(),
-            ToolDisplay::Papercut => "Logging papercut".to_string(),
-            ToolDisplay::Plan(_) => "Updating plan".to_string(),
-            ToolDisplay::ViewImage(path) => format!("Viewing {path}"),
-            ToolDisplay::WebSearch(_) => "Searching the web".to_string(),
-            ToolDisplay::Other => self.name.clone(),
+    fn set_file_change(&mut self, file_change: Option<ToolFileChange>, path: Option<String>) {
+        if let (
+            ToolDisplay::FileChange {
+                path: displayed, ..
+            },
+            Some(path),
+        ) = (&mut self.display, path)
+        {
+            *displayed = path;
         }
+        self.file_change = file_change;
+    }
+
+    fn output_max_rows(&self) -> usize {
+        match self.origin {
+            ToolOrigin::Agent => TOOL_OUTPUT_MAX_ROWS,
+            ToolOrigin::Operator => OPERATOR_OUTPUT_MAX_ROWS,
+        }
+    }
+
+    fn append_live_output(&mut self, chunk: &str) {
+        const OMITTED_MARKER: &str = "… earlier live output omitted …\n";
+        self.command_output_cache = None;
+        self.live_output.push_str(chunk);
+        let retained_bytes = LIVE_TOOL_OUTPUT_MAX_BYTES.saturating_sub(OMITTED_MARKER.len());
+        if self.live_output.len() <= LIVE_TOOL_OUTPUT_MAX_BYTES {
+            return;
+        }
+        let mut start = self.live_output.len().saturating_sub(retained_bytes);
+        while !self.live_output.is_char_boundary(start) {
+            start = start.saturating_add(1);
+        }
+        self.live_output.drain(..start);
+        self.live_output.insert_str(0, OMITTED_MARKER);
+    }
+
+    fn set_outcome(&mut self, output: Result<Value, String>) {
+        // Successful non-command payloads are model-facing data that these cells never render.
+        // Retain errors and command output, but do not duplicate large reads or web results in the
+        // long-lived TUI transcript.
+        let output = match (&self.display, output) {
+            (ToolDisplay::Read(_) | ToolDisplay::FileChange { .. }, Ok(_)) => Ok(Value::Null),
+            (_, output) => output,
+        };
+        self.outcome = Some(ToolOutcome { output });
+        self.live_output = String::new();
+        self.command_output_cache = None;
     }
 
     fn finish_if_incomplete(&mut self) {
         if self.outcome.is_none() {
-            self.outcome = Some(ToolOutcome {
-                output: Err("tool stopped before returning a result".to_string()),
-            });
+            self.set_outcome(Err("tool stopped before returning a result".to_string()));
         }
     }
 
-    fn display_lines(&self, width: u16, user_style: Style) -> Vec<Line<'static>> {
+    fn display_lines(&mut self, width: u16, user_style: Style) -> Vec<Line<'static>> {
+        if let ToolDisplay::Command { command, .. } = &self.display {
+            let command = command.clone();
+            return command_lines(self, &command, width);
+        }
         match &self.display {
-            ToolDisplay::CodeMode(source) => code_mode_lines(self, source, width),
-            ToolDisplay::Command { command, .. } => command_lines(self, command, width),
-            ToolDisplay::Interaction { command, input, .. } => {
-                interaction_lines(self, command, input, width)
+            ToolDisplay::Command { .. } => unreachable!("commands return before display dispatch"),
+            ToolDisplay::Read(path) => file_change_lines(self, "Reading", path, width),
+            ToolDisplay::FileChange { path, action } => {
+                if self.succeeded() == Some(true)
+                    && let Some(file_change) = &self.file_change
+                {
+                    file_change::lines(path, &file_change.change, width, user_style)
+                } else {
+                    file_change_lines(self, action, path, width)
+                }
             }
-            ToolDisplay::Patch(patch) => {
-                patch.display_lines(self.outcome.as_ref(), width, user_style)
-            }
-            ToolDisplay::Papercut => papercut_lines(self, width),
-            ToolDisplay::Plan(plan) => plan.display_lines(self.outcome.as_ref(), width),
-            ToolDisplay::ViewImage(path) => view_image_lines(self.outcome.as_ref(), path, width),
-            ToolDisplay::WebSearch(action) => web_search_lines(self, action, width),
             ToolDisplay::Other => generic_tool_lines(self, width),
         }
     }
@@ -3718,616 +3376,23 @@ impl ToolEntry {
     }
 }
 
-impl PatchDisplay {
-    fn parse(source: &str, cwd: &Path) -> Self {
-        let lines = if source.contains("\r\n") {
-            Cow::Owned(source.replace("\r\n", "\n"))
-        } else {
-            Cow::Borrowed(source)
-        };
-        let lines = lines.lines().collect::<Vec<_>>();
-        let mut files = Vec::new();
-        let mut remaining_preview_rows = MAX_PATCH_PREVIEW_ROWS;
-        let mut remaining_source_preview_bytes = MAX_PATCH_PREVIEW_SOURCE_BYTES;
-        let mut index = 0;
-        while index < lines.len() {
-            let line = lines[index];
-            index += 1;
-            let (kind, path) = if let Some(path) = line.strip_prefix("*** Add File: ") {
-                (PatchKind::Add, path)
-            } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
-                (PatchKind::Delete, path)
-            } else if let Some(path) = line.strip_prefix("*** Update File: ") {
-                (PatchKind::Update, path)
-            } else {
-                continue;
-            };
-            let mut move_to = None;
-            if let Some(destination) = lines
-                .get(index)
-                .and_then(|line| line.strip_prefix("*** Move to: "))
-            {
-                move_to = Some(destination.to_string());
-                index += 1;
-            }
-            let mut rows = Vec::new();
-            let mut added = 0_usize;
-            let mut removed = 0_usize;
-            let mut omitted_rows = 0_usize;
-            let mut old_line = 1_usize;
-            let mut new_line = 1_usize;
-            let (original, source_omission_bytes) = if matches!(kind, PatchKind::Update) {
-                match read_patch_preview_source(
-                    &cwd.join(path),
-                    &mut remaining_source_preview_bytes,
-                ) {
-                    PatchPreviewSource::Text(text) => (text, None),
-                    PatchPreviewSource::Omitted(bytes) => (String::new(), Some(bytes)),
-                    PatchPreviewSource::Unavailable => (String::new(), None),
-                }
-            } else {
-                (String::new(), None)
-            };
-            let original_lines = original.lines().collect::<Vec<_>>();
-            let mut search_start = 0_usize;
-            let mut line_delta = 0_isize;
-            let mut hunk_located = false;
-            while index < lines.len() && !lines[index].starts_with("*** ") {
-                let line = lines[index];
-                index += 1;
-                if line == "*** End of File" {
-                    continue;
-                }
-                if line == "@@" || line.starts_with("@@ ") {
-                    let located = line
-                        .strip_prefix("@@ ")
-                        .and_then(|anchor| {
-                            find_patch_sequence(&original_lines, &[anchor], search_start)
-                                .map(|position| position.saturating_add(1))
-                        })
-                        .or_else(|| {
-                            patch_hunk_old_lines(&lines, index).and_then(|pattern| {
-                                find_patch_sequence(&original_lines, &pattern, search_start)
-                            })
-                        });
-                    if let Some(position) = located {
-                        search_start = position;
-                        old_line = position.saturating_add(1);
-                        new_line = shifted_line_number(old_line, line_delta);
-                    }
-                    hunk_located = true;
-                    continue;
-                }
-                if !hunk_located {
-                    if let Some(pattern) = patch_hunk_old_lines(&lines, index.saturating_sub(1))
-                        && let Some(position) =
-                            find_patch_sequence(&original_lines, &pattern, search_start)
-                    {
-                        old_line = position.saturating_add(1);
-                        new_line = shifted_line_number(old_line, line_delta);
-                    }
-                    hunk_located = true;
-                }
-                if let Some(text) = line.strip_prefix('+') {
-                    added = added.saturating_add(1);
-                    push_patch_preview_row(
-                        &mut rows,
-                        &mut remaining_preview_rows,
-                        &mut omitted_rows,
-                        PatchRow {
-                            number: new_line,
-                            kind: PatchRowKind::Add,
-                            text: bounded_patch_row(text),
-                        },
-                    );
-                    new_line += 1;
-                    line_delta += 1;
-                } else if let Some(text) = line.strip_prefix('-') {
-                    removed = removed.saturating_add(1);
-                    push_patch_preview_row(
-                        &mut rows,
-                        &mut remaining_preview_rows,
-                        &mut omitted_rows,
-                        PatchRow {
-                            number: old_line,
-                            kind: PatchRowKind::Delete,
-                            text: bounded_patch_row(text),
-                        },
-                    );
-                    old_line += 1;
-                    line_delta -= 1;
-                } else if let Some(text) = line.strip_prefix(' ') {
-                    push_patch_preview_row(
-                        &mut rows,
-                        &mut remaining_preview_rows,
-                        &mut omitted_rows,
-                        PatchRow {
-                            number: new_line,
-                            kind: PatchRowKind::Context,
-                            text: bounded_patch_row(text),
-                        },
-                    );
-                    old_line += 1;
-                    new_line += 1;
-                } else if line.is_empty() {
-                    push_patch_preview_row(
-                        &mut rows,
-                        &mut remaining_preview_rows,
-                        &mut omitted_rows,
-                        PatchRow {
-                            number: new_line,
-                            kind: PatchRowKind::Context,
-                            text: String::new(),
-                        },
-                    );
-                    old_line += 1;
-                    new_line += 1;
-                }
-                search_start = old_line.saturating_sub(1);
-            }
-            let mut removed = Some(removed);
-            let mut omission =
-                (omitted_rows > 0).then_some(PatchPreviewOmission::Rows(omitted_rows));
-            if matches!(kind, PatchKind::Delete) && rows.is_empty() && omitted_rows == 0 {
-                let preview = deleted_file_preview(
-                    &cwd.join(path),
-                    &mut remaining_preview_rows,
-                    &mut remaining_source_preview_bytes,
-                );
-                rows = preview.rows;
-                removed = preview.removed;
-                omission = preview.omission;
-            }
-            files.push(PatchFile {
-                path: path.to_string(),
-                move_to,
-                kind,
-                rows,
-                added,
-                removed,
-                omission,
-                source_omission_bytes,
-            });
-        }
-        Self { files }
-    }
-
-    fn display_lines(
-        &self,
-        outcome: Option<&ToolOutcome>,
-        width: u16,
-        user_style: Style,
-    ) -> Vec<Line<'static>> {
-        let failure = outcome.and_then(|outcome| outcome.output.as_ref().err());
-        if self.files.is_empty() {
-            return match failure {
-                Some(error) => failed_tool_lines("Failed to apply patch", error, width),
-                None if outcome.is_none() => vec![Line::from(vec![
-                    activity_marker(None),
-                    " ".into(),
-                    "Applying patch".bold(),
-                ])],
-                None => vec![Line::from(vec!["• ".dim(), "Applied patch".bold()])],
-            };
-        }
-        let total_added = self.files.iter().map(PatchFile::added).sum::<usize>();
-        let total_removed = self.files.iter().try_fold(0_usize, |total, file| {
-            file.removed().map(|removed| total.saturating_add(removed))
-        });
-        let mut lines = Vec::new();
-        let mut header = vec!["• ".dim()];
-        if let [file] = self.files.as_slice() {
-            header.push(match file.kind {
-                PatchKind::Add => "Added".bold(),
-                PatchKind::Delete => "Deleted".bold(),
-                PatchKind::Update => "Edited".bold(),
-            });
-            header.push(" ".into());
-            header.push(file.display_path().into());
-            header.push(" ".into());
-            header.extend(line_count_spans(file.added(), file.removed()));
-        } else {
-            header.push("Edited".bold());
-            header.push(format!(" {} files ", self.files.len(),).into());
-            header.extend(line_count_spans(total_added, total_removed));
-        }
-        lines.push(truncate_line(Line::from(header), usize::from(width)));
-        for (file_index, file) in self.files.iter().enumerate() {
-            if file_index > 0 {
-                lines.push(Line::default());
-            }
-            if self.files.len() > 1 {
-                let mut file_header = vec!["  └ ".dim(), file.display_path().into(), " ".into()];
-                file_header.extend(line_count_spans(file.added(), file.removed()));
-                lines.push(truncate_line(Line::from(file_header), usize::from(width)));
-            }
-            let number_width = file
-                .rows
-                .iter()
-                .map(|row| row.number)
-                .max()
-                .unwrap_or(1)
-                .to_string()
-                .len();
-            for row in &file.rows {
-                lines.extend(patch_row_lines(row, width, number_width, user_style));
-            }
-            if let Some(omission) = file.omission {
-                let notice = match omission {
-                    PatchPreviewOmission::Rows(rows) => {
-                        format!("    … {rows} diff rows omitted …")
-                    }
-                    PatchPreviewOmission::FileBytes(bytes) => {
-                        format!("    … deleted-file preview omitted ({bytes} bytes) …")
-                    }
-                };
-                lines.push(truncate_line(Line::from(notice).dim(), usize::from(width)));
-            }
-            if let Some(bytes) = file.source_omission_bytes {
-                let notice = format!(
-                    "    … source preview omitted ({bytes} bytes); line numbers are patch-relative …"
-                );
-                lines.push(truncate_line(Line::from(notice).dim(), usize::from(width)));
-            }
-        }
-        if let Some(error) = failure {
-            lines.push(Line::default());
-            lines.push(Line::from("✘ Failed to apply patch").magenta().bold());
-            append_bounded_output(error, width, &mut lines);
-        }
-        lines
-    }
-}
-
-struct DeletedFilePreview {
-    rows: Vec<PatchRow>,
-    removed: Option<usize>,
-    omission: Option<PatchPreviewOmission>,
-}
-
-enum PatchPreviewSource {
-    Text(String),
-    Omitted(u64),
-    Unavailable,
-}
-
-fn read_patch_preview_source(path: &Path, remaining_bytes: &mut usize) -> PatchPreviewSource {
-    let Ok(metadata) = path.metadata() else {
-        return PatchPreviewSource::Unavailable;
+fn retain_tool_input(name: &str, input: Option<Value>) -> Option<Value> {
+    let retained_field = match name {
+        "bash" => "command",
+        "read" | "write" | "edit" => "path",
+        _ => return input,
     };
-    let reported_bytes = metadata.len();
-    let Ok(metadata_bytes) = usize::try_from(reported_bytes) else {
-        return PatchPreviewSource::Omitted(reported_bytes);
+    let input = input?;
+    let Some(value) = input
+        .get(retained_field)
+        .filter(|value| value.is_string())
+        .cloned()
+    else {
+        return Some(input);
     };
-    if !metadata.is_file() || metadata_bytes > *remaining_bytes {
-        return PatchPreviewSource::Omitted(reported_bytes);
-    }
-    let Ok(file) = std::fs::File::open(path) else {
-        return PatchPreviewSource::Omitted(reported_bytes);
-    };
-    let mut bytes = Vec::with_capacity(metadata_bytes);
-    let read_limit = remaining_bytes.saturating_add(1);
-    if file
-        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return PatchPreviewSource::Omitted(reported_bytes);
-    }
-    if bytes.len() > *remaining_bytes {
-        return PatchPreviewSource::Omitted(
-            reported_bytes.max(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
-        );
-    }
-    let read_bytes = bytes.len();
-    let Ok(text) = String::from_utf8(bytes) else {
-        return PatchPreviewSource::Omitted(
-            reported_bytes.max(u64::try_from(read_bytes).unwrap_or(u64::MAX)),
-        );
-    };
-    *remaining_bytes -= read_bytes;
-    PatchPreviewSource::Text(text)
-}
-
-fn deleted_file_preview(
-    path: &Path,
-    remaining_rows: &mut usize,
-    remaining_bytes: &mut usize,
-) -> DeletedFilePreview {
-    let content = match read_patch_preview_source(path, remaining_bytes) {
-        PatchPreviewSource::Text(content) => content,
-        PatchPreviewSource::Omitted(bytes) => {
-            return DeletedFilePreview {
-                rows: Vec::new(),
-                removed: None,
-                omission: Some(PatchPreviewOmission::FileBytes(bytes)),
-            };
-        }
-        PatchPreviewSource::Unavailable => {
-            return DeletedFilePreview {
-                rows: Vec::new(),
-                removed: None,
-                omission: None,
-            };
-        }
-    };
-
-    let mut rows = Vec::new();
-    let mut removed = 0_usize;
-    let mut omitted = 0_usize;
-    for (index, text) in content.lines().enumerate() {
-        removed = removed.saturating_add(1);
-        push_patch_preview_row(
-            &mut rows,
-            remaining_rows,
-            &mut omitted,
-            PatchRow {
-                number: index.saturating_add(1),
-                kind: PatchRowKind::Delete,
-                text: bounded_patch_row(text),
-            },
-        );
-    }
-    DeletedFilePreview {
-        rows,
-        removed: Some(removed),
-        omission: (omitted > 0).then_some(PatchPreviewOmission::Rows(omitted)),
-    }
-}
-
-fn push_patch_preview_row(
-    rows: &mut Vec<PatchRow>,
-    remaining_rows: &mut usize,
-    omitted_rows: &mut usize,
-    row: PatchRow,
-) {
-    if *remaining_rows == 0 {
-        *omitted_rows = omitted_rows.saturating_add(1);
-    } else {
-        rows.push(row);
-        *remaining_rows -= 1;
-    }
-}
-
-fn bounded_patch_row(text: &str) -> String {
-    if text.len() <= MAX_PATCH_PREVIEW_ROW_BYTES {
-        return text.to_string();
-    }
-    let mut end = MAX_PATCH_PREVIEW_ROW_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut bounded = text[..end].to_string();
-    bounded.push('…');
-    bounded
-}
-
-fn patch_hunk_old_lines<'a>(lines: &'a [&'a str], start: usize) -> Option<Vec<&'a str>> {
-    let pattern = lines[start..]
-        .iter()
-        .take_while(|line| {
-            !line.starts_with("@@")
-                && !line.starts_with("*** Add File: ")
-                && !line.starts_with("*** Delete File: ")
-                && !line.starts_with("*** Update File: ")
-                && line.trim() != "*** End Patch"
-        })
-        .filter_map(|line| {
-            if line.is_empty() {
-                Some("")
-            } else {
-                line.strip_prefix(' ').or_else(|| line.strip_prefix('-'))
-            }
-        })
-        .collect::<Vec<_>>();
-    (!pattern.is_empty()).then_some(pattern)
-}
-
-fn find_patch_sequence(haystack: &[&str], needle: &[&str], start: usize) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    let last = haystack.len().saturating_sub(needle.len());
-    let start = start.min(last);
-    [
-        |left: &str, right: &str| left == right,
-        |left: &str, right: &str| left.trim_end() == right.trim_end(),
-        |left: &str, right: &str| left.trim() == right.trim(),
-    ]
-    .into_iter()
-    .find_map(|matches| {
-        (start..=last).find(|&position| {
-            haystack[position..position + needle.len()]
-                .iter()
-                .zip(needle)
-                .all(|(actual, expected)| matches(actual, expected))
-        })
-    })
-}
-
-fn shifted_line_number(old_line: usize, delta: isize) -> usize {
-    old_line.saturating_add_signed(delta).max(1)
-}
-
-fn patch_row_lines(
-    row: &PatchRow,
-    width: u16,
-    number_width: usize,
-    user_style: Style,
-) -> Vec<Line<'static>> {
-    let light_background = matches!(user_style.bg, Some(Color::Rgb(red, green, blue))
-        if 0.299 * red as f32 + 0.587 * green as f32 + 0.114 * blue as f32 > 128.0);
-    let (marker, line_style, gutter_style, marker_style, content_style) = match row.kind {
-        PatchRowKind::Context => (
-            ' ',
-            Style::default(),
-            Style::default().dim(),
-            Style::default(),
-            Style::default(),
-        ),
-        PatchRowKind::Add if light_background => (
-            '+',
-            Style::default().bg(Color::Rgb(218, 251, 225)),
-            Style::default()
-                .fg(Color::Rgb(31, 35, 40))
-                .bg(Color::Rgb(172, 238, 187)),
-            Style::default().fg(Color::Green),
-            Style::default(),
-        ),
-        PatchRowKind::Delete if light_background => (
-            '-',
-            Style::default().bg(Color::Rgb(255, 235, 233)),
-            Style::default()
-                .fg(Color::Rgb(31, 35, 40))
-                .bg(Color::Rgb(255, 206, 203)),
-            Style::default().fg(Color::Red),
-            Style::default(),
-        ),
-        PatchRowKind::Add => {
-            let background = Color::Rgb(33, 58, 43);
-            (
-                '+',
-                Style::default().bg(background),
-                Style::default().dim(),
-                Style::default().fg(Color::Green).bg(background),
-                Style::default().fg(Color::Green).bg(background),
-            )
-        }
-        PatchRowKind::Delete => {
-            let background = Color::Rgb(74, 34, 29);
-            (
-                '-',
-                Style::default().bg(background),
-                Style::default().dim(),
-                Style::default().fg(Color::Red).bg(background),
-                Style::default().fg(Color::Red).bg(background),
-            )
-        }
-    };
-    let prefix_width = 4_usize.saturating_add(number_width).saturating_add(2);
-    let content_width = usize::from(width)
-        .saturating_sub(prefix_width)
-        .max(1)
-        .try_into()
-        .unwrap_or(u16::MAX);
-    let content = row.text.replace('\t', "    ");
-    let wrapped = wrap_styled_line(
-        &Line::from(Span::styled(content, content_style)),
-        content_width,
-    );
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut content)| {
-            let mut spans = if index == 0 {
-                vec![
-                    Span::styled(format!("    {:>number_width$} ", row.number), gutter_style),
-                    Span::styled(marker.to_string(), marker_style),
-                ]
-            } else {
-                vec![Span::styled(
-                    format!("    {:number_width$}  ", ""),
-                    gutter_style,
-                )]
-            };
-            spans.append(&mut content.spans);
-            Line::from(spans).style(line_style)
-        })
-        .collect()
-}
-
-impl PatchFile {
-    fn added(&self) -> usize {
-        self.added
-    }
-
-    fn removed(&self) -> Option<usize> {
-        self.removed
-    }
-
-    fn display_path(&self) -> String {
-        self.move_to.as_ref().map_or_else(
-            || self.path.clone(),
-            |move_to| format!("{} → {move_to}", self.path),
-        )
-    }
-}
-
-impl PlanDisplay {
-    fn parse(input: Option<&Value>) -> Self {
-        let explanation = input
-            .and_then(|input| input.get("explanation"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let steps = input
-            .and_then(|input| input.get("plan"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(|step| PlanStep {
-                text: step
-                    .get("step")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                status: step
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("pending")
-                    .to_string(),
-            })
-            .collect();
-        Self { explanation, steps }
-    }
-
-    fn display_lines(&self, outcome: Option<&ToolOutcome>, width: u16) -> Vec<Line<'static>> {
-        match outcome.map(|outcome| &outcome.output) {
-            None => {
-                return vec![Line::from(vec![
-                    activity_marker(None),
-                    " ".into(),
-                    "Updating Plan".bold(),
-                ])];
-            }
-            Some(Err(error)) => return failed_tool_lines("Failed to update plan", error, width),
-            Some(Ok(_)) => {}
-        }
-        let mut lines = vec![Line::from(vec!["• ".dim(), "Updated Plan".bold()])];
-        let mut details = Vec::new();
-        if let Some(explanation) = self
-            .explanation
-            .as_deref()
-            .map(str::trim)
-            .filter(|explanation| !explanation.is_empty())
-        {
-            for line in editor::wrap_text(explanation, width.saturating_sub(4).max(1)) {
-                details.push(Line::from(line).dim().italic());
-            }
-        }
-        if self.steps.is_empty() {
-            details.push(Line::from("(no steps provided)").dim().italic());
-        } else {
-            for step in &self.steps {
-                let (marker, style) = match step.status.as_str() {
-                    "completed" => (
-                        "✔ ",
-                        Style::default().add_modifier(Modifier::CROSSED_OUT | Modifier::DIM),
-                    ),
-                    "in_progress" => ("□ ", Style::default().cyan().bold()),
-                    _ => ("□ ", Style::default().dim()),
-                };
-                let wrapped = editor::wrap_text(&step.text, width.saturating_sub(6).max(1));
-                for (index, line) in wrapped.into_iter().enumerate() {
-                    details.push(Line::from(vec![
-                        Span::from(if index == 0 { marker } else { "  " }),
-                        Span::styled(line, style),
-                    ]));
-                }
-            }
-        }
-        prefix_lines(&mut lines, details, "  └ ", "    ");
-        lines
-    }
+    let mut retained = serde_json::Map::new();
+    retained.insert(retained_field.to_string(), value);
+    Some(Value::Object(retained))
 }
 
 impl Repository {
@@ -4696,45 +3761,6 @@ fn assistant_lines_after(
     (rendered_len, lines)
 }
 
-fn background_process_lines(processes: &[BackgroundProcess], width: u16) -> Vec<Line<'static>> {
-    if processes.is_empty() {
-        return vec![Line::from(vec![
-            "• ".dim(),
-            "No background terminals running".bold(),
-        ])];
-    }
-    let count = processes.len();
-    let plural = if count == 1 { "" } else { "s" };
-    let mut lines = vec![Line::from(vec![
-        "• ".dim(),
-        format!("{count} background terminal{plural} running").bold(),
-    ])];
-    for process in processes {
-        let prefix = format!(
-            "  {} · {} · ",
-            process.session_id,
-            format_elapsed(process.running_for.as_secs())
-        );
-        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-        let command_width = width
-            .saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
-            .max(1);
-        let command = markdown::sanitize(&process.command);
-        let mut command_lines = editor::wrap_text(&command, command_width);
-        if command_lines.is_empty() {
-            command_lines.push(String::new());
-        }
-        for (index, command) in command_lines.into_iter().enumerate() {
-            lines.push(if index == 0 {
-                Line::from(vec![prefix.clone().dim(), command.into()])
-            } else {
-                Line::from(vec![" ".repeat(prefix_width).into(), command.into()])
-            });
-        }
-    }
-    lines
-}
-
 fn git_diff_lines(diff: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec!["• ".dim(), "Git diff".bold()])];
     for source in diff.lines() {
@@ -4773,76 +3799,15 @@ fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Ve
     ]
 }
 
-fn code_mode_lines(tool: &ToolEntry, source: &str, width: u16) -> Vec<Line<'static>> {
-    let (bullet, title) = match tool.succeeded() {
-        None => (activity_marker(Some(tool.started_at)), "Running code"),
-        Some(true) => ("•".green().bold(), "Ran code"),
-        Some(false) => ("•".red().bold(), "Ran code"),
+fn command_lines(tool: &mut ToolEntry, command: &str, width: u16) -> Vec<Line<'static>> {
+    let completed_title = match tool.origin {
+        ToolOrigin::Agent => "Ran",
+        ToolOrigin::Operator => "You ran",
     };
-    let calls = code_mode_tool_names(source);
-    let mut header = vec![bullet, " ".into(), title.bold()];
-    if !calls.is_empty() {
-        header.push(" · ".dim());
-        header.push(calls.join(", ").cyan());
-    }
-    let mut lines = wrap_styled_line(&Line::from(header), width.max(1));
-    append_bounded_output(source, width, &mut lines);
-    if let Some(outcome) = &tool.outcome {
-        match &outcome.output {
-            Ok(output) => {
-                let output = transcript_output_text(output);
-                if !output.is_empty() {
-                    append_bounded_output(&output, width, &mut lines);
-                }
-            }
-            Err(error) => append_bounded_output(error, width, &mut lines),
-        }
-    }
-    lines
-}
-
-fn code_mode_tool_names(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut remaining = source;
-    while let Some(index) = remaining.find("tools.") {
-        remaining = &remaining[index + "tools.".len()..];
-        let length = remaining
-            .bytes()
-            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            .count();
-        if length == 0 {
-            continue;
-        }
-        let name = remaining[..length].replace("__", ".");
-        if !names.contains(&name) {
-            names.push(name);
-        }
-        remaining = &remaining[length..];
-    }
-    names
-}
-
-fn transcript_output_text(output: &Value) -> String {
-    match output {
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect(),
-        Value::Object(object) => object
-            .get("output")
-            .map(transcript_output_text)
-            .unwrap_or_else(|| output.to_string()),
-        Value::Null => String::new(),
-        Value::Bool(_) | Value::Number(_) => output.to_string(),
-    }
-}
-
-fn command_lines(tool: &ToolEntry, command: &str, width: u16) -> Vec<Line<'static>> {
     let (bullet, title) = match tool.succeeded() {
         None => (activity_marker(Some(tool.started_at)), "Running"),
-        Some(true) => ("•".green().bold(), "Ran"),
-        Some(false) => ("•".red().bold(), "Ran"),
+        Some(true) => ("•".green().bold(), completed_title),
+        Some(false) => ("•".red().bold(), completed_title),
     };
     let prefix_width = line_width(&Line::from(vec![
         bullet.clone(),
@@ -4877,67 +3842,60 @@ fn command_lines(tool: &ToolEntry, command: &str, width: u16) -> Vec<Line<'stati
             format!("… +{omitted} lines").dim(),
         ]));
     }
-    if let Some(outcome) = &tool.outcome {
-        match &outcome.output {
-            Ok(output) => {
-                let text = output
-                    .get("output")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if text.is_empty() {
-                    lines.push(Line::from(vec!["  └ ".dim(), "(no output)".dim()]));
-                } else {
-                    append_bounded_output(text, width, &mut lines);
-                }
-            }
-            Err(error) => append_bounded_output(error, width, &mut lines),
-        }
-    }
+    lines.extend(command_output_lines(tool, width));
     lines
 }
 
-fn interaction_lines(
-    _tool: &ToolEntry,
-    command: &str,
-    input: &str,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let waited_only = input.is_empty();
-    let command = first_display_line(&markdown::sanitize(command));
-    let mut header_spans = if waited_only {
-        vec!["• Waited for background terminal".bold()]
-    } else {
-        vec!["↳ ".dim(), "Interacted with background terminal".bold()]
-    };
-    if !command.is_empty() {
-        header_spans.push(" · ".dim());
-        header_spans.push(command.dim());
-    }
-    let mut lines = wrap_styled_line(&Line::from(header_spans), width.max(1));
-    if waited_only {
-        return lines;
+fn command_output_lines(tool: &mut ToolEntry, width: u16) -> Vec<Line<'static>> {
+    if let Some(cache) = &tool.command_output_cache
+        && cache.width == width
+    {
+        return cache.lines.clone();
     }
 
-    let input = markdown::sanitize(input);
-    let content_width = width.saturating_sub(4).max(1);
-    let mut first_row = true;
-    for source in input.lines() {
-        let mut rows = editor::wrap_text(source, content_width);
-        if rows.is_empty() {
-            rows.push(String::new());
+    let mut lines = Vec::new();
+    match &tool.outcome {
+        None if !tool.live_output.is_empty() => {
+            append_bounded_output(&tool.live_output, width, tool.output_max_rows(), &mut lines);
         }
-        for row in rows {
-            lines.push(Line::from(vec![
-                if std::mem::replace(&mut first_row, false) {
-                    "  └ ".dim()
-                } else {
-                    "    ".into()
-                },
-                Span::from(row),
-            ]));
+        Some(ToolOutcome { output: Ok(output) }) => {
+            let text = command_output_text(output);
+            if text.is_empty() {
+                lines.push(Line::from(vec!["  └ ".dim(), "(no output)".dim()]));
+            } else {
+                append_bounded_output(&text, width, tool.output_max_rows(), &mut lines);
+            }
         }
+        Some(ToolOutcome { output: Err(error) }) => {
+            append_bounded_output(error, width, tool.output_max_rows(), &mut lines);
+        }
+        None => {}
     }
+    tool.command_output_cache = Some(CommandOutputRenderCache {
+        width,
+        lines: lines.clone(),
+    });
     lines
+}
+
+fn command_output_text(output: &Value) -> String {
+    let Some(object) = output.as_object() else {
+        return output.as_str().unwrap_or_default().to_string();
+    };
+    let stdout = object
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stderr = object
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("{stdout}\n{stderr}"),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (true, true) => String::new(),
+    }
 }
 
 fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
@@ -4962,11 +3920,10 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             "Explored".bold()
         },
     ])];
-    let detail_style = Style::default().fg(Color::Cyan);
-    let mut details: Vec<(&str, Style, Vec<Span<'static>>)> = Vec::new();
+
+    let mut details = Vec::<(&str, Vec<Span<'static>>)>::new();
     let mut read_names = Vec::<String>::new();
-    let flush_reads = |details: &mut Vec<(&str, Style, Vec<Span<'static>>)>,
-                       names: &mut Vec<String>| {
+    let flush_reads = |details: &mut Vec<(&str, Vec<Span<'static>>)>, names: &mut Vec<String>| {
         if names.is_empty() {
             return;
         }
@@ -4977,170 +3934,220 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
             }
             spans.push(name.into());
         }
-        details.push(("Read", detail_style, spans));
+        details.push(("Read", spans));
     };
+
     for tool in tools {
-        if let ToolDisplay::Command { parsed, .. } = &tool.display {
-            for parsed in parsed {
-                match parsed {
-                    ParsedCommand::Read { name, .. } => {
-                        if !read_names.contains(name) {
-                            read_names.push(name.clone());
-                        }
-                    }
-                    ParsedCommand::ListFiles { cmd, path } => {
-                        flush_reads(&mut details, &mut read_names);
-                        details.push((
-                            "List",
-                            detail_style,
-                            vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
-                        ));
-                    }
-                    ParsedCommand::Search { cmd, query, path } => {
-                        flush_reads(&mut details, &mut read_names);
-                        let spans = match (query, path) {
-                            (Some(query), Some(path)) => {
-                                vec![query.clone().into(), " in ".dim(), path.clone().into()]
+        match &tool.display {
+            ToolDisplay::Read(path) if !read_names.contains(path) => {
+                read_names.push(path.clone());
+            }
+            ToolDisplay::Command { parsed, .. } => {
+                for parsed in parsed {
+                    match parsed {
+                        ParsedCommand::Read { name, .. } => {
+                            if !read_names.contains(name) {
+                                read_names.push(name.clone());
                             }
-                            (Some(query), None) => vec![query.clone().into()],
-                            _ => vec![cmd.clone().into()],
-                        };
-                        details.push(("Search", detail_style, spans));
+                        }
+                        ParsedCommand::ListFiles { cmd, path } => {
+                            flush_reads(&mut details, &mut read_names);
+                            details.push((
+                                "List",
+                                vec![path.clone().unwrap_or_else(|| cmd.clone()).into()],
+                            ));
+                        }
+                        ParsedCommand::Search { cmd, query, path } => {
+                            flush_reads(&mut details, &mut read_names);
+                            let spans = match (query, path) {
+                                (Some(query), Some(path)) => {
+                                    vec![query.clone().into(), " in ".dim(), path.clone().into()]
+                                }
+                                (Some(query), None) => vec![query.clone().into()],
+                                _ => vec![cmd.clone().into()],
+                            };
+                            details.push(("Search", spans));
+                        }
+                        ParsedCommand::Unknown { .. } => {}
                     }
-                    ParsedCommand::Unknown { .. } => {}
                 }
             }
+            _ => {}
         }
     }
     flush_reads(&mut details, &mut read_names);
+
     let detail_width = width.saturating_sub(4).max(1);
-    let mut wrapped_details = Vec::new();
-    for (title, title_style, spans) in details {
-        let title = if spans.is_empty() {
-            title.to_string()
-        } else {
-            format!("{title} ")
-        };
+    let mut first_detail = true;
+    for (title, spans) in details {
+        let title = format!("{title} ");
         let title_width = UnicodeWidthStr::width(title.as_str()) as u16;
-        let wrapped = wrap_styled_line(
+        for (index, mut row) in wrap_styled_line(
             &Line::from(spans),
             detail_width.saturating_sub(title_width).max(1),
-        );
-        for (index, mut row) in wrapped.into_iter().enumerate() {
-            let mut spans = vec![if index == 0 {
-                Span::styled(title.clone(), title_style)
+        )
+        .into_iter()
+        .enumerate()
+        {
+            let mut row_spans = vec![if std::mem::replace(&mut first_detail, false) {
+                "  └ ".dim()
+            } else {
+                "    ".into()
+            }];
+            row_spans.push(if index == 0 {
+                Span::from(title.clone()).cyan()
             } else {
                 Span::from(" ".repeat(usize::from(title_width)))
-            }];
-            spans.append(&mut row.spans);
-            wrapped_details.push(Line::from(spans));
+            });
+            row_spans.append(&mut row.spans);
+            lines.push(Line::from(row_spans));
         }
     }
-    for (index, mut detail) in wrapped_details.into_iter().enumerate() {
-        let mut spans = vec![if index == 0 {
-            "  └ ".dim()
-        } else {
-            "    ".into()
-        }];
-        spans.append(&mut detail.spans);
-        lines.push(Line::from(spans));
+    for tool in tools {
+        let Some((title, detail)) = exploration_failure(tool) else {
+            continue;
+        };
+        lines.extend(failed_tool_lines(&title, &detail, width));
     }
     lines
 }
 
-fn view_image_lines(outcome: Option<&ToolOutcome>, path: &str, width: u16) -> Vec<Line<'static>> {
-    match outcome.map(|outcome| &outcome.output) {
-        None => vec![Line::from(vec![
-            activity_marker(None),
-            " ".into(),
-            "Viewing Image".bold(),
-        ])],
-        Some(Ok(_)) => vec![
-            Line::from(vec!["• ".dim(), "Viewed Image".bold()]),
-            truncate_line(
-                Line::from(vec!["  └ ".dim(), Span::from(path.to_string()).dim()]),
-                usize::from(width),
-            ),
-        ],
-        Some(Err(error)) => failed_tool_lines("Failed to view image", error, width),
+fn exploration_failure(tool: &ToolEntry) -> Option<(String, String)> {
+    if tool.succeeded() != Some(false) {
+        return None;
     }
+    let title = match &tool.display {
+        ToolDisplay::Read(path) => format!("Failed to read {path}"),
+        ToolDisplay::Command { command, .. } => {
+            format!("Failed {}", first_display_line(command))
+        }
+        _ => format!("Failed {}", tool.name),
+    };
+    let detail = match &tool.outcome {
+        Some(ToolOutcome { output: Err(error) }) => error.clone(),
+        Some(ToolOutcome { output: Ok(output) }) => {
+            let text = command_output_text(output);
+            if text.is_empty() {
+                output.get("exit_code").and_then(Value::as_i64).map_or_else(
+                    || "tool failed without output".to_string(),
+                    |code| format!("process exited with status {code}"),
+                )
+            } else {
+                text
+            }
+        }
+        None => return None,
+    };
+    Some((title, detail))
 }
 
-fn web_search_lines(
+fn file_change_lines(
     tool: &ToolEntry,
-    action: &crate::web_search::WebSearchAction,
+    active_action: &str,
+    path: &str,
     width: u16,
 ) -> Vec<Line<'static>> {
     if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
-        return failed_tool_lines("Failed to search the web", error, width);
+        let action = match active_action {
+            "Reading" => "read",
+            "Writing" => "write",
+            "Editing" => "edit",
+            _ => "use",
+        };
+        return failed_tool_lines(&format!("Failed to {action} {path}"), error, width);
     }
-
-    let completed = tool.outcome.is_some();
-    let detail = if completed {
-        web_search_action_detail(action)
-    } else {
-        String::new()
+    let completed_action = match active_action {
+        "Reading" => "Read",
+        "Writing" => "Wrote",
+        "Editing" => "Edited",
+        _ => "Used",
     };
-    let mut content = vec![
-        Span::from(if completed {
-            "Searched the web"
-        } else {
-            "Searching the web"
-        })
-        .bold(),
-    ];
-    if !detail.is_empty() {
-        content.push(" for ".into());
-        content.push(Span::from(detail));
-    }
-    let wrapped = wrap_styled_line(&Line::from(content), width.saturating_sub(2).max(1));
-    let bullet = if completed {
-        "•".dim()
-    } else {
-        activity_marker(Some(tool.started_at))
+    let (bullet, action) = match tool.succeeded() {
+        None => (
+            activity_marker(Some(tool.started_at)),
+            active_action.to_string(),
+        ),
+        Some(true) => ("•".green().bold(), completed_action.to_string()),
+        Some(false) => ("•".red().bold(), format!("Failed {active_action}")),
     };
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            let mut spans = if index == 0 {
-                vec![bullet.clone(), " ".into()]
-            } else {
-                vec!["  ".into()]
-            };
-            spans.append(&mut line.spans);
-            Line::from(spans)
-        })
-        .collect()
+    wrap_styled_line(
+        &Line::from(vec![
+            bullet,
+            " ".into(),
+            Span::from(action).bold(),
+            " ".into(),
+            Span::from(path.to_string()).cyan(),
+        ]),
+        width.max(1),
+    )
 }
 
-fn web_search_action_detail(action: &crate::web_search::WebSearchAction) -> String {
-    use crate::web_search::WebSearchAction;
-
-    match action {
-        WebSearchAction::Search { query, queries } => {
-            query.clone().filter(|q| !q.is_empty()).unwrap_or_else(|| {
-                let items = queries.as_ref();
-                let first = items
-                    .and_then(|queries| queries.first())
-                    .cloned()
-                    .unwrap_or_default();
-                if items.is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
-                    format!("{first} ...")
-                } else {
-                    first
-                }
-            })
+impl WebSearchEntry {
+    fn active(search: crate::web_search::WebSearchCall) -> Self {
+        Self {
+            search,
+            state: WebSearchState::Active,
+            started_at: Instant::now(),
         }
-        WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
-        WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
-            (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
-            (Some(pattern), None) => format!("'{pattern}'"),
-            (None, Some(url)) => url.clone(),
-            (None, None) => String::new(),
-        },
-        WebSearchAction::Other => String::new(),
     }
+
+    fn finished(search: crate::web_search::WebSearchCall) -> Self {
+        let state = Self::finished_state(&search);
+        Self {
+            search,
+            state,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn finish(&mut self, search: crate::web_search::WebSearchCall) {
+        self.state = Self::finished_state(&search);
+        self.search = search;
+    }
+
+    fn interrupt(&mut self) {
+        if self.state == WebSearchState::Active {
+            self.state = WebSearchState::Interrupted;
+        }
+    }
+
+    fn finished_state(search: &crate::web_search::WebSearchCall) -> WebSearchState {
+        match search.status.as_deref() {
+            Some("failed") => WebSearchState::Failed,
+            Some("in_progress") | Some("searching") => WebSearchState::Interrupted,
+            _ => WebSearchState::Completed,
+        }
+    }
+}
+
+fn web_search_lines(search: &WebSearchEntry, width: u16) -> Vec<Line<'static>> {
+    let (bullet, header, detail_prefix) = match search.state {
+        WebSearchState::Active => (
+            activity_marker(Some(search.started_at)),
+            "Searching the web",
+            " ",
+        ),
+        WebSearchState::Completed => ("•".dim(), "Searched the web", " for "),
+        WebSearchState::Failed => ("•".red().bold(), "Web search failed", " for "),
+        WebSearchState::Interrupted => ("•".dim(), "Web search interrupted", " for "),
+    };
+    let detail = search.search.detail();
+    let mut content = vec![Span::from(header).bold()];
+    if !detail.is_empty() {
+        content.push(detail_prefix.into());
+        content.push(Span::from(detail));
+    }
+    let mut lines = wrap_styled_line(&Line::from(content), width.saturating_sub(2).max(1));
+    for (index, line) in lines.iter_mut().enumerate() {
+        let mut spans = if index == 0 {
+            vec![bullet.clone(), " ".into()]
+        } else {
+            vec!["  ".into()]
+        };
+        spans.append(&mut line.spans);
+        *line = Line::from(spans);
+    }
+    lines
 }
 
 fn generic_tool_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
@@ -5159,58 +4166,40 @@ fn generic_tool_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
                 " ".into(),
                 Span::from(tool.name.clone()).cyan(),
             ])];
-            append_bounded_output(&output.to_string(), width, &mut lines);
+            append_bounded_output(&output.to_string(), width, TOOL_OUTPUT_MAX_ROWS, &mut lines);
             lines
         }
         Some(Err(error)) => failed_tool_lines(&format!("Failed {}", tool.name), error, width),
     }
 }
 
-fn papercut_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
-    let line = match tool.outcome.as_ref().map(|outcome| &outcome.output) {
-        None => Line::from(vec![
-            activity_marker(Some(tool.started_at)),
-            " ".into(),
-            "Logging papercut".bold(),
-        ]),
-        Some(Ok(output)) => {
-            let path = output
-                .get("path")
-                .and_then(Value::as_str)
-                .map(markdown::sanitize)
-                .unwrap_or_else(|| "PAPERCUTS.md".to_string());
-            Line::from(vec![
-                "• ".dim(),
-                "Logged papercut".bold(),
-                " to ".into(),
-                path.cyan(),
-            ])
-        }
-        Some(Err(error)) => return failed_tool_lines("Failed to log papercut", error, width),
-    };
-    wrap_styled_line(&line, width.max(1))
-}
-
 fn failed_tool_lines(title: &str, error: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
-        "✗ ".red().bold(),
+        "•".red().bold(),
+        " ".into(),
         Span::from(title.to_string()).bold(),
     ])];
-    append_bounded_output(error, width, &mut lines);
+    append_bounded_output(error, width, TOOL_OUTPUT_MAX_ROWS, &mut lines);
     lines
 }
 
-fn append_bounded_output(output: &str, width: u16, lines: &mut Vec<Line<'static>>) {
-    let mut rendered = Vec::new();
+fn append_bounded_output(
+    output: &str,
+    width: u16,
+    maximum_rows: usize,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let mut rendered = BoundedOutputRows::new(maximum_rows);
     for raw in output.lines() {
         let ansi = ansi_escape_line(raw);
-        rendered.extend(wrap_styled_line(&ansi, width.saturating_sub(4).max(1)));
+        for_each_wrapped_styled_line(&ansi, width.saturating_sub(4).max(1), |line| {
+            rendered.push(line);
+        });
     }
     if rendered.is_empty() {
         rendered.push(Line::from("(no output)").dim());
     }
-    let rendered = middle_truncate_lines(rendered, TOOL_OUTPUT_MAX_ROWS);
-    for (index, mut line) in rendered.into_iter().enumerate() {
+    for (index, mut line) in rendered.finish().into_iter().enumerate() {
         for span in &mut line.spans {
             span.style = span.style.add_modifier(Modifier::DIM);
         }
@@ -5224,26 +4213,86 @@ fn append_bounded_output(output: &str, width: u16, lines: &mut Vec<Line<'static>
     }
 }
 
-fn middle_truncate_lines(lines: Vec<Line<'static>>, maximum: usize) -> Vec<Line<'static>> {
-    if lines.len() <= maximum {
-        return lines;
-    }
-    let head = maximum.saturating_sub(1) / 2;
-    let tail = maximum.saturating_sub(head + 1);
-    let omitted = lines.len().saturating_sub(head + tail);
-    let mut kept = lines[..head].to_vec();
-    kept.push(Line::from(format!(
-        "… +{omitted} lines (ctrl + t to view transcript)"
-    )));
-    kept.extend(lines[lines.len() - tail..].iter().cloned());
-    kept
+struct BoundedOutputRows {
+    maximum: usize,
+    total: usize,
+    head: Vec<Line<'static>>,
+    tail: VecDeque<Line<'static>>,
+    truncated: bool,
 }
 
-fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(1));
+impl BoundedOutputRows {
+    fn new(maximum: usize) -> Self {
+        Self {
+            maximum: maximum.max(1),
+            total: 0,
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            truncated: false,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn push(&mut self, line: Line<'static>) {
+        self.total = self.total.saturating_add(1);
+        if !self.truncated {
+            self.head.push(line);
+            if self.head.len() <= self.maximum {
+                return;
+            }
+
+            self.truncated = true;
+            let head_len = self.maximum.saturating_sub(1) / 2;
+            let tail_len = self.maximum.saturating_sub(head_len + 1);
+            let mut retained = std::mem::take(&mut self.head);
+            let tail_start = retained.len().saturating_sub(tail_len);
+            self.tail = retained.split_off(tail_start).into();
+            retained.truncate(head_len);
+            self.head = retained;
+            return;
+        }
+
+        let tail_capacity = self.maximum.saturating_sub(self.head.len() + 1);
+        if tail_capacity > 0 {
+            if self.tail.len() == tail_capacity {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(line);
+        }
+    }
+
+    fn finish(mut self) -> Vec<Line<'static>> {
+        if !self.truncated {
+            return self.head;
+        }
+        let omitted = self
+            .total
+            .saturating_sub(self.head.len().saturating_add(self.tail.len()));
+        self.head
+            .push(Line::from(format!("… +{omitted} lines omitted")));
+        self.head.extend(self.tail);
+        self.head
+    }
+}
+
+pub(super) fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     let mut rows = Vec::new();
+    for_each_wrapped_styled_line(line, width, |row| rows.push(row));
+    rows
+}
+
+fn for_each_wrapped_styled_line(
+    line: &Line<'static>,
+    width: u16,
+    mut emit: impl FnMut(Line<'static>),
+) {
+    let width = usize::from(width.max(1));
     let mut spans = Vec::new();
     let mut used = 0;
+    let mut emitted = false;
     for span in &line.spans {
         let mut content = String::new();
         for grapheme in span.content.graphemes(true) {
@@ -5252,7 +4301,8 @@ fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
                 if !content.is_empty() {
                     spans.push(Span::styled(std::mem::take(&mut content), span.style));
                 }
-                rows.push(Line::from(std::mem::take(&mut spans)).style(line.style));
+                emit(Line::from(std::mem::take(&mut spans)).style(line.style));
+                emitted = true;
                 used = 0;
             }
             content.push_str(grapheme);
@@ -5262,26 +4312,8 @@ fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
             spans.push(Span::styled(content, span.style));
         }
     }
-    if !spans.is_empty() || rows.is_empty() {
-        rows.push(Line::from(spans).style(line.style));
-    }
-    rows
-}
-
-fn prefix_lines(
-    output: &mut Vec<Line<'static>>,
-    lines: Vec<Line<'static>>,
-    initial: &'static str,
-    subsequent: &'static str,
-) {
-    for (index, mut line) in lines.into_iter().enumerate() {
-        let mut spans = vec![if index == 0 {
-            Span::from(initial).dim()
-        } else {
-            Span::from(subsequent)
-        }];
-        spans.append(&mut line.spans);
-        output.push(Line::from(spans));
+    if !spans.is_empty() || !emitted {
+        emit(Line::from(spans).style(line.style));
     }
 }
 
@@ -5299,20 +4331,6 @@ fn append_history_cell(
         *emitted = true;
     }
     output.append(&mut cell);
-}
-
-fn line_count_spans(added: usize, removed: Option<usize>) -> Vec<Span<'static>> {
-    vec![
-        "(".into(),
-        format!("+{added}").green(),
-        " ".into(),
-        format!(
-            "-{}",
-            removed.map_or_else(|| "?".to_string(), |count| count.to_string())
-        )
-        .red(),
-        ")".into(),
-    ]
 }
 
 fn rendered_line_count(lines: &[HyperlinkLine], width: u16) -> u16 {
@@ -5531,14 +4549,6 @@ fn shortcut_reference_lines() -> Vec<Line<'static>> {
         shortcut_line("Ctrl+O", "copy latest final response as Markdown"),
         shortcut_line("Ctrl+C", "clear draft, interrupt work, or exit when idle"),
     ];
-    #[cfg(windows)]
-    lines.extend([
-        shortcut_line("Ctrl+Left / Right", "jump by word (Alt works too)"),
-        shortcut_line("Ctrl+Backspace", "delete previous word (Ctrl+W too)"),
-        shortcut_line("Ctrl+V / Shift+Insert", "terminal-owned clipboard paste"),
-        shortcut_line("Ctrl+C with selection", "terminal-owned selection copy"),
-    ]);
-    #[cfg(not(windows))]
     lines.extend([
         shortcut_line("Option+Left / Right", "jump by word"),
         shortcut_line("Option+Backspace", "delete previous word (Ctrl+W too)"),
@@ -5559,7 +4569,7 @@ fn shortcut_line(key: &'static str, description: &'static str) -> Line<'static> 
     ])
 }
 
-fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
+pub(super) fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
     if line_width(&line) <= width {
         return line;
     }
@@ -5612,8 +4622,6 @@ mod tests {
 
     #[test]
     fn resumed_transcript_renders_user_tool_and_assistant_history_in_order() {
-        let source =
-            "const result = await tools.exec_command({cmd:\"cargo test\"}); text(result.output);";
         let transcript = vec![
             SessionTranscriptItem::User {
                 text: "run the checks".to_string(),
@@ -5622,17 +4630,21 @@ mod tests {
             SessionTranscriptItem::Tool {
                 tool: SessionTranscriptTool {
                     call_id: "call-1".to_string(),
-                    name: "exec".to_string(),
-                    input: Some(Value::String(source.to_string())),
-                    output: Some(SessionTranscriptToolOutput::Success(Value::String(
-                        "Script completed\nWall time 0.1 seconds\nOutput:\ntest result: ok"
-                            .to_string(),
-                    ))),
+                    origin: SessionTranscriptToolOrigin::Agent,
+                    name: "bash".to_string(),
+                    input: Some(json!({"command": "cargo test"})),
+                    output: Some(SessionTranscriptToolOutput::Success(json!({
+                        "stdout": "test result: ok",
+                        "stderr": "",
+                        "exit_code": 0,
+                    }))),
+                    file_change: None,
                 },
             },
             SessionTranscriptItem::Assistant {
                 text: "All checks pass.".to_string(),
                 phase: Some(MessagePhase::FinalAnswer),
+                citations: Vec::new(),
             },
         ];
         let mut view = View::new(Path::new("/tmp/bettercodex"));
@@ -5648,8 +4660,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let user = rendered.find("run the checks").expect("replayed user");
-        let tool = rendered.find("Ran code").expect("replayed Code Mode call");
-        assert!(rendered.contains("exec_command"), "{rendered}");
+        let tool = rendered.find("Ran cargo test").expect("replayed bash call");
         let output = rendered.find("test result: ok").expect("replayed output");
         let assistant = rendered
             .find("All checks pass.")
@@ -5658,6 +4669,103 @@ mod tests {
             user < tool && tool < output && output < assistant,
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn operator_command_survives_turn_completion_and_replays_with_its_source() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("keep working"));
+        view.handle_agent_event(AgentEvent::ModelMessageDelta(ModelTextDelta::now(
+            "Accepted before the local command.",
+        )));
+        view.start_operator_command("operator:test".to_string(), "printf 'live marker\\n'");
+        view.append_operator_command_output("operator:test", "live marker\n");
+
+        let boundary = view.session_transcript();
+        assert!(matches!(
+            boundary.as_slice(),
+            [
+                SessionTranscriptItem::User { .. },
+                SessionTranscriptItem::Assistant { text, .. },
+                SessionTranscriptItem::Tool { tool },
+            ] if text == "Accepted before the local command."
+                && tool.origin == SessionTranscriptToolOrigin::Operator
+        ));
+
+        view.finish_turn(Ok(SubmitOutcome::Completed("Turn complete.".to_string())));
+
+        let active = view
+            .active_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(active.contains("Running printf 'live marker"), "{active}");
+        assert!(active.contains("live marker"), "{active}");
+        assert!(
+            !active.contains("tool stopped before returning"),
+            "{active}"
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::Cancel
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+            Action::Cancel
+        );
+
+        view.finish_operator_command(
+            "operator:test",
+            Ok(json!({
+                "stdout": "live marker\nfinished marker\n",
+                "stderr": "",
+                "exit_code": 0,
+            })),
+        );
+        let transcript = view.session_transcript();
+        let operator_tool = transcript.iter().find_map(|item| match item {
+            SessionTranscriptItem::Tool { tool } => Some(tool),
+            _ => None,
+        });
+        assert_eq!(
+            operator_tool.map(|tool| tool.origin),
+            Some(SessionTranscriptToolOrigin::Operator)
+        );
+
+        let rendered = view
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("You ran printf 'live marker"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("finished marker"), "{rendered}");
+        assert!(rendered.contains("Turn complete."), "{rendered}");
+
+        let mut replay = View::new(Path::new("/tmp/bettercodex"));
+        replay.welcome_pending = false;
+        replay.replay_transcript(transcript);
+        let replayed = replay
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            replayed.contains("You ran printf 'live marker"),
+            "{replayed}"
+        );
+        assert!(replayed.contains("finished marker"), "{replayed}");
     }
 
     #[test]
@@ -5810,12 +4918,13 @@ mod tests {
         )));
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "call-1".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "printf done"})),
+            name: "bash".to_string(),
+            input: Some(json!({"command": "printf done"})),
         });
         view.handle_agent_event(AgentEvent::ToolCompleted {
             call_id: "call-1".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": "done"})),
+            output: Ok(json!({"exit_code": 0, "stdout": "done", "stderr": ""})),
+            file_change: None,
             duration: Duration::from_millis(1),
         });
 
@@ -5860,12 +4969,13 @@ mod tests {
             let call_id = format!("search-{index}");
             view.handle_agent_event(AgentEvent::ToolStarted {
                 call_id: call_id.clone(),
-                name: "exec_command".to_string(),
-                input: Some(json!({"cmd": format!("rg needle-{index} src")})),
+                name: "bash".to_string(),
+                input: Some(json!({"command": format!("rg needle-{index} src")})),
             });
             view.handle_agent_event(AgentEvent::ToolCompleted {
                 call_id,
-                output: Ok(json!({"exit_code": 0, "output": ""})),
+                output: Ok(json!({"exit_code": 0, "stdout": "", "stderr": ""})),
+                file_change: None,
                 duration: Duration::from_millis(1),
             });
         }
@@ -6058,13 +5168,8 @@ mod tests {
             ("/clear", true),
             ("/skills", true),
             ("/logout", true),
+            ("/tmux unexpected", false),
         ];
-        #[cfg(unix)]
-        let rejected = {
-            let mut rejected = rejected;
-            rejected.push(("/tmux unexpected", false));
-            rejected
-        };
         for (draft, busy) in rejected {
             let mut view = View::new(Path::new("/tmp/bettercodex"));
             if busy {
@@ -6084,7 +5189,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn rejected_local_command_preserves_a_compacted_large_paste() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
@@ -6239,6 +5343,7 @@ mod tests {
         AgentEvent::ModelMessageCompleted(AssistantMessage {
             text: text.into(),
             phase: Some(MessagePhase::FinalAnswer),
+            citations: Vec::new(),
         })
     }
 
@@ -6316,144 +5421,37 @@ mod tests {
     }
 
     #[test]
-    fn busy_terminal_detail_and_background_summary_use_dedicated_rows() {
+    fn live_tool_activity_is_rendered_once_above_the_working_status() {
         const WIDTH: u16 = 96;
-
+        const COMMAND: &str = "cargo build --release --locked";
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        view.start_turn(&UserPrompt::text("test"));
+        view.start_turn(&UserPrompt::text("build the project"));
         let _ = view.take_pending_history_lines(WIDTH, 24);
-        view.status_detail = Some("cargo nextest run".to_string());
-        let height_without_background_terminal = view.desired_height(WIDTH, 24);
-
-        assert!(view.set_background_processes(vec![BackgroundProcess {
-            session_id: 42,
-            command: "cargo nextest run".to_string(),
-            cwd: PathBuf::from("/tmp/bettercodex"),
-            running_for: Duration::from_secs(10),
-        }]));
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "build".to_string(),
+            name: "bash".to_string(),
+            input: Some(json!({"command": COMMAND})),
+        });
+        assert!(view.advance_presentation(Instant::now()));
 
         let height = view.desired_height(WIDTH, 24);
-        assert_eq!(height, height_without_background_terminal + 1);
         let backend = TestBackend::new(WIDTH, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| view.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
+        let rendered = render_buffer(terminal.backend().buffer());
         let rows = rendered.lines().collect::<Vec<_>>();
+        let tool_y = rows
+            .iter()
+            .position(|row| row.contains("Running cargo build --release --locked"))
+            .expect("rendered live tool entry");
         let status_y = rows
             .iter()
             .position(|row| row.contains("Working ("))
-            .expect("rendered activity status") as u16;
-        let detail_y = rows
-            .iter()
-            .position(|row| row.contains("└ cargo nextest run"))
-            .expect("rendered terminal detail row") as u16;
-        let background_terminal_y = rows
-            .iter()
-            .position(|row| row.contains("1 background terminal running"))
-            .expect("rendered background terminal row") as u16;
-        let composer_background = view.user_message_style.bg.unwrap();
-        let composer_y = (0..height)
-            .find(|&y| buffer[(0, y)].bg == composer_background)
-            .expect("rendered composer");
+            .expect("rendered activity status");
 
-        assert!(
-            !rows[usize::from(status_y)].contains("cargo nextest")
-                && !rows[usize::from(status_y)].contains("background terminal"),
-            "{rendered}"
-        );
-        assert_eq!(detail_y, status_y + 1, "{rendered}");
-        assert_eq!(background_terminal_y, detail_y + 1, "{rendered}");
-        assert_eq!(
-            composer_y,
-            background_terminal_y + 1 + ACTIVITY_COMPOSER_GAP,
-            "{rendered}"
-        );
-        assert_eq!(
-            rendered.matches("cargo nextest run").count(),
-            1,
-            "{rendered}"
-        );
-        assert_eq!(
-            rendered.matches("1 background terminal running").count(),
-            1,
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn background_wait_command_uses_a_detail_row_between_status_and_composer() {
-        const WIDTH: u16 = 48;
-        const COMMAND: &str = "cargo test -p bettercodex -- --exact some::very::long::test::name";
-
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.start_turn(&UserPrompt::text("test"));
-        let _ = view.take_pending_history_lines(WIDTH, 24);
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:start".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": COMMAND})),
-        });
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:start".to_string(),
-            output: Ok(json!({"session_id": 42, "output": ""})),
-            duration: Duration::from_millis(10),
-        });
-        view.advance_presentation(Instant::now());
-        let _ = view.take_pending_history_lines(WIDTH, 24);
-        let height_without_wait = view.desired_height(WIDTH, 24);
-
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:wait".to_string(),
-            name: "write_stdin".to_string(),
-            input: Some(json!({"session_id": 42})),
-        });
-        view.advance_presentation(Instant::now());
-
-        let height = view.desired_height(WIDTH, 24);
-        assert_eq!(height, height_without_wait + 1);
-        let backend = TestBackend::new(WIDTH, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
-        let rows = rendered.lines().collect::<Vec<_>>();
-        let status_y = rows
-            .iter()
-            .position(|row| row.contains("Waiting for background terminal"))
-            .expect("rendered wait status") as u16;
-        let detail_y = rows
-            .iter()
-            .position(|row| row.contains("└ cargo test -p bettercodex"))
-            .expect("rendered command detail") as u16;
-        let composer_background = view.user_message_style.bg.unwrap();
-        let composer_y = (0..height)
-            .find(|&y| buffer[(0, y)].bg == composer_background)
-            .expect("rendered composer");
-        let composer_bottom = (0..height)
-            .rfind(|&y| buffer[(0, y)].bg == composer_background)
-            .expect("rendered composer")
-            .saturating_add(1);
-        let footer_y = rows
-            .iter()
-            .position(|row| row.contains(view.model_selection.model.as_str()))
-            .expect("rendered footer") as u16;
-
-        assert!(
-            !rows[usize::from(status_y)].contains("cargo test"),
-            "{rendered}"
-        );
-        assert_eq!(detail_y, status_y + 1, "{rendered}");
-        assert_eq!(
-            composer_y,
-            detail_y + 1 + ACTIVITY_COMPOSER_GAP,
-            "{rendered}"
-        );
-        assert_eq!(footer_y, composer_bottom, "{rendered}");
-        assert_eq!(rendered.matches("cargo test").count(), 1, "{rendered}");
-        assert!(rows[usize::from(detail_y)].contains('…'), "{rendered}");
+        assert!(tool_y < status_y, "{rendered}");
+        assert_eq!(rendered.matches(COMMAND).count(), 1, "{rendered}");
     }
 
     #[test]
@@ -6744,17 +5742,29 @@ mod tests {
     }
 
     #[test]
-    fn nested_exec_uses_codex_command_cell_shape() {
+    fn direct_bash_streams_and_uses_the_command_cell_shape() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "cell:cmd".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "cargo test"})),
+            name: "bash".to_string(),
+            input: Some(json!({"command": "cargo test"})),
         });
+        view.handle_agent_event(AgentEvent::ToolOutputDelta {
+            call_id: "cell:cmd".to_string(),
+            stream: crate::process_runtime::OutputStream::Stdout,
+            chunk: "checking\n".to_string(),
+        });
+        assert!(
+            view.active_lines(80)
+                .iter()
+                .map(plain)
+                .any(|line| line.contains("checking"))
+        );
         view.handle_agent_event(AgentEvent::ToolCompleted {
             call_id: "cell:cmd".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": "21 passed\n"})),
+            output: Ok(json!({"exit_code": 0, "stdout": "21 passed\n", "stderr": ""})),
+            file_change: None,
             duration: Duration::from_millis(50),
         });
         let rendered = view
@@ -6765,147 +5775,21 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("• Ran cargo test"));
         assert!(rendered.contains("  └ 21 passed"));
-        assert!(!rendered.contains("exec ·"));
     }
 
     #[test]
-    fn write_stdin_uses_current_codex_interaction_cell_shape() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:start".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "bash"})),
-        });
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:start".to_string(),
-            output: Ok(json!({"session_id": 42, "output": ""})),
-            duration: Duration::from_millis(10),
-        });
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:input".to_string(),
-            name: "write_stdin".to_string(),
-            input: Some(json!({"session_id": 42, "chars": "echo ready\n"})),
-        });
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:input".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": "ready\n"})),
-            duration: Duration::from_millis(10),
-        });
-        let rendered = view
-            .take_pending_history_lines(80, 24)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            rendered.contains("↳ Interacted with background terminal · bash"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("  └ echo ready"), "{rendered}");
-        assert!(!rendered.contains("  └ ready"), "{rendered}");
-    }
-
-    #[test]
-    fn stale_empty_write_stdin_poll_is_not_rendered() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:start".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "set -eu\nprintf done"})),
-        });
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:start".to_string(),
-            output: Ok(json!({"session_id": 42, "output": ""})),
-            duration: Duration::from_millis(10),
-        });
-        let _ = view.take_pending_history_lines(80, 24);
-
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:stale-wait".to_string(),
-            name: "write_stdin".to_string(),
-            input: Some(json!({"session_id": 42})),
-        });
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:stale-wait".to_string(),
-            output: Err("Unknown process id 42".to_string()),
-            duration: Duration::from_millis(10),
-        });
-
-        assert!(view.take_pending_history_lines(80, 24).is_empty());
-        assert!(view.active_lines(80).is_empty());
-        assert!(!view.process_commands.contains_key(&42));
-    }
-
-    #[test]
-    fn completed_empty_write_stdin_poll_is_not_rendered() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.process_commands.insert(42, "cargo test".to_string());
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:final-wait".to_string(),
-            name: "write_stdin".to_string(),
-            input: Some(json!({"session_id": 42})),
-        });
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:final-wait".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": "done\n"})),
-            duration: Duration::from_millis(10),
-        });
-
-        assert!(view.take_pending_history_lines(80, 24).is_empty());
-        assert!(view.active_lines(80).is_empty());
-        assert!(!view.process_commands.contains_key(&42));
-    }
-
-    #[test]
-    fn repeated_live_write_stdin_polls_coalesce_like_codex() {
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.process_commands.insert(42, "just fix".to_string());
-        for call_id in ["cell:wait-1", "cell:wait-2"] {
-            view.handle_agent_event(AgentEvent::ToolStarted {
-                call_id: call_id.to_string(),
-                name: "write_stdin".to_string(),
-                input: Some(json!({"session_id": 42})),
-            });
-            view.handle_agent_event(AgentEvent::ToolCompleted {
-                call_id: call_id.to_string(),
-                output: Ok(json!({"session_id": 42, "output": ""})),
-                duration: Duration::from_millis(10),
-            });
-        }
-        view.handle_agent_event(completed_message("Finished."));
-
-        let rendered = view
-            .take_pending_history_lines(80, 24)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(
-            rendered
-                .matches("• Waited for background terminal · just fix")
-                .count(),
-            1,
-            "{rendered}"
-        );
-        assert!(!rendered.contains("Unknown process id"), "{rendered}");
-    }
-
-    #[test]
-    fn read_commands_use_codex_explored_cell() {
+    fn direct_exploration_uses_the_explored_cell_and_replays_failures() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.handle_agent_event(AgentEvent::ToolStarted {
             call_id: "cell:read".to_string(),
-            name: "exec_command".to_string(),
-            input: Some(json!({"cmd": "sed -n '1,20p' src/main.rs"})),
+            name: "read".to_string(),
+            input: Some(json!({"path": "src/main.rs", "offset": 1, "limit": 20})),
         });
         view.handle_agent_event(AgentEvent::ToolCompleted {
             call_id: "cell:read".to_string(),
-            output: Ok(json!({"exit_code": 0, "output": "fn main() {}\n"})),
+            output: Ok(json!("fn main() {}\n")),
+            file_change: None,
             duration: Duration::from_millis(10),
         });
         view.seal_exploration();
@@ -6916,168 +5800,382 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("• Explored"), "{rendered}");
-        assert!(rendered.contains("Read main.rs"), "{rendered}");
+        assert!(rendered.contains("Read src/main.rs"), "{rendered}");
         assert!(!rendered.contains("fn main"), "{rendered}");
+
+        let mut failed = View::new(Path::new("/tmp/bettercodex"));
+        failed.welcome_pending = false;
+        failed.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:failed-read".to_string(),
+            name: "read".to_string(),
+            input: Some(json!({"path": "missing.rs"})),
+        });
+        failed.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:failed-read".to_string(),
+            output: Err("unable to read `missing.rs`".to_string()),
+            file_change: None,
+            duration: Duration::from_millis(10),
+        });
+        failed.seal_exploration();
+        let lines = failed.take_pending_history_lines(80, 24);
+        let failure_row = lines
+            .iter()
+            .position(|line| plain(line).contains("Failed to read missing.rs"))
+            .expect("rendered failed read header");
+        let buffer = crate::tui::terminal::render_history_lines(&lines, 80);
+        let marker = &buffer[(0, failure_row as u16)];
+        assert_eq!(marker.symbol(), "•");
+        assert_eq!(marker.fg, Color::Red);
+        let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("Failed to read missing.rs"), "{rendered}");
+        assert!(
+            rendered.contains("unable to read `missing.rs`"),
+            "{rendered}"
+        );
+
+        let mut failed_bash = View::new(Path::new("/tmp/bettercodex"));
+        failed_bash.welcome_pending = false;
+        failed_bash.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:failed-search".to_string(),
+            name: "bash".to_string(),
+            input: Some(json!({"command": "rg needle src"})),
+        });
+        failed_bash.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:failed-search".to_string(),
+            output: Ok(json!({
+                "exit_code": 2,
+                "stdout": "",
+                "stderr": "rg: invalid search pattern",
+            })),
+            file_change: None,
+            duration: Duration::from_millis(10),
+        });
+        failed_bash.seal_exploration();
+        let transcript = failed_bash.session_transcript();
+        let rendered = failed_bash
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut replay = View::new(Path::new("/tmp/bettercodex"));
+        replay.welcome_pending = false;
+        replay.replay_transcript(transcript);
+        let replayed = replay
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for output in [rendered, replayed] {
+            assert!(output.contains("Failed rg needle src"), "{output}");
+            assert!(output.contains("rg: invalid search pattern"), "{output}");
+        }
     }
 
     #[test]
-    fn web_search_uses_codex_activity_cell_and_hides_internal_reference_ids() {
+    fn direct_file_changes_render_and_replay_changed_rows_only() {
+        let update = diffy::create_patch("alpha\nbeta\n", "alpha\ngamma\n").to_string();
+        let multi_hunk_update = concat!(
+            "--- original\n",
+            "+++ modified\n",
+            "@@ -1,2 +1,2 @@\n",
+            "-one\n",
+            "+ONE\n",
+            " keep\n",
+            "@@ -12,2 +12,2 @@\n",
+            " x\n",
+            "-last\n",
+            "+LAST\n",
+        );
+        let cases = [
+            (
+                "write",
+                json!({"path": "stale/new-from-input.rs", "content": "alpha\nbeta\n"}),
+                ToolFileChange {
+                    path: PathBuf::from("/tmp/bettercodex/new.rs"),
+                    change: FileChange::Add {
+                        content: "alpha\nbeta\n".to_string(),
+                    },
+                },
+                vec!["• Added new.rs (+2 -0)", "1 +alpha", "2 +beta"],
+            ),
+            (
+                "edit",
+                json!({"path": "existing.rs", "edits": []}),
+                ToolFileChange {
+                    path: PathBuf::from("/tmp/bettercodex/existing.rs"),
+                    change: FileChange::Update {
+                        unified_diff: update,
+                        move_path: None,
+                    },
+                },
+                vec!["• Edited existing.rs (+1 -1)", "2 -beta", "2 +gamma"],
+            ),
+            (
+                "edit",
+                json!({"path": "separated.rs", "edits": []}),
+                ToolFileChange {
+                    path: PathBuf::from("/tmp/bettercodex/separated.rs"),
+                    change: FileChange::Update {
+                        unified_diff: multi_hunk_update.to_string(),
+                        move_path: None,
+                    },
+                },
+                vec![
+                    "• Edited separated.rs (+2 -2)",
+                    "1 -one",
+                    "1 +ONE",
+                    "⋮",
+                    "13 -last",
+                    "13 +LAST",
+                ],
+            ),
+            (
+                "edit",
+                json!({"path": "obsolete.rs", "edits": []}),
+                ToolFileChange {
+                    path: PathBuf::from("/tmp/bettercodex/obsolete.rs"),
+                    change: FileChange::Delete {
+                        content: "old\ncontent\n".to_string(),
+                    },
+                },
+                vec!["• Deleted obsolete.rs (+0 -2)", "1 -old", "2 -content"],
+            ),
+        ];
+
+        for (name, input, file_change, expected) in cases {
+            let mut view = View::new(Path::new("/tmp/bettercodex"));
+            view.welcome_pending = false;
+            view.handle_agent_event(AgentEvent::ToolStarted {
+                call_id: "file-change".to_string(),
+                name: name.to_string(),
+                input: Some(input),
+            });
+            view.handle_agent_event(AgentEvent::ToolCompleted {
+                call_id: "file-change".to_string(),
+                output: Ok(json!("Done")),
+                file_change: Some(file_change),
+                duration: Duration::from_millis(1),
+            });
+            let transcript = view.session_transcript();
+            let lines = view.take_pending_history_lines(80, 24);
+            let buffer = crate::tui::terminal::render_history_lines(&lines, 80);
+            let rendered = render_buffer(&buffer);
+            let rendered_rows = rendered
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(rendered_rows, expected, "{rendered}");
+
+            let mut replay = View::new(Path::new("/tmp/bettercodex"));
+            replay.welcome_pending = false;
+            replay.replay_transcript(transcript);
+            let replayed_rows = replay
+                .take_pending_history_lines(80, 24)
+                .iter()
+                .map(|line| plain(line).trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(replayed_rows, expected);
+        }
+
+        let narrow = file_change::lines(
+            "wide.rs",
+            &FileChange::Add {
+                content: "x".repeat(2_049),
+            },
+            8,
+            Style::default(),
+        );
+        assert_eq!(narrow.len(), 1_002);
+        assert!(plain(narrow.last().expect("omission row")).contains('…'));
+    }
+
+    #[test]
+    fn assistant_url_citations_render_as_clickable_sources() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:web".to_string(),
-            name: "web.run".to_string(),
-            input: Some(json!({
-                "open": [
-                    {"ref_id": "turn0search1"},
-                    {"ref_id": "turn0search3"},
-                    {"ref_id": "turn0search4"},
-                    {"ref_id": "turn0search0"},
-                ],
-            })),
-        });
+        view.handle_agent_event(AgentEvent::ModelMessageCompleted(AssistantMessage {
+            text: "A cited answer.[1]".to_string(),
+            phase: Some(MessagePhase::FinalAnswer),
+            citations: vec![crate::web_search::UrlCitation {
+                start_index: 15,
+                end_index: 18,
+                url: "https://example.com/source".to_string(),
+                title: "Example source".to_string(),
+            }],
+        }));
 
+        let lines = view.take_pending_history_lines(80, 24);
+        assert!(lines.iter().any(|line| plain(line).contains("Sources:")));
+        let source = lines
+            .iter()
+            .find(|line| plain(line).contains("Example source"))
+            .expect("citation source line");
+        assert_eq!(source.hyperlinks.len(), 1);
+        assert_eq!(
+            source.hyperlinks[0].destination,
+            "https://example.com/source"
+        );
+        assert_eq!(
+            view.copy_latest_final_action(),
+            Action::Copy(
+                "A cited answer.[1]\n\nSources:\n1. Example source: https://example.com/source"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn fast_hosted_web_search_shows_an_active_frame_before_completion() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("find current information"));
+        let _ = view.take_pending_history_lines(80, 24);
+        let active = crate::web_search::WebSearchCall {
+            id: "ws_fast".to_string(),
+            status: Some("in_progress".to_string()),
+            action: Some(crate::web_search::WebSearchAction::Search {
+                query: Some("current information".to_string()),
+                queries: None,
+            }),
+        };
+        let mut completed = active.clone();
+        completed.status = Some("completed".to_string());
+
+        view.handle_agent_event(AgentEvent::WebSearchStarted(active));
+        view.handle_agent_event(AgentEvent::WebSearchCompleted(completed));
+
+        let first_frame_at = Instant::now();
+        assert!(view.advance_presentation(first_frame_at));
+        let first_frame = view
+            .active_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            first_frame.contains("• Searching the web current information"),
+            "{first_frame}"
+        );
+        assert!(!first_frame.contains("Searched the web"), "{first_frame}");
+        assert!(view.has_pending_presentation());
+
+        assert!(view.advance_presentation(first_frame_at + MIN_FRAME_INTERVAL));
+        let second_frame = view
+            .active_lines(80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            second_frame.contains("• Searched the web for current information"),
+            "{second_frame}"
+        );
+    }
+
+    #[test]
+    fn hosted_web_search_activity_replays_its_completed_action() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        let active = crate::web_search::WebSearchCall {
+            id: "ws_1".to_string(),
+            status: Some("in_progress".to_string()),
+            action: Some(crate::web_search::WebSearchAction::Search {
+                query: Some("ratatui activity".to_string()),
+                queries: None,
+            }),
+        };
+        view.handle_agent_event(AgentEvent::WebSearchStarted(active.clone()));
         assert_eq!(
             view.active_lines(80).iter().map(plain).collect::<Vec<_>>(),
-            ["• Searching the web"]
+            ["• Searching the web ratatui activity"]
         );
 
-        view.handle_agent_event(AgentEvent::ToolCompleted {
-            call_id: "cell:web".to_string(),
-            output: Ok(json!(
-                "opaque search result that must remain model-facing only"
-            )),
-            duration: Duration::from_millis(50),
-        });
+        let mut completed = active;
+        completed.status = Some("completed".to_string());
+        view.handle_agent_event(AgentEvent::WebSearchCompleted(completed));
+        let transcript = view.session_transcript();
+        let expected = ["• Searched the web for ratatui activity"];
         assert_eq!(
             view.take_pending_history_lines(80, 24)
                 .iter()
                 .map(plain)
                 .collect::<Vec<_>>(),
-            ["• Searched the web"]
+            expected
         );
-    }
 
-    #[test]
-    fn plan_and_image_cells_match_codex_labels() {
-        let plan = PlanDisplay::parse(Some(&json!({
-            "plan": [
-                {"step": "Port viewport", "status": "completed"},
-                {"step": "Port tools", "status": "in_progress"}
-            ]
-        })));
-        let outcome = ToolOutcome {
-            output: Ok(json!("Plan updated")),
-        };
-        let rendered = plan
-            .display_lines(Some(&outcome), 80)
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("• Updated Plan"));
-        assert!(rendered.contains("✔ Port viewport"));
-        assert!(rendered.contains("□ Port tools"));
-
-        let image = view_image_lines(Some(&outcome), "screen.png", 80);
-        assert_eq!(plain(&image[0]), "• Viewed Image");
-        assert_eq!(plain(&image[1]), "  └ screen.png");
-    }
-
-    #[test]
-    fn patch_summary_matches_codex_structure() {
-        let patch = PatchDisplay::parse(
-            "*** Begin Patch\n*** Add File: new.txt\n+alpha\n+beta\n*** End Patch",
-            Path::new("/tmp"),
-        );
-        let outcome = ToolOutcome {
-            output: Ok(json!("Done!")),
-        };
-        let lines = patch.display_lines(
-            Some(&outcome),
-            80,
-            user_message_style_for(Some((31, 31, 31))),
-        );
-        let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("• Added new.txt (+2 -0)"));
-        assert!(rendered.contains("1 +alpha"));
-        assert!(rendered.contains("2 +beta"));
+        let mut replay = View::new(Path::new("/tmp/bettercodex"));
+        replay.welcome_pending = false;
+        replay.replay_transcript(transcript);
         assert_eq!(
-            lines
+            replay
+                .take_pending_history_lines(80, 24)
                 .iter()
-                .find(|line| plain(line).contains("+alpha"))
-                .and_then(|line| line.style.bg),
-            Some(Color::Rgb(33, 58, 43))
+                .map(plain)
+                .collect::<Vec<_>>(),
+            expected
         );
     }
 
     #[test]
-    fn active_patch_rows_fill_the_viewport_width() {
-        const WIDTH: u16 = 40;
-        let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.welcome_pending = false;
-        view.handle_agent_event(AgentEvent::ToolStarted {
-            call_id: "cell:patch".to_string(),
-            name: "apply_patch".to_string(),
-            input: Some(json!(
-                "*** Begin Patch\n*** Add File: new.txt\n+alpha\n*** End Patch"
-            )),
-        });
-
-        let height = view.desired_height(WIDTH, 24);
-        let backend = TestBackend::new(WIDTH, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| view.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = render_buffer(buffer);
-        let patch_row = rendered
-            .lines()
-            .position(|row| row.contains("+alpha"))
-            .expect("active patch row") as u16;
-
-        for column in 0..WIDTH {
-            assert_eq!(
-                buffer[(column, patch_row)].bg,
-                Color::Rgb(33, 58, 43),
-                "column {column} did not retain the patch row background\n{rendered}"
-            );
-        }
-    }
-
-    #[test]
-    fn patch_hunk_rows_use_source_line_numbers() {
-        let root = std::env::temp_dir().join(format!("bcodex-tui-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("sample.txt");
-        std::fs::write(
-            &path,
-            (1..=9)
-                .map(|number| format!("line {number}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .unwrap();
-        let patch = PatchDisplay::parse(
-            "*** Begin Patch\n*** Update File: sample.txt\n@@ line 5\n-line 6\n+six\n line 7\n*** End Patch",
-            &root,
+    fn hosted_web_search_terminal_statuses_are_not_rendered_as_success() {
+        let failed = crate::web_search::WebSearchCall {
+            id: "ws_failed".to_string(),
+            status: Some("failed".to_string()),
+            action: Some(crate::web_search::WebSearchAction::Search {
+                query: None,
+                queries: Some(vec!["unavailable source".to_string()]),
+            }),
+        };
+        let mut failed_view = View::new(Path::new("/tmp/bettercodex"));
+        failed_view.welcome_pending = false;
+        failed_view.handle_agent_event(AgentEvent::WebSearchCompleted(failed));
+        assert_eq!(
+            failed_view
+                .take_pending_history_lines(80, 24)
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>(),
+            ["• Web search failed for unavailable source"]
         );
-        let rendered = patch
-            .display_lines(
-                Some(&ToolOutcome {
-                    output: Ok(json!("Done!")),
-                }),
-                80,
-                user_message_style_for(Some((31, 31, 31))),
-            )
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::remove_dir_all(&root).unwrap();
 
-        assert!(rendered.contains("6 -line 6"), "{rendered}");
-        assert!(rendered.contains("6 +six"), "{rendered}");
-        assert!(rendered.contains("7  line 7"), "{rendered}");
+        let interrupted = crate::web_search::WebSearchCall {
+            id: "ws_interrupted".to_string(),
+            status: Some("searching".to_string()),
+            action: Some(crate::web_search::WebSearchAction::OpenPage {
+                url: Some("https://example.com/interrupted".to_string()),
+            }),
+        };
+        let mut interrupted_view = View::new(Path::new("/tmp/bettercodex"));
+        interrupted_view.welcome_pending = false;
+        interrupted_view.handle_agent_event(AgentEvent::WebSearchStarted(interrupted));
+        interrupted_view.finish_incomplete_tools();
+        let transcript = interrupted_view.session_transcript();
+        let expected = ["• Web search interrupted for https://example.com/interrupted"];
+        assert_eq!(
+            interrupted_view
+                .take_pending_history_lines(80, 24)
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        let mut replay = View::new(Path::new("/tmp/bettercodex"));
+        replay.welcome_pending = false;
+        replay.replay_transcript(transcript);
+        assert_eq!(
+            replay
+                .take_pending_history_lines(80, 24)
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -7125,25 +6223,6 @@ mod tests {
         );
 
         assert_eq!(view.editor.text(), "first ");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_shortcut_reference_uses_windows_chords() {
-        let rendered = shortcut_reference_lines()
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("Ctrl+Left / Right"), "{rendered}");
-        assert!(rendered.contains("Ctrl+Backspace"), "{rendered}");
-        assert!(rendered.contains("Shift+Enter / Ctrl+J"), "{rendered}");
-        assert!(
-            rendered.contains("terminal-owned clipboard paste"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("Option+"), "{rendered}");
     }
 
     #[test]

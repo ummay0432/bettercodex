@@ -17,12 +17,8 @@ const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GIT_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
 const GIT_DIFF_TIMEOUT: Duration = Duration::from_secs(30);
-const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
-    "core.hooksPath=NUL"
-} else {
-    "core.hooksPath=/dev/null"
-};
-const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+const DISABLE_HOOKS_CONFIG: &str = "core.hooksPath=/dev/null";
+const NULL_DEVICE: &str = "/dev/null";
 
 pub(super) async fn get_git_diff(cwd: PathBuf) -> Result<String, String> {
     get_git_diff_with_program(cwd, OsString::from("git")).await
@@ -252,17 +248,8 @@ impl<'a> GitRunner<'a> {
 }
 
 fn git_path(bytes: &[u8]) -> Result<OsString, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        Ok(OsString::from_vec(bytes.to_vec()))
-    }
-    #[cfg(windows)]
-    {
-        String::from_utf8(bytes.to_vec())
-            .map(OsString::from)
-            .map_err(|_| "git returned an untracked Windows path that is not UTF-8".to_string())
-    }
+    use std::os::unix::ffi::OsStringExt;
+    Ok(OsString::from_vec(bytes.to_vec()))
 }
 
 struct GitOutput {

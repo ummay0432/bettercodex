@@ -71,7 +71,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 #[cfg(test)]
 use ratatui::text::Text;
-use regex_lite::Regex;
+use regex::Regex;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;

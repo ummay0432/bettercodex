@@ -176,8 +176,7 @@ impl ModelSelection {
     }
 }
 
-/// Shared model identity for clients that outlive an individual request, such
-/// as the standalone web-search adapter.
+/// Shared model identity retained by the Responses client across turns.
 #[derive(Clone)]
 pub(crate) struct SharedModelSelection(Arc<RwLock<ModelSelection>>);
 

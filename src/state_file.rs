@@ -34,7 +34,7 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: usize) -> R
     options.read(true);
     // O_NONBLOCK prevents a substituted FIFO from hanging startup on Unix;
     // no-follow handling keeps reads on the bettercodex-owned state file.
-    crate::platform_fs::configure_private_file_nofollow(&mut options, true);
+    crate::private_fs::configure_private_file_nofollow(&mut options, true);
     let mut file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -45,7 +45,7 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: usize) -> R
     let metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect state file {}", path.display()))?;
-    if !metadata.is_file() || crate::platform_fs::is_link(&metadata) {
+    if !metadata.is_file() || crate::private_fs::is_link(&metadata) {
         return Err(anyhow!(
             "state file {} is not a regular file",
             path.display()
@@ -82,20 +82,20 @@ pub(crate) fn update_json<T: Serialize>(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("state path has no parent: {}", path.display()))?;
-    crate::platform_fs::create_private_directory_all(parent)
+    crate::private_fs::create_private_directory_all(parent)
         .with_context(|| format!("failed to create bettercodex home {}", parent.display()))?;
 
     let lock_path = companion_path(path, ".lock")?;
     let mut lock_options = OpenOptions::new();
     lock_options.create(true).read(true).write(true);
-    crate::platform_fs::configure_private_file_nofollow(&mut lock_options, false);
+    crate::private_fs::configure_private_file_nofollow(&mut lock_options, false);
     let lock = lock_options
         .open(&lock_path)
         .with_context(|| format!("failed to open state lock {}", lock_path.display()))?;
     let lock_metadata = lock
         .metadata()
         .with_context(|| format!("failed to inspect state lock {}", lock_path.display()))?;
-    if !lock_metadata.is_file() || crate::platform_fs::is_link(&lock_metadata) {
+    if !lock_metadata.is_file() || crate::private_fs::is_link(&lock_metadata) {
         return Err(anyhow!(
             "state lock {} is not a regular file",
             lock_path.display()
@@ -126,20 +126,20 @@ fn write_json<T: Serialize>(path: &Path, document: &T, max_bytes: usize) -> Resu
     let write_result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
-        crate::platform_fs::configure_private_file(&mut options);
+        crate::private_fs::configure_private_file(&mut options);
         let mut file = options
             .open(&temporary)
             .with_context(|| format!("failed to open temporary state {}", temporary.display()))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        crate::platform_fs::replace_file(&temporary, path).with_context(|| {
+        crate::private_fs::replace_file(&temporary, path).with_context(|| {
             format!(
                 "failed to replace state file {} with {}",
                 path.display(),
                 temporary.display()
             )
         })?;
-        crate::platform_fs::sync_directory(parent)?;
+        crate::private_fs::sync_directory(parent)?;
         Ok(())
     })();
     if write_result.is_err() {

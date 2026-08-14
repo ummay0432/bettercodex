@@ -4,11 +4,15 @@ use crate::context::EFFECTIVE_CONTEXT_WINDOW;
 use crate::events::AgentEvent;
 use crate::events::ModelTextDelta;
 use crate::protocol::MessagePhase;
+use crate::rollout::SessionTranscriptToolOrigin;
+use crate::rollout::SessionTranscriptToolOutput;
 use crate::skills::SkillUpdate;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use std::path::Path;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -30,7 +34,7 @@ fn runtime_without_agent() -> Runtime {
         turn: TurnTaskState::Idle,
         turn_events: None,
         turn_handle: None,
-        exit_after_turn: false,
+        exit_after_work: false,
         context_snapshot: ContextSnapshot {
             used_tokens: 0,
             context_window: EFFECTIVE_CONTEXT_WINDOW,
@@ -56,13 +60,15 @@ fn runtime_without_agent() -> Runtime {
         prompt_history_reader: None,
         prompt_history_task: None,
         prompt_history_exclusions: HashSet::new(),
-        processes: ProcessManager::new(cwd.clone()),
         model_selection: ModelSelection::default(),
         service_tier: ServiceTier::default(),
         session_scan: None,
         resume_task: None,
         notifier: None,
         operator_command_tasks: HashMap::new(),
+        operator_command_cancellations: HashMap::new(),
+        pending_operator_contexts: VecDeque::new(),
+        operator_context_steers: Vec::new(),
         operator_command_updates,
         operator_command_updates_tx,
         terminal_focused: true,
@@ -85,7 +91,7 @@ fn composer_action(view: &mut View, text: &str, key: KeyCode) -> Action {
 
 fn submitted_prompt(action: Action) -> UserPrompt {
     match action {
-        Action::Submit(submission) | Action::Queue(submission) => submission.into_prompt(),
+        Action::Submit(submission) => submission.into_prompt(),
         action => panic!("expected a composer submission, got {action:?}"),
     }
 }
@@ -96,6 +102,22 @@ fn rendered_history(view: &mut View) -> String {
         .flat_map(|line| line.line.spans.iter())
         .map(|span| span.content.as_ref())
         .collect()
+}
+
+fn rendered_view(view: &mut View) -> String {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| view.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -122,6 +144,7 @@ fn completed_turn_drain_renders_events_beyond_the_fairness_batch() {
         .send(AgentEvent::ModelMessageCompleted(AssistantMessage {
             text: answer,
             phase: Some(MessagePhase::FinalAnswer),
+            citations: Vec::new(),
         }))
         .unwrap();
     drop(events);
@@ -188,6 +211,295 @@ fn session_action_failures_are_rendered_without_exiting() {
         "{rendered}"
     );
     assert!(rendered.contains("■ Could not update skill:"), "{rendered}");
+}
+
+#[tokio::test]
+async fn operator_command_streams_and_escape_cancels_its_process_tree() {
+    let mut runtime = runtime_without_agent();
+    runtime.cwd = std::env::current_dir().unwrap();
+    let action = composer_action(
+        &mut runtime.view,
+        "!printf 'local-live-marker\\n'; exec sleep 30",
+        KeyCode::Enter,
+    );
+    assert!(!runtime.handle_action(action));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let update = runtime
+                .operator_command_updates
+                .recv()
+                .await
+                .expect("operator command update channel");
+            let contains_marker = matches!(
+                &update,
+                OperatorCommandUpdate::Output { chunk, .. }
+                    if chunk.contains("local-live-marker")
+            );
+            runtime.apply_operator_command_update(update);
+            if contains_marker {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("operator command should stream before sleeping");
+
+    let live = rendered_view(&mut runtime.view);
+    assert!(live.contains("local-live-marker"), "{live}");
+    let cancel = runtime
+        .view
+        .handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert_eq!(cancel, Action::Cancel);
+    assert!(!runtime.handle_action(cancel));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.operator_command_tasks.is_empty() {
+            let update = runtime
+                .operator_command_updates
+                .recv()
+                .await
+                .expect("operator command completion");
+            runtime.apply_operator_command_update(update);
+        }
+    })
+    .await
+    .expect("cancelled operator command should finish promptly");
+
+    let transcript = runtime.view.session_transcript();
+    let tool = transcript
+        .iter()
+        .find_map(|item| match item {
+            SessionTranscriptItem::Tool { tool } => Some(tool),
+            _ => None,
+        })
+        .expect("operator command transcript cell");
+    assert_eq!(tool.origin, SessionTranscriptToolOrigin::Operator);
+    let Some(SessionTranscriptToolOutput::Success(output)) = &tool.output else {
+        panic!("operator command should retain its structured output");
+    };
+    assert_eq!(output.get("exit_code").and_then(Value::as_i64), Some(130));
+    assert_eq!(runtime.operator_command_cancellations.len(), 0);
+    let context = runtime
+        .pending_operator_contexts
+        .front()
+        .expect("cancelled operator output should remain pending without an agent");
+    assert!(context.contains("<user_shell_command>"), "{context}");
+    assert!(context.contains("Exit code: 130"), "{context}");
+
+    let rendered = rendered_history(&mut runtime.view);
+    assert!(rendered.contains("You ran printf"), "{rendered}");
+    assert!(rendered.contains("local-live-marker"), "{rendered}");
+}
+
+#[tokio::test]
+async fn cancel_interrupts_operator_command_even_while_an_agent_turn_is_active() {
+    let mut runtime = runtime_without_agent();
+    runtime.cwd = std::env::current_dir().unwrap();
+    runtime.start_operator_command("exec sleep 30".to_string());
+    runtime.turn = TurnTaskState::Running(tokio::spawn(std::future::pending::<(
+        Agent,
+        TurnCompletion,
+    )>()));
+    let (turn_handle, _turn_control) = crate::agent::TurnControl::channel();
+    runtime.turn_handle = Some(turn_handle);
+
+    assert!(!runtime.handle_action(Action::Cancel));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.operator_command_tasks.is_empty() {
+            let update = runtime
+                .operator_command_updates
+                .recv()
+                .await
+                .expect("operator command completion");
+            runtime.apply_operator_command_update(update);
+        }
+    })
+    .await
+    .expect("concurrent operator command should be interrupted promptly");
+
+    let exit_code = runtime
+        .view
+        .session_transcript()
+        .iter()
+        .find_map(|item| match item {
+            SessionTranscriptItem::Tool { tool } => {
+                tool.output.as_ref().and_then(|output| match output {
+                    SessionTranscriptToolOutput::Success(output) => {
+                        output.get("exit_code").and_then(Value::as_i64)
+                    }
+                    SessionTranscriptToolOutput::Error(_) => None,
+                })
+            }
+            _ => None,
+        });
+    assert_eq!(exit_code, Some(130));
+    let [(_, context)] = runtime.operator_context_steers.as_slice() else {
+        panic!("active operator output should be retained as model-context steering");
+    };
+    assert!(context.contains("Exit code: 130"), "{context}");
+}
+
+#[tokio::test]
+async fn quit_cancels_and_waits_for_an_active_operator_command() {
+    let mut runtime = runtime_without_agent();
+    runtime.cwd = std::env::current_dir().unwrap();
+    runtime.start_operator_command("printf 'quit-live-marker\\n'; exec sleep 30".to_string());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let update = runtime
+                .operator_command_updates
+                .recv()
+                .await
+                .expect("operator command update");
+            let started = matches!(
+                &update,
+                OperatorCommandUpdate::Output { chunk, .. }
+                    if chunk.contains("quit-live-marker")
+            );
+            runtime.apply_operator_command_update(update);
+            if started {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("operator command should start before quit");
+
+    assert!(!runtime.handle_action(Action::Quit));
+    assert!(runtime.exit_after_work);
+    assert!(!runtime.exit_ready());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.operator_command_tasks.is_empty() {
+            let update = runtime
+                .operator_command_updates
+                .recv()
+                .await
+                .expect("operator command completion");
+            runtime.apply_operator_command_update(update);
+        }
+    })
+    .await
+    .expect("quit should interrupt the operator command promptly");
+
+    assert!(runtime.exit_ready());
+    let exit_code = runtime
+        .view
+        .session_transcript()
+        .iter()
+        .find_map(|item| match item {
+            SessionTranscriptItem::Tool { tool } => {
+                tool.output.as_ref().and_then(|output| match output {
+                    SessionTranscriptToolOutput::Success(output) => {
+                        output.get("exit_code").and_then(Value::as_i64)
+                    }
+                    SessionTranscriptToolOutput::Error(_) => None,
+                })
+            }
+            _ => None,
+        });
+    assert_eq!(exit_code, Some(130));
+}
+
+#[tokio::test]
+async fn user_message_during_operator_command_is_queued_until_local_work_finishes() {
+    let mut runtime = runtime_without_agent();
+    runtime
+        .view
+        .start_operator_command("operator:busy".to_string(), "sleep 30");
+    runtime.operator_command_tasks.insert(
+        "operator:busy".to_string(),
+        tokio::spawn(std::future::pending()),
+    );
+
+    let action = composer_action(
+        &mut runtime.view,
+        "continue after the command",
+        KeyCode::Enter,
+    );
+    assert!(!runtime.handle_action(action));
+
+    let rendered = rendered_view(&mut runtime.view);
+    assert!(rendered.contains("Queued follow-up inputs"), "{rendered}");
+    assert!(
+        rendered.contains("continue after the command"),
+        "{rendered}"
+    );
+    assert_eq!(
+        runtime.view.pop_next_queued_follow_up(),
+        Some(QueuedFollowUp::Prompt(UserPrompt::text(
+            "continue after the command"
+        )))
+    );
+}
+
+#[tokio::test]
+async fn tab_queues_shell_until_the_active_turn_finishes_and_blocks_the_next_input() {
+    let mut runtime = runtime_without_agent();
+    runtime.cwd = std::env::current_dir().unwrap();
+    runtime.view.start_turn(&UserPrompt::text("active turn"));
+    runtime.turn = TurnTaskState::Running(tokio::spawn(std::future::pending::<(
+        Agent,
+        TurnCompletion,
+    )>()));
+
+    let shell = composer_action(
+        &mut runtime.view,
+        "!printf 'queued-shell-marker\\n'; sleep 0.05",
+        KeyCode::Tab,
+    );
+    assert!(matches!(shell, Action::Queue(_)));
+    assert!(!runtime.handle_action(shell));
+    let empty_shell = composer_action(&mut runtime.view, "!", KeyCode::Tab);
+    assert!(matches!(empty_shell, Action::Queue(_)));
+    assert!(!runtime.handle_action(empty_shell));
+    let next = composer_action(&mut runtime.view, "continue after shell", KeyCode::Tab);
+    assert!(matches!(next, Action::Queue(_)));
+    assert!(!runtime.handle_action(next));
+    assert!(runtime.operator_command_tasks.is_empty());
+
+    let TurnTaskState::Running(task) = std::mem::replace(&mut runtime.turn, TurnTaskState::Idle)
+    else {
+        panic!("test turn should be active");
+    };
+    task.abort();
+    runtime
+        .view
+        .finish_turn(Ok(SubmitOutcome::Completed("turn complete".to_string())));
+    assert!(runtime.start_next_queued_follow_up());
+    assert!(!runtime.operator_command_tasks.is_empty());
+    let pending = rendered_view(&mut runtime.view);
+    assert!(pending.contains("continue after shell"), "{pending}");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.operator_command_tasks.is_empty() {
+            let update = runtime
+                .operator_command_updates
+                .recv()
+                .await
+                .expect("queued operator command update");
+            runtime.apply_operator_command_update(update);
+        }
+    })
+    .await
+    .expect("queued operator command should complete promptly");
+
+    let restored = runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(
+        submitted_prompt(restored),
+        UserPrompt::text("continue after shell")
+    );
+    let rendered = rendered_history(&mut runtime.view);
+    assert!(rendered.contains("queued-shell-marker"), "{rendered}");
+    assert!(
+        rendered.contains("Run an operator shell command with !command"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]
