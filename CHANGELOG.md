@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0] - 2026-08-14
+
+- upstream Codex's Code Mode/V8 tool stack was refactored, cutting roughly 12,500 lines of Rust
+- parallel tool calling improved
+- added `/tools`
+- Windows support removed (debloat)
+- tools refactored into a hybrid of pi's and Codex's approaches, combining the best of both worlds
+
 ## [0.1.9] - 2026-08-13
 
 - agents given more freedom with tool use
