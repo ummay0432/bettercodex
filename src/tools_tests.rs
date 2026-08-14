@@ -21,6 +21,34 @@ impl Drop for TemporaryDirectory {
     }
 }
 
+struct TemporarySocket {
+    path: PathBuf,
+    _listener: std::os::unix::net::UnixListener,
+}
+
+impl TemporarySocket {
+    fn new() -> Self {
+        // macOS limits Unix-domain socket paths to roughly 104 bytes, while its runner TMPDIR is
+        // already long. Keep this task-owned fixture directly under /tmp and remove it on failure.
+        let path = Path::new("/tmp").join(format!(
+            "bcodex-{}-{}.sock",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        Self {
+            path,
+            _listener: listener,
+        }
+    }
+}
+
+impl Drop for TemporarySocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn tiny_png() -> Vec<u8> {
     let image = image::ImageBuffer::from_pixel(1, 1, image::Rgba([10_u8, 20, 30, 255]));
     let mut bytes = std::io::Cursor::new(Vec::new());
@@ -575,15 +603,15 @@ async fn write_completion_reports_file_changes_and_rejects_special_files() {
         }))
     );
 
-    let socket_path = root.0.join("service.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let socket = TemporarySocket::new();
+    let socket_path = &socket.path;
     let fifo_path = root.0.join("events.fifo");
     use std::os::unix::ffi::OsStrExt;
     let fifo_c_path = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
     // SAFETY: `fifo_c_path` is a valid, NUL-terminated pathname that remains alive for the call.
     assert_eq!(unsafe { libc::mkfifo(fifo_c_path.as_ptr(), 0o600) }, 0);
 
-    for path in [&socket_path, &fifo_path] {
+    for path in [socket_path, &fifo_path] {
         let call = ToolCall {
             call_id: format!("call-write-{}", path.file_name().unwrap().to_string_lossy()),
             name: WRITE_NAME.to_string(),
