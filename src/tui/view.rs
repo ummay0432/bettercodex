@@ -3544,10 +3544,10 @@ fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec
             Span::from(" in another terminal.").dim(),
         ]),
         Line::from(vec![
-            Span::from("main: ").dim(),
-            Span::from(update.current_short_revision().to_string()).dim(),
+            Span::from("version: ").dim(),
+            Span::from(update.current_version().to_string()).dim(),
             Span::from(" → ").dim(),
-            Span::from(update.latest_short_revision().to_string()).dim(),
+            Span::from(update.latest_version().to_string()).dim(),
         ]),
     ];
     let mut content = Vec::new();
@@ -5522,8 +5522,7 @@ mod tests {
         assert!(rendered.contains("Update available"), "{rendered}");
         assert!(rendered.contains("bcodex update"), "{rendered}");
         assert!(rendered.contains("in another terminal"), "{rendered}");
-        assert!(rendered.contains("111111111111"), "{rendered}");
-        assert!(rendered.contains("222222222222"), "{rendered}");
+        assert!(rendered.contains("version: 1.2.3 → 1.3.0"), "{rendered}");
     }
 
     #[test]

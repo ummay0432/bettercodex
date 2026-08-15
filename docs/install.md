@@ -58,12 +58,13 @@ Every published binary embeds a tag of the form
 whether a newer full release is available; the revision pins the exact source
 and installer used for that release.
 
-After the TUI renders, a distribution build performs one bounded, failure-silent
-check against GitHub's latest non-draft, non-prerelease release. Set
-`BCODEX_SKIP_UPDATE_CHECK=1` to disable that background check. Development builds
-do not check for updates.
+After the TUI renders, published and optimized source builds perform one
+bounded, failure-silent check against GitHub's latest non-draft, non-prerelease
+release. Set `BCODEX_SKIP_UPDATE_CHECK=1` to disable that background check.
+Debug builds stay offline.
 
-To update a published build, run:
+To replace an older published or optimized source build with the latest
+published release, run:
 
 ```sh
 bcodex update
@@ -93,8 +94,9 @@ cargo build --locked
 cargo run --bin bcodex
 ```
 
-Development binaries intentionally have no embedded release tag, so
-`bcodex update` is unavailable for them.
+Development binaries intentionally have no embedded release tag. Optimized
+source builds still check the published release version and support
+`bcodex update`; debug builds do neither.
 
 ## Development checks
 

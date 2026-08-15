@@ -535,7 +535,7 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Install the latest published bettercodex release\n\nUsage:\n  bcodex update\n\nThe updater compares this binary's embedded release version with GitHub's latest published full release. If already current, it exits immediately. Otherwise it downloads, verifies, and atomically installs the matching prebuilt binary without compiling."
+        "Install the latest published bettercodex release\n\nUsage:\n  bcodex update\n\nThe updater compares this binary's package version with GitHub's latest published full release. If already current, it exits immediately. Otherwise it downloads, verifies, and atomically installs the matching prebuilt binary without compiling. Optimized source builds can use this command; debug builds cannot."
     ))
 }
 

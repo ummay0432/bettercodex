@@ -99,15 +99,15 @@ fn latest_release_requires_one_complete_native_asset() {
 
 #[tokio::test]
 async fn bounded_lookup_reports_only_newer_release_versions() {
-    let current = parse_release_tag(&release_tag_fixture("1.2.3", '1')).unwrap();
+    let current_version = "1.2.3";
     let (url, server) = serve_once(
         200,
         release_response("1.3.0", '2'),
         Duration::from_millis(0),
     );
     assert_eq!(
-        check_for_release_update_at(&url, &current, Duration::from_secs(1)).await,
-        Some(AvailableUpdate::new(&"1".repeat(40), &"2".repeat(40)))
+        check_for_release_update_at(&url, current_version, Duration::from_secs(1)).await,
+        Some(AvailableUpdate::new("1.2.3", "1.3.0"))
     );
     server.join().unwrap();
 
@@ -118,7 +118,7 @@ async fn bounded_lookup_reports_only_newer_release_versions() {
             Duration::from_millis(0),
         );
         assert_eq!(
-            check_for_release_update_at(&url, &current, Duration::from_secs(1)).await,
+            check_for_release_update_at(&url, current_version, Duration::from_secs(1)).await,
             None
         );
         server.join().unwrap();
@@ -127,7 +127,7 @@ async fn bounded_lookup_reports_only_newer_release_versions() {
 
 #[tokio::test]
 async fn malformed_failed_oversized_and_timed_out_lookups_are_silent() {
-    let current = parse_release_tag(&release_tag_fixture("1.2.3", '1')).unwrap();
+    let current_version = "1.2.3";
     for (status, body) in [
         (500, b"failure".to_vec()),
         (200, br#"{"tag_name":"invalid"}"#.to_vec()),
@@ -135,7 +135,7 @@ async fn malformed_failed_oversized_and_timed_out_lookups_are_silent() {
     ] {
         let (url, server) = serve_once(status, body, Duration::from_millis(0));
         assert_eq!(
-            check_for_release_update_at(&url, &current, Duration::from_secs(1)).await,
+            check_for_release_update_at(&url, current_version, Duration::from_secs(1)).await,
             None
         );
         server.join().unwrap();
@@ -147,13 +147,17 @@ async fn malformed_failed_oversized_and_timed_out_lookups_are_silent() {
         Duration::from_millis(100),
     );
     assert_eq!(
-        check_for_release_update_at(&url, &current, Duration::from_millis(10)).await,
+        check_for_release_update_at(&url, current_version, Duration::from_millis(10)).await,
         None
     );
     server.join().unwrap();
     assert_eq!(
-        check_for_release_update_with("invalid repository", &current, Duration::from_millis(10),)
-            .await,
+        check_for_release_update_with(
+            "invalid repository",
+            current_version,
+            Duration::from_millis(10),
+        )
+        .await,
         None
     );
 }

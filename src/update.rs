@@ -1,10 +1,10 @@
 //! Published-release checks and prebuilt-binary updates.
 //!
-//! Distribution builds embed their GitHub release tag. After the TUI renders,
-//! they compare its semantic version with the latest published full release.
-//! The explicit update command fetches the installer from that release's
-//! immutable source revision and lets it verify and atomically install the
-//! matching prebuilt binary.
+//! Published builds embed their GitHub release tag. After the TUI renders,
+//! published and optimized source builds compare their package version with the
+//! latest published full release. The explicit update command fetches the
+//! installer from that release's immutable source revision and lets it verify
+//! and atomically install the matching prebuilt binary.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -61,47 +61,45 @@ struct Release {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AvailableUpdate {
-    current_revision: String,
-    latest_revision: String,
+    current_version: String,
+    latest_version: String,
 }
 
 impl AvailableUpdate {
-    fn new(current_revision: &str, latest_revision: &str) -> Self {
+    fn new(current_version: &str, latest_version: &str) -> Self {
         Self {
-            current_revision: current_revision.to_string(),
-            latest_revision: latest_revision.to_string(),
+            current_version: current_version.to_string(),
+            latest_version: latest_version.to_string(),
         }
     }
 
-    pub(crate) fn current_short_revision(&self) -> &str {
-        short_revision(&self.current_revision)
+    pub(crate) fn current_version(&self) -> &str {
+        &self.current_version
     }
 
-    pub(crate) fn latest_short_revision(&self) -> &str {
-        short_revision(&self.latest_revision)
+    pub(crate) fn latest_version(&self) -> &str {
+        &self.latest_version
     }
 
     #[cfg(test)]
     pub(crate) fn test_fixture() -> Self {
-        Self::new(
-            "1111111111111111111111111111111111111111",
-            "2222222222222222222222222222222222222222",
-        )
+        Self::new("1.2.3", "1.3.0")
     }
 }
 
 /// Checks once for a newer published bettercodex release after the TUI renders.
 ///
-/// Development builds stay offline. Distribution builds can opt out by setting
-/// `BCODEX_SKIP_UPDATE_CHECK`. Failures stay silent and are retried on the next
-/// launch so startup and interactive work never depend on GitHub availability.
+/// Published and optimized source builds compare their package version with the
+/// release channel. Debug builds stay offline. Any optimized build can opt out
+/// by setting `BCODEX_SKIP_UPDATE_CHECK`. Failures stay silent and are retried
+/// on the next launch so startup and interactive work never depend on GitHub.
 pub(crate) async fn check_for_update() -> Option<AvailableUpdate> {
     if cfg!(debug_assertions) || std::env::var_os("BCODEX_SKIP_UPDATE_CHECK").is_some() {
         return None;
     }
-    let current = current_release()?;
+    let current_version = current_version().ok()?;
     let repository = configured_repository().ok()?;
-    check_for_release_update_with(&repository, &current, UPDATE_CHECK_TIMEOUT).await
+    check_for_release_update_with(&repository, current_version, UPDATE_CHECK_TIMEOUT).await
 }
 
 pub(crate) fn release_tag() -> Option<&'static str> {
@@ -118,25 +116,28 @@ pub(crate) fn source_revision() -> Option<&'static str> {
         .map(|(_, revision)| revision)
 }
 
-fn current_release() -> Option<Release> {
-    parse_release_tag(release_tag()?).ok()
+fn current_version() -> Result<&'static str> {
+    let version = env!("CARGO_PKG_VERSION");
+    parse_version(version)
+        .context("bettercodex package version is not major.minor.patch")
+        .map(|_| version)
 }
 
 async fn check_for_release_update_with(
     repository: &str,
-    current: &Release,
+    current_version: &str,
     timeout: Duration,
 ) -> Option<AvailableUpdate> {
     if validate_repository(repository).is_err() {
         return None;
     }
     let url = latest_release_api_url(repository);
-    check_for_release_update_at(&url, current, timeout).await
+    check_for_release_update_at(&url, current_version, timeout).await
 }
 
 async fn check_for_release_update_at(
     url: &str,
-    current: &Release,
+    current_version: &str,
     timeout: Duration,
 ) -> Option<AvailableUpdate> {
     let client = update_client(timeout).ok()?;
@@ -148,9 +149,9 @@ async fn check_for_release_update_at(
     .ok()?
     .ok()?;
     let latest = parse_latest_release(&response).ok()?;
-    is_newer(&latest.version, &current.version)
+    is_newer(&latest.version, current_version)
         .is_some_and(|newer| newer)
-        .then(|| AvailableUpdate::new(&current.revision, &latest.revision))
+        .then(|| AvailableUpdate::new(current_version, &latest.version))
 }
 
 fn latest_release_api_url(repository: &str) -> String {
@@ -272,10 +273,6 @@ fn is_source_revision(revision: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn short_revision(revision: &str) -> &str {
-    revision.get(..12).unwrap_or(revision)
-}
-
 fn is_sha256_digest(digest: &str) -> bool {
     digest
         .strip_prefix("sha256:")
@@ -309,9 +306,12 @@ fn is_repository_name_byte(byte: u8) -> bool {
 }
 
 pub(crate) fn run_update() -> Result<()> {
-    let current = current_release().context(
-        "this is not a published bettercodex build; install a published release before using `bcodex update`",
-    )?;
+    if cfg!(debug_assertions) {
+        bail!(
+            "debug bettercodex builds cannot be updated; use an optimized build or install a published release"
+        );
+    }
+    let current_version = current_version()?;
     let repository = configured_repository()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -319,12 +319,11 @@ pub(crate) fn run_update() -> Result<()> {
         .context("could not start the bettercodex update runtime")?;
     let client = update_client(Duration::from_secs(30))?;
     let latest = runtime.block_on(resolve_latest_release(&client, &repository))?;
-    if !is_newer(&latest.version, &current.version).unwrap_or(false) {
+    if !is_newer(&latest.version, current_version).unwrap_or(false) {
         let mut output = std::io::stdout().lock();
         writeln!(
             output,
-            "bettercodex {} is already the latest published release.",
-            current.version
+            "bettercodex {current_version} is already the latest published release."
         )?;
         return Ok(());
     }
