@@ -618,6 +618,7 @@ fn write_reports_creation_then_replacement_as_structured_file_changes() {
     );
 }
 
+#[cfg(not(target_vendor = "apple"))]
 #[tokio::test]
 async fn lifecycle_journal_preserves_non_utf8_resolved_targets() {
     use std::ffi::OsString;

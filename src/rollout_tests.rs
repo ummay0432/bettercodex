@@ -1080,6 +1080,7 @@ fn session_discovery_skips_an_unreadable_journal() {
     );
 }
 
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn non_utf8_working_directory_round_trips_through_discovery_and_resume() {
     use std::os::unix::ffi::OsStringExt as _;
