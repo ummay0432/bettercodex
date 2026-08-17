@@ -1,0 +1,73 @@
+bettercodex pre-release review prompts
+=====================================
+
+PROMPT 1 OF 8 — RESPONSES API AND TRANSPORTS
+
+You've been designated shard 1 of 8: Responses API and transports. Your shard is `src/api.rs`, `src/api_tests.rs`, `src/api_sse.rs`, `src/api_websocket.rs`, `src/http_client.rs`, `src/rate_limits.rs`, `src/url_encoding.rs`, and `src/web_search.rs`.
+
+Dedicate this session to putting your shard under a microscope and surgically `$review` it in preparation for the next release. Take your time, be thorough, fix the real issues you find, run the relevant tests, and don't cut corners or create pointless churn.
+
+There are seven other agents working alongside you, so don't get spooked by unrelated changes appearing in the repository. Preserve their work, only edit your shard, don't perform git operations, and report anything outside your scope as a handoff.
+
+
+PROMPT 2 OF 8 — AGENT, INPUT, SKILLS, AND PROTOCOL
+
+You've been designated shard 2 of 8: agent orchestration, input, skills, and protocol. Your shard is `src/agent.rs`, `src/agent_tests.rs`, `src/events.rs`, `src/input.rs`, `src/protocol.rs`, `src/repository.rs`, `src/skill_settings.rs`, `src/skills.rs`, `src/skills_review_tests.rs`, `src/system_skills.rs`, and `src/text.rs`.
+
+Dedicate this session to putting your shard under a microscope and surgically `$review` it in preparation for the next release. Take your time, be thorough, fix the real issues you find, run the relevant tests, and don't cut corners or create pointless churn.
+
+There are seven other agents working alongside you, so don't get spooked by unrelated changes appearing in the repository. Preserve their work, only edit your shard, don't perform git operations, and report anything outside your scope as a handoff.
+
+
+PROMPT 3 OF 8 — CONTEXT AND COMPACTION
+
+You've been designated shard 3 of 8: conversation context, compaction, token accounting, and truncation. Your shard is `src/compaction.rs`, `src/context.rs`, `src/context_tests.rs`, `src/truncation.rs`, `src/truncation/string.rs`, `src/truncation_tests.rs`, and `src/usage.rs`.
+
+Dedicate this session to putting your shard under a microscope and surgically `$review` it in preparation for the next release. Take your time, be thorough, fix the real issues you find, run the relevant tests, and don't cut corners or create pointless churn.
+
+There are seven other agents working alongside you, so don't get spooked by unrelated changes appearing in the repository. Preserve their work, only edit your shard, don't perform git operations, and report anything outside your scope as a handoff.
+
+
+PROMPT 4 OF 8 — ROLLOUT, RESUME, AND PERSISTENCE
+
+You've been designated shard 4 of 8: rollout journaling, resume, recovery, and local persistence. Your shard is `src/managed_session.rs`, `src/paths.rs`, `src/private_fs.rs`, `src/prompt_history.rs`, `src/prompt_history_tests.rs`, `src/rollout.rs`, `src/rollout_tests.rs`, `src/state_file.rs`, `src/state_file_tests.rs`, and `src/time.rs`.
+
+Dedicate this session to putting your shard under a microscope and surgically `$review` it in preparation for the next release. Take your time, be thorough, fix the real issues you find, run the relevant tests, and don't cut corners or create pointless churn.
+
+There are seven other agents working alongside you, so don't get spooked by unrelated changes appearing in the repository. Preserve their work, only edit your shard, don't perform git operations, and report anything outside your scope as a handoff.
+
+
+PROMPT 5 OF 8 — TOOLS, PROCESSES, SHELL, AND IMAGES
+
+You've been designated shard 5 of 8: function tools, process execution, shell handling, and image preparation. Your shard is `src/image.rs`, `src/image_preparation.rs`, `src/process_runtime.rs`, `src/process_runtime_tests.rs`, `src/shell_command/**`, `src/tools.rs`, and `src/tools_tests.rs`.
+
+Dedicate this session to putting your shard under a microscope and surgically `$review` it in preparation for the next release. Take your time, be thorough, fix the real issues you find, run the relevant tests, and don't cut corners or create pointless churn.
+
+There are seven other agents working alongside you, so don't get spooked by unrelated changes appearing in the repository. Preserve their work, only edit your shard, don't perform git operations, and report anything outside your scope as a handoff.
+
+
+PROMPT 6 OF 8 — TUI LIFECYCLE AND INTERACTION
+
+You've been designated shard 6 of 8: TUI lifecycle, composer, pickers, popups, search, and interaction. Your shard is `src/file_search.rs`, `src/file_search_tests.rs`, `src/fuzzy_match.rs`, `src/tui/bottom_pane/**`, `src/tui/clipboard.rs`, `src/tui/clipboard_paste.rs`, `src/tui/editor.rs`, `src/tui/file_search.rs`, `src/tui/login_screen.rs`, `src/tui/mod.rs`, `src/tui/model_picker.rs`, `src/tui/notifications.rs`, `src/tui/pending_input.rs`, `src/tui/resume_picker.rs`, `src/tui/review_tests.rs`, `src/tui/runtime_tests.rs`, `src/tui/skill_popup.rs`, `src/tui/skills_view.rs`, `src/tui/terminal.rs`, and `src/tui/terminal_title.rs`.
+
+Dedicate this session to putting your shard under a microscope and surgically `$review` it in preparation for the next release. Take your time, be thorough, fix the real issues you find, run the relevant tests, and don't cut corners or create pointless churn.
+
+There are seven other agents working alongside you, so don't get spooked by unrelated changes appearing in the repository. Preserve their work, only edit your shard, don't perform git operations, and report anything outside your scope as a handoff.
+
+
+PROMPT 7 OF 8 — TUI PRESENTATION AND RENDERING
+
+You've been designated shard 7 of 8: TUI transcript presentation, Markdown, wrapping, status, and rendering. Your shard is `src/ansi_escape.rs`, `src/assistant_message.rs`, `src/terminal_color.rs`, `src/tui/context_window.rs`, `src/tui/file_change.rs`, `src/tui/git_diff.rs`, `src/tui/markdown.rs`, `src/tui/markdown_cache.rs`, `src/tui/markdown_render.rs`, `src/tui/markdown_render/**`, `src/tui/markdown_style.rs`, `src/tui/markdown_text_merge.rs`, `src/tui/palette.rs`, `src/tui/presentation.rs`, `src/tui/render/**`, `src/tui/status.rs`, `src/tui/status_tests.rs`, `src/tui/table_detect.rs`, `src/tui/terminal_hyperlinks.rs`, `src/tui/tools_view.rs`, `src/tui/tools_view_tests.rs`, `src/tui/view.rs`, `src/tui/width.rs`, and `src/tui/wrapping.rs`.
+
+Dedicate this session to putting your shard under a microscope and surgically `$review` it in preparation for the next release. Take your time, be thorough, fix the real issues you find, run the relevant tests, and don't cut corners or create pointless churn.
+
+There are seven other agents working alongside you, so don't get spooked by unrelated changes appearing in the repository. Preserve their work, only edit your shard, don't perform git operations, and report anything outside your scope as a handoff.
+
+
+PROMPT 8 OF 8 — CLI, AUTH, UPDATES, RELEASE, AND REPOSITORY HYGIENE
+
+You've been designated shard 8 of 8: CLI startup, authentication, model settings, patch notes, updater, installer, release workflow, documentation, and repository hygiene. Your shard is `.config/nextest.toml`, `.github/workflows/release.yml`, `.gitignore`, `Cargo.lock`, `Cargo.toml`, `PAPERCUTS.md`, `README.md`, `SPEC.md`, `clippy.toml`, `docs/**`, `justfile`, `rust-toolchain.toml`, `rustfmt.toml`, `scripts/**`, `src/auth.rs`, `src/auth_tests.rs`, `src/login.rs`, `src/login_assets/**`, `src/main.rs`, `src/model.rs`, `src/patch_notes.rs`, `src/patch_notes_tests.rs`, `src/service_tier.rs`, `src/service_tier_tests.rs`, `src/update.rs`, and `src/update_tests.rs`.
+
+Dedicate this session to putting your shard under a microscope and surgically `$review` it in preparation for the next release. Take your time, be thorough, fix the real issues you find, run the relevant tests, and don't cut corners or create pointless churn. Do not prepare or publish the release yet, and do not edit `CHANGELOG.md`.
+
+There are seven other agents working alongside you, so don't get spooked by unrelated changes appearing in the repository. Preserve their work, only edit your shard, don't perform git operations, and report anything outside your scope as a handoff.
