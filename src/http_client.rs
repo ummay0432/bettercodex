@@ -5,6 +5,8 @@
 //! and custom enterprise CA handling. The route-aware proxy, telemetry,
 //! request abstraction, and provider systems are deliberately not retained.
 
+mod native_certs;
+
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -12,6 +14,9 @@ use rand::Rng;
 use reqwest::cookie::CookieStore;
 use reqwest::cookie::Jar;
 use reqwest::header::HeaderValue;
+use rustls::ClientConfig;
+use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::pem::SectionKind;
@@ -126,6 +131,45 @@ pub(crate) fn build_client(builder: reqwest::ClientBuilder) -> Result<reqwest::C
             bundle.path.display()
         )
     })
+}
+
+/// Builds a Responses WebSocket TLS config from native roots plus the configured custom roots.
+///
+/// A single combined root store preserves ordinary public trust and avoids spending part of the
+/// connection timeout on a native-only handshake that cannot succeed behind an enterprise CA.
+pub(crate) fn build_websocket_tls_config() -> Result<Option<Arc<ClientConfig>>> {
+    let Some(bundle) = ConfiguredCaBundle::from_environment() else {
+        return Ok(None);
+    };
+    ensure_rustls_crypto_provider();
+    let certificates = bundle.load_certificates()?;
+    let mut roots = RootCertStore::empty();
+    let rustls_native_certs::CertificateResult { certs, errors, .. } =
+        native_certs::load_platform_native_certs();
+    if !errors.is_empty() {
+        tracing::warn!(
+            native_root_error_count = errors.len(),
+            "encountered errors while loading native root certificates"
+        );
+    }
+    let _ = roots.add_parsable_certificates(certs);
+    for (index, certificate) in certificates.into_iter().enumerate() {
+        roots
+            .add(CertificateDer::from(certificate))
+            .with_context(|| {
+                format!(
+                    "failed to register certificate #{} from {} selected by {}; {CA_CERT_HINT}",
+                    index + 1,
+                    bundle.path.display(),
+                    bundle.source_env
+                )
+            })?;
+    }
+    Ok(Some(Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )))
 }
 
 #[derive(Debug)]

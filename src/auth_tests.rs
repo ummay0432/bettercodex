@@ -96,6 +96,115 @@ fn oversized_auth_file_is_rejected_before_loading() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[tokio::test]
+async fn unrefreshable_access_token_remains_usable_until_rejected() {
+    crate::http_client::ensure_rustls_crypto_provider();
+    let client = reqwest::Client::new();
+    let auth = SharedAuth::new(Auth {
+        access_token: "externally-managed-token".to_string(),
+        refresh_token: None,
+        account_id: Some("account-test".to_string()),
+        account: ChatGptAccount::default(),
+        expires_at: Some(unix_timestamp().unwrap() + 60),
+        last_refresh: None,
+        refresh_url: Cow::Borrowed(REFRESH_URL),
+        storage: None,
+    });
+
+    let snapshot = auth.refreshed_snapshot(&client).await.unwrap();
+
+    assert_eq!(
+        snapshot.authorization.to_str().unwrap(),
+        "Bearer externally-managed-token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proactive_refresh_failure_uses_the_current_token() {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let refresh_url = format!("http://{}", server.server_addr());
+    let server_task = std::thread::spawn(move || {
+        let request = server
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .expect("refresh request timed out");
+        request
+            .respond(
+                tiny_http::Response::from_string("temporary refresh outage").with_status_code(500),
+            )
+            .unwrap();
+    });
+    crate::http_client::ensure_rustls_crypto_provider();
+    let client = reqwest::Client::new();
+    let auth = SharedAuth::new(Auth {
+        access_token: "still-valid-token".to_string(),
+        refresh_token: Some("initial-refresh-token".to_string()),
+        account_id: Some("account-test".to_string()),
+        account: ChatGptAccount::default(),
+        expires_at: Some(unix_timestamp().unwrap() + 60),
+        last_refresh: Some(unix_timestamp().unwrap()),
+        refresh_url: Cow::Owned(refresh_url),
+        storage: None,
+    });
+
+    let snapshot = auth.refreshed_snapshot(&client).await.unwrap();
+    server_task.join().unwrap();
+
+    assert_eq!(
+        snapshot.authorization.to_str().unwrap(),
+        "Bearer still-valid-token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_refresh_timestamp_refreshes_a_token_without_expiration() {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let refresh_url = format!("http://{}", server.server_addr());
+    let server_task = std::thread::spawn(move || {
+        let request = server
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .expect("refresh request timed out");
+        let content_type = tiny_http::Header::from_bytes(
+            b"content-type".as_slice(),
+            b"application/json".as_slice(),
+        )
+        .unwrap();
+        request
+            .respond(
+                tiny_http::Response::from_string(
+                    serde_json::json!({
+                        "access_token": "fresh-token",
+                        "refresh_token": "fresh-refresh-token",
+                    })
+                    .to_string(),
+                )
+                .with_header(content_type),
+            )
+            .unwrap();
+    });
+    crate::http_client::ensure_rustls_crypto_provider();
+    let client = reqwest::Client::new();
+    let auth = SharedAuth::new(Auth {
+        access_token: "token-without-expiration".to_string(),
+        refresh_token: Some("initial-refresh-token".to_string()),
+        account_id: Some("account-test".to_string()),
+        account: ChatGptAccount::default(),
+        expires_at: None,
+        last_refresh: Some(unix_timestamp().unwrap() - REFRESH_INTERVAL.as_secs() - 1),
+        refresh_url: Cow::Owned(refresh_url),
+        storage: None,
+    });
+
+    let snapshot = auth.refreshed_snapshot(&client).await.unwrap();
+    server_task.join().unwrap();
+
+    assert_eq!(
+        snapshot.authorization.to_str().unwrap(),
+        "Bearer fresh-token"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_unauthorized_recovery_reuses_the_first_refresh() {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -131,6 +240,7 @@ async fn concurrent_unauthorized_recovery_reuses_the_first_refresh() {
         account_id: Some("account-test".to_string()),
         account: ChatGptAccount::default(),
         expires_at: None,
+        last_refresh: None,
         refresh_url: Cow::Owned(refresh_url),
         storage: None,
     });

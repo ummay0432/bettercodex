@@ -27,6 +27,8 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -43,6 +45,7 @@ const ROLLOUT_VERSION: u32 = 1;
 const STATE_DIRECTORY: &str = "bettercodex";
 const SESSIONS_DIRECTORY: &str = "sessions";
 const INSTALLATION_ID_FILE: &str = "installation_id";
+const MAX_INSTALLATION_ID_BYTES: usize = 128;
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 160;
 const HISTORY_RECORD_PREFIX: &[u8] = br#"{"type":"history_"#;
@@ -1073,26 +1076,7 @@ impl Rollout {
     }
 
     pub(crate) fn has_saved_sessions() -> Result<bool> {
-        let sessions = state_root()?.join(SESSIONS_DIRECTORY);
-        let entries = match std::fs::read_dir(&sessions) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect {}", sessions.display()));
-            }
-        };
-        for entry in entries {
-            let entry =
-                entry.with_context(|| format!("failed to inspect {}", sessions.display()))?;
-            let Some((path, modified_at)) = saved_session_candidate(entry)? else {
-                continue;
-            };
-            if read_session_summary(&path, modified_at)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        has_saved_sessions_in(&state_root()?)
     }
 
     pub(crate) fn resume_in(
@@ -3077,6 +3061,29 @@ fn project_process_output(output: Value, text: &str) -> Value {
     Value::Object(projected)
 }
 
+fn has_saved_sessions_in(root: &Path) -> Result<bool> {
+    let sessions = root.join(SESSIONS_DIRECTORY);
+    let entries = match std::fs::read_dir(&sessions) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", sessions.display()));
+        }
+    };
+    for entry in entries {
+        let Some(entry) = saved_session_entry(entry, &sessions) else {
+            continue;
+        };
+        let Some((path, modified_at)) = saved_session_candidate(entry) else {
+            continue;
+        };
+        if discover_session_summary(&path, modified_at).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>> {
     let entries = match std::fs::read_dir(sessions) {
         Ok(entries) => entries,
@@ -3085,11 +3092,13 @@ fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>
     };
     let mut latest = None::<(u128, u64, PathBuf)>;
     for entry in entries {
-        let entry = entry.context("failed to inspect a saved bettercodex session")?;
-        let Some((path, modified_at)) = saved_session_candidate(entry)? else {
+        let Some(entry) = saved_session_entry(entry, sessions) else {
             continue;
         };
-        let Some(summary) = read_session_summary(&path, modified_at)? else {
+        let Some((path, modified_at)) = saved_session_candidate(entry) else {
+            continue;
+        };
+        let Some(summary) = discover_session_summary(&path, modified_at) else {
             continue;
         };
         if summary.cwd != cwd {
@@ -3119,14 +3128,16 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
     };
     let mut candidates = Vec::new();
     for entry in entries {
-        let entry = entry.context("failed to inspect a saved bettercodex session")?;
-        if let Some(candidate) = saved_session_candidate(entry)? {
+        let Some(entry) = saved_session_entry(entry, &sessions_directory) else {
+            continue;
+        };
+        if let Some(candidate) = saved_session_candidate(entry) {
             candidates.push(candidate);
         }
     }
     let worker_count = session_list_worker_count(candidates.len());
     let mut sessions = if worker_count == 1 {
-        read_session_summaries(candidates.iter())?
+        read_session_summaries(candidates.iter())
     } else {
         std::thread::scope(|scope| -> Result<Vec<SessionSummary>> {
             let candidates = &candidates;
@@ -3147,7 +3158,7 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
             for worker in workers {
                 let mut found = worker
                     .join()
-                    .map_err(|_| anyhow!("saved session discovery worker panicked"))??;
+                    .map_err(|_| anyhow!("saved session discovery worker panicked"))?;
                 sessions.append(&mut found);
             }
             Ok(sessions)
@@ -3163,23 +3174,47 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
     Ok(sessions)
 }
 
-fn saved_session_candidate(
-    entry: std::fs::DirEntry,
-) -> Result<Option<(PathBuf, Option<SystemTime>)>> {
+fn saved_session_entry(
+    entry: std::io::Result<std::fs::DirEntry>,
+    directory: &Path,
+) -> Option<std::fs::DirEntry> {
+    match entry {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            tracing::warn!(
+                directory = %directory.display(),
+                %error,
+                "skipping an unreadable saved session directory entry"
+            );
+            None
+        }
+    }
+}
+
+fn saved_session_candidate(entry: std::fs::DirEntry) -> Option<(PathBuf, Option<SystemTime>)> {
     let path = entry.path();
-    if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-        || !entry
-            .file_type()
-            .with_context(|| format!("failed to inspect saved session {}", path.display()))?
-            .is_file()
-    {
-        return Ok(None);
+    if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let file_type = match entry.file_type() {
+        Ok(file_type) => file_type,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "skipping an unreadable saved session entry"
+            );
+            return None;
+        }
+    };
+    if !file_type.is_file() {
+        return None;
     }
     let modified_at = entry
         .metadata()
         .and_then(|metadata| metadata.modified())
         .ok();
-    Ok(Some((path, modified_at)))
+    Some((path, modified_at))
 }
 
 fn session_list_worker_count(session_count: usize) -> usize {
@@ -3192,14 +3227,27 @@ fn session_list_worker_count(session_count: usize) -> usize {
 
 fn read_session_summaries<'a>(
     candidates: impl Iterator<Item = &'a (PathBuf, Option<SystemTime>)>,
-) -> Result<Vec<SessionSummary>> {
-    let mut sessions = Vec::new();
-    for (path, modified_at) in candidates {
-        if let Some(summary) = read_session_summary(path, *modified_at)? {
-            sessions.push(summary);
+) -> Vec<SessionSummary> {
+    candidates
+        .filter_map(|(path, modified_at)| discover_session_summary(path, *modified_at))
+        .collect()
+}
+
+fn discover_session_summary(
+    path: &Path,
+    modified_at: Option<SystemTime>,
+) -> Option<SessionSummary> {
+    match read_session_summary(path, modified_at) {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                ?error,
+                "skipping an unreadable saved session"
+            );
+            None
         }
     }
-    Ok(sessions)
 }
 
 fn read_session_summary(
@@ -3458,37 +3506,47 @@ fn state_root() -> Result<PathBuf> {
 
 fn installation_id(root: &Path) -> Result<String> {
     let path = root.join(INSTALLATION_ID_FILE);
-    if let Ok(value) = std::fs::read_to_string(&path)
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    crate::private_fs::configure_private_file_nofollow(&mut options, true);
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("failed to open installation ID {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect installation ID {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "installation ID {} is not a regular file",
+            path.display()
+        ));
+    }
+    crate::private_fs::protect_file(&file)
+        .with_context(|| format!("failed to protect installation ID {}", path.display()))?;
+    // Serialize both first creation and repair so concurrent startups converge on one identity.
+    File::lock(&file)
+        .with_context(|| format!("failed to lock installation ID {}", path.display()))?;
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_INSTALLATION_ID_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() <= MAX_INSTALLATION_ID_BYTES
+        && let Ok(value) = std::str::from_utf8(&bytes)
         && let Ok(id) = Uuid::parse_str(value.trim())
     {
         return Ok(id.to_string());
     }
 
-    let value = uuid::Uuid::new_v4().to_string();
-    let temporary = root.join(format!(
-        ".{INSTALLATION_ID_FILE}.tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4(),
-    ));
-    let mut file = open_private_replace(&temporary)?;
+    let value = Uuid::new_v4().to_string();
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
     file.write_all(value.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    let linked = std::fs::hard_link(&temporary, &path);
-    let _ = std::fs::remove_file(&temporary);
-    match linked {
-        Ok(()) => {
-            crate::private_fs::sync_directory(root)?;
-            Ok(value)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = std::fs::read_to_string(&path)?;
-            Uuid::parse_str(existing.trim())
-                .map(|id| id.to_string())
-                .context("the bettercodex installation ID is invalid")
-        }
-        Err(error) => Err(error.into()),
-    }
+    crate::private_fs::sync_directory(root)?;
+    Ok(value)
 }
 
 fn prepare_private_directory(path: &Path) -> Result<()> {
@@ -3531,24 +3589,6 @@ fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
             Err(error).with_context(|| format!("failed to lock saved session {}", path.display()))
         }
     }
-}
-
-fn open_private_replace(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    crate::private_fs::configure_private_file_nofollow(&mut options, false);
-    let file = options
-        .open(path)
-        .with_context(|| format!("failed to open private file {}", path.display()))?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || crate::private_fs::is_link(&metadata) {
-        return Err(anyhow!(
-            "private path {} is not a regular file",
-            path.display()
-        ));
-    }
-    crate::private_fs::protect_file(&file)?;
-    Ok(file)
 }
 
 #[cfg(test)]

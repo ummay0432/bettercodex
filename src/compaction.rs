@@ -173,9 +173,11 @@ fn truncate_retained_messages(items: Vec<Value>, max_tokens: usize) -> Vec<Value
     let mut truncated_reversed = Vec::with_capacity(items.len());
     for item in items.into_iter().rev() {
         if remaining == 0 {
-            continue;
+            break;
         }
-        let token_count = retained_item_token_count(&item).max(1);
+        // Match Codex's remote-v2 retention policy: the 64k budget limits message text, while
+        // user images remain attached to any retained message.
+        let token_count = message_text_token_count(&item).max(1);
         if token_count <= remaining {
             truncated_reversed.push(item);
             remaining = remaining.saturating_sub(token_count);
@@ -184,13 +186,9 @@ fn truncate_retained_messages(items: Vec<Value>, max_tokens: usize) -> Vec<Value
 
         let is_user_message = item.get("type").and_then(Value::as_str) == Some("message")
             && item.get("role").and_then(Value::as_str) == Some("user");
-        if let Some(item) = truncate_message_to_token_budget(item, remaining) {
-            let token_count = retained_item_token_count(&item).max(1);
-            debug_assert!(token_count <= remaining);
-            if token_count <= remaining {
-                truncated_reversed.push(item);
-                remaining = remaining.saturating_sub(token_count);
-            }
+        if let Some(item) = truncate_message_text_to_token_budget(item, remaining) {
+            truncated_reversed.push(item);
+            remaining = 0;
         } else if is_user_message {
             // Retained user messages are a newest-first suffix. Once the boundary message cannot
             // retain any model-visible content, admitting an older user message would misalign the
@@ -202,98 +200,51 @@ fn truncate_retained_messages(items: Vec<Value>, max_tokens: usize) -> Vec<Value
     truncated_reversed
 }
 
-fn retained_item_token_count(item: &Value) -> usize {
-    usize::try_from(estimated_tokens(std::slice::from_ref(item))).unwrap_or(usize::MAX)
+fn message_text_token_count(item: &Value) -> usize {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return usize::try_from(estimated_tokens(std::slice::from_ref(item))).unwrap_or(usize::MAX);
+    }
+    let Some(content) = item.get("content").and_then(Value::as_array) else {
+        return usize::try_from(estimated_tokens(std::slice::from_ref(item))).unwrap_or(usize::MAX);
+    };
+    content
+        .iter()
+        .filter_map(content_text)
+        .map(approx_token_count)
+        .sum()
 }
 
-fn truncate_message_to_token_budget(mut item: Value, max_tokens: usize) -> Option<Value> {
+fn truncate_message_text_to_token_budget(mut item: Value, max_tokens: usize) -> Option<Value> {
     if item.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }
     let content = item.get_mut("content")?.as_array_mut()?;
-    let original = std::mem::take(content);
-    let mut retained = vec![false; original.len()];
-    let mut replacements = std::iter::repeat_with(|| None)
-        .take(original.len())
-        .collect::<Vec<Option<Value>>>();
-
-    let base_tokens = retained_item_token_count(&item);
-    let mut remaining = max_tokens.saturating_sub(base_tokens);
-
-    // Preserve operator text before supplemental media. The opaque compaction item already carries
-    // the server's interpretation of older images, while dropping user text here can erase the
-    // instruction that the retained image was meant to support.
-    for (index, content_item) in original.iter().enumerate() {
-        let Some(text) = content_text(content_item) else {
-            continue;
-        };
-        if text.is_empty() || remaining <= 1 {
-            continue;
-        }
-        let available = remaining - 1;
-        let token_count = retained_item_token_count(content_item);
-        if token_count <= available {
-            retained[index] = true;
-            remaining = remaining.saturating_sub(token_count.saturating_add(1));
-        } else if let Some(truncated) =
-            truncate_text_content_to_token_budget(content_item, available)
-        {
-            let token_count = retained_item_token_count(&truncated);
-            retained[index] = true;
-            replacements[index] = Some(truncated);
-            remaining = remaining.saturating_sub(token_count.saturating_add(1));
+    let mut remaining = max_tokens;
+    let mut retained = Vec::with_capacity(content.len());
+    for mut content_item in std::mem::take(content) {
+        if let Some(text) = content_text_mut(&mut content_item) {
+            if remaining == 0 {
+                continue;
+            }
+            let token_count = approx_token_count(text);
+            if token_count <= remaining {
+                remaining = remaining.saturating_sub(token_count);
+            } else {
+                *text = truncate_text(text, remaining);
+                remaining = 0;
+            }
+            if !text.is_empty() {
+                retained.push(content_item);
+            }
+        } else {
+            retained.push(content_item);
         }
     }
-
-    for (index, content_item) in original.iter().enumerate() {
-        if content_text(content_item).is_some() || remaining <= 1 {
-            continue;
-        }
-        let token_count = retained_item_token_count(content_item);
-        if token_count.saturating_add(1) <= remaining {
-            retained[index] = true;
-            remaining = remaining.saturating_sub(token_count.saturating_add(1));
-        }
-    }
-
-    let retained_content = original
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, content_item)| {
-            retained[index].then(|| replacements[index].take().unwrap_or(content_item))
-        })
-        .collect::<Vec<_>>();
-    if retained_content.is_empty() {
+    if retained.is_empty() {
         return None;
     }
-    *item.get_mut("content")?.as_array_mut()? = retained_content;
-    if retained_item_token_count(&item) > max_tokens {
-        let content = item.get_mut("content")?.as_array_mut()?;
-        content.retain(|content_item| content_text(content_item).is_some());
-        if content.is_empty() || retained_item_token_count(&item) > max_tokens {
-            return None;
-        }
-    }
+    *content = retained;
     Some(item)
-}
-
-fn truncate_text_content_to_token_budget(item: &Value, max_tokens: usize) -> Option<Value> {
-    let text = content_text(item)?;
-    let mut low = 1_usize;
-    let mut high = approx_token_count(text).min(max_tokens);
-    let mut best = None;
-    while low <= high {
-        let budget = low + (high - low) / 2;
-        let mut candidate = item.clone();
-        *content_text_mut(&mut candidate)? = truncate_text(text, budget);
-        if retained_item_token_count(&candidate) <= max_tokens {
-            best = Some(candidate);
-            low = budget.saturating_add(1);
-        } else {
-            high = budget.saturating_sub(1);
-        }
-    }
-    best
 }
 
 fn content_text(item: &Value) -> Option<&str> {

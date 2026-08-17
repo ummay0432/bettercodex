@@ -1,5 +1,6 @@
 //! Sanitized OSC 0 activity titles for the interactive TUI.
 
+use crate::text::is_invisible_format_character;
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
 use std::io;
@@ -115,20 +116,5 @@ fn sanitize_terminal_title(title: &str) -> String {
 }
 
 fn is_disallowed_terminal_title_char(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{00AD}'
-                | '\u{034F}'
-                | '\u{061C}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
-                | '\u{FE00}'..='\u{FE0F}'
-                | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
-                | '\u{1BCA0}'..='\u{1BCA3}'
-                | '\u{E0100}'..='\u{E01EF}'
-        )
+    character.is_control() || is_invisible_format_character(character)
 }

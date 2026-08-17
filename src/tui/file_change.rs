@@ -1,7 +1,8 @@
 //! Codex-style rendering for authoritative direct-tool file changes.
 
+use super::markdown;
 use super::view::truncate_line;
-use super::view::wrap_styled_line;
+use super::view::wrap_styled_line_bounded;
 use crate::protocol::FileChange;
 use ratatui::style::Color;
 use ratatui::style::Style;
@@ -11,6 +12,8 @@ use ratatui::text::Span;
 
 const MAX_PREVIEW_ROWS: usize = 1_000;
 const MAX_RENDERED_PREVIEW_ROWS: usize = 1_000;
+// Keep one minified or narrow-screen source row from consuming the entire change preview.
+const MAX_RENDERED_ROWS_PER_PREVIEW_ROW: usize = 20;
 const MAX_PREVIEW_ROW_BYTES: usize = 2 * 1024;
 
 #[derive(Clone, Copy)]
@@ -38,7 +41,12 @@ pub(super) fn lines(
         FileChange::Update { .. } => "Edited",
     };
     let (rows, omitted, added, removed) = preview_rows(change);
-    let mut header = vec!["• ".dim(), verb.bold(), " ".into(), path.to_string().into()];
+    let mut header = vec![
+        "• ".dim(),
+        verb.bold(),
+        " ".into(),
+        markdown::sanitize_inline(path).into(),
+    ];
     header.push(" ".into());
     header.extend(line_count_spans(added, removed));
     let mut output = vec![truncate_line(Line::from(header), usize::from(width))];
@@ -259,20 +267,9 @@ fn diff_row_lines(
         }
         DiffRowKind::Separator => unreachable!("separators return before diff styling"),
     };
+    let total_width = usize::from(width);
     let prefix_width = 4_usize.saturating_add(number_width).saturating_add(2);
-    let content_width = usize::from(width)
-        .saturating_sub(prefix_width)
-        .max(1)
-        .try_into()
-        .unwrap_or(u16::MAX);
-    let content = row.text.replace('\t', "    ");
-    wrap_styled_line(
-        &Line::from(Span::styled(content, content_style)),
-        content_width,
-    )
-    .into_iter()
-    .enumerate()
-    .map(|(index, mut content)| {
+    let compose = |index: usize, mut content: Line<'static>| {
         let mut spans = if index == 0 {
             vec![
                 Span::styled(format!("    {:>number_width$} ", row.number), gutter_style),
@@ -285,7 +282,28 @@ fn diff_row_lines(
             )]
         };
         spans.append(&mut content.spans);
-        Line::from(spans).style(line_style)
-    })
-    .collect()
+        truncate_line(Line::from(spans).style(line_style), total_width)
+    };
+    let Some(content_width) = total_width
+        .checked_sub(prefix_width)
+        .filter(|content_width| *content_width > 0)
+    else {
+        return vec![compose(/*index*/ 0, Line::default())];
+    };
+
+    let content = markdown::sanitize(&row.text).replace('\t', "    ");
+    let (mut wrapped, omitted) = wrap_styled_line_bounded(
+        &Line::from(Span::styled(content, content_style)),
+        u16::try_from(content_width).unwrap_or(u16::MAX),
+        MAX_RENDERED_ROWS_PER_PREVIEW_ROW,
+    );
+    if omitted {
+        wrapped.pop();
+        wrapped.push(Line::from(Span::styled("…", content_style)));
+    }
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| compose(index, content))
+        .collect()
 }

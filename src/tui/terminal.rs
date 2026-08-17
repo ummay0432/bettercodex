@@ -1,3 +1,5 @@
+mod startup_replay;
+
 use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
 use crate::managed_session::PreparedTmuxSession;
@@ -53,6 +55,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_STARTUP_PROBE_BYTES: usize = 64 * 1024;
 const MAX_HISTORY_ROWS_PER_CELL: usize = 30_000;
 const CLEAR_VISIBLE_TERMINAL: &[u8] = b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[H";
 const LINE_FEED_CHUNK: [u8; 256] = [b'\n'; 256];
@@ -558,8 +561,15 @@ impl PendingStartupProbe {
     }
 
     fn finish(mut self) -> io::Result<StartupProbe> {
+        let result = self.read();
+        crossterm::event::buffer_input(&startup_replay::startup_replay_input(&self.bytes))?;
+        result
+    }
+
+    fn read(&mut self) -> io::Result<StartupProbe> {
         loop {
-            self.tty.read_available(&mut self.bytes)?;
+            self.tty
+                .read_available(&mut self.bytes, self.deadline, MAX_STARTUP_PROBE_BYTES)?;
             let probe = StartupProbe {
                 foreground: parse_osc_color(&self.bytes, 10),
                 background: parse_osc_color(&self.bytes, 11),
@@ -569,6 +579,7 @@ impl PendingStartupProbe {
             }
             let now = Instant::now();
             if now >= self.deadline
+                || self.bytes.len() >= MAX_STARTUP_PROBE_BYTES
                 || !self
                     .tty
                     .poll_readable(self.deadline.saturating_duration_since(now))?
@@ -596,6 +607,10 @@ impl ProbeTty {
                 OpenOptions::new().write(true).open("/dev/tty")?,
             ),
         };
+        Self::new(reader, writer)
+    }
+
+    fn new(reader: File, writer: File) -> io::Result<Self> {
         let fd = reader.as_raw_fd();
         let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if original_flags == -1 {
@@ -616,14 +631,23 @@ impl ProbeTty {
         self.writer.flush()
     }
 
-    fn read_available(&mut self, buffer: &mut Vec<u8>) -> io::Result<()> {
+    fn read_available(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        deadline: Instant,
+        max_bytes: usize,
+    ) -> io::Result<()> {
         let mut chunk = [0_u8; 256];
         loop {
+            if buffer.len() >= max_bytes || Instant::now() >= deadline {
+                return Ok(());
+            }
+            let bytes_to_read = chunk.len().min(max_bytes.saturating_sub(buffer.len()));
             let read = unsafe {
                 libc::read(
                     self.reader.as_raw_fd(),
                     chunk.as_mut_ptr().cast::<libc::c_void>(),
-                    chunk.len(),
+                    bytes_to_read,
                 )
             };
             if read > 0 {
@@ -650,11 +674,22 @@ impl ProbeTty {
             events: libc::POLLIN,
             revents: 0,
         };
-        let timeout_ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let deadline = Instant::now() + timeout;
         loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let timeout_ms = deadline
+                .saturating_duration_since(now)
+                .as_millis()
+                .min(libc::c_int::MAX as u128) as libc::c_int;
             let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-            if result >= 0 {
-                return Ok(result > 0 && descriptor.revents & libc::POLLIN != 0);
+            if result > 0 {
+                return Ok(descriptor.revents & libc::POLLIN != 0);
+            }
+            if result == 0 {
+                return Ok(false);
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
@@ -684,11 +719,20 @@ fn parse_osc_color(bytes: &[u8], slot: u8) -> Option<(u8, u8, u8)> {
         .windows(prefix.len())
         .position(|window| window == prefix.as_bytes())?;
     let remaining = &bytes[start + prefix.len()..];
-    let end = remaining.iter().enumerate().find_map(|(index, byte)| {
-        (*byte == 0x07 || (*byte == 0x1b && remaining.get(index + 1) == Some(&b'\\')))
-            .then_some(index)
-    })?;
+    let (end, _) = osc_payload_end(remaining)?;
     parse_osc_rgb(std::str::from_utf8(&remaining[..end]).ok()?)
+}
+
+fn osc_payload_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x07 => return Some((index, 1)),
+            0x1b if bytes.get(index + 1) == Some(&b'\\') => return Some((index, 2)),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn parse_osc_rgb(value: &str) -> Option<(u8, u8, u8)> {
@@ -729,11 +773,22 @@ mod tests {
     use ratatui::layout::Position;
     use serde_json::json;
     use std::cell::RefCell;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::rc::Rc;
     use std::time::Duration;
 
     const TEST_SCROLLBACK_ROWS: usize = 512;
+
+    fn probe_tty_with_buffered_input(input: &[u8]) -> ProbeTty {
+        let (reader, mut writer) = UnixStream::pair().expect("create terminal input pair");
+        writer.write_all(input).expect("buffer terminal input");
+
+        let reader: OwnedFd = reader.into();
+        let writer: OwnedFd = writer.into();
+        ProbeTty::new(reader.into(), writer.into()).expect("create terminal probe")
+    }
 
     #[derive(Clone)]
     struct SharedParser {
@@ -1213,6 +1268,53 @@ mod tests {
         assert!(output.history_contains("history-row-00"));
         assert!(!output.emitted_csi_scroll_up());
         assert!(output.output_contains(b"\x1b[r\x1b[0m\x1b[4;1H\n"));
+    }
+
+    #[test]
+    fn startup_probe_stops_reading_at_its_deadline() {
+        let mut tty = probe_tty_with_buffered_input(b"still queued");
+        let mut buffer = Vec::new();
+
+        tty.read_available(&mut buffer, Instant::now(), MAX_STARTUP_PROBE_BYTES)
+            .expect("respect startup probe deadline");
+
+        assert!(buffer.is_empty());
+        let mut queued = [0; 12];
+        let count = unsafe {
+            libc::read(
+                tty.reader.as_raw_fd(),
+                queued.as_mut_ptr().cast::<libc::c_void>(),
+                queued.len(),
+            )
+        };
+        assert_eq!(count, queued.len() as isize);
+        assert_eq!(&queued, b"still queued");
+    }
+
+    #[test]
+    fn startup_probe_leaves_input_queued_after_reaching_its_byte_budget() {
+        let input = [b'x'; 256];
+        let mut tty = probe_tty_with_buffered_input(&input);
+        let mut buffer = vec![b'x'; MAX_STARTUP_PROBE_BYTES - 32];
+
+        tty.read_available(
+            &mut buffer,
+            Instant::now() + Duration::from_secs(1),
+            MAX_STARTUP_PROBE_BYTES,
+        )
+        .expect("respect startup probe byte budget");
+
+        assert_eq!(buffer.len(), MAX_STARTUP_PROBE_BYTES);
+        let mut queued = [0; 224];
+        let count = unsafe {
+            libc::read(
+                tty.reader.as_raw_fd(),
+                queued.as_mut_ptr().cast::<libc::c_void>(),
+                queued.len(),
+            )
+        };
+        assert_eq!(count, queued.len() as isize);
+        assert_eq!(queued, [b'x'; 224]);
     }
 
     #[test]

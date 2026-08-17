@@ -25,6 +25,7 @@ const MIN_SCANNABLE_TOKEN_HEAVY_WIDTH: usize = 12;
 const CRAMPED_EXPANSIVE_CELL_LINES: usize = 4;
 const CATASTROPHIC_NARRATIVE_CELL_LINES: usize = 7;
 const STACKED_VALUE_INDENT: usize = 2;
+const MIN_RENDERABLE_RECORD_WIDTH: usize = STACKED_VALUE_INDENT + 2;
 
 /// Switch modes after enough records contain values the grid can no longer
 /// present in useful chunks or expansive content collapses into tall strips.
@@ -103,6 +104,16 @@ pub(super) fn render_records(
     label_style: Style,
     separator_style: Style,
 ) -> Vec<HyperlinkLine> {
+    // Below this width the stacked indent plus one double-width grapheme cannot fit. Render one
+    // bounded placeholder instead of producing several logical lines wider than the viewport.
+    if let Some(width) = available_width.filter(|width| *width < MIN_RENDERABLE_RECORD_WIDTH) {
+        return vec![HyperlinkLine::new(if width == 0 {
+            Line::default()
+        } else {
+            Line::from("…")
+        })];
+    }
+
     let label_width = headers
         .iter()
         .map(|header| display_width(&header.plain_text()))

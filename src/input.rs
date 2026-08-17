@@ -359,6 +359,12 @@ impl UserInput {
             images,
             selected_skills,
         } = self;
+        let total_image_bytes = images
+            .iter()
+            .try_fold(0_usize, |total, image| total.checked_add(image.byte_len()))
+            .filter(|total| *total <= MAX_TOTAL_IMAGE_BYTES)
+            .ok_or_else(image_size_error)?;
+        debug_assert!(total_image_bytes <= MAX_TOTAL_IMAGE_BYTES);
         let mut content = Vec::with_capacity(images.len() + 1);
         if !text.trim().is_empty() {
             content.push(json!({"type": "input_text", "text": &text}));
@@ -548,6 +554,28 @@ mod tests {
         let wide = png_bytes(6401, 100);
         let original_wide = message_for(&wide, ImageDetail::Original);
         assert_eq!(image_dimensions(&original_wide), (6401, 100));
+    }
+
+    #[test]
+    fn joined_prompts_still_enforce_the_aggregate_image_limit() {
+        let mut bytes = vec![0_u8; MAX_TOTAL_IMAGE_BYTES / 2 + 1];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let image = PromptImage::from_bytes(Path::new("shared.png"), bytes, ImageDetail::High)
+            .expect("load shared image");
+        let prompt = |image| {
+            UserPrompt::with_attachments(
+                "[image]",
+                Vec::new(),
+                vec![PromptImageAttachment::new(image, 0..7)],
+            )
+        };
+        let joined = UserPrompt::joined(vec![prompt(image.clone()), prompt(image)]);
+
+        let error = UserInput::prompt(joined)
+            .into_message_and_skills()
+            .expect_err("joined prompts must retain the aggregate image limit");
+
+        assert!(error.to_string().contains("50 MiB input limit"));
     }
 
     #[test]

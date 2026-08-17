@@ -1,5 +1,6 @@
 use crate::fuzzy_match::fuzzy_match;
 use crate::skills::Skill;
+use crate::skills::is_common_environment_variable;
 use crate::skills::is_mention_name_byte;
 use crate::tui::palette;
 use crate::tui::width::display_width;
@@ -294,23 +295,6 @@ fn dollar_query_is_completable(query: &str, skills: &[Skill]) -> bool {
         });
     }
     true
-}
-
-fn is_common_environment_variable(name: &str) -> bool {
-    matches!(
-        name.to_ascii_uppercase().as_str(),
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "SHELL"
-            | "PWD"
-            | "TMPDIR"
-            | "TEMP"
-            | "TMP"
-            | "LANG"
-            | "TERM"
-            | "XDG_CONFIG_HOME"
-    )
 }
 
 fn skill_line(

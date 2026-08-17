@@ -1,3 +1,5 @@
+use super::wrapping::RtOptions;
+use super::wrapping::adaptive_wrap_line;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
 use ratatui::style::Stylize;
@@ -5,6 +7,7 @@ use ratatui::text::Line;
 use std::collections::VecDeque;
 
 const MAX_VISIBLE_MESSAGES_PER_SECTION: usize = 3;
+const MAX_PREVIEW_ROWS: usize = 3;
 const MAX_PREVIEW_CHARS: usize = 240;
 
 #[derive(Debug)]
@@ -79,7 +82,7 @@ impl PendingInput {
         self.follow_ups.clear();
     }
 
-    pub(super) fn lines(&self) -> Vec<Line<'static>> {
+    pub(super) fn lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if !self.steers.is_empty() {
             lines.push(Line::from(vec![
@@ -91,6 +94,7 @@ impl PendingInput {
                 &mut lines,
                 self.steers.iter().map(|steer| steer.prompt.as_str()),
                 self.steers.len(),
+                width,
                 false,
             );
         }
@@ -106,6 +110,7 @@ impl PendingInput {
                 &mut lines,
                 self.follow_ups.iter().map(UserPrompt::as_str),
                 self.follow_ups.len(),
+                width,
                 true,
             );
             lines.push(Line::from("    Alt+Up / Shift+Left edit last queued message").dim());
@@ -118,20 +123,47 @@ fn append_messages<'a>(
     lines: &mut Vec<Line<'static>>,
     messages: impl Iterator<Item = &'a str>,
     count: usize,
+    width: u16,
     italic: bool,
 ) {
     for message in messages.take(MAX_VISIBLE_MESSAGES_PER_SECTION) {
-        let preview = bounded_preview(message);
-        let line = Line::from(format!("  ↳ {preview}"));
+        append_message_preview(lines, message, width, italic);
+    }
+    let hidden = count.saturating_sub(MAX_VISIBLE_MESSAGES_PER_SECTION);
+    if hidden > 0 {
+        lines.push(Line::from(format!("    … {hidden} more")).dim());
+    }
+}
+
+fn append_message_preview(lines: &mut Vec<Line<'static>>, message: &str, width: u16, italic: bool) {
+    let preview = Line::from(bounded_preview(message));
+    let wrapped = adaptive_wrap_line(
+        &preview,
+        RtOptions::new(usize::from(width))
+            .initial_indent(Line::from("  ↳ "))
+            .subsequent_indent(Line::from("    ")),
+    );
+    let wrapped_len = wrapped.len();
+    for wrapped_line in wrapped.into_iter().take(MAX_PREVIEW_ROWS) {
+        let content = wrapped_line
+            .spans
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+        let line = Line::from(content);
         lines.push(if italic {
             line.italic().dim()
         } else {
             line.dim()
         });
     }
-    let hidden = count.saturating_sub(MAX_VISIBLE_MESSAGES_PER_SECTION);
-    if hidden > 0 {
-        lines.push(Line::from(format!("    … {hidden} more")).dim());
+    if wrapped_len > MAX_PREVIEW_ROWS {
+        let line = Line::from("    …");
+        lines.push(if italic {
+            line.italic().dim()
+        } else {
+            line.dim()
+        });
     }
 }
 
@@ -163,3 +195,7 @@ fn bounded_preview(prompt: &str) -> String {
     }
     preview.trim().to_string()
 }
+
+#[cfg(test)]
+#[path = "pending_input_tests.rs"]
+mod tests;

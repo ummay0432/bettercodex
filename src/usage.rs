@@ -5,6 +5,7 @@ use serde::Serialize;
 pub(crate) struct TokenUsage {
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
+    #[serde(default)]
     pub(crate) cache_write_input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,

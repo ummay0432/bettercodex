@@ -42,13 +42,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-// Match Codex's default aggregate AGENTS.md budget. Besides avoiding needless context pressure,
-// 32 KiB keeps the wrapped repository context below the harness's estimated 10k-token per-item
-// ceiling.
+// Match Codex's default aggregate AGENTS.md source-byte budget. The rendered request item is
+// bounded separately because JSON escaping can expand those source bytes substantially.
 const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+const MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS: u64 = 10_000;
 const MAX_CONTEXT_NOTICE_TEXT_TOKENS: usize = 9_900;
-const OPERATOR_SHELL_COMMAND_BUDGET_SHARE: f64 = 0.1;
-const OPERATOR_SHELL_OUTPUT_BUDGET_SHARE: f64 = 0.9;
 const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
 const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
@@ -660,9 +658,22 @@ impl Conversation {
             preferred_insertion,
         );
         active_turn_context.insert_into(&mut history, initial_context_injection);
-        let context_metrics = ContextMetrics::from_history(&history, &self.world_state);
-        let replacement_tokens = self.estimated_context_tokens(&context_metrics);
+        let mut context_metrics = ContextMetrics::from_history(&history, &self.world_state);
+        let mut replacement_tokens = self.estimated_context_tokens(&context_metrics);
         let compact_at_tokens = self.model_selection.auto_compact_token_limit();
+        // Codex keeps images attached to retained user messages outside its 64k retained-text
+        // budget. Preserve that quality behavior, then shed only the oldest retained images when
+        // their estimated GPT-5.6 token cost would otherwise cause an immediate compaction loop.
+        while replacement_tokens >= compact_at_tokens {
+            let tokens_to_remove = replacement_tokens
+                .saturating_sub(compact_at_tokens)
+                .saturating_add(1);
+            if trim_oldest_input_images(&mut history, tokens_to_remove) == 0 {
+                break;
+            }
+            context_metrics = ContextMetrics::from_history(&history, &self.world_state);
+            replacement_tokens = self.estimated_context_tokens(&context_metrics);
+        }
         if replacement_tokens >= compact_at_tokens {
             anyhow::bail!(
                 "remote compaction replacement is estimated at {replacement_tokens} tokens and did not restore headroom below bettercodex's {compact_at_tokens}-token automatic-compaction threshold; the conversation was left unchanged"
@@ -1009,8 +1020,21 @@ impl Conversation {
 }
 
 fn context_notice(tag: &str, guidance: &str) -> Value {
-    let guidance = formatted_truncate_text(guidance, MAX_CONTEXT_NOTICE_TEXT_TOKENS);
-    message("user", format!("<{tag}>\n{guidance}\n</{tag}>"))
+    let guidance = escape_xml_text(guidance);
+    let mut guidance_budget = MAX_CONTEXT_NOTICE_TEXT_TOKENS;
+    loop {
+        let guidance = formatted_truncate_text(&guidance, guidance_budget);
+        let item = message("user", format!("<{tag}>\n{guidance}\n</{tag}>"));
+        let item_tokens = estimate_value_tokens(&item);
+        if item_tokens <= MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS || guidance_budget == 0 {
+            return item;
+        }
+        guidance_budget = reduced_budget(
+            guidance_budget,
+            MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS,
+            item_tokens,
+        );
+    }
 }
 
 fn refreshed_world_state_history(
@@ -1137,6 +1161,36 @@ fn real_user_message_indices(history: &[Value]) -> Vec<usize> {
             (is_user_message(item) && !is_contextual_user_message(item)).then_some(index)
         })
         .collect()
+}
+
+fn trim_oldest_input_images(history: &mut Vec<Value>, minimum_tokens: u64) -> u64 {
+    let mut removed_tokens = 0_u64;
+    for item in history.iter_mut() {
+        if removed_tokens >= minimum_tokens || !is_user_message(item) {
+            continue;
+        }
+        let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        content.retain(|content_item| {
+            let is_image = content_item.get("type").and_then(Value::as_str) == Some("input_image");
+            if removed_tokens < minimum_tokens && is_image {
+                removed_tokens =
+                    removed_tokens.saturating_add(estimate_value_tokens(content_item).max(1));
+                false
+            } else {
+                true
+            }
+        });
+    }
+    history.retain(|item| {
+        !is_user_message(item)
+            || item
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| !content.is_empty())
+    });
+    removed_tokens
 }
 
 impl ContextMetrics {
@@ -1580,8 +1634,6 @@ pub(crate) fn user_shell_command_context(
     policy: TruncationPolicy,
 ) -> String {
     let command = escape_xml_text(command);
-    let command =
-        formatted_truncate_text_with_policy(&command, policy * OPERATOR_SHELL_COMMAND_BUDGET_SHARE);
     let result = match output {
         Ok(output) => {
             let stdout = output.get("stdout").and_then(Value::as_str);
@@ -1597,11 +1649,53 @@ pub(crate) fn user_shell_command_context(
         Err(error) => format!("Execution error:\n{error}"),
     };
     let result = escape_xml_text(&result);
-    let result =
-        formatted_truncate_text_with_policy(&result, policy * OPERATOR_SHELL_OUTPUT_BUDGET_SHARE);
-    format!(
-        "<user_shell_command>\n<command>\n{command}\n</command>\n<result>\n{result}\n</result>\n</user_shell_command>"
-    )
+    let (maximum_cost, maximum_content_budget) = match policy {
+        TruncationPolicy::Bytes(bytes) => {
+            let maximum_bytes =
+                usize::try_from(MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS.saturating_mul(4))
+                    .unwrap_or(usize::MAX);
+            let maximum_bytes = bytes.min(maximum_bytes);
+            (
+                u64::try_from(maximum_bytes).unwrap_or(u64::MAX),
+                maximum_bytes,
+            )
+        }
+        TruncationPolicy::Tokens(tokens) => (
+            u64::try_from(tokens)
+                .unwrap_or(u64::MAX)
+                .min(MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS),
+            tokens
+                .min(usize::try_from(MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS).unwrap_or(usize::MAX)),
+        ),
+    };
+    let mut content_budget = maximum_content_budget;
+    loop {
+        let command_budget = content_budget.div_ceil(10);
+        let result_budget = content_budget.saturating_sub(command_budget);
+        let command_policy = truncation_policy_with_limit(policy, command_budget);
+        let result_policy = truncation_policy_with_limit(policy, result_budget);
+        let command = formatted_truncate_text_with_policy(&command, command_policy);
+        let result = formatted_truncate_text_with_policy(&result, result_policy);
+        let context = format!(
+            "<user_shell_command>\n<command>\n{command}\n</command>\n<result>\n{result}\n</result>\n</user_shell_command>"
+        );
+        let item = message("user", context.clone());
+        let actual_cost = match policy {
+            TruncationPolicy::Bytes(_) => estimate_value_model_visible_bytes(&item),
+            TruncationPolicy::Tokens(_) => estimate_value_tokens(&item),
+        };
+        if actual_cost <= maximum_cost || content_budget == 0 {
+            return context;
+        }
+        content_budget = reduced_budget(content_budget, maximum_cost, actual_cost);
+    }
+}
+
+fn truncation_policy_with_limit(policy: TruncationPolicy, limit: usize) -> TruncationPolicy {
+    match policy {
+        TruncationPolicy::Bytes(_) => TruncationPolicy::Bytes(limit),
+        TruncationPolicy::Tokens(_) => TruncationPolicy::Tokens(limit),
+    }
 }
 
 fn environment_context(cwd: &Path) -> String {
@@ -1647,15 +1741,40 @@ fn repository_context(cwd: &Path) -> Result<Option<RepositoryContext>> {
     }
 
     let mut seen = HashSet::new();
-    let mut remaining = MAX_REPOSITORY_INSTRUCTIONS_BYTES;
+    candidates.retain(|path| {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        seen.insert(canonical)
+    });
+
+    let mut source_budget = MAX_REPOSITORY_INSTRUCTIONS_BYTES;
+    loop {
+        let Some(context) = repository_context_with_budget(&candidates, source_budget)? else {
+            return Ok(None);
+        };
+        let item_tokens = estimate_value_tokens(&message("user", context.text.clone()));
+        if item_tokens <= MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS || source_budget == 0 {
+            return Ok(Some(context));
+        }
+        source_budget = reduced_budget(
+            source_budget,
+            MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS,
+            item_tokens,
+        );
+    }
+}
+
+fn repository_context_with_budget(
+    candidates: &[PathBuf],
+    source_budget: usize,
+) -> Result<Option<RepositoryContext>> {
+    let mut remaining = source_budget;
     let mut sections = Vec::new();
     let mut source_paths = Vec::new();
     for path in candidates {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if !seen.insert(canonical) || remaining == 0 {
-            continue;
+        if remaining == 0 {
+            break;
         }
-        let (bytes, truncated) = read_instruction_file(&path, remaining)?;
+        let (bytes, truncated) = read_instruction_file(path, remaining)?;
         let mut content = String::from_utf8_lossy(&bytes).into_owned();
         if truncated {
             content.push_str("\n[AGENTS.md truncated]");
@@ -1666,7 +1785,7 @@ fn repository_context(cwd: &Path) -> Result<Option<RepositoryContext>> {
                 escape_xml(&path.display().to_string()),
                 escape_cdata(content.trim()),
             ));
-            source_paths.push(path);
+            source_paths.push(path.clone());
             remaining = remaining.saturating_sub(bytes.len());
         }
     }
@@ -1681,6 +1800,20 @@ fn repository_context(cwd: &Path) -> Result<Option<RepositoryContext>> {
         ),
         source_paths,
     }))
+}
+
+fn reduced_budget(current: usize, maximum_cost: u64, actual_cost: u64) -> usize {
+    debug_assert!(actual_cost > maximum_cost);
+    if current == 0 || actual_cost == 0 {
+        return 0;
+    }
+    let scaled = (current as u128)
+        .saturating_mul(u128::from(maximum_cost))
+        .checked_div(u128::from(actual_cost))
+        .unwrap_or_default();
+    usize::try_from(scaled)
+        .unwrap_or(usize::MAX)
+        .min(current - 1)
 }
 
 fn first_instruction_file(directory: &Path) -> Result<Option<PathBuf>> {
@@ -1703,12 +1836,13 @@ fn first_instruction_file(directory: &Path) -> Result<Option<PathBuf>> {
 fn read_instruction_file(path: &Path, limit: usize) -> Result<(Vec<u8>, bool)> {
     let file = File::open(path)
         .with_context(|| format!("failed to read instructions from {}", path.display()))?;
-    let length = file.metadata()?.len();
-    let mut bytes = Vec::with_capacity(limit.min(length.try_into().unwrap_or(usize::MAX)));
-    file.take(limit as u64)
+    let read_limit = limit.saturating_add(1);
+    let mut bytes = Vec::with_capacity(read_limit);
+    file.take(u64::try_from(read_limit).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read instructions from {}", path.display()))?;
-    let truncated = length > bytes.len() as u64;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
     Ok((bytes, truncated))
 }
 
@@ -1738,6 +1872,10 @@ impl Write for SerializedSize {
 }
 
 fn estimate_value_tokens(value: &Value) -> u64 {
+    estimate_value_model_visible_bytes(value).div_ceil(4)
+}
+
+fn estimate_value_model_visible_bytes(value: &Value) -> u64 {
     let item_type = value.get("type").and_then(Value::as_str);
     let mut serialized_size = SerializedSize::default();
     let mut bytes =
@@ -1790,7 +1928,7 @@ fn estimate_value_tokens(value: &Value) -> u64 {
             _ => {}
         },
     );
-    bytes.div_ceil(4)
+    bytes
 }
 
 fn estimate_reasoning_bytes(encoded_len: usize) -> u64 {
@@ -1926,20 +2064,24 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     let mut offset = 2_usize;
-    while offset + 9 <= bytes.len() {
+    while offset < bytes.len() {
         if bytes[offset] != 0xff {
             offset += 1;
             continue;
         }
-        let marker = bytes[offset + 1];
-        offset += 2;
-        if marker == 0xd8 || marker == 0xd9 || marker == 0x01 {
+        while bytes.get(offset) == Some(&0xff) {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        if marker == 0x00 || marker == 0x01 || matches!(marker, 0xd0..=0xd9) {
             continue;
         }
         let length = usize::from(u16::from_be_bytes(
-            bytes.get(offset..offset + 2)?.try_into().ok()?,
+            bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
         ));
-        if length < 2 || offset + length > bytes.len() {
+        let segment_end = offset.checked_add(length)?;
+        if length < 2 || segment_end > bytes.len() {
             return None;
         }
         if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) && length >= 7 {
@@ -1947,7 +2089,7 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
             let width = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?);
             return Some((width.into(), height.into()));
         }
-        offset += length;
+        offset = segment_end;
     }
     None
 }

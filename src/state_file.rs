@@ -51,6 +51,8 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: usize) -> R
             path.display()
         ));
     }
+    crate::private_fs::protect_file(&file)
+        .with_context(|| format!("failed to protect state file {}", path.display()))?;
     if metadata.len() > max_bytes as u64 {
         return Err(anyhow!(
             "{} exceeds the {max_bytes}-byte limit",
@@ -101,6 +103,8 @@ pub(crate) fn update_json<T: Serialize>(
             lock_path.display()
         ));
     }
+    crate::private_fs::protect_file(&lock)
+        .with_context(|| format!("failed to protect state lock {}", lock_path.display()))?;
     File::lock(&lock).with_context(|| format!("failed to lock {}", path.display()))?;
 
     let mut document = load(path)?;

@@ -31,7 +31,21 @@ pub(crate) fn ansi_escape_line(input: &str) -> Line<'static> {
 
 fn ansi_escape(input: &str) -> Text<'static> {
     match input.into_text() {
-        Ok(text) => text,
+        Ok(mut text) => {
+            for line in &mut text.lines {
+                for span in &mut line.spans {
+                    if span.content.chars().any(char::is_control) {
+                        span.content = std::borrow::Cow::Owned(
+                            span.content
+                                .chars()
+                                .filter(|character| !character.is_control())
+                                .collect(),
+                        );
+                    }
+                }
+            }
+            text
+        }
         Err(Error::NomError(message)) => {
             tracing::error!(
                 "ansi_to_tui NomError docs claim should never happen when parsing `{input}`: {message}"
@@ -42,5 +56,29 @@ fn ansi_escape(input: &str) -> Text<'static> {
             tracing::error!("Utf8Error: {error}");
             panic!();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ansi_escape_line;
+    use ratatui::style::Color;
+
+    #[test]
+    fn strips_non_ansi_terminal_controls_without_losing_sgr_styles() {
+        let line = ansi_escape_line("\u{7}safe\u{8} \x1b[31mred\x1b[0m\u{009b}");
+        let visible = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(visible, "safe red");
+        assert!(!visible.chars().any(char::is_control));
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.content == "red" && span.style.fg == Some(Color::Red))
+        );
     }
 }

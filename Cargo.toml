@@ -1,6 +1,6 @@
 [package]
 name = "bettercodex"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "A deliberately focused OpenAI Codex coding-agent harness"
@@ -38,6 +38,7 @@ rand = { version = "0.9", default-features = false, features = ["thread_rng"] }
 regex = { version = "1", default-features = false, features = ["perf", "std", "unicode"] }
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls-webpki-roots-no-provider", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-native-certs = "0.8.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
@@ -48,13 +49,13 @@ textwrap = { version = "0.16.2", default-features = false, features = ["unicode-
 thiserror = "2"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", default-features = false, features = ["connect", "proxy", "rustls-tls-native-roots"] }
 tiny_http = "0.12"
 tree-sitter = "0.25.10"
 tree-sitter-bash = "0.25"
 tracing = { version = "0.1", default-features = false, features = ["log", "std"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", default-features = false, features = ["deflate", "handshake"] }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", default-features = false, features = ["deflate", "handshake", "proxy"] }
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 url = "2"
@@ -63,6 +64,9 @@ webbrowser = "1.0"
 which = "8"
 zstd = { version = "0.13", default-features = false }
 diffy = "0.4.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [profile.dev]
 # Keep line tables/backtraces while avoiding expensive full variable debug info
@@ -77,6 +81,7 @@ strip = true
 codegen-units = 4
 
 [patch.crates-io]
+crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "45fecb9508105988f42fe6ff0441783ed3717f92" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 

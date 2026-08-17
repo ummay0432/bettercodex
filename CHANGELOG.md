@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1] - 2026-08-17
+
+- im tired bruh
+
+- harness improvements (session recovery), (network resilience), (terminal rendering), (skill loading)
+
+- context compaction is now identical to upstream Codex, preserving active context, tool state, and conversation continuity across long sessions, interruptions, and resume
+
 ## [0.2.0] - 2026-08-14
 
 - upstream Codex's Code Mode/V8 tool stack was refactored, cutting roughly 12,500 lines of Rust

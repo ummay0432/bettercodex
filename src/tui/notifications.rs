@@ -1,5 +1,6 @@
 //! OSC 9/BEL completion notifications for an unfocused terminal.
 
+use crate::text::is_invisible_format_character;
 use crossterm::Command;
 use crossterm::execute;
 use std::fmt;
@@ -70,7 +71,7 @@ fn sanitize_notification(message: &str) -> String {
             pending_space = !sanitized.is_empty();
             continue;
         }
-        if character.is_control() || is_invisible_format(character) {
+        if character.is_control() || is_invisible_format_character(character) {
             continue;
         }
         if pending_space && chars_written + 1 < MAX_NOTIFICATION_CHARS {
@@ -85,24 +86,6 @@ fn sanitize_notification(message: &str) -> String {
         chars_written += 1;
     }
     sanitized
-}
-
-fn is_invisible_format(character: char) -> bool {
-    matches!(
-        character,
-        '\u{00AD}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{E0100}'..='\u{E01EF}'
-    )
 }
 
 #[derive(Debug)]

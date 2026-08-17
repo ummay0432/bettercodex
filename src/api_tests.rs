@@ -4,10 +4,14 @@ use crate::compaction::CompactionRequest;
 use crate::model::DEFAULT_MODEL as MODEL;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::pem::PemObject;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
@@ -1695,7 +1699,7 @@ async fn websocket_upgrade_error_preserves_retry_and_rate_limit_headers() {
     ]);
     let url = websocket_url(&base_url, "responses").unwrap();
 
-    let mut error = match WebSocketConnection::connect(&url, &HeaderMap::new()).await {
+    let mut error = match WebSocketConnection::connect(&url, &HeaderMap::new(), None).await {
         Err(error) => error,
         Ok(_) => panic!("rate-limited WebSocket upgrade unexpectedly succeeded"),
     };
@@ -1747,6 +1751,385 @@ async fn websocket_upgrade_failure_falls_back_to_http() {
         "/responses"
     );
     server.join().unwrap();
+}
+
+#[tokio::test]
+async fn websocket_tls_uses_the_configured_custom_root() {
+    const HELPER_ENV: &str = "BETTERCODEX_WEBSOCKET_CUSTOM_CA_TEST_HELPER";
+    const TEST_NAME: &str = "api::tests::websocket_tls_uses_the_configured_custom_root";
+
+    if std::env::var_os(HELPER_ENV).is_none() {
+        let ca_path = std::env::temp_dir().join(format!(
+            "bettercodex-websocket-ca-{}-{}.pem",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&ca_path, TEST_WEBSOCKET_CA_CERTIFICATE).unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .env(HELPER_ENV, "1")
+            .env_remove("CODEX_CA_CERTIFICATE")
+            .env("SSL_CERT_FILE", &ca_path)
+            .env_remove("SSL_CERT_DIR");
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output()).await;
+        let cleanup = std::fs::remove_file(&ca_path);
+        let output = output
+            .expect("nested custom-CA WebSocket test timed out")
+            .unwrap();
+        cleanup.unwrap();
+        assert!(
+            output.status.success(),
+            "nested custom-CA WebSocket test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    crate::http_client::ensure_rustls_crypto_provider();
+    let server_certificate =
+        CertificateDer::from_pem_slice(TEST_WEBSOCKET_CERTIFICATE.as_bytes()).unwrap();
+    let private_key = PrivateKeyDer::from_pem_slice(TEST_WEBSOCKET_PRIVATE_KEY.as_bytes()).unwrap();
+    let server_config = Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_certificate], private_key)
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let response_item = assistant_item("custom root");
+    let server_item = response_item.clone();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let connection = rustls::ServerConnection::new(Arc::clone(&server_config)).unwrap();
+        let tls = rustls::StreamOwned::new(connection, stream);
+        let mut websocket =
+            tungstenite::accept_with_config(tls, Some(super::websocket::websocket_config()))
+                .unwrap();
+
+        let tungstenite::Message::Text(warmup) = websocket.read().unwrap() else {
+            panic!("expected a text WSS warmup request");
+        };
+        let warmup: Value = serde_json::from_str(warmup.as_str()).unwrap();
+        assert_eq!(warmup["generate"], false);
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {"id": "resp_tls_warm"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        let mut warmup_completed = completed_event("resp_tls_warm", &Value::Null);
+        warmup_completed["sequence_number"] = json!(2);
+        warmup_completed["response"]["output"] = json!([]);
+        websocket
+            .send(tungstenite::Message::Text(
+                warmup_completed.to_string().into(),
+            ))
+            .unwrap();
+
+        let tungstenite::Message::Text(request) = websocket.read().unwrap() else {
+            panic!("expected a text WSS inference request");
+        };
+        let request: Value = serde_json::from_str(request.as_str()).unwrap();
+        assert_eq!(request["previous_response_id"], "resp_tls_warm");
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {"id": "resp_custom_root"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "sequence_number": 2,
+                    "item": server_item,
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        let mut completed = completed_event("resp_custom_root", &server_item);
+        completed["sequence_number"] = json!(3);
+        websocket
+            .send(tungstenite::Message::Text(completed.to_string().into()))
+            .unwrap();
+    });
+
+    let mut client = test_client(format!("https://localhost:{}", address.port()));
+    let (completed_items, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let response = client
+        .respond(vec![user_message("secure websocket")], &completed_items)
+        .await
+        .unwrap();
+    assert_eq!(response.final_answer.as_deref(), Some("custom root"));
+    assert_eq!(completed_rx.recv().await.unwrap(), response_item);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn websocket_answers_pings_while_idle_between_requests() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+    let (pong_tx, pong_rx) = tokio::sync::oneshot::channel();
+    let response_item = assistant_item("after idle ping");
+    let server_item = response_item.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async_with_config(
+            stream,
+            Some(super::websocket::websocket_config()),
+        )
+        .await
+        .unwrap();
+
+        let tungstenite::Message::Text(warmup) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected a text WebSocket warmup request");
+        };
+        let warmup: Value = serde_json::from_str(warmup.as_str()).unwrap();
+        assert_eq!(warmup["generate"], false);
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {"id": "resp_idle_warm"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut warmup_completed = completed_event("resp_idle_warm", &Value::Null);
+        warmup_completed["sequence_number"] = json!(2);
+        warmup_completed["response"]["output"] = json!([]);
+        websocket
+            .send(tungstenite::Message::Text(
+                warmup_completed.to_string().into(),
+            ))
+            .await
+            .unwrap();
+
+        idle_rx.await.unwrap();
+        websocket
+            .send(tungstenite::Message::Ping(
+                b"idle keepalive".to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(1), websocket.next())
+            .await
+            .expect("idle WebSocket ping was not answered")
+            .expect("WebSocket closed before its idle pong")
+            .expect("failed to read idle WebSocket pong");
+        assert_eq!(
+            pong,
+            tungstenite::Message::Pong(b"idle keepalive".to_vec().into())
+        );
+        pong_tx.send(()).unwrap();
+
+        let tungstenite::Message::Text(request) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected a text WebSocket inference request");
+        };
+        let request: Value = serde_json::from_str(request.as_str()).unwrap();
+        assert_eq!(request["previous_response_id"], "resp_idle_warm");
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {"id": "resp_after_idle_ping"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "sequence_number": 2,
+                    "item": server_item,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut completed = completed_event("resp_after_idle_ping", &server_item);
+        completed["sequence_number"] = json!(3);
+        websocket
+            .send(tungstenite::Message::Text(completed.to_string().into()))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(format!("http://{address}"));
+    assert!(matches!(
+        client.attempt_websocket_prewarm(None).await.unwrap(),
+        WebSocketPrewarmOutcome::Ready { .. }
+    ));
+    idle_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), pong_rx)
+        .await
+        .expect("idle WebSocket pong confirmation timed out")
+        .unwrap();
+
+    let (completed_items, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let response = client
+        .respond(vec![user_message("continue")], &completed_items)
+        .await
+        .unwrap();
+    assert_eq!(response.final_answer.as_deref(), Some("after idle ping"));
+    assert_eq!(completed_rx.recv().await.unwrap(), response_item);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_reconnects_after_an_idle_server_close() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let response_item = assistant_item("after reconnect");
+    let server_item = response_item.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async_with_config(
+            stream,
+            Some(super::websocket::websocket_config()),
+        )
+        .await
+        .unwrap();
+
+        let tungstenite::Message::Text(warmup) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected a text WebSocket warmup request");
+        };
+        let warmup: Value = serde_json::from_str(warmup.as_str()).unwrap();
+        assert_eq!(warmup["generate"], false);
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {"id": "resp_closed_warm"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut completed = completed_event("resp_closed_warm", &Value::Null);
+        completed["sequence_number"] = json!(2);
+        completed["response"]["output"] = json!([]);
+        websocket
+            .send(tungstenite::Message::Text(completed.to_string().into()))
+            .await
+            .unwrap();
+        websocket
+            .send(tungstenite::Message::Close(None))
+            .await
+            .unwrap();
+        drop(websocket);
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async_with_config(
+            stream,
+            Some(super::websocket::websocket_config()),
+        )
+        .await
+        .unwrap();
+        let tungstenite::Message::Text(request) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected a text WebSocket inference request after reconnect");
+        };
+        let request: Value = serde_json::from_str(request.as_str()).unwrap();
+        assert!(request["previous_response_id"].is_null());
+        assert_eq!(request["input"].as_array().unwrap().len(), 1);
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {"id": "resp_after_reconnect"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "sequence_number": 2,
+                    "item": server_item,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut completed = completed_event("resp_after_reconnect", &server_item);
+        completed["sequence_number"] = json!(3);
+        websocket
+            .send(tungstenite::Message::Text(completed.to_string().into()))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(format!("http://{address}"));
+    assert!(matches!(
+        client.attempt_websocket_prewarm(None).await.unwrap(),
+        WebSocketPrewarmOutcome::Ready { .. }
+    ));
+    assert!(client.websocket_baseline.is_some());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if client
+                .websocket
+                .as_ref()
+                .is_none_or(super::websocket::WebSocketConnection::is_closed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle WebSocket close was not observed");
+
+    let (completed_items, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let response = client
+        .respond(
+            vec![user_message("continue on a new socket")],
+            &completed_items,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.final_answer.as_deref(), Some("after reconnect"));
+    assert_eq!(completed_rx.recv().await.unwrap(), response_item);
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -2992,6 +3375,77 @@ async fn read_async_request(stream: &mut tokio::net::TcpStream) -> CapturedReque
         body,
     }
 }
+
+const TEST_WEBSOCKET_CA_CERTIFICATE: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDQzCCAiugAwIBAgIUX0gCod1/KrjPaMGmvQVTZ0Vh+zYwDQYJKoZIhvcNAQEL
+BQAwKDEmMCQGA1UEAwwdYmV0dGVyY29kZXggdGVzdCBXZWJTb2NrZXQgQ0EwIBcN
+MjYwODE3MTczODU3WhgPMjEyNjA3MjQxNzM4NTdaMCgxJjAkBgNVBAMMHWJldHRl
+cmNvZGV4IHRlc3QgV2ViU29ja2V0IENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A
+MIIBCgKCAQEA2RwX1XYshDz9a6kn1fzuve6a7KjFDwqHe5s+L1CDi/wn8D0zk/w8
+HYytmon253zzEvAzPwW3AubgNOHqAr65ePV1BHHM3ojpKqVydhnKx2VIGU3uRi64
+BowEzgjt69FMfUclBVhNdytVZULNCAsBTcNCCmo7XV8n5MJC+8js2szS77r0b98Q
+99RW4bHuR+Rn1L3VtKYgTaicjEi9aEoRYzPvoeL+Cr1xWYhtRt3IETexnZPtMEpN
+hrujvR6xUgFBbT5/LiJ3VJnd9yCKEhoV4D+aETcEmIzqQQlXCqyPT+I1AVpMKKBB
++M2YwJXcHULbrBnX9zfYhwHedX0IUFkjKQIDAQABo2MwYTAdBgNVHQ4EFgQU9A//
+NuAxwms/LxCCSHsX0Bdp4h0wHwYDVR0jBBgwFoAU9A//NuAxwms/LxCCSHsX0Bdp
+4h0wDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwDQYJKoZIhvcNAQEL
+BQADggEBADM9dMllBGzNuBwM22qObTCtZX/nVHcjt9ewurlFXqG4vu8dhk4o2Vh7
+exrWETGgWqybnO3xRyT9UPsoIv4lH1pkIBKRXElhBOmzbRmXCGUBH88tDN+BzqC/
+lBcGymMJUMmI40vaKfdwVyNb5+jegDns459wzqe8LB9p2r5U3OZbu5QzWLGSTBaR
+yNC9E2sgODrn5G9kIn74U9z0pso5wa1wK4M3HCk8q2UdH7FlUBSmod6MxC0fr5pg
+nXeOmJC41BmebWTCD2vcxZPpDVsVpQGK9qAIXjGOnAwvNX8W+e5UH5fQA9Kzls3r
+/YW1WWRzo38vQsZgfhxmC+uJCFewgaQ=
+-----END CERTIFICATE-----"#;
+
+const TEST_WEBSOCKET_CERTIFICATE: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDWTCCAkGgAwIBAgIUIxjMlJkiQ9vkSyamKGPk0614EucwDQYJKoZIhvcNAQEL
+BQAwKDEmMCQGA1UEAwwdYmV0dGVyY29kZXggdGVzdCBXZWJTb2NrZXQgQ0EwIBcN
+MjYwODE3MTczOTIyWhgPMjEyNjA3MjQxNzM5MjJaMBQxEjAQBgNVBAMMCWxvY2Fs
+aG9zdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAK58xz1uxQ1C0hzr
+lv+MjAuT+D/FY57GD/v/tiv3J+Jqwz17R4YmoviWGGqFFSuSAzthAZF6FYq33+s5
+5M8da++XDbBO29I3900uljQgrChMclOIv0m9qSOgXOGyGxKWWfJN7gi/+Gj5YrVN
+X2qZNQf6AmIF4EBd0BV1O4gp2qxE4ZOHRie3KtSzxq7zD+b/9YzSPudcAPg/OqBl
+dH/xyHoGy/I4i0AfFEsjn8gSPMeH/EourrZS4vEDrE9PPUGgJXGTM5oezlbwluqy
+aCyKTpKsmvd4/u4JrNaXKx62qa8ZtQQDN+ZR0OAeXL6aHreNlVskspG/M1s0v/jH
+X4NE0RMCAwEAAaOBjDCBiTAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIFoDAT
+BgNVHSUEDDAKBggrBgEFBQcDATAUBgNVHREEDTALgglsb2NhbGhvc3QwHQYDVR0O
+BBYEFIofbvGLeTuVOCiS6uRuh0I0A7n0MB8GA1UdIwQYMBaAFPQP/zbgMcJrPy8Q
+gkh7F9AXaeIdMA0GCSqGSIb3DQEBCwUAA4IBAQB89ALMykfNOeUmx5K9XLIvE6ur
+pusAntDhy5bnu0byoCx+PteKywMlynOWJsKbYU4/VoUqSK6KZtdxVDAh5K8a0S11
+WWIxXtX3eDO9NPrvBe7Cg/5g1V94dYaKNJnP5Eb3ZW6kcf+QLeboWidzuUjytlt3
+muOhTcgpQW/neL8x6GXbPRFCIFUJAEAJp2sPKA66NkBlHTVXTECQYL6nRUP7tk3Z
+r1idBEOu9xY/3GtcAw3r08tYTNCVeyxCr1O+h9/824aARRruvk7SmA6iaJel28a9
+zW84B7dAZkzUF4YkwUtmC+uWiZYLKJv6zc3k/1i1YvPItXUbVWNB0GsKgcsf
+-----END CERTIFICATE-----"#;
+
+const TEST_WEBSOCKET_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCufMc9bsUNQtIc
+65b/jIwLk/g/xWOexg/7/7Yr9yfiasM9e0eGJqL4lhhqhRUrkgM7YQGRehWKt9/r
+OeTPHWvvlw2wTtvSN/dNLpY0IKwoTHJTiL9JvakjoFzhshsSllnyTe4Iv/ho+WK1
+TV9qmTUH+gJiBeBAXdAVdTuIKdqsROGTh0YntyrUs8au8w/m//WM0j7nXAD4Pzqg
+ZXR/8ch6BsvyOItAHxRLI5/IEjzHh/xKLq62UuLxA6xPTz1BoCVxkzOaHs5W8Jbq
+smgsik6SrJr3eP7uCazWlysetqmvGbUEAzfmUdDgHly+mh63jZVbJLKRvzNbNL/4
+x1+DRNETAgMBAAECggEAE/6sfjexUQG1PicpGIOskK8WJYijD9C2iDQXVhZudZ2y
+XdtAqPjIeCALEDnL4UBMKoPFQDxzN4A2oqfxtmIyujPfF7MRsZdEOY37HGIaGEwa
+VcQ312VqenCn9B0KySh9iiyv+ES3XKAnVYtWQcrors9RcpYlynp1m9/hQIs7Sb4y
+XNU01MIDRGc3rw5ah8QlnrB9drXMo84yAWK4K8NavKFQsSEUzLfwVC1gyFwj+XGa
+gYCob9MaVcio4a+7906qQSlH7BuZVAp+b8SZbxmVGu/3PG3eEg0RndaeWOqh1FXJ
+/7EXheDdAaDf2TJjrCKQPNT0paocICtE0OSGDrrDIQKBgQDkmHlDblmbA/C2Zj5o
+ol46QlgYRInZGboI/3re0uq1McFImvyAlduB0XW7CmvZIs6hU1QV+8o4t+7qNMDg
+nDcKRaOkzcNLtiX66zhA0Z9Adgyt2KJR3VrgLbkcHjSmBVXff0+QjVZ6bSe/+9g4
+VHH2N4Gav5woPktI3IgU+CLoawKBgQDDZ73Y7v20rzP1r6ZZv4eSsqVef82/GLbD
+m3AFDwMsGUvx1qmrs/zoCC02j4gbmIjzxtGIAlavyH0uSXCmLBq4DMuXnSDDEQPK
+5Npx8x65sUeQhjk9vKbEG1OWWMMYw8DBOD1TzJg/hnc1rTStpaOwEUHS8TMA8ftc
+pxNahaaD+QKBgQCiqUSQkPM99P3SLMr31aHLPu5ExnB4hW/1eyXJbLgKmw74RSCr
+tvbtV0i5AV9gsP3rmcnZosNwvKFLEqK0sTQRISCi4q+3LjO0arAqn378dYPsKJzI
+OAS0RJTVx0CbamyCjqrlJ02D7Cw+1kwzOROmqjSVEwdhM4KKpDJJCZB9ZQKBgDlS
+QG3XxdLwJmTnDvx64/FTuJEdGqT5QfvlqBnDyqFwFkguOX2mAgWrCGBeAIZf26Tv
+aN3mGbndLWObpZEJlRjyn/Ks5ER0xFELi00sDZJZf+3UggwrQBx9C6sqBKlKG0xT
+DCJ9/Rd9gZDca3yY/4iRt2aC3Pxk/+CxHktKs4s5AoGBALlEGbZSrd1PBKWAJgCz
+TYUxjM5eG57JI2cslckmYMaPbu+PkoLpy/sNX3DjMi8cJ52eZWFtwUQnW7r1cJpt
+SHZnqPB8tXRFtYEkOW5dSEIM6hCs7yQtQWBFWu0lEnN5UC8Tv2Wo1+K6h69pvgzW
+xvbq9gKstf9a/AERJfJX6AA2
+-----END PRIVATE KEY-----"#;
 
 fn read_request(stream: &mut TcpStream) -> CapturedRequest {
     stream

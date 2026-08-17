@@ -11,8 +11,10 @@ not apply.
 The supported path overrides are:
 
 - `CODEX_HOME` for the shared Codex credential and prompt-history directory;
-- `BCODEX_HOME` for bettercodex sessions, skills, and state; and
-- `BCODEX_INSTALL_DIR` for the installer-managed binary directory.
+- `BCODEX_HOME` for bettercodex sessions, skills, and state;
+- `BCODEX_INSTALL_DIR` for the installer-managed binary directory; and
+- `CODEX_CA_CERTIFICATE`, falling back to `SSL_CERT_FILE`, for a custom root CA
+  bundle used by bettercodex's HTTPS and secure WebSocket clients.
 
 Set `BCODEX_SKIP_UPDATE_CHECK=1` to disable the failure-silent background
 release check. These environment variables are narrow operational overrides,

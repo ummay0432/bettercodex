@@ -87,6 +87,19 @@ const TABLE_CELL_PADDING: usize = 1;
 const TABLE_HEADER_SEPARATOR_CHAR: char = '━';
 const TABLE_BODY_SEPARATOR_CHAR: char = '─';
 
+fn terminal_safe_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let text = expand_tabs(text);
+    if text.chars().any(char::is_control) {
+        std::borrow::Cow::Owned(
+            text.chars()
+                .filter(|character| !character.is_control())
+                .collect(),
+        )
+    } else {
+        text
+    }
+}
+
 struct MarkdownStyles {
     h1: Style,
     h2: Style,
@@ -455,9 +468,10 @@ where
             }
             Event::Html(html) => self.html(html, /*inline*/ false),
             Event::InlineHtml(html) => self.html(html, /*inline*/ true),
-            Event::FootnoteReference(reference) => {
-                self.push_span(Span::styled(format!("[{reference}]"), self.styles.link))
-            }
+            Event::FootnoteReference(reference) => self.push_span(Span::styled(
+                format!("[{}]", terminal_safe_text(&reference)),
+                self.styles.link,
+            )),
             Event::TaskListMarker(checked) => self.push_span(Span::styled(
                 if checked { "[x] " } else { "[ ] " },
                 Style::default().dim(),
@@ -508,7 +522,9 @@ where
             Tag::TableHead => self.start_table_head(),
             Tag::TableRow => self.start_table_row(range),
             Tag::TableCell => self.start_table_cell(),
-            Tag::FootnoteDefinition(name) => self.start_footnote_definition(name.into_string()),
+            Tag::FootnoteDefinition(name) => {
+                self.start_footnote_definition(terminal_safe_text(&name).into_owned())
+            }
             Tag::HtmlBlock | Tag::Image { .. } | Tag::MetadataBlock(_) => {}
         }
     }
@@ -700,7 +716,7 @@ where
         self.line_ends_with_local_link_target = false;
         if self.in_table_cell() {
             self.push_span_to_table_cell(
-                Span::from(expand_tabs(code.as_ref()).into_owned()).style(self.styles.code),
+                Span::from(terminal_safe_text(code.as_ref()).into_owned()).style(self.styles.code),
             );
             return;
         }
@@ -709,7 +725,8 @@ where
             self.push_line(Line::default());
             self.pending_marker_line = false;
         }
-        let span = Span::from(expand_tabs(code.as_ref()).into_owned()).style(self.styles.code);
+        let span =
+            Span::from(terminal_safe_text(code.as_ref()).into_owned()).style(self.styles.code);
         self.push_span(span);
     }
 
@@ -724,7 +741,10 @@ where
                 if i > 0 {
                     self.push_table_cell_hard_break();
                 }
-                self.push_span_to_table_cell(Span::styled(expand_tabs(line).into_owned(), style));
+                self.push_span_to_table_cell(Span::styled(
+                    terminal_safe_text(line).into_owned(),
+                    style,
+                ));
             }
             if !inline {
                 self.push_table_cell_hard_break();
@@ -741,7 +761,7 @@ where
                 self.push_line(Line::default());
             }
             let style = self.inline_styles.last().copied().unwrap_or_default();
-            self.push_span(Span::styled(expand_tabs(line).into_owned(), style));
+            self.push_span(Span::styled(terminal_safe_text(line).into_owned(), style));
         }
         self.needs_newline = !inline;
     }
@@ -1043,7 +1063,7 @@ where
     }
 
     fn push_text_spans_to_table_cell(&mut self, text: &str, style: Style) {
-        let span = Span::styled(expand_tabs(text).into_owned(), style);
+        let span = Span::styled(terminal_safe_text(text).into_owned(), style);
         let destination = self
             .link
             .as_ref()
@@ -1816,11 +1836,12 @@ where
                 // Link destinations are rendered as " (url)" suffixes. When parsing table cells,
                 // append the suffix into the active cell buffer rather than the outer paragraph
                 // line to avoid detached url lines.
+                let visible_destination = terminal_safe_text(&link.destination).into_owned();
                 if self.in_table_cell() {
                     self.push_span_to_table_cell(" (".into());
                     let mut destination = HyperlinkLine::new(Line::default());
                     destination.push_span(
-                        Span::styled(link.destination.clone(), self.styles.link),
+                        Span::styled(visible_destination, self.styles.link),
                         web_destination(&link.destination).as_deref(),
                     );
                     if let Some(table_state) = self.table_state.as_mut()
@@ -1833,7 +1854,7 @@ where
                     self.push_span(" (".into());
                     let mut destination = HyperlinkLine::new(Line::default());
                     destination.push_span(
-                        Span::styled(link.destination.clone(), self.styles.link),
+                        Span::styled(visible_destination, self.styles.link),
                         web_destination(&link.destination).as_deref(),
                     );
                     self.push_annotated(destination);
@@ -1988,7 +2009,7 @@ where
     }
 
     fn push_text_spans(&mut self, text: &str, style: Style) {
-        let span = Span::styled(expand_tabs(text).into_owned(), style);
+        let span = Span::styled(terminal_safe_text(text).into_owned(), style);
         let destination = self
             .link
             .as_ref()
@@ -2071,6 +2092,9 @@ fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Option<String
     if let Some(location_suffix) = location_suffix {
         rendered.push_str(&location_suffix);
     }
+    // URL/path decoding happens after the assistant-source sanitizer, so remove any decoded C0/C1
+    // controls before the target becomes terminal-visible text.
+    rendered.retain(|character| !character.is_control());
     Some(rendered)
 }
 
@@ -2884,6 +2908,64 @@ mod tests {
     }
 
     #[test]
+    fn decoded_markdown_entities_cannot_introduce_terminal_controls() {
+        let lines = render_markdown_lines_with_width_and_cwd(
+            "plain &#x1b;[31mred&#7; [label](https://example.com/&#x1b;[33mlink)\n\n| A |\n| --- |\n| &#27;[32mcell&#8; |",
+            /*width*/ Some(80),
+            /*cwd*/ None,
+        );
+        let visible = lines
+            .iter()
+            .map(|line| {
+                line.line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            visible
+                .iter()
+                .all(|line| !line.chars().any(char::is_control)),
+            "{visible:?}"
+        );
+        let visible = visible.join("\n");
+        assert!(visible.contains("[31mred"), "{visible:?}");
+        assert!(visible.contains("[32mcell"), "{visible:?}");
+        assert!(
+            visible.contains("https://example.com/[33mlink"),
+            "{visible:?}"
+        );
+    }
+
+    #[test]
+    fn local_file_links_remove_controls_introduced_by_percent_decoding() {
+        for (target, expected) in [
+            (
+                "file:///tmp/bettercodex/src/%1B%5B31mred%0A.rs",
+                "src/[31mred.rs",
+            ),
+            ("./src/%1B%5B31mred%0A.rs", "./src/[31mred.rs"),
+        ] {
+            let lines = render_markdown_lines_with_width_and_cwd(
+                &format!("[label]({target})"),
+                /*width*/ Some(80),
+                Some(Path::new("/tmp/bettercodex")),
+            );
+            let visible = lines
+                .iter()
+                .flat_map(|line| &line.line.spans)
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+
+            assert_eq!(visible, expected);
+            assert!(!visible.chars().any(char::is_control));
+        }
+    }
+
+    #[test]
     fn literal_tabs_stay_visible_in_markdown_and_fenced_code() {
         let lines = render_markdown_lines_with_width_and_cwd(
             "before\tafter\n\n```bash\nprintf one\tthen-two\n```",
@@ -2905,6 +2987,31 @@ mod tests {
         assert!(!visible.contains('\t'));
         assert!(visible.contains("before    after"), "{visible}");
         assert!(visible.contains("printf one    then-two"), "{visible}");
+    }
+
+    #[test]
+    fn record_table_fallback_stays_within_tiny_widths() {
+        let markdown = "| A | B | C | D |\n| --- | --- | --- | --- |\n| 👩‍💻 | 2 | 3 | 4 |\n";
+
+        for width in 1..4 {
+            let lines = render_markdown_lines_with_width_and_cwd(
+                markdown,
+                /*width*/ Some(width),
+                /*cwd*/ None,
+            );
+            assert!(
+                lines.iter().all(|line| line.width() <= width),
+                "width {width}: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|line| line
+                    .line
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains('…'))),
+                "width {width}: {lines:?}"
+            );
+        }
     }
 
     #[test]

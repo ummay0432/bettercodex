@@ -2432,7 +2432,8 @@ impl View {
             .desired_height(self.composer_text_width)
             .max(1)
             .saturating_add(2);
-        let pending_height = u16::try_from(self.pending_input.lines().len()).unwrap_or(u16::MAX);
+        let pending_height =
+            u16::try_from(self.pending_input.lines(width).len()).unwrap_or(u16::MAX);
         let pending_gap = if pending_height > 0 {
             PENDING_INPUT_GAP
         } else {
@@ -2514,7 +2515,7 @@ impl View {
             requested_activity_height.saturating_add(requested_activity_gap);
         let activity_block_height = requested_activity_block_height
             .min(height_above_trailing.saturating_sub(minimum_composer_height));
-        let pending_lines = self.pending_input.lines();
+        let pending_lines = self.pending_input.lines(area.width);
         let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
         let requested_pending_gap = if requested_pending_height > 0 {
             PENDING_INPUT_GAP
@@ -2585,7 +2586,6 @@ impl View {
                     pending_lines
                         .into_iter()
                         .take(usize::from(pending_height))
-                        .map(|line| truncate_line(line, usize::from(pending_area.width)))
                         .collect::<Vec<_>>(),
                 ),
                 pending_area,
@@ -3111,7 +3111,7 @@ impl TranscriptEntry {
             Self::Exploration { tools, .. } => exploration_lines(tools, width),
             Self::Notice(message) => vec![Line::from(vec![
                 Span::from("• ").dim(),
-                Span::from(message.clone()).dim(),
+                Span::from(markdown::sanitize_inline(message)).dim(),
             ])],
             Self::PatchNotes { content } => {
                 return patch_notes_lines(content, width, cwd);
@@ -3119,7 +3119,10 @@ impl TranscriptEntry {
             Self::UpdateAvailable(update) => update_available_lines(update, width),
             Self::Error(message) => vec![Line::from(vec![
                 Span::styled("■ ", Style::default().fg(Color::Red)),
-                Span::styled(message.clone(), Style::default().fg(Color::Red)),
+                Span::styled(
+                    markdown::sanitize_inline(message),
+                    Style::default().fg(Color::Red),
+                ),
             ])],
             Self::Diff(diff) => git_diff_lines(diff, width),
             Self::Status(snapshot) => return snapshot.display_lines(width),
@@ -3446,13 +3449,13 @@ impl Repository {
         let root = command_output(cwd, &["rev-parse", "--show-toplevel"])
             .map(PathBuf::from)
             .unwrap_or_else(|| cwd.to_path_buf());
-        let name = markdown::sanitize(
+        let name = markdown::sanitize_inline(
             root.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("workspace"),
         );
         let branch = command_output(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .map(|branch| markdown::sanitize(&branch));
+            .map(|branch| markdown::sanitize_inline(&branch));
         Self { name, branch }
     }
 }
@@ -3635,15 +3638,15 @@ fn with_card_border_style(lines: Vec<Line<'static>>, border_style: Style) -> Vec
 
 fn display_directory(cwd: &Path) -> String {
     let Some(home) = crate::paths::home_dir() else {
-        return markdown::sanitize(&cwd.display().to_string());
+        return markdown::sanitize_inline(&cwd.display().to_string());
     };
     cwd.strip_prefix(&home).map_or_else(
-        |_| markdown::sanitize(&cwd.display().to_string()),
+        |_| markdown::sanitize_inline(&cwd.display().to_string()),
         |relative| {
             if relative.as_os_str().is_empty() {
                 "~".to_string()
             } else {
-                markdown::sanitize(&format!("~/{}", relative.display()))
+                markdown::sanitize_inline(&format!("~/{}", relative.display()))
             }
         },
     )
@@ -3651,17 +3654,17 @@ fn display_directory(cwd: &Path) -> String {
 
 fn display_tool_path(path: &Path, cwd: &Path) -> String {
     if path.is_relative() {
-        return markdown::sanitize(&path.display().to_string());
+        return markdown::sanitize_inline(&path.display().to_string());
     }
     if let Ok(relative) = path.strip_prefix(cwd) {
-        return markdown::sanitize(&relative.display().to_string());
+        return markdown::sanitize_inline(&relative.display().to_string());
     }
     let Some(home) = crate::paths::home_dir() else {
-        return markdown::sanitize(&path.display().to_string());
+        return markdown::sanitize_inline(&path.display().to_string());
     };
     path.strip_prefix(home).map_or_else(
-        |_| markdown::sanitize(&path.display().to_string()),
-        |relative| markdown::sanitize(&format!("~/{}", relative.display())),
+        |_| markdown::sanitize_inline(&path.display().to_string()),
+        |relative| markdown::sanitize_inline(&format!("~/{}", relative.display())),
     )
 }
 
@@ -4062,7 +4065,10 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
 
     let detail_width = width.saturating_sub(4).max(1);
     let mut first_detail = true;
-    for (title, spans) in details {
+    for (title, mut spans) in details {
+        for span in &mut spans {
+            span.content = markdown::sanitize_inline(span.content.as_ref()).into();
+        }
         let title = format!("{title} ");
         let title_width = u16::try_from(display_width(&title)).unwrap_or(u16::MAX);
         for (index, mut row) in wrap_styled_line(
@@ -4227,7 +4233,7 @@ fn web_search_lines(search: &WebSearchEntry, width: u16) -> Vec<Line<'static>> {
         WebSearchState::Failed => ("•".red().bold(), "Web search failed", " for "),
         WebSearchState::Interrupted => ("•".dim(), "Web search interrupted", " for "),
     };
-    let detail = search.search.detail();
+    let detail = markdown::sanitize_inline(&search.search.detail());
     let mut content = vec![Span::from(header).bold()];
     if !detail.is_empty() {
         content.push(detail_prefix.into());
@@ -4247,20 +4253,21 @@ fn web_search_lines(search: &WebSearchEntry, width: u16) -> Vec<Line<'static>> {
 }
 
 fn generic_tool_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
+    let name = markdown::sanitize_inline(&tool.name);
     match tool.outcome.as_ref().map(|outcome| &outcome.output) {
         None => vec![Line::from(vec![
             activity_marker(Some(tool.started_at)),
             " ".into(),
             "Running".bold(),
             " ".into(),
-            Span::styled(tool.name.clone(), palette::accent_text_style()),
+            Span::styled(name, palette::accent_text_style()),
         ])],
         Some(Ok(output)) => {
             let mut lines = vec![Line::from(vec![
                 "• ".dim(),
                 "Called".bold(),
                 " ".into(),
-                Span::styled(tool.name.clone(), palette::accent_text_style()),
+                Span::styled(name, palette::accent_text_style()),
             ])];
             append_bounded_output(&output.to_string(), width, TOOL_OUTPUT_MAX_ROWS, &mut lines);
             lines
@@ -4273,7 +4280,7 @@ fn recovered_tool_lines(title: &str, detail: &str, width: u16) -> Vec<Line<'stat
     let header = Line::from(vec![
         "•".dim(),
         " ".into(),
-        Span::from(title.to_string()).bold(),
+        Span::from(markdown::sanitize_inline(title)).bold(),
     ]);
     let mut lines = vec![truncate_line(header, usize::from(width))];
     append_bounded_output(detail, width, TOOL_OUTPUT_MAX_ROWS, &mut lines);
@@ -4284,7 +4291,7 @@ fn failed_tool_lines(title: &str, error: &str, width: u16) -> Vec<Line<'static>>
     let header = Line::from(vec![
         "•".red().bold(),
         " ".into(),
-        Span::from(title.to_string()).bold(),
+        Span::from(markdown::sanitize_inline(title)).bold(),
     ]);
     let mut lines = vec![truncate_line(header, usize::from(width))];
     append_bounded_output(error, width, TOOL_OUTPUT_MAX_ROWS, &mut lines);
@@ -4323,7 +4330,10 @@ fn append_bounded_output(
             for_each_wrapped_styled_line(
                 &ansi,
                 u16::try_from(content_width).unwrap_or(u16::MAX),
-                push,
+                |line| {
+                    push(line);
+                    true
+                },
             );
         }
     }
@@ -4482,15 +4492,37 @@ impl BoundedOutputRows {
 
 pub(super) fn wrap_styled_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     let mut rows = Vec::new();
-    for_each_wrapped_styled_line(line, width, |row| rows.push(row));
+    for_each_wrapped_styled_line(line, width, |row| {
+        rows.push(row);
+        true
+    });
     rows
+}
+
+/// Hard-wrap a styled line while stopping before more than `maximum_rows` are retained.
+///
+/// The boolean reports whether additional source content was omitted.
+pub(super) fn wrap_styled_line_bounded(
+    line: &Line<'static>,
+    width: u16,
+    maximum_rows: usize,
+) -> (Vec<Line<'static>>, bool) {
+    let mut rows = Vec::with_capacity(maximum_rows);
+    let completed = for_each_wrapped_styled_line(line, width, |row| {
+        if rows.len() == maximum_rows {
+            return false;
+        }
+        rows.push(row);
+        true
+    });
+    (rows, !completed)
 }
 
 fn for_each_wrapped_styled_line(
     line: &Line<'static>,
     width: u16,
-    mut emit: impl FnMut(Line<'static>),
-) {
+    mut emit: impl FnMut(Line<'static>) -> bool,
+) -> bool {
     let width = usize::from(width.max(1));
     let mut spans = Vec::new();
     let mut used = 0;
@@ -4503,7 +4535,9 @@ fn for_each_wrapped_styled_line(
                 if !content.is_empty() {
                     spans.push(Span::styled(std::mem::take(&mut content), span.style));
                 }
-                emit(Line::from(std::mem::take(&mut spans)).style(line.style));
+                if !emit(Line::from(std::mem::take(&mut spans)).style(line.style)) {
+                    return false;
+                }
                 emitted = true;
                 used = 0;
             }
@@ -4514,9 +4548,10 @@ fn for_each_wrapped_styled_line(
             spans.push(Span::styled(content, span.style));
         }
     }
-    if !spans.is_empty() || !emitted {
-        emit(Line::from(spans).style(line.style));
+    if (!spans.is_empty() || !emitted) && !emit(Line::from(spans).style(line.style)) {
+        return false;
     }
+    true
 }
 
 fn append_history_cell(
@@ -5094,6 +5129,40 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(finalized, streamed);
+    }
+
+    #[test]
+    fn non_markdown_transcript_fields_strip_terminal_controls() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.add_notice("safe\u{7}\nnext\t\x1b[31mred\x1b[0m");
+
+        let notice = view
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(notice, "• safe next red");
+        assert!(!notice.chars().any(char::is_control));
+
+        let preview = file_change::lines(
+            "bad\u{7}\nname.rs",
+            &FileChange::Add {
+                content: "safe\u{7}\tred".to_string(),
+            },
+            80,
+            Style::default(),
+        );
+        let preview_lines = preview.iter().map(plain).collect::<Vec<_>>();
+        let preview = preview_lines.join("\n");
+        assert!(preview.contains("bad name.rs"), "{preview:?}");
+        assert!(preview.contains("safe    red"), "{preview:?}");
+        assert!(
+            preview_lines
+                .iter()
+                .all(|line| !line.chars().any(char::is_control))
+        );
     }
 
     #[test]
@@ -5867,6 +5936,33 @@ mod tests {
 
         assert!(rows[steer_y + 1].trim().is_empty(), "{rendered}");
         assert_eq!(activity_y, steer_y + 2, "{rendered}");
+    }
+
+    #[test]
+    fn queued_input_preview_wraps_instead_of_clipping() {
+        const WIDTH: u16 = 32;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("active turn"));
+        let _ = view.take_pending_history_lines(WIDTH, 24);
+        view.queue_follow_up(UserPrompt::text(
+            "alpha beta gamma delta epsilon zeta eta theta omega",
+        ));
+
+        let height = view.desired_height(WIDTH, 24);
+        let backend = TestBackend::new(WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| view.render(frame)).unwrap();
+        let rendered = render_buffer(terminal.backend().buffer());
+        let rows = rendered.lines().collect::<Vec<_>>();
+
+        assert!(rendered.contains("↳ alpha beta"), "{rendered}");
+        let continuation = rows
+            .iter()
+            .find(|row| row.contains("theta omega"))
+            .expect("wrapped queued-input continuation");
+        assert!(continuation.starts_with("    "), "{rendered}");
     }
 
     #[test]
@@ -6707,8 +6803,9 @@ mod tests {
             8,
             Style::default(),
         );
-        assert_eq!(narrow.len(), 1_002);
-        assert!(plain(narrow.last().expect("omission row")).contains('…'));
+        assert!(narrow.len() < 100, "{} rendered rows", narrow.len());
+        assert!(narrow.iter().all(|line| line_width(line) <= 8));
+        assert!(plain(narrow.last().expect("truncated row")).contains('…'));
     }
 
     #[test]

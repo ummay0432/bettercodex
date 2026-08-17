@@ -16,6 +16,7 @@ use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -460,7 +461,8 @@ pub(super) fn is_horizontal_whitespace(character: char) -> bool {
 
 fn file_match_line(file_match: &FileMatch, selected: bool, width: usize) -> Line<'static> {
     let path = file_match.path.to_string_lossy();
-    let (parent, name, name_char_start) = split_path(&path);
+    let display_path = sanitized_display_path(&path);
+    let (parent, name, name_char_start) = split_path(&display_path);
     let indices = file_match.indices.as_deref().unwrap_or_default();
     let mut content = matched_spans(name, name_char_start, indices, palette::accent_text_style());
     content.push(Span::from("  "));
@@ -507,6 +509,26 @@ fn file_match_line(file_match: &FileMatch, selected: bool, width: usize) -> Line
         }
     }
     Line::from(spans)
+}
+
+fn sanitized_display_path(path: &str) -> Cow<'_, str> {
+    if path.chars().any(char::is_control) {
+        // Replace one scalar with one scalar so fuzzy-match character indices still align with the
+        // visible label. The original `FileMatch.path` remains untouched for composer insertion.
+        Cow::Owned(
+            path.chars()
+                .map(|character| {
+                    if character.is_control() {
+                        '�'
+                    } else {
+                        character
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(path)
+    }
 }
 
 fn split_path(path: &str) -> (&str, &str, usize) {
@@ -592,6 +614,41 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displayed_paths_replace_controls_without_changing_inserted_paths() {
+        let original = "src/bad\x1b[31m\nname.rs";
+        let file_match = FileMatch {
+            score: 1,
+            path: PathBuf::from(original),
+            match_type: MatchType::File,
+            root: PathBuf::from("/tmp/repository"),
+            indices: Some(vec![4, 13]),
+        };
+        let line = file_match_line(&file_match, false, 80);
+        let displayed = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(displayed.contains("bad�[31m�name.rs"), "{displayed:?}");
+        assert!(!displayed.chars().any(char::is_control));
+        let highlighted = line
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(highlighted, "bn");
+
+        let mut popup = FileSearchPopup::default();
+        popup.sync("@bad", 4);
+        popup.apply_update(FileSearchUpdate::Matches {
+            query: "bad".to_string(),
+            matches: vec![file_match],
+        });
+        assert_eq!(popup.selected_path(), Some((0..4, original.to_string())));
+    }
 
     #[test]
     fn fuzzy_highlighting_and_truncation_keep_extended_graphemes_intact() {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::context::EFFECTIVE_CONTEXT_WINDOW;
+use crate::context::ResponseItemForRequest;
 use serde_json::Value;
 use std::fs;
 
@@ -33,6 +34,36 @@ fn text_of(item: &Value) -> &str {
     item.pointer("/content/0/text")
         .and_then(Value::as_str)
         .unwrap()
+}
+
+#[test]
+fn catalogue_limit_applies_after_json_serialization() {
+    let escape_heavy_description = "\0\\\"".repeat(MAX_DESCRIPTION_CHARS / 3);
+    let skills = (0..64)
+        .map(|index| Skill {
+            name: format!("escape-heavy-{index:02}"),
+            description: escape_heavy_description.clone(),
+            short_description: None,
+            display_name: None,
+            path: PathBuf::from(format!("/tmp/escape-heavy-{index:02}/SKILL.md")),
+            discovery_path: PathBuf::from(format!("/tmp/escape-heavy-{index:02}/SKILL.md")),
+            scope: SkillScope::Repository,
+            enabled: true,
+            allow_implicit_invocation: true,
+        })
+        .collect();
+    let catalog = SkillCatalog {
+        skills,
+        warnings: Vec::new(),
+    };
+
+    let item = catalog
+        .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
+        .expect("escape-heavy catalogue should remain visible");
+    let serialized = serde_json::to_vec(&ResponseItemForRequest::new(&item)).unwrap();
+
+    assert!(serialized.len() <= MAX_SKILLS_CONTEXT_BYTES);
+    assert!(text_of(&item).contains("escape-heavy-00"));
 }
 
 #[test]
@@ -139,6 +170,86 @@ fn linked_skill_injections_follow_catalog_order() {
         assert!(text_of(&injection.items[1]).contains("<name>beta</name>"));
         assert!(text_of(&injection.items[2]).contains("<name>gamma</name>"));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_skill_directories_preserve_the_advertised_discovery_path() {
+    let root = TemporaryDirectory::new();
+    let cwd = root.join("repository");
+    let target = root.join("shared/linked");
+    let discovery_directory = cwd.join(".bcodex/skills/linked");
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(discovery_directory.parent().unwrap()).unwrap();
+    fs::write(
+        target.join(SKILL_FILE_NAME),
+        "---\nname: linked\ndescription: Linked skill\n---\n\nLINKED SKILL BODY\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&target, &discovery_directory).unwrap();
+    std::os::unix::fs::symlink(&target, target.join("loop")).unwrap();
+
+    let catalog = SkillCatalog::load_with_home(&cwd, None);
+    assert!(catalog.warnings().is_empty());
+    let skill = catalog
+        .skills()
+        .iter()
+        .find(|skill| skill.name() == "linked")
+        .unwrap();
+    let canonical_path = target.join(SKILL_FILE_NAME).canonicalize().unwrap();
+    let discovery_path = discovery_directory.join(SKILL_FILE_NAME);
+    assert_eq!(skill.path(), canonical_path);
+
+    let catalogue_message = catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap();
+    let catalogue = text_of(&catalogue_message);
+    assert!(catalogue.contains(&discovery_path.to_string_lossy().replace('\\', "/")));
+    assert!(!catalogue.contains(&canonical_path.to_string_lossy().replace('\\', "/")));
+
+    let invocation = format!(
+        "use [$linked](skill://{})",
+        discovery_path.to_string_lossy().replace('\\', "/")
+    );
+    let injection = catalog.explicit_injections(&invocation, &[]);
+    assert!(injection.warnings.is_empty());
+    assert_eq!(injection.items.len(), 1);
+    let injected = text_of(&injection.items[0]);
+    assert!(injected.contains("LINKED SKILL BODY"));
+    assert!(injected.contains(&format!(
+        "<path>{}</path>",
+        escape_xml_text(&canonical_path.to_string_lossy())
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_shadow_cannot_suppress_the_reserved_system_review() {
+    let root = TemporaryDirectory::new();
+    let home = root.join("home");
+    let cwd = root.join("repository");
+    let shadow = cwd.join(".bcodex/skills/review-shadow");
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+    fs::create_dir_all(shadow.parent().unwrap()).unwrap();
+    let system_root = crate::system_skills::install(&home).unwrap();
+    std::os::unix::fs::symlink(system_root.join("review"), &shadow).unwrap();
+
+    let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
+    let reviews = catalog
+        .skills()
+        .iter()
+        .filter(|skill| skill.name() == "review")
+        .collect::<Vec<_>>();
+
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].scope, SkillScope::System);
+    assert!(reviews[0].is_enabled());
+    assert!(reviews[0].allows_implicit_invocation());
+    assert!(
+        catalog
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("reserved skill name `review`"))
+    );
 }
 
 #[test]

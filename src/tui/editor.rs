@@ -628,8 +628,9 @@ impl Editor {
     }
 
     pub(super) fn move_vertical(&mut self, delta: isize, width: u16) {
-        let ranges = self.wrapped_ranges(usize::from(width.max(1)));
-        let current = line_for_cursor(&ranges, self.cursor);
+        let width = usize::from(width.max(1));
+        let ranges = self.wrapped_ranges(width);
+        let current = line_for_cursor(&self.text, &ranges, self.cursor);
         let target = current.saturating_add_signed(delta).min(ranges.len() - 1);
         if target == current {
             drop(ranges);
@@ -638,7 +639,7 @@ impl Editor {
             return;
         }
         let column = self.preferred_column.unwrap_or_else(|| {
-            editable_display_width(&self.text[ranges[current].start..self.cursor])
+            cursor_column_for_range(&self.text, &ranges[current], self.cursor, width)
         });
         let position = byte_at_column(&self.text, &ranges[target], column);
         drop(ranges);
@@ -656,7 +657,7 @@ impl Editor {
     pub(super) fn layout(&self, width: u16, max_height: u16) -> EditorLayout {
         let width = width.max(1) as usize;
         let ranges = self.wrapped_ranges(width);
-        let cursor_line = line_for_cursor(&ranges, self.cursor);
+        let cursor_line = line_for_cursor(&self.text, &ranges, self.cursor);
         let max_height = max_height.max(1) as usize;
         let first = cursor_line
             .saturating_add(1)
@@ -737,8 +738,11 @@ impl Editor {
             image_ranges,
             history_search_ranges,
             cursor_row: (cursor_line - first) as u16,
-            cursor_column: editable_display_width(
-                &self.text[ranges[cursor_line].start..self.cursor],
+            cursor_column: cursor_column_for_range(
+                &self.text,
+                &ranges[cursor_line],
+                self.cursor,
+                width,
             ) as u16,
             total_lines: ranges.len().try_into().unwrap_or(u16::MAX),
         }
@@ -1261,7 +1265,7 @@ impl Editor {
             if cache.as_ref().is_none_or(|cache| cache.width != width) {
                 *cache = Some(WrapCache {
                     width,
-                    ranges: visual_ranges(&self.text, width),
+                    ranges: editable_visual_ranges(&self.text, width),
                 });
             }
         }
@@ -1424,10 +1428,19 @@ fn end_of_next_word(text: &str, cursor: usize) -> usize {
 
 pub(super) fn visual_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
     let display_text = text_for_display(text);
-    visual_ranges_for_display(&display_text, width)
+    visual_ranges_for_display(&display_text, width, false)
 }
 
-fn visual_ranges_for_display(text: &str, width: usize) -> Vec<Range<usize>> {
+fn editable_visual_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
+    let display_text = text_for_display(text);
+    visual_ranges_for_display(&display_text, width, true)
+}
+
+fn visual_ranges_for_display(
+    text: &str,
+    width: usize,
+    reserve_cursor_row: bool,
+) -> Vec<Range<usize>> {
     if text.is_empty() {
         return std::iter::once(0..0).collect();
     }
@@ -1436,7 +1449,14 @@ fn visual_ranges_for_display(text: &str, width: usize) -> Vec<Range<usize>> {
     for segment in text.split_inclusive('\n') {
         let has_newline = segment.ends_with('\n');
         let logical_end = logical_start + segment.len() - usize::from(has_newline);
-        wrap_logical_line(text, logical_start, logical_end, width, &mut ranges);
+        wrap_logical_line(
+            text,
+            logical_start,
+            logical_end,
+            width,
+            reserve_cursor_row,
+            &mut ranges,
+        );
         logical_start += segment.len();
     }
     if text.ends_with('\n') {
@@ -1445,30 +1465,41 @@ fn visual_ranges_for_display(text: &str, width: usize) -> Vec<Range<usize>> {
     ranges
 }
 
+fn is_breakable_space(character: char) -> bool {
+    character.is_whitespace() && !matches!(character, '\u{a0}' | '\u{2007}' | '\u{202f}')
+}
+
 fn wrap_logical_line(
     text: &str,
     logical_start: usize,
     logical_end: usize,
     width: usize,
+    reserve_cursor_row: bool,
     ranges: &mut Vec<Range<usize>>,
 ) {
     if logical_start == logical_end {
         ranges.push(logical_start..logical_end);
         return;
     }
+    let logical_content_end = logical_start
+        + text[logical_start..logical_end]
+            .trim_end_matches(is_breakable_space)
+            .len();
     let mut start = logical_start;
+    let mut has_text_before_start = false;
     while start < logical_end {
-        if start > logical_start {
-            while start < logical_end {
-                let next = next_boundary(text, start).min(logical_end);
-                if !text[start..next].chars().all(char::is_whitespace) {
+        if has_text_before_start && start < logical_content_end {
+            let mut content_start = start;
+            while content_start < logical_content_end {
+                let next = next_boundary(text, content_start).min(logical_content_end);
+                if !text[content_start..next].chars().all(is_breakable_space) {
                     break;
                 }
-                start = next;
+                content_start = next;
             }
-            if start == logical_end {
-                break;
-            }
+            // Interior separators hang at the previous soft break. Keep indentation and trailing
+            // whitespace in explicit ranges so it remains visible and its cursor stays bounded.
+            start = content_start;
         }
         let mut used = 0;
         let mut fitted_end = start;
@@ -1482,7 +1513,7 @@ fn wrap_logical_line(
             }
             fitted_end = grapheme_end;
             used += grapheme_width;
-            if grapheme.chars().all(char::is_whitespace) {
+            if grapheme.chars().all(is_breakable_space) {
                 whitespace_break = Some(grapheme_end);
             }
             if used >= width {
@@ -1491,17 +1522,20 @@ fn wrap_logical_line(
         }
         if fitted_end >= logical_end {
             ranges.push(start..logical_end);
+            if reserve_cursor_row && used >= width {
+                ranges.push(logical_end..logical_end);
+            }
             break;
         }
         let exact_word_boundary = fitted_end >= logical_end
             || text[fitted_end..logical_end]
                 .chars()
                 .next()
-                .is_some_and(char::is_whitespace)
+                .is_some_and(is_breakable_space)
             || text[start..fitted_end]
                 .chars()
                 .next_back()
-                .is_some_and(char::is_whitespace);
+                .is_some_and(is_breakable_space);
         let end = if used == width && exact_word_boundary {
             fitted_end
         } else {
@@ -1509,16 +1543,37 @@ fn wrap_logical_line(
                 .filter(|end| *end > start)
                 .unwrap_or(fitted_end)
         };
+        has_text_before_start |= text[start..end]
+            .chars()
+            .any(|character| !is_breakable_space(character));
         ranges.push(start..end);
         start = end;
     }
 }
 
-fn line_for_cursor(ranges: &[Range<usize>], cursor: usize) -> usize {
-    ranges
+fn line_for_cursor(text: &str, ranges: &[Range<usize>], cursor: usize) -> usize {
+    let line = ranges
         .partition_point(|range| range.start <= cursor)
         .saturating_sub(1)
-        .min(ranges.len() - 1)
+        .min(ranges.len() - 1);
+    let Some(next) = ranges.get(line + 1) else {
+        return line;
+    };
+    if cursor >= ranges[line].end
+        && cursor < next.start
+        && !text[ranges[line].end..next.start].contains('\n')
+    {
+        line + 1
+    } else {
+        line
+    }
+}
+
+fn cursor_column_for_range(text: &str, range: &Range<usize>, cursor: usize, width: usize) -> usize {
+    if cursor <= range.start {
+        return 0;
+    }
+    editable_display_width(&text[range.start..cursor.min(range.end)]).min(width.saturating_sub(1))
 }
 
 fn byte_at_column(text: &str, range: &Range<usize>, target: usize) -> usize {
@@ -1583,6 +1638,44 @@ mod tests {
         assert_eq!(layout.lines, ["three ", "four"]);
         assert_eq!(layout.cursor_row, 1);
         assert_eq!(layout.cursor_column, 4);
+    }
+
+    #[test]
+    fn wrapping_keeps_whitespace_and_full_line_cursor_positions_visible() {
+        let mut editor = Editor::default();
+
+        editor.set_text("abad        ");
+        let layout = editor.layout(/*width*/ 5, /*max_height*/ 3);
+        assert_eq!(layout.lines, ["abad ", "     ", "  "]);
+        assert_eq!(layout.total_lines, 3);
+        assert_eq!((layout.cursor_column, layout.cursor_row), (2, 2));
+
+        editor.set_text("     a");
+        let layout = editor.layout(/*width*/ 4, /*max_height*/ 2);
+        assert_eq!(layout.lines, ["    ", " a"]);
+        assert_eq!((layout.cursor_column, layout.cursor_row), (2, 1));
+
+        editor.set_text("a abc\u{a0}de");
+        let layout = editor.layout(/*width*/ 7, /*max_height*/ 2);
+        assert_eq!(layout.lines, ["a ", "abc\u{a0}de"]);
+        assert_eq!((layout.cursor_column, layout.cursor_row), (6, 1));
+
+        editor.set_text("abad a");
+        for cursor in 4..=5 {
+            editor.cursor = cursor;
+            let layout = editor.layout(/*width*/ 4, /*max_height*/ 2);
+            assert_eq!(layout.lines, ["abad", "a"]);
+            assert_eq!((layout.cursor_column, layout.cursor_row), (0, 1));
+        }
+
+        editor.set_text("abad");
+        let layout = editor.layout(/*width*/ 4, /*max_height*/ 2);
+        assert_eq!(layout.lines, ["abad", ""]);
+        let finalized_ranges = visual_ranges("abad", /*width*/ 4);
+        assert_eq!(finalized_ranges.len(), 1);
+        assert_eq!(finalized_ranges[0], 0..4);
+        assert_eq!(layout.total_lines, 2);
+        assert_eq!((layout.cursor_column, layout.cursor_row), (0, 1));
     }
 
     #[test]

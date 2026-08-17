@@ -24,6 +24,10 @@ use crate::tui::render::line_utils::line_to_borrowed;
 use crate::tui::width::display_width;
 use crate::tui::width::line_width;
 
+// VTE and iTerm2 cap OSC 8 URI payloads at 2,083 bytes. Reject larger destinations before the
+// renderer copies the URI into every linked terminal cell.
+const MAX_TERMINAL_HYPERLINK_DESTINATION_BYTES: usize = 2_083;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminalHyperlink {
     pub(crate) columns: Range<usize>,
@@ -317,6 +321,9 @@ pub(crate) fn web_destination(destination: &str) -> Option<String> {
 
 fn safe_web_destination(destination: &str) -> Option<Cow<'_, str>> {
     let safe_destination = sanitized_destination(destination);
+    if safe_destination.len() > MAX_TERMINAL_HYPERLINK_DESTINATION_BYTES {
+        return None;
+    }
     {
         let parsed = Url::parse(&safe_destination).ok()?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -484,6 +491,17 @@ mod tests {
             Some(safe_destination.to_string())
         );
         assert_eq!(web_destination("mailto:a@example.com"), None);
+
+        let prefix = "https://example.com/";
+        let maximum_destination = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_TERMINAL_HYPERLINK_DESTINATION_BYTES - prefix.len())
+        );
+        assert_eq!(
+            web_destination(&maximum_destination),
+            Some(maximum_destination.clone())
+        );
+        assert_eq!(web_destination(&format!("{maximum_destination}a")), None);
 
         let area = Rect::new(
             /*x*/ 0, /*y*/ 0, /*width*/ 4, /*height*/ 1,

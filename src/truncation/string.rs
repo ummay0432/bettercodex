@@ -43,17 +43,16 @@ fn truncate_with_byte_estimate(s: &str, max_bytes: usize, use_tokens: bool) -> S
         return String::new();
     }
 
-    let total_chars = s.chars().count();
+    if max_bytes > 0 && s.len() <= max_bytes {
+        return s.to_string();
+    }
 
+    let total_chars = s.chars().count();
     if max_bytes == 0 {
         return format_truncation_marker(
             use_tokens,
             removed_units(use_tokens, s.len(), total_chars),
         );
-    }
-
-    if s.len() <= max_bytes {
-        return s.to_string();
     }
 
     let total_bytes = s.len();

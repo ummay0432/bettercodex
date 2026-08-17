@@ -14,6 +14,8 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 }
 
 fn platform_home_dir() -> Option<PathBuf> {
+    const MAX_PASSWORD_BUFFER_BYTES: usize = 1024 * 1024;
+
     use std::ffi::CStr;
     use std::ffi::OsString;
     use std::mem::MaybeUninit;
@@ -22,7 +24,7 @@ fn platform_home_dir() -> Option<PathBuf> {
     let suggested_buffer_len = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
     let buffer_len = usize::try_from(suggested_buffer_len)
         .ok()
-        .filter(|len| *len > 0)
+        .filter(|len| (1..=MAX_PASSWORD_BUFFER_BYTES).contains(len))
         .unwrap_or(512);
     let mut buffer = vec![0_u8; buffer_len];
     let mut passwd = MaybeUninit::<libc::passwd>::uninit();
@@ -52,10 +54,14 @@ fn platform_home_dir() -> Option<PathBuf> {
         if status != libc::ERANGE {
             return None;
         }
-        let new_len = buffer.len().checked_mul(2)?;
-        if new_len > 1024 * 1024 {
+        if buffer.len() >= MAX_PASSWORD_BUFFER_BYTES {
             return None;
         }
+        let new_len = buffer
+            .len()
+            .checked_mul(2)
+            .unwrap_or(MAX_PASSWORD_BUFFER_BYTES)
+            .min(MAX_PASSWORD_BUFFER_BYTES);
         buffer.resize(new_len, 0);
     }
 }

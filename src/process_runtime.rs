@@ -41,8 +41,12 @@ const COMMAND_ENV: [(&str, &str); 10] = [
     ("CODEX_CI", "1"),
     ("TERM", "dumb"),
 ];
-const NON_INHERITABLE_ENV_VARS: [&str; 2] =
-    ["OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE"];
+const NON_INHERITABLE_ENV_VARS: [&str; 4] = [
+    "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN",
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+    "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputStream {

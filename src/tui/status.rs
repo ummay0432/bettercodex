@@ -188,12 +188,12 @@ impl StatusSnapshot {
 }
 
 fn account_display(account: &ChatGptAccount) -> String {
-    match (&account.email, &account.plan) {
+    markdown::sanitize_inline(&match (&account.email, &account.plan) {
         (Some(email), Some(plan)) => format!("{email} ({plan})"),
         (Some(email), None) => email.clone(),
         (None, Some(plan)) => plan.clone(),
         (None, None) => "ChatGPT".to_string(),
-    }
+    })
 }
 
 fn context_window_spans(context: &ContextSnapshot) -> Vec<Span<'static>> {
@@ -246,11 +246,9 @@ fn rate_limit_rows(snapshots: &[RateLimitSnapshot], now: DateTime<Local>) -> Rat
         stale |= captured_at.is_none_or(|captured| {
             now.signed_duration_since(captured) > ChronoDuration::minutes(RATE_LIMIT_STALE_MINUTES)
         });
-        let limit_name = snapshot
-            .limit_name
-            .as_deref()
-            .unwrap_or(&snapshot.limit_id)
-            .replace('_', "-");
+        let limit_name =
+            markdown::sanitize_inline(snapshot.limit_name.as_deref().unwrap_or(&snapshot.limit_id))
+                .replace('_', "-");
         let is_codex = limit_name.eq_ignore_ascii_case("codex");
         let window_count =
             usize::from(snapshot.primary.is_some()) + usize::from(snapshot.secondary.is_some());
@@ -492,7 +490,7 @@ fn instruction_sources_summary(cwd: &Path, paths: &[PathBuf]) -> String {
         } else {
             display_directory(path, None)
         };
-        sources.push(markdown::sanitize(&display));
+        sources.push(markdown::sanitize_inline(&display));
     }
     if sources.is_empty() {
         "<none>".to_string()
@@ -511,7 +509,7 @@ fn display_directory(path: &Path, max_width: Option<usize>) -> String {
             }
         })
     });
-    let display = markdown::sanitize(&display.unwrap_or_else(|| path.display().to_string()));
+    let display = markdown::sanitize_inline(&display.unwrap_or_else(|| path.display().to_string()));
     max_width.map_or(display.clone(), |width| {
         center_truncate_path(&display, width)
     })

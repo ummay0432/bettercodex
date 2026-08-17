@@ -27,6 +27,7 @@ const ACCOUNT_ID_ENV: &str = "CHATGPT_ACCOUNT_ID";
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(8 * 24 * 60 * 60);
 const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 const MAX_REFRESH_ERROR_BODY_BYTES: usize = 8_000;
 const MAX_REFRESH_ERROR_BODY_CHARS: usize = 2_000;
@@ -38,6 +39,7 @@ pub(crate) struct Auth {
     account_id: Option<String>,
     account: ChatGptAccount,
     expires_at: Option<u64>,
+    last_refresh: Option<u64>,
     refresh_url: Cow<'static, str>,
     storage: Option<StoredAuth>,
 }
@@ -93,6 +95,7 @@ impl Auth {
             account_id: Some("test-account".to_string()),
             account: ChatGptAccount::default(),
             expires_at: None,
+            last_refresh: None,
             refresh_url: Cow::Borrowed(REFRESH_URL),
             storage: None,
         }
@@ -113,6 +116,7 @@ impl Auth {
                 refresh_token: None,
                 account_id,
                 account,
+                last_refresh: None,
                 refresh_url: Cow::Borrowed(REFRESH_URL),
                 storage: None,
             });
@@ -142,9 +146,11 @@ impl Auth {
             .or_else(|| id_token.and_then(account_id_from_jwt))
             .or_else(|| account_id_from_jwt(&access_token));
         let account = chatgpt_account_from_tokens(id_token, &access_token);
+        let last_refresh = last_refresh_timestamp(document.get("last_refresh"), &path)?;
 
         Ok(Self {
             expires_at: expiration_from_jwt(&access_token),
+            last_refresh,
             access_token,
             refresh_token,
             account_id,
@@ -155,10 +161,16 @@ impl Auth {
     }
 
     fn refresh_needed(&self) -> Result<bool> {
+        if self.refresh_token.is_none() {
+            return Ok(false);
+        }
         let now = unix_timestamp()?;
-        Ok(self
-            .expires_at
-            .is_some_and(|expires_at| expires_at <= now + REFRESH_WINDOW.as_secs()))
+        if let Some(expires_at) = self.expires_at {
+            return Ok(expires_at <= now.saturating_add(REFRESH_WINDOW.as_secs()));
+        }
+        Ok(self.last_refresh.is_some_and(|last_refresh| {
+            last_refresh < now.saturating_sub(REFRESH_INTERVAL.as_secs())
+        }))
     }
 
     pub(crate) async fn refresh_if_needed(&mut self, client: &reqwest::Client) -> Result<()> {
@@ -229,6 +241,7 @@ impl Auth {
         );
         self.access_token = access_token;
         self.refresh_token = refresh_token;
+        self.last_refresh = Some(unix_timestamp()?);
         self.persist(refreshed.id_token.as_deref())?;
         Ok(())
     }
@@ -280,7 +293,10 @@ impl Auth {
         if let Some(account_id) = &self.account_id {
             tokens.insert("account_id".to_string(), Value::String(account_id.clone()));
         }
-        storage.document["last_refresh"] = Value::String(rfc3339_now()?);
+        let last_refresh = self
+            .last_refresh
+            .ok_or_else(|| anyhow!("refreshed ChatGPT credentials have no refresh timestamp"))?;
+        storage.document["last_refresh"] = Value::String(rfc3339_from_timestamp(last_refresh)?);
         write_private_json(&storage.path, &storage.document)
     }
 
@@ -384,7 +400,7 @@ impl SharedAuth {
             .acquire()
             .await
             .map_err(|_| anyhow!("ChatGPT credential refresh coordinator closed"))?;
-        let mut auth = {
+        let (mut auth, current) = {
             let auth = self
                 .inner
                 .auth
@@ -398,11 +414,19 @@ impl SharedAuth {
                 }
                 SnapshotRefresh::IfNeeded
                 | SnapshotRefresh::Forced
-                | SnapshotRefresh::AfterUnauthorized(_) => auth.clone(),
+                | SnapshotRefresh::AfterUnauthorized(_) => (auth.clone(), current),
             }
         };
         match refresh {
-            SnapshotRefresh::IfNeeded => auth.refresh_if_needed(client).await?,
+            SnapshotRefresh::IfNeeded => {
+                if let Err(error) = auth.refresh_if_needed(client).await {
+                    tracing::warn!(
+                        %error,
+                        "proactive ChatGPT credential refresh failed; using the current token"
+                    );
+                    return Ok(current);
+                }
+            }
             SnapshotRefresh::Forced | SnapshotRefresh::AfterUnauthorized(_) => {
                 auth.force_refresh(client).await?;
             }
@@ -449,6 +473,35 @@ fn nonempty_string(value: Option<&Value>) -> Option<&str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn last_refresh_timestamp(value: Option<&Value>, path: &Path) -> Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = value.as_str().ok_or_else(|| {
+        anyhow!(
+            "{} contains an invalid ChatGPT refresh timestamp",
+            path.display()
+        )
+    })?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(value)
+        .with_context(|| {
+            format!(
+                "{} contains an invalid ChatGPT refresh timestamp",
+                path.display()
+            )
+        })?
+        .timestamp();
+    Ok(Some(u64::try_from(timestamp).with_context(|| {
+        format!(
+            "{} contains a ChatGPT refresh timestamp before the Unix epoch",
+            path.display()
+        )
+    })?))
 }
 
 fn jwt_claims(token: &str) -> Option<Value> {
@@ -540,7 +593,11 @@ fn unix_timestamp() -> Result<u64> {
 }
 
 fn rfc3339_now() -> Result<String> {
-    let seconds = unix_timestamp()? as i64;
+    rfc3339_from_timestamp(unix_timestamp()?)
+}
+
+fn rfc3339_from_timestamp(seconds: u64) -> Result<String> {
+    let seconds = i64::try_from(seconds).context("timestamp exceeds the RFC 3339 range")?;
     let days = seconds.div_euclid(86_400);
     let seconds_of_day = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_date_from_unix_days(days);

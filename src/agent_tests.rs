@@ -54,6 +54,14 @@ fn steering_interrupt_cancels_only_before_operator_input_is_drained() -> Result<
     assert_eq!(closing_pending.len(), 1);
     closing_handle.interrupt_for_steering();
     assert!(!closing_control.cancellation.is_cancelled());
+
+    let (dropped_handle, dropped_control) = TurnControl::channel();
+    drop(dropped_control);
+    assert!(
+        dropped_handle
+            .steer(UserInput::text("orphaned steering"))
+            .is_err()
+    );
     Ok(())
 }
 

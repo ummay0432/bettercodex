@@ -437,10 +437,12 @@ impl ResumePicker {
             return;
         }
         let Some(sessions) = &self.sessions else {
-            frame.render_widget(
-                Paragraph::new(Line::from("Loading sessions…").italic().dim()),
-                area,
-            );
+            if self.status.is_none() {
+                frame.render_widget(
+                    Paragraph::new(Line::from("Loading sessions…").italic().dim()),
+                    area,
+                );
+            }
             return;
         };
         if self.filtered.is_empty() {

@@ -1046,6 +1046,41 @@ fn session_discovery_ignores_non_regular_jsonl_entries() {
 }
 
 #[test]
+fn session_discovery_skips_an_unreadable_journal() {
+    let root = temporary_directory("rollout-unreadable-discovery");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut rollout = Rollout::create_in(&root, &cwd).unwrap();
+    let session_id = Uuid::parse_str(&rollout.identity().session_id).unwrap();
+    let session_path = rollout.file.path.clone();
+    rollout
+        .append_history(&[json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "healthy session"}],
+        })])
+        .unwrap();
+    drop(rollout);
+
+    let unreadable = root.join(SESSIONS_DIRECTORY).join("unreadable.jsonl");
+    std::fs::write(&unreadable, b"unreadable").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    assert!(has_saved_sessions_in(&root).unwrap());
+    let summaries = list_sessions_in(&root).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, session_id);
+    assert_eq!(
+        latest_rollout_for_cwd(&root.join(SESSIONS_DIRECTORY), &cwd)
+            .unwrap()
+            .unwrap(),
+        session_path
+    );
+}
+
+#[test]
 fn non_utf8_working_directory_round_trips_through_discovery_and_resume() {
     use std::os::unix::ffi::OsStringExt as _;
 
@@ -1236,16 +1271,30 @@ fn installation_identity_is_stable_and_state_is_private() {
     let _cleanup = DirectoryCleanup(root.clone());
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
+    let installation_path = root.join(INSTALLATION_ID_FILE);
+    std::fs::write(&installation_path, "invalid legacy contents").unwrap();
     let first = Rollout::create_in(&root, &cwd).unwrap();
     let installation_id = first.identity().installation_id.clone();
     let first_path = first.file.path.clone();
     drop(first);
     let second = Rollout::create_in(&root, &cwd).unwrap();
     assert_eq!(second.identity().installation_id, installation_id);
+    assert_eq!(
+        std::fs::read_to_string(&installation_path).unwrap().trim(),
+        installation_id
+    );
 
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(
         std::fs::metadata(first_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(installation_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o600
     );
     assert_eq!(
@@ -1256,6 +1305,27 @@ fn installation_identity_is_stable_and_state_is_private() {
             & 0o777,
         0o700
     );
+}
+
+#[test]
+fn installation_identity_rejects_a_symbolic_link() {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary_directory("rollout-installation-symlink");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let target = root.join("unrelated-installation-id");
+    let target_id = Uuid::new_v4().to_string();
+    std::fs::write(&target, format!("{target_id}\n")).unwrap();
+    symlink(&target, root.join(INSTALLATION_ID_FILE)).unwrap();
+
+    let error = Rollout::create_in(&root, &cwd)
+        .err()
+        .expect("installation identity must not follow a symbolic link");
+
+    assert!(format!("{error:#}").contains("failed to open installation ID"));
+    assert_eq!(std::fs::read_to_string(target).unwrap().trim(), target_id);
 }
 
 #[test]

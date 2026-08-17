@@ -42,6 +42,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
@@ -285,6 +286,7 @@ impl std::error::Error for ApiError {}
 
 pub(crate) struct ApiClient {
     client: reqwest::Client,
+    websocket_tls_config: Option<Arc<rustls::ClientConfig>>,
     auth: SharedAuth,
     base_url: String,
     installation_id: String,
@@ -782,8 +784,11 @@ impl ApiClient {
                 .connect_timeout(Duration::from_secs(20)),
         )
         .context("failed to create HTTP client")?;
+        let websocket_tls_config = crate::http_client::build_websocket_tls_config()
+            .context("failed to configure Responses WebSocket TLS")?;
         Ok(Self {
             client,
+            websocket_tls_config,
             auth: SharedAuth::new(auth),
             base_url,
             installation_id: identity.installation_id.clone(),
@@ -812,6 +817,7 @@ impl ApiClient {
     pub(crate) fn startup_prewarm_client(&self) -> Self {
         Self {
             client: self.client.clone(),
+            websocket_tls_config: self.websocket_tls_config.clone(),
             auth: self.auth.clone(),
             base_url: self.base_url.clone(),
             installation_id: self.installation_id.clone(),
@@ -1467,8 +1473,12 @@ impl ApiClient {
     }
 
     async fn ensure_websocket(&mut self, request_kind: RequestKind) -> ApiResult<()> {
-        if self.websocket.is_some() {
-            return Ok(());
+        if let Some(websocket) = &self.websocket {
+            if !websocket.is_closed() {
+                return Ok(());
+            }
+            // A reconnect cannot reuse connection-local `previous_response_id` state.
+            self.abandon_response();
         }
         let auth = self
             .auth
@@ -1479,7 +1489,8 @@ impl ApiClient {
         insert_header(&mut headers, "originator", "codex_cli_rs")?;
         insert_header(&mut headers, "openai-beta", RESPONSES_WEBSOCKET_BETA)?;
         let url = websocket_url(&self.base_url, "responses")?;
-        let (websocket, response_headers) = WebSocketConnection::connect(&url, &headers).await?;
+        let (websocket, response_headers) =
+            WebSocketConnection::connect(&url, &headers, self.websocket_tls_config.clone()).await?;
         self.websocket_reasoning_included = response_headers.contains_key("x-reasoning-included");
         self.websocket_server_model = response_headers
             .get("openai-model")

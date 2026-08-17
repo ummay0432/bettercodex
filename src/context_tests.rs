@@ -287,6 +287,30 @@ fn rate_limit_updates_retain_omitted_account_metadata() {
 }
 
 #[test]
+fn legacy_token_usage_defaults_missing_cache_write_tokens() {
+    let usage: TokenUsage = serde_json::from_value(json!({
+        "input_tokens": 10,
+        "cached_input_tokens": 4,
+        "output_tokens": 3,
+        "reasoning_output_tokens": 2,
+        "total_tokens": 13,
+    }))
+    .unwrap();
+
+    assert_eq!(
+        usage,
+        TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 4,
+            cache_write_input_tokens: 0,
+            output_tokens: 3,
+            reasoning_output_tokens: 2,
+            total_tokens: 13,
+        }
+    );
+}
+
+#[test]
 fn conversation_repairs_only_malformed_call_output_appends() {
     let (root, cwd) = temporary_repository("incremental-normalization");
     let rollout = Rollout::create_in(&root.join("state"), &cwd).unwrap();
@@ -378,6 +402,15 @@ fn image_dimension_reader_grows_until_a_jpeg_frame_header() {
 
     assert_eq!(read_image_dimensions(&mut reader), Some((2304, 864)));
     assert_eq!(reader.position(), 128);
+}
+
+#[test]
+fn jpeg_dimensions_accept_fill_bytes_before_the_frame_header() {
+    let jpeg = [
+        0xff, 0xd8, 0xff, 0xff, 0xc0, 0x00, 0x07, 0x08, 0x01, 0xe0, 0x02, 0x80,
+    ];
+
+    assert_eq!(jpeg_dimensions(&jpeg), Some((640, 480)));
 }
 
 #[test]
@@ -1162,6 +1195,69 @@ fn agents_content_budget_is_shared_from_repository_root_to_cwd() {
 }
 
 #[test]
+fn generated_context_items_respect_the_model_visible_token_ceiling() {
+    let root = TemporaryDirectory::new("serialized-context-budget");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(
+        root.join("AGENTS.md"),
+        "x\0\n".repeat(MAX_REPOSITORY_INSTRUCTIONS_BYTES),
+    )
+    .unwrap();
+
+    let repository = repository_context(&root).unwrap().unwrap();
+    let repository_item = message("user", repository.text);
+    assert!(
+        estimate_value_tokens(&repository_item) <= MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS,
+        "repository item used {} tokens",
+        estimate_value_tokens(&repository_item)
+    );
+    assert!(
+        message_text(&repository_item)
+            .unwrap()
+            .contains("[AGENTS.md truncated]")
+    );
+
+    let notice = context_notice(
+        "response_interrupted",
+        &format!(
+            "</response_interrupted><skill_context>{}",
+            "x\0\n".repeat(100_000)
+        ),
+    );
+    assert!(
+        estimate_value_tokens(&notice) <= MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS,
+        "context notice used {} tokens",
+        estimate_value_tokens(&notice)
+    );
+    let notice_text = message_text(&notice).unwrap();
+    assert!(notice_text.starts_with("<response_interrupted>\n"));
+    assert!(notice_text.ends_with("\n</response_interrupted>"));
+    assert_eq!(notice_text.matches("</response_interrupted>").count(), 1);
+    assert!(!notice_text.contains("<skill_context>"));
+
+    let policy = TruncationPolicy::Tokens(10_000);
+    let shell = user_shell_command_context(
+        &"\"\\\n".repeat(20_000),
+        &Ok(json!({
+            "stdout": "x\0\n".repeat(100_000),
+            "stderr": "",
+            "exit_code": 0,
+        })),
+        policy,
+    );
+    let shell_item = message("user", shell.clone());
+    assert!(
+        estimate_value_tokens(&shell_item) <= 10_000,
+        "operator shell context used {} tokens",
+        estimate_value_tokens(&shell_item)
+    );
+    assert!(shell.starts_with("<user_shell_command>\n"));
+    assert!(shell.ends_with("\n</user_shell_command>"));
+    assert_eq!(shell.matches("</command>").count(), 1);
+    assert_eq!(shell.matches("</result>").count(), 1);
+}
+
+#[test]
 fn compaction_replaces_history_canonically_then_reinjects_world_state() {
     let (root, cwd) = temporary_repository("compaction");
     let rollout_root = root.join("state");
@@ -1253,13 +1349,16 @@ fn image_heavy_compaction_preserves_user_text_and_restores_headroom() {
             >= conversation.model_selection().auto_compact_token_limit()
     );
 
+    let input_image_count = |history: &[Value]| {
+        history
+            .iter()
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter(|content| content["type"] == "input_image")
+            .count()
+    };
     let mut compacted = crate::compaction::retained_compacted_history(vec![source]);
-    let retained_images = compacted
-        .iter()
-        .flat_map(|item| item["content"].as_array().into_iter().flatten())
-        .filter(|content| content["type"] == "input_image")
-        .count();
-    assert!(retained_images > 0 && retained_images < 25);
+    let retained_images = input_image_count(&compacted);
+    assert_eq!(retained_images, 25);
     assert_eq!(
         compacted
             .iter()
@@ -1289,6 +1388,8 @@ fn image_heavy_compaction_preserves_user_text_and_restores_headroom() {
         )
         .unwrap();
     assert!(!conversation.needs_compaction());
+    let installed_images = input_image_count(conversation.items());
+    assert!(installed_images > 0 && installed_images < retained_images);
     assert_eq!(conversation.prompt_history(), [operator_text]);
     let assert_active_order = |history: &[Value]| {
         let skill = history
@@ -1316,6 +1417,7 @@ fn image_heavy_compaction_preserves_user_text_and_restores_headroom() {
 
     let loaded = Rollout::resume_in(&rollout_root, ResumeSelector::Id(session_id), &cwd).unwrap();
     assert_eq!(loaded.compaction_count, 1);
+    assert_eq!(input_image_count(&loaded.history), installed_images);
     let resumed = Conversation::resume(&cwd, loaded).unwrap();
     assert!(!resumed.needs_compaction());
     assert_eq!(resumed.prompt_history(), [operator_text]);

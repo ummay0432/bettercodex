@@ -223,6 +223,12 @@ impl TurnHandle {
     }
 }
 
+impl Drop for TurnControl {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl TurnControl {
     pub(crate) fn channel() -> (TurnHandle, Self) {
         let cancellation = CancellationToken::new();

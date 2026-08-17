@@ -82,6 +82,57 @@ async fn operator_commands_use_the_detected_user_login_shell() {
 }
 
 #[tokio::test]
+async fn model_reachable_commands_do_not_inherit_launch_credentials() {
+    const HELPER_ENV: &str = "BETTERCODEX_RESTRICTED_ENV_TEST_HELPER";
+
+    if std::env::var_os(HELPER_ENV).is_some() {
+        let output = run_bash(
+            "env",
+            &std::env::current_dir().unwrap(),
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        for name in NON_INHERITABLE_ENV_VARS {
+            assert!(
+                !output
+                    .stdout
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}="))),
+                "restricted environment variable {name} reached Bash"
+            );
+        }
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "process_runtime::tests::model_reachable_commands_do_not_inherit_launch_credentials",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HELPER_ENV, "1")
+        .envs(
+            NON_INHERITABLE_ENV_VARS
+                .into_iter()
+                .map(|name| (name, "must-not-be-inherited")),
+        )
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "nested environment-scrubbing test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn pre_cancelled_command_does_not_start() {
     let root = TemporaryDirectory::new("pre-cancelled");
     let cancellation = CancellationToken::new();

@@ -35,6 +35,7 @@ const MAX_SCAN_ENTRIES: usize = 20_000;
 const MAX_WARNINGS: usize = 32;
 const APPROXIMATE_BYTES_PER_TOKEN: u64 = 4;
 const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
+// Hard ceiling for the complete serialized Responses item, not only its decoded text body.
 const MAX_SKILLS_CONTEXT_BYTES: usize = 39_000;
 
 fn is_reserved_system_skill_name(name: &str) -> bool {
@@ -55,6 +56,7 @@ pub(crate) struct Skill {
     short_description: Option<String>,
     display_name: Option<String>,
     path: PathBuf,
+    discovery_path: PathBuf,
     scope: SkillScope,
     enabled: bool,
     allow_implicit_invocation: bool,
@@ -77,6 +79,10 @@ impl Skill {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn matches_path(&self, path: &Path) -> bool {
+        self.path == path || self.discovery_path == path
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -269,12 +275,14 @@ impl SkillCatalog {
         let mut skills = Vec::new();
 
         for root in roots {
-            for path in discover_skill_files(root.path, &mut warnings) {
-                let canonical = path.canonicalize().unwrap_or(path);
-                if !discovered_paths.insert(canonical.clone()) {
+            for discovery_path in discover_skill_files(root.path, root.scope, &mut warnings) {
+                let canonical = discovery_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| discovery_path.clone());
+                if discovered_paths.contains(&canonical) {
                     continue;
                 }
-                match load_skill(&canonical, root.scope) {
+                match load_skill(&canonical, discovery_path, root.scope) {
                     Ok((mut skill, metadata_warning)) => {
                         if is_reserved_system_skill_name(&skill.name)
                             && skill.scope != SkillScope::System
@@ -284,8 +292,11 @@ impl SkillCatalog {
                                 skill.name,
                                 canonical.display()
                             ));
+                            // Do not let a lower-trust alias claim the canonical path and suppress
+                            // the bundled system skill when its root is scanned later.
                             continue;
                         }
+                        discovered_paths.insert(canonical.clone());
                         if is_reserved_system_skill_name(&skill.name) {
                             skill.enabled = true;
                         }
@@ -294,10 +305,13 @@ impl SkillCatalog {
                             warnings.push(warning);
                         }
                     }
-                    Err(error) => warnings.push(format!(
-                        "Skipped invalid skill {}: {error:#}",
-                        canonical.display()
-                    )),
+                    Err(error) => {
+                        discovered_paths.insert(canonical.clone());
+                        warnings.push(format!(
+                            "Skipped invalid skill {}: {error:#}",
+                            canonical.display()
+                        ));
+                    }
                 }
             }
         }
@@ -337,21 +351,32 @@ impl SkillCatalog {
             .saturating_div(100)
             .saturating_mul(APPROXIMATE_BYTES_PER_TOKEN)
             .try_into()
-            .unwrap_or(usize::MAX);
-        let line_budget = line_budget.min(MAX_SKILLS_CONTEXT_BYTES);
-        let (mut lines, mut omitted) = render_catalog_lines(&visible, line_budget);
+            .unwrap_or(usize::MAX)
+            .min(MAX_SKILLS_CONTEXT_BYTES);
+        let empty_item = catalogue_item(String::new());
+        let serialized_lines_budget = MAX_SKILLS_CONTEXT_BYTES
+            .saturating_sub(serialized_value_bytes(&empty_item))
+            .saturating_sub(json_string_content_bytes(
+                "<available_skills>\n\n</available_skills>",
+            ));
+        let (mut lines, mut omitted) =
+            render_catalog_lines(&visible, line_budget, serialized_lines_budget);
         if omitted > 0 {
+            let mut cost = catalog_lines_cost(&lines);
             loop {
                 let notice = format!(
                     "- Exceeded skills context budget; {omitted} additional skill(s) were omitted."
                 );
-                if lines_bytes(&lines).saturating_add(notice.len() + 1) <= line_budget {
+                let mut candidate = cost;
+                candidate.add_line(&notice, !lines.is_empty());
+                if candidate.fits(line_budget, serialized_lines_budget) {
                     lines.push(notice);
                     break;
                 }
-                if lines.pop().is_none() {
+                let Some(removed) = lines.pop() else {
                     break;
-                }
+                };
+                cost.remove_last_line(&removed, !lines.is_empty());
                 omitted = omitted.saturating_add(1);
             }
         }
@@ -359,12 +384,10 @@ impl SkillCatalog {
             "<available_skills>\n{}\n</available_skills>",
             lines.join("\n"),
         );
-        debug_assert!(body.len() <= MAX_SKILLS_CONTEXT_BYTES + 64);
-        Some(json!({
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": body}],
-        }))
+        let item = catalogue_item(body);
+        let serialized_bytes = serialized_value_bytes(&item);
+        debug_assert!(serialized_bytes <= MAX_SKILLS_CONTEXT_BYTES);
+        (serialized_bytes <= MAX_SKILLS_CONTEXT_BYTES).then_some(item)
     }
 
     pub(crate) fn explicit_injections(
@@ -382,7 +405,7 @@ impl SkillCatalog {
             let Some(skill) = self
                 .skills
                 .iter()
-                .find(|skill| skill.name == selection.name && skill.path == selection.path)
+                .find(|skill| skill.name == selection.name && skill.matches_path(&selection.path))
             else {
                 warnings.push(bounded_warning(format!(
                     "Selected skill `${}` is no longer available at {}",
@@ -411,7 +434,8 @@ impl SkillCatalog {
             .map(|path| Path::new(path.strip_prefix("skill://").unwrap_or(path)))
             .collect::<HashSet<_>>();
         for skill in self.skills.iter().filter(|skill| skill.enabled) {
-            if linked_paths.contains(&skill.path.as_path()) && seen_paths.insert(skill.path.clone())
+            if linked_paths.iter().any(|path| skill.matches_path(path))
+                && seen_paths.insert(skill.path.clone())
             {
                 selected.push(skill);
             }
@@ -568,7 +592,11 @@ fn discovery_roots_with_home(
     roots
 }
 
-fn discover_skill_files(root: &Path, warnings: &mut WarningCollector) -> Vec<PathBuf> {
+fn discover_skill_files(
+    root: &Path,
+    scope: SkillScope,
+    warnings: &mut WarningCollector,
+) -> Vec<PathBuf> {
     if !root.is_dir() {
         return Vec::new();
     }
@@ -629,16 +657,32 @@ fn discover_skill_files(root: &Path, warnings: &mut WarningCollector) -> Vec<Pat
         let mut child_directories = Vec::new();
         for entry in entries {
             let path = entry.path();
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
                 Err(error) => {
                     warnings.push(format!("Could not inspect {}: {error}", path.display()));
                     continue;
                 }
             };
-            if metadata.is_file() && entry.file_name() == SKILL_FILE_NAME {
+            if file_type.is_file() && entry.file_name() == SKILL_FILE_NAME {
                 files.push(path);
-            } else if metadata.is_dir()
+                continue;
+            }
+
+            let is_directory = if file_type.is_dir() {
+                true
+            } else if file_type.is_symlink() && scope != SkillScope::System {
+                match std::fs::metadata(&path) {
+                    Ok(metadata) => metadata.is_dir(),
+                    Err(error) => {
+                        warnings.push(format!("Could not inspect {}: {error}", path.display()));
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if is_directory
                 && depth < MAX_SCAN_DEPTH
                 && !entry.file_name().to_string_lossy().starts_with('.')
             {
@@ -655,7 +699,11 @@ fn discover_skill_files(root: &Path, warnings: &mut WarningCollector) -> Vec<Pat
     files
 }
 
-fn load_skill(path: &Path, scope: SkillScope) -> Result<(Skill, Option<String>)> {
+fn load_skill(
+    path: &Path,
+    discovery_path: PathBuf,
+    scope: SkillScope,
+) -> Result<(Skill, Option<String>)> {
     let frontmatter = read_frontmatter(path)?;
     let parsed: SkillFrontmatter = parse_yaml_with_scalar_repair(&frontmatter)
         .with_context(|| format!("invalid YAML frontmatter in {}", path.display()))?;
@@ -708,6 +756,7 @@ fn load_skill(path: &Path, scope: SkillScope) -> Result<(Skill, Option<String>)>
             short_description,
             display_name,
             path: path.to_path_buf(),
+            discovery_path,
             scope,
             enabled,
             allow_implicit_invocation,
@@ -907,24 +956,61 @@ fn read_skill_prompt(path: &Path) -> Result<(String, bool)> {
     }
 }
 
-fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize) {
+#[derive(Clone, Copy, Default)]
+struct CatalogCost {
+    text_bytes: usize,
+    serialized_bytes: usize,
+}
+
+impl CatalogCost {
+    fn fits(self, text_budget: usize, serialized_budget: usize) -> bool {
+        self.text_bytes <= text_budget && self.serialized_bytes <= serialized_budget
+    }
+
+    fn add_line(&mut self, line: &str, after_existing_line: bool) {
+        self.text_bytes = self.text_bytes.saturating_add(line.len() + 1);
+        if after_existing_line {
+            // A newline in a JSON string is serialized as the two bytes `\\n`.
+            self.serialized_bytes = self.serialized_bytes.saturating_add(2);
+        }
+        self.serialized_bytes = self
+            .serialized_bytes
+            .saturating_add(json_string_content_bytes(line));
+    }
+
+    fn remove_last_line(&mut self, line: &str, has_preceding_line: bool) {
+        self.text_bytes = self.text_bytes.saturating_sub(line.len() + 1);
+        self.serialized_bytes = self
+            .serialized_bytes
+            .saturating_sub(json_string_content_bytes(line));
+        if has_preceding_line {
+            self.serialized_bytes = self.serialized_bytes.saturating_sub(2);
+        }
+    }
+}
+
+fn render_catalog_lines(
+    skills: &[&Skill],
+    text_budget: usize,
+    serialized_budget: usize,
+) -> (Vec<String>, usize) {
     let minimum = skills
         .iter()
         .map(|skill| catalog_line(skill, ""))
         .collect::<Vec<_>>();
-    if lines_bytes(&minimum) > budget {
-        let mut used = 0_usize;
-        let included = minimum
-            .into_iter()
-            .take_while(|line| {
-                let cost = line.len().saturating_add(1);
-                if used.saturating_add(cost) > budget {
-                    return false;
-                }
-                used = used.saturating_add(cost);
-                true
-            })
-            .collect::<Vec<_>>();
+    let minimum_cost = catalog_lines_cost(&minimum);
+    if !minimum_cost.fits(text_budget, serialized_budget) {
+        let mut included = Vec::new();
+        let mut cost = CatalogCost::default();
+        for line in minimum {
+            let mut candidate = cost;
+            candidate.add_line(&line, !included.is_empty());
+            if !candidate.fits(text_budget, serialized_budget) {
+                break;
+            }
+            cost = candidate;
+            included.push(line);
+        }
         let omitted = skills.len().saturating_sub(included.len());
         return (included, omitted);
     }
@@ -948,14 +1034,14 @@ fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize
         .zip(&full_descriptions)
         .map(|(skill, description)| catalog_line(skill, &description.iter().collect::<String>()))
         .collect::<Vec<_>>();
-    if lines_bytes(&full) <= budget {
+    if catalog_lines_cost(&full).fits(text_budget, serialized_budget) {
         return (full, 0);
     }
 
-    // Distribute the remaining bytes one character per skill at a time. Tracking only the
-    // incremental UTF-8 cost keeps this linear in the bounded output budget instead of rebuilding
-    // and recounting the complete catalogue for every character granted.
-    let mut used = lines_bytes(&minimum);
+    // Distribute the remaining budget one character per skill at a time. Track both decoded UTF-8
+    // and JSON-escaped costs so quote-, backslash-, or control-heavy metadata cannot exceed the
+    // hard serialized item ceiling.
+    let mut used = minimum_cost;
     let mut descriptions = vec![String::new(); skills.len()];
     let mut next_char = vec![0_usize; skills.len()];
     let mut pending = full_descriptions
@@ -966,13 +1052,22 @@ fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize
     while let Some(index) = pending.pop_front() {
         let character = full_descriptions[index][next_char[index]];
         let separator_cost = usize::from(next_char[index] == 0);
-        let cost = character.len_utf8().saturating_add(separator_cost);
-        if used.saturating_add(cost) > budget {
+        let candidate = CatalogCost {
+            text_bytes: used
+                .text_bytes
+                .saturating_add(character.len_utf8())
+                .saturating_add(separator_cost),
+            serialized_bytes: used
+                .serialized_bytes
+                .saturating_add(json_escaped_char_bytes(character))
+                .saturating_add(separator_cost),
+        };
+        if !candidate.fits(text_budget, serialized_budget) {
             continue;
         }
         descriptions[index].push(character);
         next_char[index] += 1;
-        used = used.saturating_add(cost);
+        used = candidate;
         if next_char[index] < full_descriptions[index].len() {
             pending.push_back(index);
         }
@@ -989,7 +1084,7 @@ fn render_catalog_lines(skills: &[&Skill], budget: usize) -> (Vec<String>, usize
 
 fn catalog_line(skill: &Skill, description: &str) -> String {
     let path = truncate_bytes(
-        &escape_xml_text(&skill.path.to_string_lossy().replace('\\', "/")),
+        &escape_xml_text(&skill.discovery_path.to_string_lossy().replace('\\', "/")),
         1_024,
     );
     let name = truncate_bytes(&escape_xml_text(&skill.name), 256);
@@ -1000,10 +1095,38 @@ fn catalog_line(skill: &Skill, description: &str) -> String {
     }
 }
 
-fn lines_bytes(lines: &[String]) -> usize {
-    lines
-        .iter()
-        .fold(0_usize, |total, line| total.saturating_add(line.len() + 1))
+fn catalog_lines_cost(lines: &[String]) -> CatalogCost {
+    let mut cost = CatalogCost::default();
+    for (index, line) in lines.iter().enumerate() {
+        cost.add_line(line, index > 0);
+    }
+    cost
+}
+
+fn json_string_content_bytes(value: &str) -> usize {
+    value.chars().fold(0_usize, |total, character| {
+        total.saturating_add(json_escaped_char_bytes(character))
+    })
+}
+
+fn json_escaped_char_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{000C}' | '\n' | '\r' | '\t' => 2,
+        '\u{0000}'..='\u{001F}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+fn catalogue_item(body: String) -> Value {
+    json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": body}],
+    })
+}
+
+fn serialized_value_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 fn truncate_bytes(value: &str, limit: usize) -> String {
@@ -1129,21 +1252,24 @@ fn parse_linked_mention(text: &str, start: usize) -> Option<(&str, &str, usize)>
     Some((&text[name_start..name_end], path, path_end + 1))
 }
 
-fn is_common_environment_variable(name: &str) -> bool {
-    matches!(
-        name.to_ascii_uppercase().as_str(),
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "SHELL"
-            | "PWD"
-            | "TMPDIR"
-            | "TEMP"
-            | "TMP"
-            | "LANG"
-            | "TERM"
-            | "XDG_CONFIG_HOME"
-    )
+pub(crate) fn is_common_environment_variable(name: &str) -> bool {
+    const COMMON_NAMES: [&str; 11] = [
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "PWD",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "TERM",
+        "XDG_CONFIG_HOME",
+    ];
+
+    COMMON_NAMES
+        .iter()
+        .any(|common| name.eq_ignore_ascii_case(common))
 }
 
 #[cfg(test)]

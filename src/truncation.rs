@@ -11,7 +11,6 @@ use self::string::truncate_middle_chars;
 use self::string::truncate_middle_with_token_budget;
 use serde::Deserialize;
 use serde::Serialize;
-use std::ops::Mul;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "mode", content = "limit", rename_all = "snake_case")]
@@ -25,17 +24,6 @@ impl TruncationPolicy {
         match self {
             Self::Bytes(bytes) => bytes,
             Self::Tokens(tokens) => approx_bytes_for_tokens(tokens),
-        }
-    }
-}
-
-impl Mul<f64> for TruncationPolicy {
-    type Output = Self;
-
-    fn mul(self, multiplier: f64) -> Self::Output {
-        match self {
-            Self::Bytes(bytes) => Self::Bytes((bytes as f64 * multiplier).ceil() as usize),
-            Self::Tokens(tokens) => Self::Tokens((tokens as f64 * multiplier).ceil() as usize),
         }
     }
 }

@@ -335,6 +335,21 @@ fn resume_and_skill_failures_are_rendered_without_exiting() {
     assert!(rendered.contains("■ Could not update skill:"), "{rendered}");
 }
 
+#[test]
+fn failed_resume_listing_replaces_the_loading_state() {
+    let mut runtime = runtime_without_agent();
+    runtime.view.show_resume_picker();
+    let loading = rendered_view(&mut runtime.view);
+    assert!(loading.contains("Loading sessions…"), "{loading}");
+
+    runtime
+        .view
+        .resume_listing_failed("session index unavailable");
+    let failed = rendered_view(&mut runtime.view);
+    assert!(failed.contains("session index unavailable"), "{failed}");
+    assert!(!failed.contains("Loading sessions…"), "{failed}");
+}
+
 #[tokio::test]
 async fn closing_the_resume_picker_cancels_the_scan_and_restores_the_command_draft() {
     for key in [

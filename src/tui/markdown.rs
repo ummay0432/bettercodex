@@ -137,6 +137,11 @@ pub(super) fn sanitize(text: &str) -> String {
     sanitized
 }
 
+/// Sanitize terminal-visible text that must remain on one logical line.
+pub(super) fn sanitize_inline(text: &str) -> String {
+    sanitize(text).replace(['\n', '\t'], " ")
+}
+
 /// Strip `` ```md ``/`` ```markdown `` fences that contain tables, emitting their content as bare
 /// markdown so `pulldown-cmark` parses the tables natively.
 ///
@@ -372,6 +377,14 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn inline_sanitization_removes_terminal_controls_and_line_breaks() {
+        assert_eq!(
+            sanitize_inline("safe\u{7}\nnext\t\x1b[31mred\x1b[0m"),
+            "safe next red"
+        );
     }
 
     #[test]

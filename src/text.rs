@@ -63,6 +63,24 @@ pub(crate) fn escape_cdata(value: &str) -> String {
     value.replace("]]>", "]]]]><![CDATA[>")
 }
 
+pub(crate) fn is_invisible_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::escape_cdata;
