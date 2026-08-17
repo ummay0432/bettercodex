@@ -395,16 +395,15 @@ impl DirectoryHandle {
     }
 
     fn open_file(&self, name: &CStr, flags: libc::c_int, mode: u32) -> io::Result<File> {
+        // C variadics promote Apple's 16-bit `mode_t` to `int`.
+        #[cfg(target_vendor = "apple")]
+        let mode = mode as libc::c_int;
+        #[cfg(not(target_vendor = "apple"))]
+        let mode = mode as libc::mode_t;
+
         // SAFETY: the directory descriptor and C string remain valid, and the returned descriptor
         // is uniquely transferred into `File`.
-        let descriptor = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                flags,
-                mode as libc::mode_t,
-            )
-        };
+        let descriptor = unsafe { libc::openat(self.file.as_raw_fd(), name.as_ptr(), flags, mode) };
         file_from_descriptor(descriptor)
     }
 
