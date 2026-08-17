@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -755,7 +756,10 @@ class InstallerTests(unittest.TestCase):
         self.f.assert_no_transactions(self)
 
     def test_custom_install_without_home_supports_unusual_paths(self) -> None:
-        raw_directory = os.fsencode(self.f.root) + b"/install space-'quote-\xff-\n/bin"
+        non_utf8 = b"\xff-" if sys.platform != "darwin" else b""
+        raw_directory = (
+            os.fsencode(self.f.root) + b"/install space-'quote-" + non_utf8 + b"\n/bin"
+        )
         os.makedirs(raw_directory)
         install_dir = os.fsdecode(raw_directory)
 
