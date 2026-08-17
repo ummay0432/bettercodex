@@ -9,7 +9,8 @@ use crate::file_search::FileSearchSession;
 use crate::file_search::FileSearchSnapshot;
 use crate::file_search::MatchType;
 use crate::file_search::SessionReporter;
-use ratatui::style::Color;
+use crate::tui::palette;
+use crate::tui::width::display_width;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
@@ -23,7 +24,6 @@ use std::sync::Mutex;
 use std::sync::Weak;
 use tokio::sync::mpsc::UnboundedSender;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 pub(super) const MAX_POPUP_ROWS: usize = 8;
 
@@ -462,12 +462,7 @@ fn file_match_line(file_match: &FileMatch, selected: bool, width: usize) -> Line
     let path = file_match.path.to_string_lossy();
     let (parent, name, name_char_start) = split_path(&path);
     let indices = file_match.indices.as_deref().unwrap_or_default();
-    let mut content = matched_spans(
-        name,
-        name_char_start,
-        indices,
-        Style::default().fg(Color::Cyan),
-    );
+    let mut content = matched_spans(name, name_char_start, indices, palette::accent_text_style());
     content.push(Span::from("  "));
     if name_char_start == 0 {
         content.push(Span::styled(
@@ -488,7 +483,7 @@ fn file_match_line(file_match: &FileMatch, selected: bool, width: usize) -> Line
         MatchType::Directory => "Dir",
     };
     let gutter_width = 2;
-    let tag_width = UnicodeWidthStr::width(tag);
+    let tag_width = display_width(tag);
     let tagged = width >= gutter_width + tag_width + 2;
     let content_limit = if tagged {
         width - gutter_width - tag_width - 2
@@ -506,9 +501,7 @@ fn file_match_line(file_match: &FileMatch, selected: bool, width: usize) -> Line
         spans.push(Span::from(tag).dim());
     }
     if selected {
-        let selected_style = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
+        let selected_style = palette::accent_style();
         for span in &mut spans {
             span.style = selected_style;
         }
@@ -532,10 +525,15 @@ fn matched_spans(
     base: Style,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (index, character) in text.chars().enumerate() {
-        let matched = indices
-            .binary_search(&((char_offset + index) as u32))
-            .is_ok();
+    let mut character_index = 0usize;
+    for grapheme in text.graphemes(/*is_extended*/ true) {
+        let character_count = grapheme.chars().count();
+        let matched =
+            (character_index..character_index.saturating_add(character_count)).any(|index| {
+                indices
+                    .binary_search(&((char_offset + index) as u32))
+                    .is_ok()
+            });
         let style = if matched {
             base.add_modifier(Modifier::BOLD)
         } else {
@@ -544,10 +542,11 @@ fn matched_spans(
         if let Some(previous) = spans.last_mut()
             && previous.style == style
         {
-            previous.content.to_mut().push(character);
+            previous.content.to_mut().push_str(grapheme);
         } else {
-            spans.push(Span::styled(character.to_string(), style));
+            spans.push(Span::styled(grapheme.to_string(), style));
         }
+        character_index = character_index.saturating_add(character_count);
     }
     spans
 }
@@ -565,7 +564,7 @@ fn truncate_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>>
     'spans: for span in spans {
         let mut content = String::new();
         for grapheme in span.content.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            let grapheme_width = display_width(grapheme);
             if used + grapheme_width > target {
                 if !content.is_empty() {
                     shortened.push(Span::styled(content, span.style));
@@ -586,6 +585,32 @@ fn truncate_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>>
 fn spans_width(spans: &[Span<'_>]) -> usize {
     spans
         .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .map(|span| display_width(span.content.as_ref()))
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_highlighting_and_truncation_keep_extended_graphemes_intact() {
+        let spans = matched_spans(
+            "e\u{301}👩‍💻x",
+            /*char_offset*/ 0,
+            /*indices*/ &[0],
+            Style::default(),
+        );
+        assert_eq!(spans[0].content.as_ref(), "e\u{301}");
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+
+        let truncated = truncate_spans(vec![Span::from("👩‍💻xy")], /*width*/ 3);
+        assert_eq!(
+            truncated
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "👩‍💻…"
+        );
+    }
 }

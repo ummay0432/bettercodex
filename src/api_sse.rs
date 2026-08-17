@@ -1,13 +1,14 @@
 use super::ApiError;
 use super::ApiResult;
 use super::MAX_STREAM_EVENT_BYTES;
-use memchr::memchr;
-use memchr::memchr_iter;
+use memchr::memchr2;
 
 #[derive(Default)]
 pub(super) struct SseDecoder {
     partial_line: Vec<u8>,
     pending_event: PendingSseEvent,
+    skip_leading_lf: bool,
+    saw_first_line: bool,
 }
 
 impl SseDecoder {
@@ -15,28 +16,42 @@ impl SseDecoder {
         let Self {
             partial_line,
             pending_event,
+            skip_leading_lf,
+            saw_first_line,
         } = self;
 
-        let chunk = if partial_line.is_empty() {
-            chunk
-        } else if let Some(newline) = memchr(b'\n', chunk) {
-            append_fragment(partial_line, &chunk[..newline])?;
-            if let Some(event) = pending_event.process_line(partial_line)? {
-                events.push(event);
+        let mut chunk = chunk;
+        if *skip_leading_lf && !chunk.is_empty() {
+            *skip_leading_lf = false;
+            if let Some(remaining) = chunk.strip_prefix(b"\n") {
+                chunk = remaining;
             }
-            partial_line.clear();
-            &chunk[newline + 1..]
-        } else {
-            append_fragment(partial_line, chunk)?;
-            return Ok(());
-        };
+        }
 
         let mut line_start = 0;
-        for newline in memchr_iter(b'\n', chunk) {
-            if let Some(event) = pending_event.process_line(&chunk[line_start..newline])? {
-                events.push(event);
+        while let Some(relative_end) = memchr2(b'\r', b'\n', &chunk[line_start..]) {
+            let line_end = line_start + relative_end;
+            if partial_line.is_empty() {
+                process_decoder_line(
+                    pending_event,
+                    saw_first_line,
+                    &chunk[line_start..line_end],
+                    events,
+                )?;
+            } else {
+                append_fragment(partial_line, &chunk[line_start..line_end])?;
+                process_decoder_line(pending_event, saw_first_line, partial_line, events)?;
+                partial_line.clear();
             }
-            line_start = newline + 1;
+
+            if chunk[line_end] == b'\r' && chunk.get(line_end + 1) == Some(&b'\n') {
+                line_start = line_end + 2;
+            } else {
+                line_start = line_end + 1;
+                if chunk[line_end] == b'\r' && line_start == chunk.len() {
+                    *skip_leading_lf = true;
+                }
+            }
         }
         append_fragment(partial_line, &chunk[line_start..])?;
         Ok(())
@@ -45,15 +60,36 @@ impl SseDecoder {
     pub(super) fn finish(&mut self, events: &mut Vec<String>) -> ApiResult<()> {
         if !self.partial_line.is_empty() {
             let line = std::mem::take(&mut self.partial_line);
-            if let Some(event) = self.pending_event.process_line(&line)? {
-                events.push(event);
-            }
+            process_decoder_line(
+                &mut self.pending_event,
+                &mut self.saw_first_line,
+                &line,
+                events,
+            )?;
         }
         if let Some(event) = self.pending_event.take() {
             events.push(event);
         }
         Ok(())
     }
+}
+
+fn process_decoder_line(
+    pending_event: &mut PendingSseEvent,
+    saw_first_line: &mut bool,
+    line: &[u8],
+    events: &mut Vec<String>,
+) -> ApiResult<()> {
+    let line = if *saw_first_line {
+        line
+    } else {
+        *saw_first_line = true;
+        line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line)
+    };
+    if let Some(event) = pending_event.process_line(line)? {
+        events.push(event);
+    }
+    Ok(())
 }
 
 fn append_fragment(partial_line: &mut Vec<u8>, fragment: &[u8]) -> ApiResult<()> {

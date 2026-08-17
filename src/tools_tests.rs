@@ -141,6 +141,7 @@ async fn foreign_namespace_returns_an_unknown_tool_output_without_dispatching_lo
             TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
             None,
             CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -178,6 +179,65 @@ fn emits_one_ordinary_function_output() {
     assert_eq!(completion.call_id, "call-1");
     assert!(completion.error.is_none());
     assert!(completion.file_change.is_none());
+    assert!(completion.inspection.is_none());
+}
+
+#[test]
+fn inspection_required_completion_preserves_warning_without_masking_errors() {
+    let call = ToolCall {
+        call_id: "call-inspection".to_string(),
+        name: WRITE_NAME.to_string(),
+        arguments: "{}".to_string(),
+    };
+    let (_, completion) = call.clone().into_output_item(
+        ToolResult::text("inspect the path".to_string()).requiring_inspection(true),
+    );
+    assert_eq!(completion.inspection.as_deref(), Some("inspect the path"));
+    assert!(completion.error.is_none());
+
+    let (_, completion) = call.into_output_item(
+        ToolResult::error(
+            "effect is unknown".to_string(),
+            TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
+        )
+        .requiring_inspection(true),
+    );
+    assert_eq!(completion.error.as_deref(), Some("effect is unknown"));
+    assert!(completion.inspection.is_none());
+}
+
+#[test]
+fn cleanup_residue_warning_survives_completion_with_the_file_change() {
+    let path = PathBuf::from("target.txt");
+    let residue = PathBuf::from(".bettercodex-staging.tmp");
+    let outcome = AtomicWriteOutcome {
+        cleanup_residue: Some(residue.clone()),
+        rebound_parent: None,
+        commit_reported_error: None,
+        requested_path_changed_after_commit: false,
+        target_changed_after_commit: false,
+    };
+    let change = FileChange::Update {
+        unified_diff: "-before\n+after\n".to_string(),
+        move_path: None,
+    };
+    let result =
+        write_result(&path, "after", &outcome).with_file_change(path.clone(), change.clone());
+    let warning = result.body.as_str().unwrap().to_string();
+
+    assert!(warning.contains(&format!("`{}` may remain", residue.display())));
+    let call = ToolCall {
+        call_id: "call-cleanup-warning".to_string(),
+        name: WRITE_NAME.to_string(),
+        arguments: "{}".to_string(),
+    };
+    let (_, completion) = call.into_output_item(result);
+    assert_eq!(completion.inspection.as_deref(), Some(warning.as_str()));
+    assert_eq!(
+        completion.file_change,
+        Some(ToolFileChange { path, change })
+    );
+    assert!(completion.error.is_none());
 }
 
 #[test]
@@ -231,6 +291,7 @@ async fn bash_bounds_live_events_without_truncating_captured_output() {
             TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
             Some(events_tx),
             CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -280,6 +341,7 @@ async fn bash_does_not_claim_omission_at_the_exact_live_output_budget() {
         TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
         Some(events_tx),
         CancellationToken::new(),
+        None,
     )
     .await;
 
@@ -444,8 +506,17 @@ fn edit_matches_normalized_text_and_preserves_bom_and_line_endings() {
 
 #[test]
 fn write_reports_creation_then_replacement_as_structured_file_changes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let root = TemporaryDirectory::new("write-file-change");
     let path = root.0.join("sample.txt");
+    let mode_reference = root.0.join("mode-reference.txt");
+    std::fs::write(&mode_reference, "reference\n").unwrap();
+    let intended_creation_mode = std::fs::metadata(&mode_reference)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
 
     let created = test_write(
         &root.0,
@@ -461,8 +532,11 @@ fn write_reports_creation_then_replacement_as_structured_file_changes() {
             },
         })
     );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        intended_creation_mode
+    );
 
-    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
     let replaced = test_write(
         &root.0,
@@ -520,11 +594,76 @@ fn write_reports_creation_then_replacement_as_structured_file_changes() {
             },
         })
     );
+
+    let actual_parent = root.0.join("actual-parent");
+    std::fs::create_dir(&actual_parent).unwrap();
+    let linked_parent = root.0.join("linked-parent");
+    std::os::unix::fs::symlink("actual-parent", &linked_parent).unwrap();
+    test_write(
+        &root.0,
+        json!({
+            "path": "linked-parent/new/nested.txt",
+            "content": "through parent symlink\n",
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(actual_parent.join("new/nested.txt")).unwrap(),
+        "through parent symlink\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(linked_parent)
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_journal_preserves_non_utf8_resolved_targets() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = TemporaryDirectory::new("non-utf8-lifecycle-path");
+    let target_name = OsString::from_vec(b"target-\xff.txt".to_vec());
+    let target = root.0.join(&target_name);
+    std::fs::write(&target, "before\n").unwrap();
+    let link = root.0.join("target-link.txt");
+    std::os::unix::fs::symlink(&target_name, &link).unwrap();
+
+    let rollout_root = root.0.join("state");
+    let rollout = crate::rollout::Rollout::create_in(&rollout_root, &root.0).unwrap();
+    let session_id = rollout.identity().session_id.parse::<uuid::Uuid>().unwrap();
+    let call = ToolCall {
+        call_id: "call-non-utf8-target".to_string(),
+        name: WRITE_NAME.to_string(),
+        arguments: json!({"path": "target-link.txt", "content": "after\n"}).to_string(),
+    };
+
+    let result = call
+        .execute(
+            &test_runtime(root.0.clone()),
+            TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
+            None,
+            CancellationToken::new(),
+            Some(rollout.tool_lifecycle_journal()),
+        )
+        .await;
+
+    assert!(result.display.is_ok(), "{:?}", result.display);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    drop(rollout);
+    crate::rollout::Rollout::resume_in(
+        &rollout_root,
+        crate::rollout::ResumeSelector::Id(session_id),
+        &root.0,
+    )
+    .unwrap();
 }
 
 #[test]
-fn write_omits_expensive_diff_preview_without_omitting_the_write() {
-    let root = TemporaryDirectory::new("write-diff-budget");
+fn file_tools_omit_expensive_diff_preview_without_omitting_the_mutation() {
+    let root = TemporaryDirectory::new("file-change-diff-budget");
     let path = root.0.join("many-short-lines.txt");
     let original = (0..MAX_FILE_CHANGE_DIFF_LINES / 2 + 1)
         .map(|index| format!("old-{index}\n"))
@@ -532,25 +671,70 @@ fn write_omits_expensive_diff_preview_without_omitting_the_write() {
     let replacement = (0..MAX_FILE_CHANGE_DIFF_LINES / 2)
         .map(|index| format!("new-{index}\n"))
         .collect::<String>();
-    std::fs::write(&path, original).unwrap();
+    std::fs::write(&path, &original).unwrap();
 
     let result = test_write(
         &root.0,
         json!({"path": "many-short-lines.txt", "content": &replacement}),
     )
     .unwrap();
+    assert!(result.file_change.is_none());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
 
+    std::fs::write(&path, &original).unwrap();
+    let result = test_edit(
+        &root.0,
+        json!({
+            "path": "many-short-lines.txt",
+            "edits": [{"oldText": &original, "newText": &replacement}],
+        }),
+    )
+    .unwrap();
     assert!(result.file_change.is_none());
     assert_eq!(std::fs::read_to_string(path).unwrap(), replacement);
+
+    let path = root.0.join("large-lines.txt");
+    let original = "a".repeat(MAX_FILE_CHANGE_PREVIEW_BYTES / 2 + 1_024);
+    let replacement = "b".repeat(MAX_FILE_CHANGE_PREVIEW_BYTES / 2 + 1_024);
+    std::fs::write(&path, &original).unwrap();
+    let result = test_edit(
+        &root.0,
+        json!({
+            "path": "large-lines.txt",
+            "edits": [{"oldText": &original, "newText": &replacement}],
+        }),
+    )
+    .unwrap();
+    assert!(result.file_change.is_none());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), replacement);
+
+    let path = root.0.join("nul-content.txt");
+    let created = test_write(
+        &root.0,
+        json!({"path": "nul-content.txt", "content": "before\0payload"}),
+    )
+    .unwrap();
+    assert!(created.file_change.is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), b"before\0payload");
+
+    let edited = test_edit(
+        &root.0,
+        json!({
+            "path": "nul-content.txt",
+            "edits": [{"oldText": "before", "newText": "after"}],
+        }),
+    )
+    .unwrap();
+    assert!(edited.file_change.is_none());
+    assert_eq!(std::fs::read(path).unwrap(), b"after\0payload");
 }
 
 #[test]
 fn atomic_file_tools_support_destinations_at_the_filename_length_limit() {
     let root = TemporaryDirectory::new("atomic-long-filename");
-    // Linux and macOS filesystems commonly permit 255-byte basenames. Keep one byte of headroom
-    // while still proving that the atomic helper does not prepend the destination's full name to
-    // its temporary file.
-    let name = format!("{}.txt", "x".repeat(250));
+    // Linux and macOS release filesystems permit 255-byte basenames. Exercise that exact limit so
+    // the staging scheme cannot regress to prefixing the destination's full name.
+    let name = format!("{}.txt", "x".repeat(251));
     let path = root.0.join(&name);
 
     test_write(&root.0, json!({"path": &name, "content": "before\n"})).unwrap();
@@ -564,6 +748,227 @@ fn atomic_file_tools_support_destinations_at_the_filename_length_limit() {
     .unwrap();
 
     assert_eq!(std::fs::read_to_string(path).unwrap(), "after\n");
+}
+
+#[test]
+fn atomic_replacement_rejects_stale_targets_and_cleans_owned_staging() {
+    let root = TemporaryDirectory::new("atomic-race-guards");
+    let has_staging = |directory: &Path| {
+        std::fs::read_dir(directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".bettercodex-")
+        })
+    };
+
+    let directory_target = root.0.join("directory-target");
+    std::fs::create_dir(&directory_target).unwrap();
+    let error = test_write(
+        &root.0,
+        json!({"path": "directory-target/", "content": "must not be written"}),
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("no file final component"));
+    assert!(
+        std::fs::read_dir(&directory_target)
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    let path = root.0.join("target.txt");
+    std::fs::write(&path, "before\n").unwrap();
+    let resolved = resolve_symlink_write_path(&path).unwrap();
+    let target = AnchoredPath::open(resolved.target()).unwrap();
+    let expected = target.entry_metadata().unwrap().unwrap().snapshot();
+    std::fs::write(&path, "external change\n").unwrap();
+    let error = write_file_atomically(
+        &resolved,
+        &target,
+        b"intended\n",
+        AtomicDestinationExpectation::Existing(expected),
+        &atomic_staging_name(),
+        |_| Ok(()),
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("was not committed"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "external change\n");
+    assert!(!has_staging(&root.0));
+
+    let first_target = root.0.join("first-target.txt");
+    let second_target = root.0.join("second-target.txt");
+    std::fs::write(&first_target, "first target\n").unwrap();
+    std::fs::write(&second_target, "second target\n").unwrap();
+    let link = root.0.join("rebound-link.txt");
+    std::os::unix::fs::symlink("first-target.txt", &link).unwrap();
+    let resolved = resolve_symlink_write_path(&link).unwrap();
+    let target = AnchoredPath::open(resolved.target()).unwrap();
+    let expected = target.entry_metadata().unwrap().unwrap().snapshot();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("second-target.txt", &link).unwrap();
+
+    let error = write_file_atomically(
+        &resolved,
+        &target,
+        b"intended\n",
+        AtomicDestinationExpectation::Existing(expected),
+        &atomic_staging_name(),
+        |_| Ok(()),
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("was not committed"));
+    assert_eq!(
+        std::fs::read_to_string(first_target).unwrap(),
+        "first target\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second_target).unwrap(),
+        "second target\n"
+    );
+    assert!(!has_staging(&root.0));
+
+    let staging_target = root.0.join("staging-target.txt");
+    std::fs::write(&staging_target, "before staging race\n").unwrap();
+    let resolved = resolve_symlink_write_path(&staging_target).unwrap();
+    let target = AnchoredPath::open(resolved.target()).unwrap();
+    let expected = target.entry_metadata().unwrap().unwrap().snapshot();
+    let staging_parent = root.0.clone();
+    let mut replaced_staging = None;
+    let error = write_file_atomically(
+        &resolved,
+        &target,
+        b"intended\n",
+        AtomicDestinationExpectation::Existing(expected),
+        &atomic_staging_name(),
+        |staging| {
+            if staging
+                .content
+                .is_some_and(|snapshot| snapshot.byte_len() == b"intended\n".len() as u64)
+            {
+                let staging = staging_parent.join(staging.name);
+                std::fs::write(staging.join("content"), "external staging change\n")?;
+                replaced_staging = Some(staging);
+            }
+            Ok(())
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("was not committed"));
+    assert_eq!(
+        std::fs::read_to_string(staging_target).unwrap(),
+        "before staging race\n"
+    );
+    let replaced_staging = replaced_staging.expect("test modified staged content");
+    assert!(!replaced_staging.exists());
+    assert!(!has_staging(&root.0));
+
+    let substituted_target = root.0.join("substituted-staging-target.txt");
+    std::fs::write(&substituted_target, "before substitution\n").unwrap();
+    let resolved = resolve_symlink_write_path(&substituted_target).unwrap();
+    let target = AnchoredPath::open(resolved.target()).unwrap();
+    let expected = target.entry_metadata().unwrap().unwrap().snapshot();
+    let staging_parent = root.0.clone();
+    let mut substituted_staging = None;
+    let error = write_file_atomically(
+        &resolved,
+        &target,
+        b"intended\n",
+        AtomicDestinationExpectation::Existing(expected),
+        &atomic_staging_name(),
+        |staging| {
+            if staging
+                .content
+                .is_some_and(|snapshot| snapshot.byte_len() == b"intended\n".len() as u64)
+            {
+                let staging = staging_parent.join(staging.name);
+                let content = staging.join("content");
+                std::fs::remove_file(&content)?;
+                std::fs::write(&content, "external staging replacement\n")?;
+                substituted_staging = Some(staging);
+            }
+            Ok(())
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("was not committed"));
+    assert_eq!(
+        std::fs::read_to_string(substituted_target).unwrap(),
+        "before substitution\n"
+    );
+    let substituted_staging = substituted_staging.expect("test substituted staged content");
+    assert_eq!(
+        std::fs::read_to_string(substituted_staging.join("content")).unwrap(),
+        "external staging replacement\n"
+    );
+    assert!(has_staging(&root.0));
+    std::fs::remove_dir_all(substituted_staging).unwrap();
+
+    let old_parent = root.0.join("old-parent");
+    let new_parent = root.0.join("new-parent");
+    std::fs::create_dir_all(&old_parent).unwrap();
+    std::fs::create_dir_all(&new_parent).unwrap();
+    std::fs::write(old_parent.join("routed.txt"), "old target\n").unwrap();
+    std::fs::write(new_parent.join("routed.txt"), "new target\n").unwrap();
+    let routed_parent = root.0.join("routed-parent");
+    std::os::unix::fs::symlink(&old_parent, &routed_parent).unwrap();
+    let routed_path = routed_parent.join("routed.txt");
+    let resolved = resolve_symlink_write_path(&routed_path).unwrap();
+    let target = AnchoredPath::open(resolved.target()).unwrap();
+    let expected = target.entry_metadata().unwrap().unwrap().snapshot();
+    std::fs::remove_file(&routed_parent).unwrap();
+    std::os::unix::fs::symlink(&new_parent, &routed_parent).unwrap();
+
+    let error = write_file_atomically(
+        &resolved,
+        &target,
+        b"intended\n",
+        AtomicDestinationExpectation::Existing(expected),
+        &atomic_staging_name(),
+        |_| Ok(()),
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("was not committed"));
+    assert_eq!(
+        std::fs::read_to_string(old_parent.join("routed.txt")).unwrap(),
+        "old target\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(new_parent.join("routed.txt")).unwrap(),
+        "new target\n"
+    );
+    assert!(!has_staging(&old_parent));
+    assert!(!has_staging(&new_parent));
+}
+
+#[test]
+fn failed_write_reports_parent_directories_created_before_the_error() {
+    let root = TemporaryDirectory::new("write-parent-residue");
+    let created_parent = root.0.join("created-parent");
+    let oversized_name = "x".repeat(256);
+    let error = match test_write(
+        &root.0,
+        json!({
+            "path": format!("created-parent/{oversized_name}"),
+            "content": "never written",
+        }),
+    ) {
+        Ok(_) => panic!("oversized destination unexpectedly succeeded"),
+        Err(error) => error,
+    };
+
+    assert!(created_parent.is_dir());
+    assert!(
+        format!("{error:#}").contains("may remain from parent creation"),
+        "{error:#}"
+    );
 }
 
 #[tokio::test]
@@ -583,6 +988,7 @@ async fn write_completion_reports_file_changes_and_rejects_special_files() {
             TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
             Some(events_tx),
             CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -624,6 +1030,7 @@ async fn write_completion_reports_file_changes_and_rejects_special_files() {
                 TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
                 None,
                 CancellationToken::new(),
+                None,
             )
             .await;
         assert_eq!(
@@ -676,6 +1083,7 @@ async fn read_bounds_output_and_reports_a_continuation_offset() {
             TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
             None,
             CancellationToken::new(),
+            None,
         )
         .await;
     assert_eq!(

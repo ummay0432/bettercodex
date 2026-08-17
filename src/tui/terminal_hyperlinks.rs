@@ -3,6 +3,7 @@
 //! Layout code measures and wraps ordinary ratatui lines. Hyperlink annotations are applied only
 //! when text reaches a terminal buffer or scrollback writer so OSC 8 bytes never affect geometry.
 
+use std::borrow::Cow;
 use std::num::NonZeroU16;
 use std::ops::Range;
 
@@ -10,18 +11,16 @@ use ratatui::buffer::Buffer;
 use ratatui::buffer::CellDiffOption;
 use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
-#[cfg(test)]
-use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
+use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
 use crate::tui::render::line_utils::line_to_borrowed;
-use crate::tui::width::char_width;
 use crate::tui::width::display_width;
 use crate::tui::width::line_width;
 
@@ -46,8 +45,8 @@ impl TerminalHyperlink {
         }
     }
 
-    fn terminal_destination(&self) -> Option<String> {
-        web_destination(&self.destination)
+    fn terminal_destination(&self) -> Option<Cow<'_, str>> {
+        safe_web_destination(&self.destination)
     }
 }
 
@@ -111,11 +110,6 @@ impl std::ops::Deref for HyperlinkLine {
     fn deref(&self) -> &Self::Target {
         &self.line
     }
-}
-
-#[cfg(test)]
-pub(crate) fn visible_lines(lines: Vec<HyperlinkLine>) -> Vec<Line<'static>> {
-    lines.into_iter().map(|line| line.line).collect()
 }
 
 pub(crate) fn plain_hyperlink_lines(lines: Vec<Line<'static>>) -> Vec<HyperlinkLine> {
@@ -183,8 +177,8 @@ pub(crate) fn remap_wrapped_line(
             let trimmed = source_text[source_byte..].trim_start_matches(char::is_whitespace);
             let skipped = source_text[source_byte..].len() - trimmed.len();
             source_column += source_text[source_byte..source_byte + skipped]
-                .chars()
-                .map(char_cell_width)
+                .graphemes(/*is_extended*/ true)
+                .map(display_width)
                 .sum::<usize>();
             source_byte += skipped;
         }
@@ -196,8 +190,8 @@ pub(crate) fn remap_wrapped_line(
         };
         let mapped = &rendered[rendered_start..];
         let mut output_column = display_width(&rendered[..rendered_start]);
-        for ch in mapped.chars() {
-            let width = char_cell_width(ch);
+        for grapheme in mapped.graphemes(/*is_extended*/ true) {
+            let width = display_width(grapheme);
             while source
                 .hyperlinks
                 .get(link_index)
@@ -229,10 +223,9 @@ fn line_text(line: &Line<'_>) -> String {
 
 fn longest_suffix_matching_prefix(rendered: &str, source: &str) -> Option<usize> {
     rendered
-        .char_indices()
+        .grapheme_indices(/*is_extended*/ true)
         .map(|(index, _)| index)
-        .chain(std::iter::once(rendered.len()))
-        .find(|index| source.starts_with(&rendered[*index..]) && *index < rendered.len())
+        .find(|index| source.starts_with(&rendered[*index..]))
 }
 
 fn push_link_range(line: &mut HyperlinkLine, range: Range<usize>, link: &TerminalHyperlink) {
@@ -252,12 +245,17 @@ fn push_link_range(line: &mut HyperlinkLine, range: Range<usize>, link: &Termina
 pub(crate) fn web_links_in_text(text: &str) -> Vec<TerminalHyperlink> {
     let mut links = Vec::new();
     let mut search_from = 0usize;
+    let mut search_column = 0usize;
     for raw_token in text.split_ascii_whitespace() {
         let Some(relative_start) = text[search_from..].find(raw_token) else {
             continue;
         };
         let raw_start = search_from + relative_start;
+        search_column += display_width(&text[search_from..raw_start]);
+        let raw_column = search_column;
         search_from = raw_start + raw_token.len();
+        search_column += display_width(raw_token);
+
         let trimmed_start = raw_token
             .find(|ch: char| !is_leading_punctuation(ch))
             .unwrap_or(raw_token.len());
@@ -269,7 +267,7 @@ pub(crate) fn web_links_in_text(text: &str) -> Vec<TerminalHyperlink> {
         let Some(destination) = web_destination(candidate) else {
             continue;
         };
-        let start = display_width(&text[..raw_start + trimmed_start]);
+        let start = raw_column + display_width(&raw_token[..trimmed_start]);
         let end = start + display_width(candidate);
         links.push(TerminalHyperlink::web(start..end, destination));
     }
@@ -314,132 +312,26 @@ fn has_unmatched_closing_delimiter(candidate: &str, closing: char) -> bool {
 }
 
 pub(crate) fn web_destination(destination: &str) -> Option<String> {
+    safe_web_destination(destination).map(Cow::into_owned)
+}
+
+fn safe_web_destination(destination: &str) -> Option<Cow<'_, str>> {
     let safe_destination = sanitized_destination(destination);
-    let parsed = Url::parse(&safe_destination).ok()?;
-    matches!(parsed.scheme(), "http" | "https")
-        .then(|| parsed.host_str())
-        .flatten()?;
+    {
+        let parsed = Url::parse(&safe_destination).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return None;
+        }
+    }
     Some(safe_destination)
 }
 
-fn sanitized_destination(destination: &str) -> String {
-    destination.chars().filter(|ch| !ch.is_control()).collect()
-}
-
-#[cfg(test)]
-pub(crate) fn osc8_hyperlink(destination: &str, text: &str) -> String {
-    let Some(safe_destination) = web_destination(destination) else {
-        return text.to_string();
-    };
-    format!("\x1b]8;;{safe_destination}\x07{text}\x1b]8;;\x07")
-}
-
-#[cfg(test)]
-pub(crate) fn strip_osc8(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut stripped = String::with_capacity(text.len());
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        if bytes[index..].starts_with(b"\x1b]8;;") {
-            index += 5;
-            while index < bytes.len() {
-                if bytes[index] == b'\x07' {
-                    index += 1;
-                    break;
-                }
-                if index + 1 < bytes.len() && bytes[index] == b'\x1b' && bytes[index + 1] == b'\\' {
-                    index += 2;
-                    break;
-                }
-                index += 1;
-            }
-            continue;
-        }
-        let ch = text[index..]
-            .chars()
-            .next()
-            .expect("current byte index starts a character");
-        stripped.push(ch);
-        index += ch.len_utf8();
+fn sanitized_destination(destination: &str) -> Cow<'_, str> {
+    if destination.chars().any(char::is_control) {
+        Cow::Owned(destination.chars().filter(|ch| !ch.is_control()).collect())
+    } else {
+        Cow::Borrowed(destination)
     }
-
-    stripped
-}
-
-#[cfg(test)]
-pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
-    if line.hyperlinks.is_empty() {
-        return line.line.spans.clone();
-    }
-
-    let mut out = Vec::new();
-    let mut column = 0usize;
-    let mut link_index = 0usize;
-    let mut active_link_index = None;
-    let mut active_destination: Option<String> = None;
-    for span in &line.line.spans {
-        for ch in span.content.chars() {
-            let width = char_cell_width(ch);
-            while line
-                .hyperlinks
-                .get(link_index)
-                .is_some_and(|link| link.columns.end <= column)
-            {
-                link_index += 1;
-            }
-            let selected_link_index = line
-                .hyperlinks
-                .get(link_index)
-                .and_then(|link| link.columns.contains(&column).then_some(link_index));
-            if active_link_index != selected_link_index {
-                if active_destination.is_some() {
-                    append_to_last_span(&mut out, "\x1b]8;;\x07");
-                }
-                active_destination = selected_link_index
-                    .and_then(|index| line.hyperlinks[index].terminal_destination());
-                if let Some(destination) = active_destination.as_ref() {
-                    push_styled_content(
-                        &mut out,
-                        &format!("\x1b]8;;{destination}\x07"),
-                        span.style,
-                    );
-                }
-                active_link_index = selected_link_index;
-            }
-            push_styled_content(&mut out, &ch.to_string(), span.style);
-            column += width;
-        }
-    }
-    if active_destination.is_some() {
-        append_to_last_span(&mut out, "\x1b]8;;\x07");
-    }
-    out
-}
-
-#[cfg(test)]
-fn push_styled_content(out: &mut Vec<Span<'static>>, content: &str, style: ratatui::style::Style) {
-    if let Some(last) = out.last_mut()
-        && last.style == style
-    {
-        last.content.to_mut().push_str(content);
-        return;
-    }
-    out.push(Span::styled(content.to_string(), style));
-}
-
-#[cfg(test)]
-fn append_to_last_span(out: &mut [Span<'static>], content: &str) {
-    if let Some(last) = out.last_mut() {
-        last.content.to_mut().push_str(content);
-    }
-}
-
-fn char_cell_width(ch: char) -> usize {
-    if ch.is_control() {
-        return 0;
-    }
-    char_width(ch)
 }
 
 pub(crate) fn mark_buffer_hyperlinks(
@@ -473,11 +365,12 @@ pub(crate) fn mark_buffer_hyperlinks(
             continue;
         }
 
+        let required_height = rendered_height.min(viewport_end.saturating_sub(logical_row));
         let layout_area = Rect::new(
             /*x*/ 0,
             /*y*/ 0,
             area.width,
-            u16::try_from(rendered_height).unwrap_or(u16::MAX),
+            u16::try_from(required_height).unwrap_or(u16::MAX),
         );
         let mut layout = Buffer::empty(layout_area);
         paragraph.render(layout_area, &mut layout);
@@ -498,12 +391,14 @@ pub(crate) fn mark_buffer_hyperlinks(
                         Some(cell.symbol())
                     })
                     .collect::<String>();
-                Line::from(text.trim_end().to_string())
+                Line::from(text.trim_end_matches(' ').to_string())
             })
             .collect();
         for (row, rendered) in remap_wrapped_line(line, rendered_lines).iter().enumerate() {
             for link in &rendered.hyperlinks {
-                let terminal_destination = link.terminal_destination();
+                let Some(terminal_destination) = link.terminal_destination() else {
+                    continue;
+                };
                 let mut trailing_columns = 0usize;
                 for column in link.columns.clone() {
                     if trailing_columns > 0 {
@@ -514,18 +409,21 @@ pub(crate) fn mark_buffer_hyperlinks(
                     if row < scroll_rows || row - scroll_rows >= usize::from(area.height) {
                         continue;
                     }
-                    let x = area.x + column as u16;
-                    let y = area.y + (row - scroll_rows) as u16;
+                    let Ok(column) = u16::try_from(column) else {
+                        continue;
+                    };
+                    let Some(x) = area.x.checked_add(column).filter(|x| *x < area.right()) else {
+                        continue;
+                    };
+                    let y = area.y.saturating_add((row - scroll_rows) as u16);
                     let cell = &mut buf[(x, y)];
                     if cell.diff_option == CellDiffOption::Skip {
                         continue;
                     }
                     trailing_columns = usize::from(cell.cell_width()).saturating_sub(1);
-                    let symbol = terminal_destination.as_ref().map_or_else(
-                        || cell.symbol().to_string(),
-                        |destination| {
-                            format!("\x1b]8;;{destination}\x07{}\x1b]8;;\x07", cell.symbol())
-                        },
+                    let symbol = format!(
+                        "\x1b]8;;{terminal_destination}\x07{}\x1b]8;;\x07",
+                        cell.symbol()
                     );
                     let width = NonZeroU16::new(cell.cell_width()).unwrap_or(NonZeroU16::MIN);
                     cell.set_symbol(&symbol)
@@ -538,54 +436,76 @@ pub(crate) fn mark_buffer_hyperlinks(
 }
 
 #[cfg(test)]
-pub(crate) fn mark_underlined_hyperlink(buf: &mut Buffer, area: Rect, destination: &str) {
-    mark_matching_cells(buf, area, destination, |cell| {
-        cell.modifier.contains(Modifier::UNDERLINED)
-    });
-}
-
-#[cfg(test)]
-fn mark_matching_cells(
-    buf: &mut Buffer,
-    area: Rect,
-    destination: &str,
-    matches: impl Fn(&ratatui::buffer::Cell) -> bool,
-) {
-    if web_destination(destination).is_none() {
-        return;
-    }
-    for position in area.positions() {
-        let cell = &mut buf[position];
-        if cell.diff_option != CellDiffOption::Skip
-            && !cell.symbol().trim().is_empty()
-            && matches(cell)
-        {
-            let width = NonZeroU16::new(cell.cell_width()).unwrap_or(NonZeroU16::MIN);
-            let symbol = osc8_hyperlink(destination, cell.symbol());
-            cell.set_symbol(&symbol)
-                .set_diff_option(CellDiffOption::ForcedWidth(width));
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use ratatui::style::Style;
+
+    fn strip_osc8(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut stripped = String::with_capacity(text.len());
+        let mut index = 0usize;
+
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"\x1b]8;;") {
+                index += 5;
+                while index < bytes.len() {
+                    if bytes[index] == b'\x07' {
+                        index += 1;
+                        break;
+                    }
+                    if index + 1 < bytes.len()
+                        && bytes[index] == b'\x1b'
+                        && bytes[index + 1] == b'\\'
+                    {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+            let ch = text[index..]
+                .chars()
+                .next()
+                .expect("current byte index starts a character");
+            stripped.push(ch);
+            index += ch.len_utf8();
+        }
+
+        stripped
+    }
 
     #[test]
-    fn only_web_destinations_receive_osc8() {
-        assert!(osc8_hyperlink("https://example.com/a", "a").contains("\x1b]8;;"));
-        assert_eq!(osc8_hyperlink("mailto:a@example.com", "a"), "a");
+    fn accepts_only_sanitized_web_destinations() {
+        let unsafe_destination = "https://example.com/\u{7}safe";
+        let safe_destination = "https://example.com/safe";
         assert_eq!(
-            osc8_hyperlink("https://example.com/\u{7}safe", "a"),
-            "\x1b]8;;https://example.com/safe\x07a\x1b]8;;\x07"
+            web_destination(unsafe_destination),
+            Some(safe_destination.to_string())
         );
-        assert_eq!(
-            strip_osc8(&osc8_hyperlink("https://example.com/a", "visible")),
-            "visible"
+        assert_eq!(web_destination("mailto:a@example.com"), None);
+
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 4, /*height*/ 1,
         );
+        let mut line = HyperlinkLine::new(Line::from("safe"));
+        line.hyperlinks.push(TerminalHyperlink::web(
+            /*columns*/ 0..4,
+            unsafe_destination.to_string(),
+        ));
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(Text::from(line.line.clone())).render(area, &mut buf);
+        mark_buffer_hyperlinks(&mut buf, area, &[line], /*scroll_rows*/ 0);
+        let rendered = area
+            .positions()
+            .map(|position| buf[position].symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains(&format!("\x1b]8;;{safe_destination}\x07")),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains(unsafe_destination), "{rendered:?}");
     }
 
     #[test]
@@ -627,27 +547,6 @@ mod tests {
                 /*columns*/ 5..5 + usize::from(destination.cell_width()),
                 destination.to_string(),
             )]
-        );
-    }
-
-    #[test]
-    fn decorates_a_contiguous_web_link_with_one_osc8_pair() {
-        let destination = "https://example.com/a/very/long/path";
-        let line = HyperlinkLine {
-            line: Line::from(destination),
-            hyperlinks: vec![TerminalHyperlink::web(
-                /*columns*/ 0..usize::from(destination.cell_width()),
-                destination.to_string(),
-            )],
-        };
-
-        assert_eq!(
-            decorate_spans(&line),
-            vec![Span::from(osc8_hyperlink(destination, destination))]
-        );
-        assert_eq!(
-            decorate_spans(&HyperlinkLine::new(Line::from("not linked"))),
-            vec![Span::from("not linked")]
         );
     }
 
@@ -775,6 +674,33 @@ mod tests {
     }
 
     #[test]
+    fn buffer_hyperlinks_follow_emoji_and_combining_graphemes() {
+        let destination = "https://example.com/graphemes";
+        let mut line = HyperlinkLine::new(Line::from("👩‍💻 e\u{301} "));
+        line.push_span("linked\u{a0}".into(), Some(destination));
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 12, /*height*/ 2,
+        );
+        let mut buf = Buffer::empty(area);
+
+        Paragraph::new(Text::from(line.line.clone()))
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+        mark_buffer_hyperlinks(&mut buf, area, &[line], /*scroll_rows*/ 0);
+
+        let linked_text = area
+            .positions()
+            .filter_map(|position| {
+                let symbol = buf[position].symbol();
+                symbol
+                    .contains(&format!("\x1b]8;;{destination}\x07"))
+                    .then(|| strip_osc8(symbol))
+            })
+            .collect::<String>();
+        assert_eq!(linked_text, "linked\u{a0}");
+    }
+
+    #[test]
     fn buffer_hyperlinks_follow_wrapped_halfwidth_dakuten() {
         let destination = "https://example.com/dakuten";
         let mut line = HyperlinkLine::new(Line::from("ｶﾞ "));
@@ -831,44 +757,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (0, "ｶﾞ".to_string()),
-                (3, "t".to_string()),
-                (4, "a".to_string()),
-                (5, "i".to_string()),
-                (6, "l".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn matching_hyperlinks_preserve_visible_cell_width_for_ratatui_diff() {
-        let destination = "https://example.com/dakuten";
-        let area = Rect::new(
-            /*x*/ 0, /*y*/ 0, /*width*/ 7, /*height*/ 1,
-        );
-        let previous = Buffer::with_lines(["       "]);
-        let mut next = Buffer::empty(area);
-        next.set_string(
-            /*x*/ 0,
-            /*y*/ 0,
-            "ｶﾞ tail",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        );
-
-        mark_underlined_hyperlink(&mut next, area, destination);
-
-        assert_eq!(next[(0, 0)].cell_width(), 2);
-        assert!(matches!(
-            next[(0, 0)].diff_option,
-            CellDiffOption::ForcedWidth(width) if width.get() == 2
-        ));
-        assert_eq!(
-            previous
-                .diff_iter(&next)
-                .map(|(x, _, cell)| (x, strip_osc8(cell.symbol())))
-                .collect::<Vec<_>>(),
-            vec![
-                (0, "ｶﾞ".to_string()),
-                (2, " ".to_string()),
                 (3, "t".to_string()),
                 (4, "a".to_string()),
                 (5, "i".to_string()),

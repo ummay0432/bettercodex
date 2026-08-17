@@ -1,12 +1,24 @@
 //! The fixed direct tool stack exposed through the Responses API.
 
 use crate::events::AgentEvent;
+use crate::private_fs::AnchoredPath;
+use crate::private_fs::DirectoryHandle;
+use crate::private_fs::FileObjectIdentity;
+use crate::private_fs::FileSnapshot;
 use crate::process_runtime::LiveOutputAction;
 use crate::process_runtime::OutputStream;
 use crate::protocol::FileChange;
 use crate::protocol::FunctionCallOutputContentItem;
 use crate::protocol::ImageDetail;
 use crate::protocol::ToolFileChange;
+use crate::rollout::MAX_TOOL_PRE_STATE_HASH_BYTES;
+use crate::rollout::ToolContentDigest;
+use crate::rollout::ToolLifecycleJournal;
+use crate::rollout::ToolMutationEvidence;
+use crate::rollout::ToolPathResolutionEvidence;
+use crate::rollout::ToolStagingEvidence;
+use crate::rollout::ToolSymlinkEvidence;
+use crate::rollout::ToolTargetPreState;
 use crate::truncation::TruncationPolicy;
 use crate::truncation::approx_bytes_for_tokens;
 use anyhow::Context;
@@ -17,6 +29,8 @@ use serde_json::Value;
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -39,7 +53,8 @@ const MAX_FORWARDED_LIVE_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_FILE_CHANGE_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
 // Myers diff work grows with the edit distance, so a byte bound alone does not keep complete
 // rewrites responsive when both versions contain many short, unrelated lines.
-const MAX_FILE_CHANGE_DIFF_LINES: usize = 8_000;
+const MAX_FILE_CHANGE_DIFF_LINES: usize = 2_000;
+const MAX_WRITE_SYMLINK_HOPS: usize = 64;
 const MAX_TIMEOUT_SECONDS: f64 = i32::MAX as f64 / 1_000.0;
 const READ_IMAGE_INVALID_MESSAGE: &str =
     "unable to process image: invalid or unsupported image data";
@@ -87,8 +102,10 @@ impl ToolCall {
         truncation_policy: TruncationPolicy,
         events: Option<UnboundedSender<AgentEvent>>,
         cancellation: CancellationToken,
+        lifecycle: Option<ToolLifecycleJournal>,
     ) -> ToolResult {
-        let input = parse_arguments(&self.name, &self.arguments);
+        let input = ensure_not_cancelled(&cancellation, &self.name)
+            .and_then(|()| parse_arguments(&self.name, &self.arguments));
         if let Some(events) = &events {
             let event_input = match &input {
                 Ok(input) => input.clone(),
@@ -112,15 +129,46 @@ impl ToolCall {
                         truncation_policy,
                         events.clone(),
                         cancellation,
+                        lifecycle.clone(),
                     )
                     .await
             }
             Err(error) => Err(error),
         };
+        #[cfg(test)]
+        crate::process_termination_test_support::stop_at("tool_result_before_finish");
         let result = match result {
             Ok(result) => result,
-            Err(error) => ToolResult::error(format!("{error:#}"), truncation_policy),
+            Err(error) => {
+                let requires_inspection = error.is::<MutationOutcomeUnknown>();
+                ToolResult::error(format!("{error:#}"), truncation_policy)
+                    .requiring_inspection(requires_inspection)
+            }
         };
+
+        if matches!(self.name.as_str(), BASH_NAME | WRITE_NAME | EDIT_NAME)
+            && let Some(lifecycle) = &lifecycle
+            && let Err(error) = lifecycle
+                .record_finished_async(
+                    &self.call_id,
+                    result.body.clone(),
+                    result.display.as_ref().err().cloned(),
+                    result.file_change.clone(),
+                    result.requires_inspection,
+                )
+                .await
+        {
+            tracing::warn!(
+                %error,
+                call_id = %self.call_id,
+                tool = %self.name,
+                "failed to record tool completion lifecycle"
+            );
+        }
+        #[cfg(test)]
+        if matches!(self.name.as_str(), BASH_NAME | WRITE_NAME | EDIT_NAME) {
+            crate::process_termination_test_support::stop_at("tool_finished");
+        }
 
         if let Some(events) = events {
             let _ = events.send(AgentEvent::ToolCompleted {
@@ -138,11 +186,19 @@ impl ToolCall {
             body,
             display,
             file_change,
+            requires_inspection,
         } = output;
+        let (error, inspection) = match display {
+            Err(error) => (Some(error), None),
+            Ok(Value::String(message)) if requires_inspection => (None, Some(message)),
+            Ok(output) if requires_inspection => (None, Some(output.to_string())),
+            Ok(_) => (None, None),
+        };
         let completion = ToolCompletion {
             call_id: self.call_id.clone(),
-            error: display.err(),
+            error,
             file_change,
+            inspection,
         };
         (
             json!({
@@ -159,12 +215,14 @@ pub(crate) struct ToolCompletion {
     pub(crate) call_id: String,
     pub(crate) error: Option<String>,
     pub(crate) file_change: Option<ToolFileChange>,
+    pub(crate) inspection: Option<String>,
 }
 
 pub(crate) struct ToolResult {
     body: Value,
     display: std::result::Result<Value, String>,
     file_change: Option<ToolFileChange>,
+    requires_inspection: bool,
 }
 
 impl ToolResult {
@@ -177,6 +235,7 @@ impl ToolResult {
             body: Value::String(text.clone()),
             display: Ok(Value::String(text)),
             file_change: None,
+            requires_inspection: false,
         }
     }
 
@@ -217,6 +276,7 @@ impl ToolResult {
             body: Value::String(body),
             display: Ok(output),
             file_change: None,
+            requires_inspection: false,
         })
     }
 
@@ -231,6 +291,7 @@ impl ToolResult {
             body,
             display: Ok(json!({})),
             file_change: None,
+            requires_inspection: false,
         })
     }
 
@@ -240,11 +301,17 @@ impl ToolResult {
             body: Value::String(error.clone()),
             display: Err(error),
             file_change: None,
+            requires_inspection: false,
         }
     }
 
     fn with_file_change(mut self, path: PathBuf, change: FileChange) -> Self {
         self.file_change = Some(ToolFileChange { path, change });
+        self
+    }
+
+    fn requiring_inspection(mut self, required: bool) -> Self {
+        self.requires_inspection = required;
         self
     }
 }
@@ -374,11 +441,19 @@ impl ToolRuntime {
         truncation_policy: TruncationPolicy,
         events: Option<UnboundedSender<AgentEvent>>,
         cancellation: CancellationToken,
+        lifecycle: Option<ToolLifecycleJournal>,
     ) -> Result<ToolResult> {
         match name {
             BASH_NAME => {
-                self.bash(call_id, input, truncation_policy, events, cancellation)
-                    .await
+                self.bash(
+                    call_id,
+                    input,
+                    truncation_policy,
+                    events,
+                    cancellation,
+                    lifecycle.as_ref(),
+                )
+                .await
             }
             READ_NAME => {
                 let cwd = self.cwd.clone();
@@ -389,15 +464,17 @@ impl ToolRuntime {
             }
             WRITE_NAME => {
                 let cwd = self.cwd.clone();
+                let call_id = call_id.to_string();
                 blocking_tool(cancellation, move |cancellation| {
-                    write(&cwd, input, &cancellation)
+                    write_with_lifecycle(&cwd, input, &cancellation, &call_id, lifecycle.as_ref())
                 })
                 .await
             }
             EDIT_NAME => {
                 let cwd = self.cwd.clone();
+                let call_id = call_id.to_string();
                 blocking_tool(cancellation, move |cancellation| {
-                    edit(&cwd, input, &cancellation)
+                    edit_with_lifecycle(&cwd, input, &cancellation, &call_id, lifecycle.as_ref())
                 })
                 .await
             }
@@ -412,9 +489,14 @@ impl ToolRuntime {
         truncation_policy: TruncationPolicy,
         events: Option<UnboundedSender<AgentEvent>>,
         cancellation: CancellationToken,
+        lifecycle: Option<&ToolLifecycleJournal>,
     ) -> Result<ToolResult> {
         let arguments: BashArgs = deserialize_arguments(input)?;
         let timeout = arguments.timeout.map(resolve_timeout).transpose()?;
+        ensure_not_cancelled(&cancellation, BASH_NAME)?;
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.record_started_async(call_id).await?;
+        }
         let live_call_id = call_id.to_string();
         let mut forwarded_live_bytes = 0_usize;
         let mut forward_live_output = |stream, mut chunk: String| {
@@ -488,6 +570,17 @@ fn ensure_not_cancelled(cancellation: &CancellationToken, operation: &str) -> Re
         Ok(())
     }
 }
+
+#[derive(Debug)]
+struct MutationOutcomeUnknown(String);
+
+impl std::fmt::Display for MutationOutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MutationOutcomeUnknown {}
 
 fn parse_arguments(name: &str, arguments: &str) -> Result<Value> {
     let input: Value = serde_json::from_str(arguments)
@@ -737,47 +830,159 @@ struct WriteArgs {
     content: String,
 }
 
+#[cfg(test)]
 fn write(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<ToolResult> {
+    write_with_lifecycle(cwd, input, cancellation, "", None)
+}
+
+fn write_with_lifecycle(
+    cwd: &Path,
+    input: Value,
+    cancellation: &CancellationToken,
+    call_id: &str,
+    lifecycle: Option<&ToolLifecycleJournal>,
+) -> Result<ToolResult> {
     ensure_not_cancelled(cancellation, WRITE_NAME)?;
     let arguments: WriteArgs = deserialize_arguments(input)?;
-    let path = resolve_path(cwd, &arguments.path);
-    let write_path = resolve_symlink_write_path(&path);
-    // Return the dedicated safety error before generic write context is added. The atomic helper
-    // checks again after preview and parent-directory preparation in case the path changed.
-    if std::fs::symlink_metadata(&write_path).is_ok_and(|metadata| !metadata.is_file()) {
-        return Err(anyhow!(
-            "write path `{}` is not a regular file",
-            write_path.display()
-        ));
-    }
-    let preview = write_preview(&write_path, &arguments.content);
     ensure_not_cancelled(cancellation, WRITE_NAME)?;
+    let path = resolve_path(cwd, &arguments.path);
+    let resolved = resolve_symlink_write_path(&path)?;
+    ensure_not_cancelled(cancellation, WRITE_NAME)?;
+    let write_path = resolved.target().to_path_buf();
     let parent = write_path
         .parent()
         .ok_or_else(|| anyhow!("write path `{}` has no parent directory", path.display()))?;
-    // Once the mutation starts, finish it so cancellation cannot report failure after creating
-    // parent directories or completing the whole-file replacement.
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("unable to create `{}`", parent.display()))?;
-    write_file_atomically(
-        &write_path,
-        arguments.content.as_bytes(),
-        AtomicWriteMode::CreateOrReplace,
-    )
-    .with_context(|| format!("unable to write `{}`", path.display()))?;
-    let result = write_result(&path, &arguments.content);
-    let change = match preview {
-        WritePreview::Add => Some(FileChange::Add {
-            content: arguments.content,
-        }),
-        WritePreview::Update(original) => {
-            let unified_diff = diffy::create_patch(&original, &arguments.content).to_string();
-            (unified_diff.len() <= MAX_FILE_CHANGE_PREVIEW_BYTES).then_some(FileChange::Update {
-                unified_diff,
-                move_path: None,
-            })
+    let missing_parent = highest_missing_parent(parent);
+    let mut target = match AnchoredPath::open(&write_path) {
+        Ok(target) => Some(target),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && missing_parent.is_some() => {
+            None
         }
-        WritePreview::Omit => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("unable to access `{}`", write_path.display()));
+        }
+    };
+    if let Some(lifecycle) = lifecycle {
+        lifecycle
+            .record_started(call_id)
+            .context("write mutation was not attempted because lifecycle start was not saved")?;
+    }
+    #[cfg(test)]
+    crate::process_termination_test_support::stop_at("write_started");
+    let WritePreparation {
+        preview,
+        pre_state,
+        expectation,
+    } = write_preparation(
+        &write_path,
+        target.as_ref(),
+        &arguments.content,
+        lifecycle.is_some(),
+        cancellation,
+    )?;
+    ensure_not_cancelled(cancellation, WRITE_NAME)?;
+
+    let staging_name = atomic_staging_name();
+    let mut evidence = if lifecycle.is_some() {
+        Some(ToolMutationEvidence {
+            target: write_path.clone(),
+            target_parent: target.as_ref().map(AnchoredPath::parent_identity),
+            path_resolution: resolved.lifecycle_evidence(),
+            pre_state,
+            post_state: content_digest_cancellable(
+                arguments.content.as_bytes(),
+                cancellation,
+                WRITE_NAME,
+            )?,
+            staging: Some(ToolStagingEvidence {
+                name: staging_name.clone(),
+                directory: None,
+                content: None,
+            }),
+            missing_parent: missing_parent.clone(),
+        })
+    } else {
+        None
+    };
+    if let (Some(lifecycle), Some(evidence)) = (lifecycle, evidence.as_ref()) {
+        lifecycle
+            .record_mutation_prepared(call_id, evidence.clone())
+            .context("write mutation was not attempted because lifecycle evidence was not saved")?;
+    }
+    #[cfg(test)]
+    crate::process_termination_test_support::stop_at("write_prepared");
+    // Recheck after lifecycle I/O. Once parent creation or private staging starts, finish the
+    // attempt so cancellation cannot be reported after a committed replacement.
+    ensure_not_cancelled(cancellation, WRITE_NAME)?;
+    let mutation = (|| -> Result<AtomicWriteOutcome> {
+        if target.is_none() {
+            verify_resolved_write_path(&resolved)?;
+            let anchored = AnchoredPath::create_parent_directories(&write_path).with_context(|| {
+                format!(
+                    "atomic replacement of `{}` was not committed because `{}` could not be created",
+                    write_path.display(),
+                    parent.display()
+                )
+            })?;
+            #[cfg(test)]
+            crate::process_termination_test_support::stop_at("write_parent_created");
+            if let (Some(lifecycle), Some(evidence)) = (lifecycle, evidence.as_mut()) {
+                evidence.target_parent = Some(anchored.parent_identity());
+                lifecycle
+                    .record_mutation_prepared(call_id, evidence.clone())
+                    .context("atomic replacement was not committed after parent creation because refined lifecycle evidence was not saved")?;
+            }
+            target = Some(anchored);
+        }
+        let anchored = target
+            .as_ref()
+            .ok_or_else(|| anyhow!("write target is not anchored before replacement"))?;
+        let outcome = write_file_atomically(
+            &resolved,
+            anchored,
+            arguments.content.as_bytes(),
+            expectation,
+            &staging_name,
+            |staging| {
+                if let (Some(lifecycle), Some(evidence)) = (lifecycle, evidence.as_mut()) {
+                    evidence.staging = Some(staging);
+                    lifecycle.record_mutation_prepared(call_id, evidence.clone())?;
+                }
+                Ok(())
+            },
+        )
+        .with_context(|| format!("unable to write `{}`", path.display()))?;
+        #[cfg(test)]
+        crate::process_termination_test_support::stop_at("write_replaced");
+        Ok(outcome)
+    })();
+    let outcome = match mutation {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(parent) = missing_parent.as_deref().filter(|parent| {
+                std::fs::symlink_metadata(parent).is_ok_and(|value| value.is_dir())
+            }) {
+                return Err(error.context(format!(
+                    "the directory `{}` may remain from parent creation",
+                    parent.display()
+                )));
+            }
+            return Err(error);
+        }
+    };
+
+    let result = write_result(&path, &arguments.content, &outcome);
+    let change = if outcome.path_requires_inspection() {
+        None
+    } else {
+        match preview {
+            WritePreview::Add => Some(FileChange::Add {
+                content: arguments.content,
+            }),
+            WritePreview::Update(change) => Some(change),
+            WritePreview::Omit => None,
+        }
     };
     Ok(match change {
         Some(change) => result.with_file_change(path, change),
@@ -785,68 +990,352 @@ fn write(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<T
     })
 }
 
+struct WritePreparation {
+    preview: WritePreview,
+    pre_state: ToolTargetPreState,
+    expectation: AtomicDestinationExpectation,
+}
+
 enum WritePreview {
     Add,
-    Update(String),
+    Update(FileChange),
     Omit,
 }
 
-fn write_preview(path: &Path, replacement: &str) -> WritePreview {
-    // A preview must never make a write fail or read an arbitrarily large existing file. The write
-    // itself retains its ordinary behavior when a bounded preview cannot be obtained.
-    if replacement.len() > MAX_FILE_CHANGE_PREVIEW_BYTES {
-        return WritePreview::Omit;
-    }
-    let file = match open_for_read(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return WritePreview::Add,
-        Err(_) => return WritePreview::Omit,
+#[derive(Clone, Copy)]
+enum AtomicDestinationExpectation {
+    Absent,
+    Existing(FileSnapshot),
+}
+
+fn write_preparation(
+    path: &Path,
+    target: Option<&AnchoredPath>,
+    replacement: &str,
+    capture_state: bool,
+    cancellation: &CancellationToken,
+) -> Result<WritePreparation> {
+    let Some(target) = target else {
+        return Ok(absent_write_preparation(replacement));
     };
-    if file
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() > MAX_FILE_CHANGE_PREVIEW_BYTES as u64)
-    {
-        return WritePreview::Omit;
+    if !target.parent_path_is_current().unwrap_or(false) {
+        return Err(target_changed_before_commit(WRITE_NAME, path));
     }
-    let mut bytes = Vec::new();
-    if file
-        .take((MAX_FILE_CHANGE_PREVIEW_BYTES as u64).saturating_add(1))
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() > MAX_FILE_CHANGE_PREVIEW_BYTES
-    {
-        return WritePreview::Omit;
+    let metadata = target
+        .entry_metadata()
+        .with_context(|| format!("unable to inspect `{}`", path.display()))?;
+    let Some(metadata) = metadata else {
+        return Ok(absent_write_preparation(replacement));
+    };
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "write path `{}` is not a regular file",
+            path.display()
+        ));
     }
-    match String::from_utf8(bytes) {
-        Ok(original) if write_diff_is_within_budget(&original, replacement) => {
-            WritePreview::Update(original)
-        }
-        Ok(_) | Err(_) => WritePreview::Omit,
+    let snapshot = metadata.snapshot();
+    let expectation = AtomicDestinationExpectation::Existing(snapshot);
+
+    // Diff previews stay capped at 2 MiB, while lifecycle hashing has a separate 64 MiB I/O
+    // budget. Both use the same descriptor snapshot when enabled, and neither is required for a
+    // valid replacement of an otherwise writable regular file.
+    let capture_preview = snapshot.byte_len() <= MAX_FILE_CHANGE_PREVIEW_BYTES as u64
+        && replacement.len() <= MAX_FILE_CHANGE_PREVIEW_BYTES
+        && !replacement.contains('\0');
+    let capture_digest = capture_state && snapshot.byte_len() <= MAX_TOOL_PRE_STATE_HASH_BYTES;
+    if !capture_preview && !capture_digest {
+        return Ok(unknown_existing_write_preparation(expectation));
+    }
+
+    let mut file = match target.open_for_read() {
+        Ok(file) => file,
+        Err(_) => return Ok(unknown_existing_write_preparation(expectation)),
+    };
+    match file.metadata() {
+        Ok(metadata)
+            if metadata.is_file() && crate::private_fs::file_snapshot(&metadata) == snapshot => {}
+        Ok(_) | Err(_) => return Err(target_changed_before_commit(WRITE_NAME, path)),
+    }
+
+    let (pre_state, preview) = if capture_preview {
+        // A previewable target is at most 2 MiB, so one exact bounded read serves both preview and
+        // lifecycle digest without an avoidable second pass.
+        let bytes = match read_exact_cancellable(
+            &mut file,
+            snapshot.byte_len(),
+            cancellation,
+            WRITE_NAME,
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                ensure_not_cancelled(cancellation, WRITE_NAME)?;
+                return Ok(unknown_existing_write_preparation(expectation));
+            }
+        };
+        ensure_target_snapshot_is_current(WRITE_NAME, path, target, &file, snapshot)?;
+        let pre_state = if capture_digest {
+            ToolTargetPreState::Digest(ToolContentDigest::from_bytes(&bytes))
+        } else {
+            ToolTargetPreState::Unknown
+        };
+        let preview = match String::from_utf8(bytes) {
+            Ok(original) => bounded_update_file_change(&original, replacement)
+                .map_or(WritePreview::Omit, WritePreview::Update),
+            Err(_) => WritePreview::Omit,
+        };
+        (pre_state, preview)
+    } else {
+        debug_assert!(capture_digest);
+        let mut cancellable = CancellableReader::new(&mut file, cancellation, WRITE_NAME);
+        let mut bounded = (&mut cancellable).take(snapshot.byte_len());
+        let digest = match ToolContentDigest::from_reader(&mut bounded) {
+            Ok(digest) if digest.byte_len() == snapshot.byte_len() => digest,
+            Ok(_) | Err(_) => {
+                ensure_not_cancelled(cancellation, WRITE_NAME)?;
+                return Ok(unknown_existing_write_preparation(expectation));
+            }
+        };
+        ensure_not_cancelled(cancellation, WRITE_NAME)?;
+        ensure_target_snapshot_is_current(WRITE_NAME, path, target, &file, snapshot)?;
+        (ToolTargetPreState::Digest(digest), WritePreview::Omit)
+    };
+
+    Ok(WritePreparation {
+        preview,
+        pre_state,
+        expectation,
+    })
+}
+
+fn absent_write_preparation(replacement: &str) -> WritePreparation {
+    WritePreparation {
+        preview: if replacement.len() <= MAX_FILE_CHANGE_PREVIEW_BYTES
+            && !replacement.contains('\0')
+        {
+            WritePreview::Add
+        } else {
+            WritePreview::Omit
+        },
+        pre_state: ToolTargetPreState::Absent,
+        expectation: AtomicDestinationExpectation::Absent,
     }
 }
 
-fn write_diff_is_within_budget(original: &str, replacement: &str) -> bool {
+fn unknown_existing_write_preparation(
+    expectation: AtomicDestinationExpectation,
+) -> WritePreparation {
+    WritePreparation {
+        preview: WritePreview::Omit,
+        pre_state: ToolTargetPreState::Unknown,
+        expectation,
+    }
+}
+
+fn ensure_target_snapshot_is_current(
+    tool: &str,
+    path: &Path,
+    target: &AnchoredPath,
+    file: &File,
+    expected: FileSnapshot,
+) -> Result<()> {
+    let opened_is_current = file.metadata().is_ok_and(|metadata| {
+        metadata.is_file() && crate::private_fs::file_snapshot(&metadata) == expected
+    });
+    let path_is_current = target.entry_metadata().is_ok_and(|metadata| {
+        metadata.is_some_and(|metadata| metadata.is_file() && metadata.snapshot() == expected)
+    });
+    if opened_is_current && path_is_current && target.parent_path_is_current().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(target_changed_before_commit(tool, path))
+    }
+}
+
+fn target_changed_before_commit(tool: &str, path: &Path) -> anyhow::Error {
+    anyhow!(
+        "{tool} target `{}` changed while the replacement was being prepared; atomic replacement was not committed",
+        path.display()
+    )
+}
+
+fn read_exact_cancellable(
+    reader: &mut impl Read,
+    bytes: u64,
+    cancellation: &CancellationToken,
+    tool: &str,
+) -> std::io::Result<Vec<u8>> {
+    let capacity = usize::try_from(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "file is too large to fit in memory",
+        )
+    })?;
+    let mut output = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        cancellation_checkpoint(cancellation, tool)?;
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = reader.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file changed while it was being read",
+            ));
+        }
+        output.extend_from_slice(&buffer[..read]);
+        remaining -= u64::try_from(read).unwrap_or(remaining);
+    }
+    cancellation_checkpoint(cancellation, tool)?;
+    Ok(output)
+}
+
+struct CancellableReader<'a, R> {
+    reader: &'a mut R,
+    cancellation: &'a CancellationToken,
+    tool: &'a str,
+}
+
+impl<'a, R> CancellableReader<'a, R> {
+    fn new(reader: &'a mut R, cancellation: &'a CancellationToken, tool: &'a str) -> Self {
+        Self {
+            reader,
+            cancellation,
+            tool,
+        }
+    }
+}
+
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        cancellation_checkpoint(self.cancellation, self.tool)?;
+        self.reader.read(buffer)
+    }
+}
+
+fn content_digest_cancellable(
+    bytes: &[u8],
+    cancellation: &CancellationToken,
+    tool: &str,
+) -> Result<ToolContentDigest> {
+    ToolContentDigest::from_bytes_with_checkpoint(bytes, || {
+        ensure_not_cancelled(cancellation, tool)
+    })
+}
+
+fn cancellation_checkpoint(cancellation: &CancellationToken, tool: &str) -> std::io::Result<()> {
+    if cancellation.is_cancelled() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("{tool} was interrupted"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn highest_missing_parent(parent: &Path) -> Option<PathBuf> {
+    let mut current = Some(parent);
+    let mut highest_missing = None;
+    while let Some(candidate) = current {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                highest_missing = Some(candidate.to_path_buf());
+            }
+            Err(_) => return None,
+        }
+        current = candidate.parent();
+    }
+    highest_missing
+}
+
+fn bounded_update_file_change(original: &str, replacement: &str) -> Option<FileChange> {
+    if original.len() > MAX_FILE_CHANGE_PREVIEW_BYTES
+        || replacement.len() > MAX_FILE_CHANGE_PREVIEW_BYTES
+        || original.contains('\0')
+        || replacement.contains('\0')
+    {
+        return None;
+    }
     let original_lines = original
         .split_inclusive('\n')
         .take(MAX_FILE_CHANGE_DIFF_LINES.saturating_add(1))
         .count();
     if original_lines > MAX_FILE_CHANGE_DIFF_LINES {
-        return false;
+        return None;
     }
-    let remaining = MAX_FILE_CHANGE_DIFF_LINES.saturating_sub(original_lines);
-    replacement
+    let remaining_lines = MAX_FILE_CHANGE_DIFF_LINES.checked_sub(original_lines)?;
+    let replacement_lines = replacement
         .split_inclusive('\n')
-        .take(remaining.saturating_add(1))
-        .count()
-        <= remaining
+        .take(remaining_lines.saturating_add(1))
+        .count();
+    if replacement_lines > remaining_lines {
+        return None;
+    }
+
+    // In the worst line-oriented patch every input byte is copied once, every line receives a
+    // prefix and hunk metadata, and fixed file/no-newline headers are added. Reject that upper
+    // bound before diffy allocates its edit graph or output buffer.
+    let total_lines = original_lines.checked_add(replacement_lines)?;
+    let output_upper_bound = original
+        .len()
+        .checked_add(replacement.len())?
+        .checked_add(total_lines.checked_mul(96)?)?
+        .checked_add(1_024)?;
+    if output_upper_bound > MAX_FILE_CHANGE_PREVIEW_BYTES {
+        return None;
+    }
+
+    let unified_diff = diffy::create_patch(original, replacement).to_string();
+    (unified_diff.len() <= MAX_FILE_CHANGE_PREVIEW_BYTES).then_some(FileChange::Update {
+        unified_diff,
+        move_path: None,
+    })
 }
 
-fn write_result(path: &Path, content: &str) -> ToolResult {
-    ToolResult::text(format!(
-        "Wrote {} bytes to {}",
-        content.len(),
-        path.display()
-    ))
+fn write_result(path: &Path, content: &str, outcome: &AtomicWriteOutcome) -> ToolResult {
+    let mut message = if outcome.path_requires_inspection() {
+        format!(
+            "An atomic replacement attempt for {} bytes at {} completed in the pinned parent directory; the final path requires inspection",
+            content.len(),
+            path.display()
+        )
+    } else {
+        format!("Wrote {} bytes to {}", content.len(), path.display())
+    };
+    append_atomic_write_warnings(&mut message, outcome);
+    ToolResult::text(message).requiring_inspection(outcome.requires_inspection())
+}
+
+fn append_atomic_write_warnings(message: &mut String, outcome: &AtomicWriteOutcome) {
+    if let Some(path) = &outcome.cleanup_residue {
+        message.push_str(&format!(
+            ". Atomic replacement committed, but the private staging directory `{}` may remain",
+            path.display()
+        ));
+    }
+    if let Some(parent) = &outcome.rebound_parent {
+        message.push_str(&format!(
+            ". Atomic replacement committed in the pinned parent directory, but `{}` changed during commit; inspect the requested path before retrying",
+            parent.display()
+        ));
+    }
+    if let Some(error) = &outcome.commit_reported_error {
+        message.push_str(&format!(
+            ". The intended file state is present at the destination, but the commit operation reported `{error}`; inspect it before retrying",
+        ));
+    }
+    if outcome.requested_path_changed_after_commit {
+        message.push_str(
+            ". Atomic replacement committed, but the requested symlink route changed immediately afterward; inspect it before retrying",
+        );
+    }
+    if outcome.target_changed_after_commit {
+        message.push_str(
+            ". Atomic replacement committed, but the target entry changed immediately afterward; inspect it before retrying",
+        );
+    }
 }
 
 #[derive(Deserialize)]
@@ -863,62 +1352,91 @@ struct Replacement {
     new_text: String,
 }
 
+#[cfg(test)]
 fn edit(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<ToolResult> {
+    edit_with_lifecycle(cwd, input, cancellation, "", None)
+}
+
+fn edit_with_lifecycle(
+    cwd: &Path,
+    input: Value,
+    cancellation: &CancellationToken,
+    call_id: &str,
+    lifecycle: Option<&ToolLifecycleJournal>,
+) -> Result<ToolResult> {
     ensure_not_cancelled(cancellation, EDIT_NAME)?;
     let arguments: EditArgs = deserialize_arguments(input)?;
+    ensure_not_cancelled(cancellation, EDIT_NAME)?;
     if arguments.edits.is_empty() {
         return Err(anyhow!("edit.edits must contain at least one replacement"));
     }
     let path = resolve_path(cwd, &arguments.path);
-    let write_path = resolve_symlink_write_path(&path);
-    let file = open_for_read(&write_path)
-        .with_context(|| format!("unable to read `{}` as UTF-8 text", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("unable to read `{}` as UTF-8 text", path.display()))?;
-    if !metadata.is_file() {
-        return Err(anyhow!("unable to read `{}` as UTF-8 text", path.display()));
+    let resolved = resolve_symlink_write_path(&path)?;
+    ensure_not_cancelled(cancellation, EDIT_NAME)?;
+    let write_path = resolved.target().to_path_buf();
+    if let Some(lifecycle) = lifecycle {
+        lifecycle
+            .record_started(call_id)
+            .context("edit mutation was not attempted because lifecycle start was not saved")?;
     }
-    if metadata.len() > MAX_EDIT_FILE_BYTES as u64 {
+    #[cfg(test)]
+    crate::process_termination_test_support::stop_at("edit_started");
+
+    let target = AnchoredPath::open(&write_path)
+        .with_context(|| format!("unable to read `{}` as UTF-8 text", path.display()))?;
+    if !target.parent_path_is_current().unwrap_or(false) {
+        return Err(target_changed_before_commit(EDIT_NAME, &path));
+    }
+    let metadata = target
+        .entry_metadata()
+        .with_context(|| format!("unable to read `{}` as UTF-8 text", path.display()))?
+        .filter(|metadata| metadata.is_file())
+        .ok_or_else(|| anyhow!("unable to read `{}` as UTF-8 text", path.display()))?;
+    let snapshot = metadata.snapshot();
+    if snapshot.byte_len() > MAX_EDIT_FILE_BYTES as u64 {
         return Err(anyhow!(
             "edit target `{}` exceeds the {} MiB edit limit; use bash for a bounded transformation",
             path.display(),
             MAX_EDIT_FILE_BYTES / (1024 * 1024)
         ));
     }
-    let capacity = usize::try_from(metadata.len())
-        .unwrap_or(MAX_EDIT_FILE_BYTES)
-        .min(MAX_EDIT_FILE_BYTES);
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take((MAX_EDIT_FILE_BYTES as u64).saturating_add(1))
-        .read_to_end(&mut bytes)
+    let mut file = target
+        .open_for_read()
         .with_context(|| format!("unable to read `{}` as UTF-8 text", path.display()))?;
-    if bytes.len() > MAX_EDIT_FILE_BYTES {
-        return Err(anyhow!(
-            "edit target `{}` exceeds the {} MiB edit limit; use bash for a bounded transformation",
-            path.display(),
-            MAX_EDIT_FILE_BYTES / (1024 * 1024)
-        ));
+    match file.metadata() {
+        Ok(metadata)
+            if metadata.is_file() && crate::private_fs::file_snapshot(&metadata) == snapshot => {}
+        Ok(_) | Err(_) => return Err(target_changed_before_commit(EDIT_NAME, &path)),
     }
+    let bytes = read_exact_cancellable(&mut file, snapshot.byte_len(), cancellation, EDIT_NAME);
+    ensure_not_cancelled(cancellation, EDIT_NAME)?;
+    let bytes =
+        bytes.with_context(|| format!("unable to read `{}` as UTF-8 text", path.display()))?;
+    ensure_target_snapshot_is_current(EDIT_NAME, &path, &target, &file, snapshot)?;
     let original = String::from_utf8(bytes)
         .with_context(|| format!("unable to read `{}` as UTF-8 text", path.display()))?;
     ensure_not_cancelled(cancellation, EDIT_NAME)?;
+
     let normalized_original = normalize_line_endings(&original);
     let preferred_line_ending = preferred_line_ending(&original);
-    let normalized_edits = arguments
-        .edits
-        .iter()
-        .map(|edit| {
-            (
-                normalize_line_endings(&edit.old_text),
-                restore_line_endings(
-                    normalize_line_endings(&edit.new_text),
-                    preferred_line_ending,
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut ranges = Vec::with_capacity(normalized_edits.len());
+    let mut normalized_edits = Vec::new();
+    normalized_edits
+        .try_reserve_exact(arguments.edits.len())
+        .map_err(|_| anyhow!("edit arguments for `{}` are too large", path.display()))?;
+    for edit in &arguments.edits {
+        ensure_not_cancelled(cancellation, EDIT_NAME)?;
+        normalized_edits.push((
+            normalize_line_endings(&edit.old_text),
+            restore_line_endings(
+                normalize_line_endings(&edit.new_text),
+                preferred_line_ending,
+            ),
+        ));
+    }
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(normalized_edits.len())
+        .map_err(|_| anyhow!("edit arguments for `{}` are too large", path.display()))?;
     for (index, (old_text, _)) in normalized_edits.iter().enumerate() {
         ensure_not_cancelled(cancellation, EDIT_NAME)?;
         if old_text.is_empty() {
@@ -958,10 +1476,16 @@ fn edit(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<To
 
     let updated_len = ranges
         .iter()
-        .fold(original.len(), |length, (start, end, index)| {
-            length - (end - start) + normalized_edits[*index].1.len()
-        });
-    let mut updated = String::with_capacity(updated_len);
+        .try_fold(original.len(), |length, (start, end, index)| {
+            length
+                .checked_sub(end - start)?
+                .checked_add(normalized_edits[*index].1.len())
+        })
+        .ok_or_else(|| anyhow!("edit result for `{}` is too large", path.display()))?;
+    let mut updated = String::new();
+    updated
+        .try_reserve_exact(updated_len)
+        .map_err(|_| anyhow!("edit result for `{}` is too large", path.display()))?;
     let mut original_start = 0_usize;
     for (start, end, index) in ranges {
         ensure_not_cancelled(cancellation, EDIT_NAME)?;
@@ -976,34 +1500,77 @@ fn edit(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<To
             path.display()
         ));
     }
-    let file_change = if original.len() <= MAX_FILE_CHANGE_PREVIEW_BYTES
-        && updated.len() <= MAX_FILE_CHANGE_PREVIEW_BYTES
-    {
-        let unified_diff = diffy::create_patch(&original, &updated).to_string();
-        (unified_diff.len() <= MAX_FILE_CHANGE_PREVIEW_BYTES).then_some(FileChange::Update {
-            unified_diff,
-            move_path: None,
+    let file_change = bounded_update_file_change(&original, &updated);
+    ensure_not_cancelled(cancellation, EDIT_NAME)?;
+    let staging_name = atomic_staging_name();
+    let mut evidence = if lifecycle.is_some() {
+        Some(ToolMutationEvidence {
+            target: write_path,
+            target_parent: Some(target.parent_identity()),
+            path_resolution: resolved.lifecycle_evidence(),
+            pre_state: ToolTargetPreState::Digest(content_digest_cancellable(
+                original.as_bytes(),
+                cancellation,
+                EDIT_NAME,
+            )?),
+            post_state: content_digest_cancellable(updated.as_bytes(), cancellation, EDIT_NAME)?,
+            staging: Some(ToolStagingEvidence {
+                name: staging_name.clone(),
+                directory: None,
+                content: None,
+            }),
+            missing_parent: None,
         })
     } else {
         None
     };
-    // Cancellation is honored throughout preparation. Once atomic replacement begins, finish it
-    // so interruption cannot leave or report a partial edit.
+    if let (Some(lifecycle), Some(evidence)) = (lifecycle, evidence.as_ref()) {
+        lifecycle
+            .record_mutation_prepared(call_id, evidence.clone())
+            .context("edit mutation was not attempted because lifecycle evidence was not saved")?;
+    }
+    #[cfg(test)]
+    crate::process_termination_test_support::stop_at("edit_prepared");
+    // Lifecycle recording may perform I/O, so honor a cancellation that arrived before staging.
+    // After staging starts, the helper either commits once or reports that it did not commit.
     ensure_not_cancelled(cancellation, EDIT_NAME)?;
-    write_file_atomically(
-        &write_path,
+    let outcome = write_file_atomically(
+        &resolved,
+        &target,
         updated.as_bytes(),
-        AtomicWriteMode::ReplaceExisting,
+        AtomicDestinationExpectation::Existing(snapshot),
+        &staging_name,
+        |staging| {
+            if let (Some(lifecycle), Some(evidence)) = (lifecycle, evidence.as_mut()) {
+                evidence.staging = Some(staging);
+                lifecycle.record_mutation_prepared(call_id, evidence.clone())?;
+            }
+            Ok(())
+        },
     )?;
-    let result = ToolResult::text(format!(
-        "Replaced {} block(s) in {}",
-        arguments.edits.len(),
-        path.display()
-    ));
-    Ok(match file_change {
-        Some(change) => result.with_file_change(path, change),
-        None => result,
-    })
+    #[cfg(test)]
+    crate::process_termination_test_support::stop_at("edit_replaced");
+    let mut message = if outcome.path_requires_inspection() {
+        format!(
+            "An atomic edit replacement for {} block(s) at {} completed in the pinned parent directory; the final path requires inspection",
+            arguments.edits.len(),
+            path.display()
+        )
+    } else {
+        format!(
+            "Replaced {} block(s) in {}",
+            arguments.edits.len(),
+            path.display()
+        )
+    };
+    append_atomic_write_warnings(&mut message, &outcome);
+    let result = ToolResult::text(message).requiring_inspection(outcome.requires_inspection());
+    Ok(
+        match file_change.filter(|_| !outcome.path_requires_inspection()) {
+            Some(change) => result.with_file_change(path, change),
+            None => result,
+        },
+    )
 }
 
 fn normalize_line_endings(text: &str) -> Cow<'_, str> {
@@ -1074,11 +1641,11 @@ fn preferred_line_ending(text: &str) -> &'static str {
     "\n"
 }
 
-fn restore_line_endings(text: Cow<'_, str>, line_ending: &str) -> String {
+fn restore_line_endings<'a>(text: Cow<'a, str>, line_ending: &str) -> Cow<'a, str> {
     if line_ending == "\n" {
-        text.into_owned()
+        text
     } else {
-        text.replace('\n', line_ending)
+        Cow::Owned(text.replace('\n', line_ending))
     }
 }
 
@@ -1102,145 +1669,584 @@ fn unique_match(content: &str, pattern: &str) -> UniqueMatch {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AtomicWriteMode {
-    CreateOrReplace,
-    ReplaceExisting,
+struct ResolvedWritePath {
+    requested: PathBuf,
+    target: PathBuf,
+    symlinks: Vec<ToolSymlinkEvidence>,
 }
 
-// Resolve the final symlink component before reading and keep that target stable through the
-// replacement. Missing targets are returned so `write` can create through a dangling symlink.
-fn resolve_symlink_write_path(path: &Path) -> PathBuf {
-    use std::os::unix::fs::MetadataExt;
+impl ResolvedWritePath {
+    fn target(&self) -> &Path {
+        &self.target
+    }
 
-    let root = path.to_path_buf();
-    let mut current = root.clone();
+    fn is_current(&self) -> bool {
+        self.symlinks.iter().all(ToolSymlinkEvidence::is_current)
+    }
+
+    fn lifecycle_evidence(&self) -> Option<ToolPathResolutionEvidence> {
+        (!self.symlinks.is_empty()).then(|| ToolPathResolutionEvidence {
+            requested: self.requested.clone(),
+            symlinks: self.symlinks.clone(),
+        })
+    }
+}
+
+// Resolve final symlink components before reading and retain their identities through commit.
+// Parent-directory components are covered separately by `AnchoredPath`'s pinned descriptor. These
+// checks narrow ordinary rebinding races but cannot turn POSIX rename into compare-and-replace.
+fn resolve_symlink_write_path(path: &Path) -> Result<ResolvedWritePath> {
+    let requested = path.to_path_buf();
+    let mut current = requested.clone();
+    let mut symlinks = Vec::new();
     let mut visited = HashSet::new();
+    let mut hops = 0_usize;
     loop {
         let metadata = match std::fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return current,
-            Err(_) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ResolvedWritePath {
+                    requested,
+                    target: current,
+                    symlinks,
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "unable to resolve write path `{}`; mutation was not attempted",
+                        requested.display()
+                    )
+                });
+            }
         };
         if !metadata.file_type().is_symlink() {
-            return current;
+            return Ok(ResolvedWritePath {
+                requested,
+                target: current,
+                symlinks,
+            });
         }
-        if !visited.insert((metadata.dev(), metadata.ino())) {
-            return root;
+        let snapshot = crate::private_fs::file_snapshot(&metadata);
+        if hops >= MAX_WRITE_SYMLINK_HOPS || !visited.insert(snapshot.object_identity()) {
+            return Err(anyhow!(
+                "write path `{}` contains a symlink loop or exceeds {MAX_WRITE_SYMLINK_HOPS} final-component symlink hops; mutation was not attempted",
+                requested.display()
+            ));
         }
-        let target = match std::fs::read_link(&current) {
-            Ok(target) => target,
-            Err(_) => return root,
-        };
-        current = if target.is_absolute() {
-            target
+        hops += 1;
+        let link_target = std::fs::read_link(&current).with_context(|| {
+            format!(
+                "unable to resolve symlink `{}`; mutation was not attempted",
+                current.display()
+            )
+        })?;
+        let link_is_current = std::fs::symlink_metadata(&current).is_ok_and(|metadata| {
+            metadata.file_type().is_symlink()
+                && crate::private_fs::file_snapshot(&metadata) == snapshot
+        });
+        if !link_is_current {
+            return Err(anyhow!(
+                "write path `{}` changed while its symlinks were being resolved; mutation was not attempted",
+                requested.display()
+            ));
+        }
+        symlinks.push(ToolSymlinkEvidence {
+            path: current.clone(),
+            snapshot,
+        });
+        current = if link_target.is_absolute() {
+            link_target
         } else if let Some(parent) = current.parent() {
-            parent.join(target)
+            parent.join(link_target)
         } else {
-            return root;
+            return Err(anyhow!(
+                "symlink `{}` has no parent path; mutation was not attempted",
+                current.display()
+            ));
         };
     }
 }
 
-fn inspect_atomic_write_destination(
-    path: &Path,
-    mode: AtomicWriteMode,
-) -> Result<Option<std::fs::Metadata>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Some(metadata),
-        Err(error)
-            if mode == AtomicWriteMode::CreateOrReplace
-                && error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            None
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("unable to inspect `{}`", path.display()));
-        }
-    };
-    if metadata
-        .as_ref()
-        .is_some_and(|metadata| !metadata.is_file())
-    {
+fn verify_resolved_write_path(resolved: &ResolvedWritePath) -> Result<()> {
+    if resolved.is_current() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "requested write path `{}` changed before atomic replacement; atomic replacement was not committed",
+            resolved.requested.display()
+        ))
+    }
+}
+
+fn verify_atomic_destination(
+    target: &AnchoredPath,
+    expectation: AtomicDestinationExpectation,
+) -> Result<()> {
+    let metadata = target
+        .entry_metadata()
+        .with_context(|| format!("unable to inspect `{}`", target.path().display()))?;
+    if metadata.is_some_and(|metadata| !metadata.is_file()) {
         return Err(anyhow!(
             "write path `{}` is not a regular file",
-            path.display()
+            target.path().display()
         ));
     }
-    Ok(metadata)
+    let matches = match (expectation, metadata) {
+        (AtomicDestinationExpectation::Absent, None) => true,
+        (AtomicDestinationExpectation::Existing(expected), Some(metadata)) => {
+            metadata.snapshot() == expected
+        }
+        (AtomicDestinationExpectation::Absent, Some(_))
+        | (AtomicDestinationExpectation::Existing(_), None) => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "write target `{}` changed before atomic replacement",
+            target.path().display()
+        ))
+    }
 }
 
-fn write_file_atomically(path: &Path, content: &[u8], mode: AtomicWriteMode) -> Result<()> {
-    let metadata = inspect_atomic_write_destination(path, mode)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("edit path `{}` has no parent directory", path.display()))?;
-    // Keep the temporary basename independent of the destination basename. A destination can be
-    // valid at the filesystem's NAME_MAX while a prefixed copy of that name is not.
-    let temporary = parent.join(format!(
+fn verify_atomic_parent(target: &AnchoredPath) -> Result<()> {
+    if target.parent_path_is_current().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "parent directory `{}` changed before atomic replacement of `{}`",
+            target.parent_path().display(),
+            target.path().display()
+        ))
+    }
+}
+
+fn target_matches_open_file(target: &AnchoredPath, file: &File, expected: FileSnapshot) -> bool {
+    let opened = match file.metadata() {
+        Ok(metadata) if metadata.is_file() => crate::private_fs::file_snapshot(&metadata),
+        Ok(_) | Err(_) => return false,
+    };
+    opened.same_content_state(expected)
+        && target.entry_metadata().is_ok_and(|metadata| {
+            metadata.is_some_and(|metadata| metadata.is_file() && metadata.snapshot() == opened)
+        })
+}
+
+struct AtomicWriteOutcome {
+    cleanup_residue: Option<PathBuf>,
+    rebound_parent: Option<PathBuf>,
+    commit_reported_error: Option<String>,
+    requested_path_changed_after_commit: bool,
+    target_changed_after_commit: bool,
+}
+
+impl AtomicWriteOutcome {
+    fn path_requires_inspection(&self) -> bool {
+        self.rebound_parent.is_some()
+            || self.commit_reported_error.is_some()
+            || self.requested_path_changed_after_commit
+            || self.target_changed_after_commit
+    }
+
+    // Cleanup residue does not invalidate the committed file change, but its warning still needs
+    // to survive transcript projection so the operator can inspect and remove it.
+    fn requires_inspection(&self) -> bool {
+        self.cleanup_residue.is_some() || self.path_requires_inspection()
+    }
+}
+
+fn atomic_staging_name() -> String {
+    format!(
         ".bettercodex-{}-{}.tmp",
         std::process::id(),
         uuid::Uuid::new_v4()
-    ));
-    let mut cleanup = TemporaryFile::new(temporary.clone());
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    if metadata.is_some() {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        // Do not expose replacement content through the temporary path using broader default
-        // permissions. The destination's ordinary mode is restored after writing so content is
-        // never exposed through the staging path under broader access than necessary.
-        options.mode(0o600);
+    )
+}
+
+fn hard_link_can_fallback_to_rename(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error.raw_os_error().is_some_and(|code| {
+            [
+                libc::EACCES,
+                libc::EMLINK,
+                libc::ENOSYS,
+                libc::EOPNOTSUPP,
+                libc::EPERM,
+                libc::EXDEV,
+            ]
+            .contains(&code)
+        })
+}
+
+fn write_file_atomically(
+    resolved: &ResolvedWritePath,
+    target: &AnchoredPath,
+    content: &[u8],
+    expectation: AtomicDestinationExpectation,
+    staging_name: &str,
+    mut record_staging: impl FnMut(ToolStagingEvidence) -> Result<()>,
+) -> Result<AtomicWriteOutcome> {
+    if let Err(error) = verify_resolved_write_path(resolved)
+        .and_then(|()| verify_atomic_parent(target))
+        .and_then(|()| verify_atomic_destination(target, expectation))
+    {
+        return Err(error.context(format!(
+            "atomic replacement of `{}` was not committed",
+            target.path().display()
+        )));
     }
-    let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("unable to create `{}`", temporary.display()))?;
-    file.write_all(content)?;
-    if let Some(metadata) = metadata {
+
+    let mut staging = PrivateStagingArea::new(target, staging_name);
+    let mut commit_outcome_unknown = false;
+    let mut commit_reported_error = None;
+    let mut committed_file = None;
+    let operation = (|| -> Result<()> {
+        target
+            .create_directory(&staging.basename, 0o700)
+            .with_context(|| format!("unable to create `{}`", staging.path().display()))?;
+        staging.directory_present = true;
+        let created_directory = target
+            .child_metadata(&staging.basename)
+            .with_context(|| format!("unable to inspect `{}`", staging.path().display()))?
+            .filter(|metadata| metadata.is_directory())
+            .ok_or_else(|| {
+                anyhow!(
+                    "private staging path `{}` is not a directory",
+                    staging.path().display()
+                )
+            })?;
+        staging.directory_identity = Some(created_directory.object_identity());
+        let directory = target
+            .open_child_directory(&staging.basename)
+            .with_context(|| format!("unable to open `{}`", staging.path().display()))?;
         use std::os::unix::fs::PermissionsExt as _;
-        // Preserve ordinary access and executable bits, but retain the kernel's safety behavior of
-        // clearing privilege bits when file contents are replaced.
-        let mode = metadata.permissions().mode() & 0o777;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    }
-    // Narrow the check-to-rename window so a special file created while the temporary file was
-    // being populated is not silently replaced.
-    let _ = inspect_atomic_write_destination(path, mode)?;
-    crate::private_fs::replace_file(&temporary, path).with_context(|| {
-        format!(
-            "unable to atomically replace `{}` with `{}`",
-            path.display(),
-            temporary.display()
-        )
-    })?;
-    cleanup.disarm();
-    Ok(())
-}
-
-struct TemporaryFile {
-    path: Option<PathBuf>,
-}
-
-impl TemporaryFile {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = std::fs::remove_file(path);
+        let directory_metadata = directory
+            .metadata()
+            .with_context(|| format!("unable to inspect `{}`", staging.path().display()))?;
+        let directory_mode = directory_metadata.permissions().mode() & 0o777;
+        if !directory_metadata.is_dir()
+            || directory_mode & 0o077 != 0
+            || directory_mode & 0o300 != 0o300
+            || crate::private_fs::file_object_identity(&directory_metadata)
+                != created_directory.object_identity()
+        {
+            // A process umask may only remove permissions from the requested 0700 mode. If it
+            // removes owner write/search access, fail safely rather than repairing the directory
+            // through a pathname that another actor could race with a symlink substitution.
+            return Err(anyhow!(
+                "private staging path `{}` is not an owner-writable private directory",
+                staging.path().display()
+            ));
         }
+        staging.directory = Some(directory);
+        record_staging(staging.evidence()?)?;
+
+        let requested_mode = match expectation {
+            AtomicDestinationExpectation::Absent => 0o666,
+            AtomicDestinationExpectation::Existing(_) => 0o600,
+        };
+        let mut file = staging
+            .directory()?
+            .create_file(OsStr::new("content"), requested_mode)
+            .with_context(|| format!("unable to create `{}/content`", staging.path().display()))?;
+        staging.content_present = true;
+        staging.content = Some(crate::private_fs::file_snapshot(
+            &file.metadata().with_context(|| {
+                format!("unable to inspect `{}/content`", staging.path().display())
+            })?,
+        ));
+        record_staging(staging.evidence()?)?;
+        file.write_all(content).with_context(|| {
+            format!("unable to populate `{}/content`", staging.path().display())
+        })?;
+        if let AtomicDestinationExpectation::Existing(expected) = expectation {
+            // Preserve ordinary access and executable bits while retaining the kernel's ordinary
+            // safety behavior of clearing set-user-ID and set-group-ID on replaced content.
+            file.set_permissions(std::fs::Permissions::from_mode(expected.ordinary_mode()))
+                .with_context(|| {
+                    format!(
+                        "unable to set mode on `{}/content`",
+                        staging.path().display()
+                    )
+                })?;
+        }
+        staging.content = Some(crate::private_fs::file_snapshot(
+            &file.metadata().with_context(|| {
+                format!("unable to inspect `{}/content`", staging.path().display())
+            })?,
+        ));
+        record_staging(staging.evidence()?)?;
+        #[cfg(test)]
+        crate::process_termination_test_support::stop_at("atomic_temporary_written");
+
+        // These checks detect ordinary concurrent replacement and parent rebinding, but are not a
+        // hardened security boundary: POSIX rename cannot condition replacement on an expected
+        // inode, so another actor can still race an existing target's final check-to-rename
+        // interval. New destinations use `linkat` first so a concurrently created entry is never
+        // overwritten on filesystems that support hard links.
+        verify_resolved_write_path(resolved)?;
+        verify_atomic_parent(target)?;
+        verify_atomic_destination(target, expectation)?;
+        staging.verify_content(&file)?;
+        let committed_snapshot = staging
+            .content
+            .ok_or_else(|| anyhow!("private staging content identity is unavailable"))?;
+        let mut source_was_moved = false;
+        let (commit_operation, commit_result) = match expectation {
+            AtomicDestinationExpectation::Absent => {
+                match target.link_from(staging.directory()?, OsStr::new("content")) {
+                    Ok(()) => ("link", Ok(())),
+                    Err(error) if target_matches_open_file(target, &file, committed_snapshot) => {
+                        ("link", Err(error))
+                    }
+                    Err(error) if hard_link_can_fallback_to_rename(&error) => {
+                        // Some writable filesystems do not support hard links. Preserve the
+                        // retained write behavior there, with the narrow race documented above.
+                        verify_resolved_write_path(resolved)?;
+                        verify_atomic_parent(target)?;
+                        verify_atomic_destination(target, expectation)?;
+                        staging.verify_content(&file)?;
+                        source_was_moved = true;
+                        (
+                            "rename fallback",
+                            target.rename_from(staging.directory()?, OsStr::new("content")),
+                        )
+                    }
+                    Err(error) => ("link", Err(error)),
+                }
+            }
+            AtomicDestinationExpectation::Existing(_) => {
+                source_was_moved = true;
+                (
+                    "rename",
+                    target.rename_from(staging.directory()?, OsStr::new("content")),
+                )
+            }
+        };
+        match commit_result {
+            Ok(()) if source_was_moved => {
+                staging.content_present = false;
+                staging.content = None;
+            }
+            Ok(()) => {}
+            Err(error) => {
+                let source_is_missing = staging
+                    .directory
+                    .as_ref()
+                    .and_then(|directory| directory.entry_metadata(OsStr::new("content")).ok())
+                    .is_some_and(|metadata| metadata.is_none());
+                if target_matches_open_file(target, &file, committed_snapshot) {
+                    commit_reported_error = Some(format!("{commit_operation}: {error}"));
+                    if source_is_missing {
+                        staging.content_present = false;
+                        staging.content = None;
+                    }
+                } else {
+                    // Network filesystems can report a failed namespace operation after the
+                    // server committed it. Source metadata can be stale as well, so only the
+                    // intended state observed at the destination proves success after an error.
+                    commit_outcome_unknown = true;
+                    return Err(anyhow::Error::new(MutationOutcomeUnknown(format!(
+                        "{commit_operation} for `{}` reported `{error}`, and the destination state does not prove whether atomic replacement committed; inspect the requested path before retrying",
+                        target.path().display()
+                    ))));
+                }
+            }
+        }
+        #[cfg(test)]
+        crate::process_termination_test_support::stop_at("atomic_replacement_committed");
+        committed_file = Some((file, committed_snapshot));
+        Ok(())
+    })();
+
+    if let Err(error) = operation {
+        let cleanup_error = staging.cleanup().err();
+        let mut error = if commit_outcome_unknown {
+            error.context(format!(
+                "atomic replacement of `{}` has an unknown outcome; inspect it before retrying",
+                target.path().display()
+            ))
+        } else {
+            error.context(format!(
+                "atomic replacement of `{}` was not committed",
+                target.path().display()
+            ))
+        };
+        if let Some(cleanup_error) = cleanup_error {
+            error = error.context(format!(
+                "private staging directory `{}` may remain after cleanup failed: {cleanup_error}",
+                staging.path().display()
+            ));
+        }
+        return Err(error);
+    }
+
+    let cleanup_residue = staging.cleanup().err().map(|_| staging.path());
+    drop(staging);
+    // Cleanup performs additional namespace I/O, and unlinking the staging hard link can update
+    // status-change time. Observe the live committed inode and all requested path routes only
+    // after that work, immediately before reporting the result.
+    let target_changed_after_commit = committed_file
+        .as_ref()
+        .is_none_or(|(file, expected)| !target_matches_open_file(target, file, *expected));
+    let requested_path_changed_after_commit = !resolved.is_current();
+    let rebound_parent = (!target.parent_path_is_current().unwrap_or(false))
+        .then(|| target.parent_path().to_path_buf());
+    Ok(AtomicWriteOutcome {
+        cleanup_residue,
+        rebound_parent,
+        commit_reported_error,
+        requested_path_changed_after_commit,
+        target_changed_after_commit,
+    })
+}
+
+struct PrivateStagingArea<'a> {
+    target: &'a AnchoredPath,
+    basename: OsString,
+    directory: Option<DirectoryHandle>,
+    directory_identity: Option<FileObjectIdentity>,
+    content: Option<FileSnapshot>,
+    directory_present: bool,
+    content_present: bool,
+}
+
+impl<'a> PrivateStagingArea<'a> {
+    fn new(target: &'a AnchoredPath, staging_name: &str) -> Self {
+        Self {
+            target,
+            basename: OsString::from(staging_name),
+            directory: None,
+            directory_identity: None,
+            content: None,
+            directory_present: false,
+            content_present: false,
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.target.parent_path().join(&self.basename)
+    }
+
+    fn directory(&self) -> Result<&DirectoryHandle> {
+        self.directory
+            .as_ref()
+            .ok_or_else(|| anyhow!("private staging directory is not open"))
+    }
+
+    fn evidence(&self) -> Result<ToolStagingEvidence> {
+        let name = self
+            .basename
+            .to_str()
+            .ok_or_else(|| anyhow!("private staging name is not UTF-8"))?
+            .to_string();
+        Ok(ToolStagingEvidence {
+            name,
+            directory: self.directory_identity,
+            content: self.content,
+        })
+    }
+
+    fn verify_content(&self, file: &File) -> Result<()> {
+        let expected = self
+            .content
+            .ok_or_else(|| anyhow!("private staging content identity is unavailable"))?;
+        let opened_is_current = file.metadata().is_ok_and(|metadata| {
+            metadata.is_file() && crate::private_fs::file_snapshot(&metadata) == expected
+        });
+        let path_is_current = self
+            .directory()?
+            .entry_metadata(OsStr::new("content"))
+            .is_ok_and(|metadata| {
+                metadata
+                    .is_some_and(|metadata| metadata.is_file() && metadata.snapshot() == expected)
+            });
+        if opened_is_current && path_is_current {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "private staging content changed before atomic replacement"
+            ))
+        }
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        let mut first_error = None;
+        if self.content_present {
+            let cleanup = (|| -> std::io::Result<()> {
+                let directory = self.directory.as_ref().ok_or_else(|| {
+                    std::io::Error::other("private staging directory is not open")
+                })?;
+                match (
+                    self.content,
+                    directory.entry_metadata(OsStr::new("content"))?,
+                ) {
+                    (Some(expected), Some(metadata))
+                        if metadata.is_file()
+                            && metadata.object_identity() == expected.object_identity() =>
+                    {
+                        // The open staging inode remains ours even if a partial write changed its
+                        // size or timestamps before returning an error. Only a directory-entry
+                        // substitution changes ownership enough to make unlinking unsafe.
+                        directory.remove_file(OsStr::new("content"))?;
+                    }
+                    (Some(_), None) | (None, None) => {}
+                    (Some(_), Some(_)) | (None, Some(_)) => {
+                        return Err(std::io::Error::other(
+                            "private staging content changed before cleanup",
+                        ));
+                    }
+                }
+                self.content_present = false;
+                self.content = None;
+                Ok(())
+            })();
+            if let Err(error) = cleanup {
+                first_error = Some(error);
+            }
+        }
+        if self.directory_present && !self.content_present {
+            let cleanup = (|| -> std::io::Result<()> {
+                let expected = self.directory_identity.ok_or_else(|| {
+                    std::io::Error::other("private staging directory identity is unavailable")
+                })?;
+                match self.target.child_metadata(&self.basename)? {
+                    Some(metadata)
+                        if metadata.is_directory() && metadata.object_identity() == expected =>
+                    {
+                        self.target.remove_directory(&self.basename)?;
+                    }
+                    None => {}
+                    Some(_) => {
+                        return Err(std::io::Error::other(
+                            "private staging directory changed before cleanup",
+                        ));
+                    }
+                }
+                self.directory_present = false;
+                self.directory = None;
+                self.directory_identity = None;
+                Ok(())
+            })();
+            if let Err(error) = cleanup
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for PrivateStagingArea<'_> {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
     }
 }
 
 fn open_for_read(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     // Opening a FIFO read-only can block before its metadata is available for the regular-file
     // check. O_NONBLOCK is ignored for ordinary local files.

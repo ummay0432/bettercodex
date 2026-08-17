@@ -30,6 +30,14 @@ release authorization.
   both current installers and immutable 0.1.2 clients.
 - GitHub's release API digest is the asset checksum. Do not add checksum,
   manifest, source, or installer assets.
+- After publication, the release API must report `draft: false`,
+  `prerelease: false`, `immutable: true`, and a `target_commitish` exactly equal
+  to the revision encoded in the tag. Current installers reject the release
+  until all four conditions hold.
+- Each native gzip asset must appear exactly once in API metadata with
+  `state: uploaded`, a nonzero size no greater than 128 MiB, and a lowercase
+  `sha256:` digest. The updater passes that API attestation to the pinned
+  installer, which verifies the downloaded bytes before execution.
 
 The manual [release workflow](../.github/workflows/release.yml) validates the
 revision and version, tests each native installer and binary, embeds the exact
@@ -38,8 +46,14 @@ on pushes, schedules, or version changes and never publishes the draft.
 
 ## Prepare a draft
 
-1. Confirm GitHub Actions are enabled for the public repository and the release
-   workflow is present on the default branch.
+1. Confirm GitHub Actions and immutable releases are enabled for the public
+   repository and the release workflow is present on the default branch. With
+   an admin-read credential, require this check to print `true` before creating
+   a draft:
+
+   ```sh
+   gh api repos/ummay0432/bettercodex/immutable-releases --jq .enabled
+   ```
 2. Select a full lowercase commit ID already on public `main`. Do not release
    working-tree content or silently follow `main` if it moves.
 3. Confirm the candidate has a plain `major.minor.patch` package version newer
@@ -58,7 +72,8 @@ on pushes, schedules, or version changes and never publishes the draft.
 
 ## Verify and publish
 
-Before publication, query the draft and verify:
+Before publication, recheck that immutable releases are enabled, then query the
+draft and verify:
 
 - its tag encodes the selected version and exact source revision;
 - it is a draft, not a prerelease;
@@ -74,8 +89,10 @@ and require a new release decision.
 
 If publication was explicitly authorized, publish the verified draft as the
 latest non-prerelease release. Then query the public release again and confirm
-its tag, target revision, four-asset set, digests, and latest status. Published
-releases must remain immutable.
+its tag, exact `target_commitish`, `draft: false`, `prerelease: false`,
+`immutable: true`, four-asset set, uploaded states, sizes, `sha256:` digests, and
+latest status. Published releases must remain immutable. Do not report the
+release as updater-ready while any of those API checks is missing.
 
 Report the release URL, version, full revision, workflow run URL, two targets,
 four assets, and final verification result. If any gate fails, leave the

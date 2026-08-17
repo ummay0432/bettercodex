@@ -1,5 +1,6 @@
 use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
 use super::bottom_pane::selection_popup_common::render_menu_surface;
+use super::palette;
 use crate::context::ContextKind;
 use crate::context::ContextSnapshot;
 use crossterm::event::KeyCode;
@@ -111,7 +112,7 @@ impl ContextWindowView {
         let lines = vec![
             Line::from("Context").bold(),
             Line::from(vec![
-                Span::from(self.model.clone()).cyan().bold(),
+                Span::styled(self.model.clone(), palette::accent_style()),
                 Span::from(format!(
                     "  ·  {} / {} tokens  ·  {used_percent} used",
                     format_tokens(self.snapshot.used_tokens),
@@ -220,7 +221,7 @@ impl ContextWindowView {
 }
 
 fn tool_summary_line() -> Line<'static> {
-    let mut spans = vec![Span::from("Tools  ").cyan().bold()];
+    let mut spans = vec![Span::styled("Tools  ", palette::accent_style())];
     for (index, specification) in crate::tools::responses_api_specifications()
         .iter()
         .enumerate()
@@ -239,7 +240,7 @@ fn tool_summary_line() -> Line<'static> {
                 .then_some("web_search")
             });
         if let Some(name) = name {
-            spans.push(Span::from(name).cyan());
+            spans.push(Span::styled(name, palette::accent_text_style()));
         }
     }
     spans.push(Span::from("  ·  t for details").dim());
@@ -324,7 +325,7 @@ fn context_label(kind: ContextKind) -> &'static str {
 fn context_color(kind: ContextKind) -> Color {
     match kind {
         ContextKind::SystemPrompt => Color::Magenta,
-        ContextKind::ToolCatalogue => Color::Cyan,
+        ContextKind::ToolCatalogue => palette::accent_color(),
         ContextKind::RepositoryInstructions => Color::Yellow,
         ContextKind::Skills => Color::LightCyan,
         ContextKind::Environment => Color::Blue,

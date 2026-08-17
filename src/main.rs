@@ -41,6 +41,33 @@ mod url_encoding;
 mod usage;
 mod web_search;
 
+#[cfg(test)]
+mod process_termination_test_support {
+    use std::path::Path;
+
+    pub(crate) const ARM_FILE_ENV: &str = "BCODEX_TEST_PROCESS_TERMINATION_ARM_FILE";
+    pub(crate) const MARKER_FILE_ENV: &str = "BCODEX_TEST_PROCESS_TERMINATION_MARKER_FILE";
+    pub(crate) const STOP_AT_ENV: &str = "BCODEX_TEST_PROCESS_TERMINATION_STOP_AT";
+
+    pub(crate) fn stop_at(boundary: &str) {
+        if std::env::var(STOP_AT_ENV).as_deref() != Ok(boundary) {
+            return;
+        }
+        if let Some(arm_file) = std::env::var_os(ARM_FILE_ENV)
+            && !Path::new(&arm_file).exists()
+        {
+            return;
+        }
+        let marker = std::env::var_os(MARKER_FILE_ENV)
+            .expect("process-termination test stop point requires a marker file");
+        std::fs::write(marker, boundary).expect("write process-termination test marker");
+        // SIGSTOP and SIGKILL cannot be caught or ignored. The parent test observes the marker,
+        // kills this process, and then verifies recovery from the exact stopped boundary.
+        assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
+        std::process::abort();
+    }
+}
+
 use agent::Agent;
 use anyhow::Context;
 use anyhow::Result;
@@ -516,8 +543,9 @@ fn write_help() -> io::Result<()> {
         ""
     };
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     Install the latest published release\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  high or original [default: high]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the readable tool catalogue and documented function outputs\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     {update_summary}\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  high or original [default: high]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the readable tool catalogue and documented function outputs\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION"),
+        update_summary = update::update_command_summary(),
     ))
 }
 
@@ -535,7 +563,9 @@ fn write_logout_help() -> io::Result<()> {
 
 fn write_update_help() -> io::Result<()> {
     write_stdout_line(format_args!(
-        "Install the latest published bettercodex release\n\nUsage:\n  bcodex update\n\nThe updater compares this binary's package version with GitHub's latest published full release. If already current, it exits immediately. Otherwise it downloads, verifies, and atomically installs the matching prebuilt binary without compiling. Optimized source builds can use this command; debug builds cannot."
+        "{}\n\nUsage:\n  bcodex update\n\n{}",
+        update::update_help_heading(),
+        update::update_help_text()
     ))
 }
 

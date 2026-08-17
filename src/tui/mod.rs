@@ -77,7 +77,6 @@ use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures_util::StreamExt;
 use notifications::Notifier;
-use pending_input::QueuedFollowUp;
 use presentation::MIN_FRAME_INTERVAL;
 use serde_json::Value;
 use status::StatusSnapshot;
@@ -263,6 +262,7 @@ struct Runtime {
     service_tier: ServiceTier,
     session_scan: Option<SessionScanTask>,
     resume_task: Option<ResumeTask>,
+    resume_submission: Option<ComposerSubmission>,
     notifier: Option<Notifier>,
     operator_command_tasks: HashMap<String, JoinHandle<()>>,
     operator_command_cancellations: HashMap<String, CancellationToken>,
@@ -305,6 +305,91 @@ enum OperatorCommandUpdate {
         output: std::result::Result<Value, String>,
         context: String,
     },
+}
+
+#[derive(Debug)]
+enum InterruptedSteering {
+    Operator(UserPrompt),
+    Context(String),
+}
+
+#[derive(Debug)]
+struct InterruptedSteeringReplay {
+    leading_contexts: Vec<String>,
+    first_prompt: UserPrompt,
+    trailing: Vec<InterruptedSteering>,
+}
+
+fn interrupted_steering_replay(
+    mut first_user_steer: (SteerId, UserPrompt),
+    user_steers: Vec<(SteerId, UserPrompt)>,
+    context_steers: Vec<(SteerId, String)>,
+) -> InterruptedSteeringReplay {
+    let mut trailing = Vec::with_capacity(user_steers.len().saturating_add(context_steers.len()));
+    for user_steer in user_steers {
+        if user_steer.0.0 < first_user_steer.0.0 {
+            trailing.push((
+                first_user_steer.0,
+                InterruptedSteering::Operator(first_user_steer.1),
+            ));
+            first_user_steer = user_steer;
+        } else {
+            trailing.push((user_steer.0, InterruptedSteering::Operator(user_steer.1)));
+        }
+    }
+
+    let mut leading_contexts = Vec::new();
+    for (id, context) in context_steers {
+        if id.0 < first_user_steer.0.0 {
+            leading_contexts.push((id, context));
+        } else {
+            trailing.push((id, InterruptedSteering::Context(context)));
+        }
+    }
+    leading_contexts.sort_by_key(|(id, _)| id.0);
+    trailing.sort_by_key(|(id, _)| id.0);
+    InterruptedSteeringReplay {
+        leading_contexts: leading_contexts
+            .into_iter()
+            .map(|(_, context)| context)
+            .collect(),
+        first_prompt: first_user_steer.1,
+        trailing: trailing.into_iter().map(|(_, input)| input).collect(),
+    }
+}
+
+fn enqueue_initial_steering(
+    turn: &TurnHandle,
+    view: &mut View,
+    context_steers: &mut Vec<(SteerId, String)>,
+    steering: Vec<InterruptedSteering>,
+) -> Vec<InterruptedSteering> {
+    // Queue replay before the task is spawned, so a fast model response cannot close the new turn
+    // between adjacent operator and generated-context inputs.
+    let mut steering = steering.into_iter();
+    while let Some(input) = steering.next() {
+        match input {
+            InterruptedSteering::Operator(prompt) => {
+                let Ok(id) = turn.steer(UserInput::prompt_ref(&prompt)) else {
+                    let mut unqueued = Vec::with_capacity(steering.len().saturating_add(1));
+                    unqueued.push(InterruptedSteering::Operator(prompt));
+                    unqueued.extend(steering);
+                    return unqueued;
+                };
+                view.add_pending_steer(id, prompt);
+            }
+            InterruptedSteering::Context(context) => {
+                let Ok(id) = turn.inject_context(context.clone()) else {
+                    let mut unqueued = Vec::with_capacity(steering.len().saturating_add(1));
+                    unqueued.push(InterruptedSteering::Context(context));
+                    unqueued.extend(steering);
+                    return unqueued;
+                };
+                context_steers.push((id, context));
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,6 +494,7 @@ impl Runtime {
             service_tier,
             session_scan: None,
             resume_task: None,
+            resume_submission: None,
             notifier: Some(Notifier::detect()),
             operator_command_tasks: HashMap::new(),
             operator_command_cancellations: HashMap::new(),
@@ -484,6 +570,11 @@ impl Runtime {
                     // minimum frame interval, precisely when the UI is under the most pressure.
                     stream_frames.schedule_frame();
                 }
+            }
+            // Completion handlers finalize transcript entries and request a redraw. Let that frame
+            // move the final rows into terminal history before teardown clears the mutable viewport.
+            if self.exit_ready() {
+                break;
             }
             let animate = self.has_foreground_activity();
 
@@ -630,13 +721,22 @@ impl Runtime {
                 completion = receive_resume_completion(&mut self.resume_task) => {
                     self.resume_task = None;
                     match completion {
-                        Ok(Ok(session)) => self.activate_resumed_session(session),
-                        Ok(Err(error)) => self.view.resume_failed(format!(
-                            "Could not resume the selected bettercodex session: {error:#}"
-                        )),
-                        Err(error) => self.view.resume_failed(format!(
-                            "Could not resume the selected bettercodex session: resume task stopped unexpectedly: {error}"
-                        )),
+                        Ok(Ok(session)) => {
+                            self.resume_submission = None;
+                            self.activate_resumed_session(session);
+                        }
+                        Ok(Err(error)) => {
+                            self.restore_resume_submission();
+                            self.view.resume_failed(format!(
+                                "Could not resume the selected bettercodex session: {error:#}"
+                            ));
+                        }
+                        Err(error) => {
+                            self.restore_resume_submission();
+                            self.view.resume_failed(format!(
+                                "Could not resume the selected bettercodex session: resume task stopped unexpectedly: {error}"
+                            ));
+                        }
                     }
                     redraw = true;
                 }
@@ -653,20 +753,7 @@ impl Runtime {
                     let (mut agent, completion) = self.turn.take_presenting();
                     self.sync_model_selection_to_agent(&mut agent);
                     self.sync_service_tier_to_agent(&mut agent);
-                    self.pending_operator_contexts.extend(
-                        self.operator_context_steers
-                            .drain(..)
-                            .map(|(_, context)| context),
-                    );
-                    if let Err(error) =
-                        flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
-                    {
-                        self.view.add_notice(format!(
-                            "Operator shell output could not be added to model context: {error:#}"
-                        ));
-                    }
-                    self.context_snapshot = agent.context_snapshot();
-                    self.cache_status_rate_limits(self.context_snapshot.rate_limits.clone());
+                    let pending_context_steers = std::mem::take(&mut self.operator_context_steers);
                     self.turn_handle = None;
                     let elapsed = self.turn_started_at.take().map(|started| started.elapsed());
                     let notification = match &completion {
@@ -679,13 +766,53 @@ impl Runtime {
                         _ => None,
                     };
                     let completed = completion.completed();
-                    let steering_after_interrupt = match completion {
+                    let interrupted_user_steers = match completion {
                         TurnCompletion::Submission(result) => self.view.finish_turn(result),
                         TurnCompletion::Compaction(result) => {
                             self.view.finish_compaction(result);
                             None
                         }
                     };
+                    let mut interrupted_steering = match interrupted_user_steers {
+                        Some(mut user_steers) => match user_steers.pop() {
+                            Some(first_user_steer) => Some(interrupted_steering_replay(
+                                first_user_steer,
+                                user_steers,
+                                pending_context_steers,
+                            )),
+                            None => {
+                                self.pending_operator_contexts.extend(
+                                    pending_context_steers
+                                        .into_iter()
+                                        .map(|(_, context)| context),
+                                );
+                                None
+                            }
+                        },
+                        None => {
+                            self.pending_operator_contexts.extend(
+                                pending_context_steers
+                                    .into_iter()
+                                    .map(|(_, context)| context),
+                            );
+                            None
+                        }
+                    };
+                    if let Some(replay) = interrupted_steering.as_mut() {
+                        self.pending_operator_contexts
+                            .extend(replay.leading_contexts.drain(..));
+                    }
+                    if let Err(error) =
+                        flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
+                    {
+                        self.view.add_notice(format!(
+                            "Operator shell output could not be added to model context: {error:#}"
+                        ));
+                    }
+                    self.context_snapshot = agent.context_snapshot();
+                    self.cache_status_rate_limits(self.context_snapshot.rate_limits.clone());
+                    self.instruction_source_paths = agent.instruction_source_paths().to_vec();
+                    self.view.refresh_skills(agent.skills());
                     if let Err(error) = persist_session_transcript(&self.view, &mut agent) {
                         self.view.add_notice(format!(
                             "Session transcript could not be saved: {error:#}"
@@ -694,9 +821,6 @@ impl Runtime {
                     self.agent = Some(agent);
                     redraw = true;
 
-                    if self.exit_ready() {
-                        break;
-                    }
                     if self.exit_after_work {
                         continue;
                     }
@@ -709,8 +833,8 @@ impl Runtime {
                         {
                             self.post_notification(&message);
                         }
-                    } else if let Some(prompt) = steering_after_interrupt {
-                        self.start_turn(prompt);
+                    } else if let Some(replay) = interrupted_steering {
+                        self.start_interrupted_turn(replay);
                     } else {
                         self.view.restore_pending_input_to_composer();
                     }
@@ -719,9 +843,6 @@ impl Runtime {
                     if let Some(update) = update {
                         self.apply_operator_command_update(update);
                         redraw = true;
-                        if self.exit_ready() {
-                            break;
-                        }
                     }
                 }
                 result = self.diff_updates.recv() => {
@@ -874,12 +995,6 @@ impl Runtime {
                     self.queue_composer_follow_up(submission);
                 }
             }
-            Action::Queue(submission) => {
-                self.queue_composer_follow_up(submission);
-                if !self.turn.is_active() && self.operator_command_tasks.is_empty() {
-                    self.start_next_queued_follow_up();
-                }
-            }
             Action::Cancel => self.cancel_active_work(),
             Action::Copy(text) => match clipboard::copy_to_clipboard(&text) {
                 Ok(lease) => {
@@ -900,12 +1015,11 @@ impl Runtime {
                         submission,
                         "Wait for the local command or Git diff before forking".to_string(),
                     );
-                } else {
-                    drop(submission);
-                    if let Err(error) = self.fork_session() {
-                        self.view
-                            .add_error(format!("Could not fork this session: {error:#}"));
-                    }
+                } else if let Err(error) = self.fork_session() {
+                    self.view.reject_composer_submission(
+                        submission,
+                        format!("Could not fork this session: {error:#}"),
+                    );
                 }
             }
             Action::Clear(submission) => {
@@ -919,12 +1033,11 @@ impl Runtime {
                         submission,
                         "Interrupt the active turn before starting a fresh session".to_string(),
                     );
-                } else {
-                    drop(submission);
-                    if let Err(error) = self.clear_session() {
-                        self.view
-                            .add_error(format!("Could not start a fresh session: {error:#}"));
-                    }
+                } else if let Err(error) = self.clear_session() {
+                    self.view.reject_composer_submission(
+                        submission,
+                        format!("Could not start a fresh session: {error:#}"),
+                    );
                 }
             }
             Action::OpenResumePicker(submission) => {
@@ -934,21 +1047,34 @@ impl Runtime {
                         "Wait for the local command or Git diff before resuming".to_string(),
                     );
                 } else {
-                    drop(submission);
+                    self.resume_submission = Some(submission);
                     self.open_resume_picker();
                 }
             }
-            Action::ResumeSession { id, submission } => {
+            Action::CloseResumePicker => self.close_resume_picker(),
+            Action::CancelResumeLoad => self.cancel_resume_load(),
+            Action::ResumeSessionFromPicker(id) => {
                 if self.has_local_session_activity() {
-                    let notice = "Wait for the local command or Git diff before resuming";
-                    if let Some(submission) = submission {
-                        self.view.defer_composer_action(submission, notice);
-                    } else {
-                        self.view.add_notice(notice.to_string());
-                    }
+                    self.view.add_notice(
+                        "Wait for the local command or Git diff before resuming".to_string(),
+                    );
+                    self.close_resume_picker();
+                } else if let Err(error) = self.start_resume(id) {
+                    self.restore_resume_submission();
+                    self.view
+                        .resume_failed(format!("Could not resume this session: {error:#}"));
+                }
+            }
+            Action::ResumeSessionFromComposer { id, submission } => {
+                if self.has_local_session_activity() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Wait for the local command or Git diff before resuming",
+                    );
                 } else {
-                    drop(submission);
+                    self.resume_submission = Some(submission);
                     if let Err(error) = self.start_resume(id) {
+                        self.restore_resume_submission();
                         self.view
                             .resume_failed(format!("Could not resume this session: {error:#}"));
                     }
@@ -1143,6 +1269,8 @@ impl Runtime {
         let skills = agent.skills().to_vec();
         let skill_warnings = agent.skill_warnings().to_vec();
 
+        self.pending_operator_contexts.clear();
+        self.operator_context_steers.clear();
         self.context_snapshot = context_snapshot;
         self.session_id = session_id;
         self.forked_from = forked_from;
@@ -1187,10 +1315,40 @@ impl Runtime {
         }
     }
 
+    fn dismiss_resume_picker(&mut self) {
+        abort_join_task(&mut self.session_scan);
+        self.view.close_resume_picker();
+    }
+
+    fn close_resume_picker(&mut self) {
+        self.dismiss_resume_picker();
+        self.restore_resume_submission();
+    }
+
+    fn cancel_resume_load(&mut self) {
+        // `spawn_blocking` work that has started cannot be preempted, but dropping its result
+        // guarantees that a cancelled resume can never replace the current session.
+        abort_join_task(&mut self.resume_task);
+        self.close_resume_picker();
+    }
+
+    fn restore_resume_submission(&mut self) {
+        if let Some(submission) = self.resume_submission.take() {
+            self.view.restore_composer_submission(submission);
+        }
+    }
+
+    fn complete_same_session_resume(&mut self, target: Uuid) {
+        self.resume_submission = None;
+        self.dismiss_resume_picker();
+        self.view
+            .add_notice(format!("Already viewing bettercodex session {target}"));
+    }
+
     fn start_resume(&mut self, target: Uuid) -> Result<()> {
         let current_session = self.current_session_id()?;
         if target == current_session {
-            self.view.close_resume_picker();
+            self.complete_same_session_resume(target);
             return Ok(());
         }
         if self.resume_task.is_some() {
@@ -1410,6 +1568,8 @@ impl Runtime {
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
 
+        self.pending_operator_contexts.clear();
+        self.operator_context_steers.clear();
         self.cwd = cwd.clone();
         self.context_snapshot = context_snapshot;
         self.session_id = session_id;
@@ -1445,46 +1605,16 @@ impl Runtime {
     }
 
     fn queue_composer_follow_up(&mut self, submission: ComposerSubmission) {
-        let history_text = submission
-            .prompt()
-            .text_without_image_placeholders()
-            .into_owned();
-        let shell_command = (submission.prompt().image_count() == 0)
-            .then(|| history_text.trim().strip_prefix('!'))
-            .flatten()
-            .map(str::trim)
-            .map(str::to_string);
-        if shell_command.as_deref() != Some("") {
-            self.persist_prompt(&history_text);
-        }
-        let prompt = submission.into_prompt();
-        if let Some(command) = shell_command {
-            self.view.queue_shell_follow_up(prompt, command);
-        } else {
-            self.view.queue_follow_up(prompt);
-        }
+        let history_text = submission.prompt().text_without_image_placeholders();
+        self.persist_prompt(&history_text);
+        self.view.queue_follow_up(submission.into_prompt());
     }
 
     fn start_next_queued_follow_up(&mut self) -> bool {
-        loop {
-            let Some(follow_up) = self.view.pop_next_queued_follow_up() else {
-                return false;
-            };
-            match follow_up {
-                QueuedFollowUp::Prompt(prompt) => {
-                    self.start_turn(prompt);
-                    return true;
-                }
-                QueuedFollowUp::Shell { command, .. } if command.is_empty() => {
-                    self.view
-                        .add_notice("Run an operator shell command with !command".to_string());
-                }
-                QueuedFollowUp::Shell { command, .. } => {
-                    self.start_operator_command(command);
-                    return true;
-                }
-            }
-        }
+        let Some(prompt) = self.view.pop_next_queued_follow_up() else {
+            return false;
+        };
+        self.start_turn(prompt)
     }
 
     fn start_composer_turn(&mut self, submission: ComposerSubmission) {
@@ -1492,7 +1622,7 @@ impl Runtime {
             Ok(agent) => {
                 let history_text = submission.prompt().text_without_image_placeholders();
                 self.persist_prompt(&history_text);
-                self.spawn_turn(agent, submission.into_prompt());
+                self.spawn_turn(agent, submission.into_prompt(), Vec::new());
             }
             Err(error) => {
                 self.view.reject_composer_submission(submission, error);
@@ -1500,10 +1630,37 @@ impl Runtime {
         }
     }
 
-    fn start_turn(&mut self, prompt: UserPrompt) {
+    fn start_turn(&mut self, prompt: UserPrompt) -> bool {
         match self.prepare_turn_start() {
-            Ok(agent) => self.spawn_turn(agent, prompt),
-            Err(error) => self.view.reject_prompt(prompt, error),
+            Ok(agent) => {
+                self.spawn_turn(agent, prompt, Vec::new());
+                true
+            }
+            Err(error) => {
+                self.view.reject_prompt(prompt, error);
+                false
+            }
+        }
+    }
+
+    fn start_interrupted_turn(&mut self, replay: InterruptedSteeringReplay) {
+        match self.prepare_turn_start() {
+            Ok(agent) => self.spawn_turn(agent, replay.first_prompt, replay.trailing),
+            Err(error) => {
+                self.view.reject_prompt(replay.first_prompt, error);
+                self.restore_interrupted_steering(replay.trailing);
+            }
+        }
+    }
+
+    fn restore_interrupted_steering(&mut self, steering: Vec<InterruptedSteering>) {
+        for input in steering {
+            match input {
+                InterruptedSteering::Operator(prompt) => self.view.queue_follow_up(prompt),
+                InterruptedSteering::Context(context) => {
+                    self.pending_operator_contexts.push_back(context);
+                }
+            }
         }
     }
 
@@ -1522,10 +1679,22 @@ impl Runtime {
         Ok(agent)
     }
 
-    fn spawn_turn(&mut self, mut agent: Agent, prompt: UserPrompt) {
+    fn spawn_turn(
+        &mut self,
+        mut agent: Agent,
+        prompt: UserPrompt,
+        initial_steering: Vec<InterruptedSteering>,
+    ) {
         let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::channel();
         self.view.start_turn(&prompt);
+        let unqueued = enqueue_initial_steering(
+            &turn_handle,
+            &mut self.view,
+            &mut self.operator_context_steers,
+            initial_steering,
+        );
+        self.restore_interrupted_steering(unqueued);
         self.turn_started_at = Some(Instant::now());
         self.turn_events = Some(events_rx);
         self.turn_handle = Some(turn_handle);
@@ -1585,7 +1754,10 @@ impl Runtime {
 
     fn cancel_turn(&mut self, intent: InterruptIntent) {
         if let Some(turn) = &self.turn_handle {
-            turn.cancel();
+            match intent {
+                InterruptIntent::StopTurn => turn.cancel(),
+                InterruptIntent::SubmitSteering => turn.interrupt_for_steering(),
+            }
             self.view.set_interrupting(intent);
         }
     }
@@ -1673,7 +1845,9 @@ impl Runtime {
             return;
         }
         self.update_check_started = true;
-        self.update_check = Some(tokio::spawn(crate::update::check_for_update()));
+        if let Some(check) = crate::update::background_update_check() {
+            self.update_check = Some(tokio::spawn(check));
+        }
     }
 
     fn start_rate_limit_prefetch_after_startup(&mut self) {

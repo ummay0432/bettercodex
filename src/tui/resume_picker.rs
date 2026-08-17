@@ -4,6 +4,9 @@
 
 use super::markdown;
 use super::palette;
+use super::width::display_width;
+use super::width::line_width;
+use super::width::prefix_fitting_width;
 use crate::rollout::SessionSummary;
 use crate::time::unix_timestamp_millis;
 use crossterm::event::KeyCode;
@@ -21,8 +24,6 @@ use ratatui::widgets::Paragraph;
 use std::cmp::Ordering;
 use std::path::Path;
 use std::path::PathBuf;
-use unicode_width::UnicodeWidthChar;
-use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 const RULE: Color = Color::Indexed(8);
@@ -122,7 +123,13 @@ impl ToolbarControl {
 pub(super) enum ResumePickerAction {
     None,
     Close,
+    CancelResume,
     Resume(Uuid),
+}
+
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
+        || key.modifiers.is_empty() && key.code == KeyCode::Char('\u{3}')
 }
 
 impl ResumePicker {
@@ -174,9 +181,13 @@ impl ResumePicker {
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> ResumePickerAction {
         if matches!(self.status, Some(PickerStatus::Resuming(_))) {
-            return ResumePickerAction::None;
+            return if key.code == KeyCode::Esc || is_ctrl_c(&key) {
+                ResumePickerAction::CancelResume
+            } else {
+                ResumePickerAction::None
+            };
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if is_ctrl_c(&key) {
             return ResumePickerAction::Close;
         }
         match key.code {
@@ -247,9 +258,10 @@ impl ResumePicker {
                 self.rebuild_filter();
             }
             KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !character.is_control()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 if self.query.chars().count() < MAX_QUERY_CHARS {
                     self.query.push(character);
@@ -291,13 +303,7 @@ impl ResumePicker {
         frame.render_widget(Clear, area);
 
         let header = inset_row(area, area.y, HORIZONTAL_CHROME_INSET);
-        let title = if palette::default_background().is_some_and(palette::is_light) {
-            Span::from("Resume a previous session")
-                .fg(Color::Rgb(0, 100, 0))
-                .bold()
-        } else {
-            Span::from("Resume a previous session").cyan().bold()
-        };
+        let title = Span::styled("Resume a previous session", palette::accent_style());
         frame.render_widget(Paragraph::new(Line::from(title)), header);
 
         let search_y = area.y.saturating_add(2);
@@ -346,15 +352,15 @@ impl ResumePicker {
             Span::from(format!("Search: {}", markdown::sanitize(&self.query)))
         };
         let mut toolbar = self.toolbar_line(false);
-        let search_width = search.width();
+        let search_width = display_width(search.content.as_ref());
         if search_width
-            .saturating_add(toolbar.width())
+            .saturating_add(line_width(&toolbar))
             .saturating_add(2)
             > usize::from(width)
         {
             toolbar = self.toolbar_line(true);
         }
-        let toolbar_width = toolbar.width();
+        let toolbar_width = line_width(&toolbar);
         if toolbar_width.saturating_add(2) >= usize::from(width) {
             return Line::from(truncate_text(search.content.as_ref(), usize::from(width)));
         }
@@ -369,7 +375,8 @@ impl ResumePicker {
         } else {
             search
         };
-        let gap = usize::from(width).saturating_sub(search.width() + toolbar_width);
+        let gap = usize::from(width)
+            .saturating_sub(display_width(search.content.as_ref()) + toolbar_width);
         let mut spans = vec![search, Span::from(" ".repeat(gap))];
         spans.extend(toolbar.spans);
         Line::from(spans)
@@ -515,6 +522,15 @@ impl ResumePicker {
                 ])),
                 Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
             );
+            if area.height > 2 {
+                frame.render_widget(
+                    Paragraph::new(footer_hints(
+                        &[("esc", "cancel"), ("ctrl+c", "cancel")],
+                        area.width,
+                    )),
+                    Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+                );
+            }
             return;
         }
 
@@ -567,7 +583,7 @@ impl ResumePicker {
             start.saturating_mul(100) / maximum.max(1)
         };
         let label = format!(" {position} / {total} · {percent}% ");
-        let label_width = UnicodeWidthStr::width(label.as_str());
+        let label_width = display_width(&label);
         if label_width.saturating_add(1) >= usize::from(width) {
             return Line::from(truncate_text(&label, usize::from(width))).dim();
         }
@@ -673,7 +689,7 @@ struct DenseSummaryInput<'a> {
 }
 
 fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
-    let marker_width = input.marker.width();
+    let marker_width = display_width(input.marker.content.as_ref());
     let available = usize::from(input.width).saturating_sub(marker_width);
     let title_width = available.saturating_sub(METADATA_DATE_WIDTH);
     let title = dense_column_text(input.title, title_width);
@@ -702,7 +718,7 @@ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
 
 fn dense_column_text(text: &str, width: usize) -> String {
     let text = truncate_text(text, width.saturating_sub(1));
-    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    let padding = width.saturating_sub(display_width(&text));
     format!("{text}{}", " ".repeat(padding))
 }
 
@@ -738,7 +754,7 @@ fn comfortable_session_lines(
 fn session_title_line(session: &SessionSummary, selected: bool, width: u16) -> Line<'static> {
     let marker = selection_marker(selected);
     let title = session_title(session);
-    let title_width = usize::from(width).saturating_sub(marker.width());
+    let title_width = usize::from(width).saturating_sub(display_width(marker.content.as_ref()));
     let title = truncate_text(&title, title_width);
     let title = if selected {
         Span::styled(title, selected_session_style())
@@ -760,8 +776,8 @@ fn session_metadata_line(
     let metadata = if show_cwd {
         let cwd_prefix = "  ⌁ ";
         let cwd_width = usize::from(width)
-            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
-            .saturating_sub(UnicodeWidthStr::width(cwd_prefix));
+            .saturating_sub(display_width(&prefix))
+            .saturating_sub(display_width(cwd_prefix));
         format!(
             "{prefix}{cwd_prefix}{}",
             truncate_text(&display_cwd(&session.cwd), cwd_width)
@@ -824,7 +840,7 @@ fn row_background_color(background: (u8, u8, u8), selected: bool) -> Color {
 }
 
 fn apply_line_background(mut line: Line<'static>, style: Style, width: u16) -> Line<'static> {
-    let padding = usize::from(width).saturating_sub(line.width());
+    let padding = usize::from(width).saturating_sub(line_width(&line));
     if padding > 0 {
         line.spans.push(Span::styled(" ".repeat(padding), style));
     }
@@ -840,7 +856,7 @@ fn footer_hints(hints: &[(&str, &str)], width: u16) -> Line<'static> {
     let mut used = 1_usize;
     for (key, label) in hints {
         let gap = if used == 1 { 0 } else { 3 };
-        let hint_width = UnicodeWidthStr::width(*key) + 1 + UnicodeWidthStr::width(*label);
+        let hint_width = display_width(key) + 1 + display_width(label);
         if used.saturating_add(gap).saturating_add(hint_width) > usize::from(width) {
             break;
         }
@@ -899,23 +915,14 @@ fn display_cwd(path: &Path) -> String {
 }
 
 fn truncate_text(text: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= max_width {
+    if display_width(text) <= max_width {
         return text.to_string();
     }
     if max_width == 0 {
         return String::new();
     }
-    let content_width = max_width.saturating_sub(1);
-    let mut truncated = String::new();
-    let mut width = 0_usize;
-    for character in text.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width.saturating_add(character_width) > content_width {
-            break;
-        }
-        truncated.push(character);
-        width += character_width;
-    }
-    truncated.push('…');
-    truncated
+    format!(
+        "{}…",
+        prefix_fitting_width(text, max_width.saturating_sub(1))
+    )
 }

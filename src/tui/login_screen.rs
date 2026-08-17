@@ -4,6 +4,7 @@
 // runtime.
 
 use super::markdown;
+use super::palette;
 use super::startup_art;
 use super::terminal;
 use super::terminal::TerminalSession;
@@ -195,9 +196,9 @@ impl LoginScreen {
                 lines.push(
                     Line::from(vec![
                         "  On a remote or headless machine? Press ".into(),
-                        "Esc".cyan(),
+                        Span::styled("Esc", palette::accent_text_style()),
                         " and choose ".into(),
-                        "Sign in with Device Code".cyan(),
+                        Span::styled("Sign in with Device Code", palette::accent_text_style()),
                         ".".into(),
                     ])
                     .into(),
@@ -221,7 +222,11 @@ impl LoginScreen {
                 );
                 lines.push("".into());
                 lines.push(
-                    Line::from(vec!["  ".into(), user_code.to_string().cyan().bold()]).into(),
+                    Line::from(vec![
+                        "  ".into(),
+                        Span::styled(user_code.to_string(), palette::accent_style()),
+                    ])
+                    .into(),
                 );
                 lines.push("".into());
                 lines.push(
@@ -286,9 +291,11 @@ impl LoginScreen {
         lines.push("  Powered by your ChatGPT account".into());
         lines.push("".into());
         lines.push(
-            Line::from("  Press Enter to continue")
-                .fg(Color::Cyan)
-                .into(),
+            Line::from(Span::styled(
+                "  Press Enter to continue",
+                palette::accent_text_style(),
+            ))
+            .into(),
         );
     }
 }
@@ -311,14 +318,18 @@ fn option_lines(
     if selected {
         [
             Line::from(vec![
-                format!("> {index}. ").cyan().dim(),
-                label.to_string().cyan(),
+                Span::styled(
+                    format!("> {index}. "),
+                    palette::accent_text_style().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(label.to_string(), palette::accent_text_style()),
             ])
             .into(),
-            Line::from(format!("     {description}"))
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::DIM)
-                .into(),
+            Line::from(Span::styled(
+                format!("     {description}"),
+                palette::soft_accent_style(),
+            ))
+            .into(),
         ]
     } else {
         [
@@ -332,7 +343,10 @@ fn option_lines(
 
 fn url_line(url: &str) -> HyperlinkLine {
     let mut line = HyperlinkLine::new(Line::from("  "));
-    line.push_span(Span::from(url.to_string()).cyan().underlined(), Some(url));
+    line.push_span(
+        Span::styled(url.to_string(), palette::accent_link_style()),
+        Some(url),
+    );
     line
 }
 

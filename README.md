@@ -33,8 +33,9 @@ bcodex
 On the first interactive launch, bettercodex asks you to sign in only when no
 valid Codex credentials are available.
 
-The installer downloads the matching binary from the latest published full
-release, verifies its embedded version and exact source revision, and replaces
-the command only after validation succeeds. Neither installs nor `bcodex update`
-require Rust, Cargo, or native build tools. See the complete [installation
-guide](docs/install.md).
+The installer accepts only an immutable full release whose target matches its
+encoded source revision, verifies the native archive's GitHub SHA-256 before any
+binary execution, and atomically replaces the command only after the macOS
+signature (when applicable) and embedded-identity checks succeed. Installs and
+`bcodex update` require neither Rust, Cargo, nor native build tools. See the
+complete [installation guide](docs/install.md).

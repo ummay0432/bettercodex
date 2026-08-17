@@ -64,6 +64,7 @@ fn runtime_without_agent() -> Runtime {
         service_tier: ServiceTier::default(),
         session_scan: None,
         resume_task: None,
+        resume_submission: None,
         notifier: None,
         operator_command_tasks: HashMap::new(),
         operator_command_cancellations: HashMap::new(),
@@ -118,6 +119,73 @@ fn rendered_view(view: &mut View) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn interrupted_steering_replay_preserves_operator_and_context_order() {
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn(&UserPrompt::text("active turn"));
+    view.add_pending_steer(SteerId(1), UserPrompt::text("first operator steer"));
+    view.add_pending_steer(SteerId(3), UserPrompt::text("second operator steer"));
+    view.set_interrupting(InterruptIntent::SubmitSteering);
+
+    let mut user_steers = view
+        .finish_turn(Ok(SubmitOutcome::Cancelled))
+        .expect("interrupt should retain submitted steering");
+    let first_user_steer = user_steers.pop().expect("at least one steering input");
+    let replay = interrupted_steering_replay(
+        first_user_steer,
+        user_steers,
+        vec![
+            (SteerId(0), "context before first".to_string()),
+            (SteerId(2), "context between operators".to_string()),
+            (SteerId(4), "context after second".to_string()),
+        ],
+    );
+
+    assert_eq!(replay.leading_contexts, ["context before first"]);
+    assert_eq!(replay.first_prompt.as_str(), "first operator steer");
+    assert!(matches!(
+        replay.trailing.as_slice(),
+        [
+            InterruptedSteering::Context(first),
+            InterruptedSteering::Operator(second),
+            InterruptedSteering::Context(third),
+        ] if first == "context between operators"
+            && second.as_str() == "second operator steer"
+            && third == "context after second"
+    ));
+
+    let mut replay_view = View::new(Path::new("/tmp/bettercodex"));
+    replay_view.start_turn(&replay.first_prompt);
+    let (turn_handle, _turn_control) = crate::agent::TurnControl::channel();
+    let mut context_steers = Vec::new();
+    let unqueued = enqueue_initial_steering(
+        &turn_handle,
+        &mut replay_view,
+        &mut context_steers,
+        replay.trailing,
+    );
+    assert!(unqueued.is_empty());
+    assert_eq!(
+        context_steers
+            .iter()
+            .map(|(id, context)| (*id, context.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (SteerId(0), "context between operators"),
+            (SteerId(2), "context after second"),
+        ]
+    );
+    let pending = rendered_view(&mut replay_view);
+    assert!(pending.contains("second operator steer"), "{pending}");
+    assert!(pending.contains("1 steering"), "{pending}");
+
+    let rendered = rendered_history(&mut view);
+    assert!(
+        rendered.contains("Model interrupted to submit steering input"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -185,11 +253,69 @@ fn unavailable_agent_restores_an_idle_submission() {
 }
 
 #[test]
-fn session_action_failures_are_rendered_without_exiting() {
+fn failed_queued_follow_up_start_restores_the_prompt_and_reports_no_start() {
     let mut runtime = runtime_without_agent();
+    runtime
+        .view
+        .queue_follow_up(UserPrompt::text("keep this queued prompt"));
 
+    assert!(!runtime.start_next_queued_follow_up());
+    assert_eq!(
+        submitted_prompt(runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))),
+        UserPrompt::text("keep this queued prompt")
+    );
+    let rendered = rendered_history(&mut runtime.view);
+    assert!(
+        rendered.contains("■ Could not start turn: the active agent is unavailable"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn failed_fork_and_clear_restore_the_command_draft() {
+    let mut runtime = runtime_without_agent();
     let fork = composer_action(&mut runtime.view, "/fork", KeyCode::Enter);
     assert!(!runtime.handle_action(fork));
+    assert!(matches!(
+        runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))),
+        Action::Fork(_)
+    ));
+    let rendered = rendered_history(&mut runtime.view);
+    assert!(
+        rendered.contains("■ Could not fork this session:"),
+        "{rendered}"
+    );
+
+    let mut runtime = runtime_without_agent();
+    runtime.cwd = PathBuf::from(format!(
+        "/tmp/bettercodex-missing-session-{}",
+        Uuid::new_v4()
+    ));
+    let clear = composer_action(&mut runtime.view, "/clear", KeyCode::Enter);
+    assert!(!runtime.handle_action(clear));
+    assert!(matches!(
+        runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))),
+        Action::Clear(_)
+    ));
+    let rendered = rendered_history(&mut runtime.view);
+    assert!(
+        rendered.contains("■ Could not start a fresh session:"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn resume_and_skill_failures_are_rendered_without_exiting() {
+    let mut runtime = runtime_without_agent();
     let resume = composer_action(
         &mut runtime.view,
         "/resume 123e4567-e89b-12d3-a456-426614174000",
@@ -203,14 +329,128 @@ fn session_action_failures_are_rendered_without_exiting() {
 
     let rendered = rendered_history(&mut runtime.view);
     assert!(
-        rendered.contains("■ Could not fork this session:"),
-        "{rendered}"
-    );
-    assert!(
         rendered.contains("■ Could not resume this session:"),
         "{rendered}"
     );
     assert!(rendered.contains("■ Could not update skill:"), "{rendered}");
+}
+
+#[tokio::test]
+async fn closing_the_resume_picker_cancels_the_scan_and_restores_the_command_draft() {
+    for key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE),
+    ] {
+        let mut runtime = runtime_without_agent();
+        let open = composer_action(&mut runtime.view, "/resume", KeyCode::Enter);
+        assert!(!runtime.handle_action(open));
+        assert!(runtime.session_scan.is_some());
+
+        let close = runtime.view.handle_terminal_event(Event::Key(key));
+        assert_eq!(close, Action::CloseResumePicker);
+        assert!(!runtime.handle_action(close));
+        assert!(runtime.session_scan.is_none());
+
+        assert!(matches!(
+            runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::OpenResumePicker(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn same_session_resume_consumes_the_command_and_closes_the_picker() {
+    let mut runtime = runtime_without_agent();
+    let target = Uuid::parse_str(&runtime.session_id).unwrap();
+    let open = composer_action(&mut runtime.view, "/resume", KeyCode::Enter);
+    assert!(!runtime.handle_action(open));
+    assert!(runtime.session_scan.is_some());
+
+    runtime.complete_same_session_resume(target);
+
+    assert!(runtime.session_scan.is_none());
+    assert!(runtime.resume_submission.is_none());
+    assert_eq!(
+        runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))),
+        Action::None
+    );
+    let rendered = rendered_history(&mut runtime.view);
+    assert!(
+        rendered.contains(&format!("Already viewing bettercodex session {target}")),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn resume_progress_can_be_cancelled_without_switching_or_losing_the_draft() {
+    const DRAFT: &str = "/resume";
+    let target = Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
+
+    for key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE),
+    ] {
+        let mut runtime = runtime_without_agent();
+        let original_session = runtime.session_id.clone();
+        let open = composer_action(&mut runtime.view, DRAFT, KeyCode::Enter);
+        assert!(!runtime.handle_action(open));
+        runtime.view.show_resume_progress(target);
+
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_completed = std::sync::Arc::clone(&completed);
+        let task_release = std::sync::Arc::clone(&release);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        runtime.resume_task = Some(tokio::task::spawn_blocking(move || {
+            started_tx.send(()).expect("resume task start signal");
+            while !task_release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            task_completed.store(true, std::sync::atomic::Ordering::Release);
+            Err(anyhow::anyhow!("late cancelled resume result"))
+        }));
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("resume task should start");
+
+        let progress = rendered_view(&mut runtime.view);
+        assert!(progress.contains("esc cancel"), "{progress}");
+        assert!(progress.contains("ctrl+c cancel"), "{progress}");
+
+        let action = runtime.view.handle_terminal_event(Event::Key(key));
+        assert_eq!(action, Action::CancelResumeLoad);
+        assert!(!runtime.handle_action(action));
+        assert!(runtime.resume_task.is_none());
+        release.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !completed.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelled blocking resume should finish without leaking its result");
+
+        assert_eq!(runtime.session_id, original_session);
+        let resumed_view = rendered_view(&mut runtime.view);
+        assert!(!resumed_view.contains("Resuming"));
+        assert!(!resumed_view.contains("Resume a previous session"));
+        assert!(!resumed_view.contains("late cancelled resume result"));
+        assert!(matches!(
+            runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::OpenResumePicker(_)
+        ));
+    }
 }
 
 #[tokio::test]
@@ -429,77 +669,25 @@ async fn user_message_during_operator_command_is_queued_until_local_work_finishe
     );
     assert_eq!(
         runtime.view.pop_next_queued_follow_up(),
-        Some(QueuedFollowUp::Prompt(UserPrompt::text(
-            "continue after the command"
-        )))
+        Some(UserPrompt::text("continue after the command"))
     );
 }
 
-#[tokio::test]
-async fn tab_queues_shell_until_the_active_turn_finishes_and_blocks_the_next_input() {
-    let mut runtime = runtime_without_agent();
-    runtime.cwd = std::env::current_dir().unwrap();
-    runtime.view.start_turn(&UserPrompt::text("active turn"));
-    runtime.turn = TurnTaskState::Running(tokio::spawn(std::future::pending::<(
-        Agent,
-        TurnCompletion,
-    )>()));
-
-    let shell = composer_action(
-        &mut runtime.view,
-        "!printf 'queued-shell-marker\\n'; sleep 0.05",
-        KeyCode::Tab,
-    );
-    assert!(matches!(shell, Action::Queue(_)));
-    assert!(!runtime.handle_action(shell));
-    let empty_shell = composer_action(&mut runtime.view, "!", KeyCode::Tab);
-    assert!(matches!(empty_shell, Action::Queue(_)));
-    assert!(!runtime.handle_action(empty_shell));
-    let next = composer_action(&mut runtime.view, "continue after shell", KeyCode::Tab);
-    assert!(matches!(next, Action::Queue(_)));
-    assert!(!runtime.handle_action(next));
-    assert!(runtime.operator_command_tasks.is_empty());
-
-    let TurnTaskState::Running(task) = std::mem::replace(&mut runtime.turn, TurnTaskState::Idle)
-    else {
-        panic!("test turn should be active");
-    };
-    task.abort();
-    runtime
-        .view
-        .finish_turn(Ok(SubmitOutcome::Completed("turn complete".to_string())));
-    assert!(runtime.start_next_queued_follow_up());
-    assert!(!runtime.operator_command_tasks.is_empty());
-    let pending = rendered_view(&mut runtime.view);
-    assert!(pending.contains("continue after shell"), "{pending}");
-
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !runtime.operator_command_tasks.is_empty() {
-            let update = runtime
-                .operator_command_updates
-                .recv()
-                .await
-                .expect("queued operator command update");
-            runtime.apply_operator_command_update(update);
+#[test]
+fn tab_never_submits_or_queues_plain_composer_text() {
+    for active in [false, true] {
+        let mut runtime = runtime_without_agent();
+        if active {
+            runtime.view.start_turn(&UserPrompt::text("active turn"));
         }
-    })
-    .await
-    .expect("queued operator command should complete promptly");
 
-    let restored = runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
-        KeyCode::Enter,
-        KeyModifiers::NONE,
-    )));
-    assert_eq!(
-        submitted_prompt(restored),
-        UserPrompt::text("continue after shell")
-    );
-    let rendered = rendered_history(&mut runtime.view);
-    assert!(rendered.contains("queued-shell-marker"), "{rendered}");
-    assert!(
-        rendered.contains("Run an operator shell command with !command"),
-        "{rendered}"
-    );
+        let action = composer_action(&mut runtime.view, "keep this draft", KeyCode::Tab);
+
+        assert_eq!(action, Action::None);
+        assert_eq!(runtime.view.pop_next_queued_follow_up(), None);
+        let rendered = rendered_view(&mut runtime.view);
+        assert!(rendered.contains("keep this draft"), "{rendered}");
+    }
 }
 
 #[tokio::test]
@@ -517,7 +705,7 @@ async fn local_activity_defers_and_restores_session_commands() {
         KeyCode::Enter,
         KeyModifiers::NONE,
     )));
-    let Action::ResumeSession { id, .. } = restored else {
+    let Action::ResumeSessionFromComposer { id, .. } = restored else {
         panic!("restored resume command should remain executable");
     };
     assert_eq!(

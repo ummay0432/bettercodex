@@ -8,6 +8,7 @@ use super::bottom_pane::selection_popup_common::measure_text_height;
 use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
 use super::bottom_pane::selection_popup_common::render_menu_surface;
 use super::bottom_pane::selection_popup_common::render_rows;
+use super::palette;
 use crate::model::DEFAULT_MODEL;
 use crate::model::ModelPreset;
 use crate::model::ModelSelection;
@@ -213,7 +214,7 @@ impl ModelPicker {
             }
             PickerStage::Advanced { .. } => vec![
                 Line::from("Advanced Reasoning").bold(),
-                Line::from("Warning: Consumes usage limits faster").cyan(),
+                Line::from("Warning: Consumes usage limits faster").fg(palette::warning_color()),
             ],
         }
     }

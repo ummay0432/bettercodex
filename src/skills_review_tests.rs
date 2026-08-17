@@ -36,7 +36,7 @@ fn text_of(item: &Value) -> &str {
 }
 
 #[test]
-fn review_skill_is_reserved_proactive_and_defers_protocol_from_both_entry_points() {
+fn review_skill_is_reserved_proactive_and_defers_protocol_from_all_entry_points() {
     let root = TemporaryDirectory::new();
     let home = root.join("home");
     let cwd = root.join("repository");
@@ -84,11 +84,17 @@ fn review_skill_is_reserved_proactive_and_defers_protocol_from_both_entry_points
     .unwrap();
     assert!(protocol.contains("Conduct rigorous web research"));
 
+    let linked_invocation = format!(
+        "use [$review](skill://{}) on the update logic",
+        reviews[0].path().display()
+    );
     for invocation in [
-        "/review the update logic",
-        "use $review on the update logic",
+        "/review the update logic".to_string(),
+        "use $review on the update logic".to_string(),
+        linked_invocation,
     ] {
-        let injection = catalog.explicit_injections(invocation, &[]);
+        assert!(explicitly_invokes_review(&invocation));
+        let injection = catalog.explicit_injections(&invocation, &[]);
         assert!(injection.warnings.is_empty());
         assert_eq!(injection.items.len(), 1);
         let injected = text_of(&injection.items[0]);
@@ -98,6 +104,41 @@ fn review_skill_is_reserved_proactive_and_defers_protocol_from_both_entry_points
         assert!(!injected.contains("MALICIOUS REVIEW BODY"));
     }
     assert!(!explicitly_invokes_review("/reviewing the update logic"));
+}
+
+#[test]
+fn linked_skill_injections_follow_catalog_order() {
+    let root = TemporaryDirectory::new();
+    let cwd = root.join("repository");
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+
+    let mut paths = Vec::new();
+    for name in ["alpha", "beta", "gamma"] {
+        let path = cwd.join(".bcodex/skills").join(name).join(SKILL_FILE_NAME);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!("---\nname: {name}\ndescription: {name} skill\n---\n\n{name}\n"),
+        )
+        .unwrap();
+        paths.push(path.canonicalize().unwrap());
+    }
+
+    let catalog = SkillCatalog::load_with_home(&cwd, None);
+    let invocation = format!(
+        "use [$gamma](skill://{}), [$beta](skill://{}), and [$alpha](skill://{})",
+        paths[2].display(),
+        paths[1].display(),
+        paths[0].display(),
+    );
+    for _ in 0..32 {
+        let injection = catalog.explicit_injections(&invocation, &[]);
+        assert!(injection.warnings.is_empty());
+        assert_eq!(injection.items.len(), 3);
+        assert!(text_of(&injection.items[0]).contains("<name>alpha</name>"));
+        assert!(text_of(&injection.items[1]).contains("<name>beta</name>"));
+        assert!(text_of(&injection.items[2]).contains("<name>gamma</name>"));
+    }
 }
 
 #[test]

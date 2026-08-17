@@ -2,6 +2,7 @@ use crate::compaction::InitialContextInjection;
 pub(crate) use crate::model::EFFECTIVE_CONTEXT_WINDOW;
 use crate::model::ModelSelection;
 use crate::rate_limits::RateLimitSnapshot;
+use crate::rate_limits::fill_missing_rate_limit_fields;
 use crate::repository;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
@@ -9,17 +10,24 @@ use crate::rollout::Rollout;
 use crate::rollout::SYNTHETIC_ABORT_OUTPUT;
 use crate::rollout::SessionIdentity;
 use crate::rollout::SessionTranscriptToolOutcome;
+use crate::rollout::SessionTranscriptToolOutput;
+use crate::rollout::ToolLifecycleJournal;
+use crate::rollout::ToolRecovery;
 use crate::rollout::TurnOutcome;
+use crate::rollout::is_legacy_exec_notification;
 use crate::service_tier::ServiceTier;
 use crate::skills::SkillCatalog;
 use crate::text::escape_cdata;
 use crate::text::escape_xml;
+use crate::text::escape_xml_text;
 use crate::truncation::TruncationPolicy;
 use crate::truncation::formatted_truncate_text;
 use crate::truncation::formatted_truncate_text_with_policy;
 use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
+use serde::Serialize;
+use serde::ser::SerializeMap;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -44,12 +52,63 @@ const OPERATOR_SHELL_OUTPUT_BUDGET_SHARE: f64 = 0.9;
 const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
 const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
+const CRASH_NOTICE: &str =
+    "The previous bettercodex process ended before its active turn completed.";
 const CRASH_GUIDANCE: &str = "The previous bettercodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
 const LEGACY_REPOSITORY_ONBOARDING_PREFIX: &str = "# Repository onboarding from AGENTS.md for ";
 const LEGACY_SKILLS_PREFIX: &str = "<skills>";
 const LEGACY_SKILL_CONTEXT_PREFIX: &str = "<skill>";
 const REPOSITORY_CONTEXT_PREFIX: &str = "<repository_context>";
 const AVAILABLE_SKILLS_PREFIX: &str = "<available_skills>";
+pub(crate) const USER_MESSAGE_KIND_FIELD: &str = "bettercodex_user_message_kind";
+const OPERATOR_USER_MESSAGE_KIND: &str = "operator";
+const CONTEXTUAL_USER_MESSAGE_KIND: &str = "context";
+
+/// Serialize one history item exactly as bettercodex sends it to Responses.
+///
+/// Local provenance is persisted for reconstruction but never crosses the API
+/// boundary. Legacy rollout IDs without a server-style prefix are likewise
+/// retained on disk and omitted from requests.
+pub(crate) struct ResponseItemForRequest<'a>(&'a Value);
+
+impl<'a> ResponseItemForRequest<'a> {
+    pub(crate) fn new(item: &'a Value) -> Self {
+        Self(item)
+    }
+}
+
+impl Serialize for ResponseItemForRequest<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Value::Object(item) = self.0 else {
+            return self.0.serialize(serializer);
+        };
+        let omit_id = item.get("id").is_some_and(|id| match id {
+            Value::String(id) => !response_item_id_is_prefixed(id),
+            _ => true,
+        });
+        let omit_provenance = item.contains_key(USER_MESSAGE_KIND_FIELD);
+        if !omit_id && !omit_provenance {
+            return self.0.serialize(serializer);
+        }
+
+        let omitted = usize::from(omit_id).saturating_add(usize::from(omit_provenance));
+        let mut serialized = serializer.serialize_map(Some(item.len().saturating_sub(omitted)))?;
+        for (name, value) in item {
+            if !(omit_id && name == "id") && name != USER_MESSAGE_KIND_FIELD {
+                serialized.serialize_entry(name, value)?;
+            }
+        }
+        serialized.end()
+    }
+}
+
+pub(crate) fn response_item_id_is_prefixed(id: &str) -> bool {
+    id.split_once('_')
+        .is_some_and(|(prefix, suffix)| !prefix.is_empty() && !suffix.is_empty())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContextKind {
@@ -129,7 +188,6 @@ pub(crate) struct ContextProjection {
     metrics: ContextMetrics,
     additional_tokens: u64,
     projected_tokens: u64,
-    compact_at_tokens: u64,
 }
 
 impl ContextProjection {
@@ -140,25 +198,17 @@ impl ContextProjection {
     pub(crate) fn projected_tokens(&self) -> u64 {
         self.projected_tokens
     }
-
-    pub(crate) fn needs_compaction(&self) -> bool {
-        self.projected_tokens >= self.compact_at_tokens
-    }
-
-    pub(crate) fn into_items(self) -> Vec<Value> {
-        self.items
-    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ActiveTurnContext {
-    // Keep one block per operator input, including empty blocks, so retained
+    // Keep one block per real user input, including empty blocks, so retained
     // user messages can be matched newest-to-newest after remote truncation.
     input_blocks: Vec<Vec<Value>>,
 }
 
 impl ActiveTurnContext {
-    pub(crate) fn record_input(&mut self, context: Vec<Value>) {
+    pub(crate) fn record_real_user_input(&mut self, context: Vec<Value>) {
         self.input_blocks.push(context);
     }
 
@@ -243,6 +293,13 @@ struct WorldState {
     skills: SkillCatalog,
 }
 
+#[derive(Clone, Copy)]
+enum WorldStateRefreshPlacement {
+    BeforeTrailingInput(usize),
+    Exact(usize),
+    Append,
+}
+
 struct RepositoryContext {
     text: String,
     source_paths: Vec<PathBuf>,
@@ -281,7 +338,7 @@ struct HistoryNormalization {
 #[derive(Clone, Copy)]
 struct TrackedCall {
     output_kind: CallOutputKind,
-    allows_multiple_outputs: bool,
+    allows_notifications: bool,
     has_output: bool,
 }
 
@@ -328,7 +385,7 @@ impl Conversation {
     pub(crate) fn resume(cwd: &Path, loaded: LoadedRollout) -> Result<Self> {
         let LoadedRollout {
             rollout,
-            mut history,
+            history,
             usage,
             total_usage,
             usage_history_estimate,
@@ -336,12 +393,14 @@ impl Conversation {
             model_selection,
             service_tier,
             unfinished_turn,
+            unfinished_turn_has_activity,
+            unfinished_turn_has_recovery_notice,
+            unfinished_turn_recovered,
+            tool_recoveries,
+            crash_recovery_requires_inspection,
             ..
         } = loaded;
         let world_state = WorldState::load(cwd)?;
-        // Match current Codex reconstruction behavior: bound legacy media in memory while keeping
-        // the source rollout unchanged. Newly recorded images are already prepared at insertion.
-        crate::image_preparation::prepare_history_images(&mut history);
         let context_metrics = ContextMetrics::from_history(&history, &world_state);
         let history_normalization = HistoryNormalization::from_history(&history);
         let mut conversation = Self {
@@ -359,14 +418,53 @@ impl Conversation {
             rollout,
             world_state,
         };
-        if let Some(turn_id) = unfinished_turn {
-            conversation.normalize()?;
-            conversation.append_context_notice("turn_aborted", CRASH_GUIDANCE)?;
-            conversation
-                .rollout
-                .finish_turn(&turn_id, TurnOutcome::Interrupted)?;
+        match unfinished_turn {
+            Some(turn_id) if unfinished_turn_recovered => {
+                // The complete recovery checkpoint already contains normalized outputs,
+                // transcript outcomes, the notice, and refreshed world state. Closing the turn is
+                // the only recovery write still required after a second process death.
+                conversation
+                    .rollout
+                    .finish_turn(&turn_id, TurnOutcome::Interrupted)?;
+                conversation.refresh_world_state()?;
+            }
+            Some(turn_id) if unfinished_turn_has_activity => {
+                conversation.recover_unfinished_turn(
+                    &turn_id,
+                    &tool_recoveries,
+                    crash_recovery_requires_inspection,
+                    unfinished_turn_has_recovery_notice,
+                )?;
+                conversation
+                    .rollout
+                    .finish_turn(&turn_id, TurnOutcome::Interrupted)?;
+            }
+            Some(turn_id) => {
+                // Startup can normalize old history before any new input or tool work exists. A
+                // crash there is housekeeping, not a model-visible interrupted turn.
+                conversation.normalize()?;
+                conversation.refresh_world_state_at_history_end()?;
+                conversation
+                    .rollout
+                    .finish_turn(&turn_id, TurnOutcome::Interrupted)?;
+            }
+            None => {
+                // Finished legacy and refactor-era turns can still contain malformed call/output
+                // pairs. Repair them durably during resume so transcript replay and the next model
+                // request observe the same settled history.
+                conversation.normalize()?;
+                conversation.refresh_world_state()?;
+            }
         }
-        conversation.refresh_world_state()?;
+        // Run durable repair and world-state refresh against the saved representation first. Bound
+        // legacy media only in the live history so a context-refresh checkpoint cannot replace the
+        // rollout's original image payload with a request-specific resize. New images are already
+        // prepared before insertion.
+        crate::image_preparation::prepare_history_images(&mut conversation.history);
+        conversation.history_normalization =
+            HistoryNormalization::from_history(&conversation.history);
+        conversation.context_metrics =
+            ContextMetrics::from_history(&conversation.history, &conversation.world_state);
         Ok(conversation)
     }
 
@@ -471,6 +569,10 @@ impl Conversation {
         self.rollout.record_tool_outcomes(outcomes)
     }
 
+    pub(crate) fn tool_lifecycle_journal(&self) -> ToolLifecycleJournal {
+        self.rollout.tool_lifecycle_journal()
+    }
+
     pub(crate) fn extend(&mut self, items: impl IntoIterator<Item = Value>) -> Result<()> {
         let items = items.into_iter().collect::<Vec<_>>();
         if items.is_empty() {
@@ -515,7 +617,6 @@ impl Conversation {
             metrics,
             additional_tokens,
             projected_tokens,
-            compact_at_tokens: self.model_selection.auto_compact_token_limit(),
         }
     }
 
@@ -544,8 +645,8 @@ impl Conversation {
         mut history: Vec<Value>,
         initial_context_injection: InitialContextInjection,
         active_turn_context: &ActiveTurnContext,
-        response_usage: Option<TokenUsage>,
-        rate_limits: Vec<RateLimitSnapshot>,
+        response_usage: Option<&TokenUsage>,
+        rate_limits: &[RateLimitSnapshot],
     ) -> Result<()> {
         let preferred_insertion = match initial_context_injection {
             InitialContextInjection::AfterCompaction => None,
@@ -559,35 +660,20 @@ impl Conversation {
             preferred_insertion,
         );
         active_turn_context.insert_into(&mut history, initial_context_injection);
-        let mut context_metrics = ContextMetrics::from_history(&history, &self.world_state);
-        let mut replacement_tokens = self.estimated_context_tokens(&context_metrics);
-        // Match Codex by retaining image inputs outside the text budget. Only
-        // shed the oldest images when keeping all of them
-        // would make the replacement immediately trigger another compaction.
+        let context_metrics = ContextMetrics::from_history(&history, &self.world_state);
+        let replacement_tokens = self.estimated_context_tokens(&context_metrics);
         let compact_at_tokens = self.model_selection.auto_compact_token_limit();
-        while replacement_tokens >= compact_at_tokens {
-            let tokens_to_remove = replacement_tokens
-                .saturating_sub(compact_at_tokens)
-                .saturating_add(1);
-            if trim_oldest_image_inputs(&mut history, tokens_to_remove) == 0 {
-                break;
-            }
-            context_metrics = ContextMetrics::from_history(&history, &self.world_state);
-            replacement_tokens = self.estimated_context_tokens(&context_metrics);
-        }
         if replacement_tokens >= compact_at_tokens {
             anyhow::bail!(
                 "remote compaction replacement is estimated at {replacement_tokens} tokens and did not restore headroom below bettercodex's {compact_at_tokens}-token automatic-compaction threshold; the conversation was left unchanged"
             );
         }
         self.rollout
-            .replace_compacted_history(&history, response_usage.as_ref())?;
-        if let Some(response_usage) = &response_usage {
+            .replace_compacted_history(&history, response_usage)?;
+        if let Some(response_usage) = response_usage {
             self.total_usage.add_assign(response_usage);
         }
-        for snapshot in rate_limits {
-            self.rate_limits.insert(snapshot.limit_id.clone(), snapshot);
-        }
+        self.update_rate_limits(rate_limits.iter().cloned());
         self.history_normalization = HistoryNormalization::from_history(&history);
         self.context_metrics = context_metrics;
         self.history = history;
@@ -641,6 +727,19 @@ impl Conversation {
         &self.world_state.skills
     }
 
+    pub(crate) fn reload_world_state_for_active_turn(
+        &mut self,
+        cwd: &Path,
+        active_turn_context: &ActiveTurnContext,
+    ) -> Result<()> {
+        let world_state = WorldState::load(cwd)?;
+        let placement = active_turn_context
+            .preferred_world_state_insertion(&self.history)
+            .map(|insertion| world_state_placement_before_input(&self.history, insertion))
+            .unwrap_or_else(|| world_state_refresh_placement(&self.history));
+        self.replace_world_state_at(world_state, placement)
+    }
+
     pub(crate) fn reload_skills(&mut self, cwd: &Path) -> Result<()> {
         let skills = SkillCatalog::load(cwd);
         let mut world_state = self.world_state.clone();
@@ -649,15 +748,26 @@ impl Conversation {
         self.replace_world_state(world_state)
     }
 
+    pub(crate) fn record_uninstalled_response(
+        &mut self,
+        usage: Option<TokenUsage>,
+        rate_limits: Vec<RateLimitSnapshot>,
+    ) -> Result<()> {
+        if let Some(usage) = usage {
+            self.rollout.record_total_usage(&usage)?;
+            self.total_usage.add_assign(&usage);
+        }
+        self.update_rate_limits(rate_limits);
+        Ok(())
+    }
+
     pub(crate) fn record_usage(
         &mut self,
         usage: Option<TokenUsage>,
         server_reasoning_included: bool,
         rate_limits: Vec<RateLimitSnapshot>,
     ) -> Result<()> {
-        for snapshot in rate_limits {
-            self.rate_limits.insert(snapshot.limit_id.clone(), snapshot);
-        }
+        self.update_rate_limits(rate_limits);
         let Some(usage) = usage else {
             return Ok(());
         };
@@ -669,6 +779,16 @@ impl Conversation {
         self.usage_history_estimate = Some(history_estimate);
         self.server_reasoning_included = server_reasoning_included;
         Ok(())
+    }
+
+    fn update_rate_limits(&mut self, rate_limits: impl IntoIterator<Item = RateLimitSnapshot>) {
+        for mut snapshot in rate_limits {
+            let limit_id = snapshot.limit_id.clone();
+            if let Some(previous) = self.rate_limits.get(&limit_id) {
+                fill_missing_rate_limit_fields(&mut snapshot, previous);
+            }
+            self.rate_limits.insert(limit_id, snapshot);
+        }
     }
 
     pub(crate) fn context_tokens(&self) -> Option<u64> {
@@ -774,13 +894,23 @@ impl Conversation {
     }
 
     pub(crate) fn normalize(&mut self) -> Result<bool> {
+        self.normalize_with_recoveries(&HashMap::new())
+    }
+
+    fn normalize_with_recoveries(
+        &mut self,
+        recoveries: &HashMap<String, ToolRecovery>,
+    ) -> Result<bool> {
         if self.history_normalization.is_normalized() {
             return Ok(false);
         }
         let mut normalized = self.history.clone();
-        normalize_history(&mut normalized);
-        self.rollout
-            .replace_history(&normalized, HistoryReplacement::Normalization)?;
+        let outcomes = normalize_history_with_recoveries(&mut normalized, recoveries);
+        self.rollout.replace_history_with_outcomes(
+            &normalized,
+            HistoryReplacement::Normalization,
+            outcomes,
+        )?;
         self.history_normalization = HistoryNormalization::from_history(&normalized);
         self.context_metrics = ContextMetrics::from_history(&normalized, &self.world_state);
         self.history = normalized;
@@ -788,48 +918,85 @@ impl Conversation {
         Ok(true)
     }
 
+    fn recover_unfinished_turn(
+        &mut self,
+        turn_id: &str,
+        recoveries: &HashMap<String, ToolRecovery>,
+        requires_inspection: bool,
+        has_recovery_notice: bool,
+    ) -> Result<()> {
+        let mut recovered = self.history.clone();
+        let outcomes = normalize_history_with_recoveries(&mut recovered, recoveries);
+        if !has_recovery_notice {
+            recovered.push(context_notice(
+                "turn_aborted",
+                if requires_inspection {
+                    CRASH_GUIDANCE
+                } else {
+                    CRASH_NOTICE
+                },
+            ));
+        }
+        let placement = world_state_refresh_placement(&recovered);
+        if let Some(refreshed) =
+            refreshed_world_state_history(&recovered, &self.world_state, placement)
+        {
+            recovered = refreshed;
+        }
+
+        // One complete replacement is the recovery commit point. If the process dies while this
+        // line is being appended, tail repair restores the pre-recovery state; if it dies after the
+        // line, replay sees the checkpoint and only needs to close the turn.
+        self.rollout.replace_recovered_history(
+            &recovered,
+            outcomes,
+            turn_id,
+            requires_inspection,
+        )?;
+        #[cfg(test)]
+        crate::process_termination_test_support::stop_at("turn_recovery_checkpoint");
+        self.history_normalization = HistoryNormalization::from_history(&recovered);
+        self.context_metrics = ContextMetrics::from_history(&recovered, &self.world_state);
+        self.history = recovered;
+        self.history_lineage = uuid::Uuid::new_v4();
+        Ok(())
+    }
+
     fn append_context_notice(&mut self, tag: &str, guidance: &str) -> Result<()> {
-        let guidance = formatted_truncate_text(guidance, MAX_CONTEXT_NOTICE_TEXT_TOKENS);
-        self.extend([message("user", format!("<{tag}>\n{guidance}\n</{tag}>"))])
+        self.extend([context_notice(tag, guidance)])
     }
 
     fn refresh_world_state(&mut self) -> Result<()> {
         self.replace_world_state(self.world_state.clone())
     }
 
-    fn replace_world_state(&mut self, world_state: WorldState) -> Result<()> {
-        let current = world_state.items();
-        let saved = self
+    fn refresh_world_state_at_history_end(&mut self) -> Result<()> {
+        let insertion = self
             .history
             .iter()
-            .filter(|item| is_generated_world_state_message(item))
-            .collect::<Vec<_>>();
-        let already_current = saved.len() == current.len()
-            && current.iter().all(|expected| {
-                saved
-                    .iter()
-                    .any(|existing| same_model_visible_message(existing, expected))
-            });
-        if already_current {
+            .rposition(|item| !is_world_state_refresh_item(item))
+            .map_or(0, |index| index + 1);
+        self.replace_world_state_at(
+            self.world_state.clone(),
+            WorldStateRefreshPlacement::Exact(insertion),
+        )
+    }
+
+    fn replace_world_state(&mut self, world_state: WorldState) -> Result<()> {
+        let placement = world_state_refresh_placement(&self.history);
+        self.replace_world_state_at(world_state, placement)
+    }
+
+    fn replace_world_state_at(
+        &mut self,
+        world_state: WorldState,
+        placement: WorldStateRefreshPlacement,
+    ) -> Result<()> {
+        let Some(refreshed) = refreshed_world_state_history(&self.history, &world_state, placement)
+        else {
             self.world_state = world_state;
             return Ok(());
-        }
-
-        let mut refreshed = self
-            .history
-            .iter()
-            .filter(|item| !is_generated_world_state_message(item))
-            .cloned()
-            .collect::<Vec<_>>();
-        let insertion = if refreshed
-            .last()
-            .is_some_and(|item| is_user_message(item) && !is_contextual_user_message(item))
-        {
-            refreshed.len().saturating_sub(1)
-        } else {
-            refreshed.len()
         };
-        refreshed.splice(insertion..insertion, current);
         self.rollout
             .replace_history(&refreshed, HistoryReplacement::ContextRefresh)?;
         self.history_normalization = HistoryNormalization::from_history(&refreshed);
@@ -839,6 +1006,60 @@ impl Conversation {
         self.world_state = world_state;
         Ok(())
     }
+}
+
+fn context_notice(tag: &str, guidance: &str) -> Value {
+    let guidance = formatted_truncate_text(guidance, MAX_CONTEXT_NOTICE_TEXT_TOKENS);
+    message("user", format!("<{tag}>\n{guidance}\n</{tag}>"))
+}
+
+fn refreshed_world_state_history(
+    history: &[Value],
+    world_state: &WorldState,
+    placement: WorldStateRefreshPlacement,
+) -> Option<Vec<Value>> {
+    let current = world_state.items();
+    let saved = history
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| is_generated_world_state_message(item))
+        .collect::<Vec<_>>();
+    let correctly_placed = match placement {
+        WorldStateRefreshPlacement::BeforeTrailingInput(insertion) => {
+            saved.iter().all(|(index, _)| *index < insertion)
+        }
+        WorldStateRefreshPlacement::Exact(insertion) => saved
+            .iter()
+            .enumerate()
+            .all(|(offset, (index, _))| insertion.checked_add(offset) == Some(*index)),
+        WorldStateRefreshPlacement::Append => true,
+    };
+    let already_current = !history.iter().any(is_legacy_harness_prefix_item)
+        && saved.len() == current.len()
+        && saved
+            .iter()
+            .zip(&current)
+            .all(|((_, existing), expected)| same_model_visible_message(existing, expected))
+        && correctly_placed;
+    if already_current {
+        return None;
+    }
+
+    let mut refreshed = history
+        .iter()
+        .filter(|item| !is_world_state_refresh_item(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    let insertion = match placement {
+        WorldStateRefreshPlacement::BeforeTrailingInput(insertion)
+        | WorldStateRefreshPlacement::Exact(insertion) => history[..insertion]
+            .iter()
+            .filter(|item| !is_world_state_refresh_item(item))
+            .count(),
+        WorldStateRefreshPlacement::Append => refreshed.len(),
+    };
+    refreshed.splice(insertion..insertion, current);
+    Some(refreshed)
 }
 
 impl WorldState {
@@ -899,9 +1120,10 @@ impl WorldState {
         self.items()
             .into_iter()
             .filter(|expected| {
-                !history
-                    .iter()
-                    .any(|existing| same_model_visible_message(existing, expected))
+                !history.iter().any(|existing| {
+                    !is_explicit_operator_user_message(existing)
+                        && same_model_visible_message(existing, expected)
+                })
             })
             .collect()
     }
@@ -917,36 +1139,6 @@ fn real_user_message_indices(history: &[Value]) -> Vec<usize> {
         .collect()
 }
 
-fn trim_oldest_image_inputs(history: &mut Vec<Value>, minimum_tokens: u64) -> u64 {
-    let mut removed_tokens = 0_u64;
-    for item in history.iter_mut() {
-        if removed_tokens >= minimum_tokens || !is_user_message(item) {
-            continue;
-        }
-        let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        content.retain(|content_item| {
-            let is_image = content_item.get("type").and_then(Value::as_str) == Some("input_image");
-            if removed_tokens < minimum_tokens && is_image {
-                removed_tokens =
-                    removed_tokens.saturating_add(estimate_value_tokens(content_item).max(1));
-                false
-            } else {
-                true
-            }
-        });
-    }
-    history.retain(|item| {
-        !is_user_message(item)
-            || item
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|content| !content.is_empty())
-    });
-    removed_tokens
-}
-
 impl ContextMetrics {
     fn from_history(history: &[Value], world_state: &WorldState) -> Self {
         let mut metrics = Self::default();
@@ -957,21 +1149,24 @@ impl ContextMetrics {
     fn extend(&mut self, history: &[Value], world_state: &WorldState) -> u64 {
         let mut additional_tokens = 0_u64;
         for item in history {
-            if is_initial_context_boundary(item) {
+            if is_instruction_boundary(item) {
                 self.encrypted_reasoning_before_last_instruction = self.encrypted_reasoning_tokens;
             }
+            let explicit_operator = is_explicit_operator_user_message(item);
             let kind = if same_model_visible_message(item, &world_state.environment) {
                 ContextKind::Environment
-            } else if world_state
-                .repository_context
-                .as_ref()
-                .is_some_and(|context| same_model_visible_message(item, context))
+            } else if !explicit_operator
+                && world_state
+                    .repository_context
+                    .as_ref()
+                    .is_some_and(|context| same_model_visible_message(item, context))
             {
                 ContextKind::RepositoryInstructions
-            } else if world_state
-                .skills_catalogue
-                .as_ref()
-                .is_some_and(|catalogue| same_model_visible_message(item, catalogue))
+            } else if !explicit_operator
+                && world_state
+                    .skills_catalogue
+                    .as_ref()
+                    .is_some_and(|catalogue| same_model_visible_message(item, catalogue))
             {
                 ContextKind::Skills
             } else {
@@ -1003,9 +1198,7 @@ fn same_model_visible_message(left: &Value, right: &Value) -> bool {
 fn context_kind(item: &Value) -> ContextKind {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => match item.get("role").and_then(Value::as_str) {
-            Some("user") if message_text(item).is_some_and(is_user_shell_command_text) => {
-                ContextKind::ToolActivity
-            }
+            Some("user") if is_user_shell_command_message(item) => ContextKind::ToolActivity,
             Some("user") => ContextKind::UserMessages,
             Some("assistant") => ContextKind::AssistantMessages,
             _ => ContextKind::Other,
@@ -1086,8 +1279,46 @@ fn is_user_message(item: &Value) -> bool {
         && item.get("role").and_then(Value::as_str) == Some("user")
 }
 
+pub(crate) fn mark_operator_user_message(item: &mut Value) {
+    mark_user_message_kind(item, OPERATOR_USER_MESSAGE_KIND);
+}
+
+pub(crate) fn mark_contextual_user_message(item: &mut Value) {
+    mark_user_message_kind(item, CONTEXTUAL_USER_MESSAGE_KIND);
+}
+
+fn mark_user_message_kind(item: &mut Value, kind: &str) {
+    debug_assert!(is_user_message(item));
+    if let Some(item) = item.as_object_mut() {
+        item.insert(
+            USER_MESSAGE_KIND_FIELD.to_string(),
+            Value::String(kind.to_string()),
+        );
+    }
+}
+
+fn user_message_kind(item: &Value) -> Option<&str> {
+    item.get(USER_MESSAGE_KIND_FIELD).and_then(Value::as_str)
+}
+
+fn is_explicit_operator_user_message(item: &Value) -> bool {
+    is_user_message(item) && user_message_kind(item) == Some(OPERATOR_USER_MESSAGE_KIND)
+}
+
 pub(crate) fn is_contextual_user_message(item: &Value) -> bool {
-    is_user_message(item) && message_text(item).is_some_and(is_contextual_user_text)
+    is_user_message(item)
+        && is_contextual_user_text_with_kind(
+            message_text(item).unwrap_or_default(),
+            user_message_kind(item),
+        )
+}
+
+pub(crate) fn is_contextual_user_text_with_kind(text: &str, kind: Option<&str>) -> bool {
+    match kind {
+        Some(OPERATOR_USER_MESSAGE_KIND) => false,
+        Some(CONTEXTUAL_USER_MESSAGE_KIND) => true,
+        _ => is_contextual_user_text(text),
+    }
 }
 
 pub(crate) fn is_contextual_user_text(text: &str) -> bool {
@@ -1108,11 +1339,22 @@ fn is_user_shell_command_text(text: &str) -> bool {
     is_complete_context_wrapper(text, "<user_shell_command>", "</user_shell_command>")
 }
 
+pub(crate) fn is_user_shell_command_message(item: &Value) -> bool {
+    is_contextual_user_message(item)
+        && message_text(item)
+            .map(str::trim_start)
+            .is_some_and(is_user_shell_command_text)
+}
+
 fn is_complete_context_wrapper(text: &str, opening: &str, closing: &str) -> bool {
     text.starts_with(opening) && text.trim_end().ends_with(closing)
 }
 
 fn is_initial_context_boundary(item: &Value) -> bool {
+    is_instruction_boundary(item) || is_assistant_commentary_message(item)
+}
+
+fn is_instruction_boundary(item: &Value) -> bool {
     (is_user_message(item) && !is_contextual_user_message(item))
         || (item.get("type").and_then(Value::as_str) == Some("agent_message")
             && !item
@@ -1121,7 +1363,16 @@ fn is_initial_context_boundary(item: &Value) -> bool {
                 .is_some_and(|text| text.starts_with("Message Type: FINAL_ANSWER\n")))
 }
 
+pub(crate) fn is_assistant_commentary_message(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("assistant")
+        && item.get("phase").and_then(Value::as_str) == Some("commentary")
+}
+
 fn is_generated_world_state_message(item: &Value) -> bool {
+    if is_explicit_operator_user_message(item) {
+        return false;
+    }
     let role = item.get("role").and_then(Value::as_str);
     let Some(text) = message_text(item).map(str::trim_start) else {
         return false;
@@ -1135,6 +1386,170 @@ fn is_generated_world_state_message(item: &Value) -> bool {
                     && text.trim_end().ends_with("</available_skills>"))
                 || (text.starts_with(LEGACY_REPOSITORY_ONBOARDING_PREFIX)
                     && text.trim_end().ends_with("# End repository onboarding"))))
+}
+
+// Before tools and instructions moved to top-level request fields, compacted rollouts could
+// persist their in-band harness prefix. Current bettercodex has no client-authored developer
+// messages, so every non-world-state developer message is part of that obsolete prefix.
+fn is_legacy_harness_prefix_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("additional_tools")
+        || (item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("developer")
+            && !is_generated_world_state_message(item))
+}
+
+fn is_world_state_refresh_item(item: &Value) -> bool {
+    is_generated_world_state_message(item) || is_legacy_harness_prefix_item(item)
+}
+
+fn world_state_refresh_placement(history: &[Value]) -> WorldStateRefreshPlacement {
+    let mut cursor = history.len();
+    let mut trailing_world_state = false;
+    while cursor > 0 && is_world_state_refresh_item(&history[cursor - 1]) {
+        trailing_world_state |= is_generated_world_state_message(&history[cursor - 1]);
+        cursor -= 1;
+    }
+
+    let user_index = if cursor > 0 && is_turn_recovery_notice(&history[cursor - 1]) {
+        let recovery_index = cursor - 1;
+        let mut context_start = recovery_index;
+        while context_start > 0 && is_world_state_refresh_item(&history[context_start - 1]) {
+            context_start -= 1;
+        }
+        if context_start < recovery_index {
+            return WorldStateRefreshPlacement::Exact(context_start);
+        }
+
+        cursor = recovery_index;
+        let mut earliest_user = None;
+        let mut persisted_context_start = None;
+        while cursor > 0 {
+            let item = &history[cursor - 1];
+            if is_terminal_assistant_message(item)
+                || is_turn_abort_notice(item)
+                || (is_compaction_item(item) && trailing_world_state)
+            {
+                break;
+            }
+            if is_world_state_refresh_item(item) {
+                let mut start = cursor - 1;
+                while start > 0 && is_world_state_refresh_item(&history[start - 1]) {
+                    start -= 1;
+                }
+                persisted_context_start = Some(start);
+                break;
+            }
+            if is_user_message(item) && !is_contextual_user_message(item) {
+                earliest_user = Some(cursor - 1);
+            }
+            cursor -= 1;
+        }
+        let Some(user_index) = earliest_user else {
+            return persisted_context_start.map_or(
+                WorldStateRefreshPlacement::Append,
+                WorldStateRefreshPlacement::Exact,
+            );
+        };
+        user_index
+    } else if cursor > 0 && is_compaction_item(&history[cursor - 1]) && !trailing_world_state {
+        // Mid-turn compaction keeps its opaque item last. Refresh the active turn's world state
+        // above the last retained real user, or immediately above the compaction item when remote
+        // retention dropped every real user, so a tool-driven AGENTS.md change cannot demote the
+        // opaque continuation token from the model-trained terminal position.
+        let compaction_index = cursor - 1;
+        let Some(user_index) = history[..compaction_index]
+            .iter()
+            .rposition(|item| is_user_message(item) && !is_contextual_user_message(item))
+        else {
+            let mut insertion = compaction_index;
+            while insertion > 0
+                && (is_world_state_refresh_item(&history[insertion - 1])
+                    || is_turn_input_context_message(&history[insertion - 1]))
+            {
+                insertion -= 1;
+            }
+            return WorldStateRefreshPlacement::Exact(insertion);
+        };
+        user_index
+    } else {
+        let Some(user_index) = cursor.checked_sub(1) else {
+            return WorldStateRefreshPlacement::Append;
+        };
+        let item = &history[user_index];
+        if is_turn_input_context_message(item) {
+            return world_state_placement_before_input(history, cursor);
+        }
+        if !is_user_message(item) || is_contextual_user_message(item) {
+            return WorldStateRefreshPlacement::Append;
+        }
+        user_index
+    };
+
+    world_state_placement_before_input(history, user_index)
+}
+
+fn world_state_placement_before_input(
+    history: &[Value],
+    input_index: usize,
+) -> WorldStateRefreshPlacement {
+    let mut start = input_index;
+    let mut scan = start;
+    while scan > 0 {
+        let preceding = &history[scan - 1];
+        if is_world_state_refresh_item(preceding) {
+            scan -= 1;
+        } else if is_turn_input_context_message(preceding) {
+            scan -= 1;
+            start = scan;
+        } else {
+            break;
+        }
+    }
+    WorldStateRefreshPlacement::BeforeTrailingInput(start)
+}
+
+fn is_turn_input_context_message(item: &Value) -> bool {
+    if !is_contextual_user_message(item) {
+        return false;
+    }
+    let Some(text) = message_text(item).map(str::trim_start) else {
+        return false;
+    };
+    is_complete_context_wrapper(text, "<skill_context>", "</skill_context>")
+        || is_complete_context_wrapper(text, LEGACY_SKILL_CONTEXT_PREFIX, "</skill>")
+        || is_user_shell_command_text(text)
+}
+
+fn is_turn_recovery_notice(item: &Value) -> bool {
+    is_turn_abort_notice(item) || is_response_interrupted_notice(item)
+}
+
+pub(crate) fn is_turn_abort_notice(item: &Value) -> bool {
+    is_context_notice(item, "<turn_aborted>", "</turn_aborted>")
+}
+
+fn is_response_interrupted_notice(item: &Value) -> bool {
+    is_context_notice(item, "<response_interrupted>", "</response_interrupted>")
+}
+
+fn is_context_notice(item: &Value, opening: &str, closing: &str) -> bool {
+    is_contextual_user_message(item)
+        && message_text(item)
+            .map(str::trim_start)
+            .is_some_and(|text| is_complete_context_wrapper(text, opening, closing))
+}
+
+fn is_terminal_assistant_message(item: &Value) -> bool {
+    if item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("assistant")
+    {
+        return !is_assistant_commentary_message(item);
+    }
+    item.get("type").and_then(Value::as_str) == Some("agent_message")
+        && item
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with("Message Type: FINAL_ANSWER\n"))
 }
 
 fn message_text(item: &Value) -> Option<&str> {
@@ -1164,8 +1579,9 @@ pub(crate) fn user_shell_command_context(
     output: &std::result::Result<Value, String>,
     policy: TruncationPolicy,
 ) -> String {
+    let command = escape_xml_text(command);
     let command =
-        formatted_truncate_text_with_policy(command, policy * OPERATOR_SHELL_COMMAND_BUDGET_SHARE);
+        formatted_truncate_text_with_policy(&command, policy * OPERATOR_SHELL_COMMAND_BUDGET_SHARE);
     let result = match output {
         Ok(output) => {
             let stdout = output.get("stdout").and_then(Value::as_str);
@@ -1180,6 +1596,7 @@ pub(crate) fn user_shell_command_context(
         }
         Err(error) => format!("Execution error:\n{error}"),
     };
+    let result = escape_xml_text(&result);
     let result =
         formatted_truncate_text_with_policy(&result, policy * OPERATOR_SHELL_OUTPUT_BUDGET_SHARE);
     format!(
@@ -1322,18 +1739,20 @@ impl Write for SerializedSize {
 
 fn estimate_value_tokens(value: &Value) -> u64 {
     let item_type = value.get("type").and_then(Value::as_str);
+    let mut serialized_size = SerializedSize::default();
+    let mut bytes =
+        serde_json::to_writer(&mut serialized_size, &ResponseItemForRequest::new(value))
+            .map(|()| serialized_size.bytes)
+            .unwrap_or_default();
     if matches!(
         item_type,
         Some("reasoning" | "compaction" | "compaction_summary" | "context_compaction")
     ) && let Some(encrypted) = value.get("encrypted_content").and_then(Value::as_str)
     {
-        return estimate_reasoning_bytes(encrypted.len()).div_ceil(4);
+        bytes = bytes
+            .saturating_sub(encrypted.len() as u64)
+            .saturating_add(estimate_reasoning_bytes(encrypted.len()));
     }
-
-    let mut serialized_size = SerializedSize::default();
-    let mut bytes = serde_json::to_writer(&mut serialized_size, value)
-        .map(|()| serialized_size.bytes)
-        .unwrap_or_default();
     visit_model_content(
         value,
         &mut |content| match content.get("type").and_then(Value::as_str) {
@@ -1346,9 +1765,10 @@ fn estimate_value_tokens(value: &Value) -> u64 {
                 };
                 let replacement = if matches!(
                     content.get("detail").and_then(Value::as_str),
-                    None | Some("original" | "auto")
+                    None | Some("auto") | Some("original")
                 ) {
-                    estimate_image_tokens(image_url).saturating_mul(4)
+                    estimate_full_resolution_image_bytes(image_url)
+                        .unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE)
                 } else {
                     RESIZED_IMAGE_BYTES_ESTIMATE
                 };
@@ -1416,19 +1836,17 @@ fn base64_image_data_url_payload(url: &str) -> Option<&str> {
     has_base64_marker.then_some(payload)
 }
 
-fn estimate_image_tokens(image_url: &str) -> u64 {
-    let Some(encoded) = base64_image_data_url_payload(image_url) else {
-        return RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4);
-    };
+fn estimate_full_resolution_image_bytes(image_url: &str) -> Option<u64> {
+    let encoded = base64_image_data_url_payload(image_url)?;
     let decoder = base64::read::DecoderReader::new(
         encoded.as_bytes(),
         &base64::engine::general_purpose::STANDARD,
     );
-    read_image_dimensions(decoder)
-        .map(|(width, height)| {
-            u64::from(width.div_ceil(32)).saturating_mul(u64::from(height.div_ceil(32)))
-        })
-        .unwrap_or_else(|| RESIZED_IMAGE_BYTES_ESTIMATE.div_ceil(4))
+    read_image_dimensions(decoder).map(|(width, height)| {
+        u64::from(width.div_ceil(32))
+            .saturating_mul(u64::from(height.div_ceil(32)))
+            .saturating_mul(4)
+    })
 }
 
 fn read_image_dimensions(mut reader: impl Read) -> Option<(u32, u32)> {
@@ -1537,22 +1955,31 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 impl HistoryNormalization {
     fn from_history(items: &[Value]) -> Self {
         let mut normalization = Self::default();
-        for item in items {
+        let mut latest_call_indices = HashMap::new();
+        for (index, item) in items.iter().enumerate() {
             let Some(call) = call_tracking_descriptor(item) else {
                 continue;
             };
+            latest_call_indices.insert(call.call_id.to_string(), index);
             normalization.calls.insert(
                 call.call_id.to_string(),
                 TrackedCall {
                     output_kind: call.output_kind,
-                    allows_multiple_outputs: call.allows_multiple_outputs,
+                    allows_notifications: call.allows_notifications,
                     has_output: false,
                 },
             );
         }
         normalization.missing_outputs = normalization.calls.len();
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
             if let Some(output) = output_descriptor(item) {
+                if latest_call_indices
+                    .get(output.call_id)
+                    .is_some_and(|call_index| index <= *call_index)
+                {
+                    normalization.requires_rebuild = true;
+                    break;
+                }
                 normalization.record_output(output);
             }
         }
@@ -1567,7 +1994,7 @@ impl HistoryNormalization {
             if let Some(call) = call_tracking_descriptor(item) {
                 let tracked = TrackedCall {
                     output_kind: call.output_kind,
-                    allows_multiple_outputs: call.allows_multiple_outputs,
+                    allows_notifications: call.allows_notifications,
                     has_output: false,
                 };
                 match self.calls.entry(call.call_id.to_string()) {
@@ -1575,11 +2002,9 @@ impl HistoryNormalization {
                         entry.insert(tracked);
                         self.missing_outputs = self.missing_outputs.saturating_add(1);
                     }
-                    Entry::Occupied(entry)
-                        if entry.get().output_kind == tracked.output_kind
-                            && entry.get().allows_multiple_outputs
-                                == tracked.allows_multiple_outputs => {}
                     Entry::Occupied(_) => {
+                        // A prior output cannot complete a later call that reused the same ID.
+                        // Rebuild against item order before the next request.
                         self.requires_rebuild = true;
                         return;
                     }
@@ -1598,11 +2023,14 @@ impl HistoryNormalization {
             self.requires_rebuild = true;
             return;
         };
-        if call.output_kind != output.kind || (!call.allows_multiple_outputs && call.has_output) {
+        if call.output_kind != output.kind
+            || (output.is_notification && !call.allows_notifications)
+            || (!output.is_notification && call.has_output)
+        {
             self.requires_rebuild = true;
             return;
         }
-        if !call.has_output {
+        if !output.is_notification {
             self.missing_outputs = self.missing_outputs.saturating_sub(1);
             call.has_output = true;
         }
@@ -1613,82 +2041,129 @@ impl HistoryNormalization {
     }
 }
 
+#[cfg(test)]
 fn normalize_history(items: &mut Vec<Value>) {
-    let calls = items
-        .iter()
-        .filter_map(call_descriptor)
-        .map(|call| (call.call_id.clone(), call))
-        .collect::<HashMap<_, _>>();
-    let mut seen_outputs = HashSet::new();
+    let _ = normalize_history_with_recoveries(items, &HashMap::new());
+}
+
+fn normalize_history_with_recoveries(
+    items: &mut Vec<Value>,
+    recoveries: &HashMap<String, ToolRecovery>,
+) -> Vec<SessionTranscriptToolOutcome> {
+    let canonical = canonical_call_outputs(items);
+    let mut original_index = 0_usize;
     items.retain(|item| {
+        let index = original_index;
+        original_index = original_index.saturating_add(1);
         let Some(output) = output_descriptor(item) else {
             return true;
         };
-        let Some(call) = calls.get(output.call_id) else {
+        let Some(call) = canonical.calls.get(output.call_id) else {
             return false;
         };
-        if call.output_kind != output.kind {
+        if index <= call.index || call.call.output_kind != output.kind {
             return false;
         }
-        if call.allows_multiple_outputs() {
-            return true;
+        if output.is_notification {
+            return call.call.allows_notifications();
         }
-        seen_outputs.insert(output.call_id.to_string())
+        if recoveries.contains_key(output.call_id) {
+            // A remaining lifecycle with an apparently completed ID means an older output shadows
+            // a later interrupted call. Remove that stale association and synthesize one
+            // conservative output after the latest call below.
+            return false;
+        }
+        canonical.output_indices.get(output.call_id) == Some(&index)
     });
 
     let present_outputs = items
         .iter()
         .filter_map(output_descriptor)
+        .filter(|output| !output.is_notification)
         .map(|output| output.call_id.to_string())
         .collect::<HashSet<_>>();
+    let last_notification_indices = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let output = output_descriptor(item)?;
+            output
+                .is_notification
+                .then(|| (output.call_id.to_string(), index))
+        })
+        .collect::<HashMap<_, _>>();
     let mut missing = Vec::new();
-    for (index, item) in items.iter().enumerate() {
+    let mut outcomes = Vec::new();
+    let mut synthesized_calls = HashSet::new();
+    // Work newest-to-oldest so a repeated call ID gets one output at its latest occurrence. Such
+    // IDs receive only conservative recovery evidence, never evidence borrowed from one copy.
+    for (index, item) in items.iter().enumerate().rev() {
         let Some(call) = call_descriptor(item) else {
             continue;
         };
-        if !present_outputs.contains(&call.call_id) {
-            missing.push((index, synthetic_output(&call)));
+        if present_outputs.contains(&call.call_id)
+            || !synthesized_calls.insert(call.call_id.clone())
+        {
+            continue;
         }
+        let (output, transcript_output, file_change) = recoveries.get(&call.call_id).map_or_else(
+            || {
+                (
+                    Value::String(SYNTHETIC_ABORT_OUTPUT.to_string()),
+                    SessionTranscriptToolOutput::Error(SYNTHETIC_ABORT_OUTPUT.to_string()),
+                    None,
+                )
+            },
+            |recovery| {
+                (
+                    recovery.output.clone(),
+                    recovery.transcript_output.clone(),
+                    recovery.file_change.clone(),
+                )
+            },
+        );
+        let insertion = last_notification_indices
+            .get(&call.call_id)
+            .copied()
+            .unwrap_or(index)
+            .max(index);
+        missing.push((insertion, synthetic_output_with_body(&call, output)));
+        outcomes.push(SessionTranscriptToolOutcome {
+            call_id: call.call_id,
+            output: Some(transcript_output),
+            error: None,
+            file_change,
+        });
     }
-    for (index, output) in missing.into_iter().rev() {
+    missing.sort_unstable_by_key(|item| std::cmp::Reverse(item.0));
+    for (index, output) in missing {
         items.insert(index + 1, output);
     }
+    outcomes
 }
 
 #[cfg(test)]
 fn history_is_normalized(items: &[Value]) -> bool {
-    let calls = items
-        .iter()
-        .filter_map(call_descriptor)
-        .map(|call| {
-            let output_kind = call.output_kind;
-            let allows_multiple_outputs = call.allows_multiple_outputs();
-            (call.call_id, (output_kind, allows_multiple_outputs))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut present_outputs = HashSet::new();
-    let mut seen_nonrepeat_outputs = HashSet::new();
-    for item in items {
-        let Some(output) = output_descriptor(item) else {
-            continue;
-        };
-        let Some((output_kind, allows_multiple_outputs)) = calls.get(output.call_id) else {
-            return false;
-        };
-        if *output_kind != output.kind {
-            return false;
-        }
-        if *allows_multiple_outputs {
-            present_outputs.insert(output.call_id);
-        } else if !seen_nonrepeat_outputs.insert(output.call_id) {
-            return false;
-        } else {
-            present_outputs.insert(output.call_id);
-        }
+    let canonical = canonical_call_outputs(items);
+    if canonical.calls.len() != canonical.output_indices.len() {
+        return false;
     }
-    calls
-        .keys()
-        .all(|call_id| present_outputs.contains(call_id.as_str()))
+    items.iter().enumerate().all(|(index, item)| {
+        let Some(output) = output_descriptor(item) else {
+            return true;
+        };
+        let Some(call) = canonical.calls.get(output.call_id) else {
+            return false;
+        };
+        if index <= call.index || call.call.output_kind != output.kind {
+            return false;
+        }
+        if output.is_notification {
+            call.call.allows_notifications()
+        } else {
+            canonical.output_indices.get(output.call_id) == Some(&index)
+        }
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1700,7 +2175,7 @@ enum CallOutputKind {
 struct CallTrackingDescriptor<'a> {
     call_id: &'a str,
     output_kind: CallOutputKind,
-    allows_multiple_outputs: bool,
+    allows_notifications: bool,
 }
 
 fn call_tracking_descriptor(item: &Value) -> Option<CallTrackingDescriptor<'_>> {
@@ -1719,7 +2194,7 @@ fn call_tracking_descriptor(item: &Value) -> Option<CallTrackingDescriptor<'_>> 
     Some(CallTrackingDescriptor {
         call_id: item.get("call_id")?.as_str()?,
         output_kind,
-        allows_multiple_outputs: output_kind == CallOutputKind::Custom
+        allows_notifications: output_kind == CallOutputKind::Custom
             && item.get("name").and_then(Value::as_str) == Some("exec"),
     })
 }
@@ -1732,8 +2207,18 @@ struct CallDescriptor {
     output_kind: CallOutputKind,
 }
 
+struct IndexedCallDescriptor {
+    index: usize,
+    call: CallDescriptor,
+}
+
+struct CanonicalCallOutputs {
+    calls: HashMap<String, IndexedCallDescriptor>,
+    output_indices: HashMap<String, usize>,
+}
+
 impl CallDescriptor {
-    fn allows_multiple_outputs(&self) -> bool {
+    fn allows_notifications(&self) -> bool {
         self.output_kind == CallOutputKind::Custom && self.name.as_deref() == Some("exec")
     }
 }
@@ -1761,6 +2246,7 @@ fn call_descriptor(item: &Value) -> Option<CallDescriptor> {
 struct OutputDescriptor<'a> {
     call_id: &'a str,
     kind: CallOutputKind,
+    is_notification: bool,
 }
 
 fn output_descriptor(item: &Value) -> Option<OutputDescriptor<'_>> {
@@ -1772,10 +2258,76 @@ fn output_descriptor(item: &Value) -> Option<OutputDescriptor<'_>> {
     Some(OutputDescriptor {
         call_id: item.get("call_id")?.as_str()?,
         kind,
+        is_notification: kind == CallOutputKind::Custom && is_legacy_exec_notification(item),
     })
 }
 
-fn synthetic_output(call: &CallDescriptor) -> Value {
+fn canonical_call_outputs(items: &[Value]) -> CanonicalCallOutputs {
+    let calls = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let call = call_descriptor(item)?;
+            Some((call.call_id.clone(), IndexedCallDescriptor { index, call }))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut output_indices = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(output) = output_descriptor(item).filter(|output| !output.is_notification) else {
+            continue;
+        };
+        let Some(call) = calls.get(output.call_id) else {
+            continue;
+        };
+        if index > call.index && output.kind == call.call.output_kind {
+            // Preserve the first matching completion, as ordinary append processing does, while
+            // discarding any later duplicate records deterministically.
+            output_indices
+                .entry(output.call_id.to_string())
+                .or_insert(index);
+        }
+    }
+    CanonicalCallOutputs {
+        calls,
+        output_indices,
+    }
+}
+
+pub(crate) fn missing_call_output_ids(items: &[Value]) -> HashSet<String> {
+    let canonical = canonical_call_outputs(items);
+    canonical
+        .calls
+        .into_keys()
+        .filter(|call_id| !canonical.output_indices.contains_key(call_id))
+        .collect()
+}
+
+pub(crate) fn completed_function_call_ids(items: &[Value]) -> HashSet<String> {
+    let canonical = canonical_call_outputs(items);
+    canonical
+        .output_indices
+        .into_keys()
+        .filter(|call_id| {
+            canonical
+                .calls
+                .get(call_id)
+                .is_some_and(|call| call.call.output_kind == CallOutputKind::Function)
+        })
+        .collect()
+}
+
+pub(crate) fn canonical_synthetic_abort_call_ids(items: &[Value]) -> HashSet<String> {
+    canonical_call_outputs(items)
+        .output_indices
+        .into_iter()
+        .filter_map(|(call_id, index)| {
+            (items[index].get("output").and_then(Value::as_str) == Some(SYNTHETIC_ABORT_OUTPUT))
+                .then_some(call_id)
+        })
+        .collect()
+}
+
+fn synthetic_output_with_body(call: &CallDescriptor, output: Value) -> Value {
     let id = call.item_id.as_deref().map(|item_id| {
         let prefix = if call.output_kind == CallOutputKind::Custom {
             "ctco"
@@ -1795,15 +2347,14 @@ fn synthetic_output(call: &CallDescriptor) -> Value {
             "id": id,
             "type": "custom_tool_call_output",
             "call_id": call.call_id,
-            "name": call.name,
-            "output": SYNTHETIC_ABORT_OUTPUT,
+            "output": output,
         })
     } else {
         json!({
             "id": id,
             "type": "function_call_output",
             "call_id": call.call_id,
-            "output": SYNTHETIC_ABORT_OUTPUT,
+            "output": output,
         })
     }
 }

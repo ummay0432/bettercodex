@@ -6,6 +6,7 @@
 //! intentionally absent; bettercodex's fixed equivalents are rendered directly.
 
 use super::markdown;
+use super::palette;
 use super::render::line_utils::line_to_static;
 use super::terminal_hyperlinks;
 use super::terminal_hyperlinks::HyperlinkLine;
@@ -111,11 +112,14 @@ impl StatusSnapshot {
 
         let usage_note = [
             Line::from(vec![
-                Span::from("Visit ").cyan(),
-                CHATGPT_USAGE_URL.cyan().underlined(),
-                Span::from(" for up-to-date").cyan(),
+                Span::styled("Visit ", palette::accent_text_style()),
+                Span::styled(CHATGPT_USAGE_URL, palette::accent_link_style()),
+                Span::styled(" for up-to-date", palette::accent_text_style()),
             ]),
-            Line::from("information on rate limits and credits").cyan(),
+            Line::styled(
+                "information on rate limits and credits",
+                palette::accent_text_style(),
+            ),
         ];
         for source in &usage_note {
             lines.extend(

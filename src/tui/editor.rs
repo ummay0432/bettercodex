@@ -121,10 +121,6 @@ impl Editor {
         self.text.is_empty()
     }
 
-    pub(super) fn image_count(&self) -> usize {
-        self.image_attachments.len()
-    }
-
     pub(super) fn history_search_active(&self) -> bool {
         self.history_search.is_some()
     }
@@ -1447,13 +1443,6 @@ fn visual_ranges_for_display(text: &str, width: usize) -> Vec<Range<usize>> {
         ranges.push(text.len()..text.len());
     }
     ranges
-}
-
-pub(super) fn wrap_text(text: &str, width: u16) -> Vec<String> {
-    visual_ranges(text, usize::from(width.max(1)))
-        .into_iter()
-        .map(|range| text[range].replace('\t', " "))
-        .collect()
 }
 
 fn wrap_logical_line(

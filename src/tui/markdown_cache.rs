@@ -6,6 +6,7 @@
 //! buffer; a filtered copy is allocated only after a control character appears.
 
 use super::markdown;
+use super::palette;
 use super::terminal_hyperlinks::HyperlinkLine;
 use super::terminal_hyperlinks::web_destination;
 use crate::web_search::UrlCitation;
@@ -141,7 +142,10 @@ fn append_citation_lines(lines: &mut Vec<HyperlinkLine>, citations: &[UrlCitatio
     )));
     for (index, (title, destination)) in sources.into_iter().enumerate() {
         let mut line = HyperlinkLine::new(Line::from(Span::from(format!("{}. ", index + 1)).dim()));
-        line.push_span(Span::from(title).cyan().underlined(), Some(&destination));
+        line.push_span(
+            Span::styled(title, palette::accent_link_style()),
+            Some(&destination),
+        );
         lines.push(line);
     }
 }

@@ -70,7 +70,9 @@ pub(crate) fn prepare_history_images(items: &mut [Value]) {
 pub(crate) fn image_content_items_mut(item: &mut Value) -> Option<&mut Vec<Value>> {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => item.get_mut("content")?.as_array_mut(),
-        Some("function_call_output") => item.get_mut("output")?.as_array_mut(),
+        Some("function_call_output" | "custom_tool_call_output") => {
+            item.get_mut("output")?.as_array_mut()
+        }
         _ => None,
     }
 }

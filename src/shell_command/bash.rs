@@ -96,6 +96,12 @@ pub(super) fn try_parse_word_only_commands_sequence(
     Some(commands)
 }
 
+/// Parses a shell script consisting only of plain commands joined by safe operators.
+pub(super) fn parse_shell_script_into_commands(script: &str) -> Option<Vec<Vec<String>>> {
+    let tree = try_parse_shell(script)?;
+    try_parse_word_only_commands_sequence(&tree, script)
+}
+
 pub(super) fn extract_bash_command(command: &[String]) -> Option<(&str, &str)> {
     let [shell, flag, script] = command else {
         return None;

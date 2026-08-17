@@ -6,7 +6,7 @@ use ansi_to_tui::IntoText;
 use ratatui::text::Line;
 use ratatui::text::Text;
 
-fn expand_tabs(input: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn expand_tabs(input: &str) -> std::borrow::Cow<'_, str> {
     if input.contains('\t') {
         std::borrow::Cow::Owned(input.replace('\t', "    "))
     } else {

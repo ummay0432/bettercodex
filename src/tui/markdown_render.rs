@@ -39,20 +39,19 @@
 //! body rows, or even 3-char-wide columns cannot fit, body rows render as
 //! key/value records.
 
+use crate::ansi_escape::expand_tabs;
 use crate::paths::home_dir;
 use crate::text::normalize_markdown_hash_location_suffix;
 use crate::tui::markdown_style::table_separator_style;
 use crate::tui::markdown_text_merge::DecodedTextMerge;
+use crate::tui::palette;
 use crate::tui::render::highlight::foreground_style_for_scopes;
 use crate::tui::render::highlight::highlight_code_to_lines;
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::terminal_hyperlinks::HyperlinkLine;
 use crate::tui::terminal_hyperlinks::annotate_web_urls_in_line;
 use crate::tui::terminal_hyperlinks::remap_wrapped_line;
-#[cfg(test)]
-use crate::tui::terminal_hyperlinks::visible_lines;
 use crate::tui::terminal_hyperlinks::web_destination;
-use crate::tui::width::char_width;
 use crate::tui::width::display_width;
 use crate::tui::wrapping::RtOptions;
 use crate::tui::wrapping::adaptive_wrap_line;
@@ -69,13 +68,12 @@ use pulldown_cmark::TagEnd;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
-#[cfg(test)]
-use ratatui::text::Text;
 use regex::Regex;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
 mod streaming;
@@ -115,13 +113,13 @@ impl Default for MarkdownStyles {
             h4: Style::new().italic(),
             h5: Style::new().italic(),
             h6: Style::new().italic(),
-            code: Style::new().cyan(),
+            code: palette::accent_text_style(),
             emphasis: Style::new().italic(),
             strong: Style::new().bold(),
             strikethrough: Style::new().crossed_out(),
-            ordered_list_marker: Style::new().light_blue(),
+            ordered_list_marker: palette::accent_text_style(),
             unordered_list_marker: Style::new(),
-            link: Style::new().cyan().underlined(),
+            link: palette::accent_link_style(),
             blockquote: Style::new().green(),
         }
     }
@@ -281,46 +279,6 @@ struct TableColumnMetrics {
     body_token_width: usize,
     /// Classification derived from body token density and average cell content.
     kind: TableColumnKind,
-}
-
-/// Render markdown with default wrapping behavior.
-///
-/// Use this when the caller does not have a concrete render width yet (for
-/// example, snapshot tests or contexts that intentionally defer wrapping). If
-/// a viewport width is known, prefer [`render_markdown_text_with_width`] so
-/// table fallback and line wrapping decisions match the visible terminal.
-#[cfg(test)]
-pub fn render_markdown_text(input: &str) -> Text<'static> {
-    render_markdown_text_with_width(input, /*width*/ None)
-}
-
-/// Render markdown constrained to a known terminal width.
-///
-/// The renderer preserves columnar table structure while values remain
-/// scannable and falls back to key/value records when body rows cannot fit
-/// readably. Passing `None` keeps intrinsic line widths and disables
-/// width-driven wrapping in the markdown writer. Local file links render
-/// relative to the current process working directory.
-#[cfg(test)]
-pub(crate) fn render_markdown_text_with_width(input: &str, width: Option<usize>) -> Text<'static> {
-    let cwd = std::env::current_dir().ok();
-    render_markdown_text_with_width_and_cwd(input, width, cwd.as_deref())
-}
-
-/// Render markdown with an explicit working directory for local file links.
-///
-/// The `cwd` parameter controls how absolute local targets are shortened before display. Passing
-/// the session cwd keeps full renders, history cells, and streamed deltas visually aligned even
-/// when rendering happens away from the process cwd.
-#[cfg(test)]
-pub(crate) fn render_markdown_text_with_width_and_cwd(
-    input: &str,
-    width: Option<usize>,
-    cwd: Option<&Path>,
-) -> Text<'static> {
-    Text::from(visible_lines(render_markdown_lines_with_width_and_cwd(
-        input, width, cwd,
-    )))
 }
 
 pub(crate) fn render_markdown_lines_with_width_and_cwd(
@@ -741,7 +699,9 @@ where
         }
         self.line_ends_with_local_link_target = false;
         if self.in_table_cell() {
-            self.push_span_to_table_cell(Span::from(code.into_string()).style(self.styles.code));
+            self.push_span_to_table_cell(
+                Span::from(expand_tabs(code.as_ref()).into_owned()).style(self.styles.code),
+            );
             return;
         }
 
@@ -749,7 +709,7 @@ where
             self.push_line(Line::default());
             self.pending_marker_line = false;
         }
-        let span = Span::from(code.into_string()).style(self.styles.code);
+        let span = Span::from(expand_tabs(code.as_ref()).into_owned()).style(self.styles.code);
         self.push_span(span);
     }
 
@@ -764,7 +724,7 @@ where
                 if i > 0 {
                     self.push_table_cell_hard_break();
                 }
-                self.push_span_to_table_cell(Span::styled(line.to_string(), style));
+                self.push_span_to_table_cell(Span::styled(expand_tabs(line).into_owned(), style));
             }
             if !inline {
                 self.push_table_cell_hard_break();
@@ -781,7 +741,7 @@ where
                 self.push_line(Line::default());
             }
             let style = self.inline_styles.last().copied().unwrap_or_default();
-            self.push_span(Span::styled(line.to_string(), style));
+            self.push_span(Span::styled(expand_tabs(line).into_owned(), style));
         }
         self.needs_newline = !inline;
     }
@@ -1083,7 +1043,7 @@ where
     }
 
     fn push_text_spans_to_table_cell(&mut self, text: &str, style: Style) {
-        let span = Span::styled(text.to_string(), style);
+        let span = Span::styled(expand_tabs(text).into_owned(), style);
         let destination = self
             .link
             .as_ref()
@@ -1625,7 +1585,7 @@ where
                         out.push_span(Span::raw(std::mem::take(current_text)), destination);
                     }
                 };
-                for ch in text.chars() {
+                for grapheme in text.graphemes(/*is_extended*/ true) {
                     let destination = line
                         .hyperlinks
                         .iter()
@@ -1635,12 +1595,14 @@ where
                         flush(&mut out, &mut current_text, current_destination);
                         current_destination = destination;
                     }
-                    if ch == '|' {
-                        current_text.push_str("\\|");
-                    } else {
-                        current_text.push(ch);
+                    for character in grapheme.chars() {
+                        if character == '|' {
+                            current_text.push_str("\\|");
+                        } else {
+                            current_text.push(character);
+                        }
                     }
-                    column += char_width(ch);
+                    column += display_width(grapheme);
                 }
                 flush(&mut out, &mut current_text, current_destination);
             }
@@ -2026,7 +1988,7 @@ where
     }
 
     fn push_text_spans(&mut self, text: &str, style: Style) {
-        let span = Span::styled(text.to_string(), style);
+        let span = Span::styled(expand_tabs(text).into_owned(), style);
         let destination = self
             .link
             .as_ref()
@@ -2272,6 +2234,20 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ratatui::text::Text;
 
+    fn render_markdown_text(input: &str) -> Text<'static> {
+        render_markdown_text_with_width(input, /*width*/ None)
+    }
+
+    fn render_markdown_text_with_width(input: &str, width: Option<usize>) -> Text<'static> {
+        let cwd = std::env::current_dir().ok();
+        Text::from(
+            render_markdown_lines_with_width_and_cwd(input, width, cwd.as_deref())
+                .into_iter()
+                .map(|line| line.line)
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn lines_to_strings(text: &Text<'_>) -> Vec<String> {
         text.lines
             .iter()
@@ -2447,6 +2423,23 @@ mod tests {
             lines,
             vec!["fn main() {}".to_string(), "    line2".to_string()],
             "CRLF code block should not produce extra blank lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn literal_citations_and_indented_code_preserve_visible_source_text() {
+        let markdown = "Before 【F:/x.rs†L1】\n\n    code  1\n\nAfter 【F:/x.rs†L3】\n";
+        let rendered = render_markdown_text(markdown);
+
+        assert_eq!(
+            lines_to_strings(&rendered),
+            vec![
+                "Before 【F:/x.rs†L1】",
+                "",
+                "    code  1",
+                "",
+                "After 【F:/x.rs†L3】",
+            ]
         );
     }
 
@@ -2874,12 +2867,53 @@ mod tests {
     }
 
     #[test]
+    fn local_file_links_show_the_target_without_web_hyperlink_metadata() {
+        let lines = render_markdown_lines_with_width_and_cwd(
+            "[arbitrary label](file:///tmp/bettercodex/src/main.rs#L12C3)",
+            /*width*/ Some(80),
+            Some(Path::new("/tmp/bettercodex")),
+        );
+        let visible = lines
+            .iter()
+            .flat_map(|line| &line.line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(visible, "src/main.rs:12:3");
+        assert!(lines.iter().all(|line| line.hyperlinks.is_empty()));
+    }
+
+    #[test]
+    fn literal_tabs_stay_visible_in_markdown_and_fenced_code() {
+        let lines = render_markdown_lines_with_width_and_cwd(
+            "before\tafter\n\n```bash\nprintf one\tthen-two\n```",
+            /*width*/ Some(80),
+            /*cwd*/ None,
+        );
+        let visible = lines
+            .iter()
+            .map(|line| {
+                line.line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!visible.contains('\t'));
+        assert!(visible.contains("before    after"), "{visible}");
+        assert!(visible.contains("printf one    then-two"), "{visible}");
+    }
+
+    #[test]
     fn pipe_table_fallback_keeps_web_annotations() {
         let destination = "https://example.com/a/long/path";
         let target = "https://target.example/path";
         let code_url = "https://code.example/not-a-link";
         let markdown = format!(
-            "| URL | Code | Label |\n| --- | --- | --- |\n| {destination} | `{code_url}` | [https://shown.example]({target}) |\n"
+            "| URL | Code | Label |\n| --- | --- | --- |\n| 👩‍💻e\u{301} {destination} | `{code_url}` | [https://shown.example]({target}) |\n"
         );
         let lines = render_markdown_lines_with_width_and_cwd(
             &markdown,
@@ -2895,5 +2929,30 @@ mod tests {
         assert!(destinations.contains(&target));
         assert!(!destinations.contains(&code_url));
         assert!(!destinations.contains(&"https://shown.example"));
+
+        let mut linked_visible = String::new();
+        for line in &lines {
+            let visible = line
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            for link in line
+                .hyperlinks
+                .iter()
+                .filter(|link| link.destination == destination)
+            {
+                let mut column = 0usize;
+                for grapheme in visible.graphemes(/*is_extended*/ true) {
+                    let next = column.saturating_add(display_width(grapheme));
+                    if column < link.columns.end && next > link.columns.start {
+                        linked_visible.push_str(grapheme);
+                    }
+                    column = next;
+                }
+            }
+        }
+        assert_eq!(linked_visible, destination);
     }
 }

@@ -1,7 +1,9 @@
 use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
 use super::bottom_pane::selection_popup_common::render_menu_surface;
 use super::context_window::format_tokens;
+use super::palette;
 use super::render::line_utils::line_to_static;
+use super::width::display_width;
 use super::wrapping::RtOptions;
 use super::wrapping::word_wrap_line;
 use crate::context::estimated_tokens;
@@ -123,11 +125,10 @@ impl ToolsView {
         let mut lines = vec![Line::from("Tools").bold()];
         lines.extend(wrap_owned(
             Line::from(vec![
-                Span::from(format!(
-                    "{direct_functions} direct functions + hosted web search"
-                ))
-                .cyan()
-                .bold(),
+                Span::styled(
+                    format!("{direct_functions} direct functions + hosted web search"),
+                    palette::accent_style(),
+                ),
                 Span::from(format!(
                     "  ·  ~{} estimated context tokens per request",
                     format_tokens(total_tokens)
@@ -209,15 +210,15 @@ fn brief_description(description: &'static str) -> &'static str {
 
 fn tool_header_lines(tool: &ToolSummary, width: usize) -> Vec<Line<'static>> {
     let token_label = format!("~{} tokens", format_tokens(tool.tokens));
-    let left_width = 2_usize.saturating_add(unicode_width::UnicodeWidthStr::width(tool.name));
-    let token_width = unicode_width::UnicodeWidthStr::width(token_label.as_str());
+    let left_width = 2_usize.saturating_add(display_width(tool.name));
+    let token_width = display_width(&token_label);
     let gap = width
         .saturating_sub(left_width.saturating_add(token_width))
         .max(2);
     wrap_owned(
         Line::from(vec![
-            Span::from("• ").cyan(),
-            Span::from(tool.name).cyan().bold(),
+            Span::styled("• ", palette::accent_text_style()),
+            Span::styled(tool.name, palette::accent_style()),
             Span::from(" ".repeat(gap)),
             Span::from(token_label).style(Style::default().fg(MUTED)),
         ]),

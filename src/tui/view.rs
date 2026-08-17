@@ -18,7 +18,6 @@ use super::model_picker::ModelPickerAction;
 use super::palette;
 use super::palette::TerminalColors;
 use super::pending_input::PendingInput;
-use super::pending_input::QueuedFollowUp;
 use super::presentation::AssistantPresentation;
 #[cfg(test)]
 use super::presentation::MIN_FRAME_INTERVAL;
@@ -56,11 +55,18 @@ use crate::rollout::SessionTranscriptTool;
 use crate::rollout::SessionTranscriptToolOrigin;
 use crate::rollout::SessionTranscriptToolOutput;
 use crate::service_tier::ServiceTier;
+use crate::shell_command::is_only_plain_ripgrep_script;
 use crate::shell_command::parse_command::parse_command;
 use crate::skills::Skill;
 use crate::skills::SkillSelection;
 use crate::skills::SkillUpdate;
+use crate::tui::render::highlight::highlight_bash_to_lines;
 use crate::tui::render::line_utils::line_to_static;
+use crate::tui::width::display_width;
+use crate::tui::width::line_width;
+use crate::tui::wrapping::RtOptions;
+use crate::tui::wrapping::adaptive_wrap_line;
+use crate::tui::wrapping::line_contains_url_like;
 use crate::tui::wrapping::word_wrap_line;
 use crate::update::AvailableUpdate;
 use crossterm::event::Event;
@@ -90,7 +96,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 const MUTED: Color = Color::Indexed(245);
@@ -192,7 +197,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "quit",
-        aliases: &["exit"],
+        aliases: &["exit", "q"],
         description: "leave bettercodex",
     },
 ];
@@ -202,7 +207,6 @@ pub(super) enum Action {
     None,
     LoadPromptHistory,
     Submit(ComposerSubmission),
-    Queue(ComposerSubmission),
     Cancel,
     Compact,
     ToggleFast,
@@ -211,9 +215,12 @@ pub(super) enum Action {
     Clear(ComposerSubmission),
     Fork(ComposerSubmission),
     OpenResumePicker(ComposerSubmission),
-    ResumeSession {
+    CloseResumePicker,
+    CancelResumeLoad,
+    ResumeSessionFromPicker(Uuid),
+    ResumeSessionFromComposer {
         id: Uuid,
-        submission: Option<ComposerSubmission>,
+        submission: ComposerSubmission,
     },
     RunShellCommand {
         command: String,
@@ -240,9 +247,12 @@ pub(super) struct ComposerSubmission {
 impl ComposerSubmission {
     fn take(editor: &mut Editor) -> Self {
         let draft = editor.snapshot();
-        editor.remember_snapshot(&draft);
         let prompt = editor.take_prompt();
         Self { prompt, draft }
+    }
+
+    fn remember(&self, editor: &mut Editor) {
+        editor.remember_snapshot(&self.draft);
     }
 
     pub(super) fn prompt(&self) -> &UserPrompt {
@@ -438,6 +448,8 @@ struct ToolEntry {
     input: Option<Value>,
     display: ToolDisplay,
     outcome: Option<ToolOutcome>,
+    empty_ripgrep_result: bool,
+    recovery: Option<String>,
     file_change: Option<ToolFileChange>,
     live_output: String,
     command_output_cache: Option<CommandOutputRenderCache>,
@@ -473,6 +485,14 @@ enum ToolDisplay {
 #[derive(Debug)]
 struct ToolOutcome {
     output: Result<Value, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolStatus {
+    Active,
+    Succeeded,
+    Failed,
+    Recovered,
 }
 
 struct Repository {
@@ -604,6 +624,12 @@ impl View {
         }
     }
 
+    pub(super) fn refresh_skills(&mut self, skills: &[Skill]) {
+        if self.skills != skills {
+            self.set_skills(skills.to_vec());
+        }
+    }
+
     pub(super) fn skill_update_failed(&mut self, error: impl Into<String>) {
         let error = error.into();
         if let Some(Overlay::Skills(skills)) = self.overlay.as_mut() {
@@ -720,11 +746,7 @@ impl View {
         self.pending_input.queue_follow_up(prompt);
     }
 
-    pub(super) fn queue_shell_follow_up(&mut self, prompt: UserPrompt, command: String) {
-        self.pending_input.queue_shell_follow_up(prompt, command);
-    }
-
-    pub(super) fn pop_next_queued_follow_up(&mut self) -> Option<QueuedFollowUp> {
+    pub(super) fn pop_next_queued_follow_up(&mut self) -> Option<UserPrompt> {
         self.pending_input.pop_next_follow_up()
     }
 
@@ -760,7 +782,7 @@ impl View {
         self.add_error(error);
     }
 
-    fn restore_composer_submission(&mut self, submission: ComposerSubmission) {
+    pub(super) fn restore_composer_submission(&mut self, submission: ComposerSubmission) {
         self.editor.restore_snapshot(submission.draft);
         self.dismiss_composer_completions();
     }
@@ -788,7 +810,7 @@ impl View {
     pub(super) fn finish_turn(
         &mut self,
         result: anyhow::Result<SubmitOutcome>,
-    ) -> Option<UserPrompt> {
+    ) -> Option<Vec<(SteerId, UserPrompt)>> {
         self.flush_presentation();
         self.refresh_repository_if_pending();
         self.close_streaming_entries();
@@ -833,7 +855,7 @@ impl View {
                     self.entries.push(TranscriptEntry::Notice(
                         "Model interrupted to submit steering input".to_string(),
                     ));
-                    Some(UserPrompt::joined(steers))
+                    Some(steers)
                 }
             }
             Err(error) => {
@@ -1508,14 +1530,9 @@ impl View {
         if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
             return match picker.handle_key(key) {
                 ResumePickerAction::None => Action::None,
-                ResumePickerAction::Close => {
-                    self.overlay = None;
-                    Action::None
-                }
-                ResumePickerAction::Resume(id) => Action::ResumeSession {
-                    id,
-                    submission: None,
-                },
+                ResumePickerAction::Close => Action::CloseResumePicker,
+                ResumePickerAction::CancelResume => Action::CancelResumeLoad,
+                ResumePickerAction::Resume(id) => Action::ResumeSessionFromPicker(id),
             };
         }
         if let Some(Overlay::Model(picker)) = self.overlay.as_mut() {
@@ -1633,7 +1650,8 @@ impl View {
             && self.slash_matches().is_empty()
         {
             if let Some(prompt) = self.pending_input.pop_latest_follow_up() {
-                self.restore_prompts_to_composer(vec![prompt]);
+                self.editor.set_user_prompt(&prompt);
+                self.dismiss_composer_completions();
             }
             return Action::None;
         }
@@ -1734,9 +1752,6 @@ impl View {
                 KeyCode::Tab => {
                     let command = slash_matches[selected];
                     self.complete_slash_command(command, selected);
-                    if command.name == "skills" {
-                        return self.submit_action();
-                    }
                     self.editor.insert(" ");
                     return Action::None;
                 }
@@ -1744,15 +1759,8 @@ impl View {
             }
         }
 
-        if key.code == KeyCode::Tab && !shift && !alt && !control {
-            return if self.has_active_task() {
-                self.queue_action()
-            } else {
-                self.submit_action()
-            };
-        }
-
-        let previous_text = self.editor.text().to_string();
+        let previous_text = (self.dismissed_slash.is_some() || self.slash_selection.is_some())
+            .then(|| self.editor.text().to_string());
         match key.code {
             KeyCode::Enter if shift || alt || control => self.editor.insert_newline(),
             KeyCode::Enter => return self.submit_action(),
@@ -1795,7 +1803,10 @@ impl View {
             KeyCode::Down => self.editor.move_vertical(1, self.composer_text_width),
             _ => {}
         }
-        if self.editor.text() != previous_text {
+        if previous_text
+            .as_deref()
+            .is_some_and(|previous| self.editor.text() != previous)
+        {
             self.dismissed_slash = None;
             self.slash_selection = None;
         }
@@ -1896,9 +1907,14 @@ impl View {
             return Action::None;
         }
         let submission = ComposerSubmission::take(&mut self.editor);
-        let history_text = submission.prompt().text_without_image_placeholders();
+        let history_text = submission
+            .prompt()
+            .text_without_image_placeholders()
+            .into_owned();
         let command = history_text.trim();
         let local_command = submission.prompt().image_count() == 0;
+        let slash_command =
+            local_command && !history_text.starts_with(' ') && command.starts_with('/');
         if local_command && let Some(shell_command) = command.strip_prefix('!') {
             let shell_command = shell_command.trim();
             if shell_command.is_empty() {
@@ -1909,12 +1925,36 @@ impl View {
                     ),
                 );
             }
+            submission.remember(&mut self.editor);
             return Action::RunShellCommand {
                 command: shell_command.to_string(),
                 history_text: command.to_string(),
             };
         }
-        if local_command
+        if slash_command {
+            let name = command
+                .strip_prefix('/')
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
+            let known = SLASH_COMMANDS
+                .iter()
+                .flat_map(SlashCommand::names)
+                .any(|candidate| candidate == name);
+            if !name.is_empty() && !name.contains('/') && !known {
+                return self.reject_local_submission(
+                    submission,
+                    TranscriptEntry::Notice(format!(
+                        "Unrecognized command '/{name}'. Type \"/\" for a list of supported commands."
+                    )),
+                );
+            }
+        }
+        if !(slash_command && command == "/clear") {
+            submission.remember(&mut self.editor);
+        }
+        if slash_command
             && let Some(arguments) = command.strip_prefix("/resume")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
@@ -1931,10 +1971,7 @@ impl View {
                 return Action::OpenResumePicker(submission);
             }
             return match Uuid::parse_str(arguments) {
-                Ok(id) => Action::ResumeSession {
-                    id,
-                    submission: Some(submission),
-                },
+                Ok(id) => Action::ResumeSessionFromComposer { id, submission },
                 Err(_) => self.reject_local_submission(
                     submission,
                     TranscriptEntry::Error(
@@ -1943,7 +1980,7 @@ impl View {
                 ),
             };
         }
-        if local_command
+        if slash_command
             && let Some(arguments) = command.strip_prefix("/tmux")
             && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
         {
@@ -1956,7 +1993,7 @@ impl View {
             };
         }
         match command {
-            _ if !local_command => Action::Submit(submission),
+            _ if !slash_command => Action::Submit(submission),
             "/q" | "/quit" | "/exit" => Action::Quit,
             "/compact" if self.has_active_task() => self.reject_local_submission(
                 submission,
@@ -1987,14 +2024,14 @@ impl View {
             "/fork" if self.has_active_task() => self.reject_local_submission(
                 submission,
                 TranscriptEntry::Notice(
-                    "Interrupt the active turn before forking this session".to_string(),
+                    "Interrupt the active task before forking this session".to_string(),
                 ),
             ),
             "/fork" => Action::Fork(submission),
             "/clear" if self.has_active_task() => self.reject_local_submission(
                 submission,
                 TranscriptEntry::Notice(
-                    "Interrupt the active turn before starting a fresh session".to_string(),
+                    "Interrupt the active task before starting a fresh session".to_string(),
                 ),
             ),
             "/clear" => Action::Clear(submission),
@@ -2023,7 +2060,7 @@ impl View {
             }
             "/logout" if self.has_active_task() => self.reject_local_submission(
                 submission,
-                TranscriptEntry::Notice("Interrupt the active turn before logging out".to_string()),
+                TranscriptEntry::Notice("Interrupt the active task before logging out".to_string()),
             ),
             "/logout" => Action::Logout,
             _ => Action::Submit(submission),
@@ -2038,23 +2075,6 @@ impl View {
         self.restore_composer_submission(submission);
         self.entries.push(entry);
         Action::None
-    }
-
-    fn queue_action(&mut self) -> Action {
-        if self.editor.text().trim().is_empty() {
-            return Action::None;
-        }
-        let command = self.editor.text().trim();
-        if self.editor.image_count() == 0 && !command.starts_with('!') && is_local_command(command)
-        {
-            self.entries.push(TranscriptEntry::Notice(
-                "Slash commands cannot be queued; use Enter or wait for the active turn"
-                    .to_string(),
-            ));
-            return Action::None;
-        }
-        let submission = ComposerSubmission::take(&mut self.editor);
-        Action::Queue(submission)
     }
 
     fn copy_latest_final_action(&mut self) -> Action {
@@ -2697,11 +2717,8 @@ impl View {
 
         if self.overlay.is_none() && self.editor.history_search_active() && !footer_area.is_empty()
         {
-            let prefix_width = UnicodeWidthStr::width("reverse-i-search: ");
-            let query_width = self
-                .editor
-                .history_search_query()
-                .map_or(0, UnicodeWidthStr::width);
+            let prefix_width = display_width("reverse-i-search: ");
+            let query_width = self.editor.history_search_query().map_or(0, display_width);
             let cursor_x = footer_area
                 .x
                 .saturating_add(u16::try_from(prefix_width + query_width).unwrap_or(u16::MAX))
@@ -2941,20 +2958,23 @@ impl View {
             self.editor.history_search_query(),
             self.editor.history_search_status(),
         ) {
-            let mut spans = vec!["reverse-i-search: ".dim(), query.to_string().cyan()];
+            let mut spans = vec![
+                "reverse-i-search: ".dim(),
+                Span::styled(query.to_string(), palette::accent_text_style()),
+            ];
             match status {
                 editor::HistorySearchStatus::Idle => {}
                 editor::HistorySearchStatus::Match => spans.extend([
                     "  ".into(),
-                    "Enter".cyan().bold(),
+                    Span::styled("Enter", palette::accent_style()),
                     " accept · ".dim(),
-                    "Esc".cyan().bold(),
+                    Span::styled("Esc", palette::accent_style()),
                     " cancel".dim(),
                 ]),
                 editor::HistorySearchStatus::Searching => {
                     spans.push("  searching older prompts…".dim());
                 }
-                editor::HistorySearchStatus::NoMatch => spans.push("  no match".red()),
+                editor::HistorySearchStatus::NoMatch => spans.push("  no match".dim()),
             }
             return truncate_line(Line::from(spans), usize::from(width));
         }
@@ -2966,14 +2986,11 @@ impl View {
             ),
         ];
         if self.service_tier.is_fast() {
-            spans.push(Span::styled(" fast", Style::default().fg(Color::Magenta)));
+            spans.push(Span::styled(" fast", palette::soft_accent_style()));
         }
         spans.extend([
             Span::styled(" │ ", Style::default().fg(MUTED)),
-            Span::styled(
-                self.repository.name.clone(),
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(self.repository.name.clone(), palette::accent_text_style()),
         ]);
         if let Some(branch) = &self.repository.branch {
             spans.push(Span::styled(
@@ -3009,41 +3026,6 @@ impl View {
         }
         lines
     }
-}
-
-fn is_local_command(command: &str) -> bool {
-    if command.starts_with('!') {
-        return true;
-    }
-    if let Some(arguments) = command.strip_prefix("/resume")
-        && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
-    {
-        return true;
-    }
-    if let Some(arguments) = command.strip_prefix("/tmux")
-        && (arguments.is_empty() || arguments.starts_with(char::is_whitespace))
-    {
-        return true;
-    }
-    matches!(
-        command,
-        "/q" | "/quit"
-            | "/exit"
-            | "/compact"
-            | "/model"
-            | "/fast"
-            | "/changelog"
-            | "/copy"
-            | "/diff"
-            | "/clear"
-            | "/fork"
-            | "/context"
-            | "/tools"
-            | "/status"
-            | "/help"
-            | "/skills"
-            | "/logout"
-    )
 }
 
 impl TranscriptEntry {
@@ -3201,6 +3183,8 @@ impl ToolEntry {
             input,
             display,
             outcome: None,
+            empty_ripgrep_result: false,
+            recovery: None,
             file_change: None,
             live_output: String::new(),
             command_output_cache: None,
@@ -3238,10 +3222,16 @@ impl ToolEntry {
             .map(|change| display_tool_path(&change.path, cwd));
         tool.set_file_change(file_change, authoritative_path);
         if let Some(output) = output {
-            tool.set_outcome(match output {
-                SessionTranscriptToolOutput::Success(output) => Ok(output),
-                SessionTranscriptToolOutput::Error(error) => Err(error),
-            });
+            if matches!(tool.name.as_str(), "write" | "edit")
+                && let Some(message) = output.recovered_file_state_message()
+            {
+                tool.set_recovery(message.to_string());
+            } else {
+                tool.set_outcome(match output {
+                    SessionTranscriptToolOutput::Success(output) => Ok(output),
+                    SessionTranscriptToolOutput::Error(error) => Err(error),
+                });
+            }
         }
         tool.finish_if_incomplete();
         tool
@@ -3249,15 +3239,21 @@ impl ToolEntry {
 
     fn session_transcript_tool(&self, retain_success_output: bool) -> SessionTranscriptTool {
         let retain_success_output = matches!(&self.display, ToolDisplay::Command { .. })
-            && (retain_success_output || self.succeeded() == Some(false));
-        let output = self.outcome.as_ref().map(|outcome| match &outcome.output {
-            Ok(output) => SessionTranscriptToolOutput::Success(if retain_success_output {
-                output.clone()
-            } else {
-                Value::Null
-            }),
-            Err(error) => SessionTranscriptToolOutput::Error(error.clone()),
-        });
+            && (retain_success_output || self.status() == ToolStatus::Failed);
+        let output = if let Some(recovery) = &self.recovery {
+            Some(SessionTranscriptToolOutput::recovered_file_state(
+                recovery.clone(),
+            ))
+        } else {
+            self.outcome.as_ref().map(|outcome| match &outcome.output {
+                Ok(output) => SessionTranscriptToolOutput::Success(if retain_success_output {
+                    output.clone()
+                } else {
+                    Value::Null
+                }),
+                Err(error) => SessionTranscriptToolOutput::Error(error.clone()),
+            })
+        };
         SessionTranscriptTool {
             call_id: self.call_id.clone(),
             origin: match self.origin {
@@ -3272,6 +3268,9 @@ impl ToolEntry {
     }
 
     fn is_exploration(&self) -> bool {
+        if self.origin != ToolOrigin::Agent {
+            return false;
+        }
         match &self.display {
             ToolDisplay::Read(_) => true,
             ToolDisplay::Command { parsed, .. } => {
@@ -3325,6 +3324,8 @@ impl ToolEntry {
     }
 
     fn set_outcome(&mut self, output: Result<Value, String>) {
+        self.recovery = None;
+        self.empty_ripgrep_result = self.is_empty_ripgrep_result(&output);
         // Successful non-command payloads are model-facing data that these cells never render.
         // Retain errors and command output, but do not duplicate large reads or web results in the
         // long-lived TUI transcript.
@@ -3333,6 +3334,16 @@ impl ToolEntry {
             (_, output) => output,
         };
         self.outcome = Some(ToolOutcome { output });
+        self.live_output = String::new();
+        self.command_output_cache = None;
+    }
+
+    fn set_recovery(&mut self, message: String) {
+        self.outcome = Some(ToolOutcome {
+            output: Ok(Value::Null),
+        });
+        self.empty_ripgrep_result = false;
+        self.recovery = Some(message);
         self.live_output = String::new();
         self.command_output_cache = None;
     }
@@ -3352,7 +3363,9 @@ impl ToolEntry {
             ToolDisplay::Command { .. } => unreachable!("commands return before display dispatch"),
             ToolDisplay::Read(path) => file_change_lines(self, "Reading", path, width),
             ToolDisplay::FileChange { path, action } => {
-                if self.succeeded() == Some(true)
+                if self.recovery.is_some() {
+                    file_change_lines(self, action, path, width)
+                } else if self.status() == ToolStatus::Succeeded
                     && let Some(file_change) = &self.file_change
                 {
                     file_change::lines(path, &file_change.change, width, user_style)
@@ -3364,15 +3377,48 @@ impl ToolEntry {
         }
     }
 
-    fn succeeded(&self) -> Option<bool> {
-        let outcome = self.outcome.as_ref()?;
-        Some(match &outcome.output {
-            Err(_) => false,
-            Ok(output) => output
-                .get("exit_code")
-                .and_then(Value::as_i64)
-                .is_none_or(|code| code == 0),
-        })
+    fn status(&self) -> ToolStatus {
+        if self.recovery.is_some() {
+            return ToolStatus::Recovered;
+        }
+        let Some(outcome) = &self.outcome else {
+            return ToolStatus::Active;
+        };
+        match &outcome.output {
+            Err(_) => ToolStatus::Failed,
+            Ok(output)
+                if output
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|code| code != 0) =>
+            {
+                ToolStatus::Failed
+            }
+            Ok(_) => ToolStatus::Succeeded,
+        }
+    }
+
+    fn failed_for_display(&self) -> bool {
+        self.status() == ToolStatus::Failed && !self.empty_ripgrep_result
+    }
+
+    // Ripgrep reserves status 1 for a completed search with no matches. Preserve that status in
+    // the tool result, but do not present an output-free agent script containing only plain `rg`
+    // commands as a failure. Use the source script rather than lossy display metadata: the latter
+    // intentionally drops helpers such as `cd`, `head`, and `true`.
+    fn is_empty_ripgrep_result(&self, output: &Result<Value, String>) -> bool {
+        if self.origin != ToolOrigin::Agent {
+            return false;
+        }
+        let ToolDisplay::Command { command, .. } = &self.display else {
+            return false;
+        };
+        let Ok(output) = output else {
+            return false;
+        };
+        output.get("exit_code").and_then(Value::as_i64) == Some(1)
+            && command_output_is_empty(output)
+            && is_only_plain_ripgrep_script(command)
     }
 }
 
@@ -3505,10 +3551,7 @@ fn patch_notes_lines(
         )
     };
 
-    let heading = Line::from(Span::styled(
-        "What's New",
-        Style::default().fg(Color::Cyan).bold(),
-    ));
+    let heading = Line::from(Span::styled("What's New", palette::accent_style()));
     let heading = word_wrap_line(&heading, content_width)
         .iter()
         .map(line_to_static)
@@ -3532,15 +3575,15 @@ fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec
         return Vec::new();
     }
     let content_width = usize::from(available_width.saturating_sub(4)).min(60);
-    let warning = Style::default().fg(Color::Yellow);
+    let warning = Style::default().fg(palette::warning_color());
     let source = [
-        Line::from(Span::styled(
-            "Update available",
-            warning.add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled("Update available", warning.bold())),
         Line::from(vec![
             Span::from("Run ").dim(),
-            Span::styled("bcodex update", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                update.update_command().to_string(),
+                palette::accent_text_style(),
+            ),
             Span::from(" in another terminal.").dim(),
         ]),
         Line::from(vec![
@@ -3709,7 +3752,7 @@ fn styled_skill_mentions(
         }
         spans.push(Span::styled(
             text[range.clone()].to_string(),
-            style.fg(Color::Cyan),
+            style.patch(palette::accent_text_style()),
         ));
         cursor = range.end;
     }
@@ -3789,7 +3832,7 @@ fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Ve
         .chars()
         .take(usize::from(width))
         .collect::<String>();
-    let label_width = UnicodeWidthStr::width(label.as_str());
+    let label_width = display_width(&label);
     vec![
         Line::from_iter([
             label,
@@ -3804,41 +3847,69 @@ fn command_lines(tool: &mut ToolEntry, command: &str, width: u16) -> Vec<Line<'s
         ToolOrigin::Agent => "Ran",
         ToolOrigin::Operator => "You ran",
     };
-    let (bullet, title) = match tool.succeeded() {
-        None => (activity_marker(Some(tool.started_at)), "Running"),
-        Some(true) => ("•".green().bold(), completed_title),
-        Some(false) => ("•".red().bold(), completed_title),
+    let (bullet, title) = match tool.status() {
+        ToolStatus::Active => (activity_marker(Some(tool.started_at)), "Running"),
+        ToolStatus::Succeeded => ("•".green().bold(), completed_title),
+        ToolStatus::Failed => ("•".red().bold(), completed_title),
+        ToolStatus::Recovered => ("•".dim(), "Recovered"),
     };
-    let prefix_width = line_width(&Line::from(vec![
-        bullet.clone(),
-        " ".into(),
-        title.bold(),
-        " ".into(),
-    ]));
-    let mut command_rows = editor::wrap_text(
-        markdown::sanitize(command).trim_end_matches(['\r', '\n']),
-        width.saturating_sub(prefix_width as u16).max(1),
-    );
-    if command_rows.is_empty() {
-        command_rows.push(String::new());
+    let mut header = Line::from(vec![bullet, " ".into(), title.bold(), " ".into()]);
+    let header_width = line_width(&header);
+    let available_width = usize::from(width);
+    let continuation_prefix = if width >= 5 {
+        "  │ "
+    } else if width >= 3 {
+        "│ "
+    } else {
+        ""
+    };
+    let continuation_width = available_width
+        .saturating_sub(display_width(continuation_prefix))
+        .max(1);
+    let header_has_command_room = available_width > header_width;
+    let first_width = if header_has_command_room {
+        available_width.saturating_sub(header_width)
+    } else {
+        continuation_width
     }
-    let first = command_rows.remove(0);
-    let mut lines = vec![Line::from(vec![
-        bullet,
-        " ".into(),
-        title.bold(),
-        " ".into(),
-        Span::from(first).cyan(),
-    ])];
-    let omitted = command_rows
+    .max(1);
+    let command = markdown::sanitize(command);
+    let command = command.trim_end_matches(['\r', '\n']);
+    let highlighted = highlight_bash_to_lines(command);
+    let no_hyphenation =
+        |width| RtOptions::new(width).word_splitter(textwrap::WordSplitter::NoHyphenation);
+    let mut continuation_rows = Vec::new();
+    if let Some((first, rest)) = highlighted.split_first() {
+        let first_wrapped = adaptive_wrap_line(first, no_hyphenation(first_width));
+        let mut first_rows = first_wrapped.iter().map(line_to_static);
+        if header_has_command_room && let Some(mut first_row) = first_rows.next() {
+            header.spans.append(&mut first_row.spans);
+        }
+        continuation_rows.extend(first_rows);
+        for source_line in rest {
+            continuation_rows.extend(
+                adaptive_wrap_line(source_line, no_hyphenation(continuation_width))
+                    .iter()
+                    .map(line_to_static),
+            );
+        }
+    }
+
+    let omitted = continuation_rows
         .len()
         .saturating_sub(COMMAND_CONTINUATION_MAX_ROWS);
-    for row in command_rows.into_iter().take(COMMAND_CONTINUATION_MAX_ROWS) {
-        lines.push(Line::from(vec!["  │ ".dim(), Span::from(row).cyan()]));
+    let mut lines = vec![header];
+    for mut row in continuation_rows
+        .into_iter()
+        .take(COMMAND_CONTINUATION_MAX_ROWS)
+    {
+        let mut spans = vec![Span::from(continuation_prefix).dim()];
+        spans.append(&mut row.spans);
+        lines.push(Line::from(spans));
     }
     if omitted > 0 {
         lines.push(Line::from(vec![
-            "  │ ".dim(),
+            Span::from(continuation_prefix).dim(),
             format!("… +{omitted} lines").dim(),
         ]));
     }
@@ -3860,11 +3931,7 @@ fn command_output_lines(tool: &mut ToolEntry, width: u16) -> Vec<Line<'static>> 
         }
         Some(ToolOutcome { output: Ok(output) }) => {
             let text = command_output_text(output);
-            if text.is_empty() {
-                lines.push(Line::from(vec!["  └ ".dim(), "(no output)".dim()]));
-            } else {
-                append_bounded_output(&text, width, tool.output_max_rows(), &mut lines);
-            }
+            append_bounded_output(&text, width, tool.output_max_rows(), &mut lines);
         }
         Some(ToolOutcome { output: Err(error) }) => {
             append_bounded_output(error, width, tool.output_max_rows(), &mut lines);
@@ -3876,6 +3943,22 @@ fn command_output_lines(tool: &mut ToolEntry, width: u16) -> Vec<Line<'static>> 
         lines: lines.clone(),
     });
     lines
+}
+
+fn command_output_is_empty(output: &Value) -> bool {
+    let Some(object) = output.as_object() else {
+        return output.as_str().unwrap_or_default().is_empty();
+    };
+    object
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .is_empty()
+        && object
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
 }
 
 fn command_output_text(output: &Value) -> String {
@@ -3900,7 +3983,7 @@ fn command_output_text(output: &Value) -> String {
 
 fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
     let active = tools.iter().any(|tool| tool.outcome.is_none());
-    let failed = tools.iter().any(|tool| tool.succeeded() == Some(false));
+    let failed = tools.iter().any(ToolEntry::failed_for_display);
     let started = tools
         .iter()
         .find(|tool| tool.outcome.is_none())
@@ -3981,7 +4064,7 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
     let mut first_detail = true;
     for (title, spans) in details {
         let title = format!("{title} ");
-        let title_width = UnicodeWidthStr::width(title.as_str()) as u16;
+        let title_width = u16::try_from(display_width(&title)).unwrap_or(u16::MAX);
         for (index, mut row) in wrap_styled_line(
             &Line::from(spans),
             detail_width.saturating_sub(title_width).max(1),
@@ -3995,7 +4078,7 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
                 "    ".into()
             }];
             row_spans.push(if index == 0 {
-                Span::from(title.clone()).cyan()
+                Span::styled(title.clone(), palette::accent_text_style())
             } else {
                 Span::from(" ".repeat(usize::from(title_width)))
             });
@@ -4013,7 +4096,7 @@ fn exploration_lines(tools: &[ToolEntry], width: u16) -> Vec<Line<'static>> {
 }
 
 fn exploration_failure(tool: &ToolEntry) -> Option<(String, String)> {
-    if tool.succeeded() != Some(false) {
+    if !tool.failed_for_display() {
         return None;
     }
     let title = match &tool.display {
@@ -4047,6 +4130,18 @@ fn file_change_lines(
     path: &str,
     width: u16,
 ) -> Vec<Line<'static>> {
+    if let Some(recovery) = &tool.recovery {
+        let action = match active_action {
+            "Writing" => "write",
+            "Editing" => "edit",
+            _ => "use",
+        };
+        return recovered_tool_lines(
+            &format!("Recovered {action} state for {path}"),
+            recovery,
+            width,
+        );
+    }
     if let Some(ToolOutcome { output: Err(error) }) = &tool.outcome {
         let action = match active_action {
             "Reading" => "read",
@@ -4062,13 +4157,14 @@ fn file_change_lines(
         "Editing" => "Edited",
         _ => "Used",
     };
-    let (bullet, action) = match tool.succeeded() {
-        None => (
+    let (bullet, action) = match tool.status() {
+        ToolStatus::Active => (
             activity_marker(Some(tool.started_at)),
             active_action.to_string(),
         ),
-        Some(true) => ("•".green().bold(), completed_action.to_string()),
-        Some(false) => ("•".red().bold(), format!("Failed {active_action}")),
+        ToolStatus::Succeeded => ("•".green().bold(), completed_action.to_string()),
+        ToolStatus::Failed => ("•".red().bold(), format!("Failed {active_action}")),
+        ToolStatus::Recovered => ("•".dim(), format!("Recovered {active_action}")),
     };
     wrap_styled_line(
         &Line::from(vec![
@@ -4076,7 +4172,7 @@ fn file_change_lines(
             " ".into(),
             Span::from(action).bold(),
             " ".into(),
-            Span::from(path.to_string()).cyan(),
+            Span::styled(path.to_string(), palette::accent_text_style()),
         ]),
         width.max(1),
     )
@@ -4157,14 +4253,14 @@ fn generic_tool_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
             " ".into(),
             "Running".bold(),
             " ".into(),
-            Span::from(tool.name.clone()).cyan(),
+            Span::styled(tool.name.clone(), palette::accent_text_style()),
         ])],
         Some(Ok(output)) => {
             let mut lines = vec![Line::from(vec![
                 "• ".dim(),
                 "Called".bold(),
                 " ".into(),
-                Span::from(tool.name.clone()).cyan(),
+                Span::styled(tool.name.clone(), palette::accent_text_style()),
             ])];
             append_bounded_output(&output.to_string(), width, TOOL_OUTPUT_MAX_ROWS, &mut lines);
             lines
@@ -4173,12 +4269,24 @@ fn generic_tool_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
     }
 }
 
+fn recovered_tool_lines(title: &str, detail: &str, width: u16) -> Vec<Line<'static>> {
+    let header = Line::from(vec![
+        "•".dim(),
+        " ".into(),
+        Span::from(title.to_string()).bold(),
+    ]);
+    let mut lines = vec![truncate_line(header, usize::from(width))];
+    append_bounded_output(detail, width, TOOL_OUTPUT_MAX_ROWS, &mut lines);
+    lines
+}
+
 fn failed_tool_lines(title: &str, error: &str, width: u16) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![
+    let header = Line::from(vec![
         "•".red().bold(),
         " ".into(),
         Span::from(title.to_string()).bold(),
-    ])];
+    ]);
+    let mut lines = vec![truncate_line(header, usize::from(width))];
     append_bounded_output(error, width, TOOL_OUTPUT_MAX_ROWS, &mut lines);
     lines
 }
@@ -4189,92 +4297,186 @@ fn append_bounded_output(
     maximum_rows: usize,
     lines: &mut Vec<Line<'static>>,
 ) {
+    let (first_prefix, subsequent_prefix) = if width >= 5 {
+        ("  └ ", "    ")
+    } else if width >= 3 {
+        ("└ ", "  ")
+    } else {
+        ("", "")
+    };
+    let prefix_width = display_width(first_prefix).max(display_width(subsequent_prefix));
+    let content_width = usize::from(width).saturating_sub(prefix_width).max(1);
+    let wrap_options =
+        RtOptions::new(content_width).word_splitter(textwrap::WordSplitter::NoHyphenation);
     let mut rendered = BoundedOutputRows::new(maximum_rows);
     for raw in output.lines() {
         let ansi = ansi_escape_line(raw);
-        for_each_wrapped_styled_line(&ansi, width.saturating_sub(4).max(1), |line| {
-            rendered.push(line);
-        });
+        let mut push = |line: Line<'static>| {
+            let height = prefixed_output_line_height(&line, prefix_width, width);
+            rendered.push(line, height);
+        };
+        if line_contains_url_like(&ansi) {
+            for wrapped in adaptive_wrap_line(&ansi, wrap_options.clone()) {
+                push(line_to_static(&wrapped));
+            }
+        } else {
+            for_each_wrapped_styled_line(
+                &ansi,
+                u16::try_from(content_width).unwrap_or(u16::MAX),
+                push,
+            );
+        }
     }
     if rendered.is_empty() {
-        rendered.push(Line::from("(no output)").dim());
+        let line = truncate_line(Line::from("(no output)").dim(), content_width);
+        let height = prefixed_output_line_height(&line, prefix_width, width);
+        rendered.push(line, height);
     }
-    for (index, mut line) in rendered.finish().into_iter().enumerate() {
+    for (index, mut line) in rendered.finish(content_width).into_iter().enumerate() {
         for span in &mut line.spans {
             span.style = span.style.add_modifier(Modifier::DIM);
         }
-        let mut spans = vec![if index == 0 {
-            "  └ ".dim()
+        let prefix = if index == 0 {
+            Span::from(first_prefix).dim()
         } else {
-            "    ".into()
-        }];
+            Span::from(subsequent_prefix)
+        };
+        let mut spans = vec![prefix];
         spans.extend(line.spans);
         lines.push(Line::from(spans));
     }
 }
 
+fn prefixed_output_line_height(line: &Line<'static>, prefix_width: usize, width: u16) -> usize {
+    let width = width.max(1);
+    if prefix_width.saturating_add(line_width(line)) <= usize::from(width) {
+        return 1;
+    }
+
+    let mut spans = Vec::with_capacity(line.spans.len().saturating_add(1));
+    spans.push(Span::from(" ".repeat(prefix_width)));
+    spans.extend(line.spans.iter().cloned());
+    super::terminal::transcript_line_height(
+        &HyperlinkLine::new(Line::from(spans).style(line.style)),
+        width,
+    )
+}
+
+struct BoundedOutputRow {
+    index: usize,
+    line: Line<'static>,
+    height: usize,
+}
+
 struct BoundedOutputRows {
-    maximum: usize,
-    total: usize,
-    head: Vec<Line<'static>>,
-    tail: VecDeque<Line<'static>>,
-    truncated: bool,
+    maximum_rows: usize,
+    total_lines: usize,
+    total_rows: usize,
+    head_rows: usize,
+    head_open: bool,
+    head: Vec<BoundedOutputRow>,
+    tail_rows: usize,
+    tail: VecDeque<BoundedOutputRow>,
 }
 
 impl BoundedOutputRows {
-    fn new(maximum: usize) -> Self {
+    fn new(maximum_rows: usize) -> Self {
         Self {
-            maximum: maximum.max(1),
-            total: 0,
+            maximum_rows: maximum_rows.max(1),
+            total_lines: 0,
+            total_rows: 0,
+            head_rows: 0,
+            head_open: true,
             head: Vec::new(),
+            tail_rows: 0,
             tail: VecDeque::new(),
-            truncated: false,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.total == 0
+        self.total_lines == 0
     }
 
-    fn push(&mut self, line: Line<'static>) {
-        self.total = self.total.saturating_add(1);
-        if !self.truncated {
-            self.head.push(line);
-            if self.head.len() <= self.maximum {
-                return;
-            }
+    fn push(&mut self, line: Line<'static>, height: usize) {
+        let height = height.max(1);
+        let row = BoundedOutputRow {
+            index: self.total_lines,
+            line,
+            height,
+        };
+        self.total_lines = self.total_lines.saturating_add(1);
+        self.total_rows = self.total_rows.saturating_add(height);
 
-            self.truncated = true;
-            let head_len = self.maximum.saturating_sub(1) / 2;
-            let tail_len = self.maximum.saturating_sub(head_len + 1);
-            let mut retained = std::mem::take(&mut self.head);
-            let tail_start = retained.len().saturating_sub(tail_len);
-            self.tail = retained.split_off(tail_start).into();
-            retained.truncate(head_len);
-            self.head = retained;
-            return;
+        if self.head_open {
+            if self.head_rows.saturating_add(height) <= self.maximum_rows {
+                self.head_rows += height;
+                self.head.push(BoundedOutputRow {
+                    index: row.index,
+                    line: row.line.clone(),
+                    height,
+                });
+            } else {
+                self.head_open = false;
+            }
         }
 
-        let tail_capacity = self.maximum.saturating_sub(self.head.len() + 1);
-        if tail_capacity > 0 {
-            if self.tail.len() == tail_capacity {
-                self.tail.pop_front();
-            }
-            self.tail.push_back(line);
+        self.tail_rows = self.tail_rows.saturating_add(height);
+        self.tail.push_back(row);
+        while self.tail_rows > self.maximum_rows {
+            let Some(removed) = self.tail.pop_front() else {
+                break;
+            };
+            self.tail_rows = self.tail_rows.saturating_sub(removed.height);
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
-        if !self.truncated {
-            return self.head;
+    fn finish(self, content_width: usize) -> Vec<Line<'static>> {
+        if self.total_rows <= self.maximum_rows {
+            return self.head.into_iter().map(|row| row.line).collect();
         }
+
+        let available_rows = self.maximum_rows.saturating_sub(1);
+        let head_budget = available_rows / 2;
+        let tail_budget = available_rows.saturating_sub(head_budget);
+
+        let mut selected_head = Vec::new();
+        let mut selected_head_rows = 0usize;
+        for row in self.head {
+            if selected_head_rows.saturating_add(row.height) > head_budget {
+                break;
+            }
+            selected_head_rows += row.height;
+            selected_head.push(row);
+        }
+        let tail_after = selected_head
+            .last()
+            .map_or(0, |row| row.index.saturating_add(1));
+
+        let mut selected_tail = Vec::new();
+        let mut selected_tail_rows = 0usize;
+        for row in self.tail.into_iter().rev() {
+            if row.index < tail_after || selected_tail_rows.saturating_add(row.height) > tail_budget
+            {
+                break;
+            }
+            selected_tail_rows += row.height;
+            selected_tail.push(row);
+        }
+        selected_tail.reverse();
+
         let omitted = self
-            .total
-            .saturating_sub(self.head.len().saturating_add(self.tail.len()));
-        self.head
-            .push(Line::from(format!("… +{omitted} lines omitted")));
-        self.head.extend(self.tail);
-        self.head
+            .total_lines
+            .saturating_sub(selected_head.len().saturating_add(selected_tail.len()));
+        let mut output = selected_head
+            .into_iter()
+            .map(|row| row.line)
+            .collect::<Vec<_>>();
+        output.push(truncate_line(
+            Line::from(format!("… +{omitted} lines omitted")),
+            content_width,
+        ));
+        output.extend(selected_tail.into_iter().map(|row| row.line));
+        output
     }
 }
 
@@ -4296,7 +4498,7 @@ fn for_each_wrapped_styled_line(
     for span in &line.spans {
         let mut content = String::new();
         for grapheme in span.content.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+            let grapheme_width = display_width(grapheme);
             if used + grapheme_width > width && used > 0 {
                 if !content.is_empty() {
                     spans.push(Span::styled(std::mem::take(&mut content), span.style));
@@ -4450,9 +4652,9 @@ fn blend(foreground: (u8, u8, u8), background: (u8, u8, u8), alpha: f32) -> (u8,
 
 fn first_display_line(source: &str) -> String {
     let first = source.lines().next().unwrap_or(source).trim();
-    let mut characters = first.chars();
-    let shortened = characters.by_ref().take(100).collect::<String>();
-    if characters.next().is_some() || source.lines().nth(1).is_some() {
+    let mut graphemes = first.graphemes(/*is_extended*/ true);
+    let shortened = graphemes.by_ref().take(100).collect::<String>();
+    if graphemes.next().is_some() || source.lines().nth(1).is_some() {
         format!("{shortened} …")
     } else {
         shortened
@@ -4493,7 +4695,7 @@ fn editor_line(
         }
         spans.push(Span::styled(
             text[range.clone()].to_string(),
-            Style::default().fg(Color::Cyan),
+            palette::accent_text_style(),
         ));
         cursor = range.end;
     }
@@ -4535,7 +4737,6 @@ fn shortcut_reference_lines() -> Vec<Line<'static>> {
         Line::default(),
         shortcut_line("Enter", "submit prompt"),
         shortcut_line("Enter while working", "steer after current model step"),
-        shortcut_line("Tab while working", "queue a follow-up turn"),
         shortcut_line("Alt+Up / Shift+Left", "edit last queued follow-up"),
         shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
         shortcut_line("@", "find and insert a file path"),
@@ -4582,7 +4783,7 @@ pub(super) fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> 
     'spans: for span in line.spans {
         let mut content = String::new();
         for grapheme in span.content.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            let grapheme_width = display_width(grapheme);
             if used + grapheme_width > target {
                 if !content.is_empty() {
                     spans.push(Span::styled(content, span.style));
@@ -4600,13 +4801,6 @@ pub(super) fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> 
     Line::from(spans).style(line.style)
 }
 
-fn line_width(line: &Line<'_>) -> usize {
-    line.spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4618,6 +4812,26 @@ mod tests {
 
     fn prompt(text: impl Into<String>) -> UserPrompt {
         UserPrompt::text(text)
+    }
+
+    #[test]
+    fn refreshed_skills_preserve_an_unchanged_completion_and_reset_a_stale_one() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let skills = crate::skills::SkillCatalog::load(Path::new("/tmp/bettercodex"))
+            .skills()
+            .to_vec();
+        assert!(!skills.is_empty());
+        view.set_skills(skills.clone());
+        view.editor.set_text("$rev");
+        view.sync_composer_popups();
+        assert!(view.skill_popup.is_active());
+
+        view.refresh_skills(&skills);
+        assert!(view.skill_popup.is_active());
+
+        view.refresh_skills(&[]);
+        assert!(!view.skill_popup.is_active());
+        assert!(view.skills.is_empty());
     }
 
     #[test]
@@ -4669,6 +4883,53 @@ mod tests {
             user < tool && tool < output && output < assistant,
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn recovered_file_state_is_neutral_and_identical_after_transcript_replay() {
+        for (name, action) in [("write", "write"), ("edit", "edit")] {
+            let recovery = format!(
+                "Recovery: `/tmp/bettercodex/tracked.txt` has reconciled state for the interrupted {name} call."
+            );
+            let transcript = vec![SessionTranscriptItem::Tool {
+                tool: SessionTranscriptTool {
+                    call_id: format!("call-recovered-{name}"),
+                    origin: SessionTranscriptToolOrigin::Agent,
+                    name: name.to_string(),
+                    input: Some(json!({"path": "tracked.txt"})),
+                    output: Some(SessionTranscriptToolOutput::recovered_file_state(recovery)),
+                    file_change: None,
+                },
+            }];
+            let mut recovered = View::new(Path::new("/tmp/bettercodex"));
+            recovered.welcome_pending = false;
+            recovered.replay_transcript(transcript.clone());
+
+            assert_eq!(recovered.session_transcript(), transcript);
+            let recovered_lines = recovered.take_pending_history_lines(100, 24);
+            let rendered = recovered_lines
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                rendered.contains(&format!("Recovered {action} state for tracked.txt")),
+                "{rendered}"
+            );
+            assert!(rendered.contains("has reconciled state"), "{rendered}");
+            assert!(!rendered.contains("Wrote tracked.txt"), "{rendered}");
+            assert!(!rendered.contains("Edited tracked.txt"), "{rendered}");
+            assert!(!rendered.contains("Failed"), "{rendered}");
+            let marker = &recovered_lines[0].line.spans[0];
+            assert_eq!(marker.content.as_ref(), "•");
+            assert_eq!(marker.style.fg, None);
+            assert!(marker.style.add_modifier.contains(Modifier::DIM));
+
+            let mut replay = View::new(Path::new("/tmp/bettercodex"));
+            replay.welcome_pending = false;
+            replay.replay_transcript(transcript);
+            assert_eq!(replay.take_pending_history_lines(100, 24), recovered_lines);
+        }
     }
 
     #[test]
@@ -5116,6 +5377,26 @@ mod tests {
     }
 
     #[test]
+    fn q_alias_remains_executable_after_dismissing_slash_completion() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/q");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            )),
+            Action::None
+        );
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Quit
+        );
+    }
+
+    #[test]
     fn enter_on_a_bare_slash_submits_an_explicit_keyboard_selection() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.editor.set_text("/");
@@ -5190,6 +5471,83 @@ mod tests {
     }
 
     #[test]
+    fn unknown_slash_commands_are_rejected_without_entering_history() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/does-not-exist");
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::None
+        );
+        assert_eq!(view.editor.text(), "/does-not-exist");
+        let rendered = view
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .flat_map(|line| line.line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Unrecognized command '/does-not-exist'"),
+            "{rendered}"
+        );
+
+        view.editor.set_text("");
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE,))),
+            Action::None
+        );
+        assert!(view.editor.is_empty());
+    }
+
+    #[test]
+    fn slash_paths_and_leading_space_commands_submit_as_text() {
+        for text in ["/Users/example/project", " /clear"] {
+            let mut view = View::new(Path::new("/tmp/bettercodex"));
+            view.editor.set_text(text);
+
+            let Action::Submit(submission) = view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))) else {
+                panic!("{text:?} should submit as ordinary text");
+            };
+            assert_eq!(submission.prompt().text_without_image_placeholders(), text);
+            drop(submission);
+            assert_eq!(
+                view.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Up,
+                    KeyModifiers::NONE,
+                ))),
+                Action::None
+            );
+            assert_eq!(view.editor.text(), text);
+        }
+    }
+
+    #[test]
+    fn clear_is_excluded_from_composer_history() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.editor.set_text("/clear");
+        assert!(matches!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Action::Clear(_)
+        ));
+        view.clear();
+
+        assert_eq!(
+            view.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE,))),
+            Action::None
+        );
+        assert!(view.editor.is_empty());
+    }
+
+    #[test]
     fn rejected_local_command_preserves_a_compacted_large_paste() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         let pasted = "x".repeat(1_001);
@@ -5213,10 +5571,9 @@ mod tests {
     }
 
     #[test]
-    fn logout_cannot_be_queued_as_agent_input() {
+    fn tab_completes_a_slash_command_without_dispatching_it() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
-        view.start_turn(&UserPrompt::text("active turn"));
-        view.editor.set_text("/logout ");
+        view.editor.set_text("/ski");
 
         assert_eq!(
             view.handle_terminal_event(Event::Key(
@@ -5224,12 +5581,29 @@ mod tests {
             )),
             Action::None
         );
-        assert_eq!(view.editor.text(), "/logout ");
-        assert!(matches!(
-            view.entries.last(),
-            Some(TranscriptEntry::Notice(message))
-                if message.starts_with("Slash commands cannot be queued")
-        ));
+        assert_eq!(view.editor.text(), "/skills ");
+        assert!(view.overlay.is_none());
+    }
+
+    #[test]
+    fn queue_edit_shortcuts_restore_only_the_most_recent_follow_up() {
+        for key in [
+            KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+        ] {
+            let mut view = View::new(Path::new("/tmp/bettercodex"));
+            view.queue_follow_up(UserPrompt::text("first queued"));
+            view.queue_follow_up(UserPrompt::text("second queued"));
+            view.editor.set_text("unsubmitted draft");
+
+            assert_eq!(view.handle_terminal_event(Event::Key(key)), Action::None);
+            assert_eq!(view.editor.text(), "second queued");
+            assert_eq!(
+                view.pop_next_queued_follow_up(),
+                Some(UserPrompt::text("first queued"))
+            );
+            assert_eq!(view.pop_next_queued_follow_up(), None);
+        }
     }
 
     #[test]
@@ -5364,9 +5738,18 @@ mod tests {
             branch: Some("main".to_string()),
         };
         view.context_tokens = Some(51_680);
+        let status = view.status_line(80);
         assert_eq!(
-            plain(&view.status_line(80)),
+            plain(&status),
             "gpt-5.6-sol xhigh │ pi / main │ 20% of 258K"
+        );
+        assert_eq!(
+            status
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == "pi")
+                .and_then(|span| span.style.fg),
+            Some(palette::accent_color())
         );
     }
 
@@ -5673,6 +6056,68 @@ mod tests {
     }
 
     #[test]
+    fn rich_markdown_links_survive_resize_and_session_replay() {
+        const DESTINATION: &str = "https://example.com/docs";
+        let source = concat!(
+            "Intro 👩‍💻 e\u{301} [web](https://example.com/docs).\n\n",
+            "[local](file:///tmp/bettercodex/src/main.rs#L2)\n\n",
+            "```markdown\n",
+            "| Name | Value |\n",
+            "| --- | --- |\n",
+            "| alpha | 界 |\n",
+            "```\n\n",
+            "```bash\n",
+            "printf one\tthen-two\n",
+            "```",
+        );
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.start_turn(&UserPrompt::text("render rich markdown"));
+        view.handle_agent_event(AgentEvent::ModelMessageCompleted(AssistantMessage {
+            text: source.to_string(),
+            phase: Some(MessagePhase::FinalAnswer),
+            citations: vec![crate::web_search::UrlCitation {
+                start_index: 0,
+                end_index: 5,
+                url: DESTINATION.to_string(),
+                title: "Documentation".to_string(),
+            }],
+        }));
+        let transcript = view.session_transcript();
+
+        let resized = view.history_lines_for_resize_reflow(24, 18);
+        let visible = resized.iter().map(plain).collect::<Vec<_>>().join("\n");
+        assert!(visible.contains("👩‍💻 e\u{301}"), "{visible}");
+        assert!(visible.contains("src/main.rs:2"), "{visible}");
+        assert!(visible.contains("alpha"), "{visible}");
+        assert!(visible.contains('界'), "{visible}");
+        assert!(visible.contains("printf one    then-two"), "{visible}");
+        assert!(!visible.contains('\t'));
+        assert!(resized.iter().any(|line| {
+            line.hyperlinks
+                .iter()
+                .any(|link| link.destination == DESTINATION)
+        }));
+        assert!(resized.iter().all(|line| {
+            line.hyperlinks
+                .iter()
+                .all(|link| link.destination.starts_with("https://"))
+        }));
+        let buffer = crate::tui::terminal::render_history_lines(&resized, 24);
+        assert!(buffer.area.positions().any(|position| {
+            buffer[position]
+                .symbol()
+                .contains(&format!("\x1b]8;;{DESTINATION}\x07"))
+        }));
+
+        let mut replay = View::new(Path::new("/tmp/bettercodex"));
+        replay.welcome_pending = false;
+        replay.replay_transcript(transcript);
+        let replayed = replay.history_lines_for_resize_reflow(24, 18);
+        assert_eq!(replayed, resized);
+    }
+
+    #[test]
     fn streamed_tail_keeps_continuation_style_without_completion_reflow() {
         const WIDTH: u16 = 48;
         const HEIGHT: u16 = 12;
@@ -5777,6 +6222,154 @@ mod tests {
     }
 
     #[test]
+    fn highlighted_shell_commands_preserve_visible_text_styles_and_url_tokens() {
+        let command = "printf '%s' one\tthen-two\necho \"界e\u{301}\"";
+        let mut tool = ToolEntry::new(
+            "cell:highlight".to_string(),
+            "bash".to_string(),
+            Some(json!({"command": command})),
+            Path::new("/tmp/bettercodex"),
+        );
+        tool.set_outcome(Ok(json!({"exit_code": 0, "stdout": "", "stderr": ""})));
+
+        let wide = command_lines(&mut tool, command, 80);
+        assert_eq!(plain(&wide[0]), "• Ran printf '%s' one    then-two");
+        assert_eq!(plain(&wide[1]), "  │ echo \"界e\u{301}\"");
+        assert!(wide.iter().all(|line| !plain(line).contains('\t')));
+        assert!(
+            wide[..2]
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg.is_some()),
+            "syntax highlighting should survive command layout: {wide:?}"
+        );
+
+        let long = concat!(
+            "first_token_is_long_enough_to_wrap\n",
+            "second_token_is_also_long_enough_to_wrap",
+        );
+        let mut narrow_tool = ToolEntry::new(
+            "cell:narrow-highlight".to_string(),
+            "bash".to_string(),
+            Some(json!({"command": long})),
+            Path::new("/tmp/bettercodex"),
+        );
+        narrow_tool.set_outcome(Ok(json!({"exit_code": 0, "stdout": "", "stderr": ""})));
+        let narrow = command_lines(&mut narrow_tool, long, 18);
+        let visible = narrow.iter().map(plain).collect::<Vec<_>>();
+
+        assert!(visible.iter().any(|line| line.starts_with("  │ ")));
+        assert!(visible.iter().any(|line| line.contains("… +")));
+        assert!(
+            narrow.iter().all(|line| line_width(line) <= 18),
+            "{visible:?}"
+        );
+
+        let url_command =
+            "curl https://example.com/a/single/unbroken/token/that/exceeds/the/terminal";
+        let mut url_tool = ToolEntry::new(
+            "cell:url-highlight".to_string(),
+            "bash".to_string(),
+            Some(json!({"command": url_command})),
+            Path::new("/tmp/bettercodex"),
+        );
+        url_tool.set_outcome(Ok(json!({"exit_code": 0, "stdout": "", "stderr": ""})));
+        let url_lines = command_lines(&mut url_tool, url_command, 18);
+        let visible = url_lines.iter().map(plain).collect::<Vec<_>>();
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|line| line.contains(
+                    "https://example.com/a/single/unbroken/token/that/exceeds/the/terminal"
+                ))
+                .count(),
+            1,
+            "expected the full command URL on one semantic line: {visible:?}"
+        );
+
+        let output_url = "example.test/api/v1/projects/alpha/releases/2026/session_id=abc123def456";
+        url_tool.set_outcome(Ok(json!({
+            "exit_code": 0,
+            "stdout": output_url,
+            "stderr": "",
+        })));
+        let output_lines = command_output_lines(&mut url_tool, 36);
+        let visible = output_lines.iter().map(plain).collect::<Vec<_>>();
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|line| line.contains(output_url))
+                .count(),
+            1,
+            "expected the full output URL on one semantic line: {visible:?}"
+        );
+        let output_rows = output_lines
+            .iter()
+            .map(|line| {
+                crate::tui::terminal::transcript_line_height(
+                    &HyperlinkLine::new(line.clone()),
+                    /*width*/ 36,
+                )
+            })
+            .sum::<usize>();
+        assert!(output_rows <= TOOL_OUTPUT_MAX_ROWS, "{visible:?}");
+
+        let huge_url = format!(
+            "https://example.test/api/v1/{}",
+            "very-long-segment-".repeat(120)
+        );
+        url_tool.set_outcome(Ok(json!({
+            "exit_code": 0,
+            "stdout": format!("{huge_url}\n{huge_url}\n"),
+            "stderr": "",
+        })));
+        let bounded = command_output_lines(&mut url_tool, 20);
+        let bounded_rows = bounded
+            .iter()
+            .map(|line| {
+                crate::tui::terminal::transcript_line_height(
+                    &HyperlinkLine::new(line.clone()),
+                    /*width*/ 20,
+                )
+            })
+            .sum::<usize>();
+        let visible = bounded.iter().map(plain).collect::<Vec<_>>();
+        assert!(bounded_rows <= TOOL_OUTPUT_MAX_ROWS, "{visible:?}");
+        assert!(
+            visible.iter().any(|line| line.contains("… +")),
+            "{visible:?}"
+        );
+
+        let long_failure = format!("{}👩‍💻tail\nsecond line", "x".repeat(99));
+        assert_eq!(
+            first_display_line(&long_failure),
+            format!("{}👩‍💻 …", "x".repeat(99))
+        );
+    }
+
+    #[test]
+    fn tool_output_wrapping_matches_terminal_width_for_zero_width_graphemes() {
+        let mut lines = Vec::new();
+        append_bounded_output(
+            "\u{301}ab",
+            /*width*/ 6,
+            TOOL_OUTPUT_MAX_ROWS,
+            &mut lines,
+        );
+
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(plain(&lines[0]), "  └ \u{301}ab");
+        assert_eq!(line_width(&lines[0]), 6);
+        assert_eq!(
+            crate::tui::terminal::transcript_line_height(
+                &HyperlinkLine::new(lines[0].clone()),
+                /*width*/ 6,
+            ),
+            1
+        );
+    }
+
+    #[test]
     fn direct_exploration_uses_the_explored_cell_and_replays_failures() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
@@ -5870,6 +6463,131 @@ mod tests {
         for output in [rendered, replayed] {
             assert!(output.contains("Failed rg needle src"), "{output}");
             assert!(output.contains("rg: invalid search pattern"), "{output}");
+        }
+    }
+
+    #[test]
+    fn empty_agent_ripgrep_result_is_neutral_live_and_after_replay() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.welcome_pending = false;
+        view.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:empty-search".to_string(),
+            name: "bash".to_string(),
+            input: Some(json!({"command": "rg needle src"})),
+        });
+        view.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:empty-search".to_string(),
+            output: Ok(json!({"exit_code": 1, "stdout": "", "stderr": ""})),
+            file_change: None,
+            duration: Duration::from_millis(10),
+        });
+        view.seal_exploration();
+
+        let transcript = view.session_transcript();
+        let [SessionTranscriptItem::Exploration { tools }] = transcript.as_slice() else {
+            panic!("empty search should be saved as one exploration cell");
+        };
+        let [tool] = tools.as_slice() else {
+            panic!("empty search exploration should retain one tool");
+        };
+        let Some(SessionTranscriptToolOutput::Success(output)) = &tool.output else {
+            panic!("empty search should retain its structured output");
+        };
+        assert_eq!(output.get("exit_code").and_then(Value::as_i64), Some(1));
+
+        let lines = view.take_pending_history_lines(80, 24);
+        let explored_row = lines
+            .iter()
+            .position(|line| plain(line).contains("Explored"))
+            .expect("rendered empty search header");
+        let buffer = crate::tui::terminal::render_history_lines(&lines, 80);
+        assert_ne!(buffer[(0, explored_row as u16)].fg, Color::Red);
+        let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+
+        let mut replay = View::new(Path::new("/tmp/bettercodex"));
+        replay.welcome_pending = false;
+        replay.replay_transcript(transcript);
+        let replayed = replay
+            .take_pending_history_lines(80, 24)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for output in [rendered.as_str(), replayed.as_str()] {
+            assert!(output.contains("• Explored"), "{output}");
+            assert!(output.contains("Search needle in src"), "{output}");
+            assert!(!output.contains("Failed"), "{output}");
+            assert!(!output.contains("process exited with status 1"), "{output}");
+        }
+    }
+
+    #[test]
+    fn compound_and_operator_ripgrep_status_one_remain_failures() {
+        let mut compound = View::new(Path::new("/tmp/bettercodex"));
+        compound.welcome_pending = false;
+        compound.handle_agent_event(AgentEvent::ToolStarted {
+            call_id: "cell:compound-search".to_string(),
+            name: "bash".to_string(),
+            input: Some(json!({"command": "true && rg needle src"})),
+        });
+        compound.handle_agent_event(AgentEvent::ToolCompleted {
+            call_id: "cell:compound-search".to_string(),
+            output: Ok(json!({"exit_code": 1, "stdout": "", "stderr": ""})),
+            file_change: None,
+            duration: Duration::from_millis(10),
+        });
+        compound.seal_exploration();
+        let compound_transcript = compound.session_transcript();
+        let compound_lines = compound.take_pending_history_lines(80, 24);
+
+        let mut compound_replay = View::new(Path::new("/tmp/bettercodex"));
+        compound_replay.welcome_pending = false;
+        compound_replay.replay_transcript(compound_transcript);
+        let compound_replay_lines = compound_replay.take_pending_history_lines(80, 24);
+        for lines in [&compound_lines, &compound_replay_lines] {
+            let failure_row = lines
+                .iter()
+                .position(|line| plain(line).contains("Failed true && rg needle src"))
+                .expect("compound search failure row");
+            let buffer = crate::tui::terminal::render_history_lines(lines, 80);
+            assert_eq!(buffer[(0, failure_row as u16)].fg, Color::Red);
+            let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+            assert!(
+                rendered.contains("process exited with status 1"),
+                "{rendered}"
+            );
+        }
+
+        let mut operator = View::new(Path::new("/tmp/bettercodex"));
+        operator.welcome_pending = false;
+        operator.start_operator_command("operator:empty-search".to_string(), "rg needle src");
+        operator.finish_operator_command(
+            "operator:empty-search",
+            Ok(json!({"exit_code": 1, "stdout": "", "stderr": ""})),
+        );
+        let operator_transcript = operator.session_transcript();
+        let [SessionTranscriptItem::Tool { tool }] = operator_transcript.as_slice() else {
+            panic!("operator search should be saved as a command cell");
+        };
+        assert_eq!(tool.origin, SessionTranscriptToolOrigin::Operator);
+        let Some(SessionTranscriptToolOutput::Success(output)) = &tool.output else {
+            panic!("operator search should retain its structured output");
+        };
+        assert_eq!(output.get("exit_code").and_then(Value::as_i64), Some(1));
+
+        let mut operator_replay = View::new(Path::new("/tmp/bettercodex"));
+        operator_replay.welcome_pending = false;
+        operator_replay.replay_transcript(operator_transcript);
+        for view in [&mut operator, &mut operator_replay] {
+            let lines = view.take_pending_history_lines(80, 24);
+            let command_row = lines
+                .iter()
+                .position(|line| plain(line).contains("You ran rg needle src"))
+                .expect("operator search command row");
+            let buffer = crate::tui::terminal::render_history_lines(&lines, 80);
+            assert_eq!(buffer[(0, command_row as u16)].fg, Color::Red);
+            let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+            assert!(!rendered.contains("Explored"), "{rendered}");
         }
     }
 
@@ -6229,6 +6947,19 @@ mod tests {
         for (width, height) in [(1, 1), (2, 3), (4, 4), (7, 6), (20, 8)] {
             let mut view = View::new(Path::new("/tmp/bettercodex"));
             view.welcome_pending = false;
+            view.editor.set_text("👩‍💻e\u{301}\tdraft-with-a-long-token");
+            view.handle_agent_event(AgentEvent::ToolStarted {
+                call_id: "cell:tiny".to_string(),
+                name: "bash".to_string(),
+                input: Some(json!({
+                    "command": "printf '👩‍💻é' https://example.com/a/long/unbroken/token"
+                })),
+            });
+            view.handle_agent_event(AgentEvent::ToolOutputDelta {
+                call_id: "cell:tiny".to_string(),
+                stream: crate::process_runtime::OutputStream::Stdout,
+                chunk: "界é\toutput-with-a-long-token\n".to_string(),
+            });
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|frame| view.render(frame)).unwrap();

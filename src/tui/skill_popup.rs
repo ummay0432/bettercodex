@@ -1,15 +1,15 @@
 use crate::fuzzy_match::fuzzy_match;
 use crate::skills::Skill;
 use crate::skills::is_mention_name_byte;
-use ratatui::style::Color;
-use ratatui::style::Modifier;
-use ratatui::style::Style;
+use crate::tui::palette;
+use crate::tui::width::display_width;
+use crate::tui::width::prefix_fitting_width;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use std::collections::HashSet;
 use std::ops::Range;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_POPUP_ROWS: usize = 8;
 const MAX_DISPLAY_NAME_WIDTH: usize = 28;
@@ -326,13 +326,14 @@ fn skill_line(
         .map(|indices| indices.iter().copied().collect::<HashSet<_>>())
         .unwrap_or_default();
     let mut spans = vec![Span::from("  ")];
-    for (index, character) in display_name.chars().enumerate() {
-        let span = Span::from(character.to_string());
-        spans.push(if matched_indices.contains(&index) {
-            span.bold()
-        } else {
-            span
-        });
+    let mut character_index = 0usize;
+    for grapheme in display_name.graphemes(/*is_extended*/ true) {
+        let character_count = grapheme.chars().count();
+        let matched = (character_index..character_index.saturating_add(character_count))
+            .any(|index| matched_indices.contains(&index));
+        let span = Span::from(grapheme.to_string());
+        spans.push(if matched { span.bold() } else { span });
+        character_index = character_index.saturating_add(character_count);
     }
     let padding = name_width
         .saturating_sub(display_width(&display_name))
@@ -341,9 +342,7 @@ fn skill_line(
     spans.push(Span::from("[Skill] ").dim());
     spans.push(Span::from(skill.display_description().to_string()).dim());
     if selected {
-        let style = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
+        let style = palette::accent_style();
         for span in &mut spans {
             span.style = style;
         }
@@ -352,22 +351,5 @@ fn skill_line(
 }
 
 fn truncate_width(value: &str, max_width: usize) -> String {
-    let mut result = String::new();
-    let mut width = 0_usize;
-    for character in value.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if width.saturating_add(character_width) > max_width {
-            break;
-        }
-        result.push(character);
-        width = width.saturating_add(character_width);
-    }
-    result
-}
-
-fn display_width(value: &str) -> usize {
-    value
-        .chars()
-        .map(|character| character.width().unwrap_or(0))
-        .sum()
+    prefix_fitting_width(value, max_width).to_string()
 }

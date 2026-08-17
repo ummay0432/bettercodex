@@ -13,8 +13,6 @@
 //! buffers the entire fence body before deciding, only unwraps fences whose
 //! info string is `md` or `markdown` AND whose body contains a
 //! header+delimiter pair, and degrades gracefully on unclosed fences.
-#[cfg(test)]
-use ratatui::text::Line;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
@@ -22,43 +20,6 @@ use std::path::Path;
 use super::markdown_render;
 use super::table_detect;
 use super::terminal_hyperlinks::HyperlinkLine;
-
-/// Render markdown source to styled ratatui lines and append them to `lines`.
-///
-/// Callers that already know the session working directory should pass it here so streamed and
-/// non-streamed rendering show the same relative path text even if the process cwd differs.
-#[cfg(test)]
-pub(super) fn append_markdown(
-    markdown_source: &str,
-    width: Option<usize>,
-    cwd: Option<&Path>,
-    lines: &mut Vec<Line<'static>>,
-) {
-    let rendered =
-        markdown_render::render_markdown_text_with_width_and_cwd(markdown_source, width, cwd);
-    super::render::line_utils::push_owned_lines(&rendered.lines, lines);
-}
-
-/// Render an agent message to styled ratatui lines.
-///
-/// Before rendering, the source is passed through [`unwrap_markdown_fences`] so that tables
-/// wrapped in `` ```md `` fences are rendered as native tables rather than code blocks.
-/// Non-markdown fences (e.g. `rust`, `sh`) are left
-/// intact.
-#[cfg(test)]
-pub(super) fn append_markdown_agent(
-    markdown_source: &str,
-    width: Option<usize>,
-    lines: &mut Vec<Line<'static>>,
-) {
-    let normalized = unwrap_markdown_fences(markdown_source);
-    let rendered = markdown_render::render_markdown_text_with_width_and_cwd(
-        &normalized,
-        width,
-        /*cwd*/ None,
-    );
-    super::render::line_utils::push_owned_lines(&rendered.lines, lines);
-}
 
 pub(super) fn render_markdown_agent_with_links_and_cwd(
     markdown_source: &str,
@@ -399,205 +360,57 @@ fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use ratatui::text::Line;
 
-    fn lines_to_strings(lines: &[Line<'static>]) -> Vec<String> {
+    fn visible_text(lines: Vec<HyperlinkLine>) -> Vec<String> {
         lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.clone())
-                    .collect::<String>()
+            .into_iter()
+            .map(|line| {
+                line.line
+                    .spans
+                    .into_iter()
+                    .map(|span| span.content)
+                    .collect()
             })
             .collect()
     }
 
     #[test]
-    fn citations_render_as_plain_text() {
-        let src = "Before 【F:/x.rs†L1】\nAfter 【F:/x.rs†L3】\n";
-        let mut out = Vec::new();
-        append_markdown(src, /*width*/ None, /*cwd*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert_eq!(
-            rendered,
-            vec![
-                "Before 【F:/x.rs†L1】".to_string(),
-                "After 【F:/x.rs†L3】".to_string()
-            ]
-        );
-    }
+    fn markdown_table_fences_render_as_tables() {
+        let source = "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n";
+        let rendered = visible_text(render_markdown_agent_with_links_and_cwd(
+            source, /*width*/ None, /*cwd*/ None,
+        ));
 
-    #[test]
-    fn indented_code_blocks_preserve_leading_whitespace() {
-        // Basic sanity: indented code with surrounding blank lines should produce the indented line.
-        let src = "Before\n\n    code 1\n\nAfter\n";
-        let mut out = Vec::new();
-        append_markdown(src, /*width*/ None, /*cwd*/ None, &mut out);
-        let lines = lines_to_strings(&out);
-        assert_eq!(lines, vec!["Before", "", "    code 1", "", "After"]);
-    }
-
-    #[test]
-    fn append_markdown_preserves_full_text_line() {
-        let src = "Hi! How can I help with codex-rs today? Want me to explore the repo, run tests, or work on a specific change?\n";
-        let mut out = Vec::new();
-        append_markdown(src, /*width*/ None, /*cwd*/ None, &mut out);
-        assert_eq!(
-            out.len(),
-            1,
-            "expected a single rendered line for plain text"
-        );
-        let rendered: String = out
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.clone())
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(
-            rendered,
-            "Hi! How can I help with codex-rs today? Want me to explore the repo, run tests, or work on a specific change?"
-        );
-    }
-
-    #[test]
-    fn append_markdown_matches_tui_markdown_for_ordered_item() {
-        let mut out = Vec::new();
-        append_markdown(
-            "1. Tight item\n",
-            /*width*/ None,
-            /*cwd*/ None,
-            &mut out,
-        );
-        let lines = lines_to_strings(&out);
-        assert_eq!(lines, vec!["1. Tight item".to_string()]);
-    }
-
-    #[test]
-    fn append_markdown_keeps_ordered_list_line_unsplit_in_context() {
-        let src = "Loose vs. tight list items:\n1. Tight item\n";
-        let mut out = Vec::new();
-        append_markdown(src, /*width*/ None, /*cwd*/ None, &mut out);
-
-        let lines = lines_to_strings(&out);
-
-        // Expect to find the ordered list line rendered as a single line,
-        // not split into a marker-only line followed by the text.
-        assert!(
-            lines.iter().any(|s| s == "1. Tight item"),
-            "expected '1. Tight item' rendered as a single line; got: {lines:?}"
-        );
-        assert!(
-            !lines
-                .windows(2)
-                .any(|w| w[0].trim_end() == "1." && w[1] == "Tight item"),
-            "did not expect a split into ['1.', 'Tight item']; got: {lines:?}"
-        );
-    }
-
-    #[test]
-    fn append_markdown_agent_unwraps_markdown_fences_for_table_rendering() {
-        let src = "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
         assert!(rendered.iter().any(|line| line.contains('━')));
         assert!(rendered.iter().any(|line| line.contains(" 1      2")));
     }
 
     #[test]
-    fn append_markdown_agent_unwraps_markdown_fences_for_no_outer_table_rendering() {
-        let src = "```md\nCol A | Col B | Col C\n--- | --- | ---\nx | y | z\n10 | 20 | 30\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert!(rendered.iter().any(|line| line.contains('━')));
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains(" Col A    Col B    Col C"))
-        );
-        assert!(
-            !rendered
-                .iter()
-                .any(|line| line.trim() == "Col A | Col B | Col C")
-        );
+    fn unwraps_supported_markdown_table_fences() {
+        for (source, expected) in [
+            (
+                "```md\nA | B\n--- | ---\nleft | right\n```\n",
+                "A | B\n--- | ---\nleft | right\n",
+            ),
+            (
+                "> ```markdown\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n> ```\n",
+                "> | A | B |\n> |---|---|\n> | 1 | 2 |\n",
+            ),
+        ] {
+            assert_eq!(unwrap_markdown_fences(source), expected);
+        }
     }
 
     #[test]
-    fn append_markdown_agent_unwraps_markdown_fences_for_two_column_no_outer_table() {
-        let src = "```md\nA | B\n--- | ---\nleft | right\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert!(rendered.iter().any(|line| line.contains('━')));
-        assert!(rendered.iter().any(|line| line.contains(" left    right")));
-        assert!(!rendered.iter().any(|line| line.trim() == "A | B"));
-    }
-
-    #[test]
-    fn append_markdown_agent_unwraps_markdown_fences_for_single_column_table() {
-        let src = "```md\n| Only |\n|---|\n| value |\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert!(rendered.iter().any(|line| line.contains('━')));
-        assert!(!rendered.iter().any(|line| line.trim() == "| Only |"));
-    }
-
-    #[test]
-    fn append_markdown_agent_keeps_non_markdown_fences_as_code() {
-        let src = "```rust\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert_eq!(
-            rendered,
-            vec![
-                "| A | B |".to_string(),
-                "|---|---|".to_string(),
-                "| 1 | 2 |".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn append_markdown_agent_unwraps_blockquoted_markdown_fence_table() {
-        let src = "> ```markdown\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n> ```\n";
-        let rendered = unwrap_markdown_fences(src);
-        assert!(
-            !rendered.contains("```"),
-            "expected markdown fence markers to be removed: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn append_markdown_agent_keeps_non_blockquoted_markdown_fence_with_blockquote_table_example() {
-        let src = "```markdown\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n```\n";
-        let normalized = unwrap_markdown_fences(src);
-        assert_eq!(normalized, src);
-    }
-
-    #[test]
-    fn append_markdown_agent_keeps_markdown_fence_when_content_is_not_table() {
-        let src = "```markdown\n**bold**\n```\n";
-        let mut out = Vec::new();
-        append_markdown_agent(src, /*width*/ None, &mut out);
-        let rendered = lines_to_strings(&out);
-        assert_eq!(rendered, vec!["**bold**".to_string()]);
-    }
-
-    #[test]
-    fn unwrap_markdown_fences_repro_keeps_fence_without_header_delimiter_pair() {
-        let src = "```markdown\n| A | B |\nnot a delimiter row\n| --- | --- |\n# Heading\n```\n";
-        let normalized = unwrap_markdown_fences(src);
-        assert_eq!(normalized, src);
-    }
-
-    #[test]
-    fn append_markdown_agent_keeps_markdown_fence_with_blank_line_between_header_and_delimiter() {
-        let src = "```markdown\n| A | B |\n\n|---|---|\n| 1 | 2 |\n```\n";
-        let rendered = unwrap_markdown_fences(src);
-        assert_eq!(rendered, src);
+    fn preserves_fences_that_are_not_table_wrappers() {
+        for source in [
+            "```rust\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n",
+            "```markdown\n**bold**\n```\n",
+            "```markdown\n> | A | B |\n> |---|---|\n> | 1 | 2 |\n```\n",
+            "```markdown\n| A | B |\nnot a delimiter row\n| --- | --- |\n# Heading\n```\n",
+            "```markdown\n| A | B |\n\n|---|---|\n| 1 | 2 |\n```\n",
+        ] {
+            assert_eq!(unwrap_markdown_fences(source), source);
+        }
     }
 }

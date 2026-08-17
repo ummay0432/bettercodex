@@ -1,6 +1,7 @@
 use crate::api::ApiClient;
 use crate::api::ApiError;
 use crate::api::CompactionResult;
+use crate::api::CompletedResponseMetadata;
 use crate::api::ModelResponse;
 use crate::api::retry_delay;
 use crate::auth::Auth;
@@ -23,6 +24,7 @@ use crate::rollout::SessionTranscriptToolOutput;
 use crate::rollout::TurnOutcome;
 use crate::service_tier::ServiceTier;
 use crate::tools::ToolCall;
+use crate::tools::ToolCompletion;
 use crate::tools::ToolRuntime;
 use anyhow::Context;
 use anyhow::Result;
@@ -43,6 +45,22 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const MAX_STREAM_RETRIES_PER_TRANSPORT: usize = 5;
+
+fn transcript_tool_outcome(completion: ToolCompletion) -> Option<SessionTranscriptToolOutcome> {
+    let output = completion
+        .inspection
+        .map(SessionTranscriptToolOutput::recovered_file_state);
+    let has_file_change = completion.file_change.is_some();
+    if completion.error.is_none() && output.is_none() && !has_file_change {
+        return None;
+    }
+    Some(SessionTranscriptToolOutcome {
+        call_id: completion.call_id,
+        output,
+        error: completion.error,
+        file_change: completion.file_change,
+    })
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SubmitOutcome {
@@ -69,13 +87,34 @@ pub(crate) struct TurnControl {
 
 struct SteeringState {
     accepting: bool,
+    // Set atomically with dequeue and cleared after sampling, so Esc-to-send cannot cancel in the
+    // gap where the UI still owns the prompt but admission has already removed it from the queue.
+    operator_input_in_flight: bool,
     next_id: u64,
     queued: VecDeque<SteeringInput>,
 }
 
 struct SteeringInput {
     id: SteerId,
-    input: UserInput,
+    payload: SteeringPayload,
+}
+
+enum SteeringPayload {
+    Operator(UserInput),
+    Context(String),
+}
+
+impl SteeringState {
+    fn has_queued_operator_input(&self) -> bool {
+        self.queued
+            .iter()
+            .any(|input| matches!(&input.payload, SteeringPayload::Operator(_)))
+    }
+
+    fn drain_into(&mut self, pending: &mut VecDeque<SteeringInput>) {
+        self.operator_input_in_flight |= self.has_queued_operator_input();
+        pending.append(&mut self.queued);
+    }
 }
 
 struct StartupPrewarm {
@@ -149,7 +188,26 @@ impl TurnHandle {
         self.cancellation.cancel();
     }
 
+    /// Interrupt current work only while the operator input still needs to be dequeued.
+    pub(crate) fn interrupt_for_steering(&self) {
+        let should_cancel = self.steering.as_ref().is_none_or(|steering| {
+            let steering = lock_steering(steering);
+            steering.has_queued_operator_input() || !steering.operator_input_in_flight
+        });
+        if should_cancel {
+            self.cancellation.cancel();
+        }
+    }
+
     pub(crate) fn steer(&self, input: UserInput) -> Result<SteerId> {
+        self.enqueue(SteeringPayload::Operator(input))
+    }
+
+    pub(crate) fn inject_context(&self, text: String) -> Result<SteerId> {
+        self.enqueue(SteeringPayload::Context(text))
+    }
+
+    fn enqueue(&self, payload: SteeringPayload) -> Result<SteerId> {
         let steering = self
             .steering
             .as_ref()
@@ -160,12 +218,8 @@ impl TurnHandle {
         }
         let id = SteerId(steering.next_id);
         steering.next_id = steering.next_id.wrapping_add(1);
-        steering.queued.push_back(SteeringInput { id, input });
+        steering.queued.push_back(SteeringInput { id, payload });
         Ok(id)
-    }
-
-    pub(crate) fn inject_context(&self, text: String) -> Result<SteerId> {
-        self.steer(UserInput::text(text))
     }
 }
 
@@ -174,6 +228,7 @@ impl TurnControl {
         let cancellation = CancellationToken::new();
         let steering = Arc::new(Mutex::new(SteeringState {
             accepting: true,
+            operator_input_in_flight: false,
             next_id: 0,
             queued: VecDeque::new(),
         }));
@@ -211,7 +266,17 @@ impl TurnControl {
         let Some(steering) = &self.steering else {
             return;
         };
-        pending.append(&mut lock_steering(steering).queued);
+        let mut steering = lock_steering(steering);
+        if self.cancellation.is_cancelled() {
+            return;
+        }
+        steering.drain_into(pending);
+    }
+
+    fn finish_sampling(&self) {
+        if let Some(steering) = &self.steering {
+            lock_steering(steering).operator_input_in_flight = false;
+        }
     }
 
     /// Atomically stop accepting steering if no input is waiting.
@@ -223,11 +288,14 @@ impl TurnControl {
             return true;
         };
         let mut steering = lock_steering(steering);
+        if self.cancellation.is_cancelled() {
+            return false;
+        }
         if steering.queued.is_empty() {
             steering.accepting = false;
             true
         } else {
-            pending.append(&mut steering.queued);
+            steering.drain_into(pending);
             false
         }
     }
@@ -411,8 +479,9 @@ impl Agent {
 
     pub(crate) fn record_operator_shell_context(&mut self, text: String) -> Result<()> {
         debug_assert!(crate::context::is_contextual_user_text(&text));
-        self.conversation
-            .extend([crate::context::message("user", text)])
+        let mut message = crate::context::message("user", text);
+        crate::context::mark_contextual_user_message(&mut message);
+        self.conversation.extend([message])
     }
 
     pub(crate) fn take_resumed_transcript(&mut self) -> Vec<SessionTranscriptItem> {
@@ -587,12 +656,11 @@ impl Agent {
             self.record_incoming_user(
                 IncomingUserInput::Initial(input),
                 &events,
-                &control.cancellation,
-                CompactionPhase::PreTurn,
+                IncomingUserAdmission::PreserveAfterCancellation,
                 &mut active_turn_context,
             )
             .await
-            .map(|_| SubmitOutcome::Cancelled)
+            .map(|()| SubmitOutcome::Cancelled)
         };
         control.close();
         let outcome = match &result {
@@ -617,16 +685,30 @@ impl Agent {
         control: &TurnControl,
     ) -> Result<SubmitOutcome> {
         let mut active_turn_context = ActiveTurnContext::default();
-        if !self
-            .record_incoming_user(
-                IncomingUserInput::Initial(input),
-                events,
-                &control.cancellation,
-                CompactionPhase::PreTurn,
-                &mut active_turn_context,
-            )
-            .await?
-        {
+        // Match Codex's pre-sampling boundary: compact only the history that was already recorded.
+        // If cancellation interrupts that request, persist the accepted input before ending.
+        let compaction_cancelled = self.conversation.needs_compaction()
+            && !self
+                .run_compaction(
+                    events,
+                    &control.cancellation,
+                    CompactionRequest::Automatic(CompactionPhase::PreTurn),
+                    InitialContextInjection::AfterCompaction,
+                    &active_turn_context,
+                )
+                .await?;
+        self.record_incoming_user(
+            IncomingUserInput::Initial(input),
+            events,
+            if compaction_cancelled {
+                IncomingUserAdmission::PreserveAfterCancellation
+            } else {
+                IncomingUserAdmission::EnforceContextWindow
+            },
+            &mut active_turn_context,
+        )
+        .await?;
+        if compaction_cancelled {
             return Ok(SubmitOutcome::Cancelled);
         }
 
@@ -634,28 +716,42 @@ impl Agent {
         // Sample the fresh turn input first. After a mid-turn compact, sample the
         // compacted tool continuation once before inserting queued steering.
         let mut can_record_pending_steering = false;
+        let mut first_sample = true;
         loop {
+            if control.cancellation.is_cancelled() {
+                return Ok(SubmitOutcome::Cancelled);
+            }
+            let mut recorded_steering = false;
             if can_record_pending_steering {
                 control.drain_steering(&mut pending_steering);
                 while let Some(input) = pending_steering.pop_front() {
-                    if !self
-                        .record_incoming_user(
-                            IncomingUserInput::Steering(input),
-                            events,
-                            &control.cancellation,
-                            CompactionPhase::MidTurn,
-                            &mut active_turn_context,
-                        )
-                        .await?
-                    {
-                        return Ok(SubmitOutcome::Cancelled);
-                    }
+                    self.record_incoming_user(
+                        IncomingUserInput::Steering(input),
+                        events,
+                        IncomingUserAdmission::EnforceContextWindow,
+                        &mut active_turn_context,
+                    )
+                    .await?;
+                    recorded_steering = true;
                 }
             }
             can_record_pending_steering = true;
 
+            // Admission captures the world state used by the first sample and any sample with
+            // fresh steering. Continuations without new input need their own request-boundary
+            // refresh so tool-driven AGENTS.md or skill changes cannot remain stale.
+            if !first_sample && !recorded_steering {
+                self.reload_world_state_for_admission(
+                    IncomingUserAdmission::EnforceContextWindow,
+                    &active_turn_context,
+                )?;
+            }
+            first_sample = false;
+
             let tool_truncation_policy = self.conversation.model_selection().truncation_policy();
-            let response = match self.sample_with_recovery(events, control).await? {
+            let sampling = self.sample_with_recovery(events, control).await;
+            control.finish_sampling();
+            let response = match sampling? {
                 SamplingOutcome::Response(response) => response,
                 SamplingOutcome::Cancelled => return Ok(SubmitOutcome::Cancelled),
             };
@@ -676,30 +772,48 @@ impl Agent {
             let tool_calls = response.tool_calls;
             if tool_calls.is_empty() && !model_needs_follow_up {
                 control.drain_steering(&mut pending_steering);
-                if !pending_steering.is_empty() {
-                    continue;
+                if pending_steering.is_empty() && control.close_if_idle(&mut pending_steering) {
+                    if let Some(final_answer) = final_answer {
+                        return Ok(SubmitOutcome::Completed(final_answer.trim().to_string()));
+                    }
+                    if has_assistant_text {
+                        // Explicit commentary remains visible in the transcript but is
+                        // not promoted into the terminal answer for line/one-shot mode.
+                        return Ok(SubmitOutcome::Completed(String::new()));
+                    }
+                    return Err(anyhow!("model returned no text or tool call"));
                 }
-                if !control.close_if_idle(&mut pending_steering) {
-                    continue;
+                if self.conversation.needs_compaction()
+                    && !self
+                        .run_compaction(
+                            events,
+                            &control.cancellation,
+                            CompactionRequest::Automatic(CompactionPhase::MidTurn),
+                            InitialContextInjection::BeforeLastUserMessage,
+                            &active_turn_context,
+                        )
+                        .await?
+                {
+                    return Ok(SubmitOutcome::Cancelled);
                 }
-                if let Some(final_answer) = final_answer {
-                    return Ok(SubmitOutcome::Completed(final_answer.trim().to_string()));
-                }
-                if has_assistant_text {
-                    // Explicit commentary remains visible in the transcript but is
-                    // not promoted into the terminal answer for line/one-shot mode.
-                    return Ok(SubmitOutcome::Completed(String::new()));
-                }
-                return Err(anyhow!("model returned no text or tool call"));
+                continue;
             }
 
+            let lifecycle = Some(self.conversation.tool_lifecycle_journal());
             let tools = &self.tools;
             let execute = |tool_call: ToolCall| {
                 let cancellation = control.cancellation.clone();
                 let tool_events = events.clone();
+                let lifecycle = lifecycle.clone();
                 async move {
                     let output = tool_call
-                        .execute(tools, tool_truncation_policy, tool_events, cancellation)
+                        .execute(
+                            tools,
+                            tool_truncation_policy,
+                            tool_events,
+                            cancellation,
+                            lifecycle,
+                        )
                         .await;
                     tool_call.into_output_item(output)
                 }
@@ -722,18 +836,7 @@ impl Agent {
             let (output_items, completions): (Vec<_>, Vec<_>) = executed_calls.into_iter().unzip();
             let outcomes = completions
                 .into_iter()
-                .filter_map(|completion| {
-                    let has_file_change = completion.file_change.is_some();
-                    if completion.error.is_none() && !has_file_change {
-                        return None;
-                    }
-                    Some(SessionTranscriptToolOutcome {
-                        call_id: completion.call_id,
-                        output: None,
-                        error: completion.error,
-                        file_change: completion.file_change,
-                    })
-                })
+                .filter_map(transcript_tool_outcome)
                 .collect();
             self.conversation
                 .extend_tool_results(output_items, outcomes)?;
@@ -802,6 +905,10 @@ impl Agent {
                 let mut completed_closed = false;
                 loop {
                     tokio::select! {
+                        biased;
+                        // If terminal metadata and cancellation become ready together, install the
+                        // completed response so usage and cache lineage cannot be discarded after
+                        // its output items have already entered history.
                         result = &mut response => break Ok(SamplingWait::Finished(result)),
                         _ = control.cancellation.cancelled() => break Ok(SamplingWait::Cancelled),
                         item = completed_rx.recv(), if !completed_closed => {
@@ -858,11 +965,15 @@ impl Agent {
                     self.api.abandon_response();
                     return Ok(SamplingOutcome::Cancelled);
                 }
-                SamplingWait::Finished(Err(error)) => {
+                SamplingWait::Finished(Err(mut error)) => {
                     self.api.abandon_response();
                     if observed_item {
                         self.conversation
                             .mark_stream_interrupted(&error.to_string())?;
+                    }
+                    if let Some((usage, rate_limits)) = error.take_completed_response() {
+                        self.conversation
+                            .record_uninstalled_response(usage, rate_limits)?;
                     }
                     if !error.is_retryable() {
                         return Err(error.into());
@@ -882,10 +993,11 @@ impl Agent {
                     );
                     tokio::pin!(delay);
                     tokio::select! {
-                        _ = &mut delay => {}
+                        biased;
                         _ = control.cancellation.cancelled() => {
                             return Ok(SamplingOutcome::Cancelled);
                         }
+                        _ = &mut delay => {}
                     }
                 }
             }
@@ -929,7 +1041,7 @@ impl Agent {
         let history_cursor = self.conversation.history_cursor();
         let compacted = self
             .request_compaction(events, cancellation, compaction, history_cursor)
-            .await;
+            .await?;
         let Some(compacted) = compacted else {
             // Dropping the request future stops polling, but the server still owns the
             // in-flight response. A Responses WebSocket cannot carry the next request
@@ -937,18 +1049,34 @@ impl Agent {
             self.api.abandon_response();
             return Ok(false);
         };
-        let compacted = compacted?;
+        let CompactionResult {
+            items,
+            usage,
+            rate_limits,
+        } = match compacted {
+            Ok(compacted) => compacted,
+            Err(mut error) => {
+                if let Some((usage, rate_limits)) = error.take_completed_response() {
+                    self.conversation
+                        .record_uninstalled_response(usage, rate_limits)?;
+                }
+                return Err(error.into());
+            }
+        };
         let replacement = self.conversation.replace_compacted(
-            compacted.items,
+            items,
             initial_context_injection,
             active_turn_context,
-            compacted.usage,
-            compacted.rate_limits,
+            usage.as_ref(),
+            &rate_limits,
         );
         if let Err(error) = replacement {
-            // The server has completed a response that was not installed. Drop
-            // its connection-local baseline before any unchanged history is sent.
+            // The server has completed a response that was not installed. Drop its
+            // connection-local baseline, but retain account usage and rate-limit status without
+            // replacing the unchanged conversation's response baseline.
             self.api.abandon_response();
+            self.conversation
+                .record_uninstalled_response(usage, rate_limits)?;
             return Err(error);
         }
         self.api.commit_compaction();
@@ -963,95 +1091,139 @@ impl Agent {
         cancellation: &CancellationToken,
         compaction: CompactionRequest,
         history_cursor: crate::context::HistoryCursor,
-    ) -> Option<std::result::Result<CompactionResult, ApiError>> {
-        let request = self.api.compact_append_only(
-            self.conversation.items(),
-            history_cursor,
-            compaction,
-            events.as_ref(),
-        );
-        tokio::pin!(request);
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => None,
-            compacted = &mut request => Some(compacted),
+    ) -> Result<Option<std::result::Result<CompactionResult, ApiError>>> {
+        let mut completed = CompletedResponseMetadata::default();
+        let compacted = {
+            let request = self.api.compact_append_only(
+                self.conversation.items(),
+                history_cursor,
+                compaction,
+                events.as_ref(),
+                &mut completed,
+            );
+            tokio::pin!(request);
+            tokio::select! {
+                biased;
+                // A terminal compaction response owns usage and a potential replacement. If completion
+                // and cancellation become ready together, finish the atomic install/reject path rather
+                // than discarding completed-response accounting.
+                compacted = &mut request => Some(compacted),
+                _ = cancellation.cancelled() => None,
+            }
+        };
+        if compacted.is_none() {
+            let (usage, rate_limits) = completed.into_parts();
+            self.conversation
+                .record_uninstalled_response(usage, rate_limits)?;
         }
+        Ok(compacted)
+    }
+
+    fn reload_world_state_for_admission(
+        &mut self,
+        admission: IncomingUserAdmission,
+        active_turn_context: &ActiveTurnContext,
+    ) -> Result<()> {
+        if let Err(error) = self
+            .conversation
+            .reload_world_state_for_active_turn(&self.cwd, active_turn_context)
+        {
+            if admission == IncomingUserAdmission::EnforceContextWindow {
+                return Err(error);
+            }
+            // Cancellation must still preserve the accepted operator input. Keep the prior
+            // context only when a fresh local snapshot cannot be loaded.
+            tracing::warn!(%error, "failed to refresh context before preserving cancelled input");
+        }
+        Ok(())
     }
 
     async fn record_incoming_user(
         &mut self,
         input: IncomingUserInput,
         events: &Option<UnboundedSender<AgentEvent>>,
-        cancellation: &CancellationToken,
-        phase: CompactionPhase,
+        admission: IncomingUserAdmission,
         active_turn_context: &mut ActiveTurnContext,
-    ) -> Result<bool> {
-        let (input, steering_id) = match input {
-            IncomingUserInput::Initial(input) => (input, None),
-            IncomingUserInput::Steering(steering) => (steering.input, Some(steering.id)),
+    ) -> Result<()> {
+        let (payload, steering_id) = match input {
+            IncomingUserInput::Initial(input) => (SteeringPayload::Operator(input), None),
+            IncomingUserInput::Steering(steering) => (steering.payload, Some(steering.id)),
         };
-        if input.is_empty() {
-            return Err(anyhow!("prompt and image list are both empty"));
-        }
-        let (user_message, prompt_text, selected_skills) = if input.has_images() {
-            tokio::task::spawn_blocking(move || input.into_message_and_skills())
-                .await
-                .context("attached image preprocessing task failed")??
-        } else {
-            input.into_message_and_skills()?
+        let (user_message, operator_input) = match payload {
+            SteeringPayload::Operator(input) => {
+                if input.is_empty() {
+                    return Err(anyhow!("prompt and image list are both empty"));
+                }
+                let (mut user_message, prompt_text, selected_skills) = if input.has_images() {
+                    tokio::task::spawn_blocking(move || input.into_message_and_skills())
+                        .await
+                        .context("attached image preprocessing task failed")??
+                } else {
+                    input.into_message_and_skills()?
+                };
+                crate::context::mark_operator_user_message(&mut user_message);
+                (user_message, Some((prompt_text, selected_skills)))
+            }
+            SteeringPayload::Context(text) => {
+                if text.is_empty() {
+                    return Err(anyhow!("prompt and image list are both empty"));
+                }
+                let mut user_message = crate::context::message("user", text);
+                crate::context::mark_contextual_user_message(&mut user_message);
+                (user_message, None)
+            }
         };
-        let injections = self
-            .conversation
-            .skill_catalog()
-            .explicit_injections(&prompt_text, &selected_skills);
-        for warning in injections.warnings {
-            emit(events, AgentEvent::Warning(warning));
-        }
-        let skill_context = injections.items;
+        // Capture filesystem-derived context after potentially expensive image preprocessing, so
+        // the catalogue used for skill matching and the next sampling request share one snapshot.
+        self.reload_world_state_for_admission(admission, active_turn_context)?;
+        let (skill_context, real_user_message) = match operator_input {
+            Some((prompt_text, selected_skills)) => {
+                let injections = self
+                    .conversation
+                    .skill_catalog()
+                    .explicit_injections(&prompt_text, &selected_skills);
+                for warning in injections.warnings {
+                    emit(events, AgentEvent::Warning(warning));
+                }
+                (injections.items, true)
+            }
+            None => (Vec::new(), false),
+        };
         let mut projected = Vec::with_capacity(skill_context.len().saturating_add(1));
         projected.extend(skill_context.iter().cloned());
         projected.push(user_message);
-        let mut projection = self.conversation.project_append(projected);
+        let projection = self.conversation.project_append(projected);
         let incoming_tokens = projection.additional_tokens();
         let effective_context_window = self
             .conversation
             .model_selection()
             .effective_context_window();
-        if incoming_tokens > effective_context_window {
+        if admission == IncomingUserAdmission::EnforceContextWindow
+            && incoming_tokens > effective_context_window
+        {
             return Err(anyhow!(
                 "input alone is estimated at {incoming_tokens} tokens, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
-        let mut compaction_cancelled = false;
-        if projection.needs_compaction() {
-            let projected = projection.into_items();
-            compaction_cancelled = !self
-                .run_compaction(
-                    events,
-                    cancellation,
-                    CompactionRequest::Automatic(phase),
-                    InitialContextInjection::AfterCompaction,
-                    active_turn_context,
-                )
-                .await?;
-            projection = self.conversation.project_append(projected);
-        }
         let projected_tokens = projection.projected_tokens();
-        if !compaction_cancelled && projected_tokens > effective_context_window {
+        // Codex still records accepted input when pre-turn work is aborted, even if the unchanged
+        // history plus that input cannot be sampled until a later compaction succeeds.
+        if admission == IncomingUserAdmission::EnforceContextWindow
+            && projected_tokens > effective_context_window
+        {
             return Err(anyhow!(
                 "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer images"
             ));
         }
         self.conversation.append_projected(projection)?;
-        active_turn_context.record_input(skill_context);
+        if real_user_message {
+            active_turn_context.record_real_user_input(skill_context);
+        }
         if let Some(id) = steering_id {
             emit(events, AgentEvent::SteeringCommitted(id));
         }
         self.emit_context(events);
-        // Codex retains submitted input when pre-sampling compaction is interrupted. Preserve the
-        // same saved-session invariant here: cancellation may defer compaction, but must not erase
-        // an operator message that the UI already accepted.
-        Ok(!compaction_cancelled)
+        Ok(())
     }
 
     fn emit_context(&self, events: &Option<UnboundedSender<AgentEvent>>) {
@@ -1075,6 +1247,12 @@ enum SamplingOutcome {
 enum IncomingUserInput {
     Initial(UserInput),
     Steering(SteeringInput),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IncomingUserAdmission {
+    EnforceContextWindow,
+    PreserveAfterCancellation,
 }
 
 fn lock_steering(steering: &Mutex<SteeringState>) -> std::sync::MutexGuard<'_, SteeringState> {

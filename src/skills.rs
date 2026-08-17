@@ -405,13 +405,13 @@ impl SkillCatalog {
         }
 
         let mentions = extract_mentions(text);
-        for path in mentions.paths {
-            let path = Path::new(path.strip_prefix("skill://").unwrap_or(path));
-            if let Some(skill) = self
-                .skills
-                .iter()
-                .find(|skill| skill.enabled && skill.path == path)
-                && seen_paths.insert(skill.path.clone())
+        let linked_paths = mentions
+            .paths
+            .iter()
+            .map(|path| Path::new(path.strip_prefix("skill://").unwrap_or(path)))
+            .collect::<HashSet<_>>();
+        for skill in self.skills.iter().filter(|skill| skill.enabled) {
+            if linked_paths.contains(&skill.path.as_path()) && seen_paths.insert(skill.path.clone())
             {
                 selected.push(skill);
             }
@@ -450,8 +450,15 @@ impl SkillCatalog {
                         )));
                     }
                     let name = escape_xml_text(&skill.name);
+                    let description = escape_xml_text(
+                        &skill
+                            .description
+                            .chars()
+                            .take(MAX_DESCRIPTION_CHARS)
+                            .collect::<String>(),
+                    );
                     let prompt = format!(
-                        "<skill_context>\n<name>{name}</name>\n<path>{path}</path>\n<instructions><![CDATA[\n{}\n]]></instructions>{}\n</skill_context>",
+                        "<skill_context>\n<name>{name}</name>\n<description>{description}</description>\n<path>{path}</path>\n<instructions><![CDATA[\n{}\n]]></instructions>{}\n</skill_context>",
                         escape_cdata(&contents),
                         truncation_notice.as_deref().unwrap_or_default(),
                     );
@@ -522,7 +529,8 @@ pub(crate) fn is_mention_name_byte(byte: u8) -> bool {
 }
 
 pub(crate) fn explicitly_invokes_review(text: &str) -> bool {
-    extract_mentions(text).plain_names.contains("review")
+    let mentions = extract_mentions(text);
+    mentions.plain_names.contains("review") || mentions.linked_review
 }
 
 fn discovery_roots_with_home(
@@ -1032,12 +1040,14 @@ fn bounded_warning(warning: String) -> String {
 
 struct Mentions<'a> {
     plain_names: HashSet<&'a str>,
+    linked_review: bool,
     paths: HashSet<&'a str>,
 }
 
 fn extract_mentions(text: &str) -> Mentions<'_> {
     let bytes = text.as_bytes();
     let mut plain_names = HashSet::new();
+    let mut linked_review = false;
     let mut paths = HashSet::new();
     let trimmed = text.trim_start();
     if let Some(rest) = trimmed.strip_prefix("/review")
@@ -1054,6 +1064,7 @@ fn extract_mentions(text: &str) -> Mentions<'_> {
             && let Some((name, path, end)) = parse_linked_mention(text, index)
         {
             if !is_common_environment_variable(name) {
+                linked_review |= name == "review";
                 paths.insert(path);
             }
             index = end;
@@ -1079,7 +1090,11 @@ fn extract_mentions(text: &str) -> Mentions<'_> {
         }
         index = end.max(index + 1);
     }
-    Mentions { plain_names, paths }
+    Mentions {
+        plain_names,
+        linked_review,
+        paths,
+    }
 }
 
 fn parse_linked_mention(text: &str, start: usize) -> Option<(&str, &str, usize)> {

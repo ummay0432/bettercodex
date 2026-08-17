@@ -56,10 +56,7 @@ impl WebSocketConnection {
         .map_err(|error| ApiError::retryable(format!("failed to send WebSocket request: {error}")))
     }
 
-    pub(super) async fn next_text(
-        &mut self,
-        idle_timeout: Duration,
-    ) -> ApiResult<Option<Utf8Bytes>> {
+    pub(super) async fn next_text(&mut self, idle_timeout: Duration) -> ApiResult<Utf8Bytes> {
         let deadline = Instant::now() + idle_timeout;
         loop {
             let message = timeout_at(deadline, self.stream.next())
@@ -73,7 +70,7 @@ impl WebSocketConnection {
                 ));
             };
             match message {
-                Ok(Message::Text(text)) => return Ok(Some(text)),
+                Ok(Message::Text(text)) => return Ok(text),
                 Ok(Message::Ping(payload)) => {
                     timeout_at(deadline, self.stream.send(Message::Pong(payload)))
                         .await
@@ -127,25 +124,27 @@ fn map_connect_error(error: tungstenite::Error) -> ApiError {
     match error {
         tungstenite::Error::Http(response) => {
             let status = response.status();
+            let headers = response.headers().clone();
             let body = response
                 .body()
                 .as_ref()
                 .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 .unwrap_or_default();
-            if status.as_u16() == 401 {
+            let message = format!("Responses WebSocket upgrade failed with {status}: {body}");
+            let error = if status.as_u16() == 401 {
                 ApiError::unauthorized(format!("Responses WebSocket authentication failed: {body}"))
             } else if matches!(status.as_u16(), 404 | 405 | 426) {
-                ApiError::websocket_unavailable(format!(
-                    "Responses WebSocket upgrade failed with {status}: {body}"
-                ))
+                ApiError::websocket_unavailable(message)
             } else if status.as_u16() == 429 || status.is_server_error() {
-                ApiError::retryable(format!(
-                    "Responses WebSocket upgrade failed with {status}: {body}"
-                ))
+                ApiError::retryable_after(message, super::parse_retry_after(&headers))
             } else {
-                ApiError::fatal(format!(
-                    "Responses WebSocket upgrade failed with {status}: {body}"
-                ))
+                ApiError::fatal(message)
+            };
+            let rate_limits = crate::rate_limits::parse_all_rate_limits(&headers);
+            if rate_limits.is_empty() {
+                error
+            } else {
+                error.with_completed_response(None, rate_limits)
             }
         }
         error => ApiError::retryable(format!("failed to connect Responses WebSocket: {error}")),

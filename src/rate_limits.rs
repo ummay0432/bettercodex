@@ -96,6 +96,22 @@ impl RateLimitSnapshot {
     }
 }
 
+/// Preserve stable fields that rolling rate-limit updates can legitimately omit.
+///
+/// The newest snapshot remains authoritative for the windows themselves. This mirrors current
+/// Codex behavior for optional account metadata while retaining bettercodex's per-limit buckets.
+pub(crate) fn fill_missing_rate_limit_fields(
+    snapshot: &mut RateLimitSnapshot,
+    previous: &RateLimitSnapshot,
+) {
+    if snapshot.limit_name.is_none() {
+        snapshot.limit_name.clone_from(&previous.limit_name);
+    }
+    if snapshot.credits.is_none() {
+        snapshot.credits.clone_from(&previous.credits);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RateLimitWindow {
     pub(crate) used_percent: f64,

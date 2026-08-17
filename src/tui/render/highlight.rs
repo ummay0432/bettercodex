@@ -1,10 +1,11 @@
-//! Fixed, adaptive syntax highlighting for transcript code fences.
+//! Fixed, adaptive syntax highlighting for transcript code fences and shell commands.
 //!
-//! Ported from Codex CLI revision `1669c2403f793d0230065397dfc25f52b844244e`.
-//! bettercodex deliberately keeps the adaptive default themes and safety limits, but has no
-//! configurable theme or theme-picker infrastructure.
+//! Ported from Codex CLI's syntax-highlighting pipeline. bettercodex deliberately keeps the
+//! adaptive upstream default themes and safety limits, but has no configurable theme or
+//! theme-picker infrastructure.
 
 use super::super::palette;
+use crate::ansi_escape::expand_tabs;
 use ratatui::style::Color as RtColor;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
@@ -108,7 +109,10 @@ fn highlight_to_line_spans(code: &str, language: &str) -> Option<Vec<Vec<Span<'s
         for (style, text) in ranges {
             let text = text.trim_end_matches(['\n', '\r']);
             if !text.is_empty() {
-                spans.push(Span::styled(text.to_string(), convert_style(style)));
+                spans.push(Span::styled(
+                    expand_tabs(text).into_owned(),
+                    convert_style(style),
+                ));
             }
         }
         if spans.is_empty() {
@@ -127,12 +131,17 @@ pub(crate) fn highlight_code_to_lines(code: &str, language: &str) -> Vec<Line<'s
 
     let mut lines = code
         .lines()
-        .map(|line| Line::from(line.to_string()))
+        .map(|line| Line::from(expand_tabs(line).into_owned()))
         .collect::<Vec<_>>();
     if lines.is_empty() {
         lines.push(Line::default());
     }
     lines
+}
+
+/// Highlight a shell command with the same adaptive theme used for fenced Bash blocks.
+pub(crate) fn highlight_bash_to_lines(script: &str) -> Vec<Line<'static>> {
+    highlight_code_to_lines(script, "bash")
 }
 
 fn convert_style(style: SyntectStyle) -> Style {
@@ -166,5 +175,76 @@ fn ansi_palette_color(index: u8) -> RtColor {
         6 => RtColor::Cyan,
         7 => RtColor::Gray,
         index => RtColor::Indexed(index),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn reconstructed(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn bash_highlighting_preserves_visible_content_and_styles() {
+        let script = "echo \"hello world\" && ls -la | rg foo";
+        let lines = highlight_bash_to_lines(script);
+
+        assert_eq!(reconstructed(&lines), script);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style != Style::default())
+        );
+    }
+
+    #[test]
+    fn highlighting_expands_literal_tabs_that_ratatui_would_drop() {
+        let lines = highlight_bash_to_lines("printf one\tthen-two");
+        assert_eq!(reconstructed(&lines), "printf one    then-two");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| !span.content.contains('\t'))
+        );
+    }
+
+    #[test]
+    fn oversized_shell_line_falls_back_without_losing_text() {
+        let script = "A".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1);
+        let lines = highlight_bash_to_lines(&script);
+
+        assert_eq!(reconstructed(&lines), script);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style == Style::default())
+        );
+    }
+
+    #[test]
+    fn syntax_theme_tracks_known_light_backgrounds_and_safe_unknown_defaults() {
+        assert_eq!(
+            adaptive_theme_name(Some((255, 255, 255))),
+            EmbeddedThemeName::CatppuccinLatte
+        );
+        assert_eq!(
+            adaptive_theme_name(None),
+            EmbeddedThemeName::CatppuccinMocha
+        );
     }
 }

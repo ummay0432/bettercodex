@@ -8,6 +8,7 @@ use crate::usage::TokenUsage;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use aws_lc_rs::digest;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -18,6 +19,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -31,6 +33,8 @@ use std::ops::DerefMut;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
@@ -44,6 +48,8 @@ const MAX_SESSION_PREVIEW_CHARS: usize = 160;
 const HISTORY_RECORD_PREFIX: &[u8] = br#"{"type":"history_"#;
 const SESSION_LIST_MAX_WORKERS: usize = 4;
 const SESSION_LIST_MIN_FILES_PER_WORKER: usize = 64;
+pub(crate) const MAX_TOOL_PRE_STATE_HASH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TOOL_RECOVERY_HASH_BYTES: u64 = MAX_TOOL_PRE_STATE_HASH_BYTES;
 pub(crate) const SYNTHETIC_ABORT_OUTPUT: &str = "aborted";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -57,6 +63,7 @@ pub(crate) struct SessionIdentity {
 pub(crate) struct SessionMetadata {
     pub(crate) version: u32,
     pub(crate) identity: SessionIdentity,
+    #[serde(with = "path_serde")]
     pub(crate) cwd: PathBuf,
     pub(crate) created_at_unix_ms: u64,
     pub(crate) model: String,
@@ -138,6 +145,27 @@ pub(crate) enum SessionTranscriptToolOutput {
     Error(String),
 }
 
+impl SessionTranscriptToolOutput {
+    // Keep the established transcript envelope so older readers can deserialize the session. The
+    // current TUI recognizes this internal payload and renders it as neutral recovered state.
+    pub(crate) fn recovered_file_state(message: String) -> Self {
+        Self::Success(serde_json::json!({
+            "type": "recovered_file_state",
+            "message": message,
+        }))
+    }
+
+    pub(crate) fn recovered_file_state_message(&self) -> Option<&str> {
+        let Self::Success(value) = self else {
+            return None;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("recovered_file_state") {
+            return None;
+        }
+        value.get("message").and_then(Value::as_str)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionTranscriptToolOutcome {
     pub(crate) call_id: String,
@@ -147,6 +175,302 @@ pub(crate) struct SessionTranscriptToolOutcome {
     pub(crate) error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) file_change: Option<ToolFileChange>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolEffectClass {
+    ReadOnly,
+    AtomicMutation,
+    Opaque,
+}
+
+impl ToolEffectClass {
+    fn for_tool(name: &str) -> Option<Self> {
+        match name {
+            "read" => Some(Self::ReadOnly),
+            "write" | "edit" => Some(Self::AtomicMutation),
+            "bash" => Some(Self::Opaque),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct ToolLifecycleRegistration {
+    call_id: String,
+    name: String,
+    effect: ToolEffectClass,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ToolContentDigest {
+    bytes: u64,
+    sha256: String,
+}
+
+impl ToolContentDigest {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        let sha256 = digest::digest(&digest::SHA256, bytes);
+        Self {
+            bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256: encode_lower_hex(sha256.as_ref()),
+        }
+    }
+
+    pub(crate) fn from_bytes_with_checkpoint(
+        bytes: &[u8],
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        let mut hasher = digest::Context::new(&digest::SHA256);
+        for chunk in bytes.chunks(64 * 1024) {
+            checkpoint()?;
+            hasher.update(chunk);
+        }
+        checkpoint()?;
+        Ok(Self {
+            bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256: encode_lower_hex(hasher.finish().as_ref()),
+        })
+    }
+
+    pub(crate) fn from_reader(reader: &mut impl Read) -> std::io::Result<Self> {
+        let mut hasher = digest::Context::new(&digest::SHA256);
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut bytes = 0_u64;
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes = bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            hasher.update(&buffer[..read]);
+        }
+        Ok(Self {
+            bytes,
+            sha256: encode_lower_hex(hasher.finish().as_ref()),
+        })
+    }
+
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.bytes
+    }
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "digest", rename_all = "snake_case")]
+pub(crate) enum ToolTargetPreState {
+    Absent,
+    Digest(ToolContentDigest),
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ToolStagingEvidence {
+    pub(crate) name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) directory: Option<crate::private_fs::FileObjectIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content: Option<crate::private_fs::FileSnapshot>,
+}
+
+impl ToolStagingEvidence {
+    fn refines(&self, previous: &Self) -> bool {
+        self.name == previous.name
+            && option_refines(&previous.directory, &self.directory)
+            && match (&previous.content, &self.content) {
+                (None, _) => true,
+                (Some(previous), Some(current)) => {
+                    previous.object_identity() == current.object_identity()
+                }
+                (Some(_), None) => false,
+            }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ToolSymlinkEvidence {
+    #[serde(with = "path_serde")]
+    pub(crate) path: PathBuf,
+    pub(crate) snapshot: crate::private_fs::FileSnapshot,
+}
+
+impl ToolSymlinkEvidence {
+    pub(crate) fn is_current(&self) -> bool {
+        std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.file_type().is_symlink()
+                && crate::private_fs::file_snapshot(&metadata) == self.snapshot
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ToolPathResolutionEvidence {
+    #[serde(with = "path_serde")]
+    pub(crate) requested: PathBuf,
+    pub(crate) symlinks: Vec<ToolSymlinkEvidence>,
+}
+
+impl ToolPathResolutionEvidence {
+    fn is_current(&self) -> bool {
+        !self.symlinks.is_empty() && self.symlinks.iter().all(ToolSymlinkEvidence::is_current)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ToolMutationEvidence {
+    #[serde(with = "path_serde")]
+    pub(crate) target: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_parent: Option<crate::private_fs::FileObjectIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) path_resolution: Option<ToolPathResolutionEvidence>,
+    pub(crate) pre_state: ToolTargetPreState,
+    pub(crate) post_state: ToolContentDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) staging: Option<ToolStagingEvidence>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "path_serde::option"
+    )]
+    pub(crate) missing_parent: Option<PathBuf>,
+}
+
+impl ToolMutationEvidence {
+    fn refines(&self, previous: &Self) -> bool {
+        self.target == previous.target
+            && self.path_resolution == previous.path_resolution
+            && self.pre_state == previous.pre_state
+            && self.post_state == previous.post_state
+            && self.missing_parent == previous.missing_parent
+            && option_refines(&previous.target_parent, &self.target_parent)
+            && match (&previous.staging, &self.staging) {
+                (None, _) => true,
+                (Some(previous), Some(current)) => current.refines(previous),
+                (Some(_), None) => false,
+            }
+    }
+}
+
+fn option_refines<T: PartialEq>(previous: &Option<T>, current: &Option<T>) -> bool {
+    match (previous, current) {
+        (None, _) => true,
+        (Some(previous), Some(current)) => previous == current,
+        (Some(_), None) => false,
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+// Serde's ordinary PathBuf encoding rejects non-UTF-8 paths. Unix working directories and tool
+// paths can contain arbitrary non-NUL bytes, so retain the readable string form when possible and
+// fall back to a lossless byte representation only when necessary.
+mod path_serde {
+    use serde::Deserialize;
+    use serde::Deserializer;
+    use serde::Serialize;
+    use serde::Serializer;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PathRepresentation {
+        Utf8(String),
+        UnixBytes { unix_bytes: Vec<u8> },
+    }
+
+    #[derive(Serialize)]
+    struct UnixPathRepresentation<'a> {
+        unix_bytes: &'a [u8],
+    }
+
+    fn from_representation(representation: PathRepresentation) -> PathBuf {
+        match representation {
+            PathRepresentation::Utf8(path) => PathBuf::from(path),
+            PathRepresentation::UnixBytes { unix_bytes } => {
+                PathBuf::from(OsString::from_vec(unix_bytes))
+            }
+        }
+    }
+
+    pub(super) fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(path) = path.to_str() {
+            serializer.serialize_str(path)
+        } else {
+            UnixPathRepresentation {
+                unix_bytes: path.as_os_str().as_bytes(),
+            }
+            .serialize(serializer)
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        PathRepresentation::deserialize(deserializer).map(from_representation)
+    }
+
+    pub(super) mod option {
+        use super::PathRepresentation;
+        use super::from_representation;
+        use serde::Deserialize;
+        use serde::Deserializer;
+        use serde::Serializer;
+        use std::path::PathBuf;
+
+        pub(in crate::rollout) fn serialize<S>(
+            path: &Option<PathBuf>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match path {
+                Some(path) => super::serialize(path, serializer),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub(in crate::rollout) fn deserialize<'de, D>(
+            deserializer: D,
+        ) -> Result<Option<PathBuf>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            Option::<PathRepresentation>::deserialize(deserializer)
+                .map(|path| path.map(from_representation))
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolRecovery {
+    pub(crate) output: Value,
+    pub(crate) transcript_output: SessionTranscriptToolOutput,
+    pub(crate) file_change: Option<ToolFileChange>,
+    requires_inspection: bool,
 }
 
 pub(crate) struct LoadedRollout {
@@ -163,16 +487,45 @@ pub(crate) struct LoadedRollout {
     pub(crate) model_selection: ModelSelection,
     pub(crate) service_tier: ServiceTier,
     pub(crate) unfinished_turn: Option<String>,
+    pub(crate) unfinished_turn_has_activity: bool,
+    pub(crate) unfinished_turn_has_recovery_notice: bool,
+    pub(crate) unfinished_turn_recovered: bool,
+    pub(crate) tool_recoveries: HashMap<String, ToolRecovery>,
+    pub(crate) crash_recovery_requires_inspection: bool,
     pub(crate) forked_from: Option<String>,
 }
 
 pub(crate) struct Rollout {
-    file: LockedRolloutFile,
-    path: PathBuf,
+    file: Arc<SharedRolloutFile>,
     metadata: SessionMetadata,
 }
 
+#[derive(Clone)]
+pub(crate) struct ToolLifecycleJournal {
+    file: Arc<SharedRolloutFile>,
+}
+
+struct SharedRolloutFile {
+    file: Mutex<LockedRolloutFile>,
+    path: PathBuf,
+    #[cfg(test)]
+    fail_next_append: std::sync::atomic::AtomicBool,
+}
+
 struct LockedRolloutFile(File);
+
+// Marks an append failure only after the prior JSONL boundary has been restored, making an exact
+// retry safe. Failures to restore the boundary deliberately retain their ordinary error type.
+#[derive(Debug)]
+struct RolledBackAppendError;
+
+impl fmt::Display for RolledBackAppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("session append was rolled back to its prior record boundary")
+    }
+}
+
+impl std::error::Error for RolledBackAppendError {}
 
 impl Deref for LockedRolloutFile {
     type Target = File;
@@ -224,18 +577,49 @@ enum RolloutRecordData<Items = Vec<Value>> {
         items: Items,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcomes: Option<Vec<SessionTranscriptToolOutcome>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_calls: Option<Vec<ToolLifecycleRegistration>>,
     },
     HistoryReplace {
         reason: HistoryReplacement,
         items: Items,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_usage: Option<TokenUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcomes: Option<Vec<SessionTranscriptToolOutcome>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<TurnRecoveryCheckpoint>,
+    },
+    // Short-lived refactor builds wrote registrations as a standalone record before they became
+    // part of HistoryAppend's atomic persistence boundary.
+    ToolCallsRegistered {
+        calls: Vec<ToolLifecycleRegistration>,
+    },
+    ToolStarted {
+        call_id: String,
+    },
+    ToolMutationPrepared {
+        call_id: String,
+        evidence: ToolMutationEvidence,
+    },
+    ToolFinished {
+        call_id: String,
+        output: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_change: Option<ToolFileChange>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        requires_inspection: bool,
     },
     Usage {
         usage: TokenUsage,
         history_estimate: u64,
         #[serde(default)]
         server_reasoning_included: bool,
+    },
+    UsageTotal {
+        usage: TokenUsage,
     },
     ServiceTierChanged {
         service_tier: ServiceTier,
@@ -270,6 +654,8 @@ struct PreviewItem {
     role: String,
     #[serde(default)]
     content: Vec<PreviewContent>,
+    #[serde(rename = "bettercodex_user_message_kind", default)]
+    user_message_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -501,6 +887,121 @@ pub(crate) enum TurnOutcome {
     Failed,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct TurnRecoveryCheckpoint {
+    turn_id: String,
+    requires_inspection: bool,
+}
+
+#[derive(Default)]
+struct LoadedToolLifecycle {
+    registration: Option<ToolLifecycleRegistration>,
+    inconsistent: bool,
+    started: bool,
+    prepared: Option<ToolMutationEvidence>,
+    finished: Option<LoadedToolFinish>,
+}
+
+struct LoadedToolFinish {
+    output: Value,
+    error: Option<String>,
+    file_change: Option<ToolFileChange>,
+    requires_inspection: bool,
+}
+
+fn register_tool_lifecycles(
+    lifecycles: &mut HashMap<String, LoadedToolLifecycle>,
+    registrations: impl IntoIterator<Item = ToolLifecycleRegistration>,
+) {
+    for registration in registrations {
+        let lifecycle = lifecycles.entry(registration.call_id.clone()).or_default();
+        match &lifecycle.registration {
+            None => {
+                if lifecycle.started || lifecycle.prepared.is_some() || lifecycle.finished.is_some()
+                {
+                    lifecycle.inconsistent = true;
+                }
+                lifecycle.registration = Some(registration);
+            }
+            Some(existing) if existing == &registration => {}
+            Some(_) => lifecycle.inconsistent = true,
+        }
+    }
+}
+
+impl ToolLifecycleJournal {
+    fn write_record(&self, record: &RolloutRecord) -> Result<()> {
+        write_bounded_rollout_record(&self.file, record)
+    }
+
+    async fn write_record_async(&self, record: RolloutRecord) -> Result<()> {
+        let journal = self.clone();
+        tokio::task::spawn_blocking(move || journal.write_record(&record))
+            .await
+            .map_err(|_| anyhow!("session journal writer is unavailable after a panic"))?
+    }
+
+    pub(crate) fn record_started(&self, call_id: &str) -> Result<()> {
+        self.write_record(&RolloutRecord::ToolStarted {
+            call_id: call_id.to_string(),
+        })
+    }
+
+    pub(crate) async fn record_started_async(&self, call_id: &str) -> Result<()> {
+        self.write_record_async(RolloutRecord::ToolStarted {
+            call_id: call_id.to_string(),
+        })
+        .await
+    }
+
+    pub(crate) fn record_mutation_prepared(
+        &self,
+        call_id: &str,
+        evidence: ToolMutationEvidence,
+    ) -> Result<()> {
+        self.write_record(&RolloutRecord::ToolMutationPrepared {
+            call_id: call_id.to_string(),
+            evidence,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_finished(
+        &self,
+        call_id: &str,
+        output: Value,
+        error: Option<String>,
+        file_change: Option<ToolFileChange>,
+        requires_inspection: bool,
+    ) -> Result<()> {
+        self.write_record(&RolloutRecord::ToolFinished {
+            call_id: call_id.to_string(),
+            output,
+            error,
+            file_change,
+            requires_inspection,
+        })
+    }
+
+    pub(crate) async fn record_finished_async(
+        &self,
+        call_id: &str,
+        output: Value,
+        error: Option<String>,
+        file_change: Option<ToolFileChange>,
+        requires_inspection: bool,
+    ) -> Result<()> {
+        self.write_record_async(RolloutRecord::ToolFinished {
+            call_id: call_id.to_string(),
+            output,
+            error,
+            file_change,
+            requires_inspection,
+        })
+        .await
+    }
+}
+
 impl Rollout {
     pub(crate) fn create_with_selection(cwd: &Path, selection: &ModelSelection) -> Result<Self> {
         Self::create_in_with_selection(&state_root()?, cwd, selection)
@@ -536,12 +1037,30 @@ impl Rollout {
         };
         let path = sessions.join(format!("{}.jsonl", metadata.identity.session_id));
         let file = lock_rollout(open_private_append(&path, true)?, &path)?;
-        let mut rollout = Self {
-            file,
-            path,
+        let rollout = Self {
+            file: Arc::new(SharedRolloutFile {
+                file: Mutex::new(file),
+                path: path.clone(),
+                #[cfg(test)]
+                fail_next_append: std::sync::atomic::AtomicBool::new(false),
+            }),
             metadata: metadata.clone(),
         };
-        rollout.write_record(&RolloutRecord::Session { metadata })?;
+        if let Err(error) = rollout.write_record(&RolloutRecord::Session { metadata }) {
+            drop(rollout);
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(error)
+                }
+                Err(cleanup_error) => Err(error).with_context(|| {
+                    format!(
+                        "failed to remove incomplete session journal {}: {cleanup_error}",
+                        path.display()
+                    )
+                }),
+            };
+        }
         Ok(rollout)
     }
 
@@ -566,19 +1085,9 @@ impl Rollout {
         for entry in entries {
             let entry =
                 entry.with_context(|| format!("failed to inspect {}", sessions.display()))?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-                || !entry
-                    .file_type()
-                    .with_context(|| format!("failed to inspect saved session {}", path.display()))?
-                    .is_file()
-            {
+            let Some((path, modified_at)) = saved_session_candidate(entry)? else {
                 continue;
-            }
-            let modified_at = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok();
+            };
             if read_session_summary(&path, modified_at)?.is_some() {
                 return Ok(true);
             }
@@ -611,9 +1120,11 @@ impl Rollout {
         if items.is_empty() {
             return Ok(());
         }
+        let tool_calls = tool_lifecycle_registrations(items);
         let record = BorrowedRolloutRecord::HistoryAppend {
             items,
             outcomes: None,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         };
         self.write_record(&record)
     }
@@ -627,8 +1138,32 @@ impl Rollout {
             return self.record_tool_outcomes(outcomes);
         }
         let outcomes = (!outcomes.is_empty()).then_some(outcomes);
-        let record = BorrowedRolloutRecord::HistoryAppend { items, outcomes };
-        self.write_record(&record)
+        let record = BorrowedRolloutRecord::HistoryAppend {
+            items,
+            outcomes,
+            tool_calls: None,
+        };
+        let first_error = match self.write_record(&record) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if !first_error.is::<RolledBackAppendError>() {
+            return Err(first_error);
+        }
+        // Tool effects may already be durable. Retry the exact history/outcome projection once so
+        // a transient journal error cannot turn a completed mutation into a synthetic abort.
+        self.write_record(&record).with_context(|| {
+            format!(
+                "failed to persist tool results after retrying a rolled-back session append: {first_error:#}"
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_append_for_test(&self) {
+        self.file
+            .fail_next_append
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn record_fork(
@@ -668,15 +1203,52 @@ impl Rollout {
         self.write_record(&RolloutRecord::ToolOutcomes { outcomes })
     }
 
+    pub(crate) fn tool_lifecycle_journal(&self) -> ToolLifecycleJournal {
+        ToolLifecycleJournal {
+            file: Arc::clone(&self.file),
+        }
+    }
+
     pub(crate) fn replace_history(
         &mut self,
         items: &[Value],
         reason: HistoryReplacement,
     ) -> Result<()> {
+        self.replace_history_with_outcomes(items, reason, Vec::new())
+    }
+
+    pub(crate) fn replace_history_with_outcomes(
+        &mut self,
+        items: &[Value],
+        reason: HistoryReplacement,
+        outcomes: Vec<SessionTranscriptToolOutcome>,
+    ) -> Result<()> {
         let record = BorrowedRolloutRecord::HistoryReplace {
             reason,
             items,
             response_usage: None,
+            outcomes: (!outcomes.is_empty()).then_some(outcomes),
+            recovery: None,
+        };
+        self.write_record(&record)
+    }
+
+    pub(crate) fn replace_recovered_history(
+        &mut self,
+        items: &[Value],
+        outcomes: Vec<SessionTranscriptToolOutcome>,
+        turn_id: &str,
+        requires_inspection: bool,
+    ) -> Result<()> {
+        let record = BorrowedRolloutRecord::HistoryReplace {
+            reason: HistoryReplacement::Normalization,
+            items,
+            response_usage: None,
+            outcomes: (!outcomes.is_empty()).then_some(outcomes),
+            recovery: Some(TurnRecoveryCheckpoint {
+                turn_id: turn_id.to_string(),
+                requires_inspection,
+            }),
         };
         self.write_record(&record)
     }
@@ -690,6 +1262,8 @@ impl Rollout {
             reason: HistoryReplacement::Compaction,
             items,
             response_usage: response_usage.cloned(),
+            outcomes: None,
+            recovery: None,
         };
         self.write_record(&record)
     }
@@ -704,6 +1278,12 @@ impl Rollout {
             usage: usage.clone(),
             history_estimate,
             server_reasoning_included,
+        })
+    }
+
+    pub(crate) fn record_total_usage(&mut self, usage: &TokenUsage) -> Result<()> {
+        self.write_record(&RolloutRecord::UsageTotal {
+            usage: usage.clone(),
         })
     }
 
@@ -731,37 +1311,107 @@ impl Rollout {
         })
     }
 
-    fn write_record(&mut self, record: &impl Serialize) -> Result<()> {
-        let record_start = self.file.metadata()?.len();
-        // Stream through a fixed-size buffer: buffering the complete JSON value would briefly
-        // duplicate the active history. Restore the prior boundary if serialization or I/O stops
-        // mid-record so a later append cannot turn a recoverable tail into interior corruption.
-        let append_result = {
-            let mut writer = BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, &mut *self.file);
-            serde_json::to_writer(&mut writer, record)
-                .context("failed to encode session record")
-                .and_then(|()| {
-                    writer
-                        .write_all(b"\n")
-                        .context("failed to terminate session record")
-                })
-                .and_then(|()| writer.flush().context("failed to flush session record"))
-        };
-        if let Err(error) = append_result {
-            self.file.set_len(record_start).with_context(|| {
-                format!(
-                    "failed to restore {} after an incomplete session record: {error:#}",
-                    self.path.display()
-                )
-            })?;
-            return Err(error).with_context(|| format!("failed to append {}", self.path.display()));
-        }
-        // `BufWriter::flush` above completes the JSONL record and reports write errors. Do not
-        // force every record through `sync_data`: that blocks the agent on durable storage even
-        // though process-crash recovery only needs complete records in the filesystem cache.
-        // `load_rollout` repairs an interrupted final record before the journal is appended again.
-        Ok(())
+    fn write_record(&self, record: &impl Serialize) -> Result<()> {
+        write_rollout_record(&self.file, record)
     }
+}
+
+fn write_rollout_record(shared: &SharedRolloutFile, record: &impl Serialize) -> Result<()> {
+    append_rollout_record(shared, |file| {
+        // Stream through a fixed-size buffer: buffering the complete JSON value would briefly
+        // duplicate the active history.
+        let mut writer = BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, &mut **file);
+        serde_json::to_writer(&mut writer, record)
+            .context("failed to encode session record")
+            .and_then(|()| {
+                #[cfg(test)]
+                crate::process_termination_test_support::stop_at(
+                    "journal_record_encoded_before_newline",
+                );
+                writer
+                    .write_all(b"\n")
+                    .context("failed to terminate session record")
+            })
+            .and_then(|()| writer.flush().context("failed to flush session record"))
+    })
+}
+
+fn write_bounded_rollout_record(shared: &SharedRolloutFile, record: &impl Serialize) -> Result<()> {
+    // Lifecycle records are hard-bounded by tool output, file-change preview, and filesystem path
+    // limits. Encoding one complete line avoids allocating the 64 KiB streaming buffer for every
+    // small phase record and keeps serialization outside the journal lock when several tools
+    // complete concurrently.
+    let mut encoded = serde_json::to_vec(record).context("failed to encode session record")?;
+    #[cfg(test)]
+    crate::process_termination_test_support::stop_at("journal_record_encoded_before_newline");
+    encoded.push(b'\n');
+    append_rollout_record(shared, |file| {
+        file.write_all(&encoded)
+            .context("failed to write session record")?;
+        file.flush().context("failed to flush session record")
+    })
+}
+
+fn append_rollout_record(
+    shared: &SharedRolloutFile,
+    append: impl FnOnce(&mut LockedRolloutFile) -> Result<()>,
+) -> Result<()> {
+    let path = &shared.path;
+    let lock = shared.file.lock();
+    let was_poisoned = lock.is_err();
+    let mut file = lock.unwrap_or_else(std::sync::PoisonError::into_inner);
+    if was_poisoned {
+        // Every append panic is caught and rolled back below before the guard is released. Clear a
+        // stale poison bit defensively so an unrelated prior panic cannot disable this session.
+        shared.file.clear_poison();
+    }
+    let record_start = file.metadata()?.len();
+    #[cfg(test)]
+    let inject_failure = shared
+        .fail_next_append
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    let append_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if inject_failure {
+            file.write_all(b"{\"type\":")?;
+            file.flush()?;
+            return Err(anyhow!("injected session append failure"));
+        }
+        append(&mut file)
+    }));
+    let append_result = match append_result {
+        Ok(result) => result,
+        Err(panic) => {
+            let restore = file.set_len(record_start).with_context(|| {
+                format!(
+                    "failed to restore {} after a panicking session append",
+                    path.display()
+                )
+            });
+            drop(file);
+            if let Err(error) = restore {
+                panic!("{error:#}");
+            }
+            std::panic::resume_unwind(panic);
+        }
+    };
+    if let Err(error) = append_result {
+        // Restore the prior boundary so a later append cannot turn a recoverable tail into interior
+        // corruption, regardless of whether the record used streaming or bounded encoding.
+        file.set_len(record_start).with_context(|| {
+            format!(
+                "failed to restore {} after an incomplete session record: {error:#}",
+                path.display()
+            )
+        })?;
+        return Err(error)
+            .context(RolledBackAppendError)
+            .with_context(|| format!("failed to append {}", path.display()));
+    }
+    // Completing the JSONL record and flushing reports write errors. Do not force every record
+    // through `sync_data`: process-crash recovery only needs complete records in the filesystem
+    // cache, and `load_rollout` repairs an interrupted final record before appending again.
+    Ok(())
 }
 
 fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
@@ -778,6 +1428,8 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut transcript_tail_tools = HashMap::new();
     let mut transcript_tail_history_start = None;
     let mut normalized_aborted_calls = HashSet::new();
+    let mut tool_lifecycles = HashMap::<String, LoadedToolLifecycle>::new();
+    let mut unfinished_turn_call_ids = HashSet::new();
     let mut has_transcript_checkpoint = false;
     let mut legacy_transcript_snapshot = false;
     let mut forked_session = false;
@@ -789,6 +1441,12 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut model_selection = None;
     let mut service_tier = ServiceTier::default();
     let mut unfinished_turn = None;
+    let mut unfinished_turn_has_activity = false;
+    let mut unfinished_turn_has_recovery_notice = false;
+    let mut unfinished_turn_recovered = false;
+    let mut recovery_checkpoint_requires_inspection = false;
+    let mut legacy_recovery_requires_inspection = false;
+    let mut unknown_record_requires_inspection = false;
     let mut forked_from = None;
     let mut line_number = 0_usize;
     let mut valid_length = 0_u64;
@@ -805,6 +1463,12 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             .context("saved session record exceeds the supported file size")?;
         let record = match line.content {
             JsonLineContent::Blank => {
+                if metadata.is_none() {
+                    return Err(anyhow!(
+                        "session header must be the first record at {}:{line_number}",
+                        path.display()
+                    ));
+                }
                 valid_length = valid_length.saturating_add(bytes_read);
                 valid_record_needs_newline = !line.terminated;
                 continue;
@@ -813,15 +1477,32 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             JsonLineContent::Record(Err(error)) if error.is_io() => {
                 return Err(error).with_context(|| format!("failed to read {}", path.display()));
             }
-            JsonLineContent::Record(Err(_)) if !line.terminated => break,
+            JsonLineContent::Record(Err(error)) if !line.terminated && error.is_eof() => break,
             JsonLineContent::Record(Err(error)) => {
                 return Err(error).with_context(|| {
                     format!("invalid session record at {}:{line_number}", path.display())
                 });
             }
         };
+        if metadata.is_none() && !matches!(&record, RolloutRecord::Session { .. }) {
+            return Err(anyhow!(
+                "session header must be the first record at {}:{line_number}",
+                path.display()
+            ));
+        }
         valid_length = valid_length.saturating_add(bytes_read);
         valid_record_needs_newline = !line.terminated;
+        if unfinished_turn_recovered
+            && !matches!(
+                &record,
+                RolloutRecord::TurnFinished { .. } | RolloutRecord::Unknown
+            )
+        {
+            return Err(anyhow!(
+                "session record follows a completed turn recovery checkpoint at {}:{line_number}",
+                path.display()
+            ));
+        }
         match record {
             RolloutRecord::Session {
                 metadata: session_metadata,
@@ -851,6 +1532,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 }
             }
             RolloutRecord::TranscriptSnapshot { items, complete } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
                 transcript = items;
                 transcript_tail.clear();
                 transcript_tail_tools.clear();
@@ -859,6 +1541,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 legacy_transcript_snapshot = !complete;
             }
             RolloutRecord::TranscriptAppend { items } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
                 transcript.extend(items);
                 transcript_tail.clear();
                 transcript_tail_tools.clear();
@@ -867,6 +1550,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 legacy_transcript_snapshot = false;
             }
             RolloutRecord::ToolOutcomes { outcomes } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
                 // Ordinary function output remains the model-history source of truth. This
                 // bounded metadata also patches explicit transcript tools such as operator shell
                 // cells, whose completion has no corresponding Responses history item.
@@ -879,7 +1563,32 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 apply_transcript_tool_outcomes(&mut transcript, &outcomes);
                 apply_transcript_tool_outcomes(&mut transcript_tail, &outcomes);
             }
-            RolloutRecord::HistoryAppend { items, outcomes } => {
+            RolloutRecord::HistoryAppend {
+                items,
+                outcomes,
+                tool_calls,
+            } => {
+                if unfinished_turn.is_some()
+                    && items
+                        .last()
+                        .is_some_and(crate::context::is_turn_abort_notice)
+                {
+                    // Recovery and interruption notices are appended as their own history record.
+                    // A notice earlier in a mixed legacy append belongs to prior context and must
+                    // not suppress recovery for the active turn.
+                    unfinished_turn_has_recovery_notice = true;
+                }
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
+                if unfinished_turn.is_some() {
+                    unfinished_turn_call_ids.extend(
+                        items
+                            .iter()
+                            .filter_map(saved_tool_call_id)
+                            .map(str::to_string),
+                    );
+                }
+                register_tool_lifecycles(&mut tool_lifecycles, tool_calls.into_iter().flatten());
+                remove_completed_tool_lifecycles_from_append(&mut tool_lifecycles, &items);
                 transcript_tail_history_start.get_or_insert(history.len());
                 history.extend(items);
                 if let Some(outcomes) = outcomes {
@@ -897,10 +1606,61 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 reason,
                 items,
                 response_usage,
+                outcomes,
+                recovery,
             } => {
-                if reason == HistoryReplacement::Normalization {
-                    normalized_aborted_calls.extend(normalized_abort_call_ids(&history, &items));
+                let had_recovery_notice = unfinished_turn_has_recovery_notice;
+                if unfinished_turn.is_some()
+                    && had_recovery_notice
+                    && !items.iter().any(crate::context::is_turn_abort_notice)
+                {
+                    unfinished_turn_has_recovery_notice = false;
                 }
+                unfinished_turn_has_activity |= unfinished_turn.is_some()
+                    && !matches!(
+                        reason,
+                        HistoryReplacement::Normalization | HistoryReplacement::ContextRefresh
+                    );
+                let has_recovery_checkpoint = recovery.is_some();
+                if let Some(recovery) = recovery.as_ref() {
+                    if unfinished_turn_recovered
+                        || reason != HistoryReplacement::Normalization
+                        || unfinished_turn.as_deref() != Some(recovery.turn_id.as_str())
+                        || !recovery_checkpoint_has_current_notice(
+                            &history,
+                            &items,
+                            had_recovery_notice,
+                        )
+                        || !recovery_checkpoint_outcomes_are_complete(&history, outcomes.as_deref())
+                    {
+                        return Err(anyhow!(
+                            "invalid turn recovery checkpoint at {}:{line_number}",
+                            path.display()
+                        ));
+                    }
+                    unfinished_turn_recovered = true;
+                    unfinished_turn_has_recovery_notice = true;
+                    recovery_checkpoint_requires_inspection = recovery.requires_inspection;
+                }
+                let normalization_aborts = if reason == HistoryReplacement::Normalization {
+                    let aborted = normalized_abort_call_ids(&history, &items);
+                    normalized_aborted_calls.extend(aborted.iter().cloned());
+                    if !has_recovery_checkpoint
+                        && unfinished_turn.is_some()
+                        && outcomes
+                            .as_deref()
+                            .is_some_and(normalization_outcomes_contain_recovery)
+                    {
+                        // Refactor-era sessions could persist recovery outputs before their notice
+                        // and turn closure. Conservatively retain inspection guidance when adopting
+                        // that multi-record state into the transactional checkpoint.
+                        legacy_recovery_requires_inspection = true;
+                    }
+                    aborted
+                } else {
+                    HashSet::new()
+                };
+                remove_completed_tool_lifecycles_from_replacement(&mut tool_lifecycles, &items);
                 flush_transcript_history(
                     &history,
                     &mut transcript_tail_history_start,
@@ -920,7 +1680,19 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 if reason == HistoryReplacement::Compaction {
                     compaction_count = compaction_count.saturating_add(1);
                 }
+                // Normalization records written before transcript outcomes existed still define
+                // the latest malformed call's presentation. Repair that exact boundary now so a
+                // stale wrong-kind output cannot survive merely because it was already displayed.
+                apply_latest_normalization_aborts(
+                    &mut transcript,
+                    &mut transcript_tail,
+                    &normalization_aborts,
+                );
                 history = items;
+                if let Some(outcomes) = outcomes {
+                    apply_transcript_tool_outcomes(&mut transcript, &outcomes);
+                    apply_transcript_tool_outcomes(&mut transcript_tail, &outcomes);
+                }
                 if let Some(response_usage) = response_usage {
                     total_usage.add_assign(&response_usage);
                 }
@@ -933,15 +1705,75 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                     server_reasoning_included = false;
                 }
             }
+            RolloutRecord::ToolCallsRegistered { calls } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
+                register_tool_lifecycles(&mut tool_lifecycles, calls);
+            }
+            RolloutRecord::ToolStarted { call_id } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
+                let lifecycle = tool_lifecycles.entry(call_id).or_default();
+                if lifecycle.prepared.is_some() || lifecycle.finished.is_some() {
+                    lifecycle.inconsistent = true;
+                }
+                lifecycle.started = true;
+            }
+            RolloutRecord::ToolMutationPrepared { call_id, evidence } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
+                let lifecycle = tool_lifecycles.entry(call_id).or_default();
+                if lifecycle.finished.is_some() {
+                    lifecycle.inconsistent = true;
+                }
+                lifecycle.started = true;
+                match &lifecycle.prepared {
+                    None => lifecycle.prepared = Some(evidence),
+                    Some(existing) if existing == &evidence => {}
+                    Some(existing) if evidence.refines(existing) => {
+                        lifecycle.prepared = Some(evidence);
+                    }
+                    Some(_) => lifecycle.inconsistent = true,
+                }
+            }
+            RolloutRecord::ToolFinished {
+                call_id,
+                output,
+                error,
+                file_change,
+                requires_inspection,
+            } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
+                let lifecycle = tool_lifecycles.entry(call_id).or_default();
+                let finished = LoadedToolFinish {
+                    output,
+                    error,
+                    file_change,
+                    requires_inspection,
+                };
+                match &lifecycle.finished {
+                    None => lifecycle.finished = Some(finished),
+                    Some(existing)
+                        if existing.output == finished.output
+                            && existing.error == finished.error
+                            && existing.file_change == finished.file_change
+                            && existing.requires_inspection == finished.requires_inspection => {}
+                    Some(_) => lifecycle.inconsistent = true,
+                }
+            }
             RolloutRecord::Usage {
                 usage: new_usage,
                 history_estimate,
                 server_reasoning_included: reasoning_included,
             } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
                 total_usage.add_assign(&new_usage);
                 usage = Some(new_usage);
                 usage_history_estimate = Some(history_estimate);
                 server_reasoning_included = reasoning_included;
+            }
+            RolloutRecord::UsageTotal {
+                usage: response_usage,
+            } => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
+                total_usage.add_assign(&response_usage);
             }
             RolloutRecord::ServiceTierChanged {
                 service_tier: updated_service_tier,
@@ -957,14 +1789,54 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 model_selection = Some(selection);
             }
             RolloutRecord::TurnStarted { turn_id } => {
+                if let Some(active_turn) = &unfinished_turn {
+                    return Err(anyhow!(
+                        "turn {turn_id} started before active turn {active_turn} finished at {}:{line_number}",
+                        path.display()
+                    ));
+                }
+                tool_lifecycles.clear();
+                unfinished_turn_call_ids.clear();
                 unfinished_turn = Some(turn_id);
+                unfinished_turn_has_activity = false;
+                unfinished_turn_has_recovery_notice = false;
+                unfinished_turn_recovered = false;
+                recovery_checkpoint_requires_inspection = false;
+                legacy_recovery_requires_inspection = false;
+                unknown_record_requires_inspection = false;
             }
             RolloutRecord::TurnFinished { turn_id, .. } => {
-                if unfinished_turn.as_deref() == Some(turn_id.as_str()) {
-                    unfinished_turn = None;
+                if unfinished_turn.as_deref() != Some(turn_id.as_str()) {
+                    return Err(anyhow!(
+                        "turn {turn_id} finished without a matching active turn at {}:{line_number}",
+                        path.display()
+                    ));
+                }
+                unfinished_turn = None;
+                unfinished_turn_has_activity = false;
+                unfinished_turn_has_recovery_notice = false;
+                unfinished_turn_recovered = false;
+                recovery_checkpoint_requires_inspection = false;
+                legacy_recovery_requires_inspection = false;
+                unknown_record_requires_inspection = false;
+                tool_lifecycles.clear();
+                unfinished_turn_call_ids.clear();
+            }
+            RolloutRecord::Unknown => {
+                // A future record inside an active turn may describe observable work. Ignore its
+                // payload for forward compatibility, but never classify a crash after unknown work
+                // as harmless or encourage a retry without inspection.
+                if unfinished_turn.is_some() {
+                    unfinished_turn_has_activity = true;
+                    unknown_record_requires_inspection = true;
+                    if unfinished_turn_recovered {
+                        // The checkpoint only covers records through itself. A future record after
+                        // it reopens recovery rather than being silently hidden by turn closure.
+                        unfinished_turn_recovered = false;
+                        unfinished_turn_has_recovery_notice = false;
+                    }
                 }
             }
-            RolloutRecord::Unknown => {}
         }
     }
 
@@ -988,17 +1860,63 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let model_selection =
         model_selection.ok_or_else(|| anyhow!("{} has no valid session model", path.display()))?;
     model_selection.validate()?;
-    if unfinished_turn.is_some() {
-        normalized_aborted_calls.extend(missing_call_output_ids(&history));
+    // Repair presentation for malformed completed turns as well as active crash recovery. The
+    // active-turn checks below still scope lifecycle evidence and inspection guidance to work that
+    // was durably associated with the unfinished turn.
+    let missing_calls = crate::context::missing_call_output_ids(&history);
+    if unfinished_turn_recovered && !missing_calls.is_empty() {
+        return Err(anyhow!(
+            "turn recovery checkpoint in {} left missing tool outputs",
+            path.display()
+        ));
     }
+    // Lifecycle evidence belongs only to calls durably appended after this active turn started.
+    // A sparse record must never borrow an older completed call merely because its ID matches.
+    let active_missing_calls = missing_calls
+        .intersection(&unfinished_turn_call_ids)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let tool_recoveries = if unfinished_turn.is_some() && !unfinished_turn_recovered {
+        recover_interrupted_tools(&history, &active_missing_calls, &tool_lifecycles)
+    } else {
+        HashMap::new()
+    };
+    let unrecovered_calls = if unfinished_turn.is_some() {
+        missing_calls
+            .iter()
+            .filter(|call_id| !tool_recoveries.contains_key(*call_id))
+            .cloned()
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    let unmatched_tool_lifecycle_requires_inspection = unfinished_turn.is_some()
+        && tool_lifecycles
+            .keys()
+            .any(|call_id| !active_missing_calls.contains(call_id));
+    let crash_recovery_requires_inspection = recovery_checkpoint_requires_inspection
+        || legacy_recovery_requires_inspection
+        || unknown_record_requires_inspection
+        || unmatched_tool_lifecycle_requires_inspection
+        || !unrecovered_calls.is_empty()
+        || tool_recoveries
+            .values()
+            .any(|recovery| recovery.requires_inspection);
+    normalized_aborted_calls.extend(unrecovered_calls);
     let transcript_checkpoint =
         (has_transcript_checkpoint && transcript_tail.is_empty()).then_some(transcript.len());
     transcript.append(&mut transcript_tail);
+    apply_current_missing_aborts(&mut transcript, &missing_calls);
+    apply_tool_recoveries(&mut transcript, &tool_recoveries);
     apply_normalized_aborts(&mut transcript, &normalized_aborted_calls);
 
     let rollout = Rollout {
-        file,
-        path,
+        file: Arc::new(SharedRolloutFile {
+            file: Mutex::new(file),
+            path,
+            #[cfg(test)]
+            fail_next_append: std::sync::atomic::AtomicBool::new(false),
+        }),
         metadata: metadata.clone(),
     };
     Ok(LoadedRollout {
@@ -1015,6 +1933,11 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         model_selection,
         service_tier,
         unfinished_turn,
+        unfinished_turn_has_activity,
+        unfinished_turn_has_recovery_notice,
+        unfinished_turn_recovered,
+        tool_recoveries,
+        crash_recovery_requires_inspection,
         forked_from,
     })
 }
@@ -1077,7 +2000,7 @@ fn append_transcript_items(
                 tool_indices.insert(call_id, index);
             }
             Some("function_call_output" | "custom_tool_call_output") => {
-                if item.get("name").and_then(Value::as_str) == Some("exec") {
+                if is_legacy_exec_notification(item) {
                     // Legacy Code Mode `notify(...)` records reuse the outer call ID. They are
                     // model-history notifications, not the final transcript output for the call.
                     continue;
@@ -1129,47 +2052,773 @@ fn apply_transcript_tool_outcomes(
     }
 }
 
-fn normalized_abort_call_ids(previous: &[Value], replacement: &[Value]) -> HashSet<String> {
-    let missing = missing_call_output_ids(previous);
-    replacement
+fn recovery_checkpoint_has_current_notice(
+    previous: &[Value],
+    replacement: &[Value],
+    had_recovery_notice: bool,
+) -> bool {
+    let previous_notices = previous
         .iter()
-        .filter(|item| {
-            matches!(
-                item.get("type").and_then(Value::as_str),
-                Some("function_call_output" | "custom_tool_call_output")
-            ) && item.get("output").and_then(Value::as_str) == Some(SYNTHETIC_ABORT_OUTPUT)
+        .filter(|item| crate::context::is_turn_abort_notice(item))
+        .count();
+    let replacement_notices = replacement
+        .iter()
+        .filter(|item| crate::context::is_turn_abort_notice(item))
+        .count();
+    if had_recovery_notice {
+        replacement_notices > 0 && replacement_notices >= previous_notices
+    } else {
+        replacement_notices > previous_notices
+    }
+}
+
+fn recovery_checkpoint_outcomes_are_complete(
+    previous: &[Value],
+    outcomes: Option<&[SessionTranscriptToolOutcome]>,
+) -> bool {
+    let mut missing_calls = crate::context::missing_call_output_ids(previous);
+    let outcomes = outcomes.unwrap_or_default();
+    outcomes.len() == missing_calls.len()
+        && outcomes.iter().all(|outcome| {
+            outcome.output.is_some() && missing_calls.remove(outcome.call_id.as_str())
         })
-        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
-        .filter(|call_id| missing.contains(*call_id))
-        .map(str::to_string)
+        && missing_calls.is_empty()
+}
+
+fn normalization_outcomes_contain_recovery(outcomes: &[SessionTranscriptToolOutcome]) -> bool {
+    outcomes.iter().any(|outcome| {
+        outcome.output.as_ref().is_some_and(|output| match output {
+            SessionTranscriptToolOutput::Error(message) => message.starts_with("Recovery:"),
+            SessionTranscriptToolOutput::Success(_) => {
+                output.recovered_file_state_message().is_some()
+            }
+        })
+    })
+}
+
+pub(crate) fn is_legacy_exec_notification(item: &Value) -> bool {
+    // Legacy Code Mode `notify(...)` records carry the outer tool name and no item ID. They may
+    // repeat and do not prove that the custom tool produced its final output; older synthetic final
+    // outputs can carry the same name but always serialized `id`.
+    item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
+        && item.get("name").and_then(Value::as_str) == Some("exec")
+        && item.get("id").is_none()
+}
+
+fn normalized_abort_call_ids(previous: &[Value], replacement: &[Value]) -> HashSet<String> {
+    let missing = crate::context::missing_call_output_ids(previous);
+    crate::context::canonical_synthetic_abort_call_ids(replacement)
+        .intersection(&missing)
+        .cloned()
         .collect()
 }
 
-fn missing_call_output_ids(items: &[Value]) -> HashSet<String> {
-    let mut missing = items
+fn remove_completed_tool_lifecycles_from_append(
+    lifecycles: &mut HashMap<String, LoadedToolLifecycle>,
+    items: &[Value],
+) {
+    let latest_calls = items
         .iter()
-        .filter(|item| {
-            matches!(
-                item.get("type").and_then(Value::as_str),
-                Some("function_call" | "custom_tool_call" | "local_shell_call")
-            )
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let is_function = match item.get("type").and_then(Value::as_str)? {
+                "function_call" | "local_shell_call" => true,
+                "custom_tool_call" => false,
+                _ => return None,
+            };
+            Some((
+                item.get("call_id")?.as_str()?.to_string(),
+                (index, is_function),
+            ))
         })
-        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
-    for call_id in items
-        .iter()
-        .filter(|item| {
-            matches!(
-                item.get("type").and_then(Value::as_str),
-                Some("function_call_output" | "custom_tool_call_output")
-            )
-        })
-        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
-    {
-        missing.remove(call_id);
+        .collect::<HashMap<_, _>>();
+    for (index, item) in items.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+            continue;
+        }
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let completes_current_call = latest_calls
+            .get(call_id)
+            .is_none_or(|(call_index, is_function)| *is_function && index > *call_index);
+        if completes_current_call {
+            lifecycles.remove(call_id);
+        }
     }
-    missing
+}
+
+fn remove_completed_tool_lifecycles_from_replacement(
+    lifecycles: &mut HashMap<String, LoadedToolLifecycle>,
+    items: &[Value],
+) {
+    for call_id in crate::context::completed_function_call_ids(items) {
+        lifecycles.remove(&call_id);
+    }
+}
+
+fn saved_tool_call_id(item: &Value) -> Option<&str> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call" | "custom_tool_call" | "local_shell_call") => {
+            item.get("call_id").and_then(Value::as_str)
+        }
+        _ => None,
+    }
+}
+
+struct RecoveryCall {
+    call_id: String,
+    name: Option<String>,
+    effect: Option<ToolEffectClass>,
+    ambiguous: bool,
+}
+
+impl RecoveryCall {
+    fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or("unknown tool")
+    }
+}
+
+fn recover_interrupted_tools(
+    history: &[Value],
+    missing_calls: &HashSet<String>,
+    lifecycles: &HashMap<String, LoadedToolLifecycle>,
+) -> HashMap<String, ToolRecovery> {
+    let mut calls = Vec::<RecoveryCall>::new();
+    let mut call_indices = HashMap::<String, usize>::new();
+    // Preserve newest-first order so a bounded hashing budget is spent on the latest mutation.
+    // A repeated call ID is never allowed to borrow lifecycle evidence from an arbitrary copy.
+    for item in history.iter().rev() {
+        let Some(call) = recovery_call(item) else {
+            continue;
+        };
+        if !missing_calls.contains(&call.call_id) {
+            continue;
+        }
+        if let Some(index) = call_indices.get(&call.call_id).copied() {
+            calls[index].ambiguous = true;
+        } else {
+            call_indices.insert(call.call_id.clone(), calls.len());
+            calls.push(call);
+        }
+    }
+
+    let mut remaining_hash_bytes = MAX_TOOL_RECOVERY_HASH_BYTES;
+    calls
+        .into_iter()
+        .map(|call| {
+            let lifecycle = lifecycles.get(&call.call_id);
+            let recovery = recover_tool_lifecycle(&call, lifecycle, &mut remaining_hash_bytes);
+            (call.call_id, recovery)
+        })
+        .collect()
+}
+
+fn recovery_call(item: &Value) -> Option<RecoveryCall> {
+    let item_type = item.get("type")?.as_str()?;
+    let call_id = item.get("call_id")?.as_str()?.to_string();
+    let (name, effect) = match item_type {
+        "function_call" => {
+            let name = normalized_function_name(item);
+            let effect = name.as_deref().and_then(ToolEffectClass::for_tool);
+            (name, effect)
+        }
+        "custom_tool_call" => (
+            item.get("name").and_then(Value::as_str).map(str::to_string),
+            Some(ToolEffectClass::Opaque),
+        ),
+        "local_shell_call" => (
+            item.get("name").and_then(Value::as_str).map_or_else(
+                || Some("local_shell".to_string()),
+                |name| Some(name.to_string()),
+            ),
+            Some(ToolEffectClass::Opaque),
+        ),
+        _ => return None,
+    };
+    Some(RecoveryCall {
+        call_id,
+        name,
+        effect,
+        ambiguous: false,
+    })
+}
+
+fn tool_lifecycle_registrations(items: &[Value]) -> Vec<ToolLifecycleRegistration> {
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .filter_map(|item| {
+            let call_id = item.get("call_id")?.as_str()?.to_string();
+            let name = normalized_function_name(item)?;
+            let effect = ToolEffectClass::for_tool(&name)?;
+            Some(ToolLifecycleRegistration {
+                call_id,
+                name,
+                effect,
+            })
+        })
+        .collect()
+}
+
+fn normalized_function_name(item: &Value) -> Option<String> {
+    let name = item.get("name")?.as_str()?;
+    match item.get("namespace") {
+        None | Some(Value::Null) => Some(name.to_string()),
+        Some(Value::String(namespace)) if namespace.is_empty() || namespace == "functions" => {
+            Some(name.to_string())
+        }
+        Some(Value::String(namespace)) => Some(format!("{namespace}.{name}")),
+        Some(_) => None,
+    }
+}
+
+fn recover_tool_lifecycle(
+    call: &RecoveryCall,
+    lifecycle: Option<&LoadedToolLifecycle>,
+    remaining_hash_bytes: &mut u64,
+) -> ToolRecovery {
+    if call.ambiguous {
+        return uncertain_recovery_error(format!(
+            "Recovery: more than one saved tool call used ID `{}`. Lifecycle evidence cannot be associated with one call safely; effects are unknown. Inspect relevant state before retrying.",
+            call.call_id
+        ));
+    }
+
+    let registration_is_exact = lifecycle.is_some_and(|lifecycle| {
+        lifecycle.registration.as_ref().is_some_and(|registration| {
+            registration.call_id == call.call_id
+                && call.name.as_deref() == Some(registration.name.as_str())
+                && call.effect == Some(registration.effect)
+        })
+    });
+    let registration_is_inconsistent = lifecycle.is_some_and(|lifecycle| {
+        lifecycle.inconsistent
+            || lifecycle
+                .registration
+                .as_ref()
+                .is_some_and(|_| !registration_is_exact)
+    });
+    if registration_is_inconsistent {
+        return uncertain_recovery_error(format!(
+            "Recovery: lifecycle records for the prior {} call conflict with its saved history. Effects are unknown; inspect relevant state before retrying it.",
+            call.name()
+        ));
+    }
+
+    if let Some(finished) = lifecycle.and_then(|lifecycle| lifecycle.finished.as_ref()) {
+        let transcript_output = if let Some(error) = &finished.error {
+            SessionTranscriptToolOutput::Error(error.clone())
+        } else if finished.requires_inspection
+            && call.effect == Some(ToolEffectClass::AtomicMutation)
+        {
+            SessionTranscriptToolOutput::recovered_file_state(history_output_text(&finished.output))
+        } else {
+            transcript_tool_output_from_history(call.name(), finished.output.clone())
+        };
+        return ToolRecovery {
+            output: finished.output.clone(),
+            transcript_output,
+            file_change: finished.file_change.clone(),
+            requires_inspection: finished.requires_inspection,
+        };
+    }
+
+    match call.effect {
+        Some(ToolEffectClass::ReadOnly) => recovery_error(format!(
+            "Recovery: the prior {} call did not produce a durable result. It has no intentional workspace mutation; repeat the read if the observation is still needed.",
+            call.name()
+        )),
+        Some(ToolEffectClass::Opaque) => {
+            let Some(lifecycle) = lifecycle else {
+                return uncertain_recovery_error(format!(
+                    "Recovery: the prior {} call has no lifecycle records or durable result. It may have produced local or external effects; inspect relevant state before retrying it.",
+                    call.name()
+                ));
+            };
+            if lifecycle.started {
+                uncertain_recovery_error(format!(
+                    "Recovery: the prior {} call started but has no durable completion record. Local or external effects are unknown; inspect relevant state before retrying it.",
+                    call.name()
+                ))
+            } else if registration_is_exact {
+                recovery_error(format!(
+                    "Recovery: the prior {} call was registered but did not start. Its command was not executed.",
+                    call.name()
+                ))
+            } else {
+                uncertain_recovery_error(format!(
+                    "Recovery: the prior {} call has sparse lifecycle records that do not prove whether it started. Effects are unknown; inspect relevant state before retrying it.",
+                    call.name()
+                ))
+            }
+        }
+        Some(ToolEffectClass::AtomicMutation) => {
+            let Some(lifecycle) = lifecycle else {
+                return uncertain_recovery_error(format!(
+                    "Recovery: the prior {} call has no lifecycle records or durable result. Its file mutation may have been attempted; inspect the target before retrying it.",
+                    call.name()
+                ));
+            };
+            if let Some(evidence) = &lifecycle.prepared {
+                return recover_prepared_mutation(call.name(), evidence, remaining_hash_bytes);
+            }
+            if lifecycle.started {
+                return file_recovery(
+                    format!(
+                        "Recovery: the prior {} call stopped before its file mutation was prepared. Its intended file mutation was not attempted.",
+                        call.name()
+                    ),
+                    false,
+                );
+            }
+            if registration_is_exact {
+                return file_recovery(
+                    format!(
+                        "Recovery: the prior {} call was registered but did not start. Its intended file mutation was not attempted.",
+                        call.name()
+                    ),
+                    false,
+                );
+            }
+            uncertain_recovery_error(format!(
+                "Recovery: the prior {} call has sparse lifecycle records that do not prove whether its file mutation started. The outcome is unknown; inspect the target before retrying it.",
+                call.name()
+            ))
+        }
+        None => uncertain_recovery_error(format!(
+            "Recovery: the prior {} call has no durable result and its effects are not classified. Inspect relevant state before retrying it.",
+            call.name()
+        )),
+    }
+}
+
+fn recovery_error(message: String) -> ToolRecovery {
+    ToolRecovery {
+        output: Value::String(message.clone()),
+        transcript_output: SessionTranscriptToolOutput::Error(message),
+        file_change: None,
+        requires_inspection: false,
+    }
+}
+
+fn uncertain_recovery_error(message: String) -> ToolRecovery {
+    ToolRecovery {
+        output: Value::String(message.clone()),
+        transcript_output: SessionTranscriptToolOutput::Error(message),
+        file_change: None,
+        requires_inspection: true,
+    }
+}
+
+fn file_recovery(message: String, requires_inspection: bool) -> ToolRecovery {
+    ToolRecovery {
+        output: Value::String(message.clone()),
+        transcript_output: SessionTranscriptToolOutput::recovered_file_state(message),
+        file_change: None,
+        requires_inspection,
+    }
+}
+
+fn recovery_path_label(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        let mut escaped = String::with_capacity(path.len());
+        for character in path.chars() {
+            match character {
+                '\\' => escaped.push_str("\\\\"),
+                '`' => escaped.push_str("\\`"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                character if character.is_control() => escaped.extend(character.escape_default()),
+                character => escaped.push(character),
+            }
+        }
+        return escaped;
+    }
+
+    use std::os::unix::ffi::OsStrExt as _;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = path.as_os_str().as_bytes();
+    let mut escaped = String::with_capacity(bytes.len().saturating_mul(4).saturating_add(11));
+    escaped.push_str("unix-bytes:");
+    for &byte in bytes {
+        match byte {
+            b'\\' => escaped.push_str("\\\\"),
+            b'`' => escaped.push_str("\\`"),
+            b'\n' => escaped.push_str("\\n"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\t' => escaped.push_str("\\t"),
+            b' '..=b'~' => escaped.push(char::from(byte)),
+            _ => {
+                escaped.push_str("\\x");
+                escaped.push(char::from(HEX[usize::from(byte >> 4)]));
+                escaped.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    escaped
+}
+
+fn recover_prepared_mutation(
+    name: &str,
+    evidence: &ToolMutationEvidence,
+    remaining_hash_bytes: &mut u64,
+) -> ToolRecovery {
+    let staging_residue = cleanup_interrupted_staging(evidence);
+    let current = inspect_recovery_target(evidence, remaining_hash_bytes);
+    let lacks_stable_path_identity = evidence.target_parent.is_none() && evidence.staging.is_none();
+    let target = recovery_path_label(
+        evidence
+            .path_resolution
+            .as_ref()
+            .map_or(&evidence.target, |resolution| &resolution.requested),
+    );
+    if matches!(&current, RecoveryTargetState::Digest(digest) if digest == &evidence.post_state) {
+        let mut recovery = if lacks_stable_path_identity {
+            format!(
+                "Recovery: the saved target `{target}` currently has the exact contents intended by the interrupted {name} call. This older lifecycle evidence does not include a stable parent identity or requested symlink route, so the effect at the originally requested path is unknown; inspect relevant paths before retrying."
+            )
+        } else {
+            format!(
+                "Recovery: `{target}` currently has the exact contents intended by the interrupted {name} call. Do not repeat the call unless a new change is needed."
+            )
+        };
+        append_staging_recovery_warning(&mut recovery, staging_residue.as_deref());
+        return file_recovery(
+            recovery,
+            lacks_stable_path_identity || staging_residue.is_some(),
+        );
+    }
+
+    let matches_pre_state = match (&current, &evidence.pre_state) {
+        (RecoveryTargetState::Absent, ToolTargetPreState::Absent) => true,
+        (RecoveryTargetState::Digest(current), ToolTargetPreState::Digest(previous)) => {
+            current == previous
+        }
+        _ => false,
+    };
+    if matches_pre_state {
+        let mut message = match (&evidence.pre_state, lacks_stable_path_identity) {
+            (ToolTargetPreState::Absent, false) => format!(
+                "Recovery: `{target}` is absent now; the contents intended by the interrupted {name} call are not present."
+            ),
+            (ToolTargetPreState::Digest(_), false) => format!(
+                "Recovery: `{target}` currently has the exact recorded pre-mutation contents for the interrupted {name} call; its intended contents are not present now."
+            ),
+            (ToolTargetPreState::Absent, true) => format!(
+                "Recovery: the saved target `{target}` is absent now. This older lifecycle evidence does not include a stable parent identity or requested symlink route, so the effect at the originally requested path is unknown; inspect relevant paths before retrying."
+            ),
+            (ToolTargetPreState::Digest(_), true) => format!(
+                "Recovery: the saved target `{target}` currently has the exact recorded pre-mutation contents for the interrupted {name} call. This older lifecycle evidence does not include a stable parent identity or requested symlink route, so the effect at the originally requested path is unknown; inspect relevant paths before retrying."
+            ),
+            (ToolTargetPreState::Unknown, _) => {
+                unreachable!("a matching pre-state cannot be unknown")
+            }
+        };
+        append_parent_creation_recovery_warning(&mut message, evidence);
+        append_staging_recovery_warning(&mut message, staging_residue.as_deref());
+        return file_recovery(
+            message,
+            lacks_stable_path_identity || staging_residue.is_some(),
+        );
+    }
+
+    let mut message = match current {
+        RecoveryTargetState::Digest(_) | RecoveryTargetState::Mismatch => format!(
+            "Recovery: `{target}` does not match the intended post-state of the interrupted {name} call, and its prior state cannot be confirmed. The outcome is unknown; inspect the file before retrying."
+        ),
+        RecoveryTargetState::Absent => format!(
+            "Recovery: `{target}` is absent and does not match the recorded state of the interrupted {name} call. The outcome is unknown; inspect relevant state before retrying."
+        ),
+        RecoveryTargetState::Unknown => format!(
+            "Recovery: the current state of `{target}` could not be reconciled with the interrupted {name} call. The outcome is unknown; inspect the file before retrying."
+        ),
+    };
+    append_parent_creation_recovery_warning(&mut message, evidence);
+    append_staging_recovery_warning(&mut message, staging_residue.as_deref());
+    file_recovery(message, true)
+}
+
+fn append_parent_creation_recovery_warning(message: &mut String, evidence: &ToolMutationEvidence) {
+    if let Some(parent) = evidence
+        .missing_parent
+        .as_ref()
+        .filter(|parent| std::fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.is_dir()))
+    {
+        message.push_str(&format!(
+            " The directory `{}` may remain from parent creation.",
+            recovery_path_label(parent)
+        ));
+    }
+}
+
+fn append_staging_recovery_warning(message: &mut String, residue: Option<&Path>) {
+    if let Some(residue) = residue {
+        message.push_str(&format!(
+            " The private staging directory `{}` may remain.",
+            recovery_path_label(residue)
+        ));
+    }
+}
+
+fn cleanup_interrupted_staging(evidence: &ToolMutationEvidence) -> Option<PathBuf> {
+    let staging = evidence.staging.as_ref()?;
+    let parent = evidence.target.parent()?;
+    let residue = parent.join(&staging.name);
+    let Some(expected_directory) = staging.directory else {
+        return match std::fs::symlink_metadata(&residue) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(_) | Err(_) => Some(residue),
+        };
+    };
+    let Some(expected_parent) = evidence.target_parent else {
+        return Some(residue);
+    };
+    let target = match crate::private_fs::AnchoredPath::open(&evidence.target) {
+        Ok(target) => target,
+        Err(_) => return Some(residue),
+    };
+    if target.parent_identity() != expected_parent
+        || !target.parent_path_is_current().unwrap_or(false)
+    {
+        return Some(residue);
+    }
+    let staging_name = OsStr::new(&staging.name);
+    let directory = match target.open_child_directory(staging_name) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(residue),
+    };
+    if directory.identity().ok() != Some(expected_directory) {
+        return Some(residue);
+    }
+    match (
+        staging.content,
+        directory.entry_metadata(OsStr::new("content")),
+    ) {
+        (Some(expected), Ok(Some(metadata)))
+            if metadata.is_file() && metadata.object_identity() == expected.object_identity() =>
+        {
+            // A crash during population or a successful create-via-hard-link commit can change
+            // size, timestamps, or link count while leaving the private staging inode ours. As in
+            // live cleanup, only an entry substitution makes unlinking this owned name unsafe.
+            if directory.remove_file(OsStr::new("content")).is_err() {
+                return Some(residue);
+            }
+        }
+        (Some(_), Ok(None)) | (None, Ok(None)) => {}
+        (Some(_), Ok(Some(_))) | (None, Ok(Some(_))) | (_, Err(_)) => return Some(residue),
+    }
+    match target.child_metadata(staging_name) {
+        Ok(Some(metadata))
+            if metadata.is_directory() && metadata.object_identity() == expected_directory => {}
+        Ok(None) => return None,
+        Ok(Some(_)) | Err(_) => return Some(residue),
+    }
+    if target.remove_directory(staging_name).is_err() {
+        return Some(residue);
+    }
+    None
+}
+
+enum RecoveryTargetState {
+    Absent,
+    Digest(ToolContentDigest),
+    Mismatch,
+    Unknown,
+}
+
+fn inspect_recovery_target(
+    evidence: &ToolMutationEvidence,
+    remaining_hash_bytes: &mut u64,
+) -> RecoveryTargetState {
+    let path_resolution_is_current = || {
+        evidence
+            .path_resolution
+            .as_ref()
+            .is_none_or(ToolPathResolutionEvidence::is_current)
+    };
+    if !path_resolution_is_current() {
+        return RecoveryTargetState::Unknown;
+    }
+    let target = match crate::private_fs::AnchoredPath::open(&evidence.target) {
+        Ok(target) => target,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && evidence.target_parent.is_none() =>
+        {
+            return if path_resolution_is_current() {
+                RecoveryTargetState::Absent
+            } else {
+                RecoveryTargetState::Unknown
+            };
+        }
+        Err(_) => return RecoveryTargetState::Unknown,
+    };
+    if evidence
+        .target_parent
+        .is_some_and(|identity| identity != target.parent_identity())
+        || !target.parent_path_is_current().unwrap_or(false)
+    {
+        return RecoveryTargetState::Unknown;
+    }
+    let metadata = match target.entry_metadata() {
+        Ok(Some(metadata)) if metadata.is_file() => metadata,
+        Ok(Some(_)) | Err(_) => return RecoveryTargetState::Unknown,
+        Ok(None) => {
+            return if target.parent_path_is_current().unwrap_or(false)
+                && path_resolution_is_current()
+            {
+                RecoveryTargetState::Absent
+            } else {
+                RecoveryTargetState::Unknown
+            };
+        }
+    };
+    let snapshot = metadata.snapshot();
+    let bytes = snapshot.byte_len();
+    let matches_candidate_size = evidence.post_state.bytes == bytes
+        || matches!(
+            &evidence.pre_state,
+            ToolTargetPreState::Digest(digest) if digest.bytes == bytes
+        );
+    if !matches_candidate_size {
+        return RecoveryTargetState::Mismatch;
+    }
+    if bytes > *remaining_hash_bytes {
+        return RecoveryTargetState::Unknown;
+    }
+
+    let file = match target.open_for_read() {
+        Ok(file) => file,
+        Err(_) => return RecoveryTargetState::Unknown,
+    };
+    match file.metadata() {
+        Ok(metadata)
+            if metadata.is_file() && crate::private_fs::file_snapshot(&metadata) == snapshot => {}
+        Ok(_) | Err(_) => return RecoveryTargetState::Unknown,
+    }
+    // Charge only attempts that reached a stable regular-file handle. Failed opens and path
+    // substitutions should not consume the bounded budget needed to classify later calls.
+    *remaining_hash_bytes = remaining_hash_bytes.saturating_sub(bytes);
+
+    let mut bounded = file.take(bytes);
+    let digest = match ToolContentDigest::from_reader(&mut bounded) {
+        Ok(digest) if digest.bytes == bytes => digest,
+        Ok(_) | Err(_) => return RecoveryTargetState::Unknown,
+    };
+    let file = bounded.into_inner();
+    let final_opened_metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return RecoveryTargetState::Unknown,
+    };
+    let final_path_metadata = match target.entry_metadata() {
+        Ok(Some(metadata)) if metadata.is_file() => metadata,
+        Ok(Some(_)) | Ok(None) | Err(_) => return RecoveryTargetState::Unknown,
+    };
+    if crate::private_fs::file_snapshot(&final_opened_metadata) != snapshot
+        || final_path_metadata.snapshot() != snapshot
+        || !target.parent_path_is_current().unwrap_or(false)
+        || !path_resolution_is_current()
+    {
+        return RecoveryTargetState::Unknown;
+    }
+    RecoveryTargetState::Digest(digest)
+}
+
+fn apply_tool_recoveries(
+    transcript: &mut [SessionTranscriptItem],
+    recoveries: &HashMap<String, ToolRecovery>,
+) {
+    if recoveries.is_empty() {
+        return;
+    }
+    let outcomes = recoveries
+        .iter()
+        .map(|(call_id, recovery)| SessionTranscriptToolOutcome {
+            call_id: call_id.clone(),
+            output: Some(recovery.transcript_output.clone()),
+            error: None,
+            file_change: recovery.file_change.clone(),
+        })
+        .collect::<Vec<_>>();
+    apply_transcript_tool_outcomes(transcript, &outcomes);
+}
+
+fn apply_current_missing_aborts(
+    transcript: &mut [SessionTranscriptItem],
+    missing_calls: &HashSet<String>,
+) {
+    if missing_calls.is_empty() {
+        return;
+    }
+    let mut latest_calls = missing_calls.clone();
+    for item in transcript.iter_mut().rev() {
+        match item {
+            SessionTranscriptItem::Tool { tool } => {
+                mark_current_missing_tool_aborted(tool, missing_calls, &mut latest_calls);
+            }
+            SessionTranscriptItem::Exploration { tools } => {
+                for tool in tools.iter_mut().rev() {
+                    mark_current_missing_tool_aborted(tool, missing_calls, &mut latest_calls);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn mark_current_missing_tool_aborted(
+    tool: &mut SessionTranscriptTool,
+    missing_calls: &HashSet<String>,
+    latest_calls: &mut HashSet<String>,
+) {
+    if tool.origin != SessionTranscriptToolOrigin::Agent || !missing_calls.contains(&tool.call_id) {
+        return;
+    }
+    if latest_calls.remove(&tool.call_id) || tool.output.is_none() {
+        tool.output = Some(SessionTranscriptToolOutput::Error(
+            SYNTHETIC_ABORT_OUTPUT.to_string(),
+        ));
+    }
+}
+
+fn apply_latest_normalization_aborts(
+    transcript: &mut [SessionTranscriptItem],
+    transcript_tail: &mut [SessionTranscriptItem],
+    aborted_calls: &HashSet<String>,
+) {
+    let mut remaining = aborted_calls.clone();
+    overwrite_latest_aborted_tools(transcript_tail, &mut remaining);
+    overwrite_latest_aborted_tools(transcript, &mut remaining);
+}
+
+fn overwrite_latest_aborted_tools(
+    transcript: &mut [SessionTranscriptItem],
+    remaining: &mut HashSet<String>,
+) {
+    for item in transcript.iter_mut().rev() {
+        match item {
+            SessionTranscriptItem::Tool { tool } => overwrite_latest_tool_abort(tool, remaining),
+            SessionTranscriptItem::Exploration { tools } => {
+                for tool in tools.iter_mut().rev() {
+                    overwrite_latest_tool_abort(tool, remaining);
+                }
+            }
+            _ => {}
+        }
+        if remaining.is_empty() {
+            break;
+        }
+    }
+}
+
+fn overwrite_latest_tool_abort(tool: &mut SessionTranscriptTool, remaining: &mut HashSet<String>) {
+    if tool.origin == SessionTranscriptToolOrigin::Agent && remaining.remove(&tool.call_id) {
+        tool.output = Some(SessionTranscriptToolOutput::Error(
+            SYNTHETIC_ABORT_OUTPUT.to_string(),
+        ));
+    }
 }
 
 fn apply_normalized_aborts(
@@ -1280,7 +2929,7 @@ fn append_transcript_message(transcript: &mut Vec<SessionTranscriptItem>, item: 
                 .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
                 .count();
             if (text.trim().is_empty() && image_count == 0)
-                || crate::context::is_contextual_user_text(&text)
+                || crate::context::is_contextual_user_message(item)
             {
                 return;
             }
@@ -1437,14 +3086,9 @@ fn latest_rollout_for_cwd(sessions: &Path, cwd: &Path) -> Result<Option<PathBuf>
     let mut latest = None::<(u128, u64, PathBuf)>;
     for entry in entries {
         let entry = entry.context("failed to inspect a saved bettercodex session")?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        let Some((path, modified_at)) = saved_session_candidate(entry)? else {
             continue;
-        }
-        let modified_at = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok();
+        };
         let Some(summary) = read_session_summary(&path, modified_at)? else {
             continue;
         };
@@ -1476,15 +3120,9 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
     let mut candidates = Vec::new();
     for entry in entries {
         let entry = entry.context("failed to inspect a saved bettercodex session")?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
+        if let Some(candidate) = saved_session_candidate(entry)? {
+            candidates.push(candidate);
         }
-        let modified_at = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        candidates.push((path, modified_at));
     }
     let worker_count = session_list_worker_count(candidates.len());
     let mut sessions = if worker_count == 1 {
@@ -1525,6 +3163,25 @@ fn list_sessions_in(root: &Path) -> Result<Vec<SessionSummary>> {
     Ok(sessions)
 }
 
+fn saved_session_candidate(
+    entry: std::fs::DirEntry,
+) -> Result<Option<(PathBuf, Option<SystemTime>)>> {
+    let path = entry.path();
+    if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        || !entry
+            .file_type()
+            .with_context(|| format!("failed to inspect saved session {}", path.display()))?
+            .is_file()
+    {
+        return Ok(None);
+    }
+    let modified_at = entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    Ok(Some((path, modified_at)))
+}
+
 fn session_list_worker_count(session_count: usize) -> usize {
     let useful_workers = (session_count / SESSION_LIST_MIN_FILES_PER_WORKER).max(1);
     std::thread::available_parallelism()
@@ -1549,8 +3206,31 @@ fn read_session_summary(
     path: &Path,
     modified_at: Option<SystemTime>,
 ) -> Result<Option<SessionSummary>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to inspect saved session {}", path.display()))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // O_NONBLOCK prevents a raced FIFO replacement from hanging discovery; it has no effect on
+    // ordinary local files. O_NOFOLLOW keeps a raced symlink replacement out of the state reader.
+    crate::private_fs::configure_private_file_nofollow(&mut options, true);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect saved session {}", path.display()));
+        }
+    };
+    if !file
+        .metadata()
+        .with_context(|| format!("failed to inspect saved session {}", path.display()))?
+        .is_file()
+    {
+        return Ok(None);
+    }
     let mut reader = BufReader::new(file);
     let Some(header) = read_json_line::<PreviewRolloutRecord>(&mut reader)
         .with_context(|| format!("failed to inspect saved session {}", path.display()))?
@@ -1693,7 +3373,10 @@ fn preview_from_items(items: &[PreviewItem]) -> Option<String> {
         } else {
             Cow::Borrowed(first)
         };
-        if crate::context::is_contextual_user_text(&text) {
+        if crate::context::is_contextual_user_text_with_kind(
+            &text,
+            item.user_message_kind.as_deref(),
+        ) {
             continue;
         }
         if let Some(preview) = normalized_preview(&text) {

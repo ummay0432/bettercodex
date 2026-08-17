@@ -1,141 +1,118 @@
-# Direct tool stack
+# Autoresearch for bettercodex
 
-## Status
+## Initial prompt
 
-Implemented on August 14, 2026. This document records the product decision and
-the retained contracts of the resulting direct tool stack.
+```text
+andrej's autoresearch has still been occupying my mind for a while, https://github.com/karpathy/autoresearch
 
-## Decision
+i've tried porting its principles over to bcodex but it was bad, we tried making a /loop but it wasnt good.
 
-bettercodex diverges from upstream Codex and does not use Code Mode. The model
-receives four fixed ordinary functions:
+i really do think this is a gem of a repo though, I want you to break it down for me, what this autoresearch essentialy does, then we can rubber duck and bounce back ideas this session to seeing how we can carry it over to bcodex.
 
-- `bash`
-- `read`
-- `write`
-- `edit`
+Keep responses concise. and we'll flesh out the @SPEC.md together as we discuss it in this session. The way you write it in the spec.md should be brief and not overexplained. and include my initial prompt (this prompt verbatim) Ok? lets begin
+```
 
-The same Responses request also declares hosted `web_search`, configured for
-live text and image results. Local images are read through `read`, as they are
-in pi, rather than requiring a second filesystem-reading tool. There is no
-reason to put a JavaScript runtime between the model and four fixed functions.
+## Working model
 
-## Why
+`autoresearch` is not a loop feature. It is a controlled search system:
 
-The former path made even one shell command or file edit pass through `exec`
-and a nested tool call. bettercodex carried roughly 6,500 lines of V8 Code Mode
-runtime and 11,500 lines under `src/tools/` for a small, fixed catalogue. That
-machinery makes sense for upstream's MCP, apps, plugins, dynamic tools, and
-large tool ecosystem. bettercodex deliberately has none of those.
+- one mutable surface: `train.py`;
+- one protected environment and evaluator: `prepare.py`;
+- one scalar objective: validation bits per byte;
+- one fixed five-minute budget per candidate;
+- baseline first;
+- commit, run, measure, and log each experiment;
+- keep improvements and reset failures;
+- continue autonomously until interrupted; and
+- the human edits research policy in `program.md`; the agent edits the experiment.
 
-That runtime was client-side Codex Code Mode, not the Responses API's hosted
-Programmatic Tool Calling feature.
+## Core insight
 
-ChatGPT subscription authentication does not require Responses Lite. A live
-August 14, 2026 probe showed that the Lite route rejects
-`parallel_tool_calls: true` with `unsupported_value`, while pi uses the same
-ChatGPT OAuth backend without the Lite header and enables native parallel tool
-calls. Do not send the Responses Lite header or its `additional_tools` input
-framing. Use the normal Responses contract instead: put the harness prompt in
-top-level `instructions`, expose the four ordinary function schemas and compact
-hosted-search declaration through top-level `tools`, and set
-`parallel_tool_calls: true`.
+Autonomy comes from making evaluation, state, and rollback unambiguous—not from telling an agent to repeat. A generic `/loop` lacks the experiment contract that makes useful iteration possible.
 
-When one response contains multiple function calls, start independent calls
-concurrently and retain their outputs in model call order. `bash` and `read`
-support concurrent execution. Keep `write` and `edit` exclusive so a
-side-effecting direct file operation does not overlap another direct function
-call. Hosted web search executes within the Responses service rather than the
-local function dispatcher.
-This mirrors Codex's shared/exclusive dispatch gate without retaining its
-general tool-router machinery.
+## Translation hypothesis
 
-`update_plan` was also removed. It did not store or enforce execution state; it
-only validated and rendered a model-authored checklist that was then duplicated
-in conversation context. Controlled todo-tool ablations on frontier
-models, including GPT-5.6 Terra, found no statistically significant accuracy
-gain and generally lower cost without it, so its context, latency, and tool-use
-overhead are not justified.
+bettercodex may need a reusable experiment contract rather than a universal loop:
 
-## Tool contracts
+- objective and acceptance rule;
+- mutable and protected scope;
+- evaluator and score extraction;
+- trial budget and timeout;
+- checkpoint and rollback;
+- experiment ledger; and
+- continuation and stopping policy.
 
-- `read(path, offset?, limit?, detail?)` reads bounded UTF-8 text or returns a
-  local image as an image attachment. Detect images from their bytes, not their
-  filename. `offset` and `limit` apply only to text; `detail` applies only to
-  images and supports `high` or `original`.
-- `write(path, content)` creates a file or completely replaces one, creating
-  parent directories when needed.
-- `edit(path, edits)` applies one or more exact, unique text replacements to one
-  file atomically.
-- `bash(command, timeout?)` runs one command in the working directory and
-  returns bounded stdout, stderr, and exit status.
-- hosted `web_search` searches and browses the live web using text and image
-  results; its `web_search_call` items remain in Responses history and saved
-  sessions.
+## Chosen direction
 
-`view_image` is folded into `read`; there is no standalone tool. The direct
-implementation reuses the retained image validation, 50 MiB input limit,
-high/original preparation, and history handling. The `read` output schema must
-describe its actual direct output: either a text string or an image content
-list. User-supplied `-i` attachments remain unchanged.
+An embedded bettercodex tool for autonomous optimization in arbitrary repositories. The campaign protocol is agnostic; each evaluator is task-specific.
 
-The former standalone `/alpha/search` client, `web_run` schema, reference-ID
-protocol, and local dispatch path are not retained. Native `url_citation`
-annotations are preserved with assistant messages and rendered as visible,
-clickable source links. The backend does not document a native equivalent for
-the former explicit PDF-page screenshot command; do not recreate it through a
-fallback function or dynamic tool route.
+## Required system
 
-## Process lifecycle
+A frozen eval is central but insufficient. The closed system requires:
 
-Use pi's `bash` contract rather than Codex's unified exec contract. It starts a
-non-PTY shell child, streams stdout and stderr to the UI, and waits for it to
-exit. It has no default timeout; an explicit timeout or interruption kills the
-process tree. It has no background sessions, session IDs, or later stdin. Use
-`tmux` when a persistent process is needed.
+- a relevant, repeatable, gaming-resistant objective;
+- frozen acceptance gates and protected files;
+- a constrained mutable scope;
+- one bounded candidate per worker;
+- incumbent-versus-challenger evaluation;
+- atomic accept or discard; and
+- a durable experiment ledger.
 
-Keep Codex's reliable process-group cleanup, environment scrubbing, and bounded
-model output. The stateful yield, polling, PTY, and stdin protocol are not
-retained.
+“Unbiased” is an aspiration, not a guarantee. Use holdouts or adversarial checks where practical.
 
-## Removed by the migration
+## Candidate architecture
 
-- model-visible `exec` and `wait`;
-- `update_plan`, its events, and plan-specific TUI rendering;
-- the V8 runtime, JavaScript bridge, nested-tool catalogue, and their
-  dependencies;
-- `apply_patch` and `exec_command`;
-- standalone `view_image`;
-- standalone `web_run`, its `/alpha/search` client, schema, description, and
-  local result protocol; and
-- Code Mode-only prompt, history, recovery, and test machinery.
+1. The current agent studies the task and drafts a campaign contract plus its evaluator, using `docs/evals/MANIFEST.md` as design guidance.
+2. The user reviews and freezes the evaluation suite.
+3. A deterministic autoresearch runner inside bettercodex starts one fresh worker with the task, frozen manifest, current incumbent, and concise experiment ledger.
+4. The worker produces exactly one candidate in a reusable isolated Git worktree.
+5. The runner executes the evaluator, keeps an improvement, or resets a failure.
+6. Repeat sequentially, with five candidates by default.
 
-`write_stdin`, background-process management, and their TUI surfaces were also
-removed.
+A fresh worker must not be stateless: accepted improvements accumulate, while the ledger prevents repeated failed ideas. “One attempt” means one candidate, not one edit or tool call.
 
-Keep the ordinary Responses `function_call` / `function_call_output` loop,
-hosted `web_search_call` history, saved-session fidelity, citation annotations,
-cancellation, output bounds, file safety, image implementation, and supported
-macOS/Linux behavior.
+## Eval integrity and threat model
 
-Native Windows support is intentionally removed as part of this simplification.
-Do not restore Windows builds, installers, release assets, dependencies,
-process/runtime branches, terminal handling, documentation, or tests.
+- The runner records the canonical baseline and frozen evaluator before workers start.
+- A worker returns only a candidate diff; its claimed test results and score are ignored.
+- The runner rejects out-of-scope changes, applies the allowed diff to a clean incumbent, and executes the canonical evaluator itself.
+- Prefer behavior-level, adversarial, randomized, or held-out cases where useful.
+- The user reviews the final winner before it leaves the campaign worktree.
 
-## Boundaries
+An unsandboxed same-user shell is not a security boundary. V1 resists eval tampering and accidental reward hacking, but cannot contain a deliberately hostile worker without sandboxing.
 
-Do not add dedicated `grep`, `find`, or `ls` tools; `bash` already covers them.
-Do not add MCP, dynamic tool search, hosted Programmatic Tool Calling, or a
-Code Mode fallback. The four direct functions plus fixed hosted `web_search`
-are the complete model-visible catalogue.
+## V1 threat model
 
-The August 14, 2026 live compatibility spikes established both sides of the
-transport decision. GPT-5.6 Sol accepted direct `bash` and image-reading tools
-through Responses Lite, but the backend rejected a Lite request with
-`parallel_tool_calls: true` and the exact error
-`X-OpenAI-Internal-Codex-Responses-Lite requires parallel_tool_calls to be
-false.` A follow-up request using the same ChatGPT subscription, normal
-top-level Responses tools, and `parallel_tool_calls: true` completed with HTTP
-200 and emitted both requested independent function calls in one response,
-matching pi's transport. The replacement and transport switch were implemented
-as one migration rather than maintaining two tool systems or a Lite fallback.
+Workers are cooperative but may exploit weak metrics while optimizing. The runner therefore owns scoring and validates candidate diffs against a clean incumbent. Public checks guide workers; optional held-out cases catch shortcuts. Deliberately hostile workers and OS-level containment are out of scope.
+
+## V1 simplicity constraints
+
+- one scalar score plus hard pass/fail gates;
+- one user approval is the only freeze gate;
+- one deterministic runner and one worker at a time;
+- one campaign branch and reusable worktree;
+- the same model and reasoning effort for every worker; and
+- no critic agent, teams, parallel candidates, tmux integration, or plugin framework.
+
+Tasks without a meaningful repeatable evaluator are unsupported. Noisy or multi-dimensional selection is deferred.
+
+## Lessons from pi-autoresearch
+
+Retain:
+
+- separate generic campaign machinery from task-specific research instructions;
+- keep one campaign directory as the source of truth;
+- persist a concise contract and append-only JSONL experiment ledger;
+- parse structured metric output from the evaluator;
+- keep correctness gates distinct from the optimization score; and
+- rehydrate fresh workers from persisted state, not parent conversation history.
+
+Do not retain:
+
+- an agent-editable evaluator;
+- agent-reported scores or keep/discard decisions;
+- one endlessly auto-resumed agent;
+- broad `git add -A` mutation handling; or
+- hooks, dashboards, confidence heuristics, and finalization machinery in V1.
+
+The minimal campaign state is a contract, a frozen evaluator, and a ledger. Fast noisy workloads may stabilize themselves inside the evaluator, such as by reporting a median.
