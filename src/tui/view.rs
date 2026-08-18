@@ -3118,7 +3118,7 @@ impl TranscriptEntry {
             }
             Self::UpdateAvailable(update) => update_available_lines(update, width),
             Self::Error(message) => vec![Line::from(vec![
-                Span::styled("■ ", Style::default().fg(Color::Red)),
+                Span::styled("• ", Style::default().fg(Color::Red)),
                 Span::styled(
                     markdown::sanitize_inline(message),
                     Style::default().fg(Color::Red),
@@ -5081,12 +5081,15 @@ mod tests {
     }
 
     #[test]
-    fn streamed_assistant_filters_control_sequences_split_across_deltas() {
+    fn streamed_assistant_filters_hidden_markup_split_across_deltas() {
         let chunks = [
             "before ",
             "\x1b[",
             "31mred \x1b]0;secret",
-            " continuation\x1b\\after",
+            " continuation\x1b\\after ",
+            "\u{e200}ci",
+            "te\u{e202}turn0search2\u{e202}",
+            "turn1news4\u{e201}done",
         ];
         let source = chunks.concat();
         let mut view = View::new(Path::new("/tmp/bettercodex"));
@@ -5118,7 +5121,7 @@ mod tests {
             .map(plain)
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(streamed, "\n• before red after");
+        assert_eq!(streamed, "\n• before red after done");
 
         view.handle_agent_event(completed_message(source));
         let finalized = view
@@ -5714,7 +5717,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(
-            rendered.contains("■ Could not start turn: the active agent is unavailable"),
+            rendered.contains("• Could not start turn: the active agent is unavailable"),
             "{rendered}"
         );
     }
@@ -6813,7 +6816,7 @@ mod tests {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.handle_agent_event(AgentEvent::ModelMessageCompleted(AssistantMessage {
-            text: "A cited answer.[1]".to_string(),
+            text: "A cited answer.\u{e200}cite\u{e202}turn0search2\u{e201}".to_string(),
             phase: Some(MessagePhase::FinalAnswer),
             citations: vec![crate::web_search::UrlCitation {
                 start_index: 15,
@@ -6824,6 +6827,9 @@ mod tests {
         }));
 
         let lines = view.take_pending_history_lines(80, 24);
+        let rendered = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+        assert!(!rendered.contains("turn0search2"), "{rendered}");
+        assert!(!rendered.contains('\u{e200}'), "{rendered}");
         assert!(lines.iter().any(|line| plain(line).contains("Sources:")));
         let source = lines
             .iter()
@@ -6837,7 +6843,7 @@ mod tests {
         assert_eq!(
             view.copy_latest_final_action(),
             Action::Copy(
-                "A cited answer.[1]\n\nSources:\n1. Example source: https://example.com/source"
+                "A cited answer.\n\nSources:\n1. Example source: https://example.com/source"
                     .to_string()
             )
         );

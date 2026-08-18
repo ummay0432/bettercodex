@@ -247,7 +247,7 @@ fn unavailable_agent_restores_an_idle_submission() {
     );
     let rendered = rendered_history(&mut runtime.view);
     assert!(
-        rendered.contains("■ Could not start turn: the active agent is unavailable"),
+        rendered.contains("• Could not start turn: the active agent is unavailable"),
         "{rendered}"
     );
 }
@@ -269,7 +269,7 @@ fn failed_queued_follow_up_start_restores_the_prompt_and_reports_no_start() {
     );
     let rendered = rendered_history(&mut runtime.view);
     assert!(
-        rendered.contains("■ Could not start turn: the active agent is unavailable"),
+        rendered.contains("• Could not start turn: the active agent is unavailable"),
         "{rendered}"
     );
 }
@@ -288,7 +288,7 @@ fn failed_fork_and_clear_restore_the_command_draft() {
     ));
     let rendered = rendered_history(&mut runtime.view);
     assert!(
-        rendered.contains("■ Could not fork this session:"),
+        rendered.contains("• Could not fork this session:"),
         "{rendered}"
     );
 
@@ -308,7 +308,7 @@ fn failed_fork_and_clear_restore_the_command_draft() {
     ));
     let rendered = rendered_history(&mut runtime.view);
     assert!(
-        rendered.contains("■ Could not start a fresh session:"),
+        rendered.contains("• Could not start a fresh session:"),
         "{rendered}"
     );
 }
@@ -329,10 +329,10 @@ fn resume_and_skill_failures_are_rendered_without_exiting() {
 
     let rendered = rendered_history(&mut runtime.view);
     assert!(
-        rendered.contains("■ Could not resume this session:"),
+        rendered.contains("• Could not resume this session:"),
         "{rendered}"
     );
-    assert!(rendered.contains("■ Could not update skill:"), "{rendered}");
+    assert!(rendered.contains("• Could not update skill:"), "{rendered}");
 }
 
 #[test]

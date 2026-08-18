@@ -20,6 +20,8 @@ use std::path::Path;
 use super::markdown_render;
 use super::table_detect;
 use super::terminal_hyperlinks::HyperlinkLine;
+use crate::assistant_message::CitationMarkerFilter;
+use crate::assistant_message::contains_raw_citation_marker;
 
 pub(super) fn render_markdown_agent_with_links_and_cwd(
     markdown_source: &str,
@@ -58,14 +60,14 @@ pub(super) fn render_streaming_markdown_agent_with_links_and_cwd(
     rendered
 }
 
-/// Stateful control-sequence filter for text split across streaming deltas.
+/// Stateful assistant-output filter for text split across streaming deltas.
 ///
-/// Keeping the parser state between calls ensures an unterminated CSI or OSC sequence cannot leak
-/// its continuation when the next model delta arrives. A one-shot [`sanitize`] call uses the same
-/// implementation so streamed and finalized text have identical filtering semantics.
+/// Keeping parser state between calls prevents split terminal-control sequences from leaking and
+/// lets raw citation markers disappear atomically once their closing marker arrives.
 #[derive(Debug, Default)]
-pub(super) struct StreamingSanitizer {
-    state: SanitizerState,
+pub(super) struct AssistantOutputSanitizer {
+    terminal_state: SanitizerState,
+    citation_filter: CitationMarkerFilter,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -78,62 +80,92 @@ enum SanitizerState {
     ControlStringEscape,
 }
 
-impl StreamingSanitizer {
+impl AssistantOutputSanitizer {
     pub(super) fn push(&mut self, text: &str, sanitized: &mut String) {
-        for character in text.chars() {
-            let mut pending = Some(character);
-            while let Some(character) = pending.take() {
-                match self.state {
-                    SanitizerState::Text => {
-                        if character == '\x1b' {
-                            self.state = SanitizerState::Escape;
-                        } else if matches!(character, '\n' | '\t') || !character.is_control() {
-                            sanitized.push(character);
-                        }
-                    }
-                    SanitizerState::Escape => {
-                        self.state = match character {
-                            '[' => SanitizerState::Csi,
-                            ']' | 'P' | '^' | '_' => SanitizerState::ControlString,
-                            _ => SanitizerState::Text,
-                        };
-                    }
-                    SanitizerState::Csi => {
-                        if ('@'..='~').contains(&character) {
-                            self.state = SanitizerState::Text;
-                        }
-                    }
-                    SanitizerState::ControlString => match character {
-                        '\x07' => self.state = SanitizerState::Text,
-                        '\x1b' => self.state = SanitizerState::ControlStringEscape,
-                        _ => {}
-                    },
-                    SanitizerState::ControlStringEscape => {
-                        if character == '\\' {
-                            self.state = SanitizerState::Text;
-                        } else {
-                            // The one-shot parser leaves a non-terminating character for the
-                            // control-string loop to consume, so do the same across chunk edges.
-                            self.state = SanitizerState::ControlString;
-                            pending = Some(character);
-                        }
-                    }
+        let terminal_state = &mut self.terminal_state;
+        self.citation_filter.push(text, |character| {
+            push_terminal_safe_character(terminal_state, character, sanitized);
+        });
+    }
+
+    pub(super) fn finish(&mut self, sanitized: &mut String) {
+        let terminal_state = &mut self.terminal_state;
+        self.citation_filter.finish(&mut |character| {
+            push_terminal_safe_character(terminal_state, character, sanitized);
+        });
+    }
+}
+
+fn push_terminal_safe_character(
+    state: &mut SanitizerState,
+    character: char,
+    sanitized: &mut String,
+) {
+    let mut pending = Some(character);
+    while let Some(character) = pending.take() {
+        match *state {
+            SanitizerState::Text => {
+                if character == '\x1b' {
+                    *state = SanitizerState::Escape;
+                } else if matches!(character, '\n' | '\t') || !character.is_control() {
+                    sanitized.push(character);
+                }
+            }
+            SanitizerState::Escape => {
+                *state = match character {
+                    '[' => SanitizerState::Csi,
+                    ']' | 'P' | '^' | '_' => SanitizerState::ControlString,
+                    _ => SanitizerState::Text,
+                };
+            }
+            SanitizerState::Csi => {
+                if ('@'..='~').contains(&character) {
+                    *state = SanitizerState::Text;
+                }
+            }
+            SanitizerState::ControlString => match character {
+                '\x07' => *state = SanitizerState::Text,
+                '\x1b' => *state = SanitizerState::ControlStringEscape,
+                _ => {}
+            },
+            SanitizerState::ControlStringEscape => {
+                if character == '\\' {
+                    *state = SanitizerState::Text;
+                } else {
+                    // The one-shot parser leaves a non-terminating character for the
+                    // control-string loop to consume, so do the same across chunk edges.
+                    *state = SanitizerState::ControlString;
+                    pending = Some(character);
                 }
             }
         }
     }
 }
 
-/// Whether [`sanitize`] would alter `text` when the parser starts in ordinary text mode.
-pub(super) fn requires_sanitization(text: &str) -> bool {
-    text.chars()
-        .any(|character| !matches!(character, '\n' | '\t') && character.is_control())
+/// Whether assistant-output filtering would alter `text` from ordinary text mode.
+pub(super) fn assistant_output_requires_sanitization(text: &str) -> bool {
+    contains_raw_citation_marker(text)
+        || text
+            .chars()
+            .any(|character| !matches!(character, '\n' | '\t') && character.is_control())
 }
 
-/// Remove control sequences before model output reaches Ratatui or a terminal escape writer.
+/// Remove terminal controls before arbitrary text reaches the terminal.
 pub(super) fn sanitize(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
-    StreamingSanitizer::default().push(text, &mut sanitized);
+    let mut state = SanitizerState::default();
+    for character in text.chars() {
+        push_terminal_safe_character(&mut state, character, &mut sanitized);
+    }
+    sanitized
+}
+
+/// Remove terminal controls and raw citation markers from completed assistant output.
+pub(super) fn sanitize_assistant_output(text: &str) -> String {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut sanitizer = AssistantOutputSanitizer::default();
+    sanitizer.push(text, &mut sanitized);
+    sanitizer.finish(&mut sanitized);
     sanitized
 }
 
@@ -380,10 +412,12 @@ mod tests {
     }
 
     #[test]
-    fn inline_sanitization_removes_terminal_controls_and_line_breaks() {
+    fn inline_sanitization_removes_terminal_controls_without_hiding_text() {
         assert_eq!(
-            sanitize_inline("safe\u{7}\nnext\t\x1b[31mred\x1b[0m"),
-            "safe next red"
+            sanitize_inline(
+                "safe\u{7}\nnext\t\x1b[31mred\x1b[0m \u{e200}cite\u{e202}turn0search2\u{e201}"
+            ),
+            "safe next red \u{e200}cite\u{e202}turn0search2\u{e201}"
         );
     }
 

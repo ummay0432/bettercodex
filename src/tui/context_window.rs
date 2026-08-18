@@ -165,9 +165,9 @@ impl ContextWindowView {
                     .enumerate()
                     .map(|(index, color)| {
                         let symbol = if index + 1 == row.len() {
-                            "■"
+                            "•"
                         } else {
-                            "■ "
+                            "• "
                         };
                         Span::styled(symbol, Style::default().fg(*color))
                     })
@@ -267,7 +267,7 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, segments: &[Segment], total:
         .take(usize::from(area.height))
         .map(|segment| {
             let mut spans = vec![
-                Span::styled("■ ", Style::default().fg(segment.color)),
+                Span::styled("• ", Style::default().fg(segment.color)),
                 Span::from(format!("{:<23}", segment.label)),
                 Span::from(format!(
                     "{:>7}  {:>6}",

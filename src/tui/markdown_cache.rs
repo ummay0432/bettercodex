@@ -3,7 +3,7 @@
 //! Completed top-level blocks remain rendered while only the final mutable block is reparsed.
 //! Reference definitions deliberately fall back to a full parse because they can retroactively
 //! change links elsewhere in the document. The raw transcript source is the sole ordinary-text
-//! buffer; a filtered copy is allocated only after a control character appears.
+//! buffer; a filtered copy is allocated only after terminal controls or raw citation markers appear.
 
 use super::markdown;
 use super::palette;
@@ -20,7 +20,7 @@ use std::path::Path;
 pub(super) struct MarkdownRenderCache {
     raw_source: String,
     sanitized_source: Option<String>,
-    sanitizer: markdown::StreamingSanitizer,
+    sanitizer: markdown::AssistantOutputSanitizer,
     citations: Vec<UrlCitation>,
     width: Option<usize>,
     render: IncrementalMarkdownRender,
@@ -29,12 +29,13 @@ pub(super) struct MarkdownRenderCache {
 
 impl MarkdownRenderCache {
     pub(super) fn new(raw_source: String) -> Self {
-        let mut sanitizer = markdown::StreamingSanitizer::default();
-        let sanitized_source = markdown::requires_sanitization(&raw_source).then(|| {
-            let mut sanitized = String::with_capacity(raw_source.len());
-            sanitizer.push(&raw_source, &mut sanitized);
-            sanitized
-        });
+        let mut sanitizer = markdown::AssistantOutputSanitizer::default();
+        let sanitized_source =
+            markdown::assistant_output_requires_sanitization(&raw_source).then(|| {
+                let mut sanitized = String::with_capacity(raw_source.len());
+                sanitizer.push(&raw_source, &mut sanitized);
+                sanitized
+            });
         Self {
             raw_source,
             sanitized_source,
@@ -64,7 +65,7 @@ impl MarkdownRenderCache {
         }
         if let Some(sanitized_source) = self.sanitized_source.as_mut() {
             self.sanitizer.push(delta, sanitized_source);
-        } else if markdown::requires_sanitization(delta) {
+        } else if markdown::assistant_output_requires_sanitization(delta) {
             let mut sanitized_source =
                 String::with_capacity(self.raw_source.len().saturating_add(delta.len()));
             sanitized_source.push_str(&self.raw_source);
@@ -82,6 +83,9 @@ impl MarkdownRenderCache {
     }
 
     pub(super) fn render_finalized(&mut self, width: usize, cwd: &Path) -> &[HyperlinkLine] {
+        if let Some(sanitized_source) = self.sanitized_source.as_mut() {
+            self.sanitizer.finish(sanitized_source);
+        }
         if self.width != Some(width) || !self.canonical {
             self.width = Some(width);
             self.render.clear();
@@ -118,7 +122,7 @@ fn append_citation_lines(lines: &mut Vec<HyperlinkLine>, citations: &[UrlCitatio
         if !seen.insert(destination.clone()) {
             continue;
         }
-        let title = markdown::sanitize(&citation.title)
+        let title = markdown::sanitize_assistant_output(&citation.title)
             .replace(['\n', '\r'], " ")
             .trim()
             .to_string();

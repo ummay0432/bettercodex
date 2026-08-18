@@ -663,15 +663,20 @@ async fn lifecycle_journal_preserves_non_utf8_resolved_targets() {
 }
 
 #[test]
-fn file_tools_omit_expensive_diff_preview_without_omitting_the_mutation() {
+fn file_tools_show_small_changes_in_large_files_and_bound_expensive_previews() {
     let root = TemporaryDirectory::new("file-change-diff-budget");
     let path = root.0.join("many-short-lines.txt");
-    let original = (0..MAX_FILE_CHANGE_DIFF_LINES / 2 + 1)
-        .map(|index| format!("old-{index}\n"))
+    let original = (0..4_000)
+        .map(|index| format!("line-{index}\n"))
         .collect::<String>();
-    let replacement = (0..MAX_FILE_CHANGE_DIFF_LINES / 2)
-        .map(|index| format!("new-{index}\n"))
-        .collect::<String>();
+    let replacement = original.replacen("line-2000\n", "changed-2000\n", 1);
+    let expected = Some(ToolFileChange {
+        path: path.clone(),
+        change: FileChange::Update {
+            unified_diff: diffy::create_patch(&original, &replacement).to_string(),
+            move_path: None,
+        },
+    });
     std::fs::write(&path, &original).unwrap();
 
     let result = test_write(
@@ -679,7 +684,7 @@ fn file_tools_omit_expensive_diff_preview_without_omitting_the_mutation() {
         json!({"path": "many-short-lines.txt", "content": &replacement}),
     )
     .unwrap();
-    assert!(result.file_change.is_none());
+    assert_eq!(result.file_change, expected);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
 
     std::fs::write(&path, &original).unwrap();
@@ -687,16 +692,37 @@ fn file_tools_omit_expensive_diff_preview_without_omitting_the_mutation() {
         &root.0,
         json!({
             "path": "many-short-lines.txt",
-            "edits": [{"oldText": &original, "newText": &replacement}],
+            "edits": [{"oldText": "line-2000\n", "newText": "changed-2000\n"}],
         }),
     )
     .unwrap();
+    assert_eq!(result.file_change, expected);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
+
+    let path = root.0.join("many-carriage-return-lines.txt");
+    let original = "old\r".repeat(MAX_FILE_CHANGE_DIFF_LINES / 2 + 1);
+    let replacement = original.replacen("old\r", "new\r", 1);
+    std::fs::write(&path, &original).unwrap();
+    let result = test_write(
+        &root.0,
+        json!({"path": "many-carriage-return-lines.txt", "content": &replacement}),
+    )
+    .unwrap();
     assert!(result.file_change.is_none());
-    assert_eq!(std::fs::read_to_string(path).unwrap(), replacement);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
 
     let path = root.0.join("large-lines.txt");
     let original = "a".repeat(MAX_FILE_CHANGE_PREVIEW_BYTES / 2 + 1_024);
     let replacement = "b".repeat(MAX_FILE_CHANGE_PREVIEW_BYTES / 2 + 1_024);
+    std::fs::write(&path, &original).unwrap();
+    let result = test_write(
+        &root.0,
+        json!({"path": "large-lines.txt", "content": &replacement}),
+    )
+    .unwrap();
+    assert!(result.file_change.is_none());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
+
     std::fs::write(&path, &original).unwrap();
     let result = test_edit(
         &root.0,

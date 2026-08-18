@@ -27,6 +27,7 @@ use anyhow::anyhow;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
+use similar::TextDiff;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -51,9 +52,11 @@ const MAX_READ_BYTES: usize = 39_000;
 const MAX_EDIT_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FORWARDED_LIVE_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_FILE_CHANGE_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
-// Myers diff work grows with the edit distance, so a byte bound alone does not keep complete
-// rewrites responsive when both versions contain many short, unrelated lines.
-const MAX_FILE_CHANGE_DIFF_LINES: usize = 2_000;
+// `similar` tokenizes both inputs before its deadline starts. Keep that eager allocation bounded
+// while leaving ample headroom for ordinary multi-thousand-line source files.
+const MAX_FILE_CHANGE_DIFF_LINES: usize = 200_000;
+// Match current upstream Codex's deadline for interactive file diffs.
+const MAX_FILE_CHANGE_DIFF_DURATION: Duration = Duration::from_millis(100);
 const MAX_WRITE_SYMLINK_HOPS: usize = 64;
 const MAX_TIMEOUT_SECONDS: f64 = i32::MAX as f64 / 1_000.0;
 const READ_IMAGE_INVALID_MESSAGE: &str =
@@ -1258,40 +1261,82 @@ fn bounded_update_file_change(original: &str, replacement: &str) -> Option<FileC
     {
         return None;
     }
-    let original_lines = original
-        .split_inclusive('\n')
-        .take(MAX_FILE_CHANGE_DIFF_LINES.saturating_add(1))
-        .count();
-    if original_lines > MAX_FILE_CHANGE_DIFF_LINES {
-        return None;
-    }
+    let original_lines = bounded_diff_line_count(original, MAX_FILE_CHANGE_DIFF_LINES)?;
     let remaining_lines = MAX_FILE_CHANGE_DIFF_LINES.checked_sub(original_lines)?;
-    let replacement_lines = replacement
-        .split_inclusive('\n')
-        .take(remaining_lines.saturating_add(1))
-        .count();
-    if replacement_lines > remaining_lines {
-        return None;
-    }
+    bounded_diff_line_count(replacement, remaining_lines)?;
 
-    // In the worst line-oriented patch every input byte is copied once, every line receives a
-    // prefix and hunk metadata, and fixed file/no-newline headers are added. Reject that upper
-    // bound before diffy allocates its edit graph or output buffer.
-    let total_lines = original_lines.checked_add(replacement_lines)?;
-    let output_upper_bound = original
-        .len()
-        .checked_add(replacement.len())?
-        .checked_add(total_lines.checked_mul(96)?)?
-        .checked_add(1_024)?;
-    if output_upper_bound > MAX_FILE_CHANGE_PREVIEW_BYTES {
-        return None;
-    }
-
-    let unified_diff = diffy::create_patch(original, replacement).to_string();
-    (unified_diff.len() <= MAX_FILE_CHANGE_PREVIEW_BYTES).then_some(FileChange::Update {
-        unified_diff,
+    // Match upstream Codex's deadline-aware Myers diff without suppressing ordinary large files.
+    // Serialize through a bounded writer so an oversized preview is never fully allocated merely
+    // to discover that it exceeds the display contract.
+    let diff = TextDiff::configure()
+        .timeout(MAX_FILE_CHANGE_DIFF_DURATION)
+        .diff_lines(original, replacement);
+    let mut output = BoundedFileChangePreview::default();
+    diff.unified_diff()
+        .header("original", "modified")
+        .to_writer(&mut output)
+        .ok()?;
+    Some(FileChange::Update {
+        unified_diff: String::from_utf8(output.bytes).ok()?,
         move_path: None,
     })
+}
+
+fn bounded_diff_line_count(text: &str, limit: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut count = 0_usize;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                count = count.checked_add(1)?;
+                if count > limit {
+                    return None;
+                }
+                index += usize::from(bytes.get(index + 1) == Some(&b'\n')) + 1;
+            }
+            b'\n' => {
+                count = count.checked_add(1)?;
+                if count > limit {
+                    return None;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    if bytes
+        .last()
+        .is_some_and(|last| !matches!(last, b'\r' | b'\n'))
+    {
+        count = count.checked_add(1)?;
+    }
+    (count <= limit).then_some(count)
+}
+
+#[derive(Default)]
+struct BoundedFileChangePreview {
+    bytes: Vec<u8>,
+}
+
+impl Write for BoundedFileChangePreview {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(new_len) = self.bytes.len().checked_add(buffer.len()) else {
+            return Err(std::io::Error::other("file-change preview is too large"));
+        };
+        if new_len > MAX_FILE_CHANGE_PREVIEW_BYTES {
+            return Err(std::io::Error::other("file-change preview is too large"));
+        }
+        self.bytes
+            .try_reserve(buffer.len())
+            .map_err(|_| std::io::Error::other("file-change preview allocation failed"))?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn write_result(path: &Path, content: &str, outcome: &AtomicWriteOutcome) -> ToolResult {

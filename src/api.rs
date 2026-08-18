@@ -2180,7 +2180,7 @@ fn process_decoded_http_events(
 struct CollectedResponse {
     output_items: CollectedOutputItems,
     added_output: OutputItemTracker,
-    completed_output: CompletedOutput,
+    completed_output: OutputItemTracker,
     last_sequence: Option<(u64, JsonFingerprint)>,
     item_summary: ResponseItemSummary,
     usage: Option<TokenUsage>,
@@ -2194,24 +2194,12 @@ struct CollectedResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct JsonFingerprint([u8; 32]);
 
-struct ObservedOutputItem {
-    id: Option<String>,
-    call_id: Option<String>,
-    fingerprint: JsonFingerprint,
-}
-
 #[derive(Default)]
 struct OutputItemTracker {
     by_id: HashMap<String, JsonFingerprint>,
     by_call_id: HashMap<String, JsonFingerprint>,
     by_index: HashMap<u64, JsonFingerprint>,
     anonymous_without_event_identity: HashSet<JsonFingerprint>,
-}
-
-#[derive(Default)]
-struct CompletedOutput {
-    order: Vec<ObservedOutputItem>,
-    items: OutputItemTracker,
 }
 
 enum CollectedOutputItems {
@@ -2249,7 +2237,7 @@ impl CollectedResponse {
         Self {
             output_items,
             added_output: OutputItemTracker::default(),
-            completed_output: CompletedOutput::default(),
+            completed_output: OutputItemTracker::default(),
             last_sequence: None,
             item_summary: ResponseItemSummary::default(),
             usage: None,
@@ -2322,17 +2310,12 @@ impl CollectedResponse {
     }
 
     fn observe_output_item_added(&mut self, event: &Value, item: &Value) -> ApiResult<bool> {
-        self.added_output
-            .observe(event, item)
-            .map(|observed| observed.is_some())
+        self.added_output.observe(event, item)
     }
 
     fn observe_output_item_done(&mut self, event: &Value, item: &Value) -> ApiResult<bool> {
-        self.completed_output.observe_done(event, item)
-    }
-
-    fn validate_completed_output(&self, response: &Value) -> ApiResult<()> {
-        self.completed_output.validate_response(response)
+        validate_output_item(item)?;
+        self.completed_output.observe(event, item)
     }
 
     fn output_item_was_completed(&self, event: &Value, item: &Value) -> ApiResult<bool> {
@@ -2475,7 +2458,7 @@ impl CollectedResponse {
 }
 
 impl OutputItemTracker {
-    fn observe(&mut self, event: &Value, item: &Value) -> ApiResult<Option<ObservedOutputItem>> {
+    fn observe(&mut self, event: &Value, item: &Value) -> ApiResult<bool> {
         let fingerprint = json_fingerprint(item)?;
         let id = optional_output_item_identity(item, "id")?;
         let call_id = optional_output_item_identity(item, "call_id")?;
@@ -2519,31 +2502,16 @@ impl OutputItemTracker {
         if anonymous_without_event_identity {
             self.anonymous_without_event_identity.insert(fingerprint);
         }
-        Ok((!duplicate).then_some(ObservedOutputItem {
-            id,
-            call_id,
-            fingerprint,
-        }))
-    }
-}
-
-impl CompletedOutput {
-    fn observe_done(&mut self, event: &Value, item: &Value) -> ApiResult<bool> {
-        validate_output_item(item)?;
-        let Some(observed) = self.items.observe(event, item)? else {
-            return Ok(false);
-        };
-        self.order.push(observed);
-        Ok(true)
+        Ok(!duplicate)
     }
 
     fn references_item(&self, event: &Value, item: &Value) -> ApiResult<bool> {
         let id = output_item_identity(item, "id")?;
         let call_id = output_item_identity(item, "call_id")?;
         let output_index = optional_event_u64(event, "output_index")?;
-        Ok(id.is_some_and(|id| self.items.by_id.contains_key(id))
-            || call_id.is_some_and(|call_id| self.items.by_call_id.contains_key(call_id))
-            || output_index.is_some_and(|index| self.items.by_index.contains_key(&index)))
+        Ok(id.is_some_and(|id| self.by_id.contains_key(id))
+            || call_id.is_some_and(|call_id| self.by_call_id.contains_key(call_id))
+            || output_index.is_some_and(|index| self.by_index.contains_key(&index)))
     }
 
     fn references_event(&self, event: &Value) -> ApiResult<bool> {
@@ -2551,50 +2519,10 @@ impl CompletedOutput {
         let call_id = event_identity(event, "call_id")?;
         let output_index = optional_event_u64(event, "output_index")?;
         Ok(
-            item_id.is_some_and(|item_id| self.items.by_id.contains_key(item_id))
-                || call_id.is_some_and(|call_id| self.items.by_call_id.contains_key(call_id))
-                || output_index.is_some_and(|index| self.items.by_index.contains_key(&index)),
+            item_id.is_some_and(|item_id| self.by_id.contains_key(item_id))
+                || call_id.is_some_and(|call_id| self.by_call_id.contains_key(call_id))
+                || output_index.is_some_and(|index| self.by_index.contains_key(&index)),
         )
-    }
-
-    fn validate_response(&self, response: &Value) -> ApiResult<()> {
-        let Some(output) = response.get("output") else {
-            // The ChatGPT backend can omit the full output array. In that compatibility shape,
-            // completed `output_item.done` events remain the only available source of truth.
-            return Ok(());
-        };
-        let output = output
-            .as_array()
-            .ok_or_else(|| ApiError::fatal("response.completed output was not an array"))?;
-        if output.len() != self.order.len() {
-            return Err(ApiError::fatal(
-                "response.completed did not match completed output items",
-            ));
-        }
-        for (expected, item) in self.order.iter().zip(output) {
-            validate_output_item(item)?;
-            let id = optional_output_item_identity(item, "id")?;
-            let call_id = optional_output_item_identity(item, "call_id")?;
-            let strong_identity_matches = expected
-                .id
-                .as_ref()
-                .is_none_or(|expected_id| id.as_ref() == Some(expected_id))
-                && expected
-                    .call_id
-                    .as_ref()
-                    .is_none_or(|expected_call_id| call_id.as_ref() == Some(expected_call_id));
-            let identity_matches = if expected.id.is_none() && expected.call_id.is_none() {
-                json_fingerprint(item)? == expected.fingerprint
-            } else {
-                strong_identity_matches
-            };
-            if !identity_matches {
-                return Err(ApiError::fatal(
-                    "response.completed did not match completed output items",
-                ));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -2979,8 +2907,9 @@ fn process_event_value_at(
             }
         }
         Some("response.completed") => {
-            // `output_item.done` remains authoritative. When the backend also supplies the full
-            // output array, use it only to prove that no completed item was omitted or reordered.
+            // Match upstream Codex by treating `output_item.done` as authoritative. The ChatGPT
+            // backend's terminal envelope can omit or project `output` differently, so completion
+            // consumes only response metadata and never replays or reconciles that array.
             let response = event
                 .get_mut("response")
                 .map(Value::take)
@@ -2992,9 +2921,6 @@ fn process_event_value_at(
                 }
             };
             if let Err(error) = validate_completed_response(&response) {
-                return Err(collected.reject_completed_response(error, usage));
-            }
-            if let Err(error) = collected.validate_completed_output(&response) {
                 return Err(collected.reject_completed_response(error, usage));
             }
             let Some(response_id) = response

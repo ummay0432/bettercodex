@@ -722,21 +722,24 @@ async fn sparse_output_indexes_after_an_interrupted_search_preserve_the_answer()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rejected_completed_output_records_usage_without_inventing_output() -> Result<()> {
-    let root = temporary_root("rejected-completed-output-accounting");
+async fn completed_response_projection_does_not_discard_streamed_tool_calls() -> Result<()> {
+    let root = temporary_root("completed-response-projection");
     let _cleanup = DirectoryCleanup(root.clone());
     let selection = ModelSelection::default();
-    let interrupted_search = json!({
-        "type": "web_search_call",
-        "id": "ws_rejected_completion",
-        "status": "in_progress",
+    let tool_call = json!({
+        "type": "function_call",
+        "id": "fc_streamed_only",
+        "call_id": "call_streamed_only",
+        "namespace": "functions",
+        "name": "bash",
+        "arguments": r#"{"command":"printf streamed-tool"}"#,
     });
     let answer = json!({
         "type": "message",
-        "id": "msg_rejected_completion",
+        "id": "msg_after_streamed_tool",
         "role": "assistant",
         "phase": "final_answer",
-        "content": [{"type": "output_text", "text": "preserve this output"}],
+        "content": [{"type": "output_text", "text": "streamed tool observed"}],
     });
     let rate_limit = json!({
         "type": "codex.rate_limits",
@@ -748,28 +751,22 @@ async fn rejected_completed_output_records_usage_without_inventing_output() -> R
             },
         },
     });
-    let stream = [
-        json!({
-            "type": "response.output_item.added",
-            "output_index": 0,
-            "sequence_number": 1,
-            "item": interrupted_search,
-        }),
+    let first_stream = [
         json!({
             "type": "response.output_item.done",
-            "output_index": 1,
-            "sequence_number": 2,
-            "item": answer,
+            "output_index": 0,
+            "sequence_number": 1,
+            "item": tool_call,
         }),
         rate_limit,
         json!({
             "type": "response.completed",
-            "sequence_number": 3,
+            "sequence_number": 2,
             "response": {
-                "id": "resp_rejected_completion",
+                "id": "resp_streamed_tool",
                 "model": selection.model,
                 "reasoning": {"context": "all_turns"},
-                "output": [interrupted_search, answer],
+                "output": [],
                 "usage": {
                     "input_tokens": 10,
                     "output_tokens": 2,
@@ -781,39 +778,50 @@ async fn rejected_completed_output_records_usage_without_inventing_output() -> R
     .into_iter()
     .map(|event| format!("data: {event}\n\n"))
     .collect::<String>();
-    let (base_url, requests, server) = serve_responses(vec![(200, stream)]);
+    let (base_url, requests, server) = serve_responses(vec![
+        (200, first_stream),
+        (
+            200,
+            completed_sse("resp_after_streamed_tool", &selection.model, &answer),
+        ),
+    ]);
     let mut agent = test_agent(&root, base_url, selection)?;
     let session_id = agent.session_id().parse::<uuid::Uuid>()?;
 
-    let error = agent
-        .submit("preserve completed accounting")
-        .await
-        .unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("did not match completed output items"),
-        "{error:#}"
-    );
     assert_eq!(
-        agent
-            .conversation
-            .items()
+        agent.submit("run the streamed tool").await?,
+        "streamed tool observed"
+    );
+    let _first_request = requests.recv_timeout(Duration::from_secs(2))?;
+    let second_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    server
+        .join()
+        .map_err(|_| anyhow!("completed response projection test server panicked"))?;
+    let input = second_request["input"]
+        .as_array()
+        .ok_or_else(|| anyhow!("tool continuation omitted input"))?;
+    assert_eq!(
+        input
             .iter()
-            .filter(|item| *item == &answer)
+            .filter(|item| {
+                item["type"] == "function_call" && item["call_id"] == "call_streamed_only"
+            })
             .count(),
         1
     );
-    assert!(
-        agent
-            .conversation
-            .items()
-            .iter()
-            .all(|item| item.get("id").and_then(Value::as_str) != Some("ws_rejected_completion"))
-    );
+    let output = input
+        .iter()
+        .find(|item| {
+            item["type"] == "function_call_output" && item["call_id"] == "call_streamed_only"
+        })
+        .and_then(|item| item["output"].as_str())
+        .ok_or_else(|| anyhow!("tool continuation omitted the streamed call output"))?;
+    let output: Value = serde_json::from_str(output)?;
+    assert_eq!(output["stdout"], "streamed-tool");
+    assert_eq!(output["stderr"], "");
+    assert_eq!(output["exit_code"], 0);
     let snapshot = agent.context_snapshot();
-    assert_eq!(snapshot.total_usage.total_tokens, 12);
+    assert_eq!(snapshot.total_usage.total_tokens, 24);
     assert_eq!(
         snapshot.rate_limits[0]
             .primary
@@ -822,13 +830,9 @@ async fn rejected_completed_output_records_usage_without_inventing_output() -> R
             .used_percent,
         29.0
     );
-    let _request = requests.recv_timeout(Duration::from_secs(2))?;
-    server
-        .join()
-        .map_err(|_| anyhow!("rejected completion test server panicked"))?;
     drop(agent);
     let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &root.join("repo"))?;
-    assert_eq!(loaded.total_usage.total_tokens, 12);
+    assert_eq!(loaded.total_usage.total_tokens, 24);
     Ok(())
 }
 

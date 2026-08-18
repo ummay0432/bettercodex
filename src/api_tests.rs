@@ -779,7 +779,7 @@ fn conflicting_reuse_of_a_function_call_id_is_rejected_without_indexes() {
 }
 
 #[test]
-fn completed_response_cannot_invent_an_interrupted_hosted_item() {
+fn completed_response_output_is_not_replayed_or_reconciled() {
     let (completed_items, mut received) = tokio::sync::mpsc::unbounded_channel();
     let mut collected = CollectedResponse::new(OutputItemMode::Transfer);
     let mut server_model_warning_emitted = false;
@@ -840,7 +840,7 @@ fn completed_response_cannot_invent_an_interrupted_hosted_item() {
     let mut completed = completed_event("resp_interrupted_completion", &Value::Null);
     completed["sequence_number"] = json!(3);
     completed["response"]["output"] = json!([interrupted_search, answer]);
-    let mut error = process_event_value(
+    process_event_value(
         completed,
         &mut collected,
         &completed_items,
@@ -848,20 +848,22 @@ fn completed_response_cannot_invent_an_interrupted_hosted_item() {
         MODEL,
         &mut server_model_warning_emitted,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("did not match completed output items")
-    );
     assert!(received.try_recv().is_err());
-    assert!(!collected.completed);
-    let (usage, rate_limits) = error
-        .take_completed_response()
-        .expect("completed response metadata");
-    assert_eq!(usage.unwrap().total_tokens, 50);
-    assert_eq!(rate_limits[0].primary.as_ref().unwrap().used_percent, 17.0);
+    assert!(collected.completed);
+    let response = collected.finish().unwrap();
+    assert_eq!(response.output_item_count, 1);
+    assert_eq!(response.final_answer.as_deref(), Some("answer"));
+    assert_eq!(response.usage.unwrap().total_tokens, 50);
+    assert_eq!(
+        response.rate_limits[0]
+            .primary
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        17.0
+    );
 }
 
 #[test]
@@ -935,11 +937,11 @@ fn hosted_web_search_and_citations_are_forwarded_without_rewriting_history() {
         "phase": "final_answer",
         "content": [{
             "type": "output_text",
-            "text": "Rust is current.[1]",
+            "text": "Rust is current.\u{e200}cite\u{e202}turn0search2\u{e201}",
             "annotations": [{
                 "type": "url_citation",
                 "start_index": 16,
-                "end_index": 19,
+                "end_index": 35,
                 "url": "https://www.rust-lang.org/",
                 "title": "Rust",
             }],
@@ -963,15 +965,15 @@ fn hosted_web_search_and_citations_are_forwarded_without_rewriting_history() {
     let AgentEvent::ModelMessageCompleted(message) = received_events.try_recv().unwrap() else {
         panic!("expected completed assistant message");
     };
-    assert_eq!(message.text, "Rust is current.[1]");
+    assert_eq!(
+        message.text,
+        "Rust is current.\u{e200}cite\u{e202}turn0search2\u{e201}"
+    );
     assert_eq!(message.citations.len(), 1);
     assert_eq!(message.citations[0].url, "https://www.rust-lang.org/");
-    assert!(
-        collected
-            .item_summary
-            .final_answer
-            .as_deref()
-            .is_some_and(|answer| answer.contains("1. Rust: https://www.rust-lang.org/"))
+    assert_eq!(
+        collected.item_summary.final_answer.as_deref(),
+        Some("Rust is current.\n\nSources:\n1. Rust: https://www.rust-lang.org/")
     );
 }
 
