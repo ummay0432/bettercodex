@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.3] - 2026-08-18
+
+- update notice says `Run bcodex update` again <- fixed
+
 ## [0.2.2] - 2026-08-18
 
 - response.completed did not match completed output items <- fixed

@@ -3,7 +3,6 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::os::unix::ffi::OsStringExt as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::SystemTime;
@@ -118,15 +117,6 @@ fn one_build_policy_controls_background_and_explicit_updates() {
     assert!(BuildKind::ReleaseSource.supports_explicit_update());
     assert!(BuildKind::Published.checks_for_updates());
     assert!(BuildKind::Published.supports_explicit_update());
-    assert!(
-        BuildKind::DebugSource
-            .update_command(
-                Path::new("/tmp/bcodex"),
-                Path::new("/tmp"),
-                DEFAULT_REPOSITORY,
-            )
-            .is_none()
-    );
     for (selected_version, revision) in [("1.2.2", '1'), ("1.2.3", '2'), ("1.3.0", '3')] {
         let selected = release_fixture(selected_version, revision);
         assert_eq!(
@@ -727,59 +717,4 @@ fn updater_passes_only_the_pinned_release_install_contract() {
         )
         .is_err()
     );
-}
-
-#[test]
-fn update_notice_command_is_self_contained_shell_safe_and_executes_the_current_binary() {
-    let quoted_path = Path::new("/tmp/bettercodex path/'quoted'/bcodex");
-    let quoted_install_dir = Path::new("/tmp/bettercodex install");
-    assert_eq!(
-        shell_update_command(quoted_path, quoted_install_dir, "owner/project"),
-        format!(
-            "BCODEX_REPOSITORY=owner/project BCODEX_INSTALL_DIR={} {} update",
-            shlex::try_quote(quoted_install_dir.to_str().unwrap()).unwrap(),
-            shlex::try_quote(quoted_path.to_str().unwrap()).unwrap()
-        )
-    );
-    assert!(
-        shell_update_command(
-            Path::new("/tmp/β/bcodex"),
-            Path::new("/tmp/β/install"),
-            "owner/project",
-        )
-        .is_ascii()
-    );
-
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        let temporary = TestDirectory::new();
-        let mut executable = temporary.path().to_path_buf();
-        executable.push(OsString::from_vec(
-            b"bcodex space-'quote-\xff-newline-\n".to_vec(),
-        ));
-        let mut install_dir = temporary.path().to_path_buf();
-        install_dir.push(OsString::from_vec(b"install-\xfe-newline-\n".to_vec()));
-        let marker = temporary.path().join("marker");
-        fs::write(
-            &executable,
-            b"#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = update ] || exit 64\n[ \"$BCODEX_REPOSITORY\" = owner/project ] || exit 65\n[ \"$BCODEX_INSTALL_DIR\" = \"$BCODEX_TEST_INSTALL_DIR\" ] || exit 66\nprintf '%s' \"$1\" >\"$BCODEX_TEST_MARKER\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let command = shell_update_command(&executable, &install_dir, "owner/project");
-        assert!(command.is_ascii());
-        assert!(!command.contains('\n'));
-        let status = ProcessCommand::new("/bin/sh")
-            .arg("-c")
-            .arg(&command)
-            .env(REPOSITORY_ENV, "wrong/repository")
-            .env(INSTALL_DIR_ENV, "/wrong/install")
-            .env("BCODEX_TEST_INSTALL_DIR", &install_dir)
-            .env("BCODEX_TEST_MARKER", &marker)
-            .status()
-            .unwrap();
-        assert!(status.success(), "command failed: {command}");
-        assert_eq!(fs::read_to_string(marker).unwrap(), "update");
-    }
 }

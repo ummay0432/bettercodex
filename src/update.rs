@@ -17,7 +17,6 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::future::Future;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -99,15 +98,13 @@ struct ConfiguredRepository {
 pub(crate) struct AvailableUpdate {
     current_version: String,
     latest_version: String,
-    update_command: String,
 }
 
 impl AvailableUpdate {
-    fn new(current_version: &str, latest_version: &str, update_command: String) -> Self {
+    fn new(current_version: &str, latest_version: &str) -> Self {
         Self {
             current_version: current_version.to_string(),
             latest_version: latest_version.to_string(),
-            update_command,
         }
     }
 
@@ -119,13 +116,9 @@ impl AvailableUpdate {
         &self.latest_version
     }
 
-    pub(crate) fn update_command(&self) -> &str {
-        &self.update_command
-    }
-
     #[cfg(test)]
     pub(crate) fn test_fixture() -> Self {
-        Self::new("1.2.3", "1.3.0", "bcodex update".to_string())
+        Self::new("1.2.3", "1.3.0")
     }
 }
 
@@ -147,16 +140,6 @@ impl BuildKind {
 
     fn supports_explicit_update(self) -> bool {
         !matches!(self, Self::DebugSource)
-    }
-
-    fn update_command(
-        self,
-        executable: &Path,
-        install_dir: &Path,
-        repository: &str,
-    ) -> Option<String> {
-        self.supports_explicit_update()
-            .then(|| shell_update_command(executable, install_dir, repository))
     }
 
     fn command_summary(self) -> &'static str {
@@ -225,25 +208,16 @@ pub(crate) fn background_update_check()
     if !build_kind.checks_for_updates() || std::env::var_os("BCODEX_SKIP_UPDATE_CHECK").is_some() {
         return None;
     }
-    Some(check_for_update(build_kind))
+    Some(check_for_update())
 }
 
-async fn check_for_update(build_kind: BuildKind) -> Option<AvailableUpdate> {
-    let executable = std::env::current_exe().ok()?;
-    let configured_dir = configured_install_dir().ok()?;
-    let install_dir =
-        update_install_dir(build_kind, &executable, configured_dir.as_deref()).ok()?;
+async fn check_for_update() -> Option<AvailableUpdate> {
     let current_version = current_version().ok()?;
     let repository = configured_repository().ok()?;
-    let update_command = build_kind.update_command(&executable, &install_dir, &repository.name)?;
     let latest_version =
         check_for_release_update_with(&repository.name, current_version, UPDATE_CHECK_TIMEOUT)
             .await?;
-    Some(AvailableUpdate::new(
-        current_version,
-        &latest_version,
-        update_command,
-    ))
+    Some(AvailableUpdate::new(current_version, &latest_version))
 }
 
 pub(crate) fn update_command_summary() -> &'static str {
@@ -943,46 +917,6 @@ fn run_installer_script(
         bail!("bettercodex installer exited with {status}");
     }
     Ok(())
-}
-
-fn shell_update_command(executable: &Path, install_dir: &Path, repository: &str) -> String {
-    let executable_bytes = executable.as_os_str().as_bytes();
-    let install_dir_bytes = install_dir.as_os_str().as_bytes();
-    if let (Some(executable), Some(install_dir)) = (
-        printable_shell_word(executable_bytes),
-        printable_shell_word(install_dir_bytes),
-    ) {
-        return format!(
-            "{REPOSITORY_ENV}={repository} {INSTALL_DIR_ENV}={install_dir} {executable} update"
-        );
-    }
-
-    let executable = octal_shell_bytes(executable_bytes);
-    let install_dir = octal_shell_bytes(install_dir_bytes);
-    format!(
-        "(_bcodex_exe=$(printf '%b_' '{executable}'); _bcodex_install_dir=$(printf '%b_' '{install_dir}'); {REPOSITORY_ENV}={repository} {INSTALL_DIR_ENV}=\"${{_bcodex_install_dir%_}}\" \"${{_bcodex_exe%_}}\" update)"
-    )
-}
-
-fn printable_shell_word(bytes: &[u8]) -> Option<String> {
-    if !bytes.iter().all(|byte| matches!(byte, b' '..=b'~')) {
-        return None;
-    }
-    shlex::try_quote(std::str::from_utf8(bytes).ok()?)
-        .ok()
-        .map(std::borrow::Cow::into_owned)
-}
-
-fn octal_shell_bytes(bytes: &[u8]) -> String {
-    let mut escaped = String::with_capacity(bytes.len().saturating_mul(5));
-    for &byte in bytes {
-        escaped.push('\\');
-        escaped.push('0');
-        escaped.push(char::from(b'0' + ((byte >> 6) & 7)));
-        escaped.push(char::from(b'0' + ((byte >> 3) & 7)));
-        escaped.push(char::from(b'0' + (byte & 7)));
-    }
-    escaped
 }
 
 #[cfg(test)]

@@ -3583,10 +3583,7 @@ fn update_available_lines(update: &AvailableUpdate, available_width: u16) -> Vec
         Line::from(Span::styled("Update available", warning.bold())),
         Line::from(vec![
             Span::from("Run ").dim(),
-            Span::styled(
-                update.update_command().to_string(),
-                palette::accent_text_style(),
-            ),
+            Span::styled("bcodex update", palette::accent_text_style()),
             Span::from(" in another terminal.").dim(),
         ]),
         Line::from(vec![
@@ -5991,7 +5988,7 @@ mod tests {
     }
 
     #[test]
-    fn update_available_card_renders_the_update_command() {
+    fn update_available_card_renders_the_stable_update_command() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
         view.add_update_available(AvailableUpdate::test_fixture());
@@ -6002,8 +5999,10 @@ mod tests {
         let rendered = render_buffer(terminal.backend().buffer());
 
         assert!(rendered.contains("Update available"), "{rendered}");
-        assert!(rendered.contains("bcodex update"), "{rendered}");
-        assert!(rendered.contains("in another terminal"), "{rendered}");
+        assert!(
+            rendered.contains("Run bcodex update in another terminal."),
+            "{rendered}"
+        );
         assert!(rendered.contains("version: 1.2.3 → 1.3.0"), "{rendered}");
     }
 
