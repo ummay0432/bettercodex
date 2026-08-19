@@ -1252,6 +1252,9 @@ fn stream_errors_classify_websocket_recovery_cases() {
     assert!(idle.is_stream_idle());
     assert!(idle.is_retryable());
     assert!(classify_stream_error("future_transient_error", "try again").is_retryable());
+    let context_window = classify_stream_error("context_length_exceeded", "too large");
+    assert!(context_window.is_context_window_exceeded());
+    assert!(!context_window.is_retryable());
     assert!(!classify_stream_error("insufficient_quota", "quota exhausted").is_retryable());
     assert!(!classify_stream_error("misalignment_policy_violation", "blocked").is_retryable());
     assert_eq!(

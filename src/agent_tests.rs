@@ -2369,6 +2369,193 @@ async fn repeated_mid_turn_compaction_preserves_active_skill_and_cold_resume() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sampling_context_window_error_forces_compaction_after_cold_resume() -> Result<()> {
+    let root = temporary_root("context-window-error-auto-compaction");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let cwd = root.join("repo");
+    std::fs::create_dir_all(&cwd)?;
+    std::fs::write(
+        cwd.join("AGENTS.md"),
+        "temporary repository context ".repeat(1_024),
+    )?;
+    let selection = ModelSelection::default();
+    let initial_answer = json!({
+        "type": "message",
+        "id": "msg_before_context_error",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "seeded"}],
+    });
+    let context_error = format!(
+        "data: {}\n\n",
+        json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_context_window_exceeded",
+                "model": selection.model.clone(),
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of this model.",
+                },
+            },
+        })
+    );
+    let (base_url, requests, server) = serve_responses(vec![
+        (
+            200,
+            completed_sse(
+                "resp_before_context_error",
+                &selection.model,
+                &initial_answer,
+            ),
+        ),
+        (200, context_error),
+    ]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+    agent.startup_prewarm = None;
+
+    assert_eq!(agent.submit("seed turn").await?, "seeded");
+    let error = agent
+        .submit("trigger context window")
+        .await
+        .expect_err("context-window rejection should fail the turn");
+    assert!(error.to_string().contains("exceeds the context window"));
+
+    let _seed_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    let failed_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    server
+        .join()
+        .map_err(|_| anyhow!("context-window test server panicked"))?;
+    assert!(
+        failed_request
+            .to_string()
+            .contains("trigger context window")
+    );
+    let effective_context_window = agent
+        .conversation
+        .model_selection()
+        .effective_context_window();
+    let compact_at_tokens = agent
+        .conversation
+        .model_selection()
+        .auto_compact_token_limit();
+    let snapshot = agent.context_snapshot();
+    assert_eq!(snapshot.used_tokens, effective_context_window);
+    assert!(snapshot.measured);
+    assert_eq!(snapshot.total_usage.total_tokens, 12);
+    assert!(agent.conversation.needs_compaction());
+    let session_id = agent.session_id().parse::<uuid::Uuid>()?;
+    drop(agent);
+    std::fs::remove_file(cwd.join("AGENTS.md"))?;
+
+    let mut loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd)?;
+    assert_eq!(loaded.total_usage.total_tokens, 12);
+
+    let compacted = json!({
+        "type": "compaction",
+        "id": "cmp_after_context_error",
+        "encrypted_content": "opaque-after-context-error",
+    });
+    let resumed_answer = json!({
+        "type": "message",
+        "id": "msg_after_context_error",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "recovered"}],
+    });
+    let resumed_selection = loaded.model_selection.clone();
+    let (resume_base_url, resume_requests, resume_server) = serve_responses(vec![
+        (
+            200,
+            completed_sse(
+                "resp_compact_after_context_error",
+                &resumed_selection.model,
+                &compacted,
+            ),
+        ),
+        (
+            200,
+            completed_sse(
+                "resp_after_context_error",
+                &resumed_selection.model,
+                &resumed_answer,
+            ),
+        ),
+    ]);
+    let identity = loaded.metadata.identity.clone();
+    let compaction_count = loaded.compaction_count;
+    let resumed_transcript = std::mem::take(&mut loaded.transcript);
+    let transcript_checkpoint = loaded.transcript_checkpoint;
+    let forked_from = loaded.forked_from.clone();
+    let conversation = Conversation::resume(&cwd, loaded)?;
+    assert_eq!(
+        conversation.active_context_tokens(),
+        effective_context_window,
+        "world-state refresh must not lower the backend full-window signal"
+    );
+    assert!(conversation.active_context_tokens() >= compact_at_tokens);
+    assert!(conversation.needs_compaction());
+    let mut api = ApiClient::new_with_base_url(
+        Auth::for_test("token-test"),
+        &identity,
+        compaction_count,
+        conversation.model_selection().clone(),
+        conversation.service_tier(),
+        resume_base_url,
+    )?;
+    api.fall_back_to_http();
+    let tools = ToolRuntime::new(cwd.clone());
+    let mut resumed = Agent {
+        cwd: cwd.clone(),
+        api,
+        startup_prewarm: None,
+        conversation,
+        tools,
+        resumed_transcript,
+        transcript_checkpoint,
+        forked_from,
+    };
+
+    assert_eq!(resumed.submit("after restart").await?, "recovered");
+    let compact_request = resume_requests.recv_timeout(Duration::from_secs(2))?.body;
+    let follow_up_request = resume_requests.recv_timeout(Duration::from_secs(2))?.body;
+    resume_server
+        .join()
+        .map_err(|_| anyhow!("resumed context-window test server panicked"))?;
+
+    let compact_input = compact_request["input"]
+        .as_array()
+        .ok_or_else(|| anyhow!("context-window compaction request omitted input"))?;
+    assert_eq!(
+        compact_input.last().and_then(|item| item["type"].as_str()),
+        Some("compaction_trigger")
+    );
+    let compact_request_text = compact_request.to_string();
+    assert!(compact_request_text.contains("trigger context window"));
+    assert!(!compact_request_text.contains("after restart"));
+
+    let follow_up_input = follow_up_request["input"]
+        .as_array()
+        .ok_or_else(|| anyhow!("post-compaction request omitted input"))?;
+    assert!(follow_up_request.to_string().contains("after restart"));
+    assert!(
+        follow_up_input
+            .iter()
+            .any(|item| item["id"] == "cmp_after_context_error"),
+        "post-compaction request omitted the opaque item"
+    );
+    assert_eq!(resumed.context_snapshot().total_usage.total_tokens, 36);
+    drop(resumed);
+
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &cwd)?;
+    assert_eq!(loaded.compaction_count, 1);
+    assert_eq!(loaded.total_usage.total_tokens, 36);
+    let conversation = Conversation::resume(&cwd, loaded)?;
+    assert!(!conversation.needs_compaction());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compaction_stream_output_is_not_emitted_as_model_activity() -> Result<()> {
     let root = temporary_root("compaction-output-events");
     let _cleanup = DirectoryCleanup(root.clone());

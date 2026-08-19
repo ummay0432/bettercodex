@@ -981,6 +981,13 @@ impl Agent {
                         self.conversation
                             .record_uninstalled_response(usage, rate_limits)?;
                     }
+                    if error.is_context_window_exceeded() {
+                        // Backend tokenization can outrun the local estimate. Match Codex by
+                        // forcing the next turn through pre-turn compaction instead of repeating
+                        // the same oversized request indefinitely.
+                        self.conversation.mark_context_window_full()?;
+                        self.emit_context(events);
+                    }
                     if !error.is_retryable() {
                         return Err(error.into());
                     }

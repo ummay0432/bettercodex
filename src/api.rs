@@ -84,6 +84,7 @@ pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApiErrorKind {
     Fatal,
+    ContextWindowExceeded,
     Retryable,
     StreamIdle,
     Unauthorized,
@@ -188,6 +189,10 @@ impl ApiError {
                 | ApiErrorKind::PreviousResponseNotFound
                 | ApiErrorKind::WebSocketUnavailable
         )
+    }
+
+    pub(crate) fn is_context_window_exceeded(&self) -> bool {
+        self.kind == ApiErrorKind::ContextWindowExceeded
     }
 
     pub(crate) fn is_stream_idle(&self) -> bool {
@@ -3061,8 +3066,8 @@ fn classify_stream_error(code: &str, message: &str) -> ApiError {
         "previous_response_not_found" => {
             ApiError::new(ApiErrorKind::PreviousResponseNotFound, message)
         }
-        "context_length_exceeded"
-        | "insufficient_quota"
+        "context_length_exceeded" => ApiError::new(ApiErrorKind::ContextWindowExceeded, message),
+        "insufficient_quota"
         | "usage_not_included"
         | "cyber_policy"
         | "misalignment_policy_violation"

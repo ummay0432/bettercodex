@@ -150,7 +150,7 @@ pub(crate) struct ContextSnapshot {
     pub(crate) used_tokens: u64,
     pub(crate) context_window: u64,
     pub(crate) compact_at_tokens: u64,
-    /// Whether `used_tokens` came from Responses usage rather than only local estimation.
+    /// Whether `used_tokens` came from a backend usage signal rather than only local estimation.
     pub(crate) measured: bool,
     pub(crate) sections: Vec<ContextSection>,
     pub(crate) total_usage: TokenUsage,
@@ -167,6 +167,8 @@ pub(crate) struct Conversation {
     rate_limits: BTreeMap<String, RateLimitSnapshot>,
     usage_history_estimate: Option<u64>,
     server_reasoning_included: bool,
+    // A backend context rejection is a durable active-context floor, not fabricated usage.
+    context_window_full: bool,
     model_selection: ModelSelection,
     service_tier: ServiceTier,
     rollout: Rollout,
@@ -373,6 +375,7 @@ impl Conversation {
             rate_limits: BTreeMap::new(),
             usage_history_estimate: None,
             server_reasoning_included: false,
+            context_window_full: false,
             model_selection,
             service_tier: ServiceTier::default(),
             rollout,
@@ -388,6 +391,7 @@ impl Conversation {
             total_usage,
             usage_history_estimate,
             server_reasoning_included,
+            context_window_full,
             model_selection,
             service_tier,
             unfinished_turn,
@@ -411,6 +415,7 @@ impl Conversation {
             rate_limits: BTreeMap::new(),
             usage_history_estimate,
             server_reasoning_included,
+            context_window_full,
             model_selection,
             service_tier,
             rollout,
@@ -471,6 +476,9 @@ impl Conversation {
         if let (Some(usage), Some(history_estimate)) = (&self.usage, self.usage_history_estimate) {
             rollout.record_usage(usage, history_estimate, self.server_reasoning_included)?;
         }
+        if self.context_window_full {
+            rollout.record_context_window_exceeded()?;
+        }
         if self.service_tier != ServiceTier::default() {
             rollout.record_service_tier(self.service_tier)?;
         }
@@ -484,6 +492,7 @@ impl Conversation {
             rate_limits: self.rate_limits.clone(),
             usage_history_estimate: self.usage_history_estimate,
             server_reasoning_included: self.server_reasoning_included,
+            context_window_full: self.context_window_full,
             model_selection: self.model_selection.clone(),
             service_tier: self.service_tier,
             rollout,
@@ -692,6 +701,7 @@ impl Conversation {
         self.usage = None;
         self.usage_history_estimate = None;
         self.server_reasoning_included = false;
+        self.context_window_full = false;
         Ok(())
     }
 
@@ -772,6 +782,12 @@ impl Conversation {
         Ok(())
     }
 
+    pub(crate) fn mark_context_window_full(&mut self) -> Result<()> {
+        self.rollout.record_context_window_exceeded()?;
+        self.context_window_full = true;
+        Ok(())
+    }
+
     pub(crate) fn record_usage(
         &mut self,
         usage: Option<TokenUsage>,
@@ -789,6 +805,7 @@ impl Conversation {
         self.usage = Some(usage);
         self.usage_history_estimate = Some(history_estimate);
         self.server_reasoning_included = server_reasoning_included;
+        self.context_window_full = false;
         Ok(())
     }
 
@@ -807,24 +824,36 @@ impl Conversation {
     }
 
     fn context_tokens_with_metrics(&self, metrics: &ContextMetrics) -> Option<u64> {
-        let usage = self.usage.as_ref()?;
-        let baseline = self.usage_history_estimate?;
         let history_estimate = metrics.estimated_tokens;
-        let active_context = if history_estimate >= baseline {
-            usage
-                .active_context_tokens()
-                .saturating_add(history_estimate - baseline)
-        } else {
-            usage
-                .active_context_tokens()
-                .saturating_sub(baseline - history_estimate)
+        let measured = match (&self.usage, self.usage_history_estimate) {
+            (Some(usage), Some(baseline)) => {
+                let active_context = if history_estimate >= baseline {
+                    usage
+                        .active_context_tokens()
+                        .saturating_add(history_estimate - baseline)
+                } else {
+                    usage
+                        .active_context_tokens()
+                        .saturating_sub(baseline - history_estimate)
+                };
+                let omitted_reasoning = if self.server_reasoning_included {
+                    0
+                } else {
+                    metrics.encrypted_reasoning_before_last_instruction
+                };
+                Some(active_context.saturating_add(omitted_reasoning))
+            }
+            _ => None,
         };
-        let omitted_reasoning = if self.server_reasoning_included {
-            0
+        if self.context_window_full {
+            Some(
+                measured
+                    .unwrap_or_default()
+                    .max(self.model_selection.effective_context_window()),
+            )
         } else {
-            metrics.encrypted_reasoning_before_last_instruction
-        };
-        Some(active_context.saturating_add(omitted_reasoning))
+            measured
+        }
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {

@@ -331,3 +331,43 @@ fn openai_docs_skill_is_explicit_and_uses_web_search() {
     assert_eq!(injection.items.len(), 1);
     assert!(text_of(&injection.items[0]).contains("`web_search`"));
 }
+
+#[test]
+fn manifest_skill_is_user_invoked_only() {
+    let root = TemporaryDirectory::new();
+    let home = root.join("home");
+    let cwd = root.join("repository");
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+
+    let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
+    let skill = catalog
+        .skills()
+        .iter()
+        .find(|skill| skill.name() == "manifest" && skill.scope == SkillScope::System)
+        .unwrap();
+    assert!(skill.is_enabled());
+    assert!(!skill.allows_implicit_invocation());
+    assert!(
+        !text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
+            .contains("- manifest:")
+    );
+    assert!(
+        catalog
+            .explicit_injections("write a documentation routing map", &[])
+            .items
+            .is_empty()
+    );
+
+    let injection = catalog.explicit_injections("use $manifest for the API docs", &[]);
+    assert!(injection.warnings.is_empty());
+    assert_eq!(injection.items.len(), 1);
+    assert!(text_of(&injection.items[0]).contains("<name>manifest</name>"));
+    assert!(
+        skill
+            .path()
+            .parent()
+            .unwrap()
+            .join("references/exemplar-shopify-graphql-manifest.md")
+            .is_file()
+    );
+}

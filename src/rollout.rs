@@ -486,6 +486,7 @@ pub(crate) struct LoadedRollout {
     pub(crate) total_usage: TokenUsage,
     pub(crate) usage_history_estimate: Option<u64>,
     pub(crate) server_reasoning_included: bool,
+    pub(crate) context_window_full: bool,
     pub(crate) compaction_count: u64,
     pub(crate) model_selection: ModelSelection,
     pub(crate) service_tier: ServiceTier,
@@ -624,6 +625,7 @@ enum RolloutRecordData<Items = Vec<Value>> {
     UsageTotal {
         usage: TokenUsage,
     },
+    ContextWindowExceeded,
     ServiceTierChanged {
         service_tier: ServiceTier,
     },
@@ -1271,6 +1273,10 @@ impl Rollout {
         })
     }
 
+    pub(crate) fn record_context_window_exceeded(&mut self) -> Result<()> {
+        self.write_record(&RolloutRecord::ContextWindowExceeded)
+    }
+
     pub(crate) fn record_service_tier(&mut self, service_tier: ServiceTier) -> Result<()> {
         self.write_record(&RolloutRecord::ServiceTierChanged { service_tier })
     }
@@ -1421,6 +1427,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut total_usage = TokenUsage::default();
     let mut usage_history_estimate = None;
     let mut server_reasoning_included = false;
+    let mut context_window_full = false;
     let mut compaction_count = 0_u64;
     let mut model_selection = None;
     let mut service_tier = ServiceTier::default();
@@ -1687,6 +1694,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                     usage = None;
                     usage_history_estimate = None;
                     server_reasoning_included = false;
+                    context_window_full = false;
                 }
             }
             RolloutRecord::ToolCallsRegistered { calls } => {
@@ -1752,12 +1760,17 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 usage = Some(new_usage);
                 usage_history_estimate = Some(history_estimate);
                 server_reasoning_included = reasoning_included;
+                context_window_full = false;
             }
             RolloutRecord::UsageTotal {
                 usage: response_usage,
             } => {
                 unfinished_turn_has_activity |= unfinished_turn.is_some();
                 total_usage.add_assign(&response_usage);
+            }
+            RolloutRecord::ContextWindowExceeded => {
+                unfinished_turn_has_activity |= unfinished_turn.is_some();
+                context_window_full = true;
             }
             RolloutRecord::ServiceTierChanged {
                 service_tier: updated_service_tier,
@@ -1913,6 +1926,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         total_usage,
         usage_history_estimate,
         server_reasoning_included,
+        context_window_full,
         compaction_count,
         model_selection,
         service_tier,
