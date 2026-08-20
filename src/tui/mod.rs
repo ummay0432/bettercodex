@@ -554,21 +554,24 @@ impl Runtime {
             .into_iter()
             .filter_map(|session_id| {
                 let slot = self.sessions.slot(&session_id)?;
-                let status = if slot.turn.is_active() || slot.view.is_busy() {
-                    AgentSwitcherStatus::Working(
-                        slot.turn_started_at
-                            .map(|started| started.elapsed())
-                            .unwrap_or_default(),
-                    )
-                } else if self
+                let lifecycle = self
                     .sessions
                     .linkage
                     .child(&session_id)
-                    .is_some_and(|child| child.lifecycle == ChildLifecycle::AwaitingReview)
-                {
-                    AgentSwitcherStatus::AwaitingReview
-                } else {
-                    AgentSwitcherStatus::Idle
+                    .map(|child| child.lifecycle);
+                let elapsed = || {
+                    slot.turn_started_at
+                        .map(|started| started.elapsed())
+                        .unwrap_or_default()
+                };
+                let status = match lifecycle {
+                    Some(ChildLifecycle::Cancelling) => AgentSwitcherStatus::Cancelling(elapsed()),
+                    Some(ChildLifecycle::Paused) => AgentSwitcherStatus::Paused,
+                    Some(ChildLifecycle::AwaitingReview) => AgentSwitcherStatus::AwaitingReview,
+                    _ if slot.turn.is_active() || slot.view.is_busy() => {
+                        AgentSwitcherStatus::Working(elapsed())
+                    }
+                    _ => AgentSwitcherStatus::Idle,
                 };
                 match slot.child_identity() {
                     Some((role, _, _)) => Some(AgentSwitcherRow::specialist(
@@ -1163,6 +1166,11 @@ impl Runtime {
     }
 
     fn finish_child_turn(&mut self, session_id: &SessionId) -> Result<()> {
+        let cancellation_requested = self
+            .sessions
+            .linkage
+            .child(session_id)
+            .is_some_and(|child| child.lifecycle == ChildLifecycle::Cancelling);
         let (mut agent, completion, role, stage_attempt) = {
             let slot = self
                 .sessions
@@ -1196,8 +1204,17 @@ impl Runtime {
                             role,
                             stage_attempt,
                             kind: SpecialistEventKind::Interrupted,
-                            status: ChildLifecycle::Active,
-                            message: "specialist turn was interrupted".to_string(),
+                            status: if cancellation_requested {
+                                ChildLifecycle::Paused
+                            } else {
+                                ChildLifecycle::Active
+                            },
+                            message: if cancellation_requested {
+                                "specialist turn was cancelled; the pipeline stage is paused"
+                                    .to_string()
+                            } else {
+                                "specialist turn was interrupted".to_string()
+                            },
                             final_result: None,
                         }
                     }
@@ -1206,8 +1223,18 @@ impl Runtime {
                         role,
                         stage_attempt,
                         kind: SpecialistEventKind::Failed,
-                        status: ChildLifecycle::Active,
-                        message: format!("specialist turn failed: {error:#}"),
+                        status: if cancellation_requested {
+                            ChildLifecycle::Paused
+                        } else {
+                            ChildLifecycle::Active
+                        },
+                        message: if cancellation_requested {
+                            format!(
+                                "specialist turn failed while cancellation was pending: {error:#}"
+                            )
+                        } else {
+                            format!("specialist turn failed: {error:#}")
+                        },
                         final_result: None,
                     },
                 };
@@ -1235,8 +1262,17 @@ impl Runtime {
                         role,
                         stage_attempt,
                         kind: SpecialistEventKind::Interrupted,
-                        status: ChildLifecycle::Active,
-                        message: "specialist compaction was interrupted".to_string(),
+                        status: if cancellation_requested {
+                            ChildLifecycle::Paused
+                        } else {
+                            ChildLifecycle::Active
+                        },
+                        message: if cancellation_requested {
+                            "specialist compaction was cancelled; the pipeline stage is paused"
+                                .to_string()
+                        } else {
+                            "specialist compaction was interrupted".to_string()
+                        },
                         final_result: None,
                     },
                     Err(error) => SpecialistEvent {
@@ -1244,8 +1280,18 @@ impl Runtime {
                         role,
                         stage_attempt,
                         kind: SpecialistEventKind::Failed,
-                        status: ChildLifecycle::Active,
-                        message: format!("specialist compaction failed: {error:#}"),
+                        status: if cancellation_requested {
+                            ChildLifecycle::Paused
+                        } else {
+                            ChildLifecycle::Active
+                        },
+                        message: if cancellation_requested {
+                            format!(
+                                "specialist compaction failed while cancellation was pending: {error:#}"
+                            )
+                        } else {
+                            format!("specialist compaction failed: {error:#}")
+                        },
                         final_result: None,
                     },
                 };
@@ -1254,7 +1300,7 @@ impl Runtime {
                     .unwrap_or_else(|| unreachable!("live specialist slot"))
                     .view
                     .finish_compaction(result);
-                (ChildLifecycle::Active, event)
+                (event.status, event)
             }
         };
         let context_snapshot = agent.context_snapshot();
@@ -1433,6 +1479,18 @@ impl Runtime {
                 Ok(coordinate_response(
                     action,
                     "follow-up sent to the existing specialist session",
+                    status,
+                    Some(session_id.to_string()),
+                    None,
+                    None,
+                ))
+            }
+            CoordinateSpecialistArgs::Cancel { session_id } => {
+                let session_id = SessionId::parse(session_id)?;
+                let status = self.sessions.cancel_deepwork_child(&session_id)?;
+                Ok(coordinate_response(
+                    action,
+                    "specialist cancellation requested; the current pipeline stage remains paused",
                     status,
                     Some(session_id.to_string()),
                     None,
@@ -2569,6 +2627,14 @@ impl Runtime {
     fn cancel_all_turns(&mut self, intent: InterruptIntent) {
         let session_ids = self.sessions.live_session_ids();
         for session_id in session_ids {
+            if let Some(slot) = self.sessions.slot(&session_id)
+                && slot.is_child()
+            {
+                if matches!(slot.turn, TurnTaskState::Running(_)) {
+                    self.cancel_child_turn(&session_id);
+                }
+                continue;
+            }
             let Some(slot) = self.sessions.slot_mut(&session_id) else {
                 continue;
             };
@@ -2584,6 +2650,15 @@ impl Runtime {
     }
 
     fn cancel_turn(&mut self, intent: InterruptIntent) {
+        let session_id = self.sessions.active_id().clone();
+        if self
+            .sessions
+            .slot(&session_id)
+            .is_some_and(AgentSlot::is_child)
+        {
+            self.cancel_child_turn(&session_id);
+            return;
+        }
         if let Some(turn) = &self.turn_handle {
             match intent {
                 InterruptIntent::StopTurn => turn.cancel(),
@@ -2591,6 +2666,26 @@ impl Runtime {
                 InterruptIntent::SubmitSteering => turn.interrupt_for_steering(),
             }
             self.view.set_interrupting(intent);
+        }
+    }
+
+    fn cancel_child_turn(&mut self, session_id: &SessionId) {
+        if let Err(error) = self.sessions.cancel_deepwork_child(session_id) {
+            let Some(slot) = self.sessions.slot_mut(session_id) else {
+                return;
+            };
+            if matches!(slot.turn, TurnTaskState::Running(_))
+                && let Some(turn) = &slot.turn_handle
+            {
+                turn.cancel();
+                slot.view.set_interrupting(InterruptIntent::StopTurn);
+                slot.view.add_notice(format!(
+                    "The specialist was interrupted, but its paused lifecycle could not be saved: {error:#}"
+                ));
+            } else {
+                slot.view
+                    .add_notice(format!("Could not cancel the specialist: {error:#}"));
+            }
         }
     }
 

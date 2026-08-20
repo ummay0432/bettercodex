@@ -20,7 +20,7 @@ Build the runtime foundation without changing the visible TUI or exposing new mo
 - move the current Main `Agent`, turn task, steering and cancellation handles, event receiver, transcript/view state, draft, status, and elapsed time into the Main slot;
 - support independent child `Agent` construction with a fixed model and reasoning effort, the same working directory, and no parent conversation fork;
 - route events by slot at channel ingress instead of adding session IDs to every `AgentEvent`;
-- implement internal start, send, wait, retire, revive, and replace lifecycle operations;
+- implement internal start, send, wait, cancel, retire, revive, and replace lifecycle operations;
 - persist enough group and child linkage for cold resume; and
 - preserve every existing single-session behavior and saved-session path.
 
@@ -34,7 +34,7 @@ Connect the Shard 1 session model to the terminal UI without exposing the pipeli
 
 - render the agent switcher between the activity row and composer;
 - keep the composer and status line bottom-anchored;
-- implement measured row columns, fixed pipeline order, colors, glow, dim states, overflow, and live status updates;
+- implement measured role-first row columns, fixed pipeline order, uniform gunmetal styling, overflow, and live status updates;
 - implement `Ctrl+Shift+Up` and `Ctrl+Shift+Down` selection, wrapping, `Enter` session entry, and `Esc` cancellation;
 - switch among real per-session transcripts and preserve each session's draft;
 - show Main as the first destination inside a child session;
@@ -43,7 +43,7 @@ Connect the Shard 1 session model to the terminal UI without exposing the pipeli
 
 Do not add fake user-facing specialist rows, model-visible question or coordination tools, pipeline policy, or prompt integration. The new surfaces remain dormant until Shard 3 supplies real sessions and question requests.
 
-Validation uses rendered output and terminal key behavior, including narrow terminals, row alignment, session switching, draft preservation, selection versus working color, default-selected checkbox toggling, and question-card interaction.
+Validation uses rendered output and terminal key behavior, including the blank activity-to-switcher row, narrow terminals, row alignment, static gunmetal styling, neutral selection state, session switching, draft preservation, default-selected checkbox toggling, and question-card interaction.
 
 ### Shard 3 — `$deepwork` orchestration and integration
 
@@ -57,7 +57,7 @@ Wire the completed runtime and TUI foundation into the real one-shot pipeline:
 - construct each role with its fixed model and reasoning effort;
 - create or recover the root `.deepwork/` container and the run's numbered workspace without treating that runtime action as Main implementation work;
 - implement the request-directed repository preflight, guided interview gate, canonical pipeline state, strict sequential stage state machine, readiness gate, and stage handoffs;
-- implement event-driven wakeups, progress updates, follow-up direction, acceptance, retirement, revival, replacement, and cleanup;
+- implement event-driven wakeups, progress updates, follow-up direction, targeted cancellation, acceptance, retirement, revival, replacement, and cleanup;
 - connect question requests to the Shard 2 TUI and specialist lifecycle operations to the Shard 1 coordinator;
 - restore active and retired pipeline state on resume; and
 - bound every new model-visible event and tool result.
@@ -317,7 +317,7 @@ These are real sessions. While active, the user can navigate into them through t
 
 ## Orchestrator communication
 
-Main coordinates specialists through the event-driven start, send, wait, and retire responsibilities defined below.
+Main coordinates specialists through the event-driven start, send, wait, cancel, and retire responsibilities defined below.
 
 A completed child turn does not immediately kill the specialist. The child remains available and visible while Main reviews its work.
 
@@ -333,9 +333,13 @@ Progress and lifecycle events drive the coordinator and TUI, but raw activity is
 ```text
 Absent
   → Working
-  → Awaiting orchestrator review
-      → Working                    when Main sends follow-up feedback
-      → Retired                    when Main accepts the stage
+      → Cancelling                 when Main or the user interrupts the turn
+          → Paused                 when interruption settles
+              → Working            when Main sends a continuation
+              → Replaced           when the stage needs a fresh redo
+      → Awaiting orchestrator review
+          → Working                when Main sends follow-up feedback
+          → Retired                when Main accepts the stage
   → Revived or Replaced            when later user feedback reopens the stage
 ```
 
@@ -369,7 +373,7 @@ Progress supervision is event-driven:
 - repeated low-value activity updates are coalesced into the latest state; and
 - elapsed time and live activity are presentation state, not model messages.
 
-The TUI can remain visually current even while Main is waiting. Rendering `Working`, elapsed time, the latest activity, a glow, or a changed status does not require another Main inference turn.
+The TUI can remain visually current even while Main is waiting. Rendering `Working`, elapsed time, the latest activity, or a changed status does not require another Main inference turn.
 
 ## Event-driven supervision
 
@@ -392,10 +396,30 @@ The required coordination operations are conceptually:
 start_specialist(specialist, task)
 send_specialist(session, message)
 wait_specialist(session)
+cancel_specialist(session)
 retire_specialist(session)
 ```
 
-These are responsibilities, not yet a commitment to four separate function tools. The eventual interface should remain as narrow as possible.
+These are responsibilities, not yet a commitment to separate function tools. The eventual interface should remain as narrow as possible.
+
+### Specialist cancellation
+
+Cancelling Main's blocking `wait` cancels only that wait call. It never implies authority to stop the child. Specialist cancellation is a separate, session-targeted coordinator operation so ownership cannot be confused across independent turns.
+
+Cancellation has these semantics:
+
+- Main calls `cancel_specialist(session)` for a live specialist whose turn is still running.
+- The coordinator persists `Cancelling` before signalling that slot's existing turn cancellation handle.
+- Repeating cancellation while the slot is `Cancelling` or `Paused` is harmless.
+- The TUI shows `Cancelling` while the turn unwinds, then `Paused`; the row remains visible because the session remains live.
+- A user cancels the same underlying turn by entering the specialist session and pressing `Esc`. This does not require or cancel a Main inference turn.
+- The specialist's interrupted completion wakes any current or later Main wait with one bounded `interrupted` event and persisted `Paused` status.
+- Cancellation pauses only the current stage. It does not accept the stage, advance the pipeline, retire the specialist, or abort the whole deepwork run.
+- Main may continue the paused session with `send_specialist`, or replace it when the interrupted context or partial work would bias a redo. A paused session cannot be accepted and retired until a later turn completes and reaches `Awaiting orchestrator review`.
+- If terminal completion wins a race with cancellation, the completed result remains `Awaiting orchestrator review`; cancellation does not discard an already completed turn.
+- Cold resume converts a persisted `Cancelling` slot to `Paused` and emits the interruption event once the session group is recovered.
+
+Cancellation is not rollback. Ordinary turn and tool cancellation must terminate owned processes and clean task-owned temporary staging through the existing interruption paths. Already committed repository mutations and retained `.deepwork/<run-index>/` artifacts remain in place because their effects may be partial or valid. Main must inspect the workspace before continuing the same session or replacing it, and later specialists must not assume an interrupted operation had no effect.
 
 A specialist event delivered to Main contains only what coordination needs:
 
@@ -548,7 +572,7 @@ Each specialist remains an ordinary saved rollout. Persist enough pipeline linka
 - the root `.deepwork/` container, assigned numeric run index, numbered run workspace, and retained artifact paths;
 - the stable specialist role and stage attempt;
 - the child session ID;
-- whether the child is active, awaiting review, retired, revived, or replaced;
+- whether the child is active, working, cancelling, paused, awaiting review, retired, revived, or replaced;
 - the accepted stage handoff; and
 - the embedded prompt revision if compatibility requires it.
 
@@ -564,7 +588,7 @@ The lower TUI cluster is the **bottom pane**. Its existing pieces are:
 - the **composer** — the chatbox where the user types; and
 - the **status line** — the model, repository, branch, and context row below the composer.
 
-The new area between the activity row and composer is the **agent switcher** in this spec.
+The new area between the activity row and composer is the **agent switcher** in this spec. When both are visible and terminal height permits, one completely empty terminal row separates the activity row from the first switcher row.
 
 ## Image 1
 
@@ -583,22 +607,22 @@ The red-marked strip is where the agent switcher appears.
 - Other live specialists follow in fixed pipeline order: `$evals`, `$manifest`, `$worker`, `$reviewer`.
 - The current session is omitted because rows are destinations.
 
-The composer and status line remain anchored at the bottom. The switcher expands upward, moving the activity row higher. Overflow scrolls around the current selection while protecting the minimum composer height.
+The composer and status line remain anchored at the bottom. The switcher expands upward, moving the activity row higher. A dedicated blank row separates the activity row from the switcher; in an extremely short terminal, spacing rows yield before switcher navigation or the minimum composer height. Overflow scrolls around the current selection.
 
 ## Switcher rows
 
 Use one compact row per destination:
 
 ```text
-› Sol XHigh  • Working (1m 12s)  · $evals
-  Luna Max     Awaiting review   · $manifest
-  Sol XHigh    Idle              · $worker
-  Sol Max      Idle              · $reviewer
+› $evals    | sol xhigh · Working (1m 12s)
+  $manifest | luna max  · Awaiting review
+  $worker   | sol xhigh · Idle
+  $reviewer | sol max   · Idle
 ```
 
-The role separator and dollar-sign label begin on the same horizontal axis in every row. This is a measured column layout, not a collection of independently padded strings. Status text may vary, but the role column must not drift and make the switcher look sloppy.
+The role comes first, followed by ` | `, the lowercase model and effort profile, ` · `, and the written status. Role and model fields are measured columns, not independently padded strings, so the vertical separator and status dot remain aligned across rows.
 
-The model profile and role label together identify a specialist. Live state is secondary. Each session retains its own unsent composer draft when the user switches away.
+The model profile and role label together identify a specialist. Live state is secondary. Main uses the same role-first shape as a destination but keeps its `Main` label rather than inventing a `$main` role. Each session retains its own unsent composer draft when the user switches away.
 
 ## Switcher interaction
 
@@ -614,17 +638,13 @@ Entering or cancelling selection must not alter the current composer draft.
 
 ## Color direction
 
-Subagent rows use a monotone, dark color palette rather than bright or competing colors.
+Every agent-switcher row uses the same static gunmetal-gray foreground. Model family, effort, and lifecycle state are communicated textually rather than through separate hues, brightness levels, glow, or shimmer.
 
-- Luna Max uses a dark indigo or muted violet identity hue.
-- Sol Max uses a dark bronze or muted amber identity hue.
-- Sol XHigh and Sol Max share the subdued Sol color family; effort is communicated textually rather than by a different hue.
-- A working specialist uses a brighter, glowish version of its identity hue.
-- An idle or review-waiting specialist uses a dim, desaturated version of the same hue.
-- Selection uses the leading `›` and a neutral dark background instead of borrowing the working brightness.
+- Working, idle, and review-waiting destinations use the same gunmetal foreground.
+- Selection uses the leading `›` and a neutral dark background; it does not recolor or animate the destination.
 - Written status labels remain present so color is never the only status signal.
-
-Hue identifies the model profile, brightness and shimmer communicate activity, and the marker and background communicate selection. The glow should feel like live activity, not a solid bright row. It can reuse the restrained shimmer language of the existing `Working` activity row.
+- Subagent rows never shimmer.
+- The existing restrained shimmer remains only on the activity row's leading `•` and `Working` label.
 
 ## Open decisions
 

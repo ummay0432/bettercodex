@@ -107,6 +107,7 @@ const OPERATOR_OUTPUT_MAX_ROWS: usize = 50;
 const COMMAND_CONTINUATION_MAX_ROWS: usize = 2;
 const LIVE_TOOL_OUTPUT_MAX_BYTES: usize = 128 * 1024;
 const PENDING_INPUT_GAP: u16 = 1;
+const ACTIVITY_SWITCHER_GAP: u16 = 1;
 const ACTIVITY_COMPOSER_GAP: u16 = 1;
 const COMPOSER_FOOTER_GAP: u16 = 0;
 const STATUS_LINE_HEIGHT: u16 = 1;
@@ -964,14 +965,6 @@ impl View {
         self.context_tokens = Some(snapshot.used_tokens);
         self.ask_user_question_enabled = snapshot.ask_user_question_enabled;
         self.specialist_coordination_enabled = snapshot.specialist_coordination_enabled;
-    }
-
-    pub(super) fn set_ask_user_question_enabled(&mut self, enabled: bool) {
-        self.ask_user_question_enabled = enabled;
-    }
-
-    pub(super) fn set_specialist_coordination_enabled(&mut self, enabled: bool) {
-        self.specialist_coordination_enabled = enabled;
     }
 
     pub(super) fn set_model_selection(&mut self, selection: ModelSelection) {
@@ -2563,7 +2556,12 @@ impl View {
         };
         let activity_height = self.activity_height();
         let switcher_height = self.agent_switcher.preferred_height();
-        let activity_gap = if activity_height > 0 || switcher_height > 0 {
+        let activity_switcher_gap = if activity_height > 0 && switcher_height > 0 {
+            ACTIVITY_SWITCHER_GAP
+        } else {
+            0
+        };
+        let activity_composer_gap = if activity_height > 0 || switcher_height > 0 {
             ACTIVITY_COMPOSER_GAP
         } else {
             0
@@ -2591,8 +2589,9 @@ impl View {
             .saturating_add(pending_height)
             .saturating_add(pending_gap)
             .saturating_add(activity_height)
+            .saturating_add(activity_switcher_gap)
             .saturating_add(switcher_height)
-            .saturating_add(activity_gap)
+            .saturating_add(activity_composer_gap)
             .saturating_add(composer_height)
             .saturating_add(trailing_height);
         (transcript_chrome_height, overlay_height)
@@ -2627,7 +2626,13 @@ impl View {
         let height_above_trailing = area.height.saturating_sub(trailing_height);
         let requested_activity_height = self.activity_height();
         let requested_switcher_height = self.agent_switcher.preferred_height();
-        let requested_activity_gap =
+        let requested_activity_switcher_gap =
+            if requested_activity_height > 0 && requested_switcher_height > 0 {
+                ACTIVITY_SWITCHER_GAP
+            } else {
+                0
+            };
+        let requested_activity_composer_gap =
             if requested_activity_height > 0 || requested_switcher_height > 0 {
                 ACTIVITY_COMPOSER_GAP
             } else {
@@ -2635,14 +2640,24 @@ impl View {
             };
         let available_cluster_height =
             height_above_trailing.saturating_sub(minimum_composer_height);
-        let activity_gap_height = requested_activity_gap.min(available_cluster_height);
-        let available_rows = available_cluster_height.saturating_sub(activity_gap_height);
-        let activity_height = requested_activity_height.min(available_rows);
-        let switcher_height =
-            requested_switcher_height.min(available_rows.saturating_sub(activity_height));
+        let requested_content_height =
+            requested_activity_height.saturating_add(requested_switcher_height);
+        let available_gap_rows = available_cluster_height.saturating_sub(requested_content_height);
+        let activity_switcher_gap_height = requested_activity_switcher_gap.min(available_gap_rows);
+        let activity_composer_gap_height = requested_activity_composer_gap
+            .min(available_gap_rows.saturating_sub(activity_switcher_gap_height));
+        let available_rows = available_cluster_height
+            .saturating_sub(activity_switcher_gap_height)
+            .saturating_sub(activity_composer_gap_height);
+        // Session navigation is the only route back to a live child or Main, so preserve its rows
+        // before the informational activity line when the terminal is extremely short.
+        let switcher_height = requested_switcher_height.min(available_rows);
+        let activity_height =
+            requested_activity_height.min(available_rows.saturating_sub(switcher_height));
         let activity_block_height = activity_height
+            .saturating_add(activity_switcher_gap_height)
             .saturating_add(switcher_height)
-            .saturating_add(activity_gap_height);
+            .saturating_add(activity_composer_gap_height);
         let pending_lines = self.pending_input.lines(area.width);
         let requested_pending_height = u16::try_from(pending_lines.len()).unwrap_or(u16::MAX);
         let requested_pending_gap = if requested_pending_height > 0 {
@@ -2681,9 +2696,10 @@ impl View {
         } else {
             Rect::default()
         };
-        let switcher_bottom = composer_y.saturating_sub(activity_gap_height);
+        let switcher_bottom = composer_y.saturating_sub(activity_composer_gap_height);
         let switcher_top = switcher_bottom.saturating_sub(switcher_height);
-        let activity_top = switcher_top.saturating_sub(activity_height);
+        let activity_bottom = switcher_top.saturating_sub(activity_switcher_gap_height);
+        let activity_top = activity_bottom.saturating_sub(activity_height);
         let activity_area = Rect::new(area.x, activity_top, area.width, activity_height);
         let switcher_area = Rect::new(area.x, switcher_top, area.width, switcher_height);
         let pending_block_bottom = if activity_block_height > 0 {
@@ -4389,21 +4405,17 @@ impl WebSearchEntry {
 }
 
 fn web_search_lines(search: &WebSearchEntry, width: u16) -> Vec<Line<'static>> {
-    let (bullet, header, detail_prefix) = match search.state {
-        WebSearchState::Active => (
-            activity_marker(Some(search.started_at)),
-            "Searching the web",
-            " ",
-        ),
-        WebSearchState::Completed => ("•".dim(), "Searched the web", " for "),
-        WebSearchState::Failed => ("•".red().bold(), "Web search failed", " for "),
-        WebSearchState::Interrupted => ("•".dim(), "Web search interrupted", " for "),
+    let bullet = match search.state {
+        WebSearchState::Active => activity_marker(Some(search.started_at)),
+        WebSearchState::Completed => "•".dim(),
+        WebSearchState::Failed => "•".red().bold(),
+        WebSearchState::Interrupted => "•".dim(),
     };
-    let detail = markdown::sanitize_inline(&search.search.detail());
+    let (header, tail) = web_search_label(search);
     let mut content = vec![Span::from(header).bold()];
-    if !detail.is_empty() {
-        content.push(detail_prefix.into());
-        content.push(Span::from(detail));
+    let tail = markdown::sanitize_inline(&tail);
+    if !tail.is_empty() {
+        content.push(Span::from(tail));
     }
     let mut lines = wrap_styled_line(&Line::from(content), width.saturating_sub(2).max(1));
     for (index, line) in lines.iter_mut().enumerate() {
@@ -4416,6 +4428,96 @@ fn web_search_lines(search: &WebSearchEntry, width: u16) -> Vec<Line<'static>> {
         *line = Line::from(spans);
     }
     lines
+}
+
+fn web_search_label(search: &WebSearchEntry) -> (&'static str, String) {
+    use crate::web_search::WebSearchAction;
+
+    match search.search.action.as_ref() {
+        Some(WebSearchAction::Search { query, queries }) => {
+            let header = match search.state {
+                WebSearchState::Active => "Searching the web",
+                WebSearchState::Completed => "Searched the web",
+                WebSearchState::Failed => "Web search failed",
+                WebSearchState::Interrupted => "Web search interrupted",
+            };
+            let detail = web_search_query_detail(query.as_deref(), queries.as_deref());
+            let tail = if detail.is_empty() {
+                if search.state == WebSearchState::Completed {
+                    " (search terms unavailable)".to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                format!(" for {detail}")
+            };
+            (header, tail)
+        }
+        Some(WebSearchAction::OpenPage { url }) => {
+            let header = match search.state {
+                WebSearchState::Active => "Opening",
+                WebSearchState::Completed => "Opened",
+                WebSearchState::Failed => "Failed to open",
+                WebSearchState::Interrupted => "Opening interrupted:",
+            };
+            let target = url
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .unwrap_or("a search result");
+            (header, format!(" {target}"))
+        }
+        Some(WebSearchAction::FindInPage { url, pattern }) => {
+            let header = match search.state {
+                WebSearchState::Active => "Searching a web page",
+                WebSearchState::Completed => "Searched a web page",
+                WebSearchState::Failed => "Failed to search a web page",
+                WebSearchState::Interrupted => "Web-page search interrupted",
+            };
+            let url = url.as_deref().filter(|url| !url.trim().is_empty());
+            let pattern = pattern
+                .as_deref()
+                .filter(|pattern| !pattern.trim().is_empty());
+            let tail = match (pattern, url) {
+                (Some(pattern), Some(url)) => format!(" for '{pattern}' at {url}"),
+                (Some(pattern), None) => format!(" for '{pattern}'"),
+                (None, Some(url)) => format!(" at {url}"),
+                (None, None) if search.state == WebSearchState::Completed => {
+                    " (page details unavailable)".to_string()
+                }
+                (None, None) => String::new(),
+            };
+            (header, tail)
+        }
+        Some(WebSearchAction::Other) | None => {
+            let header = match search.state {
+                WebSearchState::Active => "Searching the web",
+                WebSearchState::Completed => "Web search completed",
+                WebSearchState::Failed => "Web search failed",
+                WebSearchState::Interrupted => "Web search interrupted",
+            };
+            let tail = if search.state == WebSearchState::Completed {
+                " (details unavailable)".to_string()
+            } else {
+                String::new()
+            };
+            (header, tail)
+        }
+    }
+}
+
+fn web_search_query_detail(query: Option<&str>, queries: Option<&[String]>) -> String {
+    if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
+        return query.to_string();
+    }
+    let first = queries
+        .and_then(|queries| queries.iter().find(|query| !query.trim().is_empty()))
+        .cloned()
+        .unwrap_or_default();
+    if queries.is_some_and(|queries| queries.len() > 1) && !first.is_empty() {
+        format!("{first} ...")
+    } else {
+        first
+    }
 }
 
 fn ask_user_question_tool_lines(
@@ -5052,6 +5154,85 @@ pub(super) fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> 
 mod tests {
     use super::*;
     use crate::context::ContextSnapshot;
+    use crate::web_search::WebSearchCall;
+    use serde_json::json;
+
+    fn plain_line(line: &Line<'_>) -> String {
+        line.spans.iter().fold(String::new(), |mut text, span| {
+            text.push_str(span.content.as_ref());
+            text
+        })
+    }
+
+    fn rendered_web_search(item: Value) -> Vec<String> {
+        let Some(search) = WebSearchCall::from_response_item(&item) else {
+            panic!("test item should be a web search call");
+        };
+        web_search_lines(&WebSearchEntry::finished(search), 120)
+            .iter()
+            .map(plain_line)
+            .collect()
+    }
+
+    #[test]
+    fn web_search_open_without_url_names_the_action() {
+        assert_eq!(
+            rendered_web_search(json!({
+                "type": "web_search_call",
+                "id": "ws_open",
+                "status": "completed",
+                "action": {"type": "open_page"},
+            })),
+            ["• Opened a search result"]
+        );
+    }
+
+    #[test]
+    fn completed_web_searches_use_action_specific_labels() {
+        assert_eq!(
+            rendered_web_search(json!({
+                "type": "web_search_call",
+                "id": "ws_url",
+                "status": "completed",
+                "action": {
+                    "type": "open_page",
+                    "url": "https://example.com/docs",
+                },
+            })),
+            ["• Opened https://example.com/docs"]
+        );
+        assert_eq!(
+            rendered_web_search(json!({
+                "type": "web_search_call",
+                "id": "ws_find",
+                "status": "completed",
+                "action": {
+                    "type": "find_in_page",
+                    "url": "https://example.com/docs",
+                    "pattern": "installation",
+                },
+            })),
+            ["• Searched a web page for 'installation' at https://example.com/docs"]
+        );
+        assert_eq!(
+            rendered_web_search(json!({
+                "type": "web_search_call",
+                "id": "ws_search",
+                "status": "completed",
+                "action": {"type": "search"},
+            })),
+            ["• Searched the web (search terms unavailable)"]
+        );
+        assert_eq!(
+            rendered_web_search(json!({
+                "type": "web_search_call",
+                "id": "ws_unknown",
+                "status": "completed",
+                "action": {"type": "future_action"},
+            })),
+            ["• Web search completed (details unavailable)"]
+        );
+    }
 
     #[test]
     fn unmeasured_context_snapshot_is_available_to_the_footer() {

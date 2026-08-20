@@ -74,6 +74,8 @@ impl fmt::Display for SessionId {
 pub(crate) enum ChildLifecycle {
     Active,
     Working,
+    Cancelling,
+    Paused,
     AwaitingReview,
     Retired,
     Revived,
@@ -84,7 +86,12 @@ impl ChildLifecycle {
     pub(crate) const fn is_live(self) -> bool {
         matches!(
             self,
-            Self::Active | Self::Working | Self::AwaitingReview | Self::Revived
+            Self::Active
+                | Self::Working
+                | Self::Cancelling
+                | Self::Paused
+                | Self::AwaitingReview
+                | Self::Revived
         )
     }
 }

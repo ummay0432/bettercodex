@@ -46,6 +46,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use super::view::InterruptIntent;
 use super::view::View;
 
 pub(super) type RoutedAgentEvent = (SessionId, AgentEvent);
@@ -566,6 +567,13 @@ impl SessionGroup {
         let (role, stage_attempt, _) = slot
             .child_identity()
             .unwrap_or_else(|| unreachable!("child slot identity"));
+        if self.linkage.child(session_id).map(|child| child.lifecycle)
+            != Some(ChildLifecycle::AwaitingReview)
+        {
+            return Err(anyhow!(
+                "specialist session {session_id} can only be accepted after a completed turn is awaiting review"
+            ));
+        }
         if let Some(agent) = slot.agent.as_mut() {
             super::persist_session_transcript(&slot.view, agent)?;
         }
@@ -758,6 +766,71 @@ impl SessionGroup {
                 let _ = response.send(Err(anyhow!("specialist session {session_id} is not live")));
             }
         }
+    }
+
+    pub(super) fn cancel_deepwork_child(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<DeepworkStatus> {
+        self.linkage
+            .deepwork
+            .as_ref()
+            .context("no `$deepwork` run is active for this Main session")?;
+        let lifecycle = self
+            .linkage
+            .child(session_id)
+            .map(|child| child.lifecycle)
+            .context("specialist session is not linked to this group")?;
+        let slot = self
+            .slots
+            .get(session_id)
+            .context("specialist runtime is not live")?;
+        if !slot.is_child() {
+            return Err(anyhow!("Main cannot be cancelled as a specialist"));
+        }
+        if lifecycle == ChildLifecycle::Paused {
+            return self.deepwork_status();
+        }
+        if lifecycle == ChildLifecycle::Cancelling {
+            if matches!(slot.turn, TurnTaskState::Running(_)) {
+                let slot = self
+                    .slots
+                    .get_mut(session_id)
+                    .unwrap_or_else(|| unreachable!("live specialist slot"));
+                if let Some(turn) = &slot.turn_handle {
+                    turn.cancel();
+                    slot.view.set_interrupting(InterruptIntent::StopTurn);
+                }
+            }
+            return self.deepwork_status();
+        }
+        if !matches!(slot.turn, TurnTaskState::Running(_)) {
+            return Err(anyhow!(
+                "specialist session {session_id} is not currently working"
+            ));
+        }
+        if slot.turn_handle.is_none() {
+            return Err(anyhow!(
+                "working specialist session {session_id} has no cancellation handle"
+            ));
+        }
+        let mut proposed = self.linkage.clone();
+        proposed
+            .child_mut(session_id)
+            .unwrap_or_else(|| unreachable!("validated child linkage"))
+            .lifecycle = ChildLifecycle::Cancelling;
+        self.store.save(&proposed)?;
+        self.linkage = proposed;
+        let slot = self
+            .slots
+            .get_mut(session_id)
+            .unwrap_or_else(|| unreachable!("live specialist slot"));
+        slot.turn_handle
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("validated specialist cancellation handle"))
+            .cancel();
+        slot.view.set_interrupting(InterruptIntent::StopTurn);
+        self.deepwork_status()
     }
 
     pub(super) fn revive_child(
@@ -1039,10 +1112,22 @@ impl SessionGroup {
             }
             match build_slot(agent, &link) {
                 Ok(mut slot) => {
-                    if matches!(
-                        link.lifecycle,
-                        ChildLifecycle::Working | ChildLifecycle::Revived
-                    ) {
+                    let interrupted = match link.lifecycle {
+                        ChildLifecycle::Cancelling => Some((
+                            ChildLifecycle::Paused,
+                            "specialist cancellation completed before cold resume",
+                        )),
+                        ChildLifecycle::Working | ChildLifecycle::Revived => Some((
+                            ChildLifecycle::AwaitingReview,
+                            "specialist turn was interrupted before cold resume",
+                        )),
+                        ChildLifecycle::Active
+                        | ChildLifecycle::Paused
+                        | ChildLifecycle::AwaitingReview
+                        | ChildLifecycle::Retired
+                        | ChildLifecycle::Replaced => None,
+                    };
+                    if let Some((status, message)) = interrupted {
                         let role = SpecialistRole::parse(&link.role)
                             .unwrap_or_else(|_| unreachable!("validated specialist role"));
                         slot.deliver_meaningful_event(SpecialistEvent {
@@ -1050,13 +1135,12 @@ impl SessionGroup {
                             role,
                             stage_attempt: link.stage_attempt,
                             kind: SpecialistEventKind::Interrupted,
-                            status: ChildLifecycle::AwaitingReview,
-                            message: "specialist turn was interrupted before cold resume"
-                                .to_string(),
+                            status,
+                            message: message.to_string(),
                             final_result: None,
                         });
                         if let Some(persisted) = self.linkage.child_mut(&link.session_id) {
-                            persisted.lifecycle = ChildLifecycle::AwaitingReview;
+                            persisted.lifecycle = status;
                             changed = true;
                         }
                     }

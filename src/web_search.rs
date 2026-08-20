@@ -35,13 +35,6 @@ impl WebSearchCall {
             .and_then(|action| serde_json::from_value(action.clone()).ok());
         Some(Self { id, status, action })
     }
-
-    pub(crate) fn detail(&self) -> String {
-        self.action
-            .as_ref()
-            .map(WebSearchAction::detail)
-            .unwrap_or_default()
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -65,39 +58,6 @@ pub(crate) enum WebSearchAction {
     },
     #[serde(other)]
     Other,
-}
-
-impl WebSearchAction {
-    pub(crate) fn detail(&self) -> String {
-        match self {
-            Self::Search { query, queries } => query
-                .as_deref()
-                .filter(|query| !query.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    let first = queries
-                        .as_ref()
-                        .and_then(|queries| queries.first())
-                        .cloned()
-                        .unwrap_or_default();
-                    if queries.as_ref().is_some_and(|queries| queries.len() > 1)
-                        && !first.is_empty()
-                    {
-                        format!("{first} ...")
-                    } else {
-                        first
-                    }
-                }),
-            Self::OpenPage { url } => url.clone().unwrap_or_default(),
-            Self::FindInPage { url, pattern } => match (pattern, url) {
-                (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
-                (Some(pattern), None) => format!("'{pattern}'"),
-                (None, Some(url)) => url.clone(),
-                (None, None) => String::new(),
-            },
-            Self::Other => String::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

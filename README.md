@@ -15,6 +15,12 @@ bcodex:
 
 More to come.
 
+## Disclosure
+
+bcodex gets out of the model's way, that's the point. This means you are
+trusting the model with your files. if it makes destructive changes you can't
+recover, thats on you. use bcodex at your own risk.
+
 ## Install
 
 On macOS or Linux:

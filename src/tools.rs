@@ -2427,7 +2427,7 @@ static TOOL_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
         ),
         function_tool(
             COORDINATE_SPECIALIST_NAME,
-            "Coordinate the active `$deepwork` run. This is a strict sequential pipeline, not a general delegation tool. Use `approve_interview` only after the user approves the task contract, then start, supervise, inspect, and explicitly accept each expected specialist. Use `wait` instead of polling; it blocks until a meaningful completion, blocker, interruption, or failure exists. A completed turn remains available for review: send concrete corrections to the same session, or atomically accept and retire it with `retire`. After accepted `$evals` and `$manifest`, use `approve_readiness` only after the user approves the final execution contract. Revive direct amendments when prior context remains useful; replace stale or biased work. `status` recovers the canonical run state after resume. Never use this tool outside a user-invoked `$deepwork` run.",
+            "Coordinate the active `$deepwork` run. This is a strict sequential pipeline, not a general delegation tool. Use `approve_interview` only after the user approves the task contract, then start, supervise, inspect, and explicitly accept each expected specialist. Use `wait` instead of polling; it blocks until a meaningful completion, blocker, interruption, or failure exists. Cancelling `wait` only stops Main from waiting; use `cancel` to interrupt the target specialist and pause its current stage. A completed turn remains available for review: send concrete corrections to the same session, or atomically accept and retire it with `retire`. After accepted `$evals` and `$manifest`, use `approve_readiness` only after the user approves the final execution contract. Revive direct amendments when prior context remains useful; replace stale or biased work. `status` recovers the canonical run state after resume. Never use this tool outside a user-invoked `$deepwork` run.",
             coordinate_specialist_schema(),
             coordinate_specialist_output_schema(),
         ),
@@ -3006,6 +3006,15 @@ fn coordinate_specialist_schema() -> Value {
                 "properties": {
                     "action": {"type": "string", "enum": ["wait"]},
                     "session_id": {"type": "string", "description": "Stable specialist session UUID."}
+                },
+                "required": ["action", "session_id"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["cancel"]},
+                    "session_id": {"type": "string", "description": "Stable UUID of the working specialist to interrupt. The current stage remains paused and the session stays live for a later send or replacement."}
                 },
                 "required": ["action", "session_id"],
                 "additionalProperties": false

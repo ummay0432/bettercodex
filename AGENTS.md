@@ -40,22 +40,7 @@ release's semantic version determines update freshness.
 ```text
 .
 ├── assets/ — Release assets
-├── bundled-skills/ — Embedded skills
-│   ├── deepwork/ — Orchestration skill
-│   │   └── agents/ — Skill metadata
-│   ├── manifest/ — Research skill
-│   │   ├── agents/ — Skill metadata
-│   │   └── references/ — Research references
-│   ├── openai-docs/ — Documentation skill
-│   │   ├── agents/ — Skill metadata
-│   │   ├── assets/ — Skill assets
-│   │   ├── references/ — Documentation references
-│   │   └── scripts/ — Documentation utilities
-│   ├── papercut/ — Cleanup skill
-│   │   └── agents/ — Skill metadata
-│   └── review/ — Review skill
-│       ├── agents/ — Skill metadata
-│       └── references/ — Review references
+├── bundled-skills/ — Embedded skill packages
 ├── docs/ — Project documentation
 │   └── case-studies/ — Harness research
 ├── prompts/ — Model prompts
@@ -70,5 +55,5 @@ release's semantic version determines update freshness.
 │       ├── markdown_render/ — Markdown rendering
 │       ├── render/ — Rendering utilities
 │       └── terminal/ — Terminal lifecycle
-└── subagents/ — Specialist prompts
+└── subagents/ — Specialist prompt assets
 ```

@@ -738,6 +738,9 @@ pub(crate) enum CoordinateSpecialistArgs {
     Wait {
         session_id: String,
     },
+    Cancel {
+        session_id: String,
+    },
     Retire {
         session_id: String,
         accepted_handoff: String,
@@ -759,7 +762,7 @@ pub(crate) enum CoordinateSpecialistArgs {
 impl CoordinateSpecialistArgs {
     pub(crate) fn validate(&self) -> Result<()> {
         match self {
-            Self::Status | Self::Wait { .. } => {}
+            Self::Status | Self::Wait { .. } | Self::Cancel { .. } => {}
             Self::ApproveInterview { contract } | Self::ApproveReadiness { contract } => {
                 validate_contract(contract)?;
             }
@@ -803,6 +806,7 @@ impl CoordinateSpecialistArgs {
         let session_id = match self {
             Self::Send { session_id, .. }
             | Self::Wait { session_id }
+            | Self::Cancel { session_id }
             | Self::Retire { session_id, .. }
             | Self::Revive { session_id, .. }
             | Self::Replace { session_id, .. } => Some(session_id.as_str()),
@@ -822,6 +826,7 @@ impl CoordinateSpecialistArgs {
             Self::Start { .. } => "start",
             Self::Send { .. } => "send",
             Self::Wait { .. } => "wait",
+            Self::Cancel { .. } => "cancel",
             Self::Retire { .. } => "retire",
             Self::Revive { .. } => "revive",
             Self::Replace { .. } => "replace",
@@ -1151,4 +1156,23 @@ fn bounded_question_batches(batches: &[DeepworkQuestionBatch]) -> Vec<DeepworkQu
     }
     selected.reverse();
     selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_coordination_action_accepts_a_stable_session_id() {
+        let session_id = uuid::Uuid::from_u128(1).hyphenated().to_string();
+        let arguments: CoordinateSpecialistArgs = serde_json::from_value(serde_json::json!({
+            "action": "cancel",
+            "session_id": session_id,
+        }))
+        .unwrap_or_else(|error| panic!("cancel action should deserialize: {error}"));
+
+        assert_eq!(arguments.action_name(), "cancel");
+        assert!(arguments.validate().is_ok());
+        assert!(matches!(arguments, CoordinateSpecialistArgs::Cancel { .. }));
+    }
 }

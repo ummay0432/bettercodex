@@ -78,6 +78,8 @@ Never relabel that block or paraphrase away its meaning. A specialist recommenda
 
 ## Handoffs
 
+Apply `docs/5.6-prompting.md` whenever orchestrating specialist models.
+
 Send each specialist a scoped handoff, not Main's full transcript. Include only what the stage needs, without losing intent:
 
 - the user's task and exact `SUCCESS CRITERIA` block;
