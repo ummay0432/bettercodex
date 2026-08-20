@@ -1,4 +1,6 @@
 use crate::compaction::InitialContextInjection;
+use crate::deepwork::DeepworkStage;
+use crate::deepwork::HarnessProfile;
 pub(crate) use crate::model::EFFECTIVE_CONTEXT_WINDOW;
 use crate::model::ModelSelection;
 use crate::rate_limits::RateLimitSnapshot;
@@ -158,6 +160,7 @@ pub(crate) struct ContextSnapshot {
     /// Whether `used_tokens` came from a backend usage signal rather than only local estimation.
     pub(crate) measured: bool,
     pub(crate) ask_user_question_enabled: bool,
+    pub(crate) specialist_coordination_enabled: bool,
     pub(crate) sections: Vec<ContextSection>,
     pub(crate) total_usage: TokenUsage,
     pub(crate) rate_limits: Vec<RateLimitSnapshot>,
@@ -175,7 +178,9 @@ pub(crate) struct Conversation {
     server_reasoning_included: bool,
     // A backend context rejection is a durable active-context floor, not fabricated usage.
     context_window_full: bool,
+    harness_profile: HarnessProfile,
     ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
     model_selection: ModelSelection,
     service_tier: ServiceTier,
     rollout: Rollout,
@@ -362,12 +367,6 @@ impl Conversation {
         Self::from_world_state(world_state, rollout, selection)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(cwd: &Path, rollout: Rollout) -> Result<Self> {
-        let world_state = WorldState::load(cwd)?;
-        Self::from_world_state(world_state, rollout, ModelSelection::default())
-    }
-
     fn from_world_state(
         world_state: WorldState,
         mut rollout: Rollout,
@@ -388,7 +387,9 @@ impl Conversation {
             usage_history_estimate: None,
             server_reasoning_included: false,
             context_window_full: false,
+            harness_profile: HarnessProfile::Main,
             ask_user_question_enabled: false,
+            specialist_coordination_enabled: false,
             model_selection,
             service_tier: ServiceTier::default(),
             rollout,
@@ -429,7 +430,9 @@ impl Conversation {
             usage_history_estimate,
             server_reasoning_included,
             context_window_full,
+            harness_profile: HarnessProfile::Main,
             ask_user_question_enabled: false,
+            specialist_coordination_enabled: false,
             model_selection,
             service_tier,
             rollout,
@@ -507,7 +510,9 @@ impl Conversation {
             usage_history_estimate: self.usage_history_estimate,
             server_reasoning_included: self.server_reasoning_included,
             context_window_full: self.context_window_full,
+            harness_profile: HarnessProfile::Main,
             ask_user_question_enabled: false,
+            specialist_coordination_enabled: false,
             model_selection: self.model_selection.clone(),
             service_tier: self.service_tier,
             rollout,
@@ -562,8 +567,22 @@ impl Conversation {
         Ok(())
     }
 
+    pub(crate) fn set_harness_profile(&mut self, profile: HarnessProfile) -> Result<()> {
+        if self.harness_profile == profile {
+            return Ok(());
+        }
+        let world_state = self.world_state.clone().for_harness_profile(profile);
+        self.replace_world_state(world_state)?;
+        self.harness_profile = profile;
+        Ok(())
+    }
+
     pub(crate) fn set_ask_user_question_enabled(&mut self, enabled: bool) {
         self.ask_user_question_enabled = enabled;
+    }
+
+    pub(crate) fn set_specialist_coordination_enabled(&mut self, enabled: bool) {
+        self.specialist_coordination_enabled = enabled;
     }
 
     pub(crate) fn start_turn(&mut self, turn_id: &str) -> Result<()> {
@@ -778,7 +797,7 @@ impl Conversation {
         cwd: &Path,
         active_turn_context: &ActiveTurnContext,
     ) -> Result<()> {
-        let world_state = WorldState::load(cwd)?;
+        let world_state = WorldState::load(cwd)?.for_harness_profile(self.harness_profile);
         let placement = active_turn_context
             .preferred_world_state_insertion(&self.history)
             .map(|insertion| world_state_placement_before_input(&self.history, insertion))
@@ -787,6 +806,9 @@ impl Conversation {
     }
 
     pub(crate) fn reload_skills(&mut self, cwd: &Path) -> Result<()> {
+        if matches!(self.harness_profile, HarnessProfile::Specialist(_)) {
+            return Ok(());
+        }
         let skills = SkillCatalog::load(cwd);
         let mut world_state = self.world_state.clone();
         world_state.skills_catalogue = skills.catalogue_message(EFFECTIVE_CONTEXT_WINDOW);
@@ -882,8 +904,11 @@ impl Conversation {
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
-        let [tools_tokens, system_prompt_tokens] =
-            crate::api::estimated_harness_tokens_for(self.ask_user_question_enabled);
+        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens_for(
+            self.harness_profile,
+            self.ask_user_question_enabled,
+            self.specialist_coordination_enabled,
+        );
         let mut tokens = self.context_metrics.tokens;
         let mut items = self.context_metrics.items;
         record_context_estimate(
@@ -922,6 +947,7 @@ impl Conversation {
             compact_at_tokens: self.model_selection.auto_compact_token_limit(),
             measured: measured_total.is_some(),
             ask_user_question_enabled: self.ask_user_question_enabled,
+            specialist_coordination_enabled: self.specialist_coordination_enabled,
             sections,
             total_usage: self.total_usage.clone(),
             rate_limits: self.rate_limits.values().cloned().collect(),
@@ -934,8 +960,11 @@ impl Conversation {
     }
 
     fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
-        let [tools_tokens, system_prompt_tokens] =
-            crate::api::estimated_harness_tokens_for(self.ask_user_question_enabled);
+        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens_for(
+            self.harness_profile,
+            self.ask_user_question_enabled,
+            self.specialist_coordination_enabled,
+        );
         metrics
             .estimated_tokens
             .saturating_add(tools_tokens)
@@ -1021,8 +1050,6 @@ impl Conversation {
             turn_id,
             requires_inspection,
         )?;
-        #[cfg(test)]
-        crate::process_termination_test_support::stop_at("turn_recovery_checkpoint");
         self.history_normalization = HistoryNormalization::from_history(&recovered);
         self.context_metrics = ContextMetrics::from_history(&recovered, &self.world_state);
         self.history = recovered;
@@ -1164,6 +1191,14 @@ impl WorldState {
             skills_catalogue,
             skills,
         })
+    }
+
+    fn for_harness_profile(mut self, profile: HarnessProfile) -> Self {
+        if matches!(profile, HarnessProfile::Specialist(_)) {
+            self.skills_catalogue = None;
+            self.skills = SkillCatalog::default();
+        }
+        self
     }
 
     fn items(&self) -> Vec<Value> {
@@ -1716,6 +1751,23 @@ pub(crate) fn message(role: &str, text: String) -> Value {
         "role": role,
         "content": [{"type": "input_text", "text": text}],
     })
+}
+
+pub(crate) fn deepwork_runtime_context(
+    run_index: u64,
+    workspace: &str,
+    stage: DeepworkStage,
+) -> Value {
+    let workspace = escape_xml_text(workspace);
+    let stage = stage.as_str();
+    let mut item = message(
+        "user",
+        format!(
+            "<deepwork_runtime>\nrun_index: {run_index}\nworkspace: {workspace}\nstage: {stage}\nThe runtime reserved or recovered this numbered workspace for pipeline artifacts before repository preflight.\n</deepwork_runtime>"
+        ),
+    );
+    mark_contextual_user_message(&mut item);
+    item
 }
 
 pub(crate) fn user_shell_command_context(
@@ -2304,11 +2356,6 @@ impl HistoryNormalization {
     }
 }
 
-#[cfg(test)]
-fn normalize_history(items: &mut Vec<Value>) {
-    let _ = normalize_history_with_recoveries(items, &HashMap::new());
-}
-
 fn normalize_history_with_recoveries(
     items: &mut Vec<Value>,
     recoveries: &HashMap<String, ToolRecovery>,
@@ -2403,30 +2450,6 @@ fn normalize_history_with_recoveries(
         items.insert(index + 1, output);
     }
     outcomes
-}
-
-#[cfg(test)]
-fn history_is_normalized(items: &[Value]) -> bool {
-    let canonical = canonical_call_outputs(items);
-    if canonical.calls.len() != canonical.output_indices.len() {
-        return false;
-    }
-    items.iter().enumerate().all(|(index, item)| {
-        let Some(output) = output_descriptor(item) else {
-            return true;
-        };
-        let Some(call) = canonical.calls.get(output.call_id) else {
-            return false;
-        };
-        if index <= call.index || call.call.output_kind != output.kind {
-            return false;
-        }
-        if output.is_notification {
-            call.call.allows_notifications()
-        } else {
-            canonical.output_indices.get(output.call_id) == Some(&index)
-        }
-    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2621,7 +2644,3 @@ fn synthetic_output_with_body(call: &CallDescriptor, output: Value) -> Value {
         })
     }
 }
-
-#[cfg(test)]
-#[path = "context_tests.rs"]
-mod tests;

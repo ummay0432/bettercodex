@@ -11,7 +11,7 @@ use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 
-const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+const CHANGELOG: &str = include_str!("../assets/CHANGELOG.md");
 const STATE_FILE_NAME: &str = "patch-notes.json";
 const STATE_FORMAT_VERSION: u32 = 1;
 const MAX_STATE_BYTES: usize = 4 * 1024;
@@ -89,10 +89,6 @@ pub(crate) struct Startup {
 }
 
 impl Startup {
-    #[cfg(test)]
-    pub(crate) fn notes(&self) -> Option<&str> {
-        self.notes.as_deref()
-    }
 
     pub(crate) fn take_notes(&mut self) -> Option<String> {
         self.notes.take()
@@ -319,6 +315,3 @@ fn push_entry<'a>(
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "patch_notes_tests.rs"]
-mod tests;

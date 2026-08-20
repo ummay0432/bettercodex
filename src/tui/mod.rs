@@ -1,7 +1,5 @@
+mod agent_switcher;
 mod ask_user_question;
-#[cfg(test)]
-#[path = "ask_user_question_tests.rs"]
-mod ask_user_question_tests;
 mod bottom_pane;
 mod clipboard;
 mod clipboard_paste;
@@ -23,30 +21,16 @@ mod pending_input;
 mod presentation;
 mod render;
 mod resume_picker;
-#[cfg(test)]
-#[path = "review_tests.rs"]
-mod review_tests;
-#[cfg(test)]
-#[path = "runtime_tests.rs"]
-mod runtime_tests;
+mod session_group;
 mod skill_popup;
 mod skills_view;
 mod startup_art;
-#[cfg(test)]
-#[path = "startup_art_tests.rs"]
-mod startup_art_tests;
 mod status;
-#[cfg(test)]
-#[path = "status_tests.rs"]
-mod status_tests;
 mod table_detect;
 mod terminal;
 mod terminal_hyperlinks;
 mod terminal_title;
 mod tools_view;
-#[cfg(test)]
-#[path = "tools_view_tests.rs"]
-mod tools_view_tests;
 mod view;
 mod width;
 mod wrapping;
@@ -58,7 +42,15 @@ use crate::agent::TurnHandle;
 use crate::ask_user_question::AskUserQuestionRequest;
 use crate::ask_user_question::AskUserQuestionRequester;
 use crate::ask_user_question::AskUserQuestionResponse;
-use crate::context::ContextSnapshot;
+use crate::deepwork::CoordinateSpecialistArgs;
+use crate::deepwork::CoordinateSpecialistResponse;
+use crate::deepwork::DeepworkQuestionBatch;
+use crate::deepwork::DeepworkRequest;
+use crate::deepwork::DeepworkRequester;
+use crate::deepwork::DeepworkStatus;
+use crate::deepwork::SpecialistEvent;
+use crate::deepwork::SpecialistEventKind;
+use crate::deepwork::SpecialistRole;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserInput;
@@ -71,15 +63,19 @@ use crate::rate_limits::RateLimitSnapshot;
 use crate::rollout::ResumeSelector;
 use crate::rollout::Rollout;
 use crate::rollout::SessionSummary;
-use crate::rollout::SessionTranscriptItem;
 use crate::rollout::SessionTranscriptToolOutput;
-use crate::service_tier::ServiceTier;
+use crate::session_group::ChildLifecycle;
+use crate::session_group::SessionId;
 use crate::update::AvailableUpdate;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use clipboard::ClipboardLease;
 use crossterm::event::Event;
 use crossterm::event::EventStream;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use file_search::FileSearchManager;
 use file_search::FileSearchUpdate;
 use futures_util::StreamExt;
@@ -92,6 +88,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::pending;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -99,7 +97,6 @@ use std::time::Instant;
 use terminal_title::TerminalTitle;
 use terminal_title::TerminalTitleState;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use tokio::time::Interval;
@@ -111,8 +108,14 @@ use view::ComposerSubmission;
 use view::InterruptIntent;
 use view::View;
 
+use agent_switcher::AgentSwitcher;
+use agent_switcher::AgentSwitcherRow;
+use agent_switcher::AgentSwitcherStatus;
+use session_group::AgentSlot;
+use session_group::SessionGroup;
+
 type TurnResult = (Agent, TurnCompletion);
-type TurnTask = JoinHandle<TurnResult>;
+type TurnTask = JoinHandle<()>;
 type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
 type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
@@ -205,9 +208,13 @@ pub(crate) async fn run(
         let runtime = Runtime::new(loaded, cwd, worker_handoff)?;
         (runtime, startup.0.enter()?)
     };
-    runtime
-        .view
-        .set_terminal_colors(session.default_foreground(), session.default_background());
+    let foreground = session.default_foreground();
+    let background = session.default_background();
+    for session_id in runtime.sessions.live_session_ids() {
+        if let Some(slot) = runtime.sessions.slot_mut(&session_id) {
+            slot.view.set_terminal_colors(foreground, background);
+        }
+    }
     let result = runtime.event_loop(&mut session).await;
     drop(session);
     result
@@ -246,61 +253,60 @@ async fn load_agent(requested_cwd: &Path, resume: Option<ResumeSelector>) -> Res
 struct Runtime {
     clipboard_lease: Option<ClipboardLease>,
     cwd: PathBuf,
-    agent: Option<Agent>,
-    turn: TurnTaskState,
-    turn_events: Option<UnboundedReceiver<AgentEvent>>,
-    turn_handle: Option<TurnHandle>,
+    sessions: SessionGroup,
+    agent_events: UnboundedReceiver<session_group::RoutedAgentEvent>,
+    turn_results: UnboundedReceiver<session_group::RoutedTurnResult>,
+    deepwork_requester: DeepworkRequester,
+    deepwork_requests: UnboundedReceiver<DeepworkRequest>,
     ask_user_question_requester: AskUserQuestionRequester,
     ask_user_question_requests: UnboundedReceiver<AskUserQuestionRequest>,
     pending_ask_user_question: Option<AskUserQuestionRequest>,
+    switcher_selection: Option<SessionId>,
     exit_after_work: bool,
-    context_snapshot: ContextSnapshot,
-    session_id: String,
-    forked_from: Option<String>,
-    instruction_source_paths: Vec<PathBuf>,
     rate_limit_client: RateLimitClient,
     rate_limit_task: Option<RateLimitTask>,
     rate_limit_prefetch_started: bool,
     status_rate_limits: BTreeMap<String, RateLimitSnapshot>,
     diff_task: Option<JoinHandle<()>>,
-    diff_updates: UnboundedReceiver<std::result::Result<String, String>>,
-    diff_updates_tx: tokio::sync::mpsc::UnboundedSender<std::result::Result<String, String>>,
+    diff_updates: UnboundedReceiver<(SessionId, std::result::Result<String, String>)>,
+    diff_updates_tx:
+        tokio::sync::mpsc::UnboundedSender<(SessionId, std::result::Result<String, String>)>,
     file_search: FileSearchManager,
     file_search_updates: UnboundedReceiver<FileSearchUpdate>,
-    prompt_history: Option<PromptHistory>,
-    prompt_history_reader: Option<PromptHistoryReader>,
-    prompt_history_task: Option<PromptHistoryTask>,
-    prompt_history_exclusions: HashSet<String>,
     patch_notes_startup: Option<crate::patch_notes::Startup>,
     patch_notes_ack_task: Option<PatchNotesAckTask>,
-    model_selection: ModelSelection,
-    service_tier: ServiceTier,
     session_scan: Option<SessionScanTask>,
     resume_task: Option<ResumeTask>,
     resume_submission: Option<ComposerSubmission>,
     notifier: Option<Notifier>,
     operator_command_tasks: HashMap<String, JoinHandle<()>>,
     operator_command_cancellations: HashMap<String, CancellationToken>,
-    pending_operator_contexts: VecDeque<String>,
-    operator_context_steers: Vec<(SteerId, String)>,
+    operator_command_owners: HashMap<String, SessionId>,
     operator_command_updates: UnboundedReceiver<OperatorCommandUpdate>,
     operator_command_updates_tx: tokio::sync::mpsc::UnboundedSender<OperatorCommandUpdate>,
     terminal_focused: bool,
     terminal_title: TerminalTitle,
-    turn_started_at: Option<Instant>,
     update_check: Option<UpdateCheckTask>,
     update_check_started: bool,
     worker_handoff: Option<crate::managed_session::WorkerHandoff>,
-    view: View,
+}
+
+impl Deref for Runtime {
+    type Target = AgentSlot;
+
+    fn deref(&self) -> &Self::Target {
+        self.sessions.active()
+    }
+}
+
+impl DerefMut for Runtime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.sessions.active_mut()
+    }
 }
 
 struct ResumedSession {
     agent: Agent,
-    prompt_history: PromptHistory,
-    prompt_history_reader: PromptHistoryReader,
-    prompt_history_exclusions: HashSet<String>,
-    composer_history: Vec<String>,
-    transcript: Vec<SessionTranscriptItem>,
 }
 
 struct SessionPromptHistory {
@@ -312,10 +318,12 @@ struct SessionPromptHistory {
 
 enum OperatorCommandUpdate {
     Output {
+        session_id: SessionId,
         call_id: String,
         chunk: String,
     },
     Completed {
+        session_id: SessionId,
         call_id: String,
         output: std::result::Result<Value, String>,
         context: String,
@@ -370,6 +378,26 @@ fn interrupted_steering_replay(
             .collect(),
         first_prompt: first_user_steer.1,
         trailing: trailing.into_iter().map(|(_, input)| input).collect(),
+    }
+}
+
+fn coordinate_response(
+    action: String,
+    message: impl Into<String>,
+    status: DeepworkStatus,
+    session_id: Option<String>,
+    event: Option<SpecialistEvent>,
+    state: Option<DeepworkStatus>,
+) -> CoordinateSpecialistResponse {
+    CoordinateSpecialistResponse {
+        action,
+        stage: status.stage,
+        run_index: status.run_index,
+        workspace: status.workspace,
+        message: message.into(),
+        session_id,
+        event,
+        state,
     }
 }
 
@@ -439,73 +467,49 @@ impl Runtime {
         } = loaded;
         let (ask_user_question_requester, ask_user_question_requests) =
             crate::ask_user_question::channel();
+        let (deepwork_requester, deepwork_requests) = crate::deepwork::channel();
         agent.set_ask_user_question_requester(ask_user_question_requester.clone());
-        let mut view = View::new(&cwd);
-        let model_selection = agent.model_selection().clone();
-        view.set_model_selection(model_selection.clone());
-        let service_tier = agent.service_tier();
-        view.set_service_tier(service_tier);
-        view.replay_transcript(agent.take_resumed_transcript());
+        agent.set_deepwork_requester(deepwork_requester.clone());
+        let rate_limit_client = agent.rate_limit_client();
+        let mut main = AgentSlot::main(agent)?;
         let mut patch_notes_startup = match patch_notes {
             Ok(startup) => startup,
             Err(error) => {
-                view.add_notice(format!("Patch notes could not be loaded: {error:#}"));
+                main.view
+                    .add_notice(format!("Patch notes could not be loaded: {error:#}"));
                 None
             }
         };
-        view.set_skills(agent.skills().to_vec());
-        for warning in agent.skill_warnings() {
-            view.add_notice(format!("Skill warning: {warning}"));
-        }
         if let Some(startup) = &mut patch_notes_startup
             && let Some(markdown) = startup.take_notes()
         {
-            view.add_patch_notes(markdown);
+            main.view.add_patch_notes(markdown);
         }
-        view.set_context_tokens(agent.context_tokens());
-        let session_id = agent.session_id().to_string();
-        let forked_from = agent.forked_from().map(str::to_string);
-        let instruction_source_paths = agent.instruction_source_paths().to_vec();
-        let rate_limit_client = agent.rate_limit_client();
-        let SessionPromptHistory {
-            writer: prompt_history,
-            reader: prompt_history_reader,
-            exclusions: mut prompt_history_exclusions,
-            composer_history,
-        } = prompt_history_for_agent(&agent)?;
-        let has_persistent_history = prompt_history_reader.has_more();
-        if !has_persistent_history {
-            prompt_history_exclusions.clear();
-        }
-        view.seed_prompt_history(composer_history, has_persistent_history);
-        let context_snapshot = agent.context_snapshot();
-        view.set_ask_user_question_enabled(context_snapshot.ask_user_question_enabled);
-        let status_rate_limits = context_snapshot
+        let status_rate_limits = main
+            .context_snapshot
             .rate_limits
             .iter()
             .cloned()
             .map(|snapshot| (snapshot.limit_id.clone(), snapshot))
             .collect();
+        let (sessions, agent_events, turn_results) = SessionGroup::new(main)?;
         let (file_search_updates_tx, file_search_updates) = unbounded_channel();
         let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
         let (operator_command_updates_tx, operator_command_updates) = unbounded_channel();
         let (diff_updates_tx, diff_updates) = unbounded_channel();
         Ok(Self {
             clipboard_lease: None,
-            view,
             cwd,
-            agent: Some(agent),
-            turn: TurnTaskState::Idle,
-            turn_events: None,
-            turn_handle: None,
+            sessions,
+            agent_events,
+            turn_results,
+            deepwork_requester,
+            deepwork_requests,
             ask_user_question_requester,
             ask_user_question_requests,
             pending_ask_user_question: None,
+            switcher_selection: None,
             exit_after_work: false,
-            context_snapshot,
-            session_id,
-            forked_from,
-            instruction_source_paths,
             rate_limit_client,
             rate_limit_task: None,
             rate_limit_prefetch_started: false,
@@ -515,31 +519,158 @@ impl Runtime {
             diff_updates_tx,
             file_search,
             file_search_updates,
-            prompt_history: Some(prompt_history),
-            prompt_history_reader: Some(prompt_history_reader),
-            prompt_history_task: None,
-            prompt_history_exclusions,
             patch_notes_startup,
             patch_notes_ack_task: None,
-            model_selection,
-            service_tier,
             session_scan: None,
             resume_task: None,
             resume_submission: None,
             notifier: Some(Notifier::detect()),
             operator_command_tasks: HashMap::new(),
             operator_command_cancellations: HashMap::new(),
-            pending_operator_contexts: VecDeque::new(),
-            operator_context_steers: Vec::new(),
+            operator_command_owners: HashMap::new(),
             operator_command_updates,
             operator_command_updates_tx,
             terminal_focused: true,
             terminal_title: TerminalTitle::new(),
-            turn_started_at: None,
             update_check: None,
             update_check_started: false,
             worker_handoff,
         })
+    }
+
+    fn refresh_agent_switcher(&mut self) {
+        let destinations = self.sessions.destination_ids();
+        if self
+            .switcher_selection
+            .as_ref()
+            .is_some_and(|selected| !destinations.contains(selected))
+        {
+            self.switcher_selection = destinations.first().cloned();
+        }
+        if destinations.is_empty() {
+            self.switcher_selection = None;
+        }
+        let rows = destinations
+            .into_iter()
+            .filter_map(|session_id| {
+                let slot = self.sessions.slot(&session_id)?;
+                let status = if slot.turn.is_active() || slot.view.is_busy() {
+                    AgentSwitcherStatus::Working(
+                        slot.turn_started_at
+                            .map(|started| started.elapsed())
+                            .unwrap_or_default(),
+                    )
+                } else if self
+                    .sessions
+                    .linkage
+                    .child(&session_id)
+                    .is_some_and(|child| child.lifecycle == ChildLifecycle::AwaitingReview)
+                {
+                    AgentSwitcherStatus::AwaitingReview
+                } else {
+                    AgentSwitcherStatus::Idle
+                };
+                match slot.child_identity() {
+                    Some((role, _, _)) => Some(AgentSwitcherRow::specialist(
+                        session_id,
+                        &slot.model_selection,
+                        role.as_str(),
+                        status,
+                    )),
+                    None => Some(AgentSwitcherRow::main(
+                        session_id,
+                        &slot.model_selection,
+                        status,
+                    )),
+                }
+            })
+            .collect();
+        self.sessions
+            .active_mut()
+            .view
+            .set_agent_switcher(AgentSwitcher::new(rows, self.switcher_selection.clone()));
+    }
+
+    fn handle_terminal_event(&mut self, event: Event) -> Option<Action> {
+        if self.handle_agent_switcher_event(&event) {
+            return None;
+        }
+        let action = self.view.handle_terminal_event(event);
+        self.file_search
+            .on_query_changed(self.view.file_search_query());
+        Some(action)
+    }
+
+    fn handle_agent_switcher_event(&mut self, event: &Event) -> bool {
+        if self.view.session_switcher_blocked() {
+            self.switcher_selection = None;
+            return false;
+        }
+        if self.switcher_selection.is_some() && matches!(event, Event::Paste(_)) {
+            return true;
+        }
+        let Event::Key(key) = event else {
+            return false;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+        let destinations = self.sessions.destination_ids();
+        if destinations.is_empty() {
+            self.switcher_selection = None;
+            return false;
+        }
+        let switch_key = key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        let direction = match key.code {
+            KeyCode::Up if switch_key => Some(false),
+            KeyCode::Down if switch_key => Some(true),
+            _ => None,
+        };
+        if let Some(forward) = direction {
+            let selected = self
+                .switcher_selection
+                .as_ref()
+                .and_then(|selected| destinations.iter().position(|id| id == selected));
+            let index = match (selected, forward) {
+                (None, true) => 0,
+                (None, false) => destinations.len() - 1,
+                (Some(index), true) => (index + 1) % destinations.len(),
+                (Some(0), false) => destinations.len() - 1,
+                (Some(index), false) => index - 1,
+            };
+            self.switcher_selection = destinations.get(index).cloned();
+            self.refresh_agent_switcher();
+            return true;
+        }
+        let Some(selected) = self.switcher_selection.clone() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                self.switcher_selection = None;
+                match self.sessions.activate(&selected) {
+                    Ok(()) => {
+                        self.sessions.active_mut().view.request_terminal_reflow();
+                        let query = self.sessions.active().view.file_search_query().to_string();
+                        self.file_search.on_query_changed(&query);
+                    }
+                    Err(error) => self
+                        .sessions
+                        .active_mut()
+                        .view
+                        .add_notice(format!("Could not switch sessions: {error:#}")),
+                }
+                self.refresh_agent_switcher();
+            }
+            KeyCode::Esc => {
+                self.switcher_selection = None;
+                self.refresh_agent_switcher();
+            }
+            _ => {}
+        }
+        true
     }
 
     async fn event_loop(&mut self, session: &mut terminal::TerminalSession) -> Result<()> {
@@ -565,6 +696,7 @@ impl Runtime {
             };
             self.terminal_title.refresh(title_state)?;
             if redraw {
+                self.refresh_agent_switcher();
                 stream_frames.frame_started();
                 let terminal = session.terminal_mut();
                 let clear_requested = self.view.take_clear_request();
@@ -603,6 +735,10 @@ impl Runtime {
                     stream_frames.schedule_frame();
                 }
             }
+            if self.finish_ready_turns()? {
+                redraw = true;
+                continue;
+            }
             // Completion handlers finalize transcript entries and request a redraw. Let that frame
             // move the final rows into terminal history before teardown clears the mutable viewport.
             if self.exit_ready() {
@@ -613,7 +749,7 @@ impl Runtime {
             tokio::select! {
                 terminal_event = input.next() => {
                     let Some(terminal_event) = terminal_event else {
-                        self.cancel_turn(InterruptIntent::StopTurn);
+                        self.cancel_all_turns(InterruptIntent::StopTurn);
                         break;
                     };
                     let event = terminal_event.context("failed to read terminal input")?;
@@ -640,12 +776,20 @@ impl Runtime {
                     if self.exit_after_work {
                         continue;
                     }
-                    let action = self.view.handle_terminal_event(event);
-                    self.file_search
-                        .on_query_changed(self.view.file_search_query());
+                    let Some(action) = self.handle_terminal_event(event) else {
+                        redraw = true;
+                        continue;
+                    };
                     redraw = true;
                     if matches!(action, Action::EnterTmux) {
-                        self.enter_tmux(session).await?;
+                        if self.sessions.is_main_active() {
+                            self.enter_tmux(session).await?;
+                        } else {
+                            self.view.add_notice(
+                                "Switch to Main before moving the session group into tmux"
+                                    .to_string(),
+                            );
+                        }
                         continue;
                     }
                     if matches!(action, Action::Logout) {
@@ -659,16 +803,29 @@ impl Runtime {
                         break;
                     }
                 }
+                request = self.deepwork_requests.recv() => {
+                    if let Some(request) = request {
+                        self.handle_deepwork_request(request);
+                        redraw = true;
+                    }
+                }
                 request = self.ask_user_question_requests.recv() => {
                     if let Some(request) = request {
                         if self.pending_ask_user_question.is_some() {
                             let _ = request.respond(AskUserQuestionResponse::cancelled());
-                            self.view.add_notice(
+                            self.sessions.main_mut().view.add_notice(
                                 "A second AskUserQuestion request was cancelled while another was active"
                                     .to_string(),
                             );
                         } else {
-                            self.view.show_ask_user_question(
+                            self.switcher_selection = None;
+                            let main_id = self.sessions.main_id().clone();
+                            if let Err(error) = self.sessions.activate(&main_id) {
+                                self.sessions.main_mut().view.add_notice(format!(
+                                    "The question is ready, but Main could not be displayed: {error:#}"
+                                ));
+                            }
+                            self.sessions.main_mut().view.show_ask_user_question(
                                 request.call_id().to_string(),
                                 request.arguments().clone(),
                             );
@@ -677,19 +834,16 @@ impl Runtime {
                         redraw = true;
                     }
                 }
-                event = receive_agent_event(&mut self.turn_events) => {
-                    if let Some(event) = event {
-                        // Ingress remains fully drained and ordered, but presentation advances at
-                        // most once for each terminal frame. This keeps input responsive without
-                        // collapsing a burst of model deltas into one visible plop.
-                        self.apply_agent_event(event);
+                routed = self.agent_events.recv() => {
+                    if let Some((session_id, event)) = routed {
+                        // AgentEvent stays session-agnostic. The supervisor that owns this slot's
+                        // private event receiver attaches stable identity only at group ingress.
+                        self.apply_agent_event(&session_id, event);
                         self.drain_agent_events();
                         if stream_frames.request_frame() {
                             self.view.advance_presentation(Instant::now());
                             redraw = true;
                         }
-                    } else {
-                        self.turn_events = None;
                     }
                 }
                 update = self.file_search_updates.recv() => {
@@ -738,7 +892,9 @@ impl Runtime {
                         }
                     }
                 }
-                completion = receive_prompt_history(&mut self.prompt_history_task) => {
+                completion = receive_prompt_history(
+                    &mut self.sessions.active_mut().prompt_history_task
+                ) => {
                     self.prompt_history_task = None;
                     match completion {
                         Ok((reader, Ok(mut entries))) => {
@@ -776,11 +932,11 @@ impl Runtime {
                 completion = receive_session_scan(&mut self.session_scan) => {
                     self.session_scan = None;
                     match completion {
-                        Ok(Ok(sessions)) => self.view.set_resume_sessions(sessions),
-                        Ok(Err(error)) => self.view.resume_listing_failed(format!(
+                        Ok(Ok(sessions)) => self.sessions.main_mut().view.set_resume_sessions(sessions),
+                        Ok(Err(error)) => self.sessions.main_mut().view.resume_listing_failed(format!(
                             "Could not list saved bettercodex sessions: {error:#}"
                         )),
-                        Err(error) => self.view.resume_listing_failed(format!(
+                        Err(error) => self.sessions.main_mut().view.resume_listing_failed(format!(
                             "Could not list saved bettercodex sessions: listing task stopped unexpectedly: {error}"
                         )),
                     }
@@ -795,119 +951,27 @@ impl Runtime {
                         }
                         Ok(Err(error)) => {
                             self.restore_resume_submission();
-                            self.view.resume_failed(format!(
+                            self.sessions.main_mut().view.resume_failed(format!(
                                 "Could not resume the selected bettercodex session: {error:#}"
                             ));
                         }
                         Err(error) => {
                             self.restore_resume_submission();
-                            self.view.resume_failed(format!(
+                            self.sessions.main_mut().view.resume_failed(format!(
                                 "Could not resume the selected bettercodex session: resume task stopped unexpectedly: {error}"
                             ));
                         }
                     }
                     redraw = true;
                 }
-                completion = receive_turn_completion(&mut self.turn), if !self.view.has_pending_presentation() => {
-                    let task_just_completed = completion.context("agent task stopped unexpectedly")?;
-                    if task_just_completed {
-                        self.drain_completed_turn_events();
-                        if self.view.has_pending_presentation() {
-                            self.view.advance_presentation(Instant::now());
-                            redraw = true;
-                            continue;
-                        }
-                    }
-                    let (mut agent, completion) = self.turn.take_presenting();
-                    if let Some(request) = self.pending_ask_user_question.take() {
-                        self.view.dismiss_ask_user_question(request.call_id());
-                    }
-                    self.sync_model_selection_to_agent(&mut agent);
-                    self.sync_service_tier_to_agent(&mut agent);
-                    let pending_context_steers = std::mem::take(&mut self.operator_context_steers);
-                    self.turn_handle = None;
-                    let elapsed = self.turn_started_at.take().map(|started| started.elapsed());
-                    let notification = match &completion {
-                        TurnCompletion::Submission(Ok(SubmitOutcome::Completed(answer))) => {
-                            Some(answer.clone())
-                        }
-                        TurnCompletion::Compaction(Ok(CompactionOutcome::Completed)) => {
-                            Some("Context compacted".to_string())
-                        }
-                        _ => None,
-                    };
-                    let completed = completion.completed();
-                    let interrupted_user_steers = match completion {
-                        TurnCompletion::Submission(result) => self.view.finish_turn(result),
-                        TurnCompletion::Compaction(result) => {
-                            self.view.finish_compaction(result);
-                            None
-                        }
-                    };
-                    let mut interrupted_steering = match interrupted_user_steers {
-                        Some(mut user_steers) => match user_steers.pop() {
-                            Some(first_user_steer) => Some(interrupted_steering_replay(
-                                first_user_steer,
-                                user_steers,
-                                pending_context_steers,
-                            )),
-                            None => {
-                                self.pending_operator_contexts.extend(
-                                    pending_context_steers
-                                        .into_iter()
-                                        .map(|(_, context)| context),
-                                );
-                                None
-                            }
-                        },
-                        None => {
-                            self.pending_operator_contexts.extend(
-                                pending_context_steers
-                                    .into_iter()
-                                    .map(|(_, context)| context),
-                            );
-                            None
-                        }
-                    };
-                    if let Some(replay) = interrupted_steering.as_mut() {
-                        self.pending_operator_contexts
-                            .extend(replay.leading_contexts.drain(..));
-                    }
-                    if let Err(error) =
-                        flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
-                    {
-                        self.view.add_notice(format!(
-                            "Operator shell output could not be added to model context: {error:#}"
-                        ));
-                    }
-                    self.context_snapshot = agent.context_snapshot();
-                    self.cache_status_rate_limits(self.context_snapshot.rate_limits.clone());
-                    self.instruction_source_paths = agent.instruction_source_paths().to_vec();
-                    self.view.refresh_skills(agent.skills());
-                    if let Err(error) = persist_session_transcript(&self.view, &mut agent) {
-                        self.view.add_notice(format!(
-                            "Session transcript could not be saved: {error:#}"
-                        ));
-                    }
-                    self.agent = Some(agent);
-                    redraw = true;
-
-                    if self.exit_after_work {
-                        continue;
-                    }
-                    if completed {
-                        let started_follow_up = self.operator_command_tasks.is_empty()
-                            && self.start_next_queued_follow_up();
-                        if !started_follow_up
-                            && let (Some(message), Some(elapsed)) = (notification, elapsed)
-                            && should_notify_turn_completion(self.terminal_focused, elapsed)
-                        {
-                            self.post_notification(&message);
-                        }
-                    } else if let Some(replay) = interrupted_steering {
-                        self.start_interrupted_turn(replay);
-                    } else {
-                        self.view.restore_pending_input_to_composer();
+                result = self.turn_results.recv() => {
+                    if let Some((session_id, result)) = result {
+                        self.sessions.install_turn_result(&session_id, result)?;
+                        // The supervisor sends completion only after forwarding every ordinary
+                        // event. Drain the routed ingress now; presentation still retains Main's
+                        // established frame pacing before finalization.
+                        self.drain_agent_events();
+                        redraw = true;
                     }
                 }
                 update = self.operator_command_updates.recv() => {
@@ -917,9 +981,11 @@ impl Runtime {
                     }
                 }
                 result = self.diff_updates.recv() => {
-                    if let Some(result) = result {
+                    if let Some((session_id, result)) = result {
                         self.diff_task = None;
-                        self.view.add_git_diff_result(result);
+                        if let Some(slot) = self.sessions.slot_mut(&session_id) {
+                            slot.view.add_git_diff_result(result);
+                        }
                         redraw = true;
                     }
                 }
@@ -947,6 +1013,532 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+
+    fn finish_ready_turns(&mut self) -> Result<bool> {
+        let active_id = self.sessions.active_id().clone();
+        let ready = self
+            .sessions
+            .live_session_ids()
+            .into_iter()
+            .filter(|session_id| {
+                self.sessions.slot(session_id).is_some_and(|slot| {
+                    matches!(slot.turn, TurnTaskState::Presenting(_))
+                        && (session_id != &active_id || !slot.view.has_pending_presentation())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for session_id in ready {
+            if session_id == *self.sessions.main_id() {
+                self.finish_main_turn()?;
+            } else {
+                self.finish_child_turn(&session_id)?;
+            }
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    fn finish_main_turn(&mut self) -> Result<()> {
+        let (mut agent, completion, pending_context_steers, elapsed) = {
+            let main = self.sessions.main_mut();
+            let (agent, completion) = main.turn.take_presenting();
+            main.turn_handle = None;
+            (
+                agent,
+                completion,
+                std::mem::take(&mut main.operator_context_steers),
+                main.turn_started_at.take().map(|started| started.elapsed()),
+            )
+        };
+        if let Some(request) = self.pending_ask_user_question.take() {
+            self.sessions
+                .main_mut()
+                .view
+                .dismiss_ask_user_question(request.call_id());
+        }
+        self.sync_main_model_selection_to_agent(&mut agent);
+        self.sync_main_service_tier_to_agent(&mut agent);
+        let notification = match &completion {
+            TurnCompletion::Submission(Ok(SubmitOutcome::Completed(answer))) => {
+                Some(answer.clone())
+            }
+            TurnCompletion::Compaction(Ok(CompactionOutcome::Completed)) => {
+                Some("Context compacted".to_string())
+            }
+            _ => None,
+        };
+        let completed = completion.completed();
+        let interrupted_user_steers = {
+            let view = &mut self.sessions.main_mut().view;
+            match completion {
+                TurnCompletion::Submission(result) => view.finish_turn(result),
+                TurnCompletion::Compaction(result) => {
+                    view.finish_compaction(result);
+                    None
+                }
+            }
+        };
+        let mut interrupted_steering = match interrupted_user_steers {
+            Some(mut user_steers) => match user_steers.pop() {
+                Some(first_user_steer) => Some(interrupted_steering_replay(
+                    first_user_steer,
+                    user_steers,
+                    pending_context_steers,
+                )),
+                None => {
+                    self.sessions.main_mut().pending_operator_contexts.extend(
+                        pending_context_steers
+                            .into_iter()
+                            .map(|(_, context)| context),
+                    );
+                    None
+                }
+            },
+            None => {
+                self.sessions.main_mut().pending_operator_contexts.extend(
+                    pending_context_steers
+                        .into_iter()
+                        .map(|(_, context)| context),
+                );
+                None
+            }
+        };
+        if let Some(replay) = interrupted_steering.as_mut() {
+            self.sessions
+                .main_mut()
+                .pending_operator_contexts
+                .extend(replay.leading_contexts.drain(..));
+        }
+        let flush_result = {
+            let pending = &mut self.sessions.main_mut().pending_operator_contexts;
+            flush_operator_contexts(pending, &mut agent)
+        };
+        if let Err(error) = flush_result {
+            self.sessions.main_mut().view.add_notice(format!(
+                "Operator shell output could not be added to model context: {error:#}"
+            ));
+        }
+        let context_snapshot = agent.context_snapshot();
+        let rate_limits = context_snapshot.rate_limits.clone();
+        let instruction_source_paths = agent.instruction_source_paths().to_vec();
+        let skills = agent.skills().to_vec();
+        {
+            let main = self.sessions.main_mut();
+            main.set_context_snapshot(context_snapshot);
+            main.instruction_source_paths = instruction_source_paths;
+            main.view.refresh_skills(&skills);
+            if let Err(error) = persist_session_transcript(&main.view, &mut agent) {
+                main.view
+                    .add_notice(format!("Session transcript could not be saved: {error:#}"));
+            }
+            main.agent = Some(agent);
+        }
+        self.cache_status_rate_limits(rate_limits);
+
+        if self.exit_after_work {
+            return Ok(());
+        }
+        if completed {
+            let main_id = self.sessions.main_id().clone();
+            let started_follow_up = !self.has_operator_command_for(&main_id)
+                && self.start_next_queued_follow_up_for(&main_id);
+            if !started_follow_up
+                && let (Some(message), Some(elapsed)) = (notification, elapsed)
+                && should_notify_turn_completion(self.terminal_focused, elapsed)
+            {
+                self.post_notification(&message);
+            }
+        } else if let Some(replay) = interrupted_steering {
+            let main_id = self.sessions.main_id().clone();
+            self.start_interrupted_turn_for(&main_id, replay);
+        } else {
+            self.sessions
+                .main_mut()
+                .view
+                .restore_pending_input_to_composer();
+        }
+        Ok(())
+    }
+
+    fn finish_child_turn(&mut self, session_id: &SessionId) -> Result<()> {
+        let (mut agent, completion, role, stage_attempt) = {
+            let slot = self
+                .sessions
+                .slot_mut(session_id)
+                .context("specialist turn completed for a missing slot")?;
+            slot.view.flush_presentation();
+            let (agent, completion) = slot.turn.take_presenting();
+            slot.turn_handle = None;
+            slot.turn_started_at = None;
+            let (role, stage_attempt, _) = slot
+                .child_identity()
+                .unwrap_or_else(|| unreachable!("child slot identity"));
+            (agent, completion, role, stage_attempt)
+        };
+        let (lifecycle, mut event) = match completion {
+            TurnCompletion::Submission(result) => {
+                let event = match &result {
+                    Ok(SubmitOutcome::Completed(answer)) => SpecialistEvent {
+                        session_id: session_id.to_string(),
+                        role,
+                        stage_attempt,
+                        kind: SpecialistEventKind::Completed,
+                        status: ChildLifecycle::AwaitingReview,
+                        message: "specialist turn completed and is awaiting orchestrator review"
+                            .to_string(),
+                        final_result: Some(answer.clone()),
+                    },
+                    Ok(SubmitOutcome::Cancelled | SubmitOutcome::CancelledBeforeProcessing) => {
+                        SpecialistEvent {
+                            session_id: session_id.to_string(),
+                            role,
+                            stage_attempt,
+                            kind: SpecialistEventKind::Interrupted,
+                            status: ChildLifecycle::Active,
+                            message: "specialist turn was interrupted".to_string(),
+                            final_result: None,
+                        }
+                    }
+                    Err(error) => SpecialistEvent {
+                        session_id: session_id.to_string(),
+                        role,
+                        stage_attempt,
+                        kind: SpecialistEventKind::Failed,
+                        status: ChildLifecycle::Active,
+                        message: format!("specialist turn failed: {error:#}"),
+                        final_result: None,
+                    },
+                };
+                let lifecycle = event.status;
+                self.sessions
+                    .slot_mut(session_id)
+                    .unwrap_or_else(|| unreachable!("live specialist slot"))
+                    .view
+                    .finish_turn(result);
+                (lifecycle, event)
+            }
+            TurnCompletion::Compaction(result) => {
+                let event = match &result {
+                    Ok(CompactionOutcome::Completed) => SpecialistEvent {
+                        session_id: session_id.to_string(),
+                        role,
+                        stage_attempt,
+                        kind: SpecialistEventKind::Completed,
+                        status: ChildLifecycle::Active,
+                        message: "specialist context compacted".to_string(),
+                        final_result: None,
+                    },
+                    Ok(CompactionOutcome::Cancelled) => SpecialistEvent {
+                        session_id: session_id.to_string(),
+                        role,
+                        stage_attempt,
+                        kind: SpecialistEventKind::Interrupted,
+                        status: ChildLifecycle::Active,
+                        message: "specialist compaction was interrupted".to_string(),
+                        final_result: None,
+                    },
+                    Err(error) => SpecialistEvent {
+                        session_id: session_id.to_string(),
+                        role,
+                        stage_attempt,
+                        kind: SpecialistEventKind::Failed,
+                        status: ChildLifecycle::Active,
+                        message: format!("specialist compaction failed: {error:#}"),
+                        final_result: None,
+                    },
+                };
+                self.sessions
+                    .slot_mut(session_id)
+                    .unwrap_or_else(|| unreachable!("live specialist slot"))
+                    .view
+                    .finish_compaction(result);
+                (ChildLifecycle::Active, event)
+            }
+        };
+        let context_snapshot = agent.context_snapshot();
+        let instruction_source_paths = agent.instruction_source_paths().to_vec();
+        let skills = agent.skills().to_vec();
+        {
+            let slot = self
+                .sessions
+                .slot_mut(session_id)
+                .unwrap_or_else(|| unreachable!("live specialist slot"));
+            slot.set_context_snapshot(context_snapshot);
+            slot.instruction_source_paths = instruction_source_paths;
+            slot.view.refresh_skills(&skills);
+            if let Err(error) = persist_session_transcript(&slot.view, &mut agent) {
+                slot.view
+                    .add_notice(format!("Session transcript could not be saved: {error:#}"));
+            }
+            slot.agent = Some(agent);
+        }
+        if let Err(error) = self.sessions.set_lifecycle(session_id, lifecycle) {
+            if let Some(link) = self.sessions.linkage.child_mut(session_id) {
+                link.lifecycle = lifecycle;
+            }
+            event.kind = SpecialistEventKind::Failed;
+            event.message = format!(
+                "specialist turn finished, but its lifecycle could not be persisted: {error:#}"
+            );
+            self.sessions.main_mut().view.add_notice(format!(
+                "Child session {session_id} finished, but its lifecycle could not be saved: {error:#}"
+            ));
+        }
+        self.sessions
+            .slot_mut(session_id)
+            .unwrap_or_else(|| unreachable!("live specialist slot"))
+            .deliver_meaningful_event(event);
+        Ok(())
+    }
+
+    fn handle_deepwork_request(&mut self, request: DeepworkRequest) {
+        let active_before = self.sessions.active_id().clone();
+        match request {
+            DeepworkRequest::Activate {
+                original_task,
+                response,
+            } => {
+                let repository_root =
+                    crate::repository::find_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+                let result = self
+                    .sessions
+                    .activate_deepwork(&repository_root, original_task);
+                let _ = response.send(result);
+            }
+            DeepworkRequest::Coordinate {
+                arguments,
+                cancellation,
+                response,
+            } => {
+                self.handle_coordinate_specialist(arguments, cancellation, response);
+            }
+        }
+        if self.sessions.active_id() != &active_before {
+            self.switcher_selection = None;
+            self.sessions.active_mut().view.request_terminal_reflow();
+        }
+        self.refresh_agent_switcher();
+    }
+
+    fn handle_coordinate_specialist(
+        &mut self,
+        arguments: CoordinateSpecialistArgs,
+        cancellation: CancellationToken,
+        response: tokio::sync::oneshot::Sender<Result<CoordinateSpecialistResponse>>,
+    ) {
+        if cancellation.is_cancelled() {
+            let _ = response.send(Err(anyhow!("coordinate_specialist was interrupted")));
+            return;
+        }
+        let action = arguments.action_name().to_string();
+        if let CoordinateSpecialistArgs::Wait { session_id } = arguments {
+            let result = (|| {
+                let session_id = SessionId::parse(session_id)?;
+                let (stage, run_index, workspace) = self.sessions.deepwork_state_fields()?;
+                let (event_response, event_receiver) = tokio::sync::oneshot::channel();
+                self.sessions.wait_child(&session_id, event_response);
+                Ok((session_id, stage, run_index, workspace, event_receiver))
+            })();
+            match result {
+                Ok((session_id, stage, run_index, workspace, event_receiver)) => {
+                    tokio::spawn(async move {
+                        let result = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            event = event_receiver => match event {
+                                Ok(result) => result.map(|event| CoordinateSpecialistResponse {
+                                    action,
+                                    stage,
+                                    run_index,
+                                    workspace,
+                                    message: "meaningful specialist event received".to_string(),
+                                    session_id: Some(session_id.to_string()),
+                                    event: Some(event),
+                                    state: None,
+                                }),
+                                Err(_) => Err(anyhow!(
+                                    "specialist wait stopped before replying"
+                                )),
+                            }
+                        };
+                        let _ = response.send(result);
+                    });
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                }
+            }
+            return;
+        }
+
+        let result = (|| match arguments {
+            CoordinateSpecialistArgs::Status => {
+                let status = self.sessions.deepwork_status()?;
+                Ok(coordinate_response(
+                    action,
+                    "returned canonical deepwork state",
+                    status.clone(),
+                    None,
+                    None,
+                    Some(status),
+                ))
+            }
+            CoordinateSpecialistArgs::ApproveInterview { contract } => {
+                let status = self.sessions.approve_deepwork_interview(contract)?;
+                Ok(coordinate_response(
+                    action,
+                    "interview contract approved; `$evals` may start",
+                    status,
+                    None,
+                    None,
+                    None,
+                ))
+            }
+            CoordinateSpecialistArgs::ApproveReadiness { contract } => {
+                let status = self.sessions.approve_deepwork_readiness(contract)?;
+                Ok(coordinate_response(
+                    action,
+                    "readiness contract approved; `$worker` may start",
+                    status,
+                    None,
+                    None,
+                    None,
+                ))
+            }
+            CoordinateSpecialistArgs::Start {
+                specialist,
+                handoff,
+            } => {
+                let session_id = self
+                    .sessions
+                    .start_deepwork_child(&self.cwd, specialist, handoff)?;
+                let status = self.sessions.deepwork_status()?;
+                Ok(coordinate_response(
+                    action,
+                    format!("{} started", specialist.label()),
+                    status,
+                    Some(session_id.to_string()),
+                    None,
+                    None,
+                ))
+            }
+            CoordinateSpecialistArgs::Send {
+                session_id,
+                message,
+            } => {
+                let session_id = SessionId::parse(session_id)?;
+                self.sessions.send_child(&session_id, message)?;
+                let status = self.sessions.deepwork_status()?;
+                Ok(coordinate_response(
+                    action,
+                    "follow-up sent to the existing specialist session",
+                    status,
+                    Some(session_id.to_string()),
+                    None,
+                    None,
+                ))
+            }
+            CoordinateSpecialistArgs::Retire {
+                session_id,
+                accepted_handoff,
+                artifacts,
+                remaining_risks,
+            } => {
+                let session_id = SessionId::parse(session_id)?;
+                let status = self.sessions.accept_and_retire_deepwork_child(
+                    &session_id,
+                    accepted_handoff,
+                    artifacts,
+                    remaining_risks,
+                )?;
+                Ok(coordinate_response(
+                    action,
+                    "specialist stage accepted and session retired",
+                    status,
+                    Some(session_id.to_string()),
+                    None,
+                    None,
+                ))
+            }
+            CoordinateSpecialistArgs::Revive {
+                session_id,
+                message,
+            } => {
+                let session_id = SessionId::parse(session_id)?;
+                if self
+                    .sessions
+                    .linkage
+                    .children
+                    .iter()
+                    .any(|child| child.lifecycle.is_live() && child.session_id != session_id)
+                {
+                    return Err(anyhow!(
+                        "deepwork is strictly sequential; another specialist is live"
+                    ));
+                }
+                let role = SpecialistRole::parse(
+                    &self
+                        .sessions
+                        .linkage
+                        .child(&session_id)
+                        .context("specialist session is not linked to this group")?
+                        .role,
+                )?;
+                self.sessions
+                    .revive_child(&self.cwd, &session_id, message)?;
+                let status = self.sessions.deepwork_status()?;
+                Ok(coordinate_response(
+                    action,
+                    format!("{} revived", role.label()),
+                    status,
+                    Some(session_id.to_string()),
+                    None,
+                    None,
+                ))
+            }
+            CoordinateSpecialistArgs::Replace {
+                session_id,
+                message,
+            } => {
+                let session_id = SessionId::parse(session_id)?;
+                if self
+                    .sessions
+                    .linkage
+                    .children
+                    .iter()
+                    .any(|child| child.lifecycle.is_live() && child.session_id != session_id)
+                {
+                    return Err(anyhow!(
+                        "deepwork is strictly sequential; another specialist is live"
+                    ));
+                }
+                let role = SpecialistRole::parse(
+                    &self
+                        .sessions
+                        .linkage
+                        .child(&session_id)
+                        .context("specialist session is not linked to this group")?
+                        .role,
+                )?;
+                let replacement = self
+                    .sessions
+                    .replace_child(&self.cwd, &session_id, message)?;
+                let status = self.sessions.deepwork_status()?;
+                Ok(coordinate_response(
+                    action,
+                    format!("{} replaced with a fresh session", role.label()),
+                    status,
+                    Some(replacement.to_string()),
+                    None,
+                    None,
+                ))
+            }
+            CoordinateSpecialistArgs::Wait { .. } => {
+                unreachable!("wait is handled before synchronous coordination actions")
+            }
+        })();
+        let _ = response.send(result);
     }
 
     fn reconcile_terminal_geometry(
@@ -1060,7 +1652,7 @@ impl Runtime {
                             }
                         }
                     }
-                } else if self.operator_command_tasks.is_empty() {
+                } else if !self.has_operator_command_for(self.sessions.active_id()) {
                     self.start_composer_turn(submission);
                 } else {
                     self.queue_composer_follow_up(submission);
@@ -1081,7 +1673,17 @@ impl Runtime {
             Action::ToggleFast => self.toggle_fast_mode(),
             Action::SelectModel(selection) => self.select_model(selection),
             Action::Fork(submission) => {
-                if self.has_local_session_activity() {
+                if !self.sessions.is_main_active() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Switch to Main before forking the session group".to_string(),
+                    );
+                } else if self.deepwork_in_progress() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Finish or exit the active `$deepwork` run before forking".to_string(),
+                    );
+                } else if self.has_local_session_activity() {
                     self.view.defer_composer_action(
                         submission,
                         "Wait for the local command or Git diff before forking".to_string(),
@@ -1094,7 +1696,17 @@ impl Runtime {
                 }
             }
             Action::Clear(submission) => {
-                if self.has_local_session_activity() {
+                if !self.sessions.is_main_active() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Switch to Main before starting a fresh session".to_string(),
+                    );
+                } else if self.deepwork_in_progress() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Finish or exit the active `$deepwork` run before clearing".to_string(),
+                    );
+                } else if self.has_local_session_activity() {
                     self.view.defer_composer_action(
                         submission,
                         "Wait for the local command or Git diff before clearing".to_string(),
@@ -1112,7 +1724,18 @@ impl Runtime {
                 }
             }
             Action::OpenResumePicker(submission) => {
-                if self.has_local_session_activity() {
+                if !self.sessions.is_main_active() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Switch to Main before resuming another saved session".to_string(),
+                    );
+                } else if self.deepwork_in_progress() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Finish or exit the active `$deepwork` run before resuming another session"
+                            .to_string(),
+                    );
+                } else if self.has_local_session_activity() {
                     self.view.defer_composer_action(
                         submission,
                         "Wait for the local command or Git diff before resuming".to_string(),
@@ -1125,7 +1748,13 @@ impl Runtime {
             Action::CloseResumePicker => self.close_resume_picker(),
             Action::CancelResumeLoad => self.cancel_resume_load(),
             Action::ResumeSessionFromPicker(id) => {
-                if self.has_local_session_activity() {
+                if self.deepwork_in_progress() {
+                    self.view.add_notice(
+                        "Finish or exit the active `$deepwork` run before resuming another session"
+                            .to_string(),
+                    );
+                    self.close_resume_picker();
+                } else if self.has_local_session_activity() {
                     self.view.add_notice(
                         "Wait for the local command or Git diff before resuming".to_string(),
                     );
@@ -1137,7 +1766,12 @@ impl Runtime {
                 }
             }
             Action::ResumeSessionFromComposer { id, submission } => {
-                if self.has_local_session_activity() {
+                if self.deepwork_in_progress() {
+                    self.view.defer_composer_action(
+                        submission,
+                        "Finish or exit the active `$deepwork` run before resuming another session",
+                    );
+                } else if self.has_local_session_activity() {
                     self.view.defer_composer_action(
                         submission,
                         "Wait for the local command or Git diff before resuming",
@@ -1159,34 +1793,53 @@ impl Runtime {
                 self.start_operator_command(command);
             }
             Action::ShowContext => {
-                if let Some(agent) = &self.agent {
-                    self.context_snapshot = agent.context_snapshot();
-                }
-                self.view.show_context(self.context_snapshot.clone());
+                let snapshot = self.sessions.active().agent.as_ref().map_or_else(
+                    || self.sessions.active().context_snapshot.clone(),
+                    Agent::context_snapshot,
+                );
+                let slot = self.sessions.active_mut();
+                slot.set_context_snapshot(snapshot.clone());
+                slot.view.show_context(snapshot);
             }
             Action::ShowStatus => {
-                if let Some(agent) = &self.agent {
-                    self.context_snapshot = agent.context_snapshot();
-                    self.session_id = agent.session_id().to_string();
-                    self.forked_from = agent.forked_from().map(str::to_string);
-                    self.instruction_source_paths = agent.instruction_source_paths().to_vec();
+                if let Some((context_snapshot, session_id, forked_from, instruction_paths)) =
+                    self.sessions.active().agent.as_ref().map(|agent| {
+                        (
+                            agent.context_snapshot(),
+                            agent.session_id().to_string(),
+                            agent.forked_from().map(str::to_string),
+                            agent.instruction_source_paths().to_vec(),
+                        )
+                    })
+                {
+                    let slot = self.sessions.active_mut();
+                    slot.set_context_snapshot(context_snapshot);
+                    slot.session_id = session_id;
+                    slot.forked_from = forked_from;
+                    slot.instruction_source_paths = instruction_paths;
                 }
-                self.cache_status_rate_limits(self.context_snapshot.rate_limits.clone());
+                let context = self.sessions.active().context_snapshot.clone();
+                self.cache_status_rate_limits(context.rate_limits.clone());
                 let account = self.rate_limit_client.account().unwrap_or_else(|error| {
                     tracing::warn!(%error, "failed to read ChatGPT account metadata");
                     crate::auth::ChatGptAccount::default()
                 });
-                self.view.add_status(StatusSnapshot {
-                    model: self.model_selection.clone(),
+                let snapshot = StatusSnapshot {
+                    model: self.sessions.active().model_selection.clone(),
                     directory: self.cwd.clone(),
-                    instruction_source_paths: self.instruction_source_paths.clone(),
-                    session_id: self.session_id.clone(),
-                    forked_from: self.forked_from.clone(),
+                    instruction_source_paths: self
+                        .sessions
+                        .active()
+                        .instruction_source_paths
+                        .clone(),
+                    session_id: self.sessions.active().session_id.clone(),
+                    forked_from: self.sessions.active().forked_from.clone(),
                     account,
-                    context: self.context_snapshot.clone(),
+                    context,
                     rate_limits: self.status_rate_limits.values().cloned().collect(),
                     refreshing_rate_limits: true,
-                });
+                };
+                self.sessions.active_mut().view.add_status(snapshot);
                 self.start_rate_limit_refresh();
             }
             Action::ShowDiff => self.start_git_diff(),
@@ -1194,17 +1847,12 @@ impl Runtime {
             Action::Logout => unreachable!("logout is handled by the event loop"),
             Action::UpdateSkill { path, update } => match self.agent.as_mut() {
                 Some(agent) => {
-                    let result = agent.update_skill(&path, update).map(|()| {
-                        (
-                            agent.context_snapshot(),
-                            agent.context_tokens(),
-                            agent.skills().to_vec(),
-                        )
-                    });
+                    let result = agent
+                        .update_skill(&path, update)
+                        .map(|()| (agent.context_snapshot(), agent.skills().to_vec()));
                     match result {
-                        Ok((context_snapshot, context_tokens, skills)) => {
-                            self.context_snapshot = context_snapshot;
-                            self.view.set_context_tokens(context_tokens);
+                        Ok((context_snapshot, skills)) => {
+                            self.set_context_snapshot(context_snapshot);
                             self.view.set_skills(skills);
                         }
                         Err(error) => self
@@ -1222,9 +1870,21 @@ impl Runtime {
                     .as_ref()
                     .is_some_and(|request| request.call_id() == call_id);
                 if matches_pending && let Some(request) = self.pending_ask_user_question.take() {
-                    self.view.dismiss_ask_user_question(&call_id);
+                    self.sessions
+                        .main_mut()
+                        .view
+                        .dismiss_ask_user_question(&call_id);
+                    if self.sessions.linkage.deepwork.is_some() {
+                        let batch =
+                            DeepworkQuestionBatch::from_response(request.arguments(), &response);
+                        if let Err(error) = self.sessions.record_deepwork_question_batch(batch) {
+                            self.sessions.main_mut().view.add_notice(format!(
+                                "The answer was returned, but canonical deepwork state could not be saved: {error:#}"
+                            ));
+                        }
+                    }
                     if !request.respond(response) {
-                        self.view.add_notice(
+                        self.sessions.main_mut().view.add_notice(
                             "AskUserQuestion response arrived after the turn stopped".to_string(),
                         );
                     }
@@ -1258,6 +1918,12 @@ impl Runtime {
     }
 
     fn select_model(&mut self, selection: ModelSelection) {
+        if self.sessions.active().is_child() {
+            self.view.add_notice(
+                "Specialist model profiles are fixed; switch to Main to change models".to_string(),
+            );
+            return;
+        }
         if let Err(error) = selection.validate() {
             self.view
                 .add_error(format!("Could not change model: {error:#}"));
@@ -1287,32 +1953,39 @@ impl Runtime {
     }
 
     fn apply_model_selection(&mut self, selection: ModelSelection) {
-        self.model_selection = selection.clone();
-        self.view.set_model_selection(selection.clone());
-        self.context_snapshot.context_window = selection.effective_context_window();
-        self.context_snapshot.compact_at_tokens = selection.auto_compact_token_limit();
+        let slot = self.sessions.active_mut();
+        slot.model_selection = selection.clone();
+        slot.view.set_model_selection(selection.clone());
+        slot.context_snapshot.context_window = selection.effective_context_window();
+        slot.context_snapshot.compact_at_tokens = selection.auto_compact_token_limit();
     }
 
-    fn sync_model_selection_to_agent(&mut self, agent: &mut Agent) {
-        if agent.model_selection() == &self.model_selection {
+    fn sync_main_model_selection_to_agent(&mut self, agent: &mut Agent) {
+        let selection = self.sessions.main().model_selection.clone();
+        if agent.model_selection() == &selection {
             return;
         }
-        if let Err(error) = agent.set_model_selection(self.model_selection.clone()) {
-            self.model_selection = agent.model_selection().clone();
-            self.view.set_model_selection(self.model_selection.clone());
-            self.view
+        if let Err(error) = agent.set_model_selection(selection) {
+            let selection = agent.model_selection().clone();
+            let main = self.sessions.main_mut();
+            main.model_selection = selection.clone();
+            main.view.set_model_selection(selection);
+            main.view
                 .add_error(format!("Could not change model: {error:#}"));
         }
     }
 
-    fn sync_service_tier_to_agent(&mut self, agent: &mut Agent) {
-        if agent.service_tier() == self.service_tier {
+    fn sync_main_service_tier_to_agent(&mut self, agent: &mut Agent) {
+        let service_tier = self.sessions.main().service_tier;
+        if agent.service_tier() == service_tier {
             return;
         }
-        if let Err(error) = agent.set_service_tier(self.service_tier) {
-            self.service_tier = agent.service_tier();
-            self.view.set_service_tier(self.service_tier);
-            self.view
+        if let Err(error) = agent.set_service_tier(service_tier) {
+            let service_tier = agent.service_tier();
+            let main = self.sessions.main_mut();
+            main.service_tier = service_tier;
+            main.view.set_service_tier(service_tier);
+            main.view
                 .add_error(format!("Could not change Fast mode: {error:#}"));
         }
     }
@@ -1343,60 +2016,41 @@ impl Runtime {
     }
 
     fn clear_session(&mut self) -> Result<()> {
+        let selection = self.sessions.main().model_selection.clone();
+        let service_tier = self.sessions.main().service_tier;
         let mut agent = Agent::new(&self.cwd)?;
         agent.set_ask_user_question_requester(self.ask_user_question_requester.clone());
-        agent.set_model_selection(self.model_selection.clone())?;
-        agent.set_service_tier(self.service_tier)?;
-        let prompt_history = PromptHistory::open(agent.session_id())?;
-        let context_snapshot = agent.context_snapshot();
-        let session_id = agent.session_id().to_string();
-        let forked_from = agent.forked_from().map(str::to_string);
-        let instruction_source_paths = agent.instruction_source_paths().to_vec();
-        let skills = agent.skills().to_vec();
-        let skill_warnings = agent.skill_warnings().to_vec();
-
-        self.pending_operator_contexts.clear();
-        self.operator_context_steers.clear();
-        self.context_snapshot = context_snapshot;
-        self.session_id = session_id;
-        self.forked_from = forked_from;
-        self.instruction_source_paths = instruction_source_paths;
-        self.agent = Some(agent);
-        self.prompt_history = Some(prompt_history);
-        self.view.clear();
-        self.view
-            .set_ask_user_question_enabled(self.context_snapshot.ask_user_question_enabled);
-        self.view.set_skills(skills);
-        for warning in skill_warnings {
-            self.view.add_notice(format!("Skill warning: {warning}"));
-        }
-        Ok(())
+        agent.set_deepwork_requester(self.deepwork_requester.clone());
+        agent.set_model_selection(selection)?;
+        agent.set_service_tier(service_tier)?;
+        let mut slot = AgentSlot::main(agent)?;
+        slot.view.clear();
+        slot.view.sync_context_snapshot(&slot.context_snapshot);
+        self.install_main_slot(slot)
     }
 
     fn fork_session(&mut self) -> Result<()> {
         let source = self
+            .sessions
+            .main()
             .agent
             .as_ref()
             .context("a session can only be forked while the agent is idle")?;
-        let mut agent = source.fork(self.view.session_transcript())?;
+        let transcript = self.sessions.main().view.session_transcript();
+        let mut agent = source.fork(transcript)?;
         agent.set_ask_user_question_requester(self.ask_user_question_requester.clone());
-        let prompt_history = PromptHistory::open(agent.session_id())?;
+        agent.set_deepwork_requester(self.deepwork_requester.clone());
         let session_id = agent.session_id().to_string();
-        let forked_from = agent.forked_from().map(str::to_string);
-        let instruction_source_paths = agent.instruction_source_paths().to_vec();
-        self.context_snapshot = agent.context_snapshot();
-        self.session_id.clone_from(&session_id);
-        self.forked_from = forked_from;
-        self.instruction_source_paths = instruction_source_paths;
-        self.view.set_context_tokens(agent.context_tokens());
-        self.view
-            .set_ask_user_question_enabled(self.context_snapshot.ask_user_question_enabled);
-        self.view.set_skills(agent.skills().to_vec());
-        self.agent = Some(agent);
-        self.prompt_history = Some(prompt_history);
-        self.view
+        let cwd = self.cwd.clone();
+        let retained_view = std::mem::replace(&mut self.sessions.main_mut().view, View::new(&cwd));
+        let mut slot = AgentSlot::main(agent)?;
+        slot.view = retained_view;
+        slot.view.sync_context_snapshot(&slot.context_snapshot);
+        slot.view.set_model_selection(slot.model_selection.clone());
+        slot.view.set_service_tier(slot.service_tier);
+        slot.view
             .add_notice(format!("Forked conversation into session {session_id}"));
-        Ok(())
+        self.install_main_slot(slot)
     }
 
     fn open_resume_picker(&mut self) {
@@ -1448,47 +2102,48 @@ impl Runtime {
         self.view.show_resume_progress(target);
         let requested_cwd = self.cwd.clone();
         self.resume_task = Some(tokio::task::spawn_blocking(move || {
-            let mut agent = Agent::resume(&requested_cwd, ResumeSelector::Id(target))?;
-            let SessionPromptHistory {
-                writer: prompt_history,
-                reader: prompt_history_reader,
-                exclusions: prompt_history_exclusions,
-                composer_history,
-            } = prompt_history_for_agent(&agent)?;
-            let transcript = agent.take_resumed_transcript();
-            Ok(ResumedSession {
-                agent,
-                prompt_history,
-                prompt_history_reader,
-                prompt_history_exclusions,
-                composer_history,
-                transcript,
-            })
+            Agent::resume(&requested_cwd, ResumeSelector::Id(target))
+                .map(|agent| ResumedSession { agent })
         }));
         Ok(())
     }
 
     fn start_operator_command(&mut self, command: String) {
         // Resolve agent events that were already ready when the terminal action won `select!`.
-        // The view then flushes their paced presentation before inserting this local boundary.
+        // The initiating slot then owns the complete local-command presentation even if the user
+        // watches another session before the command exits.
         self.drain_agent_events();
+        let session_id = self.sessions.active_id().clone();
         let call_id = format!("operator:{}", uuid::Uuid::new_v4());
-        self.view.start_operator_command(call_id.clone(), &command);
-        if let Some(agent) = self.agent.as_mut()
-            && let Err(error) = persist_session_transcript(&self.view, agent)
         {
-            self.view
-                .add_notice(format!("Session transcript could not be saved: {error:#}"));
+            let slot = self
+                .sessions
+                .slot_mut(&session_id)
+                .unwrap_or_else(|| unreachable!("active session stayed live"));
+            slot.view.start_operator_command(call_id.clone(), &command);
+            if let Some(agent) = slot.agent.as_mut()
+                && let Err(error) = persist_session_transcript(&slot.view, agent)
+            {
+                slot.view
+                    .add_notice(format!("Session transcript could not be saved: {error:#}"));
+            }
         }
         let cwd = self.cwd.clone();
         let cancellation = CancellationToken::new();
         let updates = self.operator_command_updates_tx.clone();
         let task_call_id = call_id.clone();
+        let task_session_id = session_id.clone();
         let task_cancellation = cancellation.clone();
-        let truncation_policy = self.model_selection.truncation_policy();
+        let truncation_policy = self
+            .sessions
+            .slot(&session_id)
+            .unwrap_or_else(|| unreachable!("active session stayed live"))
+            .model_selection
+            .truncation_policy();
         let task = tokio::spawn(async move {
             let output_updates = updates.clone();
             let output_call_id = task_call_id.clone();
+            let output_session_id = task_session_id.clone();
             let mut forwarded_bytes = 0_usize;
             let mut forward_output = move |_stream, mut chunk: String| {
                 let omitted = crate::process_runtime::fit_live_output_budget(
@@ -1499,6 +2154,7 @@ impl Runtime {
                 if !chunk.is_empty()
                     && output_updates
                         .send(OperatorCommandUpdate::Output {
+                            session_id: output_session_id.clone(),
                             call_id: output_call_id.clone(),
                             chunk,
                         })
@@ -1508,6 +2164,7 @@ impl Runtime {
                 }
                 if omitted {
                     let _ = output_updates.send(OperatorCommandUpdate::Output {
+                        session_id: output_session_id.clone(),
                         call_id: output_call_id.clone(),
                         chunk: "\n… additional live output omitted …\n".to_string(),
                     });
@@ -1534,6 +2191,7 @@ impl Runtime {
             let context =
                 crate::context::user_shell_command_context(&command, &output, truncation_policy);
             let _ = updates.send(OperatorCommandUpdate::Completed {
+                session_id: task_session_id,
                 call_id: task_call_id,
                 output,
                 context,
@@ -1541,32 +2199,46 @@ impl Runtime {
         });
         self.operator_command_cancellations
             .insert(call_id.clone(), cancellation);
+        self.operator_command_owners
+            .insert(call_id.clone(), session_id);
         self.operator_command_tasks.insert(call_id, task);
     }
 
     fn apply_operator_command_update(&mut self, update: OperatorCommandUpdate) {
         match update {
-            OperatorCommandUpdate::Output { call_id, chunk } => {
-                self.view.append_operator_command_output(&call_id, &chunk);
+            OperatorCommandUpdate::Output {
+                session_id,
+                call_id,
+                chunk,
+            } => {
+                if let Some(slot) = self.sessions.slot_mut(&session_id) {
+                    slot.view.append_operator_command_output(&call_id, &chunk);
+                }
             }
             OperatorCommandUpdate::Completed {
+                session_id,
                 call_id,
                 output,
                 context,
             } => {
                 self.operator_command_tasks.remove(&call_id);
                 self.operator_command_cancellations.remove(&call_id);
+                self.operator_command_owners.remove(&call_id);
                 let transcript_output = match &output {
                     Ok(output) => SessionTranscriptToolOutput::Success(output.clone()),
                     Err(error) => SessionTranscriptToolOutput::Error(error.clone()),
                 };
-                self.view.finish_operator_command(&call_id, output);
-                self.record_operator_context(context);
-                if let Some(agent) = self.agent.as_mut() {
+                if let Some(slot) = self.sessions.slot_mut(&session_id) {
+                    slot.view.finish_operator_command(&call_id, output);
+                }
+                self.record_operator_context(&session_id, context);
+                if let Some(slot) = self.sessions.slot_mut(&session_id)
+                    && let Some(agent) = slot.agent.as_mut()
+                {
                     // Persist the cell first in case its start checkpoint failed, then patch its
                     // bounded outcome without replacing the complete transcript snapshot.
-                    if let Err(error) = persist_session_transcript(&self.view, agent) {
-                        self.view.add_notice(format!(
+                    if let Err(error) = persist_session_transcript(&slot.view, agent) {
+                        slot.view.add_notice(format!(
                             "Session transcript could not be saved: {error:#}"
                         ));
                     }
@@ -1576,42 +2248,47 @@ impl Runtime {
                         // The saved cell may still be incomplete. Force the next checkpoint to
                         // replace it from the view instead of appending past stale state.
                         agent.invalidate_transcript_checkpoint();
-                        self.view.add_notice(format!(
+                        slot.view.add_notice(format!(
                             "Session transcript could not be saved: {error:#}"
                         ));
                     }
                 }
-                if self.operator_command_tasks.is_empty()
-                    && !self.turn.is_active()
-                    && !self.exit_after_work
+                let slot_idle = self
+                    .sessions
+                    .slot(&session_id)
+                    .is_some_and(|slot| !slot.turn.is_active());
+                if !self.has_operator_command_for(&session_id) && slot_idle && !self.exit_after_work
                 {
-                    self.start_next_queued_follow_up();
+                    self.start_next_queued_follow_up_for(&session_id);
                 }
             }
         }
     }
 
-    fn record_operator_context(&mut self, context: String) {
-        if self.turn.is_active()
-            && let Some(turn) = &self.turn_handle
+    fn record_operator_context(&mut self, session_id: &SessionId, context: String) {
+        let Some(slot) = self.sessions.slot_mut(session_id) else {
+            return;
+        };
+        if slot.turn.is_active()
+            && let Some(turn) = &slot.turn_handle
             && let Ok(id) = turn.inject_context(context.clone())
         {
-            self.operator_context_steers.push((id, context));
+            slot.operator_context_steers.push((id, context));
             return;
         }
 
-        self.pending_operator_contexts.push_back(context);
-        let Some(mut agent) = self.agent.take() else {
+        slot.pending_operator_contexts.push_back(context);
+        let Some(mut agent) = slot.agent.take() else {
             return;
         };
-        if let Err(error) = flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
+        if let Err(error) = flush_operator_contexts(&mut slot.pending_operator_contexts, &mut agent)
         {
-            self.view.add_notice(format!(
+            slot.view.add_notice(format!(
                 "Operator shell output could not be added to model context: {error:#}"
             ));
         }
-        self.context_snapshot = agent.context_snapshot();
-        self.agent = Some(agent);
+        slot.set_context_snapshot(agent.context_snapshot());
+        slot.agent = Some(agent);
     }
 
     fn start_git_diff(&mut self) {
@@ -1620,11 +2297,12 @@ impl Runtime {
                 .add_notice("A Git diff is already being computed".to_string());
             return;
         }
+        let session_id = self.sessions.active_id().clone();
         let cwd = self.cwd.clone();
         let updates = self.diff_updates_tx.clone();
         self.diff_task = Some(tokio::spawn(async move {
             let result = git_diff::get_git_diff(cwd).await;
-            let _ = updates.send(result);
+            let _ = updates.send((session_id, result));
         }));
     }
 
@@ -1638,64 +2316,31 @@ impl Runtime {
     }
 
     fn activate_resumed_session(&mut self, session: ResumedSession) {
-        let ResumedSession {
-            mut agent,
-            prompt_history,
-            prompt_history_reader,
-            mut prompt_history_exclusions,
-            composer_history,
-            transcript,
-        } = session;
+        let mut agent = session.agent;
         agent.set_ask_user_question_requester(self.ask_user_question_requester.clone());
-        let model_selection = agent.model_selection().clone();
-        let service_tier = agent.service_tier();
-        let cwd = agent.cwd().to_path_buf();
-        let context_snapshot = agent.context_snapshot();
-        let session_id = agent.session_id().to_string();
-        let forked_from = agent.forked_from().map(str::to_string);
-        let instruction_source_paths = agent.instruction_source_paths().to_vec();
-        let context_tokens = agent.context_tokens();
-        let skills = agent.skills().to_vec();
-        let skill_warnings = agent.skill_warnings().to_vec();
-        let (file_search_updates_tx, file_search_updates) = unbounded_channel();
-        let file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
+        agent.set_deepwork_requester(self.deepwork_requester.clone());
+        match AgentSlot::main(agent).and_then(|slot| self.install_main_slot(slot)) {
+            Ok(()) => self.exit_after_work = false,
+            Err(error) => self.sessions.main_mut().view.add_notice(format!(
+                "The selected session loaded, but its runtime could not be activated: {error:#}"
+            )),
+        }
+    }
 
-        self.pending_operator_contexts.clear();
-        self.operator_context_steers.clear();
-        self.cwd = cwd.clone();
-        self.context_snapshot = context_snapshot;
-        self.session_id = session_id;
-        self.forked_from = forked_from;
-        self.instruction_source_paths = instruction_source_paths;
-        self.agent = Some(agent);
-        self.exit_after_work = false;
-        self.file_search = file_search;
+    fn install_main_slot(&mut self, slot: AgentSlot) -> Result<()> {
+        let cwd = slot.cwd.clone();
+        let rate_limits = slot.context_snapshot.rate_limits.clone();
+        let (sessions, agent_events, turn_results) = SessionGroup::new(slot)?;
+        let (file_search_updates_tx, file_search_updates) = unbounded_channel();
+        self.file_search = FileSearchManager::new(cwd.clone(), file_search_updates_tx);
         self.file_search_updates = file_search_updates;
-        self.prompt_history = Some(prompt_history);
-        abort_join_task(&mut self.prompt_history_task);
-        let has_persistent_history = prompt_history_reader.has_more();
-        if !has_persistent_history {
-            prompt_history_exclusions.clear();
-        }
-        self.prompt_history_reader = Some(prompt_history_reader);
-        self.prompt_history_exclusions = prompt_history_exclusions;
-        self.model_selection = model_selection.clone();
-        self.service_tier = service_tier;
-        self.view.switch_session(
-            &cwd,
-            context_tokens,
-            transcript,
-            composer_history,
-            has_persistent_history,
-            skills,
-        );
-        self.view.set_service_tier(service_tier);
-        self.view.set_model_selection(model_selection);
-        self.view
-            .set_ask_user_question_enabled(self.context_snapshot.ask_user_question_enabled);
-        for warning in skill_warnings {
-            self.view.add_notice(format!("Skill warning: {warning}"));
-        }
+        self.cwd = cwd;
+        self.sessions = sessions;
+        self.switcher_selection = None;
+        self.agent_events = agent_events;
+        self.turn_results = turn_results;
+        self.cache_status_rate_limits(rate_limits);
+        Ok(())
     }
 
     fn queue_composer_follow_up(&mut self, submission: ComposerSubmission) {
@@ -1704,19 +2349,24 @@ impl Runtime {
         self.view.queue_follow_up(submission.into_prompt());
     }
 
-    fn start_next_queued_follow_up(&mut self) -> bool {
-        let Some(prompt) = self.view.pop_next_queued_follow_up() else {
+    fn start_next_queued_follow_up_for(&mut self, session_id: &SessionId) -> bool {
+        let Some(prompt) = self
+            .sessions
+            .slot_mut(session_id)
+            .and_then(|slot| slot.view.pop_next_queued_follow_up())
+        else {
             return false;
         };
-        self.start_turn(prompt)
+        self.start_turn_for(session_id, prompt)
     }
 
     fn start_composer_turn(&mut self, submission: ComposerSubmission) {
-        match self.prepare_turn_start() {
+        let session_id = self.sessions.active_id().clone();
+        match self.prepare_turn_start_for(&session_id) {
             Ok(agent) => {
                 let history_text = submission.prompt().text_without_image_placeholders();
                 self.persist_prompt(&history_text);
-                self.spawn_turn(agent, submission.into_prompt(), Vec::new());
+                self.spawn_turn_for(&session_id, agent, submission.into_prompt(), Vec::new());
             }
             Err(error) => {
                 self.view.reject_composer_submission(submission, error);
@@ -1724,118 +2374,172 @@ impl Runtime {
         }
     }
 
-    fn start_turn(&mut self, prompt: UserPrompt) -> bool {
-        match self.prepare_turn_start() {
+    fn start_turn_for(&mut self, session_id: &SessionId, prompt: UserPrompt) -> bool {
+        match self.prepare_turn_start_for(session_id) {
             Ok(agent) => {
-                self.spawn_turn(agent, prompt, Vec::new());
+                self.spawn_turn_for(session_id, agent, prompt, Vec::new());
                 true
             }
             Err(error) => {
-                self.view.reject_prompt(prompt, error);
+                if let Some(slot) = self.sessions.slot_mut(session_id) {
+                    slot.view.reject_prompt(prompt, error);
+                }
                 false
             }
         }
     }
 
-    fn start_interrupted_turn(&mut self, replay: InterruptedSteeringReplay) {
-        match self.prepare_turn_start() {
-            Ok(agent) => self.spawn_turn(agent, replay.first_prompt, replay.trailing),
+    fn start_interrupted_turn_for(
+        &mut self,
+        session_id: &SessionId,
+        replay: InterruptedSteeringReplay,
+    ) {
+        match self.prepare_turn_start_for(session_id) {
+            Ok(agent) => {
+                self.spawn_turn_for(session_id, agent, replay.first_prompt, replay.trailing)
+            }
             Err(error) => {
-                self.view.reject_prompt(replay.first_prompt, error);
-                self.restore_interrupted_steering(replay.trailing);
+                if let Some(slot) = self.sessions.slot_mut(session_id) {
+                    slot.view.reject_prompt(replay.first_prompt, error);
+                }
+                self.restore_interrupted_steering_for(session_id, replay.trailing);
             }
         }
     }
 
-    fn restore_interrupted_steering(&mut self, steering: Vec<InterruptedSteering>) {
+    fn restore_interrupted_steering_for(
+        &mut self,
+        session_id: &SessionId,
+        steering: Vec<InterruptedSteering>,
+    ) {
+        let Some(slot) = self.sessions.slot_mut(session_id) else {
+            return;
+        };
         for input in steering {
             match input {
-                InterruptedSteering::Operator(prompt) => self.view.queue_follow_up(prompt),
+                InterruptedSteering::Operator(prompt) => slot.view.queue_follow_up(prompt),
                 InterruptedSteering::Context(context) => {
-                    self.pending_operator_contexts.push_back(context);
+                    slot.pending_operator_contexts.push_back(context);
                 }
             }
         }
     }
 
-    fn prepare_turn_start(&mut self) -> std::result::Result<Agent, String> {
+    fn prepare_turn_start_for(
+        &mut self,
+        session_id: &SessionId,
+    ) -> std::result::Result<Agent, String> {
         let mut agent = self
-            .agent
-            .take()
+            .sessions
+            .slot_mut(session_id)
+            .and_then(|slot| slot.agent.take())
             .ok_or_else(|| "Could not start turn: the active agent is unavailable".to_string())?;
-        if let Err(error) = flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
-        {
-            self.agent = Some(agent);
+        let flush_result = {
+            let slot = self
+                .sessions
+                .slot_mut(session_id)
+                .unwrap_or_else(|| unreachable!("turn session stayed live"));
+            flush_operator_contexts(&mut slot.pending_operator_contexts, &mut agent)
+        };
+        if let Err(error) = flush_result {
+            self.sessions
+                .slot_mut(session_id)
+                .unwrap_or_else(|| unreachable!("turn session stayed live"))
+                .agent = Some(agent);
             return Err(format!(
                 "Could not start turn: operator shell output could not be added to model context: {error:#}"
+            ));
+        }
+        if self
+            .sessions
+            .slot(session_id)
+            .is_some_and(AgentSlot::is_child)
+            && let Err(error) = self
+                .sessions
+                .set_lifecycle(session_id, ChildLifecycle::Working)
+        {
+            self.sessions
+                .slot_mut(session_id)
+                .unwrap_or_else(|| unreachable!("turn session stayed live"))
+                .agent = Some(agent);
+            return Err(format!(
+                "Could not start turn: specialist lifecycle could not be saved: {error:#}"
             ));
         }
         Ok(agent)
     }
 
-    fn spawn_turn(
+    fn spawn_turn_for(
         &mut self,
-        mut agent: Agent,
+        session_id: &SessionId,
+        agent: Agent,
         prompt: UserPrompt,
         initial_steering: Vec<InterruptedSteering>,
     ) {
-        let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::channel();
-        self.view.start_turn(&prompt);
-        let unqueued = enqueue_initial_steering(
-            &turn_handle,
-            &mut self.view,
-            &mut self.operator_context_steers,
-            initial_steering,
+        let unqueued = {
+            let slot = self
+                .sessions
+                .slot_mut(session_id)
+                .unwrap_or_else(|| unreachable!("turn session stayed live"));
+            slot.view.start_turn(&prompt);
+            enqueue_initial_steering(
+                &turn_handle,
+                &mut slot.view,
+                &mut slot.operator_context_steers,
+                initial_steering,
+            )
+        };
+        self.restore_interrupted_steering_for(session_id, unqueued);
+        let task = session_group::spawn_main_submission_supervisor(
+            session_id.clone(),
+            agent,
+            prompt,
+            turn_control,
+            self.sessions.agent_events_tx.clone(),
+            self.sessions.turn_results_tx.clone(),
         );
-        self.restore_interrupted_steering(unqueued);
-        self.turn_started_at = Some(Instant::now());
-        self.turn_events = Some(events_rx);
-        self.turn_handle = Some(turn_handle);
-        self.turn = TurnTaskState::Running(tokio::spawn(async move {
-            let input = UserInput::prompt(prompt);
-            let result = agent
-                .submit_with_control(input, events_tx, turn_control)
-                .await;
-            (agent, TurnCompletion::Submission(result))
-        }));
+        let slot = self
+            .sessions
+            .slot_mut(session_id)
+            .unwrap_or_else(|| unreachable!("turn session stayed live"));
+        slot.turn_started_at = Some(Instant::now());
+        slot.turn_handle = Some(turn_handle);
+        slot.turn = TurnTaskState::Running(task);
     }
 
     fn start_compaction(&mut self) {
-        let Some(mut agent) = self.agent.take() else {
+        let session_id = self.sessions.active_id().clone();
+        let Ok(agent) = self.prepare_turn_start_for(&session_id) else {
             self.view.add_notice(
                 "Could not compact conversation: the active agent is unavailable".to_string(),
             );
             return;
         };
-        if let Err(error) = flush_operator_contexts(&mut self.pending_operator_contexts, &mut agent)
-        {
-            self.agent = Some(agent);
-            self.view.add_notice(format!(
-                "Could not compact conversation: operator shell output could not be added to model context: {error:#}"
-            ));
-            return;
-        }
-        let (events_tx, events_rx) = unbounded_channel();
         let (turn_handle, turn_control) = crate::agent::TurnControl::non_steerable_channel();
-        self.view.start_compaction();
-        self.turn_started_at = Some(Instant::now());
-        self.turn_events = Some(events_rx);
-        self.turn_handle = Some(turn_handle);
-        self.turn = TurnTaskState::Running(tokio::spawn(async move {
-            let result = agent.compact_with_control(events_tx, turn_control).await;
-            (agent, TurnCompletion::Compaction(result))
-        }));
+        let task = session_group::spawn_compaction_supervisor(
+            session_id.clone(),
+            agent,
+            turn_control,
+            self.sessions.agent_events_tx.clone(),
+            self.sessions.turn_results_tx.clone(),
+        );
+        let slot = self
+            .sessions
+            .slot_mut(&session_id)
+            .unwrap_or_else(|| unreachable!("compaction session stayed live"));
+        slot.view.start_compaction();
+        slot.turn_started_at = Some(Instant::now());
+        slot.turn_handle = Some(turn_handle);
+        slot.turn = TurnTaskState::Running(task);
     }
 
     fn request_exit(&mut self) -> bool {
-        if !self.turn.is_active() && self.operator_command_tasks.is_empty() {
+        if !self.any_turn_active() && self.operator_command_tasks.is_empty() {
             return true;
         }
         self.exit_after_work = true;
-        if self.turn.is_active() {
-            self.cancel_turn(InterruptIntent::StopTurn);
-        }
+        self.cancel_all_turns(InterruptIntent::StopTurn);
         for cancellation in self.operator_command_cancellations.values() {
             cancellation.cancel();
         }
@@ -1843,7 +2547,40 @@ impl Runtime {
     }
 
     fn exit_ready(&self) -> bool {
-        self.exit_after_work && !self.turn.is_active() && self.operator_command_tasks.is_empty()
+        self.exit_after_work && !self.any_turn_active() && self.operator_command_tasks.is_empty()
+    }
+
+    fn deepwork_in_progress(&self) -> bool {
+        self.sessions
+            .linkage
+            .deepwork
+            .as_ref()
+            .is_some_and(|state| state.stage != crate::deepwork::DeepworkStage::Completed)
+    }
+
+    fn any_turn_active(&self) -> bool {
+        self.sessions.live_session_ids().iter().any(|session_id| {
+            self.sessions
+                .slot(session_id)
+                .is_some_and(|slot| slot.turn.is_active())
+        })
+    }
+
+    fn cancel_all_turns(&mut self, intent: InterruptIntent) {
+        let session_ids = self.sessions.live_session_ids();
+        for session_id in session_ids {
+            let Some(slot) = self.sessions.slot_mut(&session_id) else {
+                continue;
+            };
+            if let Some(turn) = &slot.turn_handle {
+                match intent {
+                    InterruptIntent::StopTurn => turn.cancel(),
+                    InterruptIntent::EditPrompt => turn.cancel_and_edit_prompt(),
+                    InterruptIntent::SubmitSteering => turn.interrupt_for_steering(),
+                }
+                slot.view.set_interrupting(intent);
+            }
+        }
     }
 
     fn cancel_turn(&mut self, intent: InterruptIntent) {
@@ -1866,8 +2603,11 @@ impl Runtime {
             self.interrupt_turn();
         }
         if !submitting_steering {
-            for cancellation in self.operator_command_cancellations.values() {
-                cancellation.cancel();
+            let active_id = self.sessions.active_id().clone();
+            for (call_id, cancellation) in &self.operator_command_cancellations {
+                if self.operator_command_owners.get(call_id) == Some(&active_id) {
+                    cancellation.cancel();
+                }
             }
         }
     }
@@ -1875,7 +2615,7 @@ impl Runtime {
     fn interrupt_turn(&mut self) {
         let intent = if self.view.has_pending_steers() {
             InterruptIntent::SubmitSteering
-        } else if self.operator_command_tasks.is_empty()
+        } else if !self.has_operator_command_for(self.sessions.active_id())
             && self.operator_context_steers.is_empty()
             && self.pending_operator_contexts.is_empty()
             && self.view.can_edit_submitted_prompt()
@@ -1888,44 +2628,59 @@ impl Runtime {
     }
 
     fn drain_agent_events(&mut self) {
-        let Some(mut events) = self.turn_events.take() else {
-            return;
-        };
-        if drain_ready_agent_events(&mut events, |event| self.apply_agent_event(event))
-            == ReceiverState::Open
-        {
-            self.turn_events = Some(events);
+        for _ in 0..MAX_READY_AGENT_EVENTS {
+            let Ok((session_id, event)) = self.agent_events.try_recv() else {
+                return;
+            };
+            self.apply_agent_event(&session_id, event);
         }
     }
 
-    fn drain_completed_turn_events(&mut self) {
-        let Some(mut events) = self.turn_events.take() else {
+    fn apply_agent_event(&mut self, session_id: &SessionId, event: AgentEvent) {
+        let rate_limits = match &event {
+            AgentEvent::ContextUpdated(snapshot) => Some(snapshot.rate_limits.clone()),
+            _ => None,
+        };
+        let is_active = session_id == self.sessions.active_id();
+        let Some(slot) = self.sessions.slot_mut(session_id) else {
             return;
         };
-        drain_completed_agent_events(&mut events, |event| self.apply_agent_event(event));
-    }
-
-    fn apply_agent_event(&mut self, event: AgentEvent) {
         if let AgentEvent::ContextUpdated(snapshot) = &event {
-            self.context_snapshot = snapshot.clone();
-            self.cache_status_rate_limits(snapshot.rate_limits.clone());
+            slot.context_snapshot = snapshot.clone();
         } else if let AgentEvent::SteeringCommitted(id) = &event
-            && let Some(index) = self
+            && let Some(index) = slot
                 .operator_context_steers
                 .iter()
                 .position(|(candidate, _)| candidate == id)
         {
-            self.operator_context_steers.remove(index);
+            slot.operator_context_steers.remove(index);
         }
-        self.view.handle_agent_event(event);
+        slot.view.handle_agent_event(event);
+        if !is_active {
+            // Hidden sessions do not consume terminal animation frames. Their presentation state
+            // still advances so the retained transcript is current when the user enters the slot.
+            slot.view.flush_presentation();
+        }
+        if let Some(rate_limits) = rate_limits {
+            self.cache_status_rate_limits(rate_limits);
+        }
     }
 
     fn has_foreground_activity(&self) -> bool {
-        self.view.is_busy()
-            || !self.operator_command_tasks.is_empty()
+        self.sessions.live_session_ids().iter().any(|session_id| {
+            self.sessions
+                .slot(session_id)
+                .is_some_and(|slot| slot.view.is_busy())
+        }) || !self.operator_command_tasks.is_empty()
             || self.diff_task.is_some()
             || self.resume_task.is_some()
             || self.session_scan.is_some()
+    }
+
+    fn has_operator_command_for(&self, session_id: &SessionId) -> bool {
+        self.operator_command_owners
+            .values()
+            .any(|owner| owner == session_id)
     }
 
     fn has_local_session_activity(&self) -> bool {
@@ -2053,12 +2808,6 @@ fn prompt_history_for_agent(agent: &Agent) -> Result<SessionPromptHistory> {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReceiverState {
-    Open,
-    Closed,
-}
-
 #[derive(Debug, Default)]
 struct StreamFramePacer {
     last_frame_started_at: Option<tokio::time::Instant>,
@@ -2116,34 +2865,6 @@ impl StreamFramePacer {
     }
 }
 
-fn drain_ready_agent_events(
-    receiver: &mut UnboundedReceiver<AgentEvent>,
-    mut apply: impl FnMut(AgentEvent),
-) -> ReceiverState {
-    for _ in 0..MAX_READY_AGENT_EVENTS {
-        match receiver.try_recv() {
-            Ok(event) => apply(event),
-            Err(TryRecvError::Empty) => return ReceiverState::Open,
-            Err(TryRecvError::Disconnected) => return ReceiverState::Closed,
-        }
-    }
-    // Return to `select!` so input, cancellation, and the frame clock cannot be
-    // starved by an unusually large ready backlog.
-    ReceiverState::Open
-}
-
-fn drain_completed_agent_events(
-    receiver: &mut UnboundedReceiver<AgentEvent>,
-    mut apply: impl FnMut(AgentEvent),
-) {
-    // Once the turn task has joined, every response event it emitted is already queued. The
-    // normal fairness cap no longer protects input responsiveness and would discard the tail when
-    // the receiver is dropped immediately after this drain.
-    while let Ok(event) = receiver.try_recv() {
-        apply(event);
-    }
-}
-
 async fn receive_frame_tick(animate: bool, ticks: &mut Interval) {
     if animate {
         ticks.tick().await;
@@ -2157,29 +2878,6 @@ async fn receive_deadline(deadline: Option<tokio::time::Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => pending().await,
     }
-}
-
-async fn receive_agent_event(
-    receiver: &mut Option<UnboundedReceiver<AgentEvent>>,
-) -> Option<AgentEvent> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => pending().await,
-    }
-}
-
-async fn receive_turn_completion(
-    turn: &mut TurnTaskState,
-) -> std::result::Result<bool, tokio::task::JoinError> {
-    let completion = match turn {
-        TurnTaskState::Running(turn) => turn.await?,
-        TurnTaskState::Presenting(_) => return Ok(false),
-        TurnTaskState::Idle => return pending().await,
-    };
-    // Store the joined result before this future becomes ready. If another `tokio::select!`
-    // branch wins while the task is still pending, dropping this future remains a no-op.
-    *turn = TurnTaskState::Presenting(Box::new(completion));
-    Ok(true)
 }
 
 async fn receive_session_scan(

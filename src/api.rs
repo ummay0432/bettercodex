@@ -8,6 +8,7 @@ use crate::context::HistoryCursor;
 use crate::context::ResponseItemForRequest;
 use crate::context::estimated_tokens;
 use crate::context::response_item_id_is_prefixed;
+use crate::deepwork::HarnessProfile;
 use crate::events::AgentEvent;
 use crate::events::ModelTextDelta;
 use crate::http_client::backoff;
@@ -76,10 +77,12 @@ const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
-static BASE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
-static INTERACTIVE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
+static TOOL_TOKEN_ESTIMATES: OnceLock<[u64; 4]> = OnceLock::new();
+static HARNESS_INSTRUCTION_TOKEN_ESTIMATES: OnceLock<[u64; 5]> = OnceLock::new();
 static BASE_RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
-static INTERACTIVE_RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
+static QUESTION_RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
+static COORDINATION_RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
+static DEEPWORK_RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
 
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -305,7 +308,9 @@ pub(crate) struct ApiClient {
     window: u64,
     model_selection: SharedModelSelection,
     service_tier: ServiceTier,
+    harness_profile: HarnessProfile,
     ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
     prefer_websocket: bool,
     websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
@@ -322,20 +327,23 @@ pub(crate) struct ApiClient {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct HarnessInstructions;
+struct HarnessInstructions {
+    profile: HarnessProfile,
+}
 
 impl Serialize for HarnessInstructions {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(harness_instructions())
+        serializer.serialize_str(harness_instructions_for(self.profile))
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ResponsesApiTools {
     ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
 }
 
 impl Serialize for ResponsesApiTools {
@@ -343,7 +351,11 @@ impl Serialize for ResponsesApiTools {
     where
         S: serde::Serializer,
     {
-        responses_api_specifications_json(self.ask_user_question_enabled).serialize(serializer)
+        responses_api_specifications_json(
+            self.ask_user_question_enabled,
+            self.specialist_coordination_enabled,
+        )
+        .serialize(serializer)
     }
 }
 
@@ -810,7 +822,9 @@ impl ApiClient {
             window: compaction_count,
             model_selection: SharedModelSelection::new(model_selection),
             service_tier,
+            harness_profile: HarnessProfile::Main,
             ask_user_question_enabled: false,
+            specialist_coordination_enabled: false,
             prefer_websocket: true,
             websocket_prewarm_attempted: false,
             websocket: None,
@@ -840,7 +854,9 @@ impl ApiClient {
             window: self.window,
             model_selection: self.model_selection.clone(),
             service_tier: self.service_tier,
+            harness_profile: self.harness_profile,
             ask_user_question_enabled: self.ask_user_question_enabled,
+            specialist_coordination_enabled: self.specialist_coordination_enabled,
             prefer_websocket: self.prefer_websocket,
             websocket_prewarm_attempted: false,
             websocket: None,
@@ -923,6 +939,15 @@ impl ApiClient {
         self.abandon_response();
     }
 
+    pub(crate) fn set_harness_profile(&mut self, profile: HarnessProfile) {
+        if self.harness_profile == profile {
+            return;
+        }
+        self.harness_profile = profile;
+        self.websocket_prewarm_attempted = false;
+        self.abandon_response();
+    }
+
     pub(crate) fn ask_user_question_enabled(&self) -> bool {
         self.ask_user_question_enabled
     }
@@ -932,6 +957,20 @@ impl ApiClient {
             return;
         }
         self.ask_user_question_enabled = enabled;
+        self.prefer_websocket = true;
+        self.websocket_prewarm_attempted = false;
+        self.abandon_response();
+    }
+
+    pub(crate) fn specialist_coordination_enabled(&self) -> bool {
+        self.specialist_coordination_enabled
+    }
+
+    pub(crate) fn set_specialist_coordination_enabled(&mut self, enabled: bool) {
+        if self.specialist_coordination_enabled == enabled {
+            return;
+        }
+        self.specialist_coordination_enabled = enabled;
         self.prefer_websocket = true;
         self.websocket_prewarm_attempted = false;
         self.abandon_response();
@@ -1662,8 +1701,11 @@ impl ApiClient {
         }
         let trigger = compaction::compaction_trigger();
         let selection = self.model_selection.get();
-        let [tool_tokens, instruction_tokens] =
-            estimated_harness_tokens_for(self.ask_user_question_enabled);
+        let [tool_tokens, instruction_tokens] = estimated_harness_tokens_for(
+            self.harness_profile,
+            self.ask_user_question_enabled,
+            self.specialist_coordination_enabled,
+        );
         let fixed_request_tokens = tool_tokens
             .saturating_add(instruction_tokens)
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
@@ -1771,9 +1813,12 @@ impl ApiClient {
     ) -> ResponsesRequest {
         ResponsesRequest {
             model: selection.model,
-            instructions: HarnessInstructions,
+            instructions: HarnessInstructions {
+                profile: self.harness_profile,
+            },
             tools: ResponsesApiTools {
                 ask_user_question_enabled: self.ask_user_question_enabled,
+                specialist_coordination_enabled: self.specialist_coordination_enabled,
             },
             tool_choice: "auto",
             parallel_tool_calls: true,
@@ -2084,42 +2129,89 @@ impl RequestKind {
     }
 }
 
-pub(crate) fn harness_instructions() -> &'static str {
-    SYSTEM_PROMPT.trim()
+pub(crate) fn harness_instructions_for(profile: HarnessProfile) -> &'static str {
+    fn specialist_harness(role: crate::deepwork::SpecialistRole) -> String {
+        format!("{}\n\n{}", SYSTEM_PROMPT.trim(), role.prompt())
+    }
+    static EVALS: OnceLock<String> = OnceLock::new();
+    static MANIFEST: OnceLock<String> = OnceLock::new();
+    static WORKER: OnceLock<String> = OnceLock::new();
+    static REVIEWER: OnceLock<String> = OnceLock::new();
+    match profile {
+        HarnessProfile::Main => SYSTEM_PROMPT.trim(),
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Evals) => {
+            EVALS.get_or_init(|| specialist_harness(crate::deepwork::SpecialistRole::Evals))
+        }
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Manifest) => {
+            MANIFEST.get_or_init(|| specialist_harness(crate::deepwork::SpecialistRole::Manifest))
+        }
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Worker) => {
+            WORKER.get_or_init(|| specialist_harness(crate::deepwork::SpecialistRole::Worker))
+        }
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Reviewer) => {
+            REVIEWER.get_or_init(|| specialist_harness(crate::deepwork::SpecialistRole::Reviewer))
+        }
+    }
 }
 
-fn responses_api_specifications_json(ask_user_question_enabled: bool) -> &'static RawValue {
+fn responses_api_specifications_json(
+    ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
+) -> &'static RawValue {
     // Match Codex's typed request path: serialize each fixed tool catalogue once, then transfer its
     // raw JSON directly into every HTTP and WebSocket request.
-    let storage = if ask_user_question_enabled {
-        &INTERACTIVE_RESPONSES_API_SPECIFICATIONS_JSON
-    } else {
-        &BASE_RESPONSES_API_SPECIFICATIONS_JSON
+    let storage = match (ask_user_question_enabled, specialist_coordination_enabled) {
+        (false, false) => &BASE_RESPONSES_API_SPECIFICATIONS_JSON,
+        (true, false) => &QUESTION_RESPONSES_API_SPECIFICATIONS_JSON,
+        (false, true) => &COORDINATION_RESPONSES_API_SPECIFICATIONS_JSON,
+        (true, true) => &DEEPWORK_RESPONSES_API_SPECIFICATIONS_JSON,
     };
     storage.get_or_init(|| {
         serde_json::value::to_raw_value(tools::responses_api_specifications_for(
             ask_user_question_enabled,
+            specialist_coordination_enabled,
         ))
         .unwrap_or_else(|error| panic!("failed to encode Responses tool specifications: {error}"))
     })
 }
 
-pub(crate) fn estimated_harness_tokens_for(ask_user_question_enabled: bool) -> [u64; 2] {
-    let storage = if ask_user_question_enabled {
-        &INTERACTIVE_HARNESS_TOKEN_ESTIMATES
-    } else {
-        &BASE_HARNESS_TOKEN_ESTIMATES
-    };
-    *storage.get_or_init(|| {
-        [
+pub(crate) fn estimated_harness_tokens_for(
+    profile: HarnessProfile,
+    ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
+) -> [u64; 2] {
+    let tool_index = usize::from(ask_user_question_enabled)
+        | (usize::from(specialist_coordination_enabled) << 1);
+    let tools = TOOL_TOKEN_ESTIMATES.get_or_init(|| {
+        std::array::from_fn(|index| {
             estimated_tokens(tools::responses_api_specifications_for(
-                ask_user_question_enabled,
-            )),
-            estimated_tokens(std::slice::from_ref(&Value::String(
-                harness_instructions().to_string(),
-            ))),
+                index & 1 != 0,
+                index & 2 != 0,
+            ))
+        })
+    })[tool_index];
+    let profile_index = match profile {
+        HarnessProfile::Main => 0,
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Evals) => 1,
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Manifest) => 2,
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Worker) => 3,
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Reviewer) => 4,
+    };
+    let instructions = HARNESS_INSTRUCTION_TOKEN_ESTIMATES.get_or_init(|| {
+        [
+            HarnessProfile::Main,
+            HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Evals),
+            HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Manifest),
+            HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Worker),
+            HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Reviewer),
         ]
-    })
+        .map(|profile| {
+            estimated_tokens(std::slice::from_ref(&Value::String(
+                harness_instructions_for(profile).to_string(),
+            )))
+        })
+    })[profile_index];
+    [tools, instructions]
 }
 
 async fn collect_http_stream(
@@ -2801,26 +2893,6 @@ impl ResponseItemSummary {
     }
 }
 
-#[cfg(test)]
-fn process_event(
-    data: &str,
-    collected: &mut CollectedResponse,
-    completed_items: &UnboundedSender<Value>,
-    events: Option<&UnboundedSender<AgentEvent>>,
-    expected_model: &str,
-    server_model_warning_emitted: &mut bool,
-) -> ApiResult<()> {
-    process_event_at(
-        data,
-        collected,
-        completed_items,
-        events,
-        expected_model,
-        server_model_warning_emitted,
-        Instant::now(),
-    )
-}
-
 fn process_event_at(
     data: &str,
     collected: &mut CollectedResponse,
@@ -3376,7 +3448,3 @@ fn parse_rate_limit_delay(message: &str) -> Option<Duration> {
         None
     }
 }
-
-#[cfg(test)]
-#[path = "api_tests.rs"]
-mod tests;

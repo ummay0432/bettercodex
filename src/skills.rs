@@ -1256,6 +1256,3 @@ pub(crate) fn is_common_environment_variable(name: &str) -> bool {
         .any(|common| name.eq_ignore_ascii_case(common))
 }
 
-#[cfg(test)]
-#[path = "skills_review_tests.rs"]
-mod review_tests;

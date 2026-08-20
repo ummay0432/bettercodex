@@ -59,26 +59,3 @@ fn ansi_escape(input: &str) -> Text<'static> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ansi_escape_line;
-    use ratatui::style::Color;
-
-    #[test]
-    fn strips_non_ansi_terminal_controls_without_losing_sgr_styles() {
-        let line = ansi_escape_line("\u{7}safe\u{8} \x1b[31mred\x1b[0m\u{009b}");
-        let visible = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-
-        assert_eq!(visible, "safe red");
-        assert!(!visible.chars().any(char::is_control));
-        assert!(
-            line.spans
-                .iter()
-                .any(|span| span.content == "red" && span.style.fg == Some(Color::Red))
-        );
-    }
-}

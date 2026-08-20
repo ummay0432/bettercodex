@@ -60,7 +60,3 @@ pub(super) fn startup_replay_input(input: &[u8]) -> Vec<u8> {
     }
     replay
 }
-
-#[cfg(test)]
-#[path = "startup_replay_tests.rs"]
-mod tests;

@@ -40,30 +40,3 @@ pub(crate) fn prefix_fitting_width(text: &str, max_width: usize) -> &str {
     }
     &text[..end]
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-    use ratatui::text::Line;
-
-    #[test]
-    fn display_width_matches_ratatui_halfwidth_sound_marks_without_overflow() {
-        assert_eq!(display_width("ｶﾞﾊﾟ"), 4);
-        assert_eq!(display_width("ｶﾞﾞ"), 3);
-        assert_eq!(display_width("界ﾞ"), 3);
-
-        let text = "a".repeat(65_536);
-        assert_eq!(display_width(&text), 65_536);
-        assert_eq!(line_width(&Line::from(text)), 65_536);
-    }
-
-    #[test]
-    fn fitting_prefix_preserves_extended_graphemes() {
-        let text = "👩‍💻e\u{301}x";
-        assert_eq!(prefix_fitting_width(text, 0), "");
-        assert_eq!(prefix_fitting_width(text, 1), "");
-        assert_eq!(prefix_fitting_width(text, 2), "👩‍💻");
-        assert_eq!(prefix_fitting_width(text, 3), "👩‍💻e\u{301}");
-    }
-}

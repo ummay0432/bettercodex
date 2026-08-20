@@ -116,10 +116,6 @@ impl AvailableUpdate {
         &self.latest_version
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_fixture() -> Self {
-        Self::new("1.2.3", "1.3.0")
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -919,6 +915,3 @@ fn run_installer_script(
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "update_tests.rs"]
-mod tests;

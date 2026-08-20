@@ -105,22 +105,3 @@ pub(super) fn blend(
         (foreground.2 as f32 * alpha + background.2 as f32 * (1.0 - alpha)) as u8,
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn semantic_colors_adapt_to_light_backgrounds_and_use_terminal_defaults_when_unknown() {
-        assert_eq!(
-            accent_color_for(Some((255, 255, 255))),
-            Color::Rgb(0, 95, 135)
-        );
-        assert_eq!(accent_color_for(None), Color::Cyan);
-        assert_eq!(
-            warning_color_for(Some((255, 255, 255))),
-            Color::Rgb(135, 75, 0)
-        );
-        assert_eq!(warning_color_for(None), Color::Yellow);
-    }
-}

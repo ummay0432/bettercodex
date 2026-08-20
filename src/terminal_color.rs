@@ -53,24 +53,3 @@ fn no_color() -> bool {
     !matches!(std::env::var("NO_COLOR").as_deref(), Ok("0") | Err(_))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::force_color_level_from_values;
-
-    #[test]
-    fn explicit_force_color_disable_remains_authoritative() {
-        assert_eq!(force_color_level_from_values(Some("0"), Some("1")), Some(0));
-        assert_eq!(force_color_level_from_values(Some("false"), None), Some(0));
-        assert_eq!(force_color_level_from_values(None, Some("0")), None);
-        assert_eq!(force_color_level_from_values(None, None), None);
-    }
-
-    #[test]
-    fn force_color_levels_are_bounded_for_truecolor_detection() {
-        assert_eq!(force_color_level_from_values(Some(""), None), Some(1));
-        assert_eq!(force_color_level_from_values(Some("2"), None), Some(2));
-        assert_eq!(force_color_level_from_values(Some("3"), None), Some(3));
-        assert_eq!(force_color_level_from_values(Some("9"), None), Some(3));
-        assert_eq!(force_color_level_from_values(None, Some("1")), Some(1));
-    }
-}

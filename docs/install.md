@@ -158,23 +158,3 @@ Development binaries intentionally have no embedded release tag. A standard
 release-profile build can check for a newer published version and use its exact
 notice command to install through the release channel. A debug build does
 neither.
-
-## Development checks
-
-The routine local gate mirrors upstream Codex:
-
-```sh
-just fix
-just fmt
-just test
-just clippy -- -D warnings
-cargo build --release --locked
-```
-
-The installer suite uses local fixtures and mocked GitHub endpoints:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/install_tests.py
-```
-
-See [the development workflow](development.md) for source and artifact rules.

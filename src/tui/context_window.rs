@@ -55,6 +55,10 @@ impl ContextWindowView {
         self.snapshot.ask_user_question_enabled
     }
 
+    pub(super) fn specialist_coordination_enabled(&self) -> bool {
+        self.snapshot.specialist_coordination_enabled
+    }
+
     pub(super) fn preferred_height(&self, width: u16) -> u16 {
         panel_height(width, self.segments().len())
     }
@@ -128,7 +132,10 @@ impl ContextWindowView {
                 format_tokens(self.snapshot.compact_at_tokens)
             ))
             .dim(),
-            tool_summary_line(self.snapshot.ask_user_question_enabled),
+            tool_summary_line(
+                self.snapshot.ask_user_question_enabled,
+                self.snapshot.specialist_coordination_enabled,
+            ),
             Line::default(),
         ];
         frame.render_widget(Paragraph::new(lines), area);
@@ -224,12 +231,17 @@ impl ContextWindowView {
     }
 }
 
-fn tool_summary_line(ask_user_question_enabled: bool) -> Line<'static> {
+fn tool_summary_line(
+    ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
+) -> Line<'static> {
     let mut spans = vec![Span::styled("Tools  ", palette::accent_style())];
-    for (index, specification) in
-        crate::tools::responses_api_specifications_for(ask_user_question_enabled)
-            .iter()
-            .enumerate()
+    for (index, specification) in crate::tools::responses_api_specifications_for(
+        ask_user_question_enabled,
+        specialist_coordination_enabled,
+    )
+    .iter()
+    .enumerate()
     {
         if index > 0 {
             spans.push(Span::from(" · ").dim());

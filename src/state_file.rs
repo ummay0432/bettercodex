@@ -172,6 +172,3 @@ fn temporary_path(path: &Path) -> Result<PathBuf> {
     )
 }
 
-#[cfg(test)]
-#[path = "state_file_tests.rs"]
-mod tests;

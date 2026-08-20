@@ -11,6 +11,10 @@ use crate::ask_user_question::MAX_QUESTION_CHARS;
 use crate::ask_user_question::MAX_QUESTIONS;
 use crate::ask_user_question::MIN_OPTIONS;
 use crate::ask_user_question::TOOL_NAME as ASK_USER_QUESTION_NAME;
+use crate::deepwork::CoordinateSpecialistArgs;
+use crate::deepwork::DeepworkRequester;
+use crate::deepwork::SpecialistRole;
+use crate::deepwork::TOOL_NAME as COORDINATE_SPECIALIST_NAME;
 use crate::events::AgentEvent;
 use crate::private_fs::AnchoredPath;
 use crate::private_fs::DirectoryHandle;
@@ -148,8 +152,6 @@ impl ToolCall {
             }
             Err(error) => Err(error),
         };
-        #[cfg(test)]
-        crate::process_termination_test_support::stop_at("tool_result_before_finish");
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -177,10 +179,6 @@ impl ToolCall {
                 tool = %self.name,
                 "failed to record tool completion lifecycle"
             );
-        }
-        #[cfg(test)]
-        if matches!(self.name.as_str(), BASH_NAME | WRITE_NAME | EDIT_NAME) {
-            crate::process_termination_test_support::stop_at("tool_finished");
         }
 
         if let Some(events) = events {
@@ -454,6 +452,8 @@ pub(crate) struct ToolRuntime {
     cwd: PathBuf,
     ask_user_question: Option<AskUserQuestionRequester>,
     ask_user_question_enabled: bool,
+    deepwork: Option<DeepworkRequester>,
+    specialist_coordination_enabled: bool,
 }
 
 impl ToolRuntime {
@@ -462,6 +462,8 @@ impl ToolRuntime {
             cwd,
             ask_user_question: None,
             ask_user_question_enabled: false,
+            deepwork: None,
+            specialist_coordination_enabled: false,
         }
     }
 
@@ -479,6 +481,26 @@ impl ToolRuntime {
 
     pub(crate) fn ask_user_question_enabled(&self) -> bool {
         self.ask_user_question_activated() && self.ask_user_question.is_some()
+    }
+
+    pub(crate) fn set_deepwork_requester(&mut self, requester: DeepworkRequester) {
+        self.deepwork = Some(requester);
+    }
+
+    pub(crate) fn deepwork_requester(&self) -> Option<DeepworkRequester> {
+        self.deepwork.clone()
+    }
+
+    pub(crate) fn set_specialist_coordination_enabled(&mut self, enabled: bool) {
+        self.specialist_coordination_enabled = enabled;
+    }
+
+    pub(crate) fn specialist_coordination_activated(&self) -> bool {
+        self.specialist_coordination_enabled
+    }
+
+    pub(crate) fn specialist_coordination_enabled(&self) -> bool {
+        self.specialist_coordination_activated() && self.deepwork.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -540,6 +562,19 @@ impl ToolRuntime {
                 let response = requester
                     .request(call_id.to_string(), arguments, &cancellation)
                     .await?;
+                ToolResult::structured(serde_json::to_value(response)?, truncation_policy)
+            }
+            COORDINATE_SPECIALIST_NAME => {
+                if !self.specialist_coordination_enabled() {
+                    return Err(anyhow!("unknown tool `{name}`"));
+                }
+                let arguments: CoordinateSpecialistArgs = deserialize_arguments(input)?;
+                arguments.validate()?;
+                let requester = self
+                    .deepwork
+                    .as_ref()
+                    .context("deepwork requester disappeared after specialist tool admission")?;
+                let response = requester.coordinate(arguments, &cancellation).await?;
                 ToolResult::structured(serde_json::to_value(response)?, truncation_policy)
             }
             _ => Err(anyhow!("unknown tool `{name}`")),
@@ -895,11 +930,6 @@ struct WriteArgs {
     content: String,
 }
 
-#[cfg(test)]
-fn write(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<ToolResult> {
-    write_with_lifecycle(cwd, input, cancellation, "", None)
-}
-
 fn write_with_lifecycle(
     cwd: &Path,
     input: Value,
@@ -933,8 +963,6 @@ fn write_with_lifecycle(
             .record_started(call_id)
             .context("write mutation was not attempted because lifecycle start was not saved")?;
     }
-    #[cfg(test)]
-    crate::process_termination_test_support::stop_at("write_started");
     let WritePreparation {
         preview,
         pre_state,
@@ -975,8 +1003,6 @@ fn write_with_lifecycle(
             .record_mutation_prepared(call_id, evidence.clone())
             .context("write mutation was not attempted because lifecycle evidence was not saved")?;
     }
-    #[cfg(test)]
-    crate::process_termination_test_support::stop_at("write_prepared");
     // Recheck after lifecycle I/O. Once parent creation or private staging starts, finish the
     // attempt so cancellation cannot be reported after a committed replacement.
     ensure_not_cancelled(cancellation, WRITE_NAME)?;
@@ -990,8 +1016,6 @@ fn write_with_lifecycle(
                     parent.display()
                 )
             })?;
-            #[cfg(test)]
-            crate::process_termination_test_support::stop_at("write_parent_created");
             if let (Some(lifecycle), Some(evidence)) = (lifecycle, evidence.as_mut()) {
                 evidence.target_parent = Some(anchored.parent_identity());
                 lifecycle
@@ -1018,8 +1042,6 @@ fn write_with_lifecycle(
             },
         )
         .with_context(|| format!("unable to write `{}`", path.display()))?;
-        #[cfg(test)]
-        crate::process_termination_test_support::stop_at("write_replaced");
         Ok(outcome)
     })();
     let outcome = match mutation {
@@ -1459,11 +1481,6 @@ struct Replacement {
     new_text: String,
 }
 
-#[cfg(test)]
-fn edit(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<ToolResult> {
-    edit_with_lifecycle(cwd, input, cancellation, "", None)
-}
-
 fn edit_with_lifecycle(
     cwd: &Path,
     input: Value,
@@ -1486,8 +1503,6 @@ fn edit_with_lifecycle(
             .record_started(call_id)
             .context("edit mutation was not attempted because lifecycle start was not saved")?;
     }
-    #[cfg(test)]
-    crate::process_termination_test_support::stop_at("edit_started");
 
     let target = AnchoredPath::open(&write_path)
         .with_context(|| format!("unable to read `{}` as UTF-8 text", path.display()))?;
@@ -1636,8 +1651,6 @@ fn edit_with_lifecycle(
             .record_mutation_prepared(call_id, evidence.clone())
             .context("edit mutation was not attempted because lifecycle evidence was not saved")?;
     }
-    #[cfg(test)]
-    crate::process_termination_test_support::stop_at("edit_prepared");
     // Lifecycle recording may perform I/O, so honor a cancellation that arrived before staging.
     // After staging starts, the helper either commits once or reports that it did not commit.
     ensure_not_cancelled(cancellation, EDIT_NAME)?;
@@ -1655,8 +1668,6 @@ fn edit_with_lifecycle(
             Ok(())
         },
     )?;
-    #[cfg(test)]
-    crate::process_termination_test_support::stop_at("edit_replaced");
     let mut message = if outcome.path_requires_inspection() {
         format!(
             "An atomic edit replacement for {} block(s) at {} completed in the pinned parent directory; the final path requires inspection",
@@ -2084,8 +2095,6 @@ fn write_file_atomically(
             })?,
         ));
         record_staging(staging.evidence()?)?;
-        #[cfg(test)]
-        crate::process_termination_test_support::stop_at("atomic_temporary_written");
 
         // These checks detect ordinary concurrent replacement and parent rebinding, but are not a
         // hardened security boundary: POSIX rename cannot condition replacement on an expected
@@ -2161,8 +2170,6 @@ fn write_file_atomically(
                 }
             }
         }
-        #[cfg(test)]
-        crate::process_termination_test_support::stop_at("atomic_replacement_committed");
         committed_file = Some((file, committed_snapshot));
         Ok(())
     })();
@@ -2372,11 +2379,13 @@ fn resolve_path(cwd: &Path, requested: &str) -> PathBuf {
 
 pub(crate) fn responses_api_specifications_for(
     ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
 ) -> &'static [Value] {
-    if ask_user_question_enabled {
-        &RESPONSES_API_SPECIFICATIONS
-    } else {
-        &BASE_RESPONSES_API_SPECIFICATIONS
+    match (ask_user_question_enabled, specialist_coordination_enabled) {
+        (false, false) => &BASE_RESPONSES_API_SPECIFICATIONS,
+        (true, false) => &QUESTION_RESPONSES_API_SPECIFICATIONS,
+        (false, true) => &COORDINATION_RESPONSES_API_SPECIFICATIONS,
+        (true, true) => &DEEPWORK_RESPONSES_API_SPECIFICATIONS,
     }
 }
 
@@ -2416,6 +2425,12 @@ static TOOL_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
             ask_user_question_schema(),
             ask_user_question_output_schema(),
         ),
+        function_tool(
+            COORDINATE_SPECIALIST_NAME,
+            "Coordinate the active `$deepwork` run. This is a strict sequential pipeline, not a general delegation tool. Use `approve_interview` only after the user approves the task contract, then start, supervise, inspect, and explicitly accept each expected specialist. Use `wait` instead of polling; it blocks until a meaningful completion, blocker, interruption, or failure exists. A completed turn remains available for review: send concrete corrections to the same session, or atomically accept and retire it with `retire`. After accepted `$evals` and `$manifest`, use `approve_readiness` only after the user approves the final execution contract. Revive direct amendments when prior context remains useful; replace stale or biased work. `status` recovers the canonical run state after resume. Never use this tool outside a user-invoked `$deepwork` run.",
+            coordinate_specialist_schema(),
+            coordinate_specialist_output_schema(),
+        ),
         json!({
             "type": "web_search",
             "external_web_access": true,
@@ -2424,20 +2439,30 @@ static TOOL_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
     ]
 });
 
-static RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
-    responses_specifications(/*ask_user_question_enabled*/ true)
-});
+static DEEPWORK_RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> =
+    LazyLock::new(|| responses_specifications(true, true));
 
-static BASE_RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
-    responses_specifications(/*ask_user_question_enabled*/ false)
-});
+static QUESTION_RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> =
+    LazyLock::new(|| responses_specifications(true, false));
 
-fn responses_specifications(ask_user_question_enabled: bool) -> Vec<Value> {
+static COORDINATION_RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> =
+    LazyLock::new(|| responses_specifications(false, true));
+
+static BASE_RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> =
+    LazyLock::new(|| responses_specifications(false, false));
+
+fn responses_specifications(
+    ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
+) -> Vec<Value> {
     TOOL_SPECIFICATIONS
         .iter()
         .filter(|specification| {
-            ask_user_question_enabled
-                || specification.get("name").and_then(Value::as_str) != Some(ASK_USER_QUESTION_NAME)
+            specification_is_enabled(
+                specification,
+                ask_user_question_enabled,
+                specialist_coordination_enabled,
+            )
         })
         .cloned()
         .map(|mut specification| {
@@ -2449,8 +2474,23 @@ fn responses_specifications(ask_user_question_enabled: bool) -> Vec<Value> {
         .collect()
 }
 
+fn specification_is_enabled(
+    specification: &Value,
+    ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
+) -> bool {
+    let name = specification.get("name").and_then(Value::as_str);
+    (ask_user_question_enabled || name != Some(ASK_USER_QUESTION_NAME))
+        && (specialist_coordination_enabled || name != Some(COORDINATE_SPECIALIST_NAME))
+}
+
 static CATALOGUE_TEXT: LazyLock<String> = LazyLock::new(|| {
-    render_catalogue(&TOOL_SPECIFICATIONS)
+    let specifications = TOOL_SPECIFICATIONS
+        .iter()
+        .filter(|specification| specification_is_enabled(specification, false, false))
+        .cloned()
+        .collect::<Vec<_>>();
+    render_catalogue(&specifications)
         .unwrap_or_else(|error| format!("failed to render tool catalogue: {error}"))
 });
 
@@ -2527,7 +2567,21 @@ fn render_catalogue_schema(output: &mut String, schema: &Value, depth: usize) ->
     }
 
     let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-        output.push_str("No fields.\n");
+        if let Some(variants) = schema
+            .get("anyOf")
+            .or_else(|| schema.get("oneOf"))
+            .and_then(Value::as_array)
+        {
+            output.push_str("One of these object shapes:\n\n");
+            for (index, variant) in variants.iter().enumerate() {
+                if index > 0 {
+                    output.push('\n');
+                }
+                render_catalogue_schema(output, variant, depth)?;
+            }
+        } else {
+            output.push_str("No fields.\n");
+        }
         return Ok(());
     };
     let required = schema
@@ -2582,6 +2636,28 @@ fn render_catalogue_property(
     }
     output.push('\n');
 
+    if let Some(variants) = schema
+        .get("anyOf")
+        .or_else(|| schema.get("oneOf"))
+        .and_then(Value::as_array)
+        && variants
+            .iter()
+            .all(|variant| variant.get("const").is_some())
+    {
+        for variant in variants {
+            output.push_str(&"  ".repeat(depth + 1));
+            output.push_str("- `");
+            output.push_str(&catalogue_schema_type(variant));
+            output.push('`');
+            if let Some(description) = variant.get("description").and_then(Value::as_str) {
+                output.push_str(" — ");
+                output.push_str(description);
+            }
+            output.push('\n');
+        }
+        return Ok(());
+    }
+
     render_catalogue_nested_objects(output, schema, depth)
 }
 
@@ -2609,6 +2685,11 @@ fn render_catalogue_nested_objects(
         .and_then(|nested| nested.get("type"))
         .and_then(Value::as_str)
         == Some("object")
+        && nested.is_some_and(|nested| {
+            nested.get("properties").is_some()
+                || nested.get("anyOf").is_some()
+                || nested.get("oneOf").is_some()
+        })
     {
         render_catalogue_schema(
             output,
@@ -2620,6 +2701,12 @@ fn render_catalogue_nested_objects(
 }
 
 fn catalogue_schema_type(schema: &Value) -> String {
+    if let Some(value) = schema.get("const") {
+        return match value {
+            Value::String(value) => format!("\"{value}\""),
+            value => value.to_string(),
+        };
+    }
     if let Some(variants) = schema
         .get("anyOf")
         .or_else(|| schema.get("oneOf"))
@@ -2853,6 +2940,130 @@ fn ask_user_question_output_schema() -> Value {
     })
 }
 
+fn coordinate_specialist_schema() -> Value {
+    let specialist = json!({
+        "type": "string",
+        "description": "Fixed pipeline specialist role.",
+        "oneOf": [
+            {"const": "evals", "description": SpecialistRole::Evals.description()},
+            {"const": "manifest", "description": SpecialistRole::Manifest.description()},
+            {"const": "worker", "description": SpecialistRole::Worker.description()},
+            {"const": "reviewer", "description": SpecialistRole::Reviewer.description()}
+        ]
+    });
+    json!({
+        "type": "object",
+        "description": "One deepwork coordination action.",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status"], "description": "Return bounded canonical pipeline state."}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["approve_interview"]},
+                    "contract": {"type": "string", "description": "User-approved task contract containing the literal `SUCCESS CRITERIA` heading followed by plain bullets."}
+                },
+                "required": ["action", "contract"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["approve_readiness"]},
+                    "contract": {"type": "string", "description": "User-approved execution contract containing the literal `SUCCESS CRITERIA` heading followed by plain bullets."}
+                },
+                "required": ["action", "contract"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["start"]},
+                    "specialist": specialist,
+                    "handoff": {"type": "string", "description": "Complete bounded stage handoff preserving the accepted task, literal SUCCESS CRITERIA block, constraints, non-goals, prior accepted outputs, and exact deliverable."}
+                },
+                "required": ["action", "specialist", "handoff"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["send"]},
+                    "session_id": {"type": "string", "description": "Stable specialist session UUID."},
+                    "message": {"type": "string", "description": "Concrete follow-up direction for the same live specialist context."}
+                },
+                "required": ["action", "session_id", "message"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["wait"]},
+                    "session_id": {"type": "string", "description": "Stable specialist session UUID."}
+                },
+                "required": ["action", "session_id"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["retire"]},
+                    "session_id": {"type": "string", "description": "Stable specialist session UUID to accept and retire."},
+                    "accepted_handoff": {"type": "string", "description": "Orchestrator-inspected stage output accepted for later handoffs."},
+                    "artifacts": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description": "Existing regular pipeline artifact paths under the current numbered `.deepwork` workspace."},
+                    "remaining_risks": {"type": "string", "description": "Known limitations or unresolved risks; omit when none."}
+                },
+                "required": ["action", "session_id", "accepted_handoff"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["revive"]},
+                    "session_id": {"type": "string", "description": "Stable retired specialist session UUID."},
+                    "message": {"type": "string", "description": "New user feedback or amendment that reopens this stage."}
+                },
+                "required": ["action", "session_id", "message"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["replace"]},
+                    "session_id": {"type": "string", "description": "Stable prior specialist session UUID."},
+                    "message": {"type": "string", "description": "Fresh redo brief containing the accepted handoff, current repository state, and new feedback."}
+                },
+                "required": ["action", "session_id", "message"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn coordinate_specialist_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {"type": "string"},
+            "stage": {"type": "string", "enum": ["interview", "evals", "manifest", "readiness", "worker", "reviewer", "completed"]},
+            "runIndex": {"type": "integer", "minimum": 0},
+            "workspace": {"type": "string"},
+            "message": {"type": "string"},
+            "sessionId": {"type": "string"},
+            "event": {"type": "object", "description": "Bounded meaningful specialist event, present for wait."},
+            "state": {"type": "object", "description": "Bounded canonical pipeline state, present for status."}
+        },
+        "required": ["action", "stage", "runIndex", "workspace", "message"],
+        "additionalProperties": false
+    })
+}
+
 fn edit_schema() -> Value {
     json!({
         "type": "object",
@@ -2877,7 +3088,3 @@ fn edit_schema() -> Value {
         "additionalProperties": false,
     })
 }
-
-#[cfg(test)]
-#[path = "tools_tests.rs"]
-mod tests;

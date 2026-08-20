@@ -46,17 +46,35 @@ struct ToolSummary {
 }
 
 impl ToolsView {
-    pub(super) fn standalone(ask_user_question_enabled: bool) -> Self {
-        Self::new(ToolsPlacement::Standalone, ask_user_question_enabled)
+    pub(super) fn standalone(
+        ask_user_question_enabled: bool,
+        specialist_coordination_enabled: bool,
+    ) -> Self {
+        Self::new(
+            ToolsPlacement::Standalone,
+            ask_user_question_enabled,
+            specialist_coordination_enabled,
+        )
     }
 
-    pub(super) fn under_context(ask_user_question_enabled: bool) -> Self {
-        Self::new(ToolsPlacement::UnderContext, ask_user_question_enabled)
+    pub(super) fn under_context(
+        ask_user_question_enabled: bool,
+        specialist_coordination_enabled: bool,
+    ) -> Self {
+        Self::new(
+            ToolsPlacement::UnderContext,
+            ask_user_question_enabled,
+            specialist_coordination_enabled,
+        )
     }
 
-    fn new(placement: ToolsPlacement, ask_user_question_enabled: bool) -> Self {
+    fn new(
+        placement: ToolsPlacement,
+        ask_user_question_enabled: bool,
+        specialist_coordination_enabled: bool,
+    ) -> Self {
         Self {
-            tools: tool_summaries(ask_user_question_enabled),
+            tools: tool_summaries(ask_user_question_enabled, specialist_coordination_enabled),
             placement,
         }
     }
@@ -161,38 +179,44 @@ impl ToolsView {
     }
 }
 
-fn tool_summaries(ask_user_question_enabled: bool) -> Vec<ToolSummary> {
-    crate::tools::responses_api_specifications_for(ask_user_question_enabled)
-        .iter()
-        .map(|specification| {
-            let hosted_web_search = specification
-                .get("type")
+fn tool_summaries(
+    ask_user_question_enabled: bool,
+    specialist_coordination_enabled: bool,
+) -> Vec<ToolSummary> {
+    crate::tools::responses_api_specifications_for(
+        ask_user_question_enabled,
+        specialist_coordination_enabled,
+    )
+    .iter()
+    .map(|specification| {
+        let hosted_web_search = specification
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("web_search");
+        let name = if hosted_web_search {
+            "web_search"
+        } else {
+            specification
+                .get("name")
                 .and_then(serde_json::Value::as_str)
-                == Some("web_search");
-            let name = if hosted_web_search {
-                "web_search"
-            } else {
-                specification
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-            };
-            let description = if hosted_web_search {
-                "Search and browse the live web using text and image results."
-            } else {
-                specification
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                    .map(brief_description)
-                    .unwrap_or("No description available.")
-            };
-            ToolSummary {
-                name,
-                description,
-                tokens: estimated_tokens(std::slice::from_ref(specification)),
-            }
-        })
-        .collect()
+                .unwrap_or("unknown")
+        };
+        let description = if hosted_web_search {
+            "Search and browse the live web using text and image results."
+        } else {
+            specification
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(brief_description)
+                .unwrap_or("No description available.")
+        };
+        ToolSummary {
+            name,
+            description,
+            tokens: estimated_tokens(std::slice::from_ref(specification)),
+        }
+    })
+    .collect()
 }
 
 fn brief_description(description: &'static str) -> &'static str {

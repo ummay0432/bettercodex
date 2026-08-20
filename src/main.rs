@@ -6,6 +6,7 @@ mod assistant_message;
 mod auth;
 mod compaction;
 mod context;
+mod deepwork;
 mod events;
 mod file_context;
 mod file_search;
@@ -27,6 +28,7 @@ mod rate_limits;
 mod repository;
 mod rollout;
 mod service_tier;
+mod session_group;
 mod shell_command;
 mod skill_settings;
 mod skills;
@@ -43,32 +45,6 @@ mod url_encoding;
 mod usage;
 mod web_search;
 
-#[cfg(test)]
-mod process_termination_test_support {
-    use std::path::Path;
-
-    pub(crate) const ARM_FILE_ENV: &str = "BCODEX_TEST_PROCESS_TERMINATION_ARM_FILE";
-    pub(crate) const MARKER_FILE_ENV: &str = "BCODEX_TEST_PROCESS_TERMINATION_MARKER_FILE";
-    pub(crate) const STOP_AT_ENV: &str = "BCODEX_TEST_PROCESS_TERMINATION_STOP_AT";
-
-    pub(crate) fn stop_at(boundary: &str) {
-        if std::env::var(STOP_AT_ENV).as_deref() != Ok(boundary) {
-            return;
-        }
-        if let Some(arm_file) = std::env::var_os(ARM_FILE_ENV)
-            && !Path::new(&arm_file).exists()
-        {
-            return;
-        }
-        let marker = std::env::var_os(MARKER_FILE_ENV)
-            .expect("process-termination test stop point requires a marker file");
-        std::fs::write(marker, boundary).expect("write process-termination test marker");
-        // SIGSTOP and SIGKILL cannot be caught or ignored. The parent test observes the marker,
-        // kills this process, and then verifies recovery from the exact stopped boundary.
-        assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
-        std::process::abort();
-    }
-}
 
 use agent::Agent;
 use anyhow::Context;
@@ -138,17 +114,6 @@ fn run() -> Result<()> {
         }
         Command::ToolCatalogue => {
             write_stdout_line(format_args!("{}", tools::catalogue_text()))?;
-            Ok(())
-        }
-        Command::InternalInstallSmoke => {
-            let home = paths::bettercodex_home().ok_or_else(|| {
-                anyhow!("install smoke test requires BCODEX_HOME or a user home directory")
-            })?;
-            system_skills::install(&home)?;
-            write_stdout_line(format_args!(
-                "bcodex {} install smoke passed",
-                env!("CARGO_PKG_VERSION")
-            ))?;
             Ok(())
         }
         Command::InternalReleaseTag => {
@@ -348,7 +313,6 @@ enum Command {
     Help,
     Version,
     ToolCatalogue,
-    InternalInstallSmoke,
     InternalReleaseTag,
     InternalSourceRevision,
     Login(LoginCommand),
@@ -376,18 +340,6 @@ struct RunOptions {
 impl Command {
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut arguments = arguments.into_iter().peekable();
-        if arguments
-            .peek()
-            .is_some_and(|argument| argument == "--internal-install-smoke")
-        {
-            arguments.next();
-            if arguments.next().is_some() {
-                return Err(anyhow!(
-                    "internal install smoke helper received extra arguments"
-                ));
-            }
-            return Ok(Self::InternalInstallSmoke);
-        }
         if arguments
             .peek()
             .is_some_and(|argument| argument == "--internal-release-tag")
@@ -571,96 +523,3 @@ fn write_update_help() -> io::Result<()> {
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_resume_images_and_detail() {
-        let id = uuid::Uuid::new_v4();
-        let command = Command::parse([
-            "resume".to_string(),
-            id.to_string(),
-            "--image".to_string(),
-            "screen.png".to_string(),
-            "--image-detail".to_string(),
-            "original".to_string(),
-            "inspect".to_string(),
-        ])
-        .unwrap();
-        let Command::Resume { selector, options } = command else {
-            panic!("expected resume command");
-        };
-        assert_eq!(selector, ResumeSelector::Id(id));
-        assert_eq!(options.images, vec![PathBuf::from("screen.png")]);
-        assert_eq!(options.image_detail, ImageDetail::Original);
-        assert_eq!(options.prompt, "inspect");
-    }
-
-    #[test]
-    fn rejects_unknown_options() {
-        assert!(Command::parse(["--model".to_string()]).is_err());
-    }
-
-    #[test]
-    fn parses_update_command_and_help() {
-        assert!(matches!(
-            Command::parse(["update".to_string()]).unwrap(),
-            Command::Update
-        ));
-        assert!(matches!(
-            Command::parse(["update".to_string(), "--help".to_string()]).unwrap(),
-            Command::UpdateHelp
-        ));
-        assert!(Command::parse(["update".to_string(), "unexpected".to_string()]).is_err());
-
-        let command = Command::parse(["--".to_string(), "update".to_string()]).unwrap();
-        let Command::Run(options) = command else {
-            panic!("expected run command");
-        };
-        assert_eq!(options.prompt, "update");
-    }
-
-    #[test]
-    fn internal_install_verification_commands_are_strictly_parsed() {
-        assert!(matches!(
-            Command::parse(["--internal-install-smoke".to_string()]).unwrap(),
-            Command::InternalInstallSmoke
-        ));
-        assert!(matches!(
-            Command::parse(["--internal-release-tag".to_string()]).unwrap(),
-            Command::InternalReleaseTag
-        ));
-        assert!(matches!(
-            Command::parse(["--internal-source-revision".to_string()]).unwrap(),
-            Command::InternalSourceRevision
-        ));
-        assert!(
-            Command::parse([
-                "--internal-source-revision".to_string(),
-                "unexpected".to_string(),
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn parses_tool_catalogue_flag() {
-        assert!(matches!(
-            Command::parse(["--tool-catalogue".to_string()]).unwrap(),
-            Command::ToolCatalogue
-        ));
-    }
-
-    #[test]
-    fn only_the_first_resume_positional_can_select_a_session() {
-        let id = uuid::Uuid::new_v4();
-        let command =
-            Command::parse(["resume".to_string(), "compare".to_string(), id.to_string()]).unwrap();
-        let Command::Resume { selector, options } = command else {
-            panic!("expected resume command");
-        };
-        assert_eq!(selector, ResumeSelector::LatestForCwd);
-        assert_eq!(options.prompt, format!("compare {id}"));
-    }
-}

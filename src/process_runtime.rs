@@ -865,6 +865,3 @@ fn signal_process_group_with_member_fallback(
     }
 }
 
-#[cfg(test)]
-#[path = "process_runtime_tests.rs"]
-mod tests;

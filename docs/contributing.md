@@ -13,30 +13,15 @@ baseline can be agreed first.
 
 ## Development workflow
 
-Install the pinned Rust toolchain's formatting and lint components plus the
-upstream-style command helpers:
+Install the pinned Rust toolchain and fetch dependencies:
 
 ```sh
-rustup component add rustfmt clippy
-cargo install --locked just
-cargo install --locked cargo-nextest
-just install
+rustup show active-toolchain
+cargo fetch
 ```
 
 Retained Codex behavior should be ported from current upstream source rather
-than reimplemented. Keep bettercodex's fixed product boundaries in
-[`product-direction.md`](product-direction.md) and follow the complete workflow
-in [`development.md`](development.md).
-
-Before proposing an agreed change, run:
-
-```sh
-just fix
-just fmt
-just test
-just clippy -- -D warnings
-cargo build --release --locked
-```
+than reimplemented.
 
 Document user-visible behavior and keep commits focused. By submitting a
 contribution, you agree that it is licensed under this repository's

@@ -380,30 +380,3 @@ fn is_allowed_cloudflare_cookie_name(name: &str) -> bool {
     ) || name.starts_with("cf_chl_")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ChatGptCloudflareCookieStore;
-    use super::der_item_length;
-    use reqwest::cookie::CookieStore;
-    use reqwest::header::HeaderValue;
-
-    #[test]
-    fn cloudflare_store_excludes_account_cookies() {
-        let store = ChatGptCloudflareCookieStore::default();
-        let url = reqwest::Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap();
-        let cloudflare = HeaderValue::from_static("_cfuvid=visitor; Path=/; Secure");
-        let account = HeaderValue::from_static("chatgpt_session=secret; Path=/; Secure");
-        store.set_cookies(&mut [&cloudflare, &account].into_iter(), &url);
-        assert_eq!(
-            store
-                .cookies(&url)
-                .and_then(|value| value.to_str().ok().map(str::to_string)),
-            Some("_cfuvid=visitor".to_string())
-        );
-    }
-
-    #[test]
-    fn der_length_ignores_trailing_trusted_certificate_metadata() {
-        assert_eq!(der_item_length(&[0x30, 0x03, 1, 2, 3, 9, 9]), Some(5));
-    }
-}

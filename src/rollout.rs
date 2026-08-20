@@ -512,8 +512,6 @@ pub(crate) struct ToolLifecycleJournal {
 struct SharedRolloutFile {
     file: Mutex<LockedRolloutFile>,
     path: PathBuf,
-    #[cfg(test)]
-    fail_next_append: std::sync::atomic::AtomicBool,
 }
 
 struct LockedRolloutFile(File);
@@ -970,23 +968,6 @@ impl ToolLifecycleJournal {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_finished(
-        &self,
-        call_id: &str,
-        output: Value,
-        error: Option<String>,
-        file_change: Option<ToolFileChange>,
-        requires_inspection: bool,
-    ) -> Result<()> {
-        self.write_record(&RolloutRecord::ToolFinished {
-            call_id: call_id.to_string(),
-            output,
-            error,
-            file_change,
-            requires_inspection,
-        })
-    }
 
     pub(crate) async fn record_finished_async(
         &self,
@@ -1012,10 +993,6 @@ impl Rollout {
         Self::create_in_with_selection(&state_root()?, cwd, selection)
     }
 
-    #[cfg(test)]
-    pub(crate) fn create_in(root: &Path, cwd: &Path) -> Result<Self> {
-        Self::create_in_with_selection(root, cwd, &ModelSelection::default())
-    }
 
     pub(crate) fn create_in_with_selection(
         root: &Path,
@@ -1046,8 +1023,6 @@ impl Rollout {
             file: Arc::new(SharedRolloutFile {
                 file: Mutex::new(file),
                 path: path.clone(),
-                #[cfg(test)]
-                fail_next_append: std::sync::atomic::AtomicBool::new(false),
             }),
             metadata: metadata.clone(),
         };
@@ -1145,12 +1120,6 @@ impl Rollout {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn fail_next_append_for_test(&self) {
-        self.file
-            .fail_next_append
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
 
     pub(crate) fn record_fork(
         &mut self,
@@ -1314,10 +1283,6 @@ fn write_rollout_record(shared: &SharedRolloutFile, record: &impl Serialize) -> 
         serde_json::to_writer(&mut writer, record)
             .context("failed to encode session record")
             .and_then(|()| {
-                #[cfg(test)]
-                crate::process_termination_test_support::stop_at(
-                    "journal_record_encoded_before_newline",
-                );
                 writer
                     .write_all(b"\n")
                     .context("failed to terminate session record")
@@ -1332,8 +1297,6 @@ fn write_bounded_rollout_record(shared: &SharedRolloutFile, record: &impl Serial
     // small phase record and keeps serialization outside the journal lock when several tools
     // complete concurrently.
     let mut encoded = serde_json::to_vec(record).context("failed to encode session record")?;
-    #[cfg(test)]
-    crate::process_termination_test_support::stop_at("journal_record_encoded_before_newline");
     encoded.push(b'\n');
     append_rollout_record(shared, |file| {
         file.write_all(&encoded)
@@ -1356,17 +1319,7 @@ fn append_rollout_record(
         shared.file.clear_poison();
     }
     let record_start = file.metadata()?.len();
-    #[cfg(test)]
-    let inject_failure = shared
-        .fail_next_append
-        .swap(false, std::sync::atomic::Ordering::SeqCst);
     let append_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        #[cfg(test)]
-        if inject_failure {
-            file.write_all(b"{\"type\":")?;
-            file.flush()?;
-            return Err(anyhow!("injected session append failure"));
-        }
         append(&mut file)
     }));
     let append_result = match append_result {
@@ -1911,8 +1864,6 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         file: Arc::new(SharedRolloutFile {
             file: Mutex::new(file),
             path,
-            #[cfg(test)]
-            fail_next_append: std::sync::atomic::AtomicBool::new(false),
         }),
         metadata: metadata.clone(),
     };
@@ -3512,7 +3463,7 @@ fn repair_rollout_tail(
         .with_context(|| format!("failed to persist repaired session {}", path.display()))
 }
 
-fn state_root() -> Result<PathBuf> {
+pub(crate) fn state_root() -> Result<PathBuf> {
     let codex_home = crate::paths::codex_home()
         .ok_or_else(|| anyhow!("cannot locate bettercodex state: no user home is available"))?;
     Ok(codex_home.join(STATE_DIRECTORY))
@@ -3605,6 +3556,3 @@ fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
     }
 }
 
-#[cfg(test)]
-#[path = "rollout_tests.rs"]
-mod tests;

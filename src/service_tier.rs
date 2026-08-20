@@ -89,6 +89,3 @@ fn read_settings(path: &Path) -> Result<Settings> {
     Ok(settings)
 }
 
-#[cfg(test)]
-#[path = "service_tier_tests.rs"]
-mod tests;

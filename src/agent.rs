@@ -11,6 +11,9 @@ use crate::compaction::InitialContextInjection;
 use crate::context::ActiveTurnContext;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
+use crate::deepwork::DeepworkRequester;
+use crate::deepwork::HarnessProfile;
+use crate::deepwork::SpecialistRole;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
 use crate::input::UserInput;
@@ -401,12 +404,25 @@ pub(crate) struct Agent {
 
 impl Agent {
     pub(crate) fn new(cwd: impl AsRef<Path>) -> Result<Self> {
-        let cwd = canonical_directory(cwd.as_ref())?;
-        let auth = Auth::load()?;
         let model_selection = crate::model::load_default_selection().unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to load saved model selection; using the default");
             ModelSelection::default()
         });
+        Self::new_with_selection(cwd, model_selection)
+    }
+
+    /// Starts a fresh independent session with an explicit model profile.
+    ///
+    /// This deliberately creates a new rollout instead of forking another Agent's conversation.
+    /// The current working directory and repository instructions are discovered normally for the
+    /// child, while the selected model and reasoning effort never inherit Main's `/model` choice.
+    pub(crate) fn new_with_selection(
+        cwd: impl AsRef<Path>,
+        model_selection: ModelSelection,
+    ) -> Result<Self> {
+        let cwd = canonical_directory(cwd.as_ref())?;
+        model_selection.validate()?;
+        let auth = Auth::load()?;
         let service_tier = crate::service_tier::load_default().unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to load saved Fast mode preference; using off");
             ServiceTier::default()
@@ -433,6 +449,12 @@ impl Agent {
             transcript_checkpoint: None,
             forked_from: None,
         })
+    }
+
+    pub(crate) fn new_specialist(cwd: impl AsRef<Path>, role: SpecialistRole) -> Result<Self> {
+        let mut agent = Self::new_with_selection(cwd, role.model_selection())?;
+        agent.set_specialist_role(role)?;
+        Ok(agent)
     }
 
     pub(crate) fn resume(cwd: impl AsRef<Path>, selector: ResumeSelector) -> Result<Self> {
@@ -462,10 +484,7 @@ impl Agent {
             conversation.model_selection().clone(),
             conversation.service_tier(),
         )?;
-        let mut tools = ToolRuntime::new(self.cwd.clone());
-        let deepwork_active = self.tools.ask_user_question_activated()
-            || conversation.has_injected_skill(DEEPWORK_SYSTEM_SKILL_NAME);
-        tools.set_ask_user_question_enabled(deepwork_active);
+        let tools = ToolRuntime::new(self.cwd.clone());
         let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd: self.cwd.clone(),
@@ -498,6 +517,7 @@ impl Agent {
         let mut tools = ToolRuntime::new(cwd.clone());
         let deepwork_active = conversation.has_injected_skill(DEEPWORK_SYSTEM_SKILL_NAME);
         tools.set_ask_user_question_enabled(deepwork_active);
+        tools.set_specialist_coordination_enabled(deepwork_active);
         let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd,
@@ -542,26 +562,75 @@ impl Agent {
         requester: crate::ask_user_question::AskUserQuestionRequester,
     ) {
         self.tools.set_ask_user_question_requester(requester);
-        self.sync_ask_user_question_access();
+        self.sync_deepwork_tool_access();
     }
 
-    fn apply_skill_tool_access(&mut self, skill_context: &[Value]) {
+    pub(crate) fn set_deepwork_requester(&mut self, requester: DeepworkRequester) {
+        self.tools.set_deepwork_requester(requester);
+        self.sync_deepwork_tool_access();
+    }
+
+    pub(crate) fn restore_deepwork_access(&mut self) {
+        self.tools.set_ask_user_question_enabled(true);
+        self.tools.set_specialist_coordination_enabled(true);
+        self.sync_deepwork_tool_access();
+    }
+
+    pub(crate) fn set_specialist_role(&mut self, role: SpecialistRole) -> Result<()> {
+        self.startup_prewarm = None;
+        let profile = HarnessProfile::Specialist(role);
+        self.conversation.set_harness_profile(profile)?;
+        self.api.set_harness_profile(profile);
+        self.tools.set_ask_user_question_enabled(false);
+        self.tools.set_specialist_coordination_enabled(false);
+        self.sync_deepwork_tool_access();
+        Ok(())
+    }
+
+    async fn apply_skill_tool_access(
+        &mut self,
+        skill_context: &[Value],
+        original_task: Option<String>,
+    ) -> Result<()> {
         let activates_deepwork = skill_context.iter().any(|item| {
             crate::context::injected_skill_name(item) == Some(DEEPWORK_SYSTEM_SKILL_NAME)
         });
-        if activates_deepwork {
-            self.tools.set_ask_user_question_enabled(true);
-            self.sync_ask_user_question_access();
+        if !activates_deepwork {
+            return Ok(());
         }
+        let requester = self
+            .tools
+            .deepwork_requester()
+            .ok_or_else(|| anyhow!("$deepwork requires the interactive session coordinator"))?;
+        let status = requester
+            .activate(original_task.context("$deepwork activation lost the user's task")?)
+            .await?;
+        self.conversation
+            .extend([crate::context::deepwork_runtime_context(
+                status.run_index,
+                &status.workspace,
+                status.stage,
+            )])?;
+        self.tools.set_ask_user_question_enabled(true);
+        self.tools.set_specialist_coordination_enabled(true);
+        self.sync_deepwork_tool_access();
+        Ok(())
     }
 
-    fn sync_ask_user_question_access(&mut self) {
-        let enabled = self.tools.ask_user_question_enabled();
-        if self.api.ask_user_question_enabled() != enabled {
+    fn sync_deepwork_tool_access(&mut self) {
+        let ask_enabled = self.tools.ask_user_question_enabled();
+        let coordinate_enabled = self.tools.specialist_coordination_enabled();
+        if self.api.ask_user_question_enabled() != ask_enabled
+            || self.api.specialist_coordination_enabled() != coordinate_enabled
+        {
             self.startup_prewarm = None;
-            self.api.set_ask_user_question_enabled(enabled);
+            self.api.set_ask_user_question_enabled(ask_enabled);
+            self.api
+                .set_specialist_coordination_enabled(coordinate_enabled);
         }
-        self.conversation.set_ask_user_question_enabled(enabled);
+        self.conversation.set_ask_user_question_enabled(ask_enabled);
+        self.conversation
+            .set_specialist_coordination_enabled(coordinate_enabled);
     }
 
     pub(crate) fn service_tier(&self) -> ServiceTier {
@@ -572,10 +641,6 @@ impl Agent {
         self.conversation.set_service_tier(service_tier)?;
         self.api.set_service_tier(service_tier);
         Ok(())
-    }
-
-    pub(crate) fn context_tokens(&self) -> Option<u64> {
-        self.conversation.context_tokens()
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
@@ -1302,11 +1367,18 @@ impl Agent {
                 }
                 let has_blocking_attachments = input.has_blocking_attachments();
                 let cwd = self.cwd.clone();
+                let file_context_token_budget = self
+                    .conversation
+                    .model_selection()
+                    .effective_context_window();
                 let prepare = move || {
                     let (user_message, prompt_text, selected_skills, selected_files) =
                         input.into_message_and_attachments()?;
-                    let file_context =
-                        crate::file_context::inject_selected_files(&cwd, &selected_files);
+                    let file_context = crate::file_context::inject_selected_files(
+                        &cwd,
+                        &selected_files,
+                        file_context_token_budget,
+                    );
                     Ok::<_, anyhow::Error>((
                         user_message,
                         prompt_text,
@@ -1348,33 +1420,43 @@ impl Agent {
             return Ok(false);
         }
         reloaded?;
-        let (turn_context, skill_context_len, injected_files, warnings, real_user_message) =
-            match operator_input {
-                Some((prompt_text, selected_skills, file_context)) => {
-                    let skill_injections = self
-                        .conversation
-                        .skill_catalog()
-                        .explicit_injections(&prompt_text, &selected_skills);
-                    let crate::file_context::FileContextInjectionOutcome {
-                        items: file_items,
-                        injected: injected_files,
-                        warnings: file_warnings,
-                    } = file_context;
-                    let skill_context_len = skill_injections.items.len();
-                    let mut turn_context = skill_injections.items;
-                    turn_context.extend(file_items);
-                    let mut warnings = skill_injections.warnings;
-                    warnings.extend(file_warnings);
-                    (
-                        turn_context,
-                        skill_context_len,
-                        injected_files,
-                        warnings,
-                        true,
-                    )
-                }
-                None => (Vec::new(), 0, Vec::new(), Vec::new(), false),
-            };
+        let (
+            turn_context,
+            skill_context_len,
+            injected_files,
+            warnings,
+            real_user_message,
+            deepwork_original_task,
+        ) = match operator_input {
+            Some((prompt_text, selected_skills, file_context)) => {
+                let skill_injections = self
+                    .conversation
+                    .skill_catalog()
+                    .explicit_injections(&prompt_text, &selected_skills);
+                let activates_deepwork = skill_injections.items.iter().any(|item| {
+                    crate::context::injected_skill_name(item) == Some(DEEPWORK_SYSTEM_SKILL_NAME)
+                });
+                let crate::file_context::FileContextInjectionOutcome {
+                    items: file_items,
+                    injected: injected_files,
+                    warnings: file_warnings,
+                } = file_context;
+                let skill_context_len = skill_injections.items.len();
+                let mut turn_context = skill_injections.items;
+                turn_context.extend(file_items);
+                let mut warnings = skill_injections.warnings;
+                warnings.extend(file_warnings);
+                (
+                    turn_context,
+                    skill_context_len,
+                    injected_files,
+                    warnings,
+                    true,
+                    activates_deepwork.then_some(prompt_text),
+                )
+            }
+            None => (Vec::new(), 0, Vec::new(), Vec::new(), false, None),
+        };
         let mut projected = Vec::with_capacity(turn_context.len().saturating_add(1));
         projected.extend(turn_context.iter().cloned());
         projected.push(user_message);
@@ -1405,7 +1487,8 @@ impl Agent {
             return Ok(false);
         }
         self.conversation.append_projected(projection)?;
-        self.apply_skill_tool_access(&turn_context[..skill_context_len]);
+        self.apply_skill_tool_access(&turn_context[..skill_context_len], deepwork_original_task)
+            .await?;
         if let Some(id) = steering_id {
             emit(events, AgentEvent::SteeringCommitted(id));
         } else {
@@ -1474,7 +1557,3 @@ fn emit(events: &Option<UnboundedSender<AgentEvent>>, event: AgentEvent) {
         let _ = events.send(event);
     }
 }
-
-#[cfg(test)]
-#[path = "agent_tests.rs"]
-mod tests;

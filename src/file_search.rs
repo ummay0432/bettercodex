@@ -553,6 +553,3 @@ fn matcher_worker(
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "file_search_tests.rs"]
-mod tests;

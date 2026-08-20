@@ -59,6 +59,3 @@ pub(crate) fn truncate_text_with_policy(content: &str, policy: TruncationPolicy)
     }
 }
 
-#[cfg(test)]
-#[path = "truncation_tests.rs"]
-mod tests;

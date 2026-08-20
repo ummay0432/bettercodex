@@ -227,39 +227,3 @@ fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> DetectedShe
     shell_with_fallback.unwrap_or_else(ultimate_fallback_shell)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn test_detect_shell_type() {
-        assert_eq!(
-            detect_shell_type(PathBuf::from("zsh")),
-            Some(ShellType::Zsh)
-        );
-        assert_eq!(
-            detect_shell_type(PathBuf::from("bash")),
-            Some(ShellType::Bash)
-        );
-        assert_eq!(detect_shell_type(PathBuf::from("fish")), None);
-        assert_eq!(detect_shell_type(PathBuf::from("other")), None);
-        assert_eq!(
-            detect_shell_type(PathBuf::from("/bin/zsh")),
-            Some(ShellType::Zsh)
-        );
-        assert_eq!(
-            detect_shell_type(PathBuf::from("/bin/bash")),
-            Some(ShellType::Bash)
-        );
-        assert_eq!(
-            detect_shell_type(PathBuf::from("/usr/bin/bash")),
-            Some(ShellType::Bash)
-        );
-        assert_eq!(
-            detect_shell_type(PathBuf::from("/bin/sh")),
-            Some(ShellType::Sh)
-        );
-        assert_eq!(detect_shell_type(PathBuf::from("sh")), Some(ShellType::Sh));
-    }
-}

@@ -61,30 +61,6 @@ Atomically edit one UTF-8 file of at most 64 MiB with exact replacements. Every 
 
 - Value — `string`.
 
-## `ask_user_question`
-
-Ask the user for decisions in an interactive terminal card. Wait for an explicit response to one to four related questions. Use this only when the answer materially affects the work and cannot be inferred safely. Provide two to six concise options per question; the UI automatically adds an Other free-text choice. Use multiSelect for questions where several options can apply, and defaultSelected only for genuinely recommended multi-select defaults. Add preview only when seeing the proposed content helps the user decide. Cancellation is returned explicitly and never chooses a highlighted or default option.
-
-### Input
-
-- `questions: object[]` (required) — Related questions shown together in one interactive card.
-  - `question: string` (required) — Complete question shown to the user.
-  - `header: string` (required) — Short label for this question, at most 12 characters.
-  - `options: object[]` (required) — Concise choices. Do not add Other; the UI supplies it.
-    - `label: string` (required) — Concise option label.
-    - `description: string` (required) — Brief consequence or meaning of this option.
-    - `defaultSelected?: boolean` — Optional initial checkbox state. Valid only when multiSelect is true.
-    - `preview?: string` — Optional Markdown preview shown while this option is focused.
-  - `multiSelect?: boolean` — Whether the user may choose multiple options. Defaults to false.
-
-### Output
-
-- `answers: object[]` (required) — Answers in the same order as the submitted questions.
-  - `question: string` (required) — Original question text.
-  - `selectedOptions: string[]` (required) — Selected supplied option labels.
-  - `freeText?: string` — The user's Other answer, when supplied.
-- `cancelled: boolean` (required) — True only when the user explicitly cancelled the card.
-
 ## Hosted web search
 
 The Responses API can search and browse the live web using text and image results. URL citations in assistant output are displayed as clickable source links.

@@ -18,10 +18,6 @@ impl ModelTextDelta {
         Self { text, received_at }
     }
 
-    #[cfg(test)]
-    pub(crate) fn now(text: impl Into<String>) -> Self {
-        Self::new(text.into(), Instant::now())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

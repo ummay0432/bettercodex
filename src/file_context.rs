@@ -10,10 +10,8 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
-pub(crate) const MAX_FILE_CONTEXT_TOKENS: u64 = 8_000;
-pub(crate) const MAX_TURN_FILE_CONTEXT_TOKENS: u64 = 16_000;
-const MAX_FILE_CONTEXT_FILES: usize = 16;
-const MAX_FILE_CONTEXT_SOURCE_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_FILE_CONTEXT_ITEM_TOKENS: u64 = 10_000;
+const APPROXIMATE_BYTES_PER_TOKEN: u64 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InjectedFileContext {
@@ -31,6 +29,7 @@ pub(crate) struct FileContextInjectionOutcome {
 pub(crate) fn inject_selected_files(
     cwd: &Path,
     selected_files: &[PathBuf],
+    max_total_tokens: u64,
 ) -> FileContextInjectionOutcome {
     let mut outcome = FileContextInjectionOutcome::default();
     let mut seen = HashSet::new();
@@ -40,9 +39,11 @@ pub(crate) fn inject_selected_files(
         if !seen.insert(selected.clone()) {
             continue;
         }
-        if seen.len() > MAX_FILE_CONTEXT_FILES {
+
+        let remaining_tokens = max_total_tokens.saturating_sub(total_tokens);
+        if remaining_tokens == 0 {
             outcome.warnings.push(format!(
-                "Additional file injections were skipped after bettercodex's {MAX_FILE_CONTEXT_FILES}-file per-turn limit"
+                "Additional file injections were skipped because the selected files already fill bettercodex's {max_total_tokens}-token effective context window"
             ));
             break;
         }
@@ -53,11 +54,12 @@ pub(crate) fn inject_selected_files(
         } else {
             cwd.join(selected)
         };
-        let contents = match read_utf8_file(&resolved) {
+        let max_source_bytes = remaining_tokens.saturating_mul(APPROXIMATE_BYTES_PER_TOKEN);
+        let contents = match read_utf8_file(&resolved, max_source_bytes) {
             Ok(contents) => contents,
             Err(FileContextReadError::TooLarge) => {
                 outcome.warnings.push(format!(
-                    "File injection skipped for `{display_path}`: it exceeds bettercodex's {MAX_FILE_CONTEXT_TOKENS}-token per-file limit"
+                    "File injection skipped for `{display_path}`: its complete contents cannot fit in the remaining {remaining_tokens}-token effective-context budget"
                 ));
                 continue;
             }
@@ -75,29 +77,22 @@ pub(crate) fn inject_selected_files(
             }
         };
 
-        let path = escape_xml_text(&display_path);
-        let body = format!(
-            "<file_context>\n<path>{path}</path>\n<contents><![CDATA[\n{}\n]]></contents>\n</file_context>",
-            escape_cdata(&contents),
-        );
-        let mut item = message("user", body);
-        mark_contextual_user_message(&mut item);
-        let tokens = estimated_tokens(std::slice::from_ref(&item));
-        if tokens > MAX_FILE_CONTEXT_TOKENS {
+        let Some(items) = file_context_items(&display_path, &contents) else {
             outcome.warnings.push(format!(
-                "File injection skipped for `{display_path}`: it is estimated at {tokens} tokens, exceeding bettercodex's {MAX_FILE_CONTEXT_TOKENS}-token per-file limit"
+                "File injection skipped for `{display_path}`: its path cannot fit in a bounded context item"
             ));
             continue;
-        }
-        if total_tokens.saturating_add(tokens) > MAX_TURN_FILE_CONTEXT_TOKENS {
+        };
+        let tokens = estimated_tokens(&items);
+        if tokens > remaining_tokens {
             outcome.warnings.push(format!(
-                "File injection skipped for `{display_path}`: it would exceed bettercodex's {MAX_TURN_FILE_CONTEXT_TOKENS}-token per-turn file limit"
+                "File injection skipped for `{display_path}`: its complete contents require an estimated {tokens} tokens, exceeding the remaining {remaining_tokens}-token effective-context budget"
             ));
             continue;
         }
 
         total_tokens = total_tokens.saturating_add(tokens);
-        outcome.items.push(item);
+        outcome.items.extend(items);
         outcome.injected.push(InjectedFileContext {
             path: display_path,
             tokens,
@@ -107,13 +102,77 @@ pub(crate) fn inject_selected_files(
     outcome
 }
 
+fn file_context_items(display_path: &str, contents: &str) -> Option<Vec<serde_json::Value>> {
+    let escaped_path = escape_xml_text(display_path);
+    let item = file_context_item(&escaped_path, contents, None);
+    if estimated_tokens(std::slice::from_ref(&item)) <= MAX_FILE_CONTEXT_ITEM_TOKENS {
+        return Some(vec![item]);
+    }
+
+    let boundaries = contents
+        .char_indices()
+        .map(|(offset, character)| offset.saturating_add(character.len_utf8()))
+        .collect::<Vec<_>>();
+    if boundaries.is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut start = 0_usize;
+    let mut next_boundary = 0_usize;
+    let mut part = 1_usize;
+
+    while next_boundary < boundaries.len() {
+        let mut low = next_boundary;
+        let mut high = boundaries.len();
+        let mut best = None;
+        while low < high {
+            let candidate = low + (high - low) / 2;
+            let end = boundaries[candidate];
+            let item = file_context_item(&escaped_path, &contents[start..end], Some(part));
+            if estimated_tokens(std::slice::from_ref(&item)) <= MAX_FILE_CONTEXT_ITEM_TOKENS {
+                best = Some(candidate);
+                low = candidate.saturating_add(1);
+            } else {
+                high = candidate;
+            }
+        }
+
+        let boundary = best?;
+        let end = boundaries[boundary];
+        items.push(file_context_item(
+            &escaped_path,
+            &contents[start..end],
+            Some(part),
+        ));
+        start = end;
+        next_boundary = boundary.saturating_add(1);
+        part = part.saturating_add(1);
+    }
+
+    Some(items)
+}
+
+fn file_context_item(escaped_path: &str, contents: &str, part: Option<usize>) -> serde_json::Value {
+    let part = part.map_or_else(String::new, |part| format!("\n<part>{part}</part>"));
+    let body = format!(
+        "<file_context>\n<path>{escaped_path}</path>{part}\n<contents><![CDATA[\n{}\n]]></contents>\n</file_context>",
+        escape_cdata(contents),
+    );
+    let mut item = message("user", body);
+    mark_contextual_user_message(&mut item);
+    item
+}
+
 enum FileContextReadError {
     TooLarge,
     NotUtf8,
     Other(anyhow::Error),
 }
 
-fn read_utf8_file(path: &Path) -> std::result::Result<String, FileContextReadError> {
+fn read_utf8_file(
+    path: &Path,
+    max_source_bytes: u64,
+) -> std::result::Result<String, FileContextReadError> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut options = std::fs::OpenOptions::new();
@@ -133,20 +192,18 @@ fn read_utf8_file(path: &Path) -> std::result::Result<String, FileContextReadErr
             path.display()
         )));
     }
-    if metadata.len() > u64::try_from(MAX_FILE_CONTEXT_SOURCE_BYTES).unwrap_or(u64::MAX) {
+    if metadata.len() > max_source_bytes {
         return Err(FileContextReadError::TooLarge);
     }
 
-    let read_limit = MAX_FILE_CONTEXT_SOURCE_BYTES.saturating_add(1);
-    let capacity = usize::try_from(metadata.len())
-        .unwrap_or(MAX_FILE_CONTEXT_SOURCE_BYTES)
-        .min(MAX_FILE_CONTEXT_SOURCE_BYTES);
+    let read_limit = max_source_bytes.saturating_add(1);
+    let capacity = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
     let mut bytes = Vec::with_capacity(capacity);
-    file.take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+    file.take(read_limit)
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {}", path.display()))
         .map_err(FileContextReadError::Other)?;
-    if bytes.len() > MAX_FILE_CONTEXT_SOURCE_BYTES {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_source_bytes {
         return Err(FileContextReadError::TooLarge);
     }
     String::from_utf8(bytes).map_err(|_| FileContextReadError::NotUtf8)

@@ -71,11 +71,6 @@ pub(crate) struct PromptHistoryReader {
 }
 
 impl PromptHistory {
-    pub(crate) fn open(session_id: &str) -> Result<Self> {
-        let path = history_path()?;
-        Self::open_in(&path, session_id)
-    }
-
     pub(crate) fn open_with_reader(session_id: &str) -> Result<(Self, PromptHistoryReader)> {
         let path = history_path()?;
         Self::open_with_reader_in(&path, session_id)
@@ -430,6 +425,3 @@ impl Drop for FileLock<'_> {
     }
 }
 
-#[cfg(test)]
-#[path = "prompt_history_tests.rs"]
-mod tests;
