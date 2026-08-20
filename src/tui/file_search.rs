@@ -312,16 +312,12 @@ impl FileSearchPopup {
         });
     }
 
-    pub(super) fn selected_path(&self) -> Option<(Range<usize>, String)> {
+    pub(super) fn selected_path(&self) -> Option<(Range<usize>, String, MatchType)> {
         let token = self.token.as_ref()?;
         let selected = self.selected?;
-        let path = self
-            .matches
-            .get(selected)?
-            .path
-            .to_string_lossy()
-            .into_owned();
-        Some((token.range.clone(), path))
+        let selected = self.matches.get(selected)?;
+        let path = selected.path.to_string_lossy().into_owned();
+        Some((token.range.clone(), path, selected.match_type))
     }
 
     pub(super) fn height(&self) -> u16 {
@@ -647,7 +643,10 @@ mod tests {
             query: "bad".to_string(),
             matches: vec![file_match],
         });
-        assert_eq!(popup.selected_path(), Some((0..4, original.to_string())));
+        assert_eq!(
+            popup.selected_path(),
+            Some((0..4, original.to_string(), MatchType::File))
+        );
     }
 
     #[test]

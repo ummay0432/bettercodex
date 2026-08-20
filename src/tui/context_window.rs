@@ -51,6 +51,10 @@ impl ContextWindowView {
         self.snapshot = snapshot;
     }
 
+    pub(super) fn ask_user_question_enabled(&self) -> bool {
+        self.snapshot.ask_user_question_enabled
+    }
+
     pub(super) fn preferred_height(&self, width: u16) -> u16 {
         panel_height(width, self.segments().len())
     }
@@ -124,7 +128,7 @@ impl ContextWindowView {
                 format_tokens(self.snapshot.compact_at_tokens)
             ))
             .dim(),
-            tool_summary_line(),
+            tool_summary_line(self.snapshot.ask_user_question_enabled),
             Line::default(),
         ];
         frame.render_widget(Paragraph::new(lines), area);
@@ -165,9 +169,9 @@ impl ContextWindowView {
                     .enumerate()
                     .map(|(index, color)| {
                         let symbol = if index + 1 == row.len() {
-                            "•"
+                            "■"
                         } else {
-                            "• "
+                            "■ "
                         };
                         Span::styled(symbol, Style::default().fg(*color))
                     })
@@ -220,11 +224,12 @@ impl ContextWindowView {
     }
 }
 
-fn tool_summary_line() -> Line<'static> {
+fn tool_summary_line(ask_user_question_enabled: bool) -> Line<'static> {
     let mut spans = vec![Span::styled("Tools  ", palette::accent_style())];
-    for (index, specification) in crate::tools::responses_api_specifications()
-        .iter()
-        .enumerate()
+    for (index, specification) in
+        crate::tools::responses_api_specifications_for(ask_user_question_enabled)
+            .iter()
+            .enumerate()
     {
         if index > 0 {
             spans.push(Span::from(" · ").dim());
@@ -267,7 +272,7 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, segments: &[Segment], total:
         .take(usize::from(area.height))
         .map(|segment| {
             let mut spans = vec![
-                Span::styled("• ", Style::default().fg(segment.color)),
+                Span::styled("■ ", Style::default().fg(segment.color)),
                 Span::from(format!("{:<23}", segment.label)),
                 Span::from(format!(
                     "{:>7}  {:>6}",

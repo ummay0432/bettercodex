@@ -1,22 +1,21 @@
 # bettercodex
 
-Claude Code and Codex steer the model toward the smallest change that gets the
-task done. Over thousands of sessions, that compounds slop and technical debt.
+codex is good at its core but its bloated, openai injects wasteful steering into
+the context window of the agent to optimize the experience for user engagement
+rather than pure output quality. This is obviously suboptimal, so I removed all of
+it in bcodex.
 
-bettercodex is a focused, work-in-progress port of
-[OpenAI Codex](https://github.com/openai/codex). It gives the agent room to own
-engineering work proactively, including active review and cleanup, instead of
-making the smallest possible patch the objective.
+upstream codex:
 
-This is early, unofficial, and not an OpenAI product.
+![upstream codex context](assets/upstream-codex-context.png)
 
-bettercodex has no Codex sandbox. Commands and patches run with your full user
-permissions.
+bcodex:
+
+![bcodex context](assets/bcodex-context.png)
+
+More to come.
 
 ## Install
-
-bettercodex supports Apple silicon macOS 12+, Ubuntu 22.04+ x86-64, and Debian
-12+ x86-64.
 
 On macOS or Linux:
 
@@ -29,13 +28,3 @@ Open a new terminal, then run:
 ```sh
 bcodex
 ```
-
-On the first interactive launch, bettercodex asks you to sign in only when no
-valid Codex credentials are available.
-
-The installer accepts only an immutable full release whose target matches its
-encoded source revision, verifies the native archive's GitHub SHA-256 before any
-binary execution, and atomically replaces the command only after the macOS
-signature (when applicable) and embedded-identity checks succeed. Installs and
-`bcodex update` require neither Rust, Cargo, nor native build tools. See the
-complete [installation guide](docs/install.md).

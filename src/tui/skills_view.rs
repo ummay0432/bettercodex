@@ -105,6 +105,13 @@ impl SkillsView {
                 ..
             } => {
                 if let Some(skill) = self.selected_skill(skills) {
+                    if skill.settings_are_fixed() {
+                        self.error = Some(format!(
+                            "{} has fixed settings and cannot be changed",
+                            skill.display_name()
+                        ));
+                        return SkillsViewAction::None;
+                    }
                     self.error = None;
                     return SkillsViewAction::Update {
                         path: skill.path().to_path_buf(),
@@ -118,6 +125,13 @@ impl SkillsView {
                 ..
             } => {
                 if let Some(skill) = self.selected_skill(skills) {
+                    if skill.settings_are_fixed() {
+                        self.error = Some(format!(
+                            "{} has fixed settings and cannot be changed",
+                            skill.display_name()
+                        ));
+                        return SkillsViewAction::None;
+                    }
                     self.error = None;
                     return SkillsViewAction::Update {
                         path: skill.path().to_path_buf(),
@@ -188,7 +202,7 @@ impl SkillsView {
             );
             frame.render_widget(
                 Paragraph::new(
-                    "Press space or enter to toggle enabled; i to toggle implicit; esc to close",
+                    "space/enter: enabled; i: implicit; fixed entries locked; esc: close",
                 )
                 .dim(),
                 hint_area,
@@ -248,9 +262,14 @@ impl SkillsView {
                 } else {
                     ' '
                 };
+                let fixed = if skill.settings_are_fixed() {
+                    "  fixed"
+                } else {
+                    ""
+                };
                 GenericDisplayRow {
                     name: format!(
-                        "{prefix} [{enabled}] enabled  [{implicit}] implicit  {}",
+                        "{prefix} [{enabled}] enabled  [{implicit}] implicit  {}{fixed}",
                         skill.display_name()
                     ),
                     description: Some(skill.display_description().to_string()),

@@ -1099,26 +1099,17 @@ async fn read_bounds_output_and_reports_a_continuation_offset() {
     assert!(text.contains(&format!("bounded at 1 line or {MAX_READ_BYTES} bytes")));
     assert!(text.contains("offset=3"));
 
-    let call = ToolCall {
-        call_id: "call-read-invalid-limit".to_string(),
-        name: READ_NAME.to_string(),
-        arguments: json!({"path": "sample.txt", "limit": MAX_READ_LINES + 1}).to_string(),
-    };
-    let result = call
-        .execute(
-            &test_runtime(root.0.clone()),
-            TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
-            None,
-            CancellationToken::new(),
-            None,
-        )
-        .await;
-    assert_eq!(
-        result.body,
-        Value::String(format!(
-            "read.limit must be no greater than {MAX_READ_LINES}"
-        ))
-    );
+    let requested_lines = 2_001;
+    let short_lines = "x\n".repeat(requested_lines);
+    std::fs::write(root.0.join("many-short-lines.txt"), &short_lines).unwrap();
+    let result = test_read(&root.0, json!({"path": "many-short-lines.txt"})).unwrap();
+    assert_eq!(result.body, Value::String(short_lines.clone()));
+    let result = test_read(
+        &root.0,
+        json!({"path": "many-short-lines.txt", "limit": requested_lines}),
+    )
+    .unwrap();
+    assert_eq!(result.body, Value::String(short_lines));
 
     let long_line = format!("{}\n", "x".repeat(99));
     std::fs::write(root.0.join("large.txt"), long_line.repeat(500)).unwrap();

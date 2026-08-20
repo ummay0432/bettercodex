@@ -30,6 +30,8 @@ pub(crate) enum AgentEvent {
     ModelMessageDelta(ModelTextDelta),
     ModelMessageCompleted(AssistantMessage),
     ModelResponseCompleted,
+    UserInputAccepted,
+    FileContextInjected(crate::file_context::InjectedFileContext),
     WebSearchStarted(crate::web_search::WebSearchCall),
     WebSearchCompleted(crate::web_search::WebSearchCall),
     ToolStarted {

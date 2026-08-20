@@ -1,3 +1,7 @@
+mod ask_user_question;
+#[cfg(test)]
+#[path = "ask_user_question_tests.rs"]
+mod ask_user_question_tests;
 mod bottom_pane;
 mod clipboard;
 mod clipboard_paste;
@@ -51,6 +55,9 @@ use crate::agent::Agent;
 use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
 use crate::agent::TurnHandle;
+use crate::ask_user_question::AskUserQuestionRequest;
+use crate::ask_user_question::AskUserQuestionRequester;
+use crate::ask_user_question::AskUserQuestionResponse;
 use crate::context::ContextSnapshot;
 use crate::events::AgentEvent;
 use crate::events::SteerId;
@@ -110,6 +117,7 @@ type SessionScanTask = JoinHandle<Result<Vec<SessionSummary>>>;
 type ResumeTask = JoinHandle<Result<ResumedSession>>;
 type UpdateCheckTask = JoinHandle<Option<AvailableUpdate>>;
 type PromptHistoryTask = JoinHandle<(PromptHistoryReader, Result<Vec<String>>)>;
+type PatchNotesAckTask = JoinHandle<Result<()>>;
 type RateLimitTask = JoinHandle<Result<Vec<RateLimitSnapshot>>>;
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(32);
 // Match Codex's settled-size recheck delay. Resize signals are reconciled with the backend
@@ -207,7 +215,7 @@ pub(crate) async fn run(
 
 struct LoadedAgent {
     agent: Agent,
-    patch_notes: Result<Option<String>>,
+    patch_notes: Result<Option<crate::patch_notes::Startup>>,
 }
 
 async fn load_agent(requested_cwd: &Path, resume: Option<ResumeSelector>) -> Result<LoadedAgent> {
@@ -229,7 +237,9 @@ async fn load_agent(requested_cwd: &Path, resume: Option<ResumeSelector>) -> Res
         }
         None => Agent::new(requested_cwd)?,
     };
-    let patch_notes = had_saved_sessions.map_or(Ok(None), crate::patch_notes::for_startup);
+    let patch_notes = had_saved_sessions.map_or(Ok(None), |had_saved_sessions| {
+        crate::patch_notes::for_startup(had_saved_sessions).map(Some)
+    });
     Ok(LoadedAgent { agent, patch_notes })
 }
 
@@ -240,6 +250,9 @@ struct Runtime {
     turn: TurnTaskState,
     turn_events: Option<UnboundedReceiver<AgentEvent>>,
     turn_handle: Option<TurnHandle>,
+    ask_user_question_requester: AskUserQuestionRequester,
+    ask_user_question_requests: UnboundedReceiver<AskUserQuestionRequest>,
+    pending_ask_user_question: Option<AskUserQuestionRequest>,
     exit_after_work: bool,
     context_snapshot: ContextSnapshot,
     session_id: String,
@@ -258,6 +271,8 @@ struct Runtime {
     prompt_history_reader: Option<PromptHistoryReader>,
     prompt_history_task: Option<PromptHistoryTask>,
     prompt_history_exclusions: HashSet<String>,
+    patch_notes_startup: Option<crate::patch_notes::Startup>,
+    patch_notes_ack_task: Option<PatchNotesAckTask>,
     model_selection: ModelSelection,
     service_tier: ServiceTier,
     session_scan: Option<SessionScanTask>,
@@ -422,20 +437,30 @@ impl Runtime {
             mut agent,
             patch_notes,
         } = loaded;
+        let (ask_user_question_requester, ask_user_question_requests) =
+            crate::ask_user_question::channel();
+        agent.set_ask_user_question_requester(ask_user_question_requester.clone());
         let mut view = View::new(&cwd);
         let model_selection = agent.model_selection().clone();
         view.set_model_selection(model_selection.clone());
         let service_tier = agent.service_tier();
         view.set_service_tier(service_tier);
         view.replay_transcript(agent.take_resumed_transcript());
-        match patch_notes {
-            Ok(Some(markdown)) => view.add_patch_notes(markdown),
-            Ok(None) => {}
-            Err(error) => view.add_notice(format!("Patch notes could not be loaded: {error:#}")),
-        }
+        let mut patch_notes_startup = match patch_notes {
+            Ok(startup) => startup,
+            Err(error) => {
+                view.add_notice(format!("Patch notes could not be loaded: {error:#}"));
+                None
+            }
+        };
         view.set_skills(agent.skills().to_vec());
         for warning in agent.skill_warnings() {
             view.add_notice(format!("Skill warning: {warning}"));
+        }
+        if let Some(startup) = &mut patch_notes_startup
+            && let Some(markdown) = startup.take_notes()
+        {
+            view.add_patch_notes(markdown);
         }
         view.set_context_tokens(agent.context_tokens());
         let session_id = agent.session_id().to_string();
@@ -454,6 +479,7 @@ impl Runtime {
         }
         view.seed_prompt_history(composer_history, has_persistent_history);
         let context_snapshot = agent.context_snapshot();
+        view.set_ask_user_question_enabled(context_snapshot.ask_user_question_enabled);
         let status_rate_limits = context_snapshot
             .rate_limits
             .iter()
@@ -472,6 +498,9 @@ impl Runtime {
             turn: TurnTaskState::Idle,
             turn_events: None,
             turn_handle: None,
+            ask_user_question_requester,
+            ask_user_question_requests,
+            pending_ask_user_question: None,
             exit_after_work: false,
             context_snapshot,
             session_id,
@@ -490,6 +519,8 @@ impl Runtime {
             prompt_history_reader: Some(prompt_history_reader),
             prompt_history_task: None,
             prompt_history_exclusions,
+            patch_notes_startup,
+            patch_notes_ack_task: None,
             model_selection,
             service_tier,
             session_scan: None,
@@ -562,6 +593,7 @@ impl Runtime {
                     })
                 })?;
                 redraw = false;
+                self.start_patch_notes_acknowledgement();
                 self.start_update_check_after_startup();
                 self.start_rate_limit_prefetch_after_startup();
                 if self.view.has_pending_presentation() {
@@ -627,6 +659,24 @@ impl Runtime {
                         break;
                     }
                 }
+                request = self.ask_user_question_requests.recv() => {
+                    if let Some(request) = request {
+                        if self.pending_ask_user_question.is_some() {
+                            let _ = request.respond(AskUserQuestionResponse::cancelled());
+                            self.view.add_notice(
+                                "A second AskUserQuestion request was cancelled while another was active"
+                                    .to_string(),
+                            );
+                        } else {
+                            self.view.show_ask_user_question(
+                                request.call_id().to_string(),
+                                request.arguments().clone(),
+                            );
+                            self.pending_ask_user_question = Some(request);
+                        }
+                        redraw = true;
+                    }
+                }
                 event = receive_agent_event(&mut self.turn_events) => {
                     if let Some(event) = event {
                         // Ingress remains fully drained and ordered, but presentation advances at
@@ -656,6 +706,24 @@ impl Runtime {
                     if let Ok(Some(update)) = completion {
                         self.view.add_update_available(update);
                         redraw = true;
+                    }
+                }
+                completion = receive_patch_notes_acknowledgement(&mut self.patch_notes_ack_task) => {
+                    self.patch_notes_ack_task = None;
+                    match completion {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            self.view.add_notice(format!(
+                                "Patch notes could not be marked as seen: {error:#}"
+                            ));
+                            redraw = true;
+                        }
+                        Err(error) => {
+                            self.view.add_notice(format!(
+                                "Patch notes could not be marked as seen: task stopped unexpectedly: {error}"
+                            ));
+                            redraw = true;
+                        }
                     }
                 }
                 completion = receive_rate_limit_refresh(&mut self.rate_limit_task) => {
@@ -751,6 +819,9 @@ impl Runtime {
                         }
                     }
                     let (mut agent, completion) = self.turn.take_presenting();
+                    if let Some(request) = self.pending_ask_user_question.take() {
+                        self.view.dismiss_ask_user_question(request.call_id());
+                    }
                     self.sync_model_selection_to_agent(&mut agent);
                     self.sync_service_tier_to_agent(&mut agent);
                     let pending_context_steers = std::mem::take(&mut self.operator_context_steers);
@@ -1145,6 +1216,20 @@ impl Runtime {
                     "Could not update skill: skills can only be changed while the agent is idle",
                 ),
             },
+            Action::ResolveAskUserQuestion { call_id, response } => {
+                let matches_pending = self
+                    .pending_ask_user_question
+                    .as_ref()
+                    .is_some_and(|request| request.call_id() == call_id);
+                if matches_pending && let Some(request) = self.pending_ask_user_question.take() {
+                    self.view.dismiss_ask_user_question(&call_id);
+                    if !request.respond(response) {
+                        self.view.add_notice(
+                            "AskUserQuestion response arrived after the turn stopped".to_string(),
+                        );
+                    }
+                }
+            }
             Action::Quit => return self.request_exit(),
         }
         false
@@ -1259,6 +1344,7 @@ impl Runtime {
 
     fn clear_session(&mut self) -> Result<()> {
         let mut agent = Agent::new(&self.cwd)?;
+        agent.set_ask_user_question_requester(self.ask_user_question_requester.clone());
         agent.set_model_selection(self.model_selection.clone())?;
         agent.set_service_tier(self.service_tier)?;
         let prompt_history = PromptHistory::open(agent.session_id())?;
@@ -1278,6 +1364,8 @@ impl Runtime {
         self.agent = Some(agent);
         self.prompt_history = Some(prompt_history);
         self.view.clear();
+        self.view
+            .set_ask_user_question_enabled(self.context_snapshot.ask_user_question_enabled);
         self.view.set_skills(skills);
         for warning in skill_warnings {
             self.view.add_notice(format!("Skill warning: {warning}"));
@@ -1290,7 +1378,8 @@ impl Runtime {
             .agent
             .as_ref()
             .context("a session can only be forked while the agent is idle")?;
-        let agent = source.fork(self.view.session_transcript())?;
+        let mut agent = source.fork(self.view.session_transcript())?;
+        agent.set_ask_user_question_requester(self.ask_user_question_requester.clone());
         let prompt_history = PromptHistory::open(agent.session_id())?;
         let session_id = agent.session_id().to_string();
         let forked_from = agent.forked_from().map(str::to_string);
@@ -1300,6 +1389,8 @@ impl Runtime {
         self.forked_from = forked_from;
         self.instruction_source_paths = instruction_source_paths;
         self.view.set_context_tokens(agent.context_tokens());
+        self.view
+            .set_ask_user_question_enabled(self.context_snapshot.ask_user_question_enabled);
         self.view.set_skills(agent.skills().to_vec());
         self.agent = Some(agent);
         self.prompt_history = Some(prompt_history);
@@ -1548,13 +1639,14 @@ impl Runtime {
 
     fn activate_resumed_session(&mut self, session: ResumedSession) {
         let ResumedSession {
-            agent,
+            mut agent,
             prompt_history,
             prompt_history_reader,
             mut prompt_history_exclusions,
             composer_history,
             transcript,
         } = session;
+        agent.set_ask_user_question_requester(self.ask_user_question_requester.clone());
         let model_selection = agent.model_selection().clone();
         let service_tier = agent.service_tier();
         let cwd = agent.cwd().to_path_buf();
@@ -1599,6 +1691,8 @@ impl Runtime {
         );
         self.view.set_service_tier(service_tier);
         self.view.set_model_selection(model_selection);
+        self.view
+            .set_ask_user_question_enabled(self.context_snapshot.ask_user_question_enabled);
         for warning in skill_warnings {
             self.view.add_notice(format!("Skill warning: {warning}"));
         }
@@ -1756,6 +1850,7 @@ impl Runtime {
         if let Some(turn) = &self.turn_handle {
             match intent {
                 InterruptIntent::StopTurn => turn.cancel(),
+                InterruptIntent::EditPrompt => turn.cancel_and_edit_prompt(),
                 InterruptIntent::SubmitSteering => turn.interrupt_for_steering(),
             }
             self.view.set_interrupting(intent);
@@ -1763,6 +1858,9 @@ impl Runtime {
     }
 
     fn cancel_active_work(&mut self) {
+        if let Some(request) = self.pending_ask_user_question.take() {
+            self.view.dismiss_ask_user_question(request.call_id());
+        }
         let submitting_steering = self.turn.is_active() && self.view.has_pending_steers();
         if self.turn.is_active() {
             self.interrupt_turn();
@@ -1777,6 +1875,12 @@ impl Runtime {
     fn interrupt_turn(&mut self) {
         let intent = if self.view.has_pending_steers() {
             InterruptIntent::SubmitSteering
+        } else if self.operator_command_tasks.is_empty()
+            && self.operator_context_steers.is_empty()
+            && self.pending_operator_contexts.is_empty()
+            && self.view.can_edit_submitted_prompt()
+        {
+            InterruptIntent::EditPrompt
         } else {
             InterruptIntent::StopTurn
         };
@@ -1840,6 +1944,13 @@ impl Runtime {
         }
     }
 
+    fn start_patch_notes_acknowledgement(&mut self) {
+        let Some(startup) = self.patch_notes_startup.take() else {
+            return;
+        };
+        self.patch_notes_ack_task = Some(tokio::task::spawn_blocking(move || startup.mark_seen()));
+    }
+
     fn start_update_check_after_startup(&mut self) {
         if self.update_check_started {
             return;
@@ -1888,6 +1999,9 @@ impl Drop for Runtime {
         abort_join_task(&mut self.update_check);
         abort_join_task(&mut self.rate_limit_task);
         abort_join_task(&mut self.prompt_history_task);
+        // A successful first frame owns this persistence attempt. Detach it on immediate exit
+        // rather than cancelling a queued blocking write.
+        drop(self.patch_notes_ack_task.take());
         for (_, cancellation) in self.operator_command_cancellations.drain() {
             cancellation.cancel();
         }
@@ -2089,6 +2203,15 @@ async fn receive_resume_completion(
 async fn receive_update_check(
     task: &mut Option<UpdateCheckTask>,
 ) -> std::result::Result<Option<AvailableUpdate>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => pending().await,
+    }
+}
+
+async fn receive_patch_notes_acknowledgement(
+    task: &mut Option<PatchNotesAckTask>,
+) -> std::result::Result<Result<()>, tokio::task::JoinError> {
     match task {
         Some(task) => task.await,
         None => pending().await,

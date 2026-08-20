@@ -22,6 +22,8 @@ fn runtime_without_agent() -> Runtime {
     let (diff_updates_tx, diff_updates) = unbounded_channel();
     let (file_search_updates_tx, file_search_updates) = unbounded_channel();
     let (operator_command_updates_tx, operator_command_updates) = unbounded_channel();
+    let (ask_user_question_requester, ask_user_question_requests) =
+        crate::ask_user_question::channel();
     let rate_limit_client = RateLimitClient::new(
         reqwest::Client::new(),
         crate::auth::SharedAuth::new(crate::auth::Auth::for_test("test-token")),
@@ -34,12 +36,16 @@ fn runtime_without_agent() -> Runtime {
         turn: TurnTaskState::Idle,
         turn_events: None,
         turn_handle: None,
+        ask_user_question_requester,
+        ask_user_question_requests,
+        pending_ask_user_question: None,
         exit_after_work: false,
         context_snapshot: ContextSnapshot {
             used_tokens: 0,
             context_window: EFFECTIVE_CONTEXT_WINDOW,
             compact_at_tokens: 0,
             measured: false,
+            ask_user_question_enabled: false,
             sections: Vec::new(),
             total_usage: Default::default(),
             rate_limits: Vec::new(),
@@ -60,6 +66,8 @@ fn runtime_without_agent() -> Runtime {
         prompt_history_reader: None,
         prompt_history_task: None,
         prompt_history_exclusions: HashSet::new(),
+        patch_notes_startup: None,
+        patch_notes_ack_task: None,
         model_selection: ModelSelection::default(),
         service_tier: ServiceTier::default(),
         session_scan: None,
@@ -119,6 +127,65 @@ fn rendered_view(view: &mut View) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[tokio::test]
+async fn ask_user_question_action_resolves_the_pending_tool_request() {
+    let mut runtime = runtime_without_agent();
+    let requester = runtime.ask_user_question_requester.clone();
+    let cancellation = CancellationToken::new();
+    let arguments = crate::ask_user_question::AskUserQuestionArgs {
+        questions: vec![crate::ask_user_question::AskUserQuestion {
+            question: "Which path should be used?".to_string(),
+            header: "Path".to_string(),
+            options: vec![
+                crate::ask_user_question::AskUserQuestionOption {
+                    label: "First".to_string(),
+                    description: "Use the first path.".to_string(),
+                    preview: None,
+                    default_selected: false,
+                },
+                crate::ask_user_question::AskUserQuestionOption {
+                    label: "Second".to_string(),
+                    description: "Use the second path.".to_string(),
+                    preview: None,
+                    default_selected: false,
+                },
+            ],
+            multi_select: false,
+        }],
+    };
+    let request_arguments = arguments.clone();
+    let response = tokio::spawn(async move {
+        requester
+            .request(
+                "call-question".to_string(),
+                request_arguments,
+                &cancellation,
+            )
+            .await
+    });
+    let request = runtime
+        .ask_user_question_requests
+        .recv()
+        .await
+        .expect("pending AskUserQuestion request");
+    runtime
+        .view
+        .show_ask_user_question(request.call_id().to_string(), request.arguments().clone());
+    runtime.pending_ask_user_question = Some(request);
+
+    let action = runtime.view.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert!(matches!(action, Action::ResolveAskUserQuestion { .. }));
+    assert!(!runtime.handle_action(action));
+
+    let response = response.await.unwrap().unwrap();
+    assert!(!response.cancelled);
+    assert_eq!(response.answers[0].selected_options, ["First"]);
+    assert!(runtime.pending_ask_user_question.is_none());
 }
 
 #[test]
@@ -186,6 +253,55 @@ fn interrupted_steering_replay_preserves_operator_and_context_order() {
         rendered.contains("Model interrupted to submit steering input"),
         "{rendered}"
     );
+}
+
+#[test]
+fn output_free_interrupt_restores_the_submitted_prompt_before_later_input() {
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    let prompt = UserPrompt::text("revise this prompt");
+    let queued = UserPrompt::text("later queued input");
+    let draft = UserPrompt::text("unsent editor draft");
+    view.start_turn(&prompt);
+    let _ = view.take_pending_history_lines(80, 24);
+    assert!(view.can_edit_submitted_prompt());
+
+    view.set_interrupting(InterruptIntent::EditPrompt);
+    view.queue_follow_up(queued.clone());
+    assert_eq!(
+        view.handle_terminal_event(Event::Paste(draft.as_str().to_string())),
+        Action::None
+    );
+    // A later shutdown request may overwrite the UI intent after the core has already decided
+    // that the input was never accepted. The outcome must still restore the prompt and its row.
+    view.set_interrupting(InterruptIntent::StopTurn);
+    assert_eq!(
+        view.finish_turn(Ok(SubmitOutcome::CancelledBeforeProcessing)),
+        None
+    );
+
+    assert!(view.take_resize_reflow_request());
+    assert!(view.session_transcript().is_empty());
+    // Runtime always performs this cleanup after a turn; it must not prepend the later queued
+    // input ahead of the earlier prompt that the core restored.
+    view.restore_pending_input_to_composer();
+    assert_eq!(
+        submitted_prompt(view.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))),
+        UserPrompt::joined(vec![prompt, queued, draft])
+    );
+}
+
+#[test]
+fn input_acceptance_ends_the_edit_window_but_status_updates_do_not() {
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.start_turn(&UserPrompt::text("active turn"));
+
+    view.handle_agent_event(AgentEvent::CompactionStarted);
+    assert!(view.can_edit_submitted_prompt());
+    view.handle_agent_event(AgentEvent::UserInputAccepted);
+    assert!(!view.can_edit_submitted_prompt());
 }
 
 #[test]

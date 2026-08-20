@@ -1,0 +1,7 @@
+interface:
+  display_name: "Deep work"
+  short_description: "Orchestrate the fixed specialist quality pipeline"
+  default_prompt: "Use $deepwork to interview me, establish the task contract, and supervise the specialist pipeline."
+
+policy:
+  allow_implicit_invocation: false

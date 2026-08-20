@@ -1,6 +1,6 @@
 ---
 name: review
-description: "Proactively review, repair, and refactor a user-specified part of a software system during implementation work. Invoke whenever a thorough engineering audit could improve correctness, simplicity, performance, resource efficiency, or maintainability; `$review` or `/review` is not required. Do not use for read-only requests."
+description: "Thoroughly review, repair, and refactor a software target. Use only when the user explicitly invokes `$review` or `/review`; never select this skill proactively. Do not use for read-only requests."
 ---
 
 # Review

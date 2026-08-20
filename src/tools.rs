@@ -1,5 +1,16 @@
 //! The fixed direct tool stack exposed through the Responses API.
 
+use crate::ask_user_question::AskUserQuestionArgs;
+use crate::ask_user_question::AskUserQuestionRequester;
+use crate::ask_user_question::MAX_HEADER_CHARS;
+use crate::ask_user_question::MAX_OPTION_DESCRIPTION_CHARS;
+use crate::ask_user_question::MAX_OPTION_LABEL_CHARS;
+use crate::ask_user_question::MAX_OPTIONS;
+use crate::ask_user_question::MAX_PREVIEW_CHARS;
+use crate::ask_user_question::MAX_QUESTION_CHARS;
+use crate::ask_user_question::MAX_QUESTIONS;
+use crate::ask_user_question::MIN_OPTIONS;
+use crate::ask_user_question::TOOL_NAME as ASK_USER_QUESTION_NAME;
 use crate::events::AgentEvent;
 use crate::private_fs::AnchoredPath;
 use crate::private_fs::DirectoryHandle;
@@ -46,7 +57,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 const MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS: usize = 10_000;
-const MAX_READ_LINES: usize = 2_000;
 // Leave room for the continuation marker inside the 10,000-token tool-output bound.
 const MAX_READ_BYTES: usize = 39_000;
 const MAX_EDIT_FILE_BYTES: usize = 64 * 1024 * 1024;
@@ -283,6 +293,20 @@ impl ToolResult {
         })
     }
 
+    fn structured(output: Value, policy: TruncationPolicy) -> Result<Self> {
+        let body =
+            serde_json::to_string(&output).context("failed to encode structured tool output")?;
+        if body.len() > bounded_output_bytes(policy) {
+            return Err(anyhow!("structured tool output exceeds its output bound"));
+        }
+        Ok(Self {
+            body: Value::String(body),
+            display: Ok(output),
+            file_change: None,
+            requires_inspection: false,
+        })
+    }
+
     fn image(items: Vec<FunctionCallOutputContentItem>) -> Result<Self> {
         let body = Value::Array(
             items
@@ -428,11 +452,33 @@ fn json_encoded_char_len(character: char) -> usize {
 
 pub(crate) struct ToolRuntime {
     cwd: PathBuf,
+    ask_user_question: Option<AskUserQuestionRequester>,
+    ask_user_question_enabled: bool,
 }
 
 impl ToolRuntime {
     pub(crate) fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            ask_user_question: None,
+            ask_user_question_enabled: false,
+        }
+    }
+
+    pub(crate) fn set_ask_user_question_requester(&mut self, requester: AskUserQuestionRequester) {
+        self.ask_user_question = Some(requester);
+    }
+
+    pub(crate) fn set_ask_user_question_enabled(&mut self, enabled: bool) {
+        self.ask_user_question_enabled = enabled;
+    }
+
+    pub(crate) fn ask_user_question_activated(&self) -> bool {
+        self.ask_user_question_enabled
+    }
+
+    pub(crate) fn ask_user_question_enabled(&self) -> bool {
+        self.ask_user_question_activated() && self.ask_user_question.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -480,6 +526,21 @@ impl ToolRuntime {
                     edit_with_lifecycle(&cwd, input, &cancellation, &call_id, lifecycle.as_ref())
                 })
                 .await
+            }
+            ASK_USER_QUESTION_NAME => {
+                if !self.ask_user_question_enabled() {
+                    return Err(anyhow!("unknown tool `{name}`"));
+                }
+                let arguments: AskUserQuestionArgs = deserialize_arguments(input)?;
+                arguments.validate()?;
+                let requester = self
+                    .ask_user_question
+                    .as_ref()
+                    .context("ask_user_question requester disappeared after tool admission")?;
+                let response = requester
+                    .request(call_id.to_string(), arguments, &cancellation)
+                    .await?;
+                ToolResult::structured(serde_json::to_value(response)?, truncation_policy)
             }
             _ => Err(anyhow!("unknown tool `{name}`")),
         }
@@ -631,14 +692,9 @@ fn read(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<To
     if offset == 0 {
         return Err(anyhow!("read.offset is 1-indexed and must be at least 1"));
     }
-    let limit = arguments.limit.unwrap_or(MAX_READ_LINES);
-    if limit == 0 {
+    let line_limit = arguments.limit;
+    if line_limit == Some(0) {
         return Err(anyhow!("read.limit must be at least 1"));
-    }
-    if limit > MAX_READ_LINES {
-        return Err(anyhow!(
-            "read.limit must be no greater than {MAX_READ_LINES}"
-        ));
     }
     let path = resolve_path(cwd, &arguments.path);
     let file =
@@ -726,7 +782,7 @@ fn read(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<To
     let mut output = Vec::new();
     let mut emitted_lines = 0_usize;
     let mut truncated = false;
-    while emitted_lines < limit {
+    while line_limit.is_none_or(|limit| emitted_lines < limit) {
         ensure_not_cancelled(cancellation, READ_NAME)?;
         let line = match read_bounded_line(&mut reader, MAX_READ_BYTES)? {
             BoundedLine::Eof => break,
@@ -748,7 +804,7 @@ fn read(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<To
         output.extend_from_slice(&line);
         emitted_lines = emitted_lines.saturating_add(1);
     }
-    if emitted_lines == limit && !reader.fill_buf()?.is_empty() {
+    if line_limit.is_some_and(|limit| emitted_lines == limit) && !reader.fill_buf()?.is_empty() {
         truncated = true;
     }
     if offset > 1 && emitted_lines == 0 {
@@ -764,9 +820,15 @@ fn read(cwd: &Path, input: Value, cancellation: &CancellationToken) -> Result<To
         if !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
-        let line_unit = if limit == 1 { "line" } else { "lines" };
+        let bound = line_limit.map_or_else(
+            || format!("{MAX_READ_BYTES} bytes"),
+            |limit| {
+                let line_unit = if limit == 1 { "line" } else { "lines" };
+                format!("{limit} {line_unit} or {MAX_READ_BYTES} bytes")
+            },
+        );
         output.push_str(&format!(
-            "\n[Output bounded at {limit} {line_unit} or {MAX_READ_BYTES} bytes. Use offset={next_offset} to continue.]"
+            "\n[Output bounded at {bound}. Use offset={next_offset} to continue.]"
         ));
     }
     Ok(ToolResult::text(output))
@@ -2308,8 +2370,14 @@ fn resolve_path(cwd: &Path, requested: &str) -> PathBuf {
     }
 }
 
-pub(crate) fn responses_api_specifications() -> &'static [Value] {
-    &RESPONSES_API_SPECIFICATIONS
+pub(crate) fn responses_api_specifications_for(
+    ask_user_question_enabled: bool,
+) -> &'static [Value] {
+    if ask_user_question_enabled {
+        &RESPONSES_API_SPECIFICATIONS
+    } else {
+        &BASE_RESPONSES_API_SPECIFICATIONS
+    }
 }
 
 pub(crate) fn catalogue_text() -> &'static str {
@@ -2326,7 +2394,7 @@ static TOOL_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
         ),
         function_tool(
             READ_NAME,
-            "Read bounded UTF-8 text or inspect a PNG, JPEG, GIF, or WebP image from a local file. Use `read` rather than shell commands to inspect a known file. Text reads include at most 2,000 lines or 39,000 bytes of file content and report the next offset when truncated; image reads accept files up to 50 MiB and return one image attachment. Failures return plain error text.",
+            "Read bounded UTF-8 text or inspect a PNG, JPEG, GIF, or WebP image from a local file. Use `read` rather than shell commands to inspect a known file. Text reads stop at 39,000 bytes or the optional `limit` in lines, whichever comes first, and report the next offset when truncated. Image reads accept files up to 50 MiB and return one image attachment. Failures return plain error text.",
             read_schema(),
             read_output_schema(),
         ),
@@ -2342,6 +2410,12 @@ static TOOL_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
             edit_schema(),
             json!({"type": "string"}),
         ),
+        function_tool(
+            ASK_USER_QUESTION_NAME,
+            "Ask the user for decisions in an interactive terminal card. Wait for an explicit response to one to four related questions. Use this only when the answer materially affects the work and cannot be inferred safely. Provide two to six concise options per question; the UI automatically adds an Other free-text choice. Use multiSelect for questions where several options can apply, and defaultSelected only for genuinely recommended multi-select defaults. Add preview only when seeing the proposed content helps the user decide. Cancellation is returned explicitly and never chooses a highlighted or default option.",
+            ask_user_question_schema(),
+            ask_user_question_output_schema(),
+        ),
         json!({
             "type": "web_search",
             "external_web_access": true,
@@ -2351,8 +2425,20 @@ static TOOL_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
 });
 
 static RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    responses_specifications(/*ask_user_question_enabled*/ true)
+});
+
+static BASE_RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    responses_specifications(/*ask_user_question_enabled*/ false)
+});
+
+fn responses_specifications(ask_user_question_enabled: bool) -> Vec<Value> {
     TOOL_SPECIFICATIONS
         .iter()
+        .filter(|specification| {
+            ask_user_question_enabled
+                || specification.get("name").and_then(Value::as_str) != Some(ASK_USER_QUESTION_NAME)
+        })
         .cloned()
         .map(|mut specification| {
             if let Some(specification) = specification.as_object_mut() {
@@ -2361,7 +2447,7 @@ static RESPONSES_API_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
             specification
         })
         .collect()
-});
+}
 
 static CATALOGUE_TEXT: LazyLock<String> = LazyLock::new(|| {
     render_catalogue(&TOOL_SPECIFICATIONS)
@@ -2615,7 +2701,7 @@ fn read_schema() -> Value {
         "properties": {
             "path": {"type": "string", "description": "Path to the file, relative to the working directory or absolute."},
             "offset": {"type": "integer", "minimum": 1, "description": "Text files only: 1-indexed line number to start reading from."},
-            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": "Text files only: maximum number of lines to read, up to 2,000."},
+            "limit": {"type": "integer", "minimum": 1, "description": "Text files only: maximum number of lines to read. Omit to use only the byte bound."},
             "detail": {"type": "string", "enum": ["high", "original"], "description": "Image files only: detail level. Defaults to `high`; use `original` to preserve exact resolution."},
         },
         "required": ["path"],
@@ -2656,6 +2742,114 @@ fn write_schema() -> Value {
         },
         "required": ["path", "content"],
         "additionalProperties": false,
+    })
+}
+
+fn ask_user_question_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_QUESTIONS,
+                "description": "Related questions shown together in one interactive card.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_QUESTION_CHARS,
+                            "description": "Complete question shown to the user."
+                        },
+                        "header": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_HEADER_CHARS,
+                            "description": "Short label for this question, at most 12 characters."
+                        },
+                        "options": {
+                            "type": "array",
+                            "minItems": MIN_OPTIONS,
+                            "maxItems": MAX_OPTIONS,
+                            "description": "Concise choices. Do not add Other; the UI supplies it.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": MAX_OPTION_LABEL_CHARS,
+                                        "description": "Concise option label."
+                                    },
+                                    "description": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": MAX_OPTION_DESCRIPTION_CHARS,
+                                        "description": "Brief consequence or meaning of this option."
+                                    },
+                                    "preview": {
+                                        "type": "string",
+                                        "maxLength": MAX_PREVIEW_CHARS,
+                                        "description": "Optional Markdown preview shown while this option is focused."
+                                    },
+                                    "defaultSelected": {
+                                        "type": "boolean",
+                                        "description": "Optional initial checkbox state. Valid only when multiSelect is true."
+                                    }
+                                },
+                                "required": ["label", "description"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "multiSelect": {
+                            "type": "boolean",
+                            "description": "Whether the user may choose multiple options. Defaults to false."
+                        }
+                    },
+                    "required": ["question", "header", "options"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["questions"],
+        "additionalProperties": false
+    })
+}
+
+fn ask_user_question_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "answers": {
+                "type": "array",
+                "description": "Answers in the same order as the submitted questions.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "Original question text."},
+                        "selectedOptions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Selected supplied option labels."
+                        },
+                        "freeText": {
+                            "type": "string",
+                            "description": "The user's Other answer, when supplied."
+                        }
+                    },
+                    "required": ["question", "selectedOptions"],
+                    "additionalProperties": false
+                }
+            },
+            "cancelled": {
+                "type": "boolean",
+                "description": "True only when the user explicitly cancelled the card."
+            }
+        },
+        "required": ["answers", "cancelled"],
+        "additionalProperties": false
     })
 }
 

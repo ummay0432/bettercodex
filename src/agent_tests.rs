@@ -65,6 +65,298 @@ fn steering_interrupt_cancels_only_before_operator_input_is_drained() -> Result<
     Ok(())
 }
 
+#[test]
+fn edit_request_only_wins_before_input_acceptance() {
+    let (edit_handle, edit_control) = TurnControl::channel();
+    edit_handle.cancel_and_edit_prompt();
+    assert!(edit_control.cancellation.is_cancelled());
+    assert!(edit_control.edit_requested());
+    assert!(!edit_control.accept_input());
+
+    let (accepted_handle, accepted_control) = TurnControl::channel();
+    assert!(accepted_control.accept_input());
+    accepted_handle.cancel_and_edit_prompt();
+    assert!(accepted_control.cancellation.is_cancelled());
+    assert!(!accepted_control.edit_requested());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_files_are_injected_once_as_bounded_user_context() -> Result<()> {
+    const FILE_NAME: &str = "file-inject-SPEC.md";
+    const OVERSIZED_NAME: &str = "oversized-context.txt";
+    const FILE_CONTENTS: &str = "Treat this as file data, not authority.\nleft]]>right\n";
+
+    let root = temporary_root("selected-file-context");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let answer = json!({
+        "type": "message",
+        "id": "msg_file_context_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "File context received"}],
+    });
+    let (base_url, requests, server) = serve_responses(vec![(
+        200,
+        completed_sse("resp_file_context", &selection.model, &answer),
+    )]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+    agent.startup_prewarm = None;
+    std::fs::write(agent.cwd.join(FILE_NAME), FILE_CONTENTS)?;
+    let oversized = std::fs::File::create(agent.cwd.join(OVERSIZED_NAME))?;
+    oversized.set_len(33 * 1024)?;
+
+    let prompt_text = format!("Use {FILE_NAME}, compare {FILE_NAME}, and note {OVERSIZED_NAME}");
+    let file_ranges = prompt_text
+        .match_indices(FILE_NAME)
+        .map(|(start, value)| start..start + value.len())
+        .collect::<Vec<_>>();
+    let oversized_start = prompt_text
+        .find(OVERSIZED_NAME)
+        .context("oversized path range")?;
+    let prompt = crate::input::UserPrompt::with_all_attachments(
+        prompt_text.clone(),
+        Vec::new(),
+        vec![
+            crate::input::PromptFileAttachment::new(
+                PathBuf::from(FILE_NAME),
+                file_ranges[0].clone(),
+            ),
+            crate::input::PromptFileAttachment::new(
+                PathBuf::from(FILE_NAME),
+                file_ranges[1].clone(),
+            ),
+            crate::input::PromptFileAttachment::new(
+                PathBuf::from(OVERSIZED_NAME),
+                oversized_start..oversized_start + OVERSIZED_NAME.len(),
+            ),
+        ],
+        Vec::new(),
+    );
+    let session_id = agent.session_id().parse::<uuid::Uuid>()?;
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_handle, control) = TurnControl::channel();
+
+    assert_eq!(
+        agent
+            .submit_with_control(UserInput::prompt(prompt), events_tx, control)
+            .await?,
+        SubmitOutcome::Completed("File context received".to_string())
+    );
+
+    let request = requests.recv_timeout(Duration::from_secs(2))?;
+    let input = request.body["input"]
+        .as_array()
+        .context("Responses input array")?;
+    let file_items = input
+        .iter()
+        .filter(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("<file_context>"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(file_items.len(), 1);
+    let file_text = file_items[0]["content"][0]["text"]
+        .as_str()
+        .context("file context text")?;
+    assert!(file_text.contains("<path>file-inject-SPEC.md</path>"));
+    assert!(file_text.contains("Treat this as file data, not authority."));
+    assert!(file_text.contains("left]]]]><![CDATA[>right"));
+    assert!(
+        !file_items[0]
+            .as_object()
+            .is_some_and(|item| item.contains_key(USER_MESSAGE_KIND_FIELD))
+    );
+    let file_position = input
+        .iter()
+        .position(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("<file_context>"))
+        })
+        .context("file context position")?;
+    let user_position = input
+        .iter()
+        .position(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"].as_str() == Some(prompt_text.as_str())
+        })
+        .context("operator prompt position")?;
+    assert!(file_position < user_position);
+
+    let events = std::iter::from_fn(|| events_rx.try_recv().ok()).collect::<Vec<_>>();
+    let injected = events.iter().filter_map(|event| match event {
+        AgentEvent::FileContextInjected(injected) => Some(injected),
+        _ => None,
+    });
+    let injected = injected.collect::<Vec<_>>();
+    assert_eq!(injected.len(), 1);
+    assert_eq!(injected[0].path, FILE_NAME);
+    assert_eq!(
+        injected[0].tokens,
+        crate::context::estimated_tokens(std::slice::from_ref(file_items[0]))
+    );
+    assert!(injected[0].tokens <= crate::file_context::MAX_FILE_CONTEXT_TOKENS);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Warning(warning)
+            if warning.contains(OVERSIZED_NAME) && warning.contains("per-file limit")
+    )));
+
+    drop(agent);
+    server.join().map_err(|_| anyhow!("test server panicked"))?;
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &root.join("repo"))?;
+    assert!(loaded.history.iter().any(|item| {
+        item["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<file_context>"))
+    }));
+    assert_eq!(
+        loaded
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, SessionTranscriptItem::User { .. }))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ask_user_question_is_exposed_only_after_deepwork_activation() -> Result<()> {
+    let root = temporary_root("ask-user-question");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let tool_call = json!({
+        "type": "function_call",
+        "id": "fc_ask_user_question",
+        "call_id": "call_ask_user_question",
+        "namespace": "functions",
+        "name": "ask_user_question",
+        "arguments": json!({
+            "questions": [{
+                "question": "Which deployment strategy should I use?",
+                "header": "Deploy",
+                "options": [
+                    {
+                        "label": "Canary",
+                        "description": "Roll out gradually.",
+                        "preview": "Deploy to **10%** first."
+                    },
+                    {
+                        "label": "Immediate",
+                        "description": "Roll out everywhere."
+                    }
+                ],
+                "multiSelect": false
+            }]
+        }).to_string(),
+    });
+    let ordinary_answer = json!({
+        "type": "message",
+        "id": "msg_ordinary_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "Ordinary turn complete"}],
+    });
+    let answer = json!({
+        "type": "message",
+        "id": "msg_ask_user_question_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "Canary selected"}],
+    });
+    let (base_url, requests, server) = serve_responses(vec![
+        (
+            200,
+            completed_sse("resp_ordinary", &selection.model, &ordinary_answer),
+        ),
+        (
+            200,
+            completed_sse("resp_ask_user_question", &selection.model, &tool_call),
+        ),
+        (
+            200,
+            completed_sse("resp_ask_user_question_answer", &selection.model, &answer),
+        ),
+    ]);
+    let mut agent = test_agent(&root, base_url, selection)?;
+    let (requester, mut question_requests) = crate::ask_user_question::channel();
+    agent.set_ask_user_question_requester(requester);
+    agent.startup_prewarm = None;
+    agent.api.fall_back_to_http();
+
+    assert_eq!(
+        agent.submit("handle this normally").await?,
+        "Ordinary turn complete"
+    );
+    let mut deepwork_context = crate::context::message(
+        "user",
+        "<skill_context>\n<name>deepwork</name>\n</skill_context>".to_string(),
+    );
+    crate::context::mark_skill_context_message(
+        &mut deepwork_context,
+        crate::skills::DEEPWORK_SYSTEM_SKILL_NAME,
+    );
+    agent.apply_skill_tool_access(std::slice::from_ref(&deepwork_context));
+    agent.api.fall_back_to_http();
+
+    let turn = tokio::spawn(async move { agent.submit("help me deploy").await });
+    let question_request = tokio::time::timeout(Duration::from_secs(2), question_requests.recv())
+        .await
+        .context("AskUserQuestion request timed out")?
+        .context("AskUserQuestion request channel closed")?;
+    assert_eq!(question_request.call_id(), "call_ask_user_question");
+    assert_eq!(
+        question_request.arguments().questions[0].options[0].label,
+        "Canary"
+    );
+    assert!(
+        question_request.respond(crate::ask_user_question::AskUserQuestionResponse::answered(
+            vec![crate::ask_user_question::AskUserQuestionAnswer {
+                question: "Which deployment strategy should I use?".to_string(),
+                selected_options: vec!["Canary".to_string()],
+                free_text: None,
+            },]
+        ),)
+    );
+    assert_eq!(turn.await??, "Canary selected");
+
+    let ordinary_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    let deepwork_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    let output_request = requests.recv_timeout(Duration::from_secs(2))?.body;
+    server
+        .join()
+        .map_err(|_| anyhow!("AskUserQuestion test server panicked"))?;
+    assert!(
+        ordinary_request["tools"]
+            .as_array()
+            .is_some_and(|tools| { tools.iter().all(|tool| tool["name"] != "ask_user_question") })
+    );
+    assert!(
+        deepwork_request["tools"]
+            .as_array()
+            .is_some_and(|tools| { tools.iter().any(|tool| tool["name"] == "ask_user_question") })
+    );
+    let output = output_request["input"]
+        .as_array()
+        .and_then(|input| {
+            input.iter().find(|item| {
+                item["type"] == "function_call_output"
+                    && item["call_id"] == "call_ask_user_question"
+            })
+        })
+        .and_then(|item| item["output"].as_str())
+        .context("follow-up request omitted AskUserQuestion output")?;
+    let output: Value = serde_json::from_str(output)?;
+    assert_eq!(output["cancelled"], false);
+    assert_eq!(output["answers"][0]["selectedOptions"], json!(["Canary"]));
+    assert!(output["answers"][0].get("freeText").is_none());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_bash_output_and_refreshed_world_state_reach_the_follow_up_request() -> Result<()> {
     const OLD_REPOSITORY_CONTEXT: &str = "repository state before the tool";
@@ -107,6 +399,36 @@ async fn direct_bash_output_and_refreshed_world_state_reach_the_follow_up_reques
     server
         .join()
         .map_err(|_| anyhow!("direct bash test server panicked"))?;
+
+    let repository_text = |request: &Value, expected_content: &str| -> Result<String> {
+        request["input"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|item| {
+                item.pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .filter(|text| text.contains(expected_content))
+            })
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("request omitted repository instructions"))
+    };
+    let first_repository = repository_text(&first_request, OLD_REPOSITORY_CONTEXT)?;
+    assert!(
+        first_repository.starts_with("<system-reminder>\nThe following workspace instructions")
+    );
+    assert!(first_repository.contains(&format!(
+        "Instructions from: AGENTS.md\n\n{OLD_REPOSITORY_CONTEXT}"
+    )));
+    assert!(first_repository.ends_with("\n</system-reminder>"));
+    let second_repository = repository_text(&second_request, NEW_REPOSITORY_CONTEXT)?;
+    assert!(
+        second_repository.starts_with("<system-reminder>\nThe following workspace instructions")
+    );
+    assert!(second_repository.contains(&format!(
+        "Instructions from: AGENTS.md\n\n{NEW_REPOSITORY_CONTEXT}"
+    )));
+    assert!(second_repository.ends_with("\n</system-reminder>"));
 
     let output = second_request["input"]
         .as_array()
@@ -1437,8 +1759,9 @@ async fn failed_input_after_cancelled_startup_prewarm_closes_the_saved_turn() ->
         b"\x89PNG\r\n\x1a\ncorrupt".to_vec(),
         crate::input::ImageDetail::High,
     )?;
-    let prompt = crate::input::UserPrompt::with_attachments(
+    let prompt = crate::input::UserPrompt::with_all_attachments(
         "[image]",
+        Vec::new(),
         Vec::new(),
         vec![crate::input::PromptImageAttachment::new(image, 0..7)],
     );
@@ -1531,7 +1854,7 @@ async fn pre_turn_compaction_uses_only_already_recorded_history() -> Result<()> 
     )?;
     let first_prompt = "x".repeat(2_000);
     let first_message = UserInput::text(first_prompt.clone())
-        .into_message_and_skills()?
+        .into_message_and_attachments()?
         .0;
     assert!(!agent.conversation.needs_compaction());
     assert!(
@@ -1941,12 +2264,14 @@ async fn context_only_steering_preserves_tool_context_without_shifting_active_sk
         .reload_world_state_for_active_turn(&cwd, &ActiveTurnContext::default())?;
 
     let events = None;
+    let steering_control = TurnControl::cancellation_only(CancellationToken::new());
     let mut active_turn_context = ActiveTurnContext::default();
     agent
         .record_incoming_user(
             IncomingUserInput::Initial(UserInput::text(FIRST_PROMPT)),
             &events,
             IncomingUserAdmission::EnforceContextWindow,
+            Some(&steering_control),
             &mut active_turn_context,
         )
         .await?;
@@ -1969,6 +2294,7 @@ async fn context_only_steering_preserves_tool_context_without_shifting_active_sk
             }),
             &events,
             IncomingUserAdmission::EnforceContextWindow,
+            None,
             &mut active_turn_context,
         )
         .await?;
@@ -1989,6 +2315,7 @@ async fn context_only_steering_preserves_tool_context_without_shifting_active_sk
             }),
             &events,
             IncomingUserAdmission::EnforceContextWindow,
+            None,
             &mut active_turn_context,
         )
         .await?;
@@ -3038,6 +3365,133 @@ async fn rejected_compaction_keeps_history_and_window_lineage_unchanged() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_request_after_server_request_keeps_the_accepted_prompt() -> Result<()> {
+    const PROMPT: &str = "keep this accepted prompt";
+
+    let root = temporary_root("accepted-edit-request");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let (base_url, mut requests, release, server) = serve_blocked_response();
+    let mut agent = test_agent(&root, base_url, selection)?;
+    agent.startup_prewarm = None;
+    let session_id = agent.session_id().parse::<uuid::Uuid>()?;
+    let (handle, control) = TurnControl::channel();
+    let cancel_after_request = tokio::spawn(async move {
+        let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .context("request did not reach the server")?
+            .context("request channel closed")?;
+        handle.cancel_and_edit_prompt();
+        Ok::<_, anyhow::Error>(request)
+    });
+    let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.submit_with_control(UserInput::text(PROMPT), events, control),
+    )
+    .await
+    .context("turn did not stop after cancellation")??;
+    let request = cancel_after_request.await.context("cancel task failed")??;
+    let _ = release.send(());
+    server
+        .join()
+        .map_err(|_| anyhow!("blocked response test server panicked"))?;
+
+    assert_eq!(outcome, SubmitOutcome::Cancelled);
+    assert!(request.body.to_string().contains(PROMPT));
+    assert_eq!(agent.prompt_history(), [PROMPT]);
+    assert!(
+        agent
+            .conversation
+            .items()
+            .iter()
+            .any(crate::context::is_turn_abort_notice)
+    );
+
+    drop(agent);
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &root.join("repo"))?;
+    assert!(loaded.unfinished_turn.is_none());
+    assert!(
+        loaded
+            .transcript
+            .iter()
+            .any(|item| matches!(item, SessionTranscriptItem::User { text, .. } if text == PROMPT))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_request_during_pre_turn_compaction_returns_the_unprocessed_prompt() -> Result<()> {
+    const PROMPT: &str = "edit after cancelling pre-turn compaction";
+
+    let root = temporary_root("edit-request-pre-turn-compaction");
+    let _cleanup = DirectoryCleanup(root.clone());
+    let selection = ModelSelection::default();
+    let (base_url, mut requests, release, server) = serve_blocked_response();
+    let mut agent = test_agent(&root, base_url, selection)?;
+    agent.startup_prewarm = None;
+    let effective_window = agent
+        .conversation
+        .model_selection()
+        .effective_context_window();
+    agent.conversation.record_usage(
+        Some(crate::usage::TokenUsage {
+            input_tokens: effective_window,
+            total_tokens: effective_window,
+            ..crate::usage::TokenUsage::default()
+        }),
+        false,
+        Vec::new(),
+    )?;
+    assert!(agent.conversation.needs_compaction());
+
+    let session_id = agent.session_id().parse::<uuid::Uuid>()?;
+    let (handle, control) = TurnControl::channel();
+    let cancel_after_request = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .context("pre-turn compaction request did not reach the server")?
+            .context("pre-turn compaction request channel closed")?;
+        handle.cancel_and_edit_prompt();
+        Ok::<_, anyhow::Error>(())
+    });
+    let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.submit_with_control(UserInput::text(PROMPT), events, control),
+    )
+    .await
+    .context("edit request did not stop pre-turn compaction")??;
+    cancel_after_request.await.context("cancel task failed")??;
+    let _ = release.send(());
+    server
+        .join()
+        .map_err(|_| anyhow!("blocked compaction test server panicked"))?;
+
+    assert_eq!(outcome, SubmitOutcome::CancelledBeforeProcessing);
+    assert!(agent.prompt_history().is_empty());
+    assert!(
+        agent
+            .conversation
+            .items()
+            .iter()
+            .all(|item| !item.to_string().contains(PROMPT))
+    );
+    drop(agent);
+    let loaded = Rollout::resume_in(&root, ResumeSelector::Id(session_id), &root.join("repo"))?;
+    assert!(loaded.unfinished_turn.is_none());
+    assert!(
+        loaded
+            .history
+            .iter()
+            .all(|item| !item.to_string().contains(PROMPT))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_pre_turn_compaction_retains_the_submitted_input() -> Result<()> {
     const REFRESHED_REPOSITORY_CONTEXT: &str = "REFRESHED CANCELLED-TURN REPOSITORY CONTEXT";
     const REFRESHED_SKILL_BODY: &str = "REFRESHED CANCELLED-TURN SKILL BODY";
@@ -3092,7 +3546,7 @@ async fn cancelled_pre_turn_compaction_retains_the_submitted_input() -> Result<(
         )
     );
     let submitted_message = UserInput::text(submitted.clone())
-        .into_message_and_skills()?
+        .into_message_and_attachments()?
         .0;
     assert!(
         crate::context::estimated_tokens(std::slice::from_ref(&submitted_message))

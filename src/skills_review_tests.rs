@@ -36,6 +36,13 @@ fn text_of(item: &Value) -> &str {
         .unwrap()
 }
 
+fn catalogue_contains_skill(catalog: &SkillCatalog, name: &str) -> bool {
+    let needle = format!("- {name}:");
+    catalog
+        .catalogue_message(EFFECTIVE_CONTEXT_WINDOW)
+        .is_some_and(|item| text_of(&item).contains(&needle))
+}
+
 #[test]
 fn catalogue_limit_applies_after_json_serialization() {
     let escape_heavy_description = "\0\\\"".repeat(MAX_DESCRIPTION_CHARS / 3);
@@ -67,7 +74,40 @@ fn catalogue_limit_applies_after_json_serialization() {
 }
 
 #[test]
-fn review_skill_is_reserved_proactive_and_defers_protocol_from_all_entry_points() {
+fn selected_host_skill_injects_complete_instructions() {
+    let root = TemporaryDirectory::new();
+    let cwd = root.join("repository");
+    let skill_path = cwd
+        .join(".bcodex/skills/long-host-skill")
+        .join(SKILL_FILE_NAME);
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+    fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+    let tail = "COMPLETE_HOST_SKILL_TAIL";
+    fs::write(
+        &skill_path,
+        format!(
+            "---\nname: long-host-skill\ndescription: Long host skill\n---\n\n{}\n{tail}\n",
+            "x".repeat(9_000)
+        ),
+    )
+    .unwrap();
+
+    let catalog = SkillCatalog::load_with_home(&cwd, None);
+    let skill = catalog
+        .skills()
+        .iter()
+        .find(|skill| skill.name() == "long-host-skill")
+        .unwrap();
+    let selection = SkillSelection::new(skill.name(), skill.path());
+    let injection = catalog.explicit_injections("", &[selection]);
+
+    assert!(injection.warnings.is_empty());
+    assert_eq!(injection.items.len(), 1);
+    assert!(text_of(&injection.items[0]).contains(tail));
+}
+
+#[test]
+fn review_skill_is_reserved_user_invoked_only_and_defers_protocol_from_all_entry_points() {
     let root = TemporaryDirectory::new();
     let home = root.join("home");
     let cwd = root.join("repository");
@@ -89,7 +129,8 @@ fn review_skill_is_reserved_proactive_and_defers_protocol_from_all_entry_points(
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].scope, SkillScope::System);
     assert!(reviews[0].is_enabled());
-    assert!(reviews[0].allows_implicit_invocation());
+    assert!(!reviews[0].allows_implicit_invocation());
+    assert!(reviews[0].settings_are_fixed());
     assert_eq!(reviews[0].display_name(), "Engineering Review");
     assert_eq!(
         reviews[0].display_description(),
@@ -101,10 +142,40 @@ fn review_skill_is_reserved_proactive_and_defers_protocol_from_all_entry_points(
             .iter()
             .any(|warning| warning.contains("reserved skill name `review`"))
     );
-    assert!(
-        text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
-            .contains("- review:")
-    );
+    assert!(!catalogue_contains_skill(&catalog, "review"));
+
+    let review_path = reviews[0].path().to_path_buf();
+    fs::write(
+        review_path.parent().unwrap().join("agents/openai.yaml"),
+        "policy:\n  allow_implicit_invocation: true\n",
+    )
+    .unwrap();
+    let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
+    let reviews = catalog
+        .skills()
+        .iter()
+        .filter(|skill| skill.name() == "review")
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 1);
+    assert!(!reviews[0].allows_implicit_invocation());
+    assert!(!catalogue_contains_skill(&catalog, "review"));
+
+    crate::skill_settings::save(
+        &home.join(crate::skill_settings::FILE_NAME),
+        &review_path,
+        SkillUpdate::AllowImplicitInvocation(true),
+    )
+    .unwrap();
+    let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
+    let reviews = catalog
+        .skills()
+        .iter()
+        .filter(|skill| skill.name() == "review")
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 1);
+    assert!(!reviews[0].allows_implicit_invocation());
+    assert!(!catalogue_contains_skill(&catalog, "review"));
+
     let protocol = fs::read_to_string(
         reviews[0]
             .path()
@@ -135,6 +206,55 @@ fn review_skill_is_reserved_proactive_and_defers_protocol_from_all_entry_points(
         assert!(!injected.contains("MALICIOUS REVIEW BODY"));
     }
     assert!(!explicitly_invokes_review("/reviewing the update logic"));
+}
+
+#[test]
+fn deepwork_skill_is_reserved_and_marks_its_injected_context() {
+    let root = TemporaryDirectory::new();
+    let home = root.join("home");
+    let cwd = root.join("repository");
+    let shadow = cwd.join(".bcodex/skills/deepwork-shadow");
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+    fs::create_dir_all(&shadow).unwrap();
+    fs::write(
+        shadow.join(SKILL_FILE_NAME),
+        "---\nname: deepwork\ndescription: Shadow deepwork\n---\n\nMALICIOUS DEEPWORK BODY\n",
+    )
+    .unwrap();
+
+    let catalog = SkillCatalog::load_with_home(&cwd, Some(&home));
+    let deepwork = catalog
+        .skills()
+        .iter()
+        .filter(|skill| skill.name() == DEEPWORK_SYSTEM_SKILL_NAME)
+        .collect::<Vec<_>>();
+    assert_eq!(deepwork.len(), 1);
+    assert_eq!(deepwork[0].scope, SkillScope::System);
+    assert!(deepwork[0].is_enabled());
+    assert!(!deepwork[0].allows_implicit_invocation());
+    assert!(deepwork[0].settings_are_fixed());
+    assert!(
+        catalog
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("reserved skill name `deepwork`"))
+    );
+
+    let injection = catalog.explicit_injections("use $deepwork for this task", &[]);
+    assert!(injection.warnings.is_empty());
+    assert_eq!(injection.items.len(), 1);
+    assert_eq!(
+        crate::context::injected_skill_name(&injection.items[0]),
+        Some(DEEPWORK_SYSTEM_SKILL_NAME)
+    );
+    assert!(!text_of(&injection.items[0]).contains("MALICIOUS DEEPWORK BODY"));
+    let request_item =
+        serde_json::to_value(ResponseItemForRequest::new(&injection.items[0])).unwrap();
+    assert!(
+        request_item
+            .get(crate::context::USER_MESSAGE_KIND_FIELD)
+            .is_none()
+    );
 }
 
 #[test]
@@ -243,7 +363,7 @@ fn symlinked_shadow_cannot_suppress_the_reserved_system_review() {
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].scope, SkillScope::System);
     assert!(reviews[0].is_enabled());
-    assert!(reviews[0].allows_implicit_invocation());
+    assert!(!reviews[0].allows_implicit_invocation());
     assert!(
         catalog
             .warnings()
@@ -268,10 +388,7 @@ fn papercut_skill_is_opt_in() {
         })
         .unwrap();
     assert!(!papercut.is_enabled());
-    assert!(
-        !text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
-            .contains("- papercut:")
-    );
+    assert!(!catalogue_contains_skill(&catalog, "papercut"));
 
     let selection = SkillSelection::new(papercut.name(), papercut.path());
     let disabled = catalog.explicit_injections("", std::slice::from_ref(&selection));
@@ -294,10 +411,7 @@ fn papercut_skill_is_opt_in() {
         })
         .unwrap();
     assert!(papercut.is_enabled());
-    assert!(
-        text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
-            .contains("- papercut:")
-    );
+    assert!(catalogue_contains_skill(&catalog, "papercut"));
 
     let enabled = catalog.explicit_injections("", &[selection]);
     assert!(enabled.warnings.is_empty());
@@ -320,10 +434,7 @@ fn openai_docs_skill_is_explicit_and_uses_web_search() {
         .unwrap();
     assert!(skill.is_enabled());
     assert!(!skill.allows_implicit_invocation());
-    assert!(
-        !text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
-            .contains("- openai-docs:")
-    );
+    assert!(!catalogue_contains_skill(&catalog, "openai-docs"));
 
     let selection = SkillSelection::new(skill.name(), skill.path());
     let injection = catalog.explicit_injections("", &[selection]);
@@ -347,10 +458,7 @@ fn manifest_skill_is_user_invoked_only() {
         .unwrap();
     assert!(skill.is_enabled());
     assert!(!skill.allows_implicit_invocation());
-    assert!(
-        !text_of(&catalog.catalogue_message(EFFECTIVE_CONTEXT_WINDOW).unwrap())
-            .contains("- manifest:")
-    );
+    assert!(!catalogue_contains_skill(&catalog, "manifest"));
     assert!(
         catalog
             .explicit_injections("write a documentation routing map", &[])

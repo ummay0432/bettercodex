@@ -622,7 +622,7 @@ async fn status_rate_limit_prefetch_reads_chatgpt_usage_with_account_auth() {
 }
 
 #[test]
-fn completed_items_ignore_sparse_indexes_and_are_emitted_once_in_stream_order() {
+fn completed_items_ignore_sparse_and_reused_indexes_and_emit_once_in_stream_order() {
     let (completed_items, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
     let mut collected = CollectedResponse::new(OutputItemMode::Transfer);
@@ -640,7 +640,7 @@ fn completed_items_ignore_sparse_indexes_and_are_emitted_once_in_stream_order() 
     for (output_index, sequence_number, item) in [
         (Some(0), 1, &first),
         (None, 3, &second),
-        (Some(5), 5, &third),
+        (Some(0), 5, &third),
     ] {
         let mut done = json!({
             "type": "response.output_item.done",
@@ -1016,9 +1016,33 @@ fn duplicate_sequence_numbers_require_identical_events() {
 }
 
 #[test]
-fn completed_output_rejects_late_lifecycle_events() {
+fn completed_output_ignores_late_lifecycle_replays() {
     let item = assistant_item_with_phase("complete", "final_answer");
-    let late_events = [
+    let (completed_items, mut received_items) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
+    let mut collected = CollectedResponse::new(OutputItemMode::Transfer);
+    let mut server_model_warning_emitted = false;
+    process_event_value(
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 4,
+            "sequence_number": 1,
+            "item": item,
+        }),
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    assert_eq!(received_items.try_recv().unwrap(), item);
+    assert!(matches!(
+        received_events.try_recv().unwrap(),
+        AgentEvent::ModelMessageCompleted(_)
+    ));
+
+    for late_event in [
         json!({
             "type": "response.output_item.added",
             "output_index": 4,
@@ -1030,37 +1054,11 @@ fn completed_output_rejects_late_lifecycle_events() {
             "item_id": item["id"],
             "output_index": 4,
             "content_index": 0,
-            "sequence_number": 2,
+            "sequence_number": 3,
             "delta": "late",
         }),
-    ];
-
-    for late_event in late_events {
-        let (completed_items, mut received_items) = tokio::sync::mpsc::unbounded_channel();
-        let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
-        let mut collected = CollectedResponse::new(OutputItemMode::Transfer);
-        let mut server_model_warning_emitted = false;
+    ] {
         process_event_value(
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 4,
-                "sequence_number": 1,
-                "item": item,
-            }),
-            &mut collected,
-            &completed_items,
-            Some(&events),
-            MODEL,
-            &mut server_model_warning_emitted,
-        )
-        .unwrap();
-        assert_eq!(received_items.try_recv().unwrap(), item);
-        assert!(matches!(
-            received_events.try_recv().unwrap(),
-            AgentEvent::ModelMessageCompleted(_)
-        ));
-
-        let error = process_event_value(
             late_event,
             &mut collected,
             &completed_items,
@@ -1068,11 +1066,25 @@ fn completed_output_rejects_late_lifecycle_events() {
             MODEL,
             &mut server_model_warning_emitted,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("after it was completed"));
-        assert!(received_items.try_recv().is_err());
-        assert!(received_events.try_recv().is_err());
+        .unwrap();
     }
+    assert!(received_items.try_recv().is_err());
+    assert!(received_events.try_recv().is_err());
+
+    let mut completed = completed_event("resp_late_replay", &item);
+    completed["sequence_number"] = json!(4);
+    process_event_value(
+        completed,
+        &mut collected,
+        &completed_items,
+        Some(&events),
+        MODEL,
+        &mut server_model_warning_emitted,
+    )
+    .unwrap();
+    let response = collected.finish().unwrap();
+    assert_eq!(response.output_item_count, 1);
+    assert_eq!(response.final_answer.as_deref(), Some("complete"));
 }
 
 #[test]
@@ -1386,7 +1398,9 @@ async fn http_transport_sends_the_contract_and_collects_the_response() {
         read["parameters"]["properties"]["detail"]["enum"],
         json!(["high", "original"])
     );
-    assert_eq!(read["parameters"]["properties"]["limit"]["maximum"], 2_000);
+    let read_limit = &read["parameters"]["properties"]["limit"];
+    assert_eq!(read_limit["minimum"], 1);
+    assert!(read_limit.get("maximum").is_none());
     let edit = tools
         .as_array()
         .unwrap()
@@ -2138,7 +2152,7 @@ async fn websocket_reconnects_after_an_idle_server_close() {
 }
 
 #[tokio::test]
-async fn websocket_ignores_trailing_terminal_frames_after_the_next_request() {
+async fn websocket_ignores_lifecycle_replays_and_trailing_prior_frames() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let first_item = assistant_item("first");
@@ -2214,8 +2228,36 @@ async fn websocket_ignores_trailing_terminal_frames_after_the_next_request() {
             ))
             .await
             .unwrap();
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "sequence_number": 3,
+                    "item": server_first_item,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_first",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "sequence_number": 4,
+                    "delta": "first",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
         let mut first_completed = completed_event("resp_first", &server_first_item);
-        first_completed["sequence_number"] = json!(3);
+        first_completed["sequence_number"] = json!(5);
         websocket
             .send(tungstenite::Message::Text(
                 first_completed.to_string().into(),
@@ -2967,7 +3009,7 @@ async fn compaction_rewrites_only_the_trailing_output_group() {
 async fn compaction_budget_counts_the_full_model_visible_request() {
     let selection = ModelSelection::default();
     let effective_window = selection.effective_context_window();
-    let [tool_tokens, instruction_tokens] = estimated_harness_tokens();
+    let [tool_tokens, instruction_tokens] = estimated_harness_tokens_for(false);
     let trigger_tokens = estimated_tokens(std::slice::from_ref(&compaction::compaction_trigger()));
     let full_request_history_limit = effective_window.saturating_sub(
         tool_tokens

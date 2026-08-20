@@ -1,3 +1,5 @@
+use super::ask_user_question::AskUserQuestionCard;
+use super::ask_user_question::AskUserQuestionCardAction;
 use super::bottom_pane::selection_popup_common::MAX_POPUP_ROWS;
 use super::bottom_pane::selection_popup_common::measure_text_height;
 use super::bottom_pane::selection_popup_common::menu_surface_padding_height;
@@ -5,6 +7,7 @@ use super::bottom_pane::selection_popup_common::render_menu_surface;
 use super::clipboard_paste;
 use super::context_window::ContextAction;
 use super::context_window::ContextWindowView;
+use super::context_window::format_tokens;
 use super::editor;
 use super::editor::Editor;
 use super::file_change;
@@ -36,6 +39,8 @@ use super::tools_view::ToolsView;
 use crate::agent::CompactionOutcome;
 use crate::agent::SubmitOutcome;
 use crate::ansi_escape::ansi_escape_line;
+use crate::ask_user_question::AskUserQuestionArgs;
+use crate::ask_user_question::AskUserQuestionResponse;
 use crate::assistant_message::AssistantMessage;
 use crate::assistant_message::with_citation_sources;
 use crate::context::ContextSnapshot;
@@ -44,6 +49,7 @@ use crate::events::AgentEvent;
 use crate::events::ModelTextDelta;
 use crate::events::SteerId;
 use crate::input::UserPrompt;
+use crate::input::file_attachment_text;
 use crate::model::ModelSelection;
 #[cfg(test)]
 use crate::protocol::FileChange;
@@ -235,6 +241,10 @@ pub(super) enum Action {
         path: PathBuf,
         update: SkillUpdate,
     },
+    ResolveAskUserQuestion {
+        call_id: String,
+        response: AskUserQuestionResponse,
+    },
     Quit,
 }
 
@@ -242,6 +252,11 @@ pub(super) enum Action {
 pub(super) struct ComposerSubmission {
     prompt: UserPrompt,
     draft: editor::EditorSnapshot,
+}
+
+struct SubmittedPrompt {
+    prompt: UserPrompt,
+    entry: usize,
 }
 
 impl ComposerSubmission {
@@ -267,6 +282,7 @@ impl ComposerSubmission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InterruptIntent {
     StopTurn,
+    EditPrompt,
     SubmitSteering,
 }
 
@@ -285,6 +301,7 @@ pub(super) struct View {
     skill_popup: SkillPopup,
     skills: Vec<Skill>,
     context_tokens: Option<u64>,
+    ask_user_question_enabled: bool,
     model_selection: ModelSelection,
     service_tier: ServiceTier,
     busy: bool,
@@ -292,6 +309,7 @@ pub(super) struct View {
     interrupting: Option<InterruptIntent>,
     working_since: Option<Instant>,
     turn_had_work: bool,
+    submitted_prompt: Option<SubmittedPrompt>,
     assistant_presentation: AssistantPresentation,
     deferred_agent_events: VecDeque<QueuedAgentEvent>,
     compacting: bool,
@@ -479,6 +497,9 @@ enum ToolDisplay {
         path: String,
         action: &'static str,
     },
+    AskUserQuestion {
+        questions: usize,
+    },
     Other,
 }
 
@@ -537,6 +558,7 @@ enum Overlay {
     Model(Box<ModelPicker>),
     Resume(ResumePicker),
     Skills(SkillsView),
+    AskUserQuestion(Box<AskUserQuestionCard>),
 }
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -562,6 +584,7 @@ impl View {
             skill_popup: SkillPopup::default(),
             skills,
             context_tokens: None,
+            ask_user_question_enabled: false,
             model_selection: ModelSelection::default(),
             service_tier: ServiceTier::default(),
             busy: false,
@@ -569,6 +592,7 @@ impl View {
             interrupting: None,
             working_since: None,
             turn_had_work: false,
+            submitted_prompt: None,
             assistant_presentation: AssistantPresentation::default(),
             deferred_agent_events: VecDeque::new(),
             compacting: false,
@@ -697,6 +721,10 @@ impl View {
 
     pub(super) fn start_turn(&mut self, prompt: &UserPrompt) {
         self.seal_exploration();
+        self.submitted_prompt = Some(SubmittedPrompt {
+            prompt: prompt.clone(),
+            entry: self.entries.len(),
+        });
         self.entries
             .push(TranscriptEntry::User(DisplayedUserPrompt::from_prompt(
                 prompt,
@@ -715,6 +743,7 @@ impl View {
 
     pub(super) fn start_compaction(&mut self) {
         self.seal_exploration();
+        self.submitted_prompt = None;
         self.context_tokens = None;
         self.busy = true;
         self.action_required = false;
@@ -729,6 +758,7 @@ impl View {
     }
 
     pub(super) fn add_user_message(&mut self, prompt: &UserPrompt) {
+        self.submitted_prompt = None;
         self.close_streaming_entries();
         self.seal_exploration();
         self.entries
@@ -752,6 +782,14 @@ impl View {
 
     pub(super) fn has_pending_steers(&self) -> bool {
         self.pending_input.has_steers()
+    }
+
+    pub(super) fn can_edit_submitted_prompt(&self) -> bool {
+        self.busy
+            && self.submitted_prompt.is_some()
+            && self.editor.is_empty()
+            && !self.pending_input.has_steers()
+            && !self.pending_input.has_follow_ups()
     }
 
     pub(super) fn restore_pending_input_to_composer(&mut self) {
@@ -825,6 +863,22 @@ impl View {
         let interrupt_intent = self.interrupting.take();
         self.compacting = false;
         self.action_required = result.is_err();
+        if matches!(&result, Ok(SubmitOutcome::CancelledBeforeProcessing))
+            && let Some(submitted) = self.submitted_prompt.take()
+        {
+            let mut prompts = vec![submitted.prompt];
+            prompts.extend(self.pending_input.take_all());
+            if submitted.entry < self.entries.len() {
+                self.entries.remove(submitted.entry);
+                if submitted.entry < self.committed_entries {
+                    self.committed_entries -= 1;
+                }
+            }
+            self.restore_prompts_to_composer(prompts);
+            self.resize_reflow_requested = true;
+            return None;
+        }
+        self.submitted_prompt = None;
         match result {
             Ok(SubmitOutcome::Completed(answer)) => {
                 if !self.terminal_assistant_received_this_turn && !answer.trim().is_empty() {
@@ -841,7 +895,7 @@ impl View {
                 }
                 None
             }
-            Ok(SubmitOutcome::Cancelled) => {
+            Ok(SubmitOutcome::Cancelled | SubmitOutcome::CancelledBeforeProcessing) => {
                 let steers = if interrupt_intent == Some(InterruptIntent::SubmitSteering) {
                     self.pending_input.take_steers()
                 } else {
@@ -872,6 +926,7 @@ impl View {
         self.working_since = None;
         self.busy = false;
         self.interrupting = None;
+        self.submitted_prompt = None;
         self.assistant_presentation.clear();
         self.deferred_agent_events.clear();
         self.compacting = false;
@@ -900,6 +955,10 @@ impl View {
 
     pub(super) fn set_context_tokens(&mut self, tokens: Option<u64>) {
         self.context_tokens = tokens;
+    }
+
+    pub(super) fn set_ask_user_question_enabled(&mut self, enabled: bool) {
+        self.ask_user_question_enabled = enabled;
     }
 
     pub(super) fn set_model_selection(&mut self, selection: ModelSelection) {
@@ -931,6 +990,7 @@ impl View {
     }
 
     pub(super) fn start_operator_command(&mut self, call_id: String, command: &str) {
+        self.submitted_prompt = None;
         // A terminal action is an explicit transcript boundary. Materialize agent events already
         // accepted by the view before inserting the local command so replay preserves their order.
         self.flush_presentation();
@@ -1044,10 +1104,31 @@ impl View {
     }
 
     pub(super) fn show_context(&mut self, snapshot: ContextSnapshot) {
+        self.ask_user_question_enabled = snapshot.ask_user_question_enabled;
         self.overlay = Some(Overlay::Context(ContextWindowView::new(
             snapshot,
             self.model_selection.model.clone(),
         )));
+    }
+
+    pub(super) fn show_ask_user_question(
+        &mut self,
+        call_id: String,
+        arguments: AskUserQuestionArgs,
+    ) {
+        self.overlay = Some(Overlay::AskUserQuestion(Box::new(
+            AskUserQuestionCard::new(call_id, arguments),
+        )));
+        self.action_required = true;
+    }
+
+    pub(super) fn dismiss_ask_user_question(&mut self, call_id: &str) {
+        if matches!(
+            self.overlay.as_ref(),
+            Some(Overlay::AskUserQuestion(card)) if card.call_id() == call_id
+        ) {
+            self.overlay = None;
+        }
     }
 
     pub(super) fn add_status(&mut self, snapshot: StatusSnapshot) {
@@ -1216,9 +1297,14 @@ impl View {
         self.dismissed_slash = None;
         self.terminal_assistant_received_this_turn = false;
         self.active_message_phase = None;
+        self.submitted_prompt = None;
     }
 
     pub(super) fn handle_agent_event(&mut self, event: AgentEvent) {
+        if matches!(event, AgentEvent::UserInputAccepted) {
+            self.submitted_prompt = None;
+            return;
+        }
         if !self.deferred_agent_events.is_empty() {
             self.defer_agent_event(event);
             return;
@@ -1355,6 +1441,19 @@ impl View {
                 self.complete_assistant_message(message);
             }
             AgentEvent::ModelResponseCompleted => self.close_streaming_entries(),
+            AgentEvent::UserInputAccepted => {}
+            AgentEvent::FileContextInjected(injected) => {
+                let unit = if injected.tokens == 1 {
+                    "token"
+                } else {
+                    "tokens"
+                };
+                self.add_notice(format!(
+                    "Injected {} into context · ~{} {unit}",
+                    injected.path,
+                    format_tokens(injected.tokens),
+                ));
+            }
             AgentEvent::WebSearchStarted(search) => {
                 self.close_streaming_entries();
                 self.seal_exploration();
@@ -1429,6 +1528,7 @@ impl View {
             AgentEvent::ContextUpdated(snapshot) => {
                 self.refresh_repository_if_pending();
                 self.context_tokens = snapshot.measured.then_some(snapshot.used_tokens);
+                self.ask_user_question_enabled = snapshot.ask_user_question_enabled;
                 match self.overlay.as_mut() {
                     Some(Overlay::Context(context)) => context.update(snapshot),
                     Some(Overlay::Tools {
@@ -1465,6 +1565,14 @@ impl View {
         let action = match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
+            }
+            Event::Paste(text)
+                if matches!(self.overlay.as_ref(), Some(Overlay::AskUserQuestion(_))) =>
+            {
+                if let Some(Overlay::AskUserQuestion(card)) = self.overlay.as_mut() {
+                    card.handle_paste(&text);
+                }
+                Action::None
             }
             Event::Paste(text) if matches!(self.overlay.as_ref(), Some(Overlay::Resume(_))) => {
                 if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
@@ -1527,6 +1635,20 @@ impl View {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        let ask_user_question_width = self.composer_text_width.saturating_sub(1).max(1);
+        if let Some(Overlay::AskUserQuestion(card)) = self.overlay.as_mut() {
+            return match card.handle_key(key, ask_user_question_width) {
+                AskUserQuestionCardAction::None => Action::None,
+                AskUserQuestionCardAction::Submit { call_id, response } => {
+                    Action::ResolveAskUserQuestion { call_id, response }
+                }
+                AskUserQuestionCardAction::Cancel { call_id } => Action::ResolveAskUserQuestion {
+                    call_id,
+                    response: AskUserQuestionResponse::cancelled(),
+                },
+                AskUserQuestionCardAction::Interrupt => Action::Cancel,
+            };
+        }
         if let Some(Overlay::Resume(picker)) = self.overlay.as_mut() {
             return match picker.handle_key(key) {
                 ResumePickerAction::None => Action::None,
@@ -1589,7 +1711,7 @@ impl View {
                         unreachable!("context overlay was matched above");
                     };
                     self.overlay = Some(Overlay::Tools {
-                        view: ToolsView::under_context(),
+                        view: ToolsView::under_context(context.ask_user_question_enabled()),
                         parent: Some(Box::new(context)),
                     });
                 }
@@ -1853,15 +1975,17 @@ impl View {
     }
 
     fn insert_selected_file(&mut self) -> bool {
-        let Some((token_range, path)) = self.file_search.selected_path() else {
+        let Some((token_range, path, match_type)) = self.file_search.selected_path() else {
             return false;
         };
-        let inserted = if path.chars().any(char::is_whitespace) && !path.contains('"') {
-            format!("\"{path}\"")
-        } else {
-            path
-        };
+        let path = PathBuf::from(path);
+        let inserted = file_attachment_text(&path);
+        let start = token_range.start;
         self.editor.replace_range(token_range, &inserted);
+        if match_type == crate::file_search::MatchType::File {
+            self.editor
+                .bind_file(start..start.saturating_add(inserted.len()), path);
+        }
         self.advance_past_completion_separator();
         self.file_search.dismiss();
         true
@@ -2038,7 +2162,7 @@ impl View {
             "/context" => Action::ShowContext,
             "/tools" => {
                 self.overlay = Some(Overlay::Tools {
-                    view: ToolsView::standalone(),
+                    view: ToolsView::standalone(self.ask_user_question_enabled),
                     parent: None,
                 });
                 Action::None
@@ -2461,6 +2585,7 @@ impl View {
             Some(Overlay::Model(picker)) => picker.preferred_height(width),
             Some(Overlay::Resume(_)) => screen_height,
             Some(Overlay::Skills(skills)) => skills.preferred_height(&self.skills, width),
+            Some(Overlay::AskUserQuestion(card)) => card.preferred_height(width, &self.cwd),
             None => 0,
         };
         let transcript_chrome_height = bottom_spacing
@@ -2609,6 +2734,9 @@ impl View {
             Some(Overlay::Resume(picker)) => picker.render(frame, area),
             Some(Overlay::Skills(skills)) => {
                 skills.render(frame, area, &self.skills, self.user_message_style)
+            }
+            Some(Overlay::AskUserQuestion(card)) => {
+                card.render(frame, area, self.user_message_style, &self.cwd)
             }
             None => {}
         }
@@ -2933,7 +3061,8 @@ impl View {
 fn is_presentation_step(event: &AgentEvent) -> bool {
     matches!(
         event,
-        AgentEvent::WebSearchStarted(_)
+        AgentEvent::FileContextInjected(_)
+            | AgentEvent::WebSearchStarted(_)
             | AgentEvent::WebSearchCompleted(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::Warning(_)
@@ -3176,6 +3305,18 @@ impl ToolEntry {
                     .unwrap_or_else(|| "file".to_string()),
                 action: "Editing",
             },
+            crate::ask_user_question::TOOL_NAME => ToolDisplay::AskUserQuestion {
+                questions: input
+                    .as_ref()
+                    .and_then(|input| input.get("questions"))
+                    .and_then(|questions| {
+                        questions
+                            .as_array()
+                            .map(Vec::len)
+                            .or_else(|| questions.as_u64().and_then(|count| count.try_into().ok()))
+                    })
+                    .unwrap_or(1),
+            },
             _ => ToolDisplay::Other,
         };
         let input = retain_tool_input(&name, input);
@@ -3241,8 +3382,13 @@ impl ToolEntry {
     }
 
     fn session_transcript_tool(&self, retain_success_output: bool) -> SessionTranscriptTool {
-        let retain_success_output = matches!(&self.display, ToolDisplay::Command { .. })
-            && (retain_success_output || self.status() == ToolStatus::Failed);
+        let retain_success_output = match &self.display {
+            ToolDisplay::Command { .. } => {
+                retain_success_output || self.status() == ToolStatus::Failed
+            }
+            ToolDisplay::AskUserQuestion { .. } => true,
+            _ => false,
+        };
         let output = if let Some(recovery) = &self.recovery {
             Some(SessionTranscriptToolOutput::recovered_file_state(
                 recovery.clone(),
@@ -3376,6 +3522,9 @@ impl ToolEntry {
                     file_change_lines(self, action, path, width)
                 }
             }
+            ToolDisplay::AskUserQuestion { questions } => {
+                ask_user_question_tool_lines(self, *questions, width)
+            }
             ToolDisplay::Other => generic_tool_lines(self, width),
         }
     }
@@ -3426,6 +3575,15 @@ impl ToolEntry {
 }
 
 fn retain_tool_input(name: &str, input: Option<Value>) -> Option<Value> {
+    if name == crate::ask_user_question::TOOL_NAME {
+        let questions = input
+            .as_ref()
+            .and_then(|input| input.get("questions"))
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        return Some(serde_json::json!({"questions": questions}));
+    }
     let retained_field = match name {
         "bash" => "command",
         "read" | "write" | "edit" => "path",
@@ -4249,6 +4407,52 @@ fn web_search_lines(search: &WebSearchEntry, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+fn ask_user_question_tool_lines(
+    tool: &ToolEntry,
+    questions: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let question_label = if questions == 1 {
+        "question".to_string()
+    } else {
+        format!("{questions} questions")
+    };
+    let line = match tool.outcome.as_ref().map(|outcome| &outcome.output) {
+        None => Line::from(vec![
+            activity_marker(Some(tool.started_at)),
+            " ".into(),
+            "Waiting for your answer".bold(),
+            " to ".into(),
+            Span::styled(question_label, palette::accent_text_style()),
+        ]),
+        Some(Ok(output)) if output.get("cancelled").and_then(Value::as_bool) == Some(true) => {
+            Line::from(vec!["• ".dim(), "Question cancelled".bold()])
+        }
+        Some(Ok(output)) => {
+            let answered = output
+                .get("answers")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(questions);
+            let answered_label = if answered == 1 {
+                "1 question".to_string()
+            } else {
+                format!("{answered} questions")
+            };
+            Line::from(vec![
+                "• ".green().bold(),
+                "Answered".bold(),
+                " ".into(),
+                Span::styled(answered_label, palette::accent_text_style()),
+            ])
+        }
+        Some(Err(error)) => {
+            return failed_tool_lines("Failed to ask user", error, width);
+        }
+    };
+    wrap_styled_line(&line, width.max(1))
+}
+
 fn generic_tool_lines(tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
     let name = markdown::sanitize_inline(&tool.name);
     match tool.outcome.as_ref().map(|outcome| &outcome.output) {
@@ -4771,7 +4975,7 @@ fn shortcut_reference_lines() -> Vec<Line<'static>> {
         shortcut_line("Enter while working", "steer after current model step"),
         shortcut_line("Alt+Up / Shift+Left", "edit last queued follow-up"),
         shortcut_line("Shift+Enter / Ctrl+J", "insert newline"),
-        shortcut_line("@", "find and insert a file path"),
+        shortcut_line("@", "find and attach a file to context"),
         shortcut_line("$", "mention an installed skill"),
         shortcut_line("Esc", "interrupt active turn"),
         shortcut_line("Up / Down", "restore prompt history"),
@@ -4844,6 +5048,79 @@ mod tests {
 
     fn prompt(text: impl Into<String>) -> UserPrompt {
         UserPrompt::text(text)
+    }
+
+    #[test]
+    fn accepted_input_releases_the_editable_prompt() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.start_turn(&prompt(
+            "large prompt retained only until input is accepted",
+        ));
+        assert!(view.submitted_prompt.is_some());
+
+        view.handle_agent_event(AgentEvent::UserInputAccepted);
+
+        assert!(view.submitted_prompt.is_none());
+        assert!(!view.can_edit_submitted_prompt());
+    }
+
+    #[test]
+    fn file_search_selection_binds_the_inserted_path_as_context_attachment() {
+        let cwd = Path::new("/tmp/bettercodex");
+        let mut view = View::new(cwd);
+        view.editor.set_text("@SPEC");
+        view.sync_composer_popups();
+        view.handle_file_search_update(FileSearchUpdate::Matches {
+            query: "SPEC".to_string(),
+            matches: vec![crate::file_search::FileMatch {
+                score: 100,
+                path: PathBuf::from("file-inject-SPEC.md"),
+                match_type: crate::file_search::MatchType::File,
+                root: cwd.to_path_buf(),
+                indices: None,
+            }],
+        });
+
+        assert!(view.insert_selected_file());
+        let prompt = view.editor.take_prompt();
+        assert_eq!(prompt.as_str(), "file-inject-SPEC.md ");
+        assert_eq!(prompt.file_attachments().len(), 1);
+        assert_eq!(
+            prompt.file_attachments()[0].path(),
+            Path::new("file-inject-SPEC.md")
+        );
+        assert_eq!(prompt.file_attachments()[0].range(), &(0..19));
+    }
+
+    #[test]
+    fn injected_file_context_renders_as_a_muted_token_sized_notice() {
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.start_turn(&prompt("Use file-inject-SPEC.md"));
+        view.handle_agent_event(AgentEvent::UserInputAccepted);
+        view.handle_agent_event(AgentEvent::FileContextInjected(
+            crate::file_context::InjectedFileContext {
+                path: "file-inject-SPEC.md".to_string(),
+                tokens: 1_240,
+            },
+        ));
+        assert!(view.advance_presentation(Instant::now() + Duration::from_secs(1)));
+
+        let lines = view.take_pending_history_lines(80, 24);
+        let notice = lines
+            .iter()
+            .find(|line| plain(*line).contains("Injected file-inject-SPEC.md into context"))
+            .expect("file injection notice");
+        assert_eq!(
+            plain(notice),
+            "• Injected file-inject-SPEC.md into context · ~1.2K tokens"
+        );
+        assert!(
+            notice
+                .line
+                .spans
+                .iter()
+                .all(|span| { span.style.add_modifier.contains(Modifier::DIM) })
+        );
     }
 
     #[test]
@@ -5676,17 +5953,23 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rejection_restores_skill_and_image_bindings() {
+    fn runtime_rejection_restores_skill_file_and_image_bindings() {
         let mut view = View::new(Path::new("/tmp/bettercodex"));
         view.welcome_pending = false;
-        let text = "$review inspect [Image #1]";
+        let text = "$review inspect file-inject-SPEC.md [Image #1]";
+        let file_label = "file-inject-SPEC.md";
+        let file_start = text.find(file_label).unwrap();
         let image_label = "[Image #1]";
         let image_start = text.find(image_label).unwrap();
-        let expected = UserPrompt::with_attachments(
+        let expected = UserPrompt::with_all_attachments(
             text,
             vec![crate::skills::SkillMention::new(
                 SkillSelection::new("review", "/tmp/review/SKILL.md"),
                 0.."$review".len(),
+            )],
+            vec![crate::input::PromptFileAttachment::new(
+                PathBuf::from(file_label),
+                file_start..file_start + file_label.len(),
             )],
             vec![crate::input::PromptImageAttachment::new(
                 crate::input::PromptImage::from_bytes(
@@ -5725,12 +6008,13 @@ mod tests {
         let text = "$review inspect [Image #1]";
         let image_label = "[Image #1]";
         let image_start = text.find(image_label).unwrap();
-        let prompt = UserPrompt::with_attachments(
+        let prompt = UserPrompt::with_all_attachments(
             text,
             vec![crate::skills::SkillMention::new(
                 SkillSelection::new("review", "/tmp/review/SKILL.md"),
                 0.."$review".len(),
             )],
+            Vec::new(),
             vec![crate::input::PromptImageAttachment::new(
                 crate::input::PromptImage::from_bytes(
                     Path::new("fixture.png"),

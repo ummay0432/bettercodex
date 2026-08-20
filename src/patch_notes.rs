@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
+use std::path::PathBuf;
 
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 const STATE_FILE_NAME: &str = "patch-notes.json";
@@ -80,12 +81,35 @@ impl Default for State {
     }
 }
 
-/// Marks this build as seen and returns notes newer than the previous marker.
+#[derive(Debug)]
+pub(crate) struct Startup {
+    notes: Option<String>,
+    state_path: PathBuf,
+    current: Version,
+}
+
+impl Startup {
+    #[cfg(test)]
+    pub(crate) fn notes(&self) -> Option<&str> {
+        self.notes.as_deref()
+    }
+
+    pub(crate) fn take_notes(&mut self) -> Option<String> {
+        self.notes.take()
+    }
+
+    /// Acknowledge these notes only after the first TUI frame presents them.
+    pub(crate) fn mark_seen(self) -> Result<()> {
+        mark_seen_at(&self.state_path, self.current)
+    }
+}
+
+/// Loads notes newer than the previous marker without acknowledging them yet.
 ///
 /// `had_saved_sessions` is sampled before the new session is created. It lets
 /// the first release with this mechanism distinguish an existing 0.1.3 user
 /// from a genuinely fresh installation, matching pi's fresh-install behavior.
-pub(crate) fn for_startup(had_saved_sessions: bool) -> Result<Option<String>> {
+pub(crate) fn for_startup(had_saved_sessions: bool) -> Result<Startup> {
     let home = crate::paths::bettercodex_home()
         .context("cannot save patch-note state because no bettercodex home is available")?;
     for_startup_at(
@@ -116,28 +140,29 @@ fn for_startup_at(
     changelog: &str,
     current: Version,
     had_saved_sessions: bool,
-) -> Result<Option<String>> {
-    let mut notes = None;
-    state_file::update_json(state_path, MAX_STATE_BYTES, read_state, |state| {
-        let last_seen = match state.last_seen_version.as_deref() {
-            Some(version) => Version::parse(version).ok_or_else(|| {
-                anyhow!(
-                    "patch-note state contains invalid version `{version}` in {}",
-                    state_path.display()
-                )
-            })?,
-            None if had_saved_sessions => LEGACY_LAST_SEEN_VERSION,
-            None => current,
-        };
+) -> Result<Startup> {
+    let state = read_state(state_path)?;
+    let last_seen = match saved_last_seen(&state, state_path)? {
+        Some(version) => version,
+        None if had_saved_sessions => LEGACY_LAST_SEEN_VERSION,
+        None => current,
+    };
+    Ok(Startup {
+        notes: startup_notes_between(changelog, last_seen, current)?,
+        state_path: state_path.to_path_buf(),
+        current,
+    })
+}
 
-        notes = notes_between(changelog, Some(last_seen), current)?;
-        let changed = state.last_seen_version.is_none() || last_seen < current;
+fn mark_seen_at(state_path: &Path, current: Version) -> Result<()> {
+    state_file::update_json(state_path, MAX_STATE_BYTES, read_state, |state| {
+        let changed =
+            saved_last_seen(state, state_path)?.is_none_or(|last_seen| last_seen < current);
         if changed {
             state.last_seen_version = Some(current.to_string());
         }
         Ok(state_file::StateChange::from_changed(changed))
-    })?;
-    Ok(notes)
+    })
 }
 
 fn read_state(path: &Path) -> Result<State> {
@@ -151,11 +176,60 @@ fn read_state(path: &Path) -> Result<State> {
     Ok(state)
 }
 
+fn saved_last_seen(state: &State, state_path: &Path) -> Result<Option<Version>> {
+    state
+        .last_seen_version
+        .as_deref()
+        .map(|version| {
+            Version::parse(version).ok_or_else(|| {
+                anyhow!(
+                    "patch-note state contains invalid version `{version}` in {}",
+                    state_path.display()
+                )
+            })
+        })
+        .transpose()
+}
+
 fn notes_between(
     changelog: &str,
     last_seen: Option<Version>,
     current: Version,
 ) -> Result<Option<String>> {
+    Ok(join_entries(&entries_between(
+        changelog, last_seen, current,
+    )?))
+}
+
+fn startup_notes_between(
+    changelog: &str,
+    last_seen: Version,
+    current: Version,
+) -> Result<Option<String>> {
+    let entries = entries_between(changelog, Some(last_seen), current)?;
+    let Some(mut markdown) = join_entries(&entries) else {
+        return Ok(None);
+    };
+    if entries.len() > 1 {
+        markdown.push_str("\n\n**Included releases:** ");
+        for (index, entry) in entries.iter().enumerate() {
+            if index > 0 {
+                markdown.push_str(" → ");
+            }
+            markdown.push('`');
+            markdown.push_str(&entry.version.to_string());
+            markdown.push('`');
+        }
+        markdown.push_str("\n\nScroll up to review every release included in this update.");
+    }
+    Ok(Some(markdown))
+}
+
+fn entries_between<'a>(
+    changelog: &'a str,
+    last_seen: Option<Version>,
+    current: Version,
+) -> Result<Vec<Entry<'a>>> {
     let mut entries = parse_changelog(changelog)?
         .into_iter()
         .filter(|entry| {
@@ -163,12 +237,16 @@ fn notes_between(
         })
         .collect::<Vec<_>>();
     entries.sort_unstable_by_key(|entry| entry.version);
+    Ok(entries)
+}
+
+fn join_entries(entries: &[Entry<'_>]) -> Option<String> {
     let markdown = entries
-        .into_iter()
+        .iter()
         .map(|entry| entry.markdown)
         .collect::<Vec<_>>()
         .join("\n\n");
-    Ok((!markdown.is_empty()).then_some(markdown))
+    (!markdown.is_empty()).then_some(markdown)
 }
 
 fn parse_changelog(source: &str) -> Result<Vec<Entry<'_>>> {

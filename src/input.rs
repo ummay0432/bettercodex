@@ -16,11 +16,50 @@ use std::sync::Arc;
 
 pub(crate) const MAX_TOTAL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UserPrompt {
     text: String,
     skill_mentions: Vec<SkillMention>,
+    file_attachments: Vec<PromptFileAttachment>,
     image_attachments: Vec<PromptImageAttachment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptFileAttachment {
+    path: PathBuf,
+    range: Range<usize>,
+}
+
+impl PromptFileAttachment {
+    pub(crate) fn new(path: PathBuf, range: Range<usize>) -> Self {
+        Self { path, range }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn range(&self) -> &Range<usize> {
+        &self.range
+    }
+
+    pub(crate) fn range_mut(&mut self) -> &mut Range<usize> {
+        &mut self.range
+    }
+
+    fn shifted(mut self, offset: usize) -> Self {
+        self.range = self.range.start.saturating_add(offset)..self.range.end.saturating_add(offset);
+        self
+    }
+}
+
+pub(crate) fn file_attachment_text(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if path.chars().any(char::is_whitespace) && !path.contains('"') {
+        format!("\"{path}\"")
+    } else {
+        path.into_owned()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,20 +96,24 @@ impl UserPrompt {
         Self {
             text: text.into(),
             skill_mentions: Vec::new(),
+            file_attachments: Vec::new(),
             image_attachments: Vec::new(),
         }
     }
 
-    pub(crate) fn with_attachments(
+    pub(crate) fn with_all_attachments(
         text: impl Into<String>,
         mut skill_mentions: Vec<SkillMention>,
+        mut file_attachments: Vec<PromptFileAttachment>,
         mut image_attachments: Vec<PromptImageAttachment>,
     ) -> Self {
         skill_mentions.sort_by_key(|mention| mention.range().start);
+        file_attachments.sort_by_key(|attachment| attachment.range.start);
         image_attachments.sort_by_key(|attachment| attachment.range.start);
         Self {
             text: text.into(),
             skill_mentions,
+            file_attachments,
             image_attachments,
         }
     }
@@ -78,6 +121,7 @@ impl UserPrompt {
     pub(crate) fn joined(prompts: Vec<Self>) -> Self {
         let mut text = String::new();
         let mut skill_mentions = Vec::new();
+        let mut file_attachments = Vec::new();
         let mut image_attachments = Vec::new();
         for prompt in prompts {
             if !text.is_empty() {
@@ -91,6 +135,12 @@ impl UserPrompt {
                     .into_iter()
                     .map(|mention| mention.shifted(offset)),
             );
+            file_attachments.extend(
+                prompt
+                    .file_attachments
+                    .into_iter()
+                    .map(|attachment| attachment.shifted(offset)),
+            );
             image_attachments.extend(
                 prompt
                     .image_attachments
@@ -101,6 +151,7 @@ impl UserPrompt {
         Self {
             text,
             skill_mentions,
+            file_attachments,
             image_attachments,
         }
     }
@@ -111,6 +162,10 @@ impl UserPrompt {
 
     pub(crate) fn skill_mentions(&self) -> &[SkillMention] {
         &self.skill_mentions
+    }
+
+    pub(crate) fn file_attachments(&self) -> &[PromptFileAttachment] {
+        &self.file_attachments
     }
 
     pub(crate) fn image_attachments(&self) -> &[PromptImageAttachment] {
@@ -131,10 +186,13 @@ impl UserPrompt {
         ))
     }
 
-    pub(crate) fn into_parts(self) -> (String, Vec<SkillSelection>, Vec<PromptImage>) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (String, Vec<SkillSelection>, Vec<PathBuf>, Vec<PromptImage>) {
         let Self {
             text,
             skill_mentions,
+            file_attachments,
             image_attachments,
         } = self;
         let text = if image_attachments.is_empty() {
@@ -149,6 +207,10 @@ impl UserPrompt {
             skill_mentions
                 .into_iter()
                 .map(|mention| mention.selection().clone())
+                .collect(),
+            file_attachments
+                .into_iter()
+                .map(|attachment| attachment.path)
                 .collect(),
             image_attachments
                 .into_iter()
@@ -284,6 +346,7 @@ pub(crate) struct UserInput {
     text: String,
     images: Vec<PromptImage>,
     selected_skills: Vec<SkillSelection>,
+    selected_files: Vec<PathBuf>,
 }
 
 impl UserInput {
@@ -292,15 +355,17 @@ impl UserInput {
             text: text.into(),
             images: Vec::new(),
             selected_skills: Vec::new(),
+            selected_files: Vec::new(),
         }
     }
 
     pub(crate) fn prompt(prompt: UserPrompt) -> Self {
-        let (text, selected_skills, images) = prompt.into_parts();
+        let (text, selected_skills, selected_files, images) = prompt.into_parts();
         Self {
             text,
             images,
             selected_skills,
+            selected_files,
         }
     }
 
@@ -317,6 +382,11 @@ impl UserInput {
                 .skill_mentions()
                 .iter()
                 .map(|mention| mention.selection().clone())
+                .collect(),
+            selected_files: prompt
+                .file_attachments()
+                .iter()
+                .map(|attachment| attachment.path().to_path_buf())
                 .collect(),
         }
     }
@@ -338,6 +408,7 @@ impl UserInput {
             text: text.into(),
             images,
             selected_skills: Vec::new(),
+            selected_files: Vec::new(),
         };
         if input.is_empty() {
             return Err(anyhow!("prompt and image list are both empty"));
@@ -346,18 +417,21 @@ impl UserInput {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.text.trim().is_empty() && self.images.is_empty()
+        self.text.trim().is_empty() && self.images.is_empty() && self.selected_files.is_empty()
     }
 
-    pub(crate) fn has_images(&self) -> bool {
-        !self.images.is_empty()
+    pub(crate) fn has_blocking_attachments(&self) -> bool {
+        !self.images.is_empty() || !self.selected_files.is_empty()
     }
 
-    pub(crate) fn into_message_and_skills(self) -> Result<(Value, String, Vec<SkillSelection>)> {
+    pub(crate) fn into_message_and_attachments(
+        self,
+    ) -> Result<(Value, String, Vec<SkillSelection>, Vec<PathBuf>)> {
         let Self {
             text,
             images,
             selected_skills,
+            selected_files,
         } = self;
         let total_image_bytes = images
             .iter()
@@ -380,6 +454,7 @@ impl UserInput {
             }),
             text,
             selected_skills,
+            selected_files,
         ))
     }
 }
@@ -489,7 +564,7 @@ mod tests {
     fn text_input_uses_the_responses_message_shape() {
         assert_eq!(
             UserInput::text("inspect")
-                .into_message_and_skills()
+                .into_message_and_attachments()
                 .unwrap()
                 .0,
             json!({
@@ -511,7 +586,7 @@ mod tests {
 
         let message = UserInput::from_paths("", std::slice::from_ref(&path), ImageDetail::High)
             .unwrap()
-            .into_message_and_skills()
+            .into_message_and_attachments()
             .unwrap()
             .0;
         assert_eq!(message["role"], "user");
@@ -536,8 +611,9 @@ mod tests {
                 text: String::new(),
                 images: vec![image],
                 selected_skills: Vec::new(),
+                selected_files: Vec::new(),
             }
-            .into_message_and_skills()
+            .into_message_and_attachments()
             .expect("prepare image")
             .0
         };
@@ -563,8 +639,9 @@ mod tests {
         let image = PromptImage::from_bytes(Path::new("shared.png"), bytes, ImageDetail::High)
             .expect("load shared image");
         let prompt = |image| {
-            UserPrompt::with_attachments(
+            UserPrompt::with_all_attachments(
                 "[image]",
+                Vec::new(),
                 Vec::new(),
                 vec![PromptImageAttachment::new(image, 0..7)],
             )
@@ -572,7 +649,7 @@ mod tests {
         let joined = UserPrompt::joined(vec![prompt(image.clone()), prompt(image)]);
 
         let error = UserInput::prompt(joined)
-            .into_message_and_skills()
+            .into_message_and_attachments()
             .expect_err("joined prompts must retain the aggregate image limit");
 
         assert!(error.to_string().contains("50 MiB input limit"));

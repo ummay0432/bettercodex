@@ -25,10 +25,10 @@ const SKILL_FILE_NAME: &str = "SKILL.md";
 const SKILLS_DIRECTORY: &str = "skills";
 const PROJECT_DIRECTORY: &str = ".bcodex";
 const PAPERCUT_SYSTEM_SKILL_NAME: &str = "papercut";
+pub(crate) const DEEPWORK_SYSTEM_SKILL_NAME: &str = "deepwork";
 const MAX_NAME_CHARS: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 1_024;
 const MAX_METADATA_BYTES: usize = 64 * 1024;
-const MAX_SKILL_PROMPT_BYTES: usize = 8_000;
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_SCAN_DIRECTORIES: usize = 2_000;
 const MAX_SCAN_ENTRIES: usize = 20_000;
@@ -39,7 +39,7 @@ const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
 const MAX_SKILLS_CONTEXT_BYTES: usize = 39_000;
 
 fn is_reserved_system_skill_name(name: &str) -> bool {
-    name == "review"
+    matches!(name, "review" | DEEPWORK_SYSTEM_SKILL_NAME)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,6 +91,17 @@ impl Skill {
 
     pub(crate) fn allows_implicit_invocation(&self) -> bool {
         self.allow_implicit_invocation
+    }
+
+    pub(crate) fn settings_are_fixed(&self) -> bool {
+        is_reserved_system_skill_name(&self.name)
+    }
+
+    fn enforce_fixed_settings(&mut self) {
+        if self.settings_are_fixed() {
+            self.enabled = true;
+            self.allow_implicit_invocation = false;
+        }
     }
 }
 
@@ -297,9 +308,7 @@ impl SkillCatalog {
                             continue;
                         }
                         discovered_paths.insert(canonical.clone());
-                        if is_reserved_system_skill_name(&skill.name) {
-                            skill.enabled = true;
-                        }
+                        skill.enforce_fixed_settings();
                         skills.push(skill);
                         if let Some(warning) = metadata_warning {
                             warnings.push(warning);
@@ -460,19 +469,8 @@ impl SkillCatalog {
         let mut items = Vec::with_capacity(selected.len());
         for skill in selected {
             match read_skill_prompt(&skill.path) {
-                Ok((contents, truncated)) => {
+                Ok(contents) => {
                     let path = escape_xml_text(&skill.path.to_string_lossy());
-                    let truncation_notice = truncated.then(|| {
-                        format!(
-                            "\n<skill_truncated>The injected copy reached bettercodex's {MAX_SKILL_PROMPT_BYTES}-byte item limit. Read the complete SKILL.md at {path} before acting.</skill_truncated>"
-                        )
-                    });
-                    if truncated {
-                        warnings.push(bounded_warning(format!(
-                            "Skill `{}` exceeded the {}-byte prompt limit and was truncated",
-                            skill.name, MAX_SKILL_PROMPT_BYTES
-                        )));
-                    }
                     let name = escape_xml_text(&skill.name);
                     let description = escape_xml_text(
                         &skill
@@ -482,15 +480,18 @@ impl SkillCatalog {
                             .collect::<String>(),
                     );
                     let prompt = format!(
-                        "<skill_context>\n<name>{name}</name>\n<description>{description}</description>\n<path>{path}</path>\n<instructions><![CDATA[\n{}\n]]></instructions>{}\n</skill_context>",
+                        "<skill_context>\n<name>{name}</name>\n<description>{description}</description>\n<path>{path}</path>\n<instructions><![CDATA[\n{}\n]]></instructions>\n</skill_context>",
                         escape_cdata(&contents),
-                        truncation_notice.as_deref().unwrap_or_default(),
                     );
-                    items.push(json!({
+                    let mut item = json!({
                         "type": "message",
                         "role": "user",
                         "content": [{"type": "input_text", "text": prompt}],
-                    }));
+                    });
+                    if skill.name == DEEPWORK_SYSTEM_SKILL_NAME {
+                        crate::context::mark_skill_context_message(&mut item, &skill.name);
+                    }
+                    items.push(item);
                 }
                 Err(error) => warnings.push(bounded_warning(format!(
                     "Failed to load selected skill `{}` at {}: {error:#}",
@@ -517,8 +518,8 @@ impl SkillCatalog {
             }
         };
         for skill in &mut self.skills {
-            if is_reserved_system_skill_name(&skill.name) {
-                skill.enabled = true;
+            if skill.settings_are_fixed() {
+                skill.enforce_fixed_settings();
                 continue;
             }
             let Some(settings) = settings.skills.get(&skill.path) else {
@@ -935,25 +936,8 @@ fn load_optional_metadata(path: &Path) -> (SkillMetadataFile, Option<String>) {
     }
 }
 
-fn read_skill_prompt(path: &Path) -> Result<(String, bool)> {
-    let file = File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.take((MAX_SKILL_PROMPT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    let truncated = bytes.len() > MAX_SKILL_PROMPT_BYTES;
-    bytes.truncate(MAX_SKILL_PROMPT_BYTES);
-    match std::str::from_utf8(&bytes) {
-        Ok(contents) => Ok((contents.to_string(), truncated)),
-        Err(error) if error.error_len().is_none() => {
-            bytes.truncate(error.valid_up_to());
-            Ok((
-                String::from_utf8(bytes)
-                    .context("failed to retain the valid UTF-8 skill prefix")?,
-                true,
-            ))
-        }
-        Err(error) => Err(anyhow!("skill is not valid UTF-8: {error}")),
-    }
+fn read_skill_prompt(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
 #[derive(Clone, Copy, Default)]

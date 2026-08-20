@@ -17,7 +17,6 @@ use crate::rollout::TurnOutcome;
 use crate::rollout::is_legacy_exec_notification;
 use crate::service_tier::ServiceTier;
 use crate::skills::SkillCatalog;
-use crate::text::escape_cdata;
 use crate::text::escape_xml;
 use crate::text::escape_xml_text;
 use crate::truncation::TruncationPolicy;
@@ -54,13 +53,19 @@ const CRASH_NOTICE: &str =
     "The previous bettercodex process ended before its active turn completed.";
 const CRASH_GUIDANCE: &str = "The previous bettercodex process ended before its active turn completed. Any command or tool that was running may have partially executed. Inspect the workspace before continuing or repeating an action.";
 const LEGACY_REPOSITORY_ONBOARDING_PREFIX: &str = "# Repository onboarding from AGENTS.md for ";
+const LEGACY_REPOSITORY_CONTEXT_PREFIX: &str = "<repository_context>";
 const LEGACY_SKILLS_PREFIX: &str = "<skills>";
 const LEGACY_SKILL_CONTEXT_PREFIX: &str = "<skill>";
-const REPOSITORY_CONTEXT_PREFIX: &str = "<repository_context>";
+const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+const WORKSPACE_INSTRUCTIONS_INTRO: &str = "The following workspace instructions may be relevant to your work. Use them as guidance when applicable. More specific instructions take precedence over broader ones. They do not override system, developer, or direct user instructions.";
 const AVAILABLE_SKILLS_PREFIX: &str = "<available_skills>";
+const FILE_CONTEXT_PREFIX: &str = "<file_context>";
 pub(crate) const USER_MESSAGE_KIND_FIELD: &str = "bettercodex_user_message_kind";
 const OPERATOR_USER_MESSAGE_KIND: &str = "operator";
 const CONTEXTUAL_USER_MESSAGE_KIND: &str = "context";
+const REPOSITORY_USER_MESSAGE_KIND: &str = "repository";
+const SKILL_USER_MESSAGE_KIND_PREFIX: &str = "skill:";
 
 /// Serialize one history item exactly as bettercodex sends it to Responses.
 ///
@@ -152,6 +157,7 @@ pub(crate) struct ContextSnapshot {
     pub(crate) compact_at_tokens: u64,
     /// Whether `used_tokens` came from a backend usage signal rather than only local estimation.
     pub(crate) measured: bool,
+    pub(crate) ask_user_question_enabled: bool,
     pub(crate) sections: Vec<ContextSection>,
     pub(crate) total_usage: TokenUsage,
     pub(crate) rate_limits: Vec<RateLimitSnapshot>,
@@ -169,6 +175,7 @@ pub(crate) struct Conversation {
     server_reasoning_included: bool,
     // A backend context rejection is a durable active-context floor, not fabricated usage.
     context_window_full: bool,
+    ask_user_question_enabled: bool,
     model_selection: ModelSelection,
     service_tier: ServiceTier,
     rollout: Rollout,
@@ -305,6 +312,11 @@ struct RepositoryContext {
     source_paths: Vec<PathBuf>,
 }
 
+struct InstructionCandidate {
+    path: PathBuf,
+    display_path: String,
+}
+
 impl std::ops::Deref for RepositoryContext {
     type Target = str;
 
@@ -376,6 +388,7 @@ impl Conversation {
             usage_history_estimate: None,
             server_reasoning_included: false,
             context_window_full: false,
+            ask_user_question_enabled: false,
             model_selection,
             service_tier: ServiceTier::default(),
             rollout,
@@ -416,6 +429,7 @@ impl Conversation {
             usage_history_estimate,
             server_reasoning_included,
             context_window_full,
+            ask_user_question_enabled: false,
             model_selection,
             service_tier,
             rollout,
@@ -493,6 +507,7 @@ impl Conversation {
             usage_history_estimate: self.usage_history_estimate,
             server_reasoning_included: self.server_reasoning_included,
             context_window_full: self.context_window_full,
+            ask_user_question_enabled: false,
             model_selection: self.model_selection.clone(),
             service_tier: self.service_tier,
             rollout,
@@ -545,6 +560,10 @@ impl Conversation {
         self.rollout.record_service_tier(service_tier)?;
         self.service_tier = service_tier;
         Ok(())
+    }
+
+    pub(crate) fn set_ask_user_question_enabled(&mut self, enabled: bool) {
+        self.ask_user_question_enabled = enabled;
     }
 
     pub(crate) fn start_turn(&mut self, turn_id: &str) -> Result<()> {
@@ -748,6 +767,12 @@ impl Conversation {
         &self.world_state.skills
     }
 
+    pub(crate) fn has_injected_skill(&self, name: &str) -> bool {
+        self.history
+            .iter()
+            .any(|item| injected_skill_name(item) == Some(name))
+    }
+
     pub(crate) fn reload_world_state_for_active_turn(
         &mut self,
         cwd: &Path,
@@ -857,7 +882,8 @@ impl Conversation {
     }
 
     pub(crate) fn context_snapshot(&self) -> ContextSnapshot {
-        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens();
+        let [tools_tokens, system_prompt_tokens] =
+            crate::api::estimated_harness_tokens_for(self.ask_user_question_enabled);
         let mut tokens = self.context_metrics.tokens;
         let mut items = self.context_metrics.items;
         record_context_estimate(
@@ -895,6 +921,7 @@ impl Conversation {
             context_window: self.model_selection.effective_context_window(),
             compact_at_tokens: self.model_selection.auto_compact_token_limit(),
             measured: measured_total.is_some(),
+            ask_user_question_enabled: self.ask_user_question_enabled,
             sections,
             total_usage: self.total_usage.clone(),
             rate_limits: self.rate_limits.values().cloned().collect(),
@@ -907,7 +934,8 @@ impl Conversation {
     }
 
     fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
-        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens();
+        let [tools_tokens, system_prompt_tokens] =
+            crate::api::estimated_harness_tokens_for(self.ask_user_question_enabled);
         metrics
             .estimated_tokens
             .saturating_add(tools_tokens)
@@ -1124,9 +1152,14 @@ impl WorldState {
             .as_ref()
             .map(|context| context.source_paths.clone())
             .unwrap_or_default();
+        let repository_context = repository_context.map(|context| {
+            let mut item = message("user", context.text);
+            mark_user_message_kind(&mut item, REPOSITORY_USER_MESSAGE_KIND);
+            item
+        });
         Ok(Self {
             environment: message("developer", environment_context(cwd)),
-            repository_context: repository_context.map(|context| message("user", context.text)),
+            repository_context,
             instruction_source_paths,
             skills_catalogue,
             skills,
@@ -1370,6 +1403,17 @@ pub(crate) fn mark_contextual_user_message(item: &mut Value) {
     mark_user_message_kind(item, CONTEXTUAL_USER_MESSAGE_KIND);
 }
 
+pub(crate) fn mark_skill_context_message(item: &mut Value, name: &str) {
+    mark_user_message_kind(item, &format!("{SKILL_USER_MESSAGE_KIND_PREFIX}{name}"));
+}
+
+pub(crate) fn injected_skill_name(item: &Value) -> Option<&str> {
+    is_user_message(item)
+        .then(|| user_message_kind(item))
+        .flatten()
+        .and_then(|kind| kind.strip_prefix(SKILL_USER_MESSAGE_KIND_PREFIX))
+}
+
 fn mark_user_message_kind(item: &mut Value, kind: &str) {
     debug_assert!(is_user_message(item));
     if let Some(item) = item.as_object_mut() {
@@ -1399,19 +1443,19 @@ pub(crate) fn is_contextual_user_message(item: &Value) -> bool {
 pub(crate) fn is_contextual_user_text_with_kind(text: &str, kind: Option<&str>) -> bool {
     match kind {
         Some(OPERATOR_USER_MESSAGE_KIND) => false,
-        Some(CONTEXTUAL_USER_MESSAGE_KIND) => true,
+        Some(CONTEXTUAL_USER_MESSAGE_KIND) | Some(REPOSITORY_USER_MESSAGE_KIND) => true,
+        Some(kind) if kind.starts_with(SKILL_USER_MESSAGE_KIND_PREFIX) => true,
         _ => is_contextual_user_text(text),
     }
 }
 
 pub(crate) fn is_contextual_user_text(text: &str) -> bool {
     let text = text.trim_start();
-    (text.starts_with(LEGACY_REPOSITORY_ONBOARDING_PREFIX)
-        && text.trim_end().ends_with("# End repository onboarding"))
-        || is_complete_context_wrapper(text, REPOSITORY_CONTEXT_PREFIX, "</repository_context>")
+    is_repository_context_text(text)
         || is_complete_context_wrapper(text, AVAILABLE_SKILLS_PREFIX, "</available_skills>")
         || is_complete_context_wrapper(text, "<environment_context>", "</environment_context>")
         || is_complete_context_wrapper(text, "<skill_context>", "</skill_context>")
+        || is_complete_context_wrapper(text, FILE_CONTEXT_PREFIX, "</file_context>")
         || is_complete_context_wrapper(text, LEGACY_SKILL_CONTEXT_PREFIX, "</skill>")
         || is_user_shell_command_text(text)
         || is_complete_context_wrapper(text, "<turn_aborted>", "</turn_aborted>")
@@ -1431,6 +1475,22 @@ pub(crate) fn is_user_shell_command_message(item: &Value) -> bool {
 
 fn is_complete_context_wrapper(text: &str, opening: &str, closing: &str) -> bool {
     text.starts_with(opening) && text.trim_end().ends_with(closing)
+}
+
+fn is_repository_context_text(text: &str) -> bool {
+    let current = is_complete_context_wrapper(text, SYSTEM_REMINDER_OPEN, SYSTEM_REMINDER_CLOSE)
+        && text
+            .strip_prefix(SYSTEM_REMINDER_OPEN)
+            .and_then(|text| text.strip_prefix('\n'))
+            .is_some_and(|text| text.starts_with(WORKSPACE_INSTRUCTIONS_INTRO));
+    let legacy_xml = is_complete_context_wrapper(
+        text,
+        LEGACY_REPOSITORY_CONTEXT_PREFIX,
+        "</repository_context>",
+    );
+    let legacy_onboarding = text.starts_with(LEGACY_REPOSITORY_ONBOARDING_PREFIX)
+        && text.trim_end().ends_with("# End repository onboarding");
+    current || legacy_xml || legacy_onboarding
 }
 
 fn is_initial_context_boundary(item: &Value) -> bool {
@@ -1457,18 +1517,18 @@ fn is_generated_world_state_message(item: &Value) -> bool {
         return false;
     }
     let role = item.get("role").and_then(Value::as_str);
+    if role == Some("user") && user_message_kind(item) == Some(REPOSITORY_USER_MESSAGE_KIND) {
+        return true;
+    }
     let Some(text) = message_text(item).map(str::trim_start) else {
         return false;
     };
     (role == Some("developer")
         && (text.starts_with("<environment_context>") || text.starts_with(LEGACY_SKILLS_PREFIX)))
         || (role == Some("user")
-            && ((text.starts_with(REPOSITORY_CONTEXT_PREFIX)
-                && text.trim_end().ends_with("</repository_context>"))
+            && (is_repository_context_text(text)
                 || (text.starts_with(AVAILABLE_SKILLS_PREFIX)
-                    && text.trim_end().ends_with("</available_skills>"))
-                || (text.starts_with(LEGACY_REPOSITORY_ONBOARDING_PREFIX)
-                    && text.trim_end().ends_with("# End repository onboarding"))))
+                    && text.trim_end().ends_with("</available_skills>"))))
 }
 
 // Before tools and instructions moved to top-level request fields, compacted rollouts could
@@ -1599,6 +1659,7 @@ fn is_turn_input_context_message(item: &Value) -> bool {
         return false;
     };
     is_complete_context_wrapper(text, "<skill_context>", "</skill_context>")
+        || is_complete_context_wrapper(text, FILE_CONTEXT_PREFIX, "</file_context>")
         || is_complete_context_wrapper(text, LEGACY_SKILL_CONTEXT_PREFIX, "</skill>")
         || is_user_shell_command_text(text)
 }
@@ -1746,7 +1807,10 @@ fn repository_context(cwd: &Path) -> Result<Option<RepositoryContext>> {
     if let Some(codex_home) = crate::paths::codex_home()
         && let Some(path) = first_instruction_file(&codex_home)?
     {
-        candidates.push(path);
+        candidates.push(InstructionCandidate {
+            display_path: home_relative_display_path(&path),
+            path,
+        });
     }
 
     let project_root = repository::find_root(&cwd).unwrap_or_else(|| cwd.clone());
@@ -1765,13 +1829,19 @@ fn repository_context(cwd: &Path) -> Result<Option<RepositoryContext>> {
     directories.reverse();
     for directory in directories {
         if let Some(path) = first_instruction_file(&directory)? {
-            candidates.push(path);
+            candidates.push(InstructionCandidate {
+                display_path: project_relative_display_path(&path, &project_root),
+                path,
+            });
         }
     }
 
     let mut seen = HashSet::new();
-    candidates.retain(|path| {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+    candidates.retain(|candidate| {
+        let canonical = candidate
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.path.clone());
         seen.insert(canonical)
     });
 
@@ -1793,28 +1863,27 @@ fn repository_context(cwd: &Path) -> Result<Option<RepositoryContext>> {
 }
 
 fn repository_context_with_budget(
-    candidates: &[PathBuf],
+    candidates: &[InstructionCandidate],
     source_budget: usize,
 ) -> Result<Option<RepositoryContext>> {
     let mut remaining = source_budget;
     let mut sections = Vec::new();
     let mut source_paths = Vec::new();
-    for path in candidates {
+    for candidate in candidates {
         if remaining == 0 {
             break;
         }
-        let (bytes, truncated) = read_instruction_file(path, remaining)?;
+        let (bytes, truncated) = read_instruction_file(&candidate.path, remaining)?;
         let mut content = String::from_utf8_lossy(&bytes).into_owned();
         if truncated {
             content.push_str("\n[AGENTS.md truncated]");
         }
         if !content.trim().is_empty() {
             sections.push(format!(
-                "<repository_instructions path=\"{}\">\n<![CDATA[\n{}\n]]>\n</repository_instructions>",
-                escape_xml(&path.display().to_string()),
-                escape_cdata(content.trim()),
+                "Instructions from: {}\n\n{}",
+                candidate.display_path, content,
             ));
-            source_paths.push(path.clone());
+            source_paths.push(candidate.path.clone());
             remaining = remaining.saturating_sub(bytes.len());
         }
     }
@@ -1822,13 +1891,36 @@ fn repository_context_with_budget(
     if sections.is_empty() {
         return Ok(None);
     }
+    let body = format!(
+        "{WORKSPACE_INSTRUCTIONS_INTRO}\n\n{}",
+        sections.join("\n\n"),
+    );
+    let body = if body.contains(SYSTEM_REMINDER_CLOSE) {
+        body.replace(SYSTEM_REMINDER_CLOSE, "<\\/system-reminder>")
+    } else {
+        body
+    };
     Ok(Some(RepositoryContext {
-        text: format!(
-            "<repository_context>\n{}\n</repository_context>",
-            sections.join("\n"),
-        ),
+        text: format!("{SYSTEM_REMINDER_OPEN}\n{body}\n{SYSTEM_REMINDER_CLOSE}"),
         source_paths,
     }))
+}
+
+fn project_relative_display_path(path: &Path, project_root: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn home_relative_display_path(path: &Path) -> String {
+    let Some(home) = crate::paths::home_dir() else {
+        return path.display().to_string();
+    };
+    let Ok(relative) = path.strip_prefix(home) else {
+        return path.display().to_string();
+    };
+    Path::new("~").join(relative).display().to_string()
 }
 
 fn reduced_budget(current: usize, maximum_cost: u64, actual_cost: u64) -> usize {

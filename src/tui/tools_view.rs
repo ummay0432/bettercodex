@@ -46,17 +46,17 @@ struct ToolSummary {
 }
 
 impl ToolsView {
-    pub(super) fn standalone() -> Self {
-        Self::new(ToolsPlacement::Standalone)
+    pub(super) fn standalone(ask_user_question_enabled: bool) -> Self {
+        Self::new(ToolsPlacement::Standalone, ask_user_question_enabled)
     }
 
-    pub(super) fn under_context() -> Self {
-        Self::new(ToolsPlacement::UnderContext)
+    pub(super) fn under_context(ask_user_question_enabled: bool) -> Self {
+        Self::new(ToolsPlacement::UnderContext, ask_user_question_enabled)
     }
 
-    fn new(placement: ToolsPlacement) -> Self {
+    fn new(placement: ToolsPlacement, ask_user_question_enabled: bool) -> Self {
         Self {
-            tools: tool_summaries(),
+            tools: tool_summaries(ask_user_question_enabled),
             placement,
         }
     }
@@ -138,16 +138,14 @@ impl ToolsView {
         ));
         lines.extend(wrap_owned(
             Line::from(
-                "The fixed function schemas and compact hosted-search declaration consume context on every request.",
+                "Fixed function schemas and hosted search consume context on every request.",
             )
             .dim(),
             RtOptions::new(width),
         ));
         lines.extend(wrap_owned(
-            Line::from(
-                "bettercodex runs local functions; the Responses API executes hosted web search.",
-            )
-            .dim(),
+            Line::from("bettercodex runs functions locally; the Responses API runs web search.")
+                .dim(),
             RtOptions::new(width),
         ));
         lines.push(Line::default());
@@ -163,8 +161,8 @@ impl ToolsView {
     }
 }
 
-fn tool_summaries() -> Vec<ToolSummary> {
-    crate::tools::responses_api_specifications()
+fn tool_summaries(ask_user_question_enabled: bool) -> Vec<ToolSummary> {
+    crate::tools::responses_api_specifications_for(ask_user_question_enabled)
         .iter()
         .map(|specification| {
             let hosted_web_search = specification

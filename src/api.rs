@@ -76,8 +76,10 @@ const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
-static STABLE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
-static RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
+static BASE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
+static INTERACTIVE_HARNESS_TOKEN_ESTIMATES: OnceLock<[u64; 2]> = OnceLock::new();
+static BASE_RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
+static INTERACTIVE_RESPONSES_API_SPECIFICATIONS_JSON: OnceLock<Box<RawValue>> = OnceLock::new();
 
 pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -303,6 +305,7 @@ pub(crate) struct ApiClient {
     window: u64,
     model_selection: SharedModelSelection,
     service_tier: ServiceTier,
+    ask_user_question_enabled: bool,
     prefer_websocket: bool,
     websocket_prewarm_attempted: bool,
     websocket: Option<WebSocketConnection>,
@@ -331,14 +334,16 @@ impl Serialize for HarnessInstructions {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct ResponsesApiTools;
+struct ResponsesApiTools {
+    ask_user_question_enabled: bool,
+}
 
 impl Serialize for ResponsesApiTools {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        responses_api_specifications_json().serialize(serializer)
+        responses_api_specifications_json(self.ask_user_question_enabled).serialize(serializer)
     }
 }
 
@@ -805,6 +810,7 @@ impl ApiClient {
             window: compaction_count,
             model_selection: SharedModelSelection::new(model_selection),
             service_tier,
+            ask_user_question_enabled: false,
             prefer_websocket: true,
             websocket_prewarm_attempted: false,
             websocket: None,
@@ -834,6 +840,7 @@ impl ApiClient {
             window: self.window,
             model_selection: self.model_selection.clone(),
             service_tier: self.service_tier,
+            ask_user_question_enabled: self.ask_user_question_enabled,
             prefer_websocket: self.prefer_websocket,
             websocket_prewarm_attempted: false,
             websocket: None,
@@ -913,6 +920,20 @@ impl ApiClient {
         self.websocket_prewarm_attempted = false;
         // Model, tool transport, reasoning fields, and routing headers are all
         // connection/baseline properties.
+        self.abandon_response();
+    }
+
+    pub(crate) fn ask_user_question_enabled(&self) -> bool {
+        self.ask_user_question_enabled
+    }
+
+    pub(crate) fn set_ask_user_question_enabled(&mut self, enabled: bool) {
+        if self.ask_user_question_enabled == enabled {
+            return;
+        }
+        self.ask_user_question_enabled = enabled;
+        self.prefer_websocket = true;
+        self.websocket_prewarm_attempted = false;
         self.abandon_response();
     }
 
@@ -1641,7 +1662,8 @@ impl ApiClient {
         }
         let trigger = compaction::compaction_trigger();
         let selection = self.model_selection.get();
-        let [tool_tokens, instruction_tokens] = estimated_harness_tokens();
+        let [tool_tokens, instruction_tokens] =
+            estimated_harness_tokens_for(self.ask_user_question_enabled);
         let fixed_request_tokens = tool_tokens
             .saturating_add(instruction_tokens)
             .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
@@ -1750,7 +1772,9 @@ impl ApiClient {
         ResponsesRequest {
             model: selection.model,
             instructions: HarnessInstructions,
-            tools: ResponsesApiTools,
+            tools: ResponsesApiTools {
+                ask_user_question_enabled: self.ask_user_question_enabled,
+            },
             tool_choice: "auto",
             parallel_tool_calls: true,
             reasoning: RequestReasoning {
@@ -2064,20 +2088,33 @@ pub(crate) fn harness_instructions() -> &'static str {
     SYSTEM_PROMPT.trim()
 }
 
-fn responses_api_specifications_json() -> &'static RawValue {
-    // Match Codex's typed request path: serialize the fixed tool catalogue once, then transfer its
+fn responses_api_specifications_json(ask_user_question_enabled: bool) -> &'static RawValue {
+    // Match Codex's typed request path: serialize each fixed tool catalogue once, then transfer its
     // raw JSON directly into every HTTP and WebSocket request.
-    RESPONSES_API_SPECIFICATIONS_JSON.get_or_init(|| {
-        serde_json::value::to_raw_value(tools::responses_api_specifications()).unwrap_or_else(
-            |error| panic!("failed to encode Responses tool specifications: {error}"),
-        )
+    let storage = if ask_user_question_enabled {
+        &INTERACTIVE_RESPONSES_API_SPECIFICATIONS_JSON
+    } else {
+        &BASE_RESPONSES_API_SPECIFICATIONS_JSON
+    };
+    storage.get_or_init(|| {
+        serde_json::value::to_raw_value(tools::responses_api_specifications_for(
+            ask_user_question_enabled,
+        ))
+        .unwrap_or_else(|error| panic!("failed to encode Responses tool specifications: {error}"))
     })
 }
 
-pub(crate) fn estimated_harness_tokens() -> [u64; 2] {
-    *STABLE_HARNESS_TOKEN_ESTIMATES.get_or_init(|| {
+pub(crate) fn estimated_harness_tokens_for(ask_user_question_enabled: bool) -> [u64; 2] {
+    let storage = if ask_user_question_enabled {
+        &INTERACTIVE_HARNESS_TOKEN_ESTIMATES
+    } else {
+        &BASE_HARNESS_TOKEN_ESTIMATES
+    };
+    *storage.get_or_init(|| {
         [
-            estimated_tokens(tools::responses_api_specifications()),
+            estimated_tokens(tools::responses_api_specifications_for(
+                ask_user_question_enabled,
+            )),
             estimated_tokens(std::slice::from_ref(&Value::String(
                 harness_instructions().to_string(),
             ))),
@@ -2474,7 +2511,13 @@ impl OutputItemTracker {
         let call_id_fingerprint = call_id
             .as_ref()
             .and_then(|call_id| self.by_call_id.get(call_id));
-        let index_fingerprint = output_index.and_then(|index| self.by_index.get(&index));
+        // Item and call IDs are stable identities. `output_index` is only a fallback for items
+        // without either one because hosted continuations can reuse an index for a later item.
+        let index_fingerprint = if id.is_none() && call_id.is_none() {
+            output_index.and_then(|index| self.by_index.get(&index))
+        } else {
+            None
+        };
         if [id_fingerprint, call_id_fingerprint, index_fingerprint]
             .into_iter()
             .flatten()
@@ -2514,20 +2557,24 @@ impl OutputItemTracker {
         let id = output_item_identity(item, "id")?;
         let call_id = output_item_identity(item, "call_id")?;
         let output_index = optional_event_u64(event, "output_index")?;
-        Ok(id.is_some_and(|id| self.by_id.contains_key(id))
-            || call_id.is_some_and(|call_id| self.by_call_id.contains_key(call_id))
-            || output_index.is_some_and(|index| self.by_index.contains_key(&index)))
+        if id.is_some() || call_id.is_some() {
+            return Ok(id.is_some_and(|id| self.by_id.contains_key(id))
+                || call_id.is_some_and(|call_id| self.by_call_id.contains_key(call_id)));
+        }
+        Ok(output_index.is_some_and(|index| self.by_index.contains_key(&index)))
     }
 
     fn references_event(&self, event: &Value) -> ApiResult<bool> {
         let item_id = event_identity(event, "item_id")?;
         let call_id = event_identity(event, "call_id")?;
         let output_index = optional_event_u64(event, "output_index")?;
-        Ok(
-            item_id.is_some_and(|item_id| self.by_id.contains_key(item_id))
-                || call_id.is_some_and(|call_id| self.by_call_id.contains_key(call_id))
-                || output_index.is_some_and(|index| self.by_index.contains_key(&index)),
-        )
+        if item_id.is_some() || call_id.is_some() {
+            return Ok(
+                item_id.is_some_and(|item_id| self.by_id.contains_key(item_id))
+                    || call_id.is_some_and(|call_id| self.by_call_id.contains_key(call_id)),
+            );
+        }
+        Ok(output_index.is_some_and(|index| self.by_index.contains_key(&index)))
     }
 }
 
@@ -2866,9 +2913,10 @@ fn process_event_value_at(
             if let Some(item) = event.get("item")
                 && collected.output_item_was_completed(&event, item)?
             {
-                return Err(ApiError::fatal(
-                    "model stream added an output item after it was completed",
-                ));
+                // `output_item.done` is authoritative. Reused WebSocket connections can replay an
+                // earlier lifecycle frame after completion; suppress it instead of aborting a turn
+                // whose completed item is already preserved in history.
+                return Ok(());
             }
             if collected.validates_output_content()
                 && let Some(item) = event.get("item")
@@ -2897,9 +2945,9 @@ fn process_event_value_at(
                 && event.get("delta").is_some_and(Value::is_string) =>
         {
             if collected.event_references_completed_output(&event)? {
-                return Err(ApiError::fatal(
-                    "model stream sent text for an output item after it was completed",
-                ));
+                // The completed item already contains the final text. A replayed delta must not be
+                // rendered twice or turn an otherwise usable response into a fatal stream error.
+                return Ok(());
             }
             collected.observe_model_activity();
             if let Some(Value::String(delta)) = event.get_mut("delta")

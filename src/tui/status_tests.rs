@@ -46,6 +46,7 @@ fn snapshot() -> StatusSnapshot {
             context_window: EFFECTIVE_CONTEXT_WINDOW,
             compact_at_tokens: 244_800,
             measured: true,
+            ask_user_question_enabled: false,
             sections: Vec::new(),
             total_usage: TokenUsage {
                 input_tokens: 125_000,

@@ -28,7 +28,8 @@ fn version(value: &str) -> Version {
 
 const RELEASES: &str = "# Changelog\n\n\
 ## [Unreleased]\n\n- Not shipped\n\n\
-## [0.1.5] - 2026-08-20\n\n- Newer\n\n\
+## [0.1.6] - 2026-08-20\n\n- Latest\n\n\
+## [0.1.5] - 2026-08-19\n\n- Newer\n\n\
 ## [0.1.4] - 2026-08-10\n\n- First tracked\n";
 
 #[test]
@@ -38,10 +39,11 @@ fn released_notes_are_bounded_by_the_binary_and_ordered_for_scrollback() -> Resu
         Some("## [0.1.4] - 2026-08-10\n\n- First tracked".to_string())
     );
     assert_eq!(
-        notes_between(RELEASES, Some(version("0.1.3")), version("0.1.5"))?,
+        notes_between(RELEASES, Some(version("0.1.3")), version("0.1.6"))?,
         Some(
             "## [0.1.4] - 2026-08-10\n\n- First tracked\n\n\
-             ## [0.1.5] - 2026-08-20\n\n- Newer"
+             ## [0.1.5] - 2026-08-19\n\n- Newer\n\n\
+             ## [0.1.6] - 2026-08-20\n\n- Latest"
                 .to_string()
         )
     );
@@ -49,25 +51,41 @@ fn released_notes_are_bounded_by_the_binary_and_ordered_for_scrollback() -> Resu
 }
 
 #[test]
-fn existing_users_see_each_new_release_once() -> Result<()> {
+fn skipped_releases_are_indexed_and_acknowledged_only_after_presentation() -> Result<()> {
     let root = TempDir::new();
     let path = root.state_path();
 
+    let first = for_startup_at(&path, RELEASES, version("0.1.4"), true)?;
     assert_eq!(
-        for_startup_at(&path, RELEASES, version("0.1.4"), true)?,
-        Some("## [0.1.4] - 2026-08-10\n\n- First tracked".to_string())
+        first.notes(),
+        Some("## [0.1.4] - 2026-08-10\n\n- First tracked")
     );
+    assert!(!path.exists());
+    first.mark_seen()?;
+
+    let repeated = for_startup_at(&path, RELEASES, version("0.1.4"), true)?;
+    assert_eq!(repeated.notes(), None);
+    repeated.mark_seen()?;
+
+    let skipped = for_startup_at(&path, RELEASES, version("0.1.6"), true)?;
     assert_eq!(
-        for_startup_at(&path, RELEASES, version("0.1.4"), true)?,
-        None
-    );
-    assert_eq!(
-        for_startup_at(&path, RELEASES, version("0.1.5"), true)?,
-        Some("## [0.1.5] - 2026-08-20\n\n- Newer".to_string())
+        skipped.notes(),
+        Some(
+            "## [0.1.5] - 2026-08-19\n\n- Newer\n\n\
+             ## [0.1.6] - 2026-08-20\n\n- Latest\n\n\
+             **Included releases:** `0.1.5` → `0.1.6`\n\n\
+             Scroll up to review every release included in this update."
+        )
     );
     assert_eq!(
         read_state(&path)?.last_seen_version.as_deref(),
-        Some("0.1.5")
+        Some("0.1.4")
+    );
+
+    skipped.mark_seen()?;
+    assert_eq!(
+        read_state(&path)?.last_seen_version.as_deref(),
+        Some("0.1.6")
     );
     Ok(())
 }
@@ -77,13 +95,34 @@ fn fresh_install_skips_old_notes_but_tracks_later_updates() -> Result<()> {
     let root = TempDir::new();
     let path = root.state_path();
 
+    let fresh = for_startup_at(&path, RELEASES, version("0.1.4"), false)?;
+    assert_eq!(fresh.notes(), None);
+    assert!(!path.exists());
+    fresh.mark_seen()?;
+
+    let updated = for_startup_at(&path, RELEASES, version("0.1.5"), true)?;
+    assert_eq!(updated.notes(), Some("## [0.1.5] - 2026-08-19\n\n- Newer"));
+    updated.mark_seen()?;
+    Ok(())
+}
+
+#[test]
+fn delayed_acknowledgement_cannot_regress_a_newer_marker() -> Result<()> {
+    let root = TempDir::new();
+    let path = root.state_path();
+
+    for_startup_at(&path, RELEASES, version("0.1.4"), false)?.mark_seen()?;
+    let older = for_startup_at(&path, RELEASES, version("0.1.5"), true)?;
+    let newer = for_startup_at(&path, RELEASES, version("0.1.6"), true)?;
+    assert_eq!(older.notes(), Some("## [0.1.5] - 2026-08-19\n\n- Newer"));
+    assert!(newer.notes().is_some_and(|notes| notes.contains("0.1.6")));
+
+    newer.mark_seen()?;
+    older.mark_seen()?;
+
     assert_eq!(
-        for_startup_at(&path, RELEASES, version("0.1.4"), false)?,
-        None
-    );
-    assert_eq!(
-        for_startup_at(&path, RELEASES, version("0.1.5"), true)?,
-        Some("## [0.1.5] - 2026-08-20\n\n- Newer".to_string())
+        read_state(&path)?.last_seen_version.as_deref(),
+        Some("0.1.6")
     );
     Ok(())
 }

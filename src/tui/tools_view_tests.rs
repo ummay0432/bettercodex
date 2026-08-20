@@ -16,17 +16,19 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::Path;
 
-fn context_snapshot(used_tokens: u64) -> ContextSnapshot {
-    let tool_tokens = estimated_tokens(crate::tools::responses_api_specifications());
+fn context_snapshot(used_tokens: u64, ask_user_question_enabled: bool) -> ContextSnapshot {
+    let specifications = crate::tools::responses_api_specifications_for(ask_user_question_enabled);
+    let tool_tokens = estimated_tokens(specifications);
     ContextSnapshot {
         used_tokens,
         context_window: EFFECTIVE_CONTEXT_WINDOW,
         compact_at_tokens: AUTO_COMPACT_TOKEN_LIMIT,
         measured: false,
+        ask_user_question_enabled,
         sections: vec![ContextSection {
             kind: ContextKind::ToolCatalogue,
             tokens: tool_tokens,
-            items: crate::tools::responses_api_specifications().len(),
+            items: specifications.len(),
         }],
         total_usage: Default::default(),
         rate_limits: Vec::new(),
@@ -64,7 +66,7 @@ fn tools_command_renders_the_live_catalogue_and_context_costs() {
     assert_eq!(press(&mut view, KeyCode::Enter), Action::None);
 
     let rendered = render(&mut view, 80, 24);
-    let specifications = crate::tools::responses_api_specifications();
+    let specifications = crate::tools::responses_api_specifications_for(false);
     let total_tokens = estimated_tokens(specifications);
     let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(rendered.contains("Tools"), "{rendered}");
@@ -76,11 +78,11 @@ fn tools_command_renders_the_live_catalogue_and_context_costs() {
         "{rendered}"
     );
     assert!(
-        normalized.contains("fixed function schemas and compact hosted-search declaration"),
+        normalized.contains("Fixed function schemas and hosted search consume context"),
         "{rendered}"
     );
     assert!(
-        normalized.contains("Responses API executes hosted web search"),
+        normalized.contains("Responses API runs web search"),
         "{rendered}"
     );
     for specification in specifications {
@@ -119,13 +121,41 @@ fn tools_command_renders_the_live_catalogue_and_context_costs() {
 }
 
 #[test]
+fn deepwork_context_and_tools_include_ask_user_question() {
+    let mut view = View::new(Path::new("/tmp/bettercodex"));
+    view.show_context(context_snapshot(1_000, true));
+
+    let context = render(&mut view, 80, 24);
+    assert!(
+        context.contains("Tools  bash · read · write · edit · ask_user_question · web_search"),
+        "{context}"
+    );
+
+    assert_eq!(press(&mut view, KeyCode::Char('t')), Action::None);
+    let tools = render(&mut view, 80, 24);
+    assert!(tools.contains("ask_user_question"), "{tools}");
+    assert!(
+        tools
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("5 direct functions + hosted web search"),
+        "{tools}"
+    );
+}
+
+#[test]
 fn context_opens_tools_as_a_child_and_returns_to_the_updated_context() {
     let mut view = View::new(Path::new("/tmp/bettercodex"));
-    view.show_context(context_snapshot(1_000));
+    view.show_context(context_snapshot(1_000, false));
     let context = render(&mut view, 80, 24);
     assert!(context.contains("Context"), "{context}");
     assert!(
-        context.contains("Tools  bash · read · write · edit · web_search  ·  t for details"),
+        context.matches('■').count() >= 100,
+        "expected the 10×10 context cube\n{context}"
+    );
+    assert!(
+        context.contains("Tools  bash · read · write · edit · web_search"),
         "{context}"
     );
     assert!(
@@ -138,7 +168,7 @@ fn context_opens_tools_as_a_child_and_returns_to_the_updated_context() {
     assert!(tools.contains("Tools"), "{tools}");
     assert!(tools.contains("Press esc to go back to context"), "{tools}");
 
-    view.handle_agent_event(AgentEvent::ContextUpdated(context_snapshot(2_000)));
+    view.handle_agent_event(AgentEvent::ContextUpdated(context_snapshot(2_000, false)));
     assert_eq!(press(&mut view, KeyCode::Esc), Action::None);
     let returned = render(&mut view, 80, 24);
     assert!(returned.contains("Context"), "{returned}");

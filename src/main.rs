@@ -1,11 +1,13 @@
 mod agent;
 mod ansi_escape;
 mod api;
+mod ask_user_question;
 mod assistant_message;
 mod auth;
 mod compaction;
 mod context;
 mod events;
+mod file_context;
 mod file_search;
 mod fuzzy_match;
 mod http_client;
@@ -543,7 +545,7 @@ fn write_help() -> io::Result<()> {
         ""
     };
     write_stdout_line(format_args!(
-        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     {update_summary}\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  high or original [default: high]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the readable tool catalogue and documented function outputs\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, for active engineering review and refactoring; the agent may also select review proactively during implementation work.{tmux_help} Sessions are saved automatically under the Codex home directory.",
+        "bcodex {}\n\nUsage:\n  bcodex [OPTIONS] [PROMPT]\n  bcodex resume [SESSION_ID] [OPTIONS] [PROMPT]\n  bcodex login [--device-auth]\n  bcodex login status\n  bcodex logout\n  bcodex update\n  bcodex --tool-catalogue\n\nCommands:\n  login                      Sign in with ChatGPT\n  logout                     Remove stored ChatGPT credentials\n  resume                     Resume a saved bettercodex session\n  update                     {update_summary}\n\nOptions:\n  -i, --image FILE           Attach a PNG, JPEG, WEBP, or GIF; repeat for more\n      --image-detail DETAIL  high or original [default: high]\n      --last                 Resume the latest session for the current directory\n      --tool-catalogue       Print the readable tool catalogue and documented function outputs\n  -h, --help                 Show this help\n  -V, --version              Show the version\n\nWith no prompt, starts the interactive terminal UI. Use /review <target> there, or include $review <target> in any prompt, to explicitly invoke active engineering review and refactoring.{tmux_help} Sessions are saved automatically under the Codex home directory.",
         env!("CARGO_PKG_VERSION"),
         update_summary = update::update_command_summary(),
     ))

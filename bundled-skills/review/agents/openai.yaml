@@ -4,4 +4,4 @@ interface:
   default_prompt: "Use $review to inspect the current work, eliminate confirmed bugs, refactor inferior designs, and validate the result."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

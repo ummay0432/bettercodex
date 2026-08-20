@@ -23,6 +23,7 @@ use crate::rollout::SessionTranscriptToolOutcome;
 use crate::rollout::SessionTranscriptToolOutput;
 use crate::rollout::TurnOutcome;
 use crate::service_tier::ServiceTier;
+use crate::skills::DEEPWORK_SYSTEM_SKILL_NAME;
 use crate::tools::ToolCall;
 use crate::tools::ToolCompletion;
 use crate::tools::ToolRuntime;
@@ -36,6 +37,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
@@ -66,6 +69,7 @@ fn transcript_tool_outcome(completion: ToolCompletion) -> Option<SessionTranscri
 pub(crate) enum SubmitOutcome {
     Completed(String),
     Cancelled,
+    CancelledBeforeProcessing,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -78,11 +82,13 @@ pub(crate) enum CompactionOutcome {
 pub(crate) struct TurnHandle {
     cancellation: CancellationToken,
     steering: Option<Arc<Mutex<SteeringState>>>,
+    input_acceptance: Option<Arc<InputAcceptance>>,
 }
 
 pub(crate) struct TurnControl {
     cancellation: CancellationToken,
     steering: Option<Arc<Mutex<SteeringState>>>,
+    input_acceptance: Option<Arc<InputAcceptance>>,
 }
 
 struct SteeringState {
@@ -102,6 +108,47 @@ struct SteeringInput {
 enum SteeringPayload {
     Operator(UserInput),
     Context(String),
+}
+
+const INPUT_PENDING: u8 = 0;
+const INPUT_EDIT_REQUESTED: u8 = 1;
+const INPUT_ACCEPTED: u8 = 2;
+
+#[derive(Debug)]
+struct InputAcceptance {
+    state: AtomicU8,
+}
+
+impl InputAcceptance {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(INPUT_PENDING),
+        }
+    }
+
+    fn request_edit(&self) {
+        let _ = self.state.compare_exchange(
+            INPUT_PENDING,
+            INPUT_EDIT_REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn edit_requested(&self) -> bool {
+        self.state.load(Ordering::Acquire) == INPUT_EDIT_REQUESTED
+    }
+
+    fn accept(&self) -> bool {
+        self.state
+            .compare_exchange(
+                INPUT_PENDING,
+                INPUT_ACCEPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 impl SteeringState {
@@ -188,6 +235,13 @@ impl TurnHandle {
         self.cancellation.cancel();
     }
 
+    pub(crate) fn cancel_and_edit_prompt(&self) {
+        if let Some(input_acceptance) = &self.input_acceptance {
+            input_acceptance.request_edit();
+        }
+        self.cancellation.cancel();
+    }
+
     /// Interrupt current work only while the operator input still needs to be dequeued.
     pub(crate) fn interrupt_for_steering(&self) {
         let should_cancel = self.steering.as_ref().is_none_or(|steering| {
@@ -232,6 +286,7 @@ impl Drop for TurnControl {
 impl TurnControl {
     pub(crate) fn channel() -> (TurnHandle, Self) {
         let cancellation = CancellationToken::new();
+        let input_acceptance = Arc::new(InputAcceptance::new());
         let steering = Arc::new(Mutex::new(SteeringState {
             accepting: true,
             operator_input_in_flight: false,
@@ -242,10 +297,12 @@ impl TurnControl {
             TurnHandle {
                 cancellation: cancellation.clone(),
                 steering: Some(Arc::clone(&steering)),
+                input_acceptance: Some(Arc::clone(&input_acceptance)),
             },
             Self {
                 cancellation,
                 steering: Some(steering),
+                input_acceptance: Some(input_acceptance),
             },
         )
     }
@@ -256,8 +313,13 @@ impl TurnControl {
             TurnHandle {
                 cancellation: cancellation.clone(),
                 steering: None,
+                input_acceptance: None,
             },
-            Self::cancellation_only(cancellation),
+            Self {
+                cancellation,
+                steering: None,
+                input_acceptance: None,
+            },
         )
     }
 
@@ -265,7 +327,20 @@ impl TurnControl {
         Self {
             cancellation,
             steering: None,
+            input_acceptance: None,
         }
+    }
+
+    fn edit_requested(&self) -> bool {
+        self.input_acceptance
+            .as_ref()
+            .is_some_and(|input_acceptance| input_acceptance.edit_requested())
+    }
+
+    fn accept_input(&self) -> bool {
+        self.input_acceptance
+            .as_ref()
+            .is_none_or(|input_acceptance| input_acceptance.accept())
     }
 
     fn drain_steering(&self, pending: &mut VecDeque<SteeringInput>) {
@@ -387,7 +462,10 @@ impl Agent {
             conversation.model_selection().clone(),
             conversation.service_tier(),
         )?;
-        let tools = ToolRuntime::new(self.cwd.clone());
+        let mut tools = ToolRuntime::new(self.cwd.clone());
+        let deepwork_active = self.tools.ask_user_question_activated()
+            || conversation.has_injected_skill(DEEPWORK_SYSTEM_SKILL_NAME);
+        tools.set_ask_user_question_enabled(deepwork_active);
         let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd: self.cwd.clone(),
@@ -417,7 +495,9 @@ impl Agent {
             conversation.model_selection().clone(),
             conversation.service_tier(),
         )?;
-        let tools = ToolRuntime::new(cwd.clone());
+        let mut tools = ToolRuntime::new(cwd.clone());
+        let deepwork_active = conversation.has_injected_skill(DEEPWORK_SYSTEM_SKILL_NAME);
+        tools.set_ask_user_question_enabled(deepwork_active);
         let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd,
@@ -455,6 +535,33 @@ impl Agent {
         self.conversation.set_model_selection(selection.clone())?;
         self.api.set_model_selection(selection);
         Ok(())
+    }
+
+    pub(crate) fn set_ask_user_question_requester(
+        &mut self,
+        requester: crate::ask_user_question::AskUserQuestionRequester,
+    ) {
+        self.tools.set_ask_user_question_requester(requester);
+        self.sync_ask_user_question_access();
+    }
+
+    fn apply_skill_tool_access(&mut self, skill_context: &[Value]) {
+        let activates_deepwork = skill_context.iter().any(|item| {
+            crate::context::injected_skill_name(item) == Some(DEEPWORK_SYSTEM_SKILL_NAME)
+        });
+        if activates_deepwork {
+            self.tools.set_ask_user_question_enabled(true);
+            self.sync_ask_user_question_access();
+        }
+    }
+
+    fn sync_ask_user_question_access(&mut self) {
+        let enabled = self.tools.ask_user_question_enabled();
+        if self.api.ask_user_question_enabled() != enabled {
+            self.startup_prewarm = None;
+            self.api.set_ask_user_question_enabled(enabled);
+        }
+        self.conversation.set_ask_user_question_enabled(enabled);
     }
 
     pub(crate) fn service_tier(&self) -> ServiceTier {
@@ -551,8 +658,11 @@ impl Agent {
         path: &Path,
         update: crate::skills::SkillUpdate,
     ) -> Result<()> {
-        if !self.skills().iter().any(|skill| skill.path() == path) {
+        let Some(skill) = self.skills().iter().find(|skill| skill.path() == path) else {
             return Err(anyhow!("skill {} is no longer available", path.display()));
+        };
+        if skill.settings_are_fixed() {
+            return Err(anyhow!("skill `{}` has fixed settings", skill.name()));
         }
         crate::skills::save_skill_update(path, update)?;
         self.conversation
@@ -592,7 +702,9 @@ impl Agent {
             .await?
         {
             SubmitOutcome::Completed(answer) => Ok(answer),
-            SubmitOutcome::Cancelled => Err(anyhow!("turn was cancelled")),
+            SubmitOutcome::Cancelled | SubmitOutcome::CancelledBeforeProcessing => {
+                Err(anyhow!("turn was cancelled"))
+            }
         }
     }
 
@@ -663,10 +775,17 @@ impl Agent {
                 IncomingUserInput::Initial(input),
                 &events,
                 IncomingUserAdmission::PreserveAfterCancellation,
+                Some(&control),
                 &mut active_turn_context,
             )
             .await
-            .map(|()| SubmitOutcome::Cancelled)
+            .map(|accepted| {
+                if accepted {
+                    SubmitOutcome::Cancelled
+                } else {
+                    SubmitOutcome::CancelledBeforeProcessing
+                }
+            })
         };
         control.close();
         let outcome = match &result {
@@ -675,6 +794,7 @@ impl Agent {
                 self.conversation.mark_interrupted()?;
                 TurnOutcome::Interrupted
             }
+            Ok(SubmitOutcome::CancelledBeforeProcessing) => TurnOutcome::Interrupted,
             Err(_) => {
                 self.conversation.normalize()?;
                 TurnOutcome::Failed
@@ -692,7 +812,8 @@ impl Agent {
     ) -> Result<SubmitOutcome> {
         let mut active_turn_context = ActiveTurnContext::default();
         // Match Codex's pre-sampling boundary: compact only the history that was already recorded.
-        // If cancellation interrupts that request, persist the accepted input before ending.
+        // If cancellation interrupts that request, persist the accepted input before ending unless
+        // the operator requested it back before admission completed.
         let compaction_cancelled = self.conversation.needs_compaction()
             && !self
                 .run_compaction(
@@ -703,17 +824,22 @@ impl Agent {
                     &active_turn_context,
                 )
                 .await?;
-        self.record_incoming_user(
-            IncomingUserInput::Initial(input),
-            events,
-            if compaction_cancelled {
-                IncomingUserAdmission::PreserveAfterCancellation
-            } else {
-                IncomingUserAdmission::EnforceContextWindow
-            },
-            &mut active_turn_context,
-        )
-        .await?;
+        let accepted = self
+            .record_incoming_user(
+                IncomingUserInput::Initial(input),
+                events,
+                if compaction_cancelled {
+                    IncomingUserAdmission::PreserveAfterCancellation
+                } else {
+                    IncomingUserAdmission::EnforceContextWindow
+                },
+                Some(control),
+                &mut active_turn_context,
+            )
+            .await?;
+        if !accepted {
+            return Ok(SubmitOutcome::CancelledBeforeProcessing);
+        }
         if compaction_cancelled {
             return Ok(SubmitOutcome::Cancelled);
         }
@@ -731,13 +857,16 @@ impl Agent {
             if can_record_pending_steering {
                 control.drain_steering(&mut pending_steering);
                 while let Some(input) = pending_steering.pop_front() {
-                    self.record_incoming_user(
-                        IncomingUserInput::Steering(input),
-                        events,
-                        IncomingUserAdmission::EnforceContextWindow,
-                        &mut active_turn_context,
-                    )
-                    .await?;
+                    let accepted = self
+                        .record_incoming_user(
+                            IncomingUserInput::Steering(input),
+                            events,
+                            IncomingUserAdmission::EnforceContextWindow,
+                            None,
+                            &mut active_turn_context,
+                        )
+                        .await?;
+                    debug_assert!(accepted);
                     recorded_steering = true;
                 }
             }
@@ -1156,8 +1285,12 @@ impl Agent {
         input: IncomingUserInput,
         events: &Option<UnboundedSender<AgentEvent>>,
         admission: IncomingUserAdmission,
+        control: Option<&TurnControl>,
         active_turn_context: &mut ActiveTurnContext,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if control.is_some_and(TurnControl::edit_requested) {
+            return Ok(false);
+        }
         let (payload, steering_id) = match input {
             IncomingUserInput::Initial(input) => (SteeringPayload::Operator(input), None),
             IncomingUserInput::Steering(steering) => (steering.payload, Some(steering.id)),
@@ -1165,45 +1298,85 @@ impl Agent {
         let (user_message, operator_input) = match payload {
             SteeringPayload::Operator(input) => {
                 if input.is_empty() {
-                    return Err(anyhow!("prompt and image list are both empty"));
+                    return Err(anyhow!("prompt and attachment list are both empty"));
                 }
-                let (mut user_message, prompt_text, selected_skills) = if input.has_images() {
-                    tokio::task::spawn_blocking(move || input.into_message_and_skills())
-                        .await
-                        .context("attached image preprocessing task failed")??
-                } else {
-                    input.into_message_and_skills()?
+                let has_blocking_attachments = input.has_blocking_attachments();
+                let cwd = self.cwd.clone();
+                let prepare = move || {
+                    let (user_message, prompt_text, selected_skills, selected_files) =
+                        input.into_message_and_attachments()?;
+                    let file_context =
+                        crate::file_context::inject_selected_files(&cwd, &selected_files);
+                    Ok::<_, anyhow::Error>((
+                        user_message,
+                        prompt_text,
+                        selected_skills,
+                        file_context,
+                    ))
                 };
+                let prepared = if has_blocking_attachments {
+                    tokio::task::spawn_blocking(prepare)
+                        .await
+                        .context("attachment preprocessing task failed")?
+                } else {
+                    prepare()
+                };
+                if control.is_some_and(TurnControl::edit_requested) {
+                    return Ok(false);
+                }
+                let (mut user_message, prompt_text, selected_skills, file_context) = prepared?;
                 crate::context::mark_operator_user_message(&mut user_message);
-                (user_message, Some((prompt_text, selected_skills)))
+                (
+                    user_message,
+                    Some((prompt_text, selected_skills, file_context)),
+                )
             }
             SteeringPayload::Context(text) => {
                 if text.is_empty() {
-                    return Err(anyhow!("prompt and image list are both empty"));
+                    return Err(anyhow!("prompt and attachment list are both empty"));
                 }
                 let mut user_message = crate::context::message("user", text);
                 crate::context::mark_contextual_user_message(&mut user_message);
                 (user_message, None)
             }
         };
-        // Capture filesystem-derived context after potentially expensive image preprocessing, so
-        // the catalogue used for skill matching and the next sampling request share one snapshot.
-        self.reload_world_state_for_admission(admission, active_turn_context)?;
-        let (skill_context, real_user_message) = match operator_input {
-            Some((prompt_text, selected_skills)) => {
-                let injections = self
-                    .conversation
-                    .skill_catalog()
-                    .explicit_injections(&prompt_text, &selected_skills);
-                for warning in injections.warnings {
-                    emit(events, AgentEvent::Warning(warning));
+        // Capture filesystem-derived context after potentially expensive attachment preprocessing,
+        // so the catalogue used for skill matching and the next sampling request share one
+        // snapshot.
+        let reloaded = self.reload_world_state_for_admission(admission, active_turn_context);
+        if control.is_some_and(TurnControl::edit_requested) {
+            return Ok(false);
+        }
+        reloaded?;
+        let (turn_context, skill_context_len, injected_files, warnings, real_user_message) =
+            match operator_input {
+                Some((prompt_text, selected_skills, file_context)) => {
+                    let skill_injections = self
+                        .conversation
+                        .skill_catalog()
+                        .explicit_injections(&prompt_text, &selected_skills);
+                    let crate::file_context::FileContextInjectionOutcome {
+                        items: file_items,
+                        injected: injected_files,
+                        warnings: file_warnings,
+                    } = file_context;
+                    let skill_context_len = skill_injections.items.len();
+                    let mut turn_context = skill_injections.items;
+                    turn_context.extend(file_items);
+                    let mut warnings = skill_injections.warnings;
+                    warnings.extend(file_warnings);
+                    (
+                        turn_context,
+                        skill_context_len,
+                        injected_files,
+                        warnings,
+                        true,
+                    )
                 }
-                (injections.items, true)
-            }
-            None => (Vec::new(), false),
-        };
-        let mut projected = Vec::with_capacity(skill_context.len().saturating_add(1));
-        projected.extend(skill_context.iter().cloned());
+                None => (Vec::new(), 0, Vec::new(), Vec::new(), false),
+            };
+        let mut projected = Vec::with_capacity(turn_context.len().saturating_add(1));
+        projected.extend(turn_context.iter().cloned());
         projected.push(user_message);
         let projection = self.conversation.project_append(projected);
         let incoming_tokens = projection.additional_tokens();
@@ -1215,7 +1388,7 @@ impl Agent {
             && incoming_tokens > effective_context_window
         {
             return Err(anyhow!(
-                "input alone is estimated at {incoming_tokens} tokens, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer images"
+                "input alone is estimated at {incoming_tokens} tokens, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer files or images"
             ));
         }
         let projected_tokens = projection.projected_tokens();
@@ -1225,18 +1398,30 @@ impl Agent {
             && projected_tokens > effective_context_window
         {
             return Err(anyhow!(
-                "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer images"
+                "input would require an estimated {projected_tokens} tokens after compaction, exceeding bettercodex's {effective_context_window}-token effective context window; shorten the prompt or attach fewer files or images"
             ));
         }
-        self.conversation.append_projected(projection)?;
-        if real_user_message {
-            active_turn_context.record_real_user_input(skill_context);
+        if control.is_some_and(|control| !control.accept_input()) {
+            return Ok(false);
         }
+        self.conversation.append_projected(projection)?;
+        self.apply_skill_tool_access(&turn_context[..skill_context_len]);
         if let Some(id) = steering_id {
             emit(events, AgentEvent::SteeringCommitted(id));
+        } else {
+            emit(events, AgentEvent::UserInputAccepted);
+        }
+        for injected in injected_files {
+            emit(events, AgentEvent::FileContextInjected(injected));
+        }
+        for warning in warnings {
+            emit(events, AgentEvent::Warning(warning));
+        }
+        if real_user_message {
+            active_turn_context.record_real_user_input(turn_context);
         }
         self.emit_context(events);
-        Ok(())
+        Ok(true)
     }
 
     fn emit_context(&self, events: &Option<UnboundedSender<AgentEvent>>) {

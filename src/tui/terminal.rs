@@ -763,9 +763,12 @@ fn parse_osc_component(value: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::SubmitOutcome;
     use crate::events::AgentEvent;
     use crate::events::ModelTextDelta;
+    use crate::input::UserPrompt;
     use crate::model::DEFAULT_MODEL as MODEL;
+    use crate::tui::view::InterruptIntent;
     use crate::tui::view::View;
     use ratatui::backend::ClearType as BackendClearType;
     use ratatui::backend::WindowSize;
@@ -810,6 +813,12 @@ mod tests {
 
         fn screen(&self) -> String {
             self.parser.borrow().screen().contents()
+        }
+
+        fn reset_emulated_surface(&self, width: u16, height: u16) {
+            // vt100 does not implement CSI 3 J (erase scrollback), while real terminals use the
+            // sequence emitted by AppTerminal::clear_screen before source-backed replay.
+            *self.parser.borrow_mut() = vt100::Parser::new(height, width, TEST_SCROLLBACK_ROWS);
         }
 
         fn history_contains(&self, needle: &str) -> bool {
@@ -996,6 +1005,11 @@ mod tests {
         screen_height: u16,
     ) {
         terminal.clear_screen().unwrap();
+        terminal
+            .terminal
+            .backend()
+            .output
+            .reset_emulated_surface(width, screen_height);
         let history = view.history_lines_for_resize_reflow(width, screen_height);
         render_test_terminal(view, terminal, width, screen_height, history);
     }
@@ -1095,6 +1109,91 @@ mod tests {
             presented.screen().contents().contains("replacement frame"),
             "replacement frame must be complete before synchronized-update end"
         );
+    }
+
+    #[test]
+    fn cumulative_patch_notes_keep_the_release_index_visible_and_old_notes_in_scrollback() {
+        const WIDTH: u16 = 52;
+        const SCREEN_HEIGHT: u16 = 14;
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        view.add_patch_notes(
+            "## [0.1.4]\n\n\
+             - oldest-release-marker\n\n\
+             - oldest detail one\n\n\
+             - oldest detail two\n\n\
+             ## [0.1.5]\n\n\
+             - middle-release-marker\n\n\
+             - middle detail one\n\n\
+             - middle detail two\n\n\
+             ## [0.1.6]\n\n\
+             - latest-release-marker\n\n\
+             - latest detail one\n\n\
+             - latest detail two\n\n\
+             **Included releases:** `0.1.4` → `0.1.5` → `0.1.6`\n\n\
+             Scroll up to review every release included in this update.",
+        );
+        let (mut terminal, output) =
+            test_terminal(WIDTH, SCREEN_HEIGHT, /*viewport_height*/ 1);
+
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+
+        let visible = output
+            .screen()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let index_at = visible
+            .find("Included releases:")
+            .unwrap_or_else(|| panic!("release index is not visible: {visible}"));
+        let visible_index = &visible[index_at..];
+        for version in ["0.1.4", "0.1.5", "0.1.6"] {
+            assert!(visible_index.contains(version), "{visible}");
+        }
+        assert!(
+            visible_index.contains("Scroll up to review every release included in this update."),
+            "{visible}"
+        );
+        assert!(output.history_contains("oldest-release-marker"));
+    }
+
+    #[test]
+    fn pre_processing_interrupt_reflows_the_prompt_back_into_the_composer() {
+        const WIDTH: u16 = 48;
+        const SCREEN_HEIGHT: u16 = 12;
+        const PROMPT: &str = "restored-prompt-terminal-marker";
+
+        let mut view = View::new(Path::new("/tmp/bettercodex"));
+        let (mut terminal, output) =
+            test_terminal(WIDTH, SCREEN_HEIGHT, /*viewport_height*/ 1);
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+        view.start_turn(&UserPrompt::text(PROMPT));
+        redraw_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT);
+        assert!(output.history_contains(PROMPT));
+
+        view.set_interrupting(InterruptIntent::EditPrompt);
+        assert_eq!(
+            view.finish_turn(Ok(SubmitOutcome::CancelledBeforeProcessing)),
+            None
+        );
+        assert!(view.take_resize_reflow_request());
+        terminal.clear_screen().unwrap();
+        terminal
+            .terminal
+            .backend()
+            .output
+            .reset_emulated_surface(WIDTH, SCREEN_HEIGHT);
+        let history = view.history_lines_for_resize_reflow(WIDTH, SCREEN_HEIGHT);
+        let rebuilt_history = history
+            .iter()
+            .flat_map(|line| line.line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!rebuilt_history.contains(PROMPT), "{rebuilt_history}");
+        render_test_terminal(&mut view, &mut terminal, WIDTH, SCREEN_HEIGHT, history);
+
+        assert!(output.output_contains(b"\x1b[3J"));
+        assert!(output.screen().contains(PROMPT), "{}", output.screen());
     }
 
     #[test]
