@@ -25,6 +25,11 @@ use syntect::util::LinesWithEndings;
 use two_face::re_exports::syntect;
 use two_face::theme::EmbeddedThemeName;
 
+#[path = "highlight_streaming.rs"]
+mod streaming;
+
+pub(crate) use streaming::StreamingCodeHighlighter;
+
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<Theme> = OnceLock::new();
 
@@ -33,7 +38,7 @@ const ANSI_ALPHA_DEFAULT: u8 = 0x01;
 const OPAQUE_ALPHA: u8 = 0xFF;
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
-const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
 
 fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
@@ -89,10 +94,31 @@ fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
         .or_else(|| syntax_set.find_syntax_by_extension(language))
 }
 
+fn exceeds_highlight_limits(total_bytes: usize, total_lines: usize) -> bool {
+    total_bytes > MAX_HIGHLIGHT_BYTES || total_lines > MAX_HIGHLIGHT_LINES
+}
+
+fn highlighted_line_spans(ranges: Vec<(SyntectStyle, &str)>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (style, text) in ranges {
+        let text = text.trim_end_matches(['\n', '\r']);
+        if !text.is_empty() {
+            spans.push(Span::styled(
+                expand_tabs(text).into_owned(),
+                convert_style(style),
+            ));
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
+}
+
 fn highlight_to_line_spans(code: &str, language: &str) -> Option<Vec<Vec<Span<'static>>>> {
+    let line_count = code.lines().count();
     if code.is_empty()
-        || code.len() > MAX_HIGHLIGHT_BYTES
-        || code.lines().count() > MAX_HIGHLIGHT_LINES
+        || exceeds_highlight_limits(code.len(), line_count)
         || code
             .lines()
             .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
@@ -102,23 +128,10 @@ fn highlight_to_line_spans(code: &str, language: &str) -> Option<Vec<Vec<Span<'s
 
     let syntax = find_syntax(language)?;
     let mut highlighter = HighlightLines::new(syntax, theme());
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(line_count);
     for line in LinesWithEndings::from(code) {
         let ranges = highlighter.highlight_line(line, syntax_set()).ok()?;
-        let mut spans = Vec::new();
-        for (style, text) in ranges {
-            let text = text.trim_end_matches(['\n', '\r']);
-            if !text.is_empty() {
-                spans.push(Span::styled(
-                    expand_tabs(text).into_owned(),
-                    convert_style(style),
-                ));
-            }
-        }
-        if spans.is_empty() {
-            spans.push(Span::raw(String::new()));
-        }
-        lines.push(spans);
+        lines.push(highlighted_line_spans(ranges));
     }
     Some(lines)
 }

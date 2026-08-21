@@ -16,6 +16,10 @@ use ratatui::text::Span;
 use std::collections::HashSet;
 use std::path::Path;
 
+mod open_code_fence;
+
+use self::open_code_fence::OpenCodeFence;
+
 #[derive(Debug, Default)]
 pub(super) struct MarkdownRenderCache {
     raw_source: String,
@@ -99,13 +103,15 @@ impl MarkdownRenderCache {
     }
 
     pub(super) fn render_streaming(&mut self, width: usize, cwd: &Path) -> &[HyperlinkLine] {
+        let allow_open_fence = self.sanitized_source.is_none();
         let source = self.sanitized_source.as_deref().unwrap_or(&self.raw_source);
         if self.width != Some(width) {
             self.width = Some(width);
             self.render.recompute(source, Some(width), cwd);
             self.canonical = false;
         } else if !self.canonical {
-            self.render.append(source, Some(width), cwd);
+            self.render
+                .append(source, Some(width), cwd, allow_open_fence);
         }
 
         &self.render.lines
@@ -162,6 +168,7 @@ struct IncrementalMarkdownRender {
     stable_rendered_len: usize,
     parsed_source_len: usize,
     has_reference_link_definition: bool,
+    open_code_fence: Option<OpenCodeFence>,
 }
 
 impl IncrementalMarkdownRender {
@@ -170,6 +177,7 @@ impl IncrementalMarkdownRender {
     }
 
     fn recompute(&mut self, source: &str, width: Option<usize>, cwd: &Path) {
+        self.open_code_fence = None;
         let rendered =
             markdown::render_streaming_markdown_agent_with_links_and_cwd(source, width, Some(cwd));
         self.lines = rendered.lines;
@@ -179,13 +187,30 @@ impl IncrementalMarkdownRender {
         self.has_reference_link_definition = rendered.has_reference_link_definition;
     }
 
-    fn append(&mut self, source: &str, width: Option<usize>, cwd: &Path) {
+    fn append(&mut self, source: &str, width: Option<usize>, cwd: &Path, allow_open_fence: bool) {
         if source.len() == self.parsed_source_len {
             return;
         }
         if source.len() < self.parsed_source_len || self.has_reference_link_definition {
             self.recompute(source, width, cwd);
             return;
+        }
+        let Some(appended_source) = source.get(self.parsed_source_len..) else {
+            self.recompute(source, width, cwd);
+            return;
+        };
+
+        if allow_open_fence {
+            if let Some(fence) = self.open_code_fence.take()
+                && let Some((fence, lines)) = fence.append(source, appended_source)
+            {
+                self.lines.extend(lines);
+                self.open_code_fence = Some(fence);
+                self.parsed_source_len = source.len();
+                return;
+            }
+        } else {
+            self.open_code_fence = None;
         }
 
         let pending_source = &source[self.stable_source_len..];
@@ -199,6 +224,11 @@ impl IncrementalMarkdownRender {
             self.recompute(source, width, cwd);
             return;
         }
+
+        let final_block_start = pending.last_top_level_block_start.unwrap_or(0);
+        self.open_code_fence = allow_open_fence
+            .then(|| OpenCodeFence::detect(&pending_source[final_block_start..], source.len()))
+            .flatten();
 
         let mut newly_stable_rendered_len = None;
         if let Some(boundary) = pending.last_top_level_block_start {
@@ -225,5 +255,29 @@ impl IncrementalMarkdownRender {
             self.stable_rendered_len = pending_render_start + newly_stable_rendered_len;
         }
         self.parsed_source_len = source.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_open_fence_append_matches_canonical_render() {
+        let cwd = Path::new(".");
+        for language in ["rust", "unknown-language"] {
+            let mut incremental = MarkdownRenderCache::new("before\n".to_string());
+            incremental.render_streaming(80, cwd);
+            incremental.append(&format!("\n```{language}\n"));
+            incremental.render_streaming(80, cwd);
+            assert!(incremental.render.open_code_fence.is_some());
+
+            incremental.append("fn main() {}\n\n");
+            let actual = incremental.render_streaming(80, cwd).to_vec();
+            let mut canonical = MarkdownRenderCache::new(incremental.source().to_string());
+            let expected = canonical.render_streaming(80, cwd).to_vec();
+
+            assert_eq!(actual, expected, "language: {language}");
+        }
     }
 }
