@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.5] - 2026-08-21
+
+- added $deepwork
+
 ## [0.2.4] - 2026-08-19
 
 - compaction aligned with upstream codex

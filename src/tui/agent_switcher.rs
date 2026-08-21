@@ -19,6 +19,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const SELECTOR_WIDTH: usize = 2;
 const ROOT_ROWS: usize = 1;
+const NAVIGATION_ROWS: usize = 1;
+const NAVIGATION_KEY: &str = "ctrl+shift+↑/↓";
+const NAVIGATION_LABEL: &str = "navigate";
 const TREE_CONNECTOR: &str = "├── ";
 const TREE_LAST_CONNECTOR: &str = "└── ";
 const ROLE_SEPARATOR: &str = " | ";
@@ -170,15 +173,26 @@ impl AgentSwitcher {
         if self.rows.is_empty() {
             return 0;
         }
-        u16::try_from(self.rows.len().saturating_add(ROOT_ROWS)).unwrap_or(u16::MAX)
+        u16::try_from(
+            self.rows
+                .len()
+                .saturating_add(ROOT_ROWS)
+                .saturating_add(NAVIGATION_ROWS),
+        )
+        .unwrap_or(u16::MAX)
     }
 
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         if area.is_empty() || self.rows.is_empty() {
             return;
         }
-        let total_rows = self.rows.len().saturating_add(ROOT_ROWS);
-        let visible = usize::from(area.height).min(total_rows);
+        let tree_rows = self.rows.len().saturating_add(ROOT_ROWS);
+        let hint_visible = usize::from(area.height) >= tree_rows.saturating_add(NAVIGATION_ROWS);
+        let visible = if hint_visible {
+            tree_rows
+        } else {
+            usize::from(area.height).min(tree_rows)
+        };
         let range = self.visible_range(visible);
         let role_width = self
             .rows
@@ -224,6 +238,16 @@ impl AgentSwitcher {
                     shimmer_elapsed(),
                 )),
                 row_area,
+            );
+        }
+        if hint_visible {
+            let Ok(hint_offset) = u16::try_from(tree_rows) else {
+                return;
+            };
+            let hint_area = Rect::new(area.x, area.y.saturating_add(hint_offset), area.width, 1);
+            frame.render_widget(
+                Paragraph::new(render_navigation_hint(usize::from(hint_area.width))),
+                hint_area,
             );
         }
     }
@@ -275,6 +299,20 @@ fn render_root(available_width: usize) -> Line<'static> {
         Span::from("  "),
         Span::styled(content, palette::soft_accent_style()),
     ])
+}
+
+fn render_navigation_hint(available_width: usize) -> Line<'static> {
+    let content_width = available_width.saturating_sub(SELECTOR_WIDTH);
+    let key = truncate_text(NAVIGATION_KEY, content_width);
+    let key_width = crate::tui::width::display_width(&key);
+    let hint_style = inactive_gunmetal_style();
+    let mut spans = vec![Span::from("  "), Span::styled(key, hint_style)];
+    if key_width == crate::tui::width::display_width(NAVIGATION_KEY) {
+        let label = format!(" {NAVIGATION_LABEL}");
+        let label = truncate_text(&label, content_width.saturating_sub(key_width));
+        spans.push(Span::styled(label, hint_style));
+    }
+    Line::from(spans)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -546,6 +584,42 @@ mod tests {
     }
 
     #[test]
+    fn navigation_hint_aligns_with_the_deepwork_root() {
+        let root = render_root(52);
+        let hint = render_navigation_hint(52);
+        let root_rendered = root
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let hint_rendered = hint
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(root_rendered.find('$'), Some(2));
+        assert_eq!(hint_rendered.find('c'), Some(2));
+        assert_eq!(hint_rendered, "  ctrl+shift+↑/↓ navigate");
+        let hint_style = inactive_gunmetal_style();
+        assert_eq!(hint.spans[1].style, hint_style);
+        assert_eq!(hint.spans[2].style, hint_style);
+    }
+
+    #[test]
+    fn narrow_navigation_hint_truncates_from_the_left_axis() {
+        let line = render_navigation_hint(12);
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(rendered, "  ctrl+shif…");
+        assert_eq!(crate::tui::width::display_width(&rendered), 12);
+    }
+
+    #[test]
     fn persistent_pipeline_tree_renders_between_activity_and_composer() {
         let mut view = view_with_tree(session_id(1));
         let (buffer, lines) = render(&mut view, 80, 24);
@@ -572,6 +646,12 @@ mod tests {
                     .unwrap_or_else(|| panic!("tree row `{expected}` missing: {lines:#?}"))
             })
             .collect::<Vec<_>>();
+        let Some(hint) = lines
+            .iter()
+            .position(|line| line.contains("ctrl+shift+↑/↓ navigate"))
+        else {
+            panic!("navigation hint missing: {lines:#?}");
+        };
         let Some(composer) = lines.iter().position(|line| line.trim() == "›") else {
             panic!("composer row missing: {lines:#?}");
         };
@@ -581,11 +661,12 @@ mod tests {
         for pair in positions.windows(2) {
             assert_eq!(pair[1], pair[0] + 1, "{lines:#?}");
         }
-        assert_eq!(composer, positions[5] + 3, "{lines:#?}");
-        let gap = positions[5] + 1;
+        assert_eq!(hint, positions[5] + 1, "{lines:#?}");
+        let gap = hint + 1;
         assert!(lines[gap].trim().is_empty(), "{lines:#?}");
+        assert_eq!(composer, positions[5] + 4, "{lines:#?}");
         let Ok(gap_y) = u16::try_from(gap) else {
-            panic!("tree-to-composer gap should fit in the test terminal");
+            panic!("hint-to-composer gap should fit in the test terminal");
         };
         for x in buffer.area.x..buffer.area.right() {
             let cell = &buffer[(x, gap_y)];
@@ -593,6 +674,16 @@ mod tests {
             assert_eq!(cell.fg, Color::Reset);
             assert_eq!(cell.bg, Color::Reset);
             assert!(cell.modifier.is_empty());
+        }
+        let Ok(hint_y) = u16::try_from(hint) else {
+            panic!("navigation hint should fit in the test terminal");
+        };
+        for x in [2, 17] {
+            assert_eq!(
+                buffer[(x, hint_y)].fg,
+                inactive_gunmetal_style().fg.unwrap_or(Color::Reset)
+            );
+            assert!(buffer[(x, hint_y)].modifier.contains(Modifier::DIM));
         }
         let Ok(root_y) = u16::try_from(positions[0]) else {
             panic!("tree root should fit in the test terminal");
@@ -707,7 +798,7 @@ mod tests {
 
         assert_eq!(switcher.active, Some(active.clone()));
         assert_eq!(switcher.selected, Some(queued));
-        assert_eq!(switcher.preferred_height(), 6);
+        assert_eq!(switcher.preferred_height(), 7);
 
         let current = AgentSwitcher::new(
             pipeline_rows(),
