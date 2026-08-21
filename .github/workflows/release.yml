@@ -280,7 +280,7 @@ jobs:
             started { lines[++count] = $0 }
             END {
               while (count > 0 && lines[count] == "") count--
-              for (index = 1; index <= count; index++) print lines[index]
+              for (i = 1; i <= count; i++) print lines[i]
             }
           ' assets/CHANGELOG.md)"
           notes="$(printf 'Source revision: `%s`\n\nPatch notes:\n%s\n\nPrebuilt binaries:\n- macOS Apple silicon\n- Linux x86-64 (qualified on Ubuntu and Debian)' \
