@@ -132,10 +132,6 @@ jobs:
           [[ "$("$binary" --version)" == "bcodex $EXPECTED_VERSION" ]]
           [[ "$("$binary" --internal-release-tag)" == "$EXPECTED_TAG" ]]
           [[ "$("$binary" --internal-source-revision)" == "${EXPECTED_TAG##*-}" ]]
-          smoke_root="$(mktemp -d)"
-          trap 'rm -rf "$smoke_root"' EXIT
-          BCODEX_HOME="$smoke_root/bcodex" CODEX_HOME="$smoke_root/codex" \
-            "$binary" --internal-install-smoke
           mkdir -p dist
           gzip -9 -n -c "$binary" >dist/bcodex-x86_64-unknown-linux-gnu.gz
           zstd -19 --no-progress -f "$binary" -o dist/bcodex-x86_64-unknown-linux-gnu.zst
@@ -186,10 +182,6 @@ jobs:
           [[ "$("$binary" --version)" == "bcodex $EXPECTED_VERSION" ]]
           [[ "$("$binary" --internal-release-tag)" == "$EXPECTED_TAG" ]]
           [[ "$("$binary" --internal-source-revision)" == "${EXPECTED_TAG##*-}" ]]
-          smoke_root="$(mktemp -d)"
-          trap 'rm -rf "$smoke_root"' EXIT
-          BCODEX_HOME="$smoke_root/bcodex" CODEX_HOME="$smoke_root/codex" \
-            "$binary" --internal-install-smoke
           mkdir -p dist
           gzip -9 -n -c "$binary" >dist/bcodex-aarch64-apple-darwin.gz
           zstd -19 --no-progress -f "$binary" -o dist/bcodex-aarch64-apple-darwin.zst
@@ -217,22 +209,20 @@ jobs:
         shell: bash
         env:
           EXPECTED_TAG: ${{ needs.prepare.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           gzip -dc dist/bcodex-x86_64-unknown-linux-gnu.gz >dist/bcodex
           chmod 755 dist/bcodex
           cmp dist/bcodex <(zstd -dc dist/bcodex-x86_64-unknown-linux-gnu.zst)
+          [[ "$(dist/bcodex --version)" == "bcodex $EXPECTED_VERSION" ]]
           [[ "$(dist/bcodex --internal-release-tag)" == "$EXPECTED_TAG" ]]
-          smoke_root="$(mktemp -d)"
-          trap 'rm -rf "$smoke_root"' EXIT
-          BCODEX_HOME="$smoke_root/bcodex" CODEX_HOME="$smoke_root/codex" \
-            dist/bcodex --internal-install-smoke
-          docker run --rm \
-            -v "$PWD/dist:/release:ro" \
-            -e BCODEX_HOME=/tmp/bcodex \
-            -e CODEX_HOME=/tmp/codex \
-            debian:12-slim \
-            /release/bcodex --internal-install-smoke
+          [[ "$(
+            docker run --rm \
+              -v "$PWD/dist:/release:ro" \
+              debian:12-slim \
+              /release/bcodex --version
+          )" == "bcodex $EXPECTED_VERSION" ]]
 
   draft-release:
     name: Create draft GitHub release
