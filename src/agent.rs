@@ -12,6 +12,7 @@ use crate::context::ActiveTurnContext;
 use crate::context::ContextSnapshot;
 use crate::context::Conversation;
 use crate::deepwork::DeepworkRequester;
+use crate::deepwork::DeepworkStatus;
 use crate::deepwork::HarnessProfile;
 use crate::deepwork::SpecialistRole;
 use crate::events::AgentEvent;
@@ -514,10 +515,7 @@ impl Agent {
             conversation.model_selection().clone(),
             conversation.service_tier(),
         )?;
-        let mut tools = ToolRuntime::new(cwd.clone());
-        let deepwork_active = conversation.has_injected_skill(DEEPWORK_SYSTEM_SKILL_NAME);
-        tools.set_ask_user_question_enabled(deepwork_active);
-        tools.set_specialist_coordination_enabled(deepwork_active);
+        let tools = ToolRuntime::new(cwd.clone());
         let startup_prewarm = StartupPrewarm::schedule(&api);
         Ok(Self {
             cwd,
@@ -570,9 +568,43 @@ impl Agent {
         self.sync_deepwork_tool_access();
     }
 
-    pub(crate) fn restore_deepwork_access(&mut self) {
+    pub(crate) fn restore_deepwork_access(&mut self, status: &DeepworkStatus) -> Result<()> {
+        let selection = self
+            .conversation
+            .skill_catalog()
+            .unique_enabled_selection(DEEPWORK_SYSTEM_SKILL_NAME)
+            .context("the approved `$deepwork` skill is unavailable during active-run restore")?;
+        let injection = self
+            .conversation
+            .skill_catalog()
+            .explicit_injections("", &[selection]);
+        if injection.items.len() != 1 {
+            return Err(anyhow!(
+                "the approved `$deepwork` context could not be restored{}",
+                injection
+                    .warnings
+                    .first()
+                    .map(|warning| format!(": {warning}"))
+                    .unwrap_or_default()
+            ));
+        }
+        self.conversation
+            .extend(injection.items.into_iter().chain([
+                crate::context::deepwork_runtime_context(
+                    status.run_index,
+                    &status.workspace,
+                    status.stage,
+                ),
+            ]))?;
         self.tools.set_ask_user_question_enabled(true);
         self.tools.set_specialist_coordination_enabled(true);
+        self.sync_deepwork_tool_access();
+        Ok(())
+    }
+
+    pub(crate) fn disable_deepwork_access(&mut self) {
+        self.tools.set_ask_user_question_enabled(false);
+        self.tools.set_specialist_coordination_enabled(false);
         self.sync_deepwork_tool_access();
     }
 
@@ -1000,24 +1032,6 @@ impl Agent {
             }
 
             let lifecycle = Some(self.conversation.tool_lifecycle_journal());
-            let tools = &self.tools;
-            let execute = |tool_call: ToolCall| {
-                let cancellation = control.cancellation.clone();
-                let tool_events = events.clone();
-                let lifecycle = lifecycle.clone();
-                async move {
-                    let output = tool_call
-                        .execute(
-                            tools,
-                            tool_truncation_policy,
-                            tool_events,
-                            cancellation,
-                            lifecycle,
-                        )
-                        .await;
-                    tool_call.into_output_item(output)
-                }
-            };
             let mut executed_calls = Vec::with_capacity(tool_calls.len());
             let mut tool_calls = tool_calls.into_iter().peekable();
             while let Some(tool_call) = tool_calls.next() {
@@ -1028,9 +1042,42 @@ impl Agent {
                     {
                         parallel_calls.push(tool_call);
                     }
-                    executed_calls.extend(join_all(parallel_calls.into_iter().map(&execute)).await);
+                    let tools = &self.tools;
+                    let execute = |tool_call: ToolCall| {
+                        let cancellation = control.cancellation.clone();
+                        let tool_events = events.clone();
+                        let lifecycle = lifecycle.clone();
+                        async move {
+                            let output = tool_call
+                                .execute(
+                                    tools,
+                                    tool_truncation_policy,
+                                    tool_events,
+                                    cancellation,
+                                    lifecycle,
+                                )
+                                .await;
+                            tool_call.into_output_item(output)
+                        }
+                    };
+                    executed_calls.extend(join_all(parallel_calls.into_iter().map(execute)).await);
                 } else {
-                    executed_calls.push(execute(tool_call).await);
+                    let cancellation = control.cancellation.clone();
+                    let output = tool_call
+                        .execute(
+                            &self.tools,
+                            tool_truncation_policy,
+                            events.clone(),
+                            cancellation,
+                            lifecycle.clone(),
+                        )
+                        .await;
+                    let executed = tool_call.into_output_item(output);
+                    let disable_deepwork = executed.1.disable_deepwork;
+                    executed_calls.push(executed);
+                    if disable_deepwork {
+                        self.disable_deepwork_access();
+                    }
                 }
             }
             let (output_items, completions): (Vec<_>, Vec<_>) = executed_calls.into_iter().unzip();
@@ -1087,8 +1134,11 @@ impl Agent {
             }
             let (completed_tx, mut completed_rx) = unbounded_channel::<Value>();
             let mut observed_item = false;
-            let (history, cursor) = self.conversation.take_history_for_sampling();
-            let request = self.api.build_sampling_request(history, cursor);
+            let (history, cursor, omissions) = self.conversation.take_history_for_sampling();
+            let exact_input = !omissions.is_empty();
+            let request = self
+                .api
+                .build_sampling_request(history, cursor, exact_input);
             let wait: Result<SamplingWait> = {
                 let api = &mut self.api;
                 let conversation = &mut self.conversation;
@@ -1140,7 +1190,7 @@ impl Agent {
             let (history, cursor) = request.into_history();
             if let Err(error) = self
                 .conversation
-                .restore_history_after_sampling(history, cursor)
+                .restore_history_after_sampling(history, cursor, omissions)
             {
                 self.api.abandon_response();
                 return Err(error);
@@ -1301,9 +1351,12 @@ impl Agent {
     ) -> Result<Option<std::result::Result<CompactionResult, ApiError>>> {
         let mut completed = CompletedResponseMetadata::default();
         let compacted = {
-            let request = self.api.compact_append_only(
-                self.conversation.items(),
+            let history = self.conversation.history_for_model_request();
+            let exact_input = matches!(&history, std::borrow::Cow::Owned(_));
+            let request = self.api.compact_for_model_request(
+                history.as_ref(),
                 history_cursor,
+                exact_input,
                 compaction,
                 events.as_ref(),
                 &mut completed,

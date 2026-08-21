@@ -1,7 +1,7 @@
 interface:
   display_name: "Engineering Review"
   short_description: "Hunt bugs and refactor inferior designs"
-  default_prompt: "Use $review to inspect the current work, eliminate confirmed bugs, refactor inferior designs, and validate the result."
+  default_prompt: "$review inspect the current work, eliminate confirmed bugs, refactor inferior designs, and validate the result."
 
 policy:
   allow_implicit_invocation: false

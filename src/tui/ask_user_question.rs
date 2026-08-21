@@ -20,7 +20,6 @@ use crossterm::event::KeyModifiers;
 use ratatui::Frame;
 use ratatui::layout::Position;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -35,17 +34,15 @@ use std::path::Path;
 const TOP_GAP_HEIGHT: u16 = 1;
 const FOOTER_HEIGHT: u16 = 1;
 const SECTION_GAP_HEIGHT: u16 = 1;
-const PRIMARY: Color = Color::White;
-const SECONDARY: Color = Color::Indexed(250);
 const MAX_DETAIL_HEIGHT: u16 = 7;
 const MAX_EDITOR_HEIGHT: u16 = 5;
 
 fn primary_style() -> Style {
-    Style::default().fg(PRIMARY)
+    Style::default()
 }
 
 fn secondary_style() -> Style {
-    Style::default().fg(SECONDARY)
+    primary_style().dim()
 }
 
 fn selected_style() -> Style {
@@ -53,7 +50,7 @@ fn selected_style() -> Style {
 }
 
 fn focused_style() -> Style {
-    selected_style().reversed()
+    palette::accent_style()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,12 +318,8 @@ impl AskUserQuestionCard {
             KeyCode::Left => self.editor.move_left(),
             KeyCode::Right if control || alt => self.editor.move_word_right(),
             KeyCode::Right => self.editor.move_right(),
-            KeyCode::Up => self
-                .editor
-                .move_vertical(-1, self.other_text_width(available_width)),
-            KeyCode::Down => self
-                .editor
-                .move_vertical(1, self.other_text_width(available_width)),
+            KeyCode::Up => self.move_editor_or_choice(false, available_width),
+            KeyCode::Down => self.move_editor_or_choice(true, available_width),
             KeyCode::Home => self.editor.move_home(),
             KeyCode::End => self.editor.move_end(),
             KeyCode::Char('u') if control => self.editor.kill_to_line_start(),
@@ -340,6 +333,30 @@ impl AskUserQuestionCard {
         }
         self.validation = None;
         AskUserQuestionCardAction::None
+    }
+
+    fn move_editor_or_choice(&mut self, forward: bool, available_width: u16) {
+        let width = self.other_text_width(available_width);
+        let layout = self.editor.layout(width, u16::MAX);
+        let at_boundary = if forward {
+            layout.cursor_row.saturating_add(1) >= layout.total_lines
+        } else {
+            layout.cursor_row == 0
+        };
+        if !at_boundary {
+            self.editor
+                .move_vertical(if forward { 1 } else { -1 }, width);
+            return;
+        }
+
+        self.save_editor();
+        self.editing_other = false;
+        let row_count = self.row_count();
+        if forward {
+            self.move_cursor_down(row_count);
+        } else {
+            self.move_cursor_up(row_count);
+        }
     }
 
     fn activate_cursor(&mut self) -> AskUserQuestionCardAction {
@@ -573,14 +590,13 @@ impl AskUserQuestionCard {
         for (index, question) in self.arguments.questions.iter().enumerate() {
             let header = markdown::sanitize_inline(&question.header);
             let header = compact_label(&header, label_budget);
-            let marker = if self.answered(index) { "✓" } else { "□" };
-            let content = format!(" {marker} {header} ");
+            let content = format!(" • {header} ");
             let style = if index == self.current {
                 focused_style()
             } else if self.answered(index) {
                 selected_style()
             } else {
-                primary_style()
+                secondary_style()
             };
             spans.push(Span::styled(content, style));
             spans.push(Span::from(" "));
@@ -589,9 +605,9 @@ impl AskUserQuestionCard {
             let style = if self.review_active() {
                 focused_style()
             } else {
-                primary_style()
+                secondary_style()
             };
-            spans.push(Span::styled(" ✓ Submit ", style));
+            spans.push(Span::styled(" • Submit ", style));
             spans.push(Span::from(" "));
         }
         if !hide_navigation {
@@ -621,7 +637,7 @@ impl AskUserQuestionCard {
                 Span::styled(
                     format!("  {marker} "),
                     if self.answered(index) {
-                        selected_style()
+                        palette::accent_style()
                     } else {
                         palette::warning_color().into()
                     },
@@ -646,6 +662,9 @@ impl AskUserQuestionCard {
                     .into_iter()
                     .map(line_to_owned),
             );
+            if index + 1 < self.arguments.questions.len() {
+                lines.push(Line::default());
+            }
         }
         lines
     }
@@ -706,6 +725,7 @@ impl AskUserQuestionCard {
                         .map(line_to_owned),
                 );
             }
+            lines.push(Line::default());
             return lines;
         }
         if index == options_len {
@@ -734,15 +754,22 @@ impl AskUserQuestionCard {
         } else {
             "Submit"
         };
-        let pointer = if focused { "› " } else { "  " };
-        let style = if focused {
+        let pointer_style = if focused {
+            focused_style()
+        } else {
+            primary_style()
+        };
+        let label_style = if focused {
             focused_style()
         } else {
             selected_style()
         };
         vec![
             Line::default(),
-            Line::from(Span::styled(format!("{pointer}   {label}"), style)),
+            Line::from(vec![
+                Span::styled(if focused { "›    " } else { "     " }, pointer_style),
+                Span::styled(label, label_style),
+            ]),
         ]
     }
 
@@ -760,15 +787,9 @@ impl AskUserQuestionCard {
         } else {
             primary_style()
         };
-        let number_style = if focused {
+        let number_style = secondary_style();
+        let marker_style = if focused || selected {
             focused_style()
-        } else {
-            secondary_style()
-        };
-        let marker_style = if focused {
-            focused_style()
-        } else if selected {
-            selected_style()
         } else {
             secondary_style()
         };
@@ -1020,13 +1041,13 @@ impl AskUserQuestionCard {
         let number = question.options.len() + 1;
         let number_width = self.number_width();
         let mut prefix = vec![
-            Span::styled("› ", selected_style()),
+            Span::styled("› ", focused_style()),
             Span::styled(format!("{number:>number_width$}. "), secondary_style()),
         ];
         if question.multi_select {
             let selected = !self.editor.text().trim().is_empty();
             prefix.push(
-                Span::styled(if selected { "[✓] " } else { "[ ] " }, selected_style()).not_dim(),
+                Span::styled(if selected { "[✓] " } else { "[ ] " }, focused_style()).not_dim(),
             );
         }
         frame.render_widget(
@@ -1181,4 +1202,195 @@ fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
         boundary -= 1;
     }
     &value[..boundary]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ask_user_question::AskUserQuestion;
+    use crate::ask_user_question::AskUserQuestionOption;
+    use ratatui::style::Modifier;
+
+    fn card() -> AskUserQuestionCard {
+        AskUserQuestionCard::new(
+            "call-1".to_string(),
+            AskUserQuestionArgs {
+                questions: vec![
+                    AskUserQuestion {
+                        question: "Which outcome should the pipeline produce?".to_string(),
+                        header: "Outcome".to_string(),
+                        options: vec![
+                            AskUserQuestionOption {
+                                label: "Small focused change".to_string(),
+                                description: "Keep the implementation narrow and easy to review."
+                                    .to_string(),
+                                preview: None,
+                                default_selected: false,
+                            },
+                            AskUserQuestionOption {
+                                label: "Broader rewrite".to_string(),
+                                description: "Replace the surrounding implementation as well."
+                                    .to_string(),
+                                preview: None,
+                                default_selected: false,
+                            },
+                        ],
+                        multi_select: false,
+                    },
+                    AskUserQuestion {
+                        question: "Which quality targets matter?".to_string(),
+                        header: "Criteria".to_string(),
+                        options: vec![
+                            AskUserQuestionOption {
+                                label: "Simpler".to_string(),
+                                description: "Prefer the smallest sufficient solution.".to_string(),
+                                preview: None,
+                                default_selected: true,
+                            },
+                            AskUserQuestionOption {
+                                label: "Faster".to_string(),
+                                description: "Keep interactive work responsive.".to_string(),
+                                preview: None,
+                                default_selected: true,
+                            },
+                        ],
+                        multi_select: true,
+                    },
+                ],
+            },
+        )
+    }
+
+    fn edit_criteria_other(card: &mut AskUserQuestionCard, text: &str) {
+        card.current = 1;
+        card.answers[1].cursor = card.arguments.questions[1].options.len();
+        card.begin_editing_other();
+        card.insert_bounded(text);
+    }
+
+    #[test]
+    fn focused_choice_uses_accent_without_reverse_video() {
+        let card = card();
+        let lines = card.choice_lines(0, 80);
+        let label_line = &lines[0];
+
+        assert_eq!(label_line.spans[0].style.fg, Some(palette::accent_color()));
+        assert_eq!(label_line.spans[2].style.fg, Some(palette::accent_color()));
+        assert!(
+            label_line
+                .spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    #[test]
+    fn answer_blocks_have_a_blank_row_between_them() {
+        let card = card();
+        let lines = card.choice_lines(0, 80);
+
+        assert!(lines.last().is_some_and(|line| line.spans.is_empty()));
+    }
+
+    #[test]
+    fn active_tab_uses_accent_without_reverse_video() {
+        let card = card();
+        let tabs = card.tabs_line(100);
+        let active = tabs
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Outcome"))
+            .unwrap_or_else(|| panic!("active question tab should be rendered"));
+        let text = tabs
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(active.style.fg, Some(palette::accent_color()));
+        assert!(!active.style.add_modifier.contains(Modifier::REVERSED));
+        assert!(text.contains("• Outcome"));
+        assert!(text.contains("• Criteria"));
+        assert!(text.contains("• Submit"));
+        assert!(!text.contains('✓'));
+        assert!(!text.contains('□'));
+    }
+
+    #[test]
+    fn arrow_up_leaves_single_line_other_editor_and_moves_to_previous_choice() {
+        let mut card = card();
+        edit_criteria_other(&mut card, "Custom criterion");
+
+        let action = card.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 80);
+
+        assert_eq!(action, AskUserQuestionCardAction::None);
+        assert!(!card.editing_other);
+        assert_eq!(card.answers[1].cursor, 1);
+        assert_eq!(card.answers[1].other, "Custom criterion");
+    }
+
+    #[test]
+    fn arrow_down_leaves_single_line_other_editor_and_moves_to_submit() {
+        let mut card = card();
+        edit_criteria_other(&mut card, "Custom criterion");
+
+        let action = card.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 80);
+
+        assert_eq!(action, AskUserQuestionCardAction::None);
+        assert!(!card.editing_other);
+        assert_eq!(card.answers[1].cursor, 3);
+        assert_eq!(card.answers[1].other, "Custom criterion");
+    }
+
+    #[test]
+    fn arrows_still_move_inside_multiline_other_text_before_leaving() {
+        let mut card = card();
+        edit_criteria_other(&mut card, "First line\nSecond line");
+
+        let first = card.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 80);
+        assert_eq!(first, AskUserQuestionCardAction::None);
+        assert!(card.editing_other);
+
+        let second = card.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 80);
+        assert_eq!(second, AskUserQuestionCardAction::None);
+        assert!(!card.editing_other);
+        assert_eq!(card.answers[1].cursor, 1);
+        assert_eq!(card.answers[1].other, "First line\nSecond line");
+    }
+
+    #[test]
+    fn escape_cancels_without_selecting_a_highlighted_option() {
+        let mut card = card();
+
+        let action = card.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 80);
+
+        assert_eq!(
+            action,
+            AskUserQuestionCardAction::Cancel {
+                call_id: "call-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn multi_select_defaults_are_submitted_when_the_user_accepts_them() {
+        let mut card = card();
+        assert_eq!(
+            card.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 80),
+            AskUserQuestionCardAction::None
+        );
+
+        let action = card.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), 80);
+        let AskUserQuestionCardAction::Submit { response, .. } = action else {
+            panic!("completed answers should submit");
+        };
+
+        assert!(!response.cancelled);
+        assert_eq!(response.answers.len(), 2);
+        assert_eq!(
+            response.answers[1].selected_options,
+            vec!["Simpler".to_string(), "Faster".to_string()]
+        );
+        assert!(response.answers[1].free_text.is_none());
+    }
 }

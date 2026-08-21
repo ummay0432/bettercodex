@@ -52,6 +52,8 @@ use super::view::View;
 pub(super) type RoutedAgentEvent = (SessionId, AgentEvent);
 pub(super) type RoutedTurnResult = (SessionId, std::result::Result<TurnResult, String>);
 
+const MAX_MEANINGFUL_EVENTS: usize = 32;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ChildLaunch {
     pub(crate) role: SpecialistRole,
@@ -213,19 +215,16 @@ impl AgentSlot {
     pub(super) fn deliver_meaningful_event(&mut self, mut event: SpecialistEvent) {
         event.message = bounded_event_text(&event.message);
         event.final_result = event.final_result.as_deref().map(bounded_event_text);
-        while let Some(waiter) = self.waiters.pop_front() {
-            if waiter.send(Ok(event.clone())).is_ok() {
-                return;
-            }
+        if !deliver_to_waiter(&mut self.waiters, &event) {
+            queue_meaningful_event(&mut self.meaningful_events, event);
         }
-        self.meaningful_events.push_back(event);
     }
 
     fn wait(&mut self, response: oneshot::Sender<Result<SpecialistEvent>>) {
         if let Some(event) = self.meaningful_events.pop_front() {
             let _ = response.send(Ok(event));
         } else {
-            self.waiters.push_back(response);
+            queue_waiter(&mut self.waiters, response);
         }
     }
 
@@ -312,14 +311,25 @@ impl SessionGroup {
     }
 
     fn restore_main_deepwork_access(&mut self) {
-        if self.linkage.deepwork.is_none() {
+        let Some(status) = self
+            .linkage
+            .deepwork
+            .as_ref()
+            .filter(|state| state.stage != DeepworkStage::Completed)
+            .map(DeepworkState::status)
+        else {
             return;
-        }
+        };
         let main = self.main_mut();
         let Some(agent) = main.agent.as_mut() else {
             return;
         };
-        agent.restore_deepwork_access();
+        if let Err(error) = agent.restore_deepwork_access(&status) {
+            main.view.add_notice(format!(
+                "Active deepwork context could not be restored; protected tools remain disabled: {error:#}"
+            ));
+            return;
+        }
         let snapshot = agent.context_snapshot();
         main.set_context_snapshot(snapshot);
     }
@@ -370,34 +380,6 @@ impl SessionGroup {
         self.store.save(&proposed)?;
         self.linkage = proposed;
         Ok(())
-    }
-
-    pub(super) fn destination_ids(&self) -> Vec<SessionId> {
-        let active_id = self.active_id();
-        let mut destinations = Vec::new();
-        if active_id != self.main_id() {
-            destinations.push(self.main_id().clone());
-        }
-        let mut children = self
-            .linkage
-            .children
-            .iter()
-            .enumerate()
-            .filter(|(_, child)| {
-                &child.session_id != active_id
-                    && child.lifecycle.is_live()
-                    && self.slots.contains_key(&child.session_id)
-            })
-            .collect::<Vec<_>>();
-        children.sort_by_key(|(index, child)| {
-            (specialist_order(&child.role), child.stage_attempt, *index)
-        });
-        destinations.extend(
-            children
-                .into_iter()
-                .map(|(_, child)| child.session_id.clone()),
-        );
-        destinations
     }
 
     pub(super) fn main(&self) -> &AgentSlot {
@@ -456,13 +438,8 @@ impl SessionGroup {
         original_task: String,
     ) -> Result<DeepworkStatus> {
         let mut proposed = self.linkage.clone();
-        let state = match proposed.deepwork.take() {
-            Some(state) if state.stage != DeepworkStage::Completed => {
-                state.ensure_workspace()?;
-                state
-            }
-            _ => DeepworkState::activate(repository_root, original_task)?,
-        };
+        let state =
+            select_deepwork_activation(proposed.deepwork.take(), repository_root, original_task)?;
         let status = state.status();
         proposed.deepwork = Some(state);
         self.store.save(&proposed)?;
@@ -477,11 +454,18 @@ impl SessionGroup {
         self.update_deepwork(|state| state.approve_interview(contract))
     }
 
-    pub(super) fn approve_deepwork_readiness(
-        &mut self,
-        contract: String,
-    ) -> Result<DeepworkStatus> {
-        self.update_deepwork(|state| state.approve_readiness(contract))
+    pub(super) fn skip_deepwork_manifest(&mut self, reason: String) -> Result<DeepworkStatus> {
+        if self
+            .linkage
+            .children
+            .iter()
+            .any(|child| child.lifecycle.is_live())
+        {
+            return Err(anyhow!(
+                "`$manifest` cannot be skipped while a specialist session is live"
+            ));
+        }
+        self.update_deepwork(|state| state.skip_manifest(reason))
     }
 
     pub(super) fn record_deepwork_question_batch(
@@ -515,6 +499,20 @@ impl SessionGroup {
         role: SpecialistRole,
         handoff: String,
     ) -> Result<SessionId> {
+        let has_live_child =
+            self.linkage.children.iter().any(|child| {
+                child.lifecycle.is_live() && self.slots.contains_key(&child.session_id)
+            });
+        let reopen_skipped_manifest = role == SpecialistRole::Manifest
+            && !has_live_child
+            && self
+                .linkage
+                .deepwork
+                .as_ref()
+                .is_some_and(DeepworkState::can_reopen_skipped_manifest);
+        if reopen_skipped_manifest {
+            self.update_deepwork(DeepworkState::reopen_skipped_manifest)?;
+        }
         let launch = self.deepwork_launch(role, handoff)?;
         self.start_child(cwd, launch)
     }
@@ -524,19 +522,13 @@ impl SessionGroup {
             self.linkage.children.iter().any(|child| {
                 child.lifecycle.is_live() && self.slots.contains_key(&child.session_id)
             });
-        self.linkage
+        let state = self
+            .linkage
             .deepwork
             .as_ref()
-            .context("no `$deepwork` run is active for this Main session")?
-            .validate_start(role, has_live_child, &handoff)?;
-        let stage_attempt = self
-            .linkage
-            .children
-            .iter()
-            .filter(|child| SpecialistRole::parse(&child.role).ok() == Some(role))
-            .map(|child| child.stage_attempt)
-            .max()
-            .map_or(0, |attempt| attempt.saturating_add(1));
+            .context("no `$deepwork` run is active for this Main session")?;
+        state.validate_start(role, has_live_child, &handoff)?;
+        let stage_attempt = next_stage_attempt(&self.linkage.children, role, state.run_index)?;
         Ok(ChildLaunch {
             role,
             stage_attempt,
@@ -656,10 +648,17 @@ impl SessionGroup {
         }
         agent.set_specialist_role(launch.role)?;
         let session_id = SessionId::parse(agent.session_id().to_string())?;
+        let run_index = self
+            .linkage
+            .deepwork
+            .as_ref()
+            .context("no `$deepwork` run is active for this Main session")?
+            .run_index;
         let link = ChildSessionLink {
             session_id: session_id.clone(),
             role: launch.role.as_str().to_string(),
             stage_attempt: launch.stage_attempt,
+            run_index: Some(run_index),
             model_selection: fixed_model,
             lifecycle: ChildLifecycle::Working,
             accepted_handoff: launch.accepted_handoff,
@@ -833,17 +832,31 @@ impl SessionGroup {
         self.deepwork_status()
     }
 
+    fn child_for_current_run(&self, session_id: &SessionId) -> Result<ChildSessionLink> {
+        let child = self
+            .linkage
+            .child(session_id)
+            .cloned()
+            .context("specialist session is not linked to this group")?;
+        let run_index = self
+            .linkage
+            .deepwork
+            .as_ref()
+            .context("no `$deepwork` run is active for this Main session")?
+            .run_index;
+        if child.run_index != Some(run_index) {
+            return Err(anyhow!("specialist session is not linked to this group"));
+        }
+        Ok(child)
+    }
+
     pub(super) fn revive_child(
         &mut self,
         cwd: &Path,
         session_id: &SessionId,
         message: String,
     ) -> Result<()> {
-        let link = self
-            .linkage
-            .child(session_id)
-            .cloned()
-            .context("specialist session is not linked to this group")?;
+        let link = self.child_for_current_run(session_id)?;
         let mut agent = Agent::resume(cwd, ResumeSelector::Id(session_id.as_uuid()?))?;
         if agent.model_selection() != &link.model_selection {
             agent.set_model_selection(link.model_selection)?;
@@ -865,11 +878,7 @@ impl SessionGroup {
         if self.slots.contains_key(session_id) {
             return Err(anyhow!("specialist session {session_id} is already live"));
         }
-        let link = self
-            .linkage
-            .child(session_id)
-            .cloned()
-            .context("specialist session is not linked to this group")?;
+        let link = self.child_for_current_run(session_id)?;
         if link.lifecycle != ChildLifecycle::Retired {
             return Err(anyhow!("only a retired specialist session can be revived"));
         }
@@ -903,11 +912,7 @@ impl SessionGroup {
         session_id: &SessionId,
         message: String,
     ) -> Result<SessionId> {
-        let old = self
-            .linkage
-            .child(session_id)
-            .cloned()
-            .context("specialist session is not linked to this group")?;
+        let old = self.child_for_current_run(session_id)?;
         let agent = Agent::new_specialist(cwd, SpecialistRole::parse(&old.role)?)?;
         self.replace_child_with_agent(session_id, message, agent, AgentSlot::child)
     }
@@ -931,11 +936,7 @@ impl SessionGroup {
                 "specialist session {session_id} cannot be replaced while working"
             ));
         }
-        let old = self
-            .linkage
-            .child(session_id)
-            .cloned()
-            .context("specialist session is not linked to this group")?;
+        let old = self.child_for_current_run(session_id)?;
         if old.lifecycle == ChildLifecycle::Replaced || old.replaced_by.is_some() {
             return Err(anyhow!(
                 "specialist session {session_id} has already been replaced"
@@ -951,7 +952,11 @@ impl SessionGroup {
                 "replacement specialist Agent does not match the fixed model profile and working directory"
             ));
         }
-        agent.set_specialist_role(SpecialistRole::parse(&old.role)?)?;
+        let role = SpecialistRole::parse(&old.role)?;
+        let Some(run_index) = old.run_index else {
+            unreachable!()
+        };
+        agent.set_specialist_role(role)?;
         let replacement_id = SessionId::parse(agent.session_id().to_string())?;
         let replacement = ChildSessionLink {
             session_id: replacement_id.clone(),
@@ -960,6 +965,7 @@ impl SessionGroup {
                 .stage_attempt
                 .checked_add(1)
                 .context("specialist stage-attempt counter overflowed")?,
+            run_index: Some(run_index),
             model_selection: old.model_selection.clone(),
             lifecycle: ChildLifecycle::Working,
             accepted_handoff: old.accepted_handoff.clone(),
@@ -970,7 +976,7 @@ impl SessionGroup {
         let slot = build_slot(agent, &replacement)?;
         let mut proposed = self.linkage.clone();
         if let Some(state) = proposed.deepwork.as_mut() {
-            state.reopen(SpecialistRole::parse(&old.role)?);
+            state.reopen(role);
         }
         proposed
             .child_mut(session_id)
@@ -1114,11 +1120,11 @@ impl SessionGroup {
                 Ok(mut slot) => {
                     let interrupted = match link.lifecycle {
                         ChildLifecycle::Cancelling => Some((
-                            ChildLifecycle::Paused,
+                            recovered_lifecycle(link.lifecycle),
                             "specialist cancellation completed before cold resume",
                         )),
                         ChildLifecycle::Working | ChildLifecycle::Revived => Some((
-                            ChildLifecycle::AwaitingReview,
+                            recovered_lifecycle(link.lifecycle),
                             "specialist turn was interrupted before cold resume",
                         )),
                         ChildLifecycle::Active
@@ -1164,13 +1170,77 @@ impl SessionGroup {
     }
 }
 
-fn specialist_order(role: &str) -> u8 {
-    match role.trim().trim_start_matches('$') {
-        "evals" => 0,
-        "manifest" => 1,
-        "worker" => 2,
-        "reviewer" => 3,
-        _ => 4,
+fn select_deepwork_activation(
+    current: Option<DeepworkState>,
+    repository_root: &Path,
+    original_task: String,
+) -> Result<DeepworkState> {
+    match current {
+        Some(state) if state.stage != DeepworkStage::Completed => {
+            state.ensure_workspace()?;
+            Ok(state)
+        }
+        _ => DeepworkState::activate(repository_root, original_task),
+    }
+}
+
+fn queue_meaningful_event(events: &mut VecDeque<SpecialistEvent>, event: SpecialistEvent) {
+    if events.len() == MAX_MEANINGFUL_EVENTS {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+fn queue_waiter(
+    waiters: &mut VecDeque<oneshot::Sender<Result<SpecialistEvent>>>,
+    response: oneshot::Sender<Result<SpecialistEvent>>,
+) {
+    waiters.retain(|waiter| !waiter.is_closed());
+    waiters.push_back(response);
+}
+
+fn deliver_to_waiter(
+    waiters: &mut VecDeque<oneshot::Sender<Result<SpecialistEvent>>>,
+    event: &SpecialistEvent,
+) -> bool {
+    while let Some(waiter) = waiters.pop_front() {
+        if waiter.send(Ok(event.clone())).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn next_stage_attempt(
+    children: &[ChildSessionLink],
+    role: SpecialistRole,
+    run_index: u64,
+) -> Result<u32> {
+    children
+        .iter()
+        .filter(|child| {
+            child.run_index == Some(run_index)
+                && SpecialistRole::parse(&child.role).ok() == Some(role)
+        })
+        .map(|child| child.stage_attempt)
+        .max()
+        .map_or(Ok(0), |attempt| {
+            attempt
+                .checked_add(1)
+                .context("specialist stage-attempt counter overflowed")
+        })
+}
+
+fn recovered_lifecycle(lifecycle: ChildLifecycle) -> ChildLifecycle {
+    match lifecycle {
+        ChildLifecycle::Cancelling | ChildLifecycle::Working | ChildLifecycle::Revived => {
+            ChildLifecycle::Paused
+        }
+        ChildLifecycle::Active
+        | ChildLifecycle::Paused
+        | ChildLifecycle::AwaitingReview
+        | ChildLifecycle::Retired
+        | ChildLifecycle::Replaced => lifecycle,
     }
 }
 
@@ -1309,5 +1379,174 @@ impl<T> Drop for AbortOnDrop<T> {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "bettercodex-deepwork-activation-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&root)
+                .unwrap_or_else(|error| panic!("temporary root should be created: {error}"));
+            Self(root)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn event(message: impl Into<String>) -> SpecialistEvent {
+        SpecialistEvent {
+            session_id: uuid::Uuid::from_u128(1).hyphenated().to_string(),
+            role: SpecialistRole::Worker,
+            stage_attempt: 0,
+            kind: SpecialistEventKind::Completed,
+            status: ChildLifecycle::AwaitingReview,
+            message: message.into(),
+            final_result: None,
+        }
+    }
+
+    fn child(role: SpecialistRole, stage_attempt: u32, run_index: u64) -> ChildSessionLink {
+        ChildSessionLink {
+            session_id: SessionId::new(),
+            role: role.as_str().to_string(),
+            stage_attempt,
+            run_index: Some(run_index),
+            model_selection: role.model_selection(),
+            lifecycle: ChildLifecycle::Retired,
+            accepted_handoff: None,
+            prompt_revision: Some(role.prompt_revision().to_string()),
+            replaces: None,
+            replaced_by: None,
+        }
+    }
+
+    #[test]
+    fn activation_reuses_unfinished_and_allocates_after_completion() {
+        let root = TestRoot::new();
+        let first = select_deepwork_activation(None, &root.0, "first task".to_string())
+            .unwrap_or_else(|error| panic!("first run should activate: {error}"));
+        assert_eq!(first.run_index, 0);
+
+        let reused = select_deepwork_activation(
+            Some(first.clone()),
+            &root.0,
+            "replacement task".to_string(),
+        )
+        .unwrap_or_else(|error| panic!("unfinished run should be reused: {error}"));
+        assert_eq!(reused, first);
+
+        let mut completed = reused;
+        completed.stage = DeepworkStage::Completed;
+        let next = select_deepwork_activation(Some(completed), &root.0, "next task".to_string())
+            .unwrap_or_else(|error| panic!("completed run should allocate a successor: {error}"));
+        assert_eq!(next.run_index, 1);
+        assert_eq!(next.original_task, "next task");
+    }
+
+    #[test]
+    fn meaningful_event_queue_is_bounded_and_waiters_are_pruned_without_broadcast() {
+        let mut events = VecDeque::new();
+        for index in 0..MAX_MEANINGFUL_EVENTS + 5 {
+            queue_meaningful_event(&mut events, event(index.to_string()));
+        }
+        assert_eq!(events.len(), MAX_MEANINGFUL_EVENTS);
+        assert_eq!(
+            events.front().map(|event| event.message.as_str()),
+            Some("5")
+        );
+
+        let mut waiters = VecDeque::new();
+        for _ in 0..100 {
+            let (sender, receiver) = oneshot::channel();
+            drop(receiver);
+            queue_waiter(&mut waiters, sender);
+        }
+        assert_eq!(waiters.len(), 1);
+
+        let (first_sender, mut first_receiver) = oneshot::channel();
+        queue_waiter(&mut waiters, first_sender);
+        let (second_sender, mut second_receiver) = oneshot::channel();
+        queue_waiter(&mut waiters, second_sender);
+        assert_eq!(waiters.len(), 2);
+
+        let first_event = event("first");
+        assert!(deliver_to_waiter(&mut waiters, &first_event));
+        assert_eq!(waiters.len(), 1);
+        assert_eq!(
+            first_receiver
+                .try_recv()
+                .unwrap_or_else(|error| panic!("first waiter should receive an event: {error}"))
+                .unwrap_or_else(|error| panic!("first event delivery should succeed: {error}")),
+            first_event
+        );
+        assert!(matches!(
+            second_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let second_event = event("second");
+        assert!(deliver_to_waiter(&mut waiters, &second_event));
+        assert!(waiters.is_empty());
+        assert_eq!(
+            second_receiver
+                .try_recv()
+                .unwrap_or_else(|error| panic!("second waiter should receive an event: {error}"))
+                .unwrap_or_else(|error| panic!("second event delivery should succeed: {error}")),
+            second_event
+        );
+    }
+
+    #[test]
+    fn interrupted_work_recovers_paused() {
+        assert_eq!(
+            recovered_lifecycle(ChildLifecycle::Cancelling),
+            ChildLifecycle::Paused
+        );
+        assert_eq!(
+            recovered_lifecycle(ChildLifecycle::Working),
+            ChildLifecycle::Paused
+        );
+        assert_eq!(
+            recovered_lifecycle(ChildLifecycle::Revived),
+            ChildLifecycle::Paused
+        );
+        assert_eq!(
+            recovered_lifecycle(ChildLifecycle::AwaitingReview),
+            ChildLifecycle::AwaitingReview
+        );
+    }
+
+    #[test]
+    fn stage_attempts_are_scoped_to_the_current_run() {
+        let children = vec![
+            child(SpecialistRole::Worker, 8, 6),
+            child(SpecialistRole::Worker, 0, 7),
+            child(SpecialistRole::Worker, 2, 7),
+            child(SpecialistRole::Reviewer, 9, 7),
+        ];
+
+        assert_eq!(
+            next_stage_attempt(&children, SpecialistRole::Worker, 7)
+                .unwrap_or_else(|error| panic!("worker attempt should advance: {error}")),
+            3
+        );
+        assert_eq!(
+            next_stage_attempt(&children, SpecialistRole::Acceptance, 7)
+                .unwrap_or_else(|error| panic!("first acceptance attempt should exist: {error}")),
+            0
+        );
     }
 }

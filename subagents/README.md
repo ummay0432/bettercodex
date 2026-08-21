@@ -2,7 +2,7 @@
 
 This directory contains the four fixed bettercodex `$deepwork` child specialist definitions described in [`SPEC-SUBAGENTS.md`](../SPEC-SUBAGENTS.md):
 
-- `evals.md` — evaluation contract and acceptance gates;
+- `acceptance.md` — evidence-backed completion contract and verification surfaces;
 - `manifest.md` — official documentation research and constrained handoff;
 - `worker.md` — implementation;
 - `reviewer.md` — final surgical review and refinement.

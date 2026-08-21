@@ -687,6 +687,7 @@ impl OutputItemMode {
 pub(crate) struct SamplingRequest {
     request: ResponsesRequest,
     cursor: HistoryCursor,
+    input_identity: RequestInputIdentity,
 }
 
 impl WebSocketBaseline {
@@ -1062,10 +1063,7 @@ impl ApiClient {
             completed_items,
             events,
             RequestKind::Turn,
-            RequestInputIdentity::AppendOnly {
-                cursor: request.cursor,
-                trailing_items: 0,
-            },
+            request.input_identity,
         )
         .await
     }
@@ -1667,25 +1665,25 @@ impl ApiClient {
         }
     }
 
-    pub(crate) async fn compact_append_only(
+    pub(crate) async fn compact_for_model_request(
         &mut self,
         history: &[Value],
         cursor: HistoryCursor,
+        exact_input: bool,
         compaction: CompactionRequest,
         events: Option<&UnboundedSender<AgentEvent>>,
         completed: &mut CompletedResponseMetadata,
     ) -> ApiResult<CompactionResult> {
-        self.compact_with_identity(
-            history,
-            compaction,
+        let input_identity = if exact_input {
+            RequestInputIdentity::Exact
+        } else {
             RequestInputIdentity::AppendOnly {
                 cursor,
                 trailing_items: 1,
-            },
-            events,
-            completed,
-        )
-        .await
+            }
+        };
+        self.compact_with_identity(history, compaction, input_identity, events, completed)
+            .await
     }
 
     async fn compact_with_identity(
@@ -1797,11 +1795,20 @@ impl ApiClient {
         &self,
         history: Vec<Value>,
         cursor: HistoryCursor,
+        exact_input: bool,
     ) -> SamplingRequest {
         let selection = self.model_selection.get();
         SamplingRequest {
             request: self.build_request_from_input(history, RequestKind::Turn, selection),
             cursor,
+            input_identity: if exact_input {
+                RequestInputIdentity::Exact
+            } else {
+                RequestInputIdentity::AppendOnly {
+                    cursor,
+                    trailing_items: 0,
+                }
+            },
         }
     }
 
@@ -2133,15 +2140,14 @@ pub(crate) fn harness_instructions_for(profile: HarnessProfile) -> &'static str 
     fn specialist_harness(role: crate::deepwork::SpecialistRole) -> String {
         format!("{}\n\n{}", SYSTEM_PROMPT.trim(), role.prompt())
     }
-    static EVALS: OnceLock<String> = OnceLock::new();
+    static ACCEPTANCE: OnceLock<String> = OnceLock::new();
     static MANIFEST: OnceLock<String> = OnceLock::new();
     static WORKER: OnceLock<String> = OnceLock::new();
     static REVIEWER: OnceLock<String> = OnceLock::new();
     match profile {
         HarnessProfile::Main => SYSTEM_PROMPT.trim(),
-        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Evals) => {
-            EVALS.get_or_init(|| specialist_harness(crate::deepwork::SpecialistRole::Evals))
-        }
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Acceptance) => ACCEPTANCE
+            .get_or_init(|| specialist_harness(crate::deepwork::SpecialistRole::Acceptance)),
         HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Manifest) => {
             MANIFEST.get_or_init(|| specialist_harness(crate::deepwork::SpecialistRole::Manifest))
         }
@@ -2192,7 +2198,7 @@ pub(crate) fn estimated_harness_tokens_for(
     })[tool_index];
     let profile_index = match profile {
         HarnessProfile::Main => 0,
-        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Evals) => 1,
+        HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Acceptance) => 1,
         HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Manifest) => 2,
         HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Worker) => 3,
         HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Reviewer) => 4,
@@ -2200,7 +2206,7 @@ pub(crate) fn estimated_harness_tokens_for(
     let instructions = HARNESS_INSTRUCTION_TOKEN_ESTIMATES.get_or_init(|| {
         [
             HarnessProfile::Main,
-            HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Evals),
+            HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Acceptance),
             HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Manifest),
             HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Worker),
             HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Reviewer),

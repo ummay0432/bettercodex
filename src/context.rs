@@ -68,6 +68,7 @@ const OPERATOR_USER_MESSAGE_KIND: &str = "operator";
 const CONTEXTUAL_USER_MESSAGE_KIND: &str = "context";
 const REPOSITORY_USER_MESSAGE_KIND: &str = "repository";
 const SKILL_USER_MESSAGE_KIND_PREFIX: &str = "skill:";
+const DEEPWORK_RUNTIME_USER_MESSAGE_KIND: &str = "deepwork_runtime";
 
 /// Serialize one history item exactly as bettercodex sends it to Responses.
 ///
@@ -191,6 +192,23 @@ pub(crate) struct Conversation {
 pub(crate) struct HistoryCursor {
     lineage: Uuid,
     len: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct RequestHistoryOmissions {
+    items: Vec<(usize, Value)>,
+}
+
+impl RequestHistoryOmissions {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn restore_into(self, history: &mut Vec<Value>) {
+        for (index, item) in self.items {
+            history.insert(index, item);
+        }
+    }
 }
 
 /// A pending history append and the context accounting computed for those exact items.
@@ -743,10 +761,6 @@ impl Conversation {
         Ok(())
     }
 
-    pub(crate) fn items(&self) -> &[Value] {
-        &self.history
-    }
-
     pub(crate) fn history_cursor(&self) -> HistoryCursor {
         HistoryCursor {
             lineage: self.history_lineage,
@@ -754,19 +768,41 @@ impl Conversation {
         }
     }
 
-    pub(crate) fn take_history_for_sampling(&mut self) -> (Vec<Value>, HistoryCursor) {
+    pub(crate) fn take_history_for_sampling(
+        &mut self,
+    ) -> (Vec<Value>, HistoryCursor, RequestHistoryOmissions) {
         let cursor = self.history_cursor();
-        (std::mem::take(&mut self.history), cursor)
+        let mut history = std::mem::take(&mut self.history);
+        let omissions = omit_deepwork_context_for_request(
+            &mut history,
+            self.ask_user_question_enabled || self.specialist_coordination_enabled,
+        );
+        (history, cursor, omissions)
+    }
+
+    pub(crate) fn history_for_model_request(&self) -> std::borrow::Cow<'_, [Value]> {
+        let deepwork_active =
+            self.ask_user_question_enabled || self.specialist_coordination_enabled;
+        if !has_deepwork_context_to_omit(&self.history, deepwork_active) {
+            return std::borrow::Cow::Borrowed(&self.history);
+        }
+        let mut history = self.history.clone();
+        let _ = omit_deepwork_context_for_request(&mut history, deepwork_active);
+        std::borrow::Cow::Owned(history)
     }
 
     pub(crate) fn restore_history_after_sampling(
         &mut self,
         mut history: Vec<Value>,
         cursor: HistoryCursor,
+        omissions: RequestHistoryOmissions,
     ) -> Result<()> {
-        if self.history_lineage != cursor.lineage || history.len() != cursor.len {
+        if self.history_lineage != cursor.lineage
+            || history.len().saturating_add(omissions.items.len()) != cursor.len
+        {
             anyhow::bail!("conversation changed while its sampling history was in flight");
         }
+        omissions.restore_into(&mut history);
         history.append(&mut self.history);
         self.history = history;
         Ok(())
@@ -784,12 +820,6 @@ impl Conversation {
 
     pub(crate) fn skill_catalog(&self) -> &SkillCatalog {
         &self.world_state.skills
-    }
-
-    pub(crate) fn has_injected_skill(&self, name: &str) -> bool {
-        self.history
-            .iter()
-            .any(|item| injected_skill_name(item) == Some(name))
     }
 
     pub(crate) fn reload_world_state_for_active_turn(
@@ -1442,6 +1472,10 @@ pub(crate) fn mark_skill_context_message(item: &mut Value, name: &str) {
     mark_user_message_kind(item, &format!("{SKILL_USER_MESSAGE_KIND_PREFIX}{name}"));
 }
 
+fn mark_deepwork_runtime_message(item: &mut Value) {
+    mark_user_message_kind(item, DEEPWORK_RUNTIME_USER_MESSAGE_KIND);
+}
+
 pub(crate) fn injected_skill_name(item: &Value) -> Option<&str> {
     is_user_message(item)
         .then(|| user_message_kind(item))
@@ -1478,7 +1512,9 @@ pub(crate) fn is_contextual_user_message(item: &Value) -> bool {
 pub(crate) fn is_contextual_user_text_with_kind(text: &str, kind: Option<&str>) -> bool {
     match kind {
         Some(OPERATOR_USER_MESSAGE_KIND) => false,
-        Some(CONTEXTUAL_USER_MESSAGE_KIND) | Some(REPOSITORY_USER_MESSAGE_KIND) => true,
+        Some(CONTEXTUAL_USER_MESSAGE_KIND)
+        | Some(REPOSITORY_USER_MESSAGE_KIND)
+        | Some(DEEPWORK_RUNTIME_USER_MESSAGE_KIND) => true,
         Some(kind) if kind.starts_with(SKILL_USER_MESSAGE_KIND_PREFIX) => true,
         _ => is_contextual_user_text(text),
     }
@@ -1490,6 +1526,7 @@ pub(crate) fn is_contextual_user_text(text: &str) -> bool {
         || is_complete_context_wrapper(text, AVAILABLE_SKILLS_PREFIX, "</available_skills>")
         || is_complete_context_wrapper(text, "<environment_context>", "</environment_context>")
         || is_complete_context_wrapper(text, "<skill_context>", "</skill_context>")
+        || is_complete_context_wrapper(text, "<deepwork_runtime>", "</deepwork_runtime>")
         || is_complete_context_wrapper(text, FILE_CONTEXT_PREFIX, "</file_context>")
         || is_complete_context_wrapper(text, LEGACY_SKILL_CONTEXT_PREFIX, "</skill>")
         || is_user_shell_command_text(text)
@@ -1694,6 +1731,7 @@ fn is_turn_input_context_message(item: &Value) -> bool {
         return false;
     };
     is_complete_context_wrapper(text, "<skill_context>", "</skill_context>")
+        || is_complete_context_wrapper(text, "<deepwork_runtime>", "</deepwork_runtime>")
         || is_complete_context_wrapper(text, FILE_CONTEXT_PREFIX, "</file_context>")
         || is_complete_context_wrapper(text, LEGACY_SKILL_CONTEXT_PREFIX, "</skill>")
         || is_user_shell_command_text(text)
@@ -1738,6 +1776,80 @@ fn message_text(item: &Value) -> Option<&str> {
         .find_map(|content| content.get("text").and_then(Value::as_str))
 }
 
+fn is_deepwork_skill_context(item: &Value) -> bool {
+    if injected_skill_name(item) == Some("deepwork") {
+        return true;
+    }
+    if !is_contextual_user_message(item) {
+        return false;
+    }
+    let Some(text) = message_text(item).map(str::trim) else {
+        return false;
+    };
+    is_complete_context_wrapper(text, "<skill_context>", "</skill_context>")
+        && text
+            .lines()
+            .any(|line| line.trim() == "<name>deepwork</name>")
+}
+
+fn is_deepwork_runtime_context(item: &Value) -> bool {
+    if !is_contextual_user_message(item) {
+        return false;
+    }
+    let Some(text) = message_text(item).map(str::trim) else {
+        return false;
+    };
+    user_message_kind(item) == Some(DEEPWORK_RUNTIME_USER_MESSAGE_KIND)
+        || is_complete_context_wrapper(text, "<deepwork_runtime>", "</deepwork_runtime>")
+}
+
+fn has_deepwork_context_to_omit(history: &[Value], deepwork_active: bool) -> bool {
+    if !deepwork_active {
+        return history
+            .iter()
+            .any(|item| is_deepwork_skill_context(item) || is_deepwork_runtime_context(item));
+    }
+    history
+        .iter()
+        .filter(|item| is_deepwork_skill_context(item))
+        .nth(1)
+        .is_some()
+        || history
+            .iter()
+            .filter(|item| is_deepwork_runtime_context(item))
+            .nth(1)
+            .is_some()
+}
+
+fn omit_deepwork_context_for_request(
+    history: &mut Vec<Value>,
+    deepwork_active: bool,
+) -> RequestHistoryOmissions {
+    let latest_skill = deepwork_active
+        .then(|| history.iter().rposition(is_deepwork_skill_context))
+        .flatten();
+    let latest_runtime = deepwork_active
+        .then(|| history.iter().rposition(is_deepwork_runtime_context))
+        .flatten();
+    let mut retained = Vec::with_capacity(history.len());
+    let mut omitted = Vec::new();
+    for (index, item) in history.drain(..).enumerate() {
+        let omit = if deepwork_active {
+            (is_deepwork_skill_context(&item) && Some(index) != latest_skill)
+                || (is_deepwork_runtime_context(&item) && Some(index) != latest_runtime)
+        } else {
+            is_deepwork_skill_context(&item) || is_deepwork_runtime_context(&item)
+        };
+        if omit {
+            omitted.push((index, item));
+        } else {
+            retained.push(item);
+        }
+    }
+    *history = retained;
+    RequestHistoryOmissions { items: omitted }
+}
+
 fn is_compaction_item(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
@@ -1766,7 +1878,7 @@ pub(crate) fn deepwork_runtime_context(
             "<deepwork_runtime>\nrun_index: {run_index}\nworkspace: {workspace}\nstage: {stage}\nThe runtime reserved or recovered this numbered workspace for pipeline artifacts before repository preflight.\n</deepwork_runtime>"
         ),
     );
-    mark_contextual_user_message(&mut item);
+    mark_deepwork_runtime_message(&mut item);
     item
 }
 
@@ -2642,5 +2754,85 @@ fn synthetic_output_with_body(call: &CallDescriptor, output: Value) -> Value {
             "call_id": call.call_id,
             "output": output,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deepwork_skill_context(marked: bool) -> Value {
+        let mut item = message(
+            "user",
+            "<skill_context>\n<name>deepwork</name>\n<instructions>test</instructions>\n</skill_context>"
+                .to_string(),
+        );
+        if marked {
+            mark_skill_context_message(&mut item, "deepwork");
+        }
+        item
+    }
+
+    #[test]
+    fn inactive_requests_omit_deepwork_context_without_rewriting_history() {
+        let mut quoted = message(
+            "user",
+            "Document `<deepwork_runtime>` and `$deepwork` literally.".to_string(),
+        );
+        mark_operator_user_message(&mut quoted);
+        let history = vec![
+            quoted,
+            deepwork_skill_context(false),
+            deepwork_runtime_context(3, ".deepwork/3", DeepworkStage::Worker),
+            message("assistant", "historical result".to_string()),
+        ];
+        let original = history.clone();
+        let mut request = history;
+
+        let omissions = omit_deepwork_context_for_request(&mut request, false);
+
+        assert_eq!(omissions.items.len(), 2);
+        assert_eq!(request.len(), 2);
+        assert!(request.iter().all(|item| {
+            !is_deepwork_skill_context(item) && !is_deepwork_runtime_context(item)
+        }));
+
+        omissions.restore_into(&mut request);
+        assert_eq!(request, original);
+    }
+
+    #[test]
+    fn active_requests_keep_only_the_latest_skill_and_runtime_context() {
+        let old_skill = deepwork_skill_context(false);
+        let current_skill = deepwork_skill_context(true);
+        let old_runtime = deepwork_runtime_context(3, ".deepwork/3", DeepworkStage::Interview);
+        let current_runtime = deepwork_runtime_context(3, ".deepwork/3", DeepworkStage::Reviewer);
+        let mut history = vec![
+            old_skill,
+            old_runtime,
+            message("assistant", "continued".to_string()),
+            current_skill.clone(),
+            current_runtime.clone(),
+        ];
+
+        let omissions = omit_deepwork_context_for_request(&mut history, true);
+
+        assert_eq!(omissions.items.len(), 2);
+        assert!(history.contains(&current_skill));
+        assert!(history.contains(&current_runtime));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| is_deepwork_skill_context(item))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| is_deepwork_runtime_context(item))
+                .count(),
+            1
+        );
     }
 }

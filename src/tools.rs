@@ -2,6 +2,7 @@
 
 use crate::ask_user_question::AskUserQuestionArgs;
 use crate::ask_user_question::AskUserQuestionRequester;
+use crate::ask_user_question::MAX_FREE_TEXT_BYTES;
 use crate::ask_user_question::MAX_HEADER_CHARS;
 use crate::ask_user_question::MAX_OPTION_DESCRIPTION_CHARS;
 use crate::ask_user_question::MAX_OPTION_LABEL_CHARS;
@@ -9,10 +10,12 @@ use crate::ask_user_question::MAX_OPTIONS;
 use crate::ask_user_question::MAX_PREVIEW_CHARS;
 use crate::ask_user_question::MAX_QUESTION_CHARS;
 use crate::ask_user_question::MAX_QUESTIONS;
+use crate::ask_user_question::MAX_RESPONSE_JSON_BYTES;
 use crate::ask_user_question::MIN_OPTIONS;
 use crate::ask_user_question::TOOL_NAME as ASK_USER_QUESTION_NAME;
 use crate::deepwork::CoordinateSpecialistArgs;
 use crate::deepwork::DeepworkRequester;
+use crate::deepwork::DeepworkStage;
 use crate::deepwork::SpecialistRole;
 use crate::deepwork::TOOL_NAME as COORDINATE_SPECIALIST_NAME;
 use crate::events::AgentEvent;
@@ -198,6 +201,7 @@ impl ToolCall {
             display,
             file_change,
             requires_inspection,
+            disable_deepwork,
         } = output;
         let (error, inspection) = match display {
             Err(error) => (Some(error), None),
@@ -210,6 +214,7 @@ impl ToolCall {
             error,
             file_change,
             inspection,
+            disable_deepwork,
         };
         (
             json!({
@@ -227,6 +232,7 @@ pub(crate) struct ToolCompletion {
     pub(crate) error: Option<String>,
     pub(crate) file_change: Option<ToolFileChange>,
     pub(crate) inspection: Option<String>,
+    pub(crate) disable_deepwork: bool,
 }
 
 pub(crate) struct ToolResult {
@@ -234,6 +240,7 @@ pub(crate) struct ToolResult {
     display: std::result::Result<Value, String>,
     file_change: Option<ToolFileChange>,
     requires_inspection: bool,
+    disable_deepwork: bool,
 }
 
 impl ToolResult {
@@ -247,6 +254,7 @@ impl ToolResult {
             display: Ok(Value::String(text)),
             file_change: None,
             requires_inspection: false,
+            disable_deepwork: false,
         }
     }
 
@@ -288,6 +296,7 @@ impl ToolResult {
             display: Ok(output),
             file_change: None,
             requires_inspection: false,
+            disable_deepwork: false,
         })
     }
 
@@ -302,6 +311,7 @@ impl ToolResult {
             display: Ok(output),
             file_change: None,
             requires_inspection: false,
+            disable_deepwork: false,
         })
     }
 
@@ -317,6 +327,7 @@ impl ToolResult {
             display: Ok(json!({})),
             file_change: None,
             requires_inspection: false,
+            disable_deepwork: false,
         })
     }
 
@@ -327,6 +338,7 @@ impl ToolResult {
             display: Err(error),
             file_change: None,
             requires_inspection: false,
+            disable_deepwork: false,
         }
     }
 
@@ -337,6 +349,11 @@ impl ToolResult {
 
     fn requiring_inspection(mut self, required: bool) -> Self {
         self.requires_inspection = required;
+        self
+    }
+
+    fn disabling_deepwork(mut self, disabled: bool) -> Self {
+        self.disable_deepwork = disabled;
         self
     }
 }
@@ -560,8 +577,9 @@ impl ToolRuntime {
                     .as_ref()
                     .context("ask_user_question requester disappeared after tool admission")?;
                 let response = requester
-                    .request(call_id.to_string(), arguments, &cancellation)
+                    .request(call_id.to_string(), arguments.clone(), &cancellation)
                     .await?;
+                response.validate_for(&arguments)?;
                 ToolResult::structured(serde_json::to_value(response)?, truncation_policy)
             }
             COORDINATE_SPECIALIST_NAME => {
@@ -575,7 +593,9 @@ impl ToolRuntime {
                     .as_ref()
                     .context("deepwork requester disappeared after specialist tool admission")?;
                 let response = requester.coordinate(arguments, &cancellation).await?;
+                let completed = response.stage == DeepworkStage::Completed;
                 ToolResult::structured(serde_json::to_value(response)?, truncation_policy)
+                    .map(|result| result.disabling_deepwork(completed))
             }
             _ => Err(anyhow!("unknown tool `{name}`")),
         }
@@ -2421,13 +2441,13 @@ static TOOL_SPECIFICATIONS: LazyLock<Vec<Value>> = LazyLock::new(|| {
         ),
         function_tool(
             ASK_USER_QUESTION_NAME,
-            "Ask the user for decisions in an interactive terminal card. Wait for an explicit response to one to four related questions. Use this only when the answer materially affects the work and cannot be inferred safely. Provide two to six concise options per question; the UI automatically adds an Other free-text choice. Use multiSelect for questions where several options can apply, and defaultSelected only for genuinely recommended multi-select defaults. Add preview only when seeing the proposed content helps the user decide. Cancellation is returned explicitly and never chooses a highlighted or default option.",
+            "Ask the user for decisions in an interactive terminal card. Wait for an explicit response to one to four related questions. Use this only when the answer materially affects the work and cannot be inferred safely. Questions are limited to 80 characters, option labels to 24 characters, and Other answers to 256 UTF-8 bytes so the complete response remains within 6 KiB. Deepwork retains the newest 16 persisted question batches; status includes the newest batches fitting its 8 KiB answer-history budget and explicitly reports omitted or historically truncated batches. Provide two to six concise options per question; the UI automatically adds an Other free-text choice. Use multiSelect for questions where several options can apply, and defaultSelected only for genuinely recommended multi-select defaults. Add preview only when seeing the proposed content helps the user decide. Preview Markdown may contain newlines and tabs but no other control characters. Cancellation is returned explicitly and never chooses a highlighted or default option.",
             ask_user_question_schema(),
             ask_user_question_output_schema(),
         ),
         function_tool(
             COORDINATE_SPECIALIST_NAME,
-            "Coordinate the active `$deepwork` run. This is a strict sequential pipeline, not a general delegation tool. Use `approve_interview` only after the user approves the task contract, then start, supervise, inspect, and explicitly accept each expected specialist. Use `wait` instead of polling; it blocks until a meaningful completion, blocker, interruption, or failure exists. Cancelling `wait` only stops Main from waiting; use `cancel` to interrupt the target specialist and pause its current stage. A completed turn remains available for review: send concrete corrections to the same session, or atomically accept and retire it with `retire`. After accepted `$evals` and `$manifest`, use `approve_readiness` only after the user approves the final execution contract. Revive direct amendments when prior context remains useful; replace stale or biased work. `status` recovers the canonical run state after resume. Never use this tool outside a user-invoked `$deepwork` run.",
+            "Coordinate the active `$deepwork` run. This is a strict sequential pipeline, not a general delegation tool. Use `approve_interview` only after the user approves the task contract, then start, supervise, inspect, and explicitly accept each required specialist. Use `wait` instead of polling; it blocks until a meaningful completion, blocker, interruption, or failure exists. Cancelling `wait` only stops Main from waiting; use `cancel` to interrupt the target specialist and pause its current stage. A completed turn remains available for review: send concrete corrections to the same session, or atomically accept and retire it with `retire`. Start `$manifest` only when task-relevant documentation routing is materially useful; otherwise use `skip_manifest` with a concrete repository-grounded reason and create no session. Starting `$manifest` after a skip reopens it only while `$worker` has not started. Accepting or skipping `$manifest` advances directly to `$worker`; there is no second confirmation gate. Revive direct amendments when prior context remains useful; replace stale or biased work. `status` recovers the canonical run state after resume. Never use this tool outside a user-invoked `$deepwork` run.",
             coordinate_specialist_schema(),
             coordinate_specialist_output_schema(),
         ),
@@ -2848,13 +2868,13 @@ fn ask_user_question_schema() -> Value {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": MAX_QUESTION_CHARS,
-                            "description": "Complete question shown to the user."
+                            "description": "Complete concise question shown to the user. Unsupported control characters are rejected; newline and tab are allowed."
                         },
                         "header": {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": MAX_HEADER_CHARS,
-                            "description": "Short label for this question, at most 12 characters."
+                            "description": "Short label for this question, at most 12 characters. Unsupported control characters are rejected; newline and tab are allowed."
                         },
                         "options": {
                             "type": "array",
@@ -2868,18 +2888,18 @@ fn ask_user_question_schema() -> Value {
                                         "type": "string",
                                         "minLength": 1,
                                         "maxLength": MAX_OPTION_LABEL_CHARS,
-                                        "description": "Concise option label."
+                                        "description": "Concise option label, at most 24 characters. Unsupported control characters are rejected; newline and tab are allowed."
                                     },
                                     "description": {
                                         "type": "string",
                                         "minLength": 1,
                                         "maxLength": MAX_OPTION_DESCRIPTION_CHARS,
-                                        "description": "Brief consequence or meaning of this option."
+                                        "description": "Brief consequence or meaning of this option. Unsupported control characters are rejected; newline and tab are allowed."
                                     },
                                     "preview": {
                                         "type": "string",
                                         "maxLength": MAX_PREVIEW_CHARS,
-                                        "description": "Optional Markdown preview shown while this option is focused."
+                                        "description": "Optional Markdown preview shown while this option is focused. Newline and tab are allowed; all other control characters are rejected."
                                     },
                                     "defaultSelected": {
                                         "type": "boolean",
@@ -2911,19 +2931,22 @@ fn ask_user_question_output_schema() -> Value {
         "properties": {
             "answers": {
                 "type": "array",
-                "description": "Answers in the same order as the submitted questions.",
+                "maxItems": MAX_QUESTIONS,
+                "description": format!("Answers in the same order as the submitted questions. The complete serialized response is limited to {MAX_RESPONSE_JSON_BYTES} bytes."),
                 "items": {
                     "type": "object",
                     "properties": {
-                        "question": {"type": "string", "description": "Original question text."},
+                        "question": {"type": "string", "maxLength": MAX_QUESTION_CHARS, "description": "Original question text."},
                         "selectedOptions": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "maxItems": MAX_OPTIONS,
+                            "items": {"type": "string", "maxLength": MAX_OPTION_LABEL_CHARS},
                             "description": "Selected supplied option labels."
                         },
                         "freeText": {
                             "type": "string",
-                            "description": "The user's Other answer, when supplied."
+                            "maxLength": MAX_FREE_TEXT_BYTES,
+                            "description": format!("The user's Other answer, when supplied; limited to {MAX_FREE_TEXT_BYTES} UTF-8 bytes and may contain newline or tab but no other control characters.")
                         }
                     },
                     "required": ["question", "selectedOptions"],
@@ -2945,7 +2968,7 @@ fn coordinate_specialist_schema() -> Value {
         "type": "string",
         "description": "Fixed pipeline specialist role.",
         "oneOf": [
-            {"const": "evals", "description": SpecialistRole::Evals.description()},
+            {"const": "acceptance", "description": SpecialistRole::Acceptance.description()},
             {"const": "manifest", "description": SpecialistRole::Manifest.description()},
             {"const": "worker", "description": SpecialistRole::Worker.description()},
             {"const": "reviewer", "description": SpecialistRole::Reviewer.description()}
@@ -2975,10 +2998,10 @@ fn coordinate_specialist_schema() -> Value {
             {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["approve_readiness"]},
-                    "contract": {"type": "string", "description": "User-approved execution contract containing the literal `SUCCESS CRITERIA` heading followed by plain bullets."}
+                    "action": {"type": "string", "enum": ["skip_manifest"]},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 2048, "description": "Concrete repository-grounded reason that a documentation routing specialist would add no material value for this run."}
                 },
-                "required": ["action", "contract"],
+                "required": ["action", "reason"],
                 "additionalProperties": false
             },
             {
@@ -3060,13 +3083,13 @@ fn coordinate_specialist_output_schema() -> Value {
         "type": "object",
         "properties": {
             "action": {"type": "string"},
-            "stage": {"type": "string", "enum": ["interview", "evals", "manifest", "readiness", "worker", "reviewer", "completed"]},
+            "stage": {"type": "string", "enum": ["interview", "acceptance", "manifest", "worker", "reviewer", "completed"]},
             "runIndex": {"type": "integer", "minimum": 0},
             "workspace": {"type": "string"},
             "message": {"type": "string"},
             "sessionId": {"type": "string"},
             "event": {"type": "object", "description": "Bounded meaningful specialist event, present for wait."},
-            "state": {"type": "object", "description": "Bounded canonical pipeline state, present for status."}
+            "state": {"type": "object", "description": "Bounded canonical pipeline state, present for status. During interview it includes the newest persisted question batches fitting 8 KiB, reports older status omissions in questionBatchesOmitted, and reports a rolled or migrated history window with questionHistoryTruncated."}
         },
         "required": ["action", "stage", "runIndex", "workspace", "message"],
         "additionalProperties": false
@@ -3096,4 +3119,89 @@ fn edit_schema() -> Value {
         "required": ["path", "edits"],
         "additionalProperties": false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has_tool(specifications: &[Value], name: &str) -> bool {
+        specifications
+            .iter()
+            .any(|specification| specification.get("name").and_then(Value::as_str) == Some(name))
+    }
+
+    #[test]
+    fn responses_catalogues_cover_all_question_and_coordination_combinations() {
+        for (ask, coordinate) in [(false, false), (true, false), (false, true), (true, true)] {
+            let specifications = responses_api_specifications_for(ask, coordinate);
+            assert_eq!(has_tool(specifications, ASK_USER_QUESTION_NAME), ask);
+            assert_eq!(
+                has_tool(specifications, COORDINATE_SPECIALIST_NAME),
+                coordinate
+            );
+            assert!(has_tool(specifications, BASH_NAME));
+            assert!(has_tool(specifications, READ_NAME));
+            assert!(has_tool(specifications, WRITE_NAME));
+            assert!(has_tool(specifications, EDIT_NAME));
+        }
+    }
+
+    #[test]
+    fn question_schema_matches_runtime_size_and_preview_control_contracts() {
+        let input = ask_user_question_schema();
+        assert_eq!(
+            input.pointer("/properties/questions/items/properties/question/maxLength"),
+            Some(&json!(MAX_QUESTION_CHARS))
+        );
+        assert_eq!(
+            input.pointer(
+                "/properties/questions/items/properties/options/items/properties/label/maxLength"
+            ),
+            Some(&json!(MAX_OPTION_LABEL_CHARS))
+        );
+        let preview_description = input
+            .pointer(
+                "/properties/questions/items/properties/options/items/properties/preview/description",
+            )
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("preview description should exist"));
+        assert!(preview_description.contains("Newline and tab are allowed"));
+        assert!(preview_description.contains("other control characters are rejected"));
+
+        let output = ask_user_question_output_schema();
+        assert_eq!(
+            output.pointer("/properties/answers/maxItems"),
+            Some(&json!(MAX_QUESTIONS))
+        );
+        assert_eq!(
+            output.pointer("/properties/answers/items/properties/freeText/maxLength"),
+            Some(&json!(MAX_FREE_TEXT_BYTES))
+        );
+        assert!(
+            output
+                .pointer("/properties/answers/description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| description.contains("6144 bytes"))
+        );
+    }
+
+    #[test]
+    fn tool_completion_carries_the_internal_deepwork_disable_signal() {
+        let call = ToolCall {
+            call_id: "call-1".to_string(),
+            name: COORDINATE_SPECIALIST_NAME.to_string(),
+            arguments: "{}".to_string(),
+        };
+        let result = ToolResult::structured(
+            json!({"stage": "completed"}),
+            TruncationPolicy::Tokens(MAX_MODEL_VISIBLE_TOOL_OUTPUT_TOKENS),
+        )
+        .unwrap_or_else(|error| panic!("test result should serialize: {error}"))
+        .disabling_deepwork(true);
+
+        let (_, completion) = call.into_output_item(result);
+
+        assert!(completion.disable_deepwork);
+    }
 }

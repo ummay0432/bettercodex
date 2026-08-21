@@ -110,7 +110,9 @@ use view::View;
 
 use agent_switcher::AgentSwitcher;
 use agent_switcher::AgentSwitcherRow;
+use agent_switcher::AgentSwitcherSelection;
 use agent_switcher::AgentSwitcherStatus;
+use agent_switcher::move_selection;
 use session_group::AgentSlot;
 use session_group::SessionGroup;
 
@@ -261,7 +263,7 @@ struct Runtime {
     ask_user_question_requester: AskUserQuestionRequester,
     ask_user_question_requests: UnboundedReceiver<AskUserQuestionRequest>,
     pending_ask_user_question: Option<AskUserQuestionRequest>,
-    switcher_selection: Option<SessionId>,
+    switcher_selection: Option<AgentSwitcherSelection>,
     exit_after_work: bool,
     rate_limit_client: RateLimitClient,
     rate_limit_task: Option<RateLimitTask>,
@@ -539,59 +541,146 @@ impl Runtime {
     }
 
     fn refresh_agent_switcher(&mut self) {
-        let destinations = self.sessions.destination_ids();
-        if self
-            .switcher_selection
+        const PIPELINE: [SpecialistRole; 4] = [
+            SpecialistRole::Acceptance,
+            SpecialistRole::Manifest,
+            SpecialistRole::Worker,
+            SpecialistRole::Reviewer,
+        ];
+
+        let Some((accepted, skipped)) = self
+            .sessions
+            .linkage
+            .deepwork
             .as_ref()
-            .is_some_and(|selected| !destinations.contains(selected))
-        {
-            self.switcher_selection = destinations.first().cloned();
-        }
-        if destinations.is_empty() {
-            self.switcher_selection = None;
-        }
-        let rows = destinations
-            .into_iter()
-            .filter_map(|session_id| {
-                let slot = self.sessions.slot(&session_id)?;
-                let lifecycle = self
-                    .sessions
-                    .linkage
-                    .child(&session_id)
-                    .map(|child| child.lifecycle);
-                let elapsed = || {
-                    slot.turn_started_at
-                        .map(|started| started.elapsed())
-                        .unwrap_or_default()
-                };
-                let status = match lifecycle {
-                    Some(ChildLifecycle::Cancelling) => AgentSwitcherStatus::Cancelling(elapsed()),
-                    Some(ChildLifecycle::Paused) => AgentSwitcherStatus::Paused,
-                    Some(ChildLifecycle::AwaitingReview) => AgentSwitcherStatus::AwaitingReview,
-                    _ if slot.turn.is_active() || slot.view.is_busy() => {
-                        AgentSwitcherStatus::Working(elapsed())
-                    }
-                    _ => AgentSwitcherStatus::Idle,
-                };
-                match slot.child_identity() {
-                    Some((role, _, _)) => Some(AgentSwitcherRow::specialist(
-                        session_id,
-                        &slot.model_selection,
-                        role.as_str(),
-                        status,
-                    )),
-                    None => Some(AgentSwitcherRow::main(
-                        session_id,
-                        &slot.model_selection,
-                        status,
-                    )),
-                }
+            .filter(|state| state.stage != crate::deepwork::DeepworkStage::Completed)
+            .map(|state| {
+                (
+                    PIPELINE.map(|role| state.accepted_stages.contains_key(&role)),
+                    PIPELINE.map(|role| state.skipped_stages.contains_key(&role)),
+                )
             })
-            .collect();
+        else {
+            self.switcher_selection = None;
+            self.sessions
+                .active_mut()
+                .view
+                .set_agent_switcher(AgentSwitcher::default());
+            return;
+        };
+
+        let active_id = self.sessions.active_id().clone();
+        let main_id = self.sessions.main_id().clone();
+        let active_specialist = self
+            .sessions
+            .linkage
+            .children
+            .iter()
+            .filter(|child| child.lifecycle.is_live())
+            .find_map(|child| {
+                self.sessions
+                    .slot(&child.session_id)
+                    .filter(|slot| slot.turn.is_active() || slot.view.is_busy())
+                    .map(|_| child.session_id.clone())
+            });
+        let main_is_working = active_specialist.is_none()
+            && self
+                .sessions
+                .slot(&main_id)
+                .is_some_and(|slot| slot.turn.is_active() || slot.view.is_busy());
+
+        let main = self.sessions.main();
+        let main_elapsed = main
+            .turn_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let mut rows = vec![AgentSwitcherRow::main(
+            main_id,
+            &main.model_selection,
+            if main_is_working {
+                AgentSwitcherStatus::Working(main_elapsed)
+            } else {
+                AgentSwitcherStatus::Waiting
+            },
+        )];
+
+        for (index, role) in PIPELINE.into_iter().enumerate() {
+            let live = self
+                .sessions
+                .linkage
+                .children
+                .iter()
+                .rev()
+                .find(|child| {
+                    child.lifecycle.is_live()
+                        && SpecialistRole::parse(&child.role).ok() == Some(role)
+                })
+                .map(|child| (child.session_id.clone(), child.lifecycle));
+            let (session_id, status) = if let Some((session_id, lifecycle)) = live {
+                let slot = self.sessions.slot(&session_id);
+                let elapsed = slot
+                    .and_then(|slot| slot.turn_started_at)
+                    .map(|started| started.elapsed())
+                    .unwrap_or_default();
+                let status = match lifecycle {
+                    ChildLifecycle::Cancelling => AgentSwitcherStatus::Cancelling(elapsed),
+                    ChildLifecycle::Paused => AgentSwitcherStatus::Paused,
+                    ChildLifecycle::AwaitingReview => AgentSwitcherStatus::AwaitingReview,
+                    ChildLifecycle::Working | ChildLifecycle::Revived
+                        if active_specialist.as_ref() == Some(&session_id) =>
+                    {
+                        AgentSwitcherStatus::Working(elapsed)
+                    }
+                    ChildLifecycle::Active | ChildLifecycle::Working | ChildLifecycle::Revived => {
+                        AgentSwitcherStatus::Waiting
+                    }
+                    ChildLifecycle::Retired | ChildLifecycle::Replaced => {
+                        unreachable!("retired and replaced specialist sessions are not live")
+                    }
+                };
+                (slot.map(|_| session_id), status)
+            } else if accepted[index] {
+                (None, AgentSwitcherStatus::Accepted)
+            } else if skipped[index] {
+                (None, AgentSwitcherStatus::Skipped)
+            } else {
+                (None, AgentSwitcherStatus::Queued)
+            };
+            let selection = role.model_selection();
+            rows.push(AgentSwitcherRow::specialist(
+                session_id,
+                &selection,
+                role.as_str(),
+                status,
+            ));
+        }
+
         self.sessions
             .active_mut()
             .view
-            .set_agent_switcher(AgentSwitcher::new(rows, self.switcher_selection.clone()));
+            .set_agent_switcher(AgentSwitcher::new(
+                rows,
+                Some(active_id),
+                self.switcher_selection,
+            ));
+    }
+
+    fn switcher_session_id(&self, selection: AgentSwitcherSelection) -> Option<SessionId> {
+        match selection {
+            AgentSwitcherSelection::Main => Some(self.sessions.main_id().clone()),
+            AgentSwitcherSelection::Specialist(role) => self
+                .sessions
+                .linkage
+                .children
+                .iter()
+                .rev()
+                .find(|child| {
+                    child.lifecycle.is_live()
+                        && SpecialistRole::parse(&child.role).ok() == Some(role)
+                        && self.sessions.slot(&child.session_id).is_some()
+                })
+                .map(|child| child.session_id.clone()),
+        }
     }
 
     fn handle_terminal_event(&mut self, event: Event) -> Option<Action> {
@@ -609,6 +698,10 @@ impl Runtime {
             self.switcher_selection = None;
             return false;
         }
+        if !self.deepwork_in_progress() {
+            self.switcher_selection = None;
+            return false;
+        }
         if self.switcher_selection.is_some() && matches!(event, Event::Paste(_)) {
             return true;
         }
@@ -616,11 +709,6 @@ impl Runtime {
             return false;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return false;
-        }
-        let destinations = self.sessions.destination_ids();
-        if destinations.is_empty() {
-            self.switcher_selection = None;
             return false;
         }
         let switch_key = key.modifiers.contains(KeyModifiers::CONTROL)
@@ -632,28 +720,24 @@ impl Runtime {
             _ => None,
         };
         if let Some(forward) = direction {
-            let selected = self
-                .switcher_selection
-                .as_ref()
-                .and_then(|selected| destinations.iter().position(|id| id == selected));
-            let index = match (selected, forward) {
-                (None, true) => 0,
-                (None, false) => destinations.len() - 1,
-                (Some(index), true) => (index + 1) % destinations.len(),
-                (Some(0), false) => destinations.len() - 1,
-                (Some(index), false) => index - 1,
-            };
-            self.switcher_selection = destinations.get(index).cloned();
+            self.switcher_selection = move_selection(
+                &AgentSwitcherSelection::ROWS,
+                self.switcher_selection,
+                forward,
+            );
             self.refresh_agent_switcher();
             return true;
         }
-        let Some(selected) = self.switcher_selection.clone() else {
+        let Some(selected) = self.switcher_selection else {
             return false;
         };
         match key.code {
             KeyCode::Enter => {
+                let Some(session_id) = self.switcher_session_id(selected) else {
+                    return true;
+                };
                 self.switcher_selection = None;
-                match self.sessions.activate(&selected) {
+                match self.sessions.activate(&session_id) {
                     Ok(()) => {
                         self.sessions.active_mut().view.request_terminal_reflow();
                         let query = self.sessions.active().view.file_search_query().to_string();
@@ -1123,6 +1207,9 @@ impl Runtime {
                 "Operator shell output could not be added to model context: {error:#}"
             ));
         }
+        if !self.deepwork_in_progress() {
+            agent.disable_deepwork_access();
+        }
         let context_snapshot = agent.context_snapshot();
         let rate_limits = context_snapshot.rate_limits.clone();
         let instruction_source_paths = agent.instruction_source_paths().to_vec();
@@ -1434,18 +1521,18 @@ impl Runtime {
                 let status = self.sessions.approve_deepwork_interview(contract)?;
                 Ok(coordinate_response(
                     action,
-                    "interview contract approved; `$evals` may start",
+                    "interview contract approved; `$acceptance` may start",
                     status,
                     None,
                     None,
                     None,
                 ))
             }
-            CoordinateSpecialistArgs::ApproveReadiness { contract } => {
-                let status = self.sessions.approve_deepwork_readiness(contract)?;
+            CoordinateSpecialistArgs::SkipManifest { reason } => {
+                let status = self.sessions.skip_deepwork_manifest(reason)?;
                 Ok(coordinate_response(
                     action,
-                    "readiness contract approved; `$worker` may start",
+                    "`$manifest` skipped; `$worker` may start",
                     status,
                     None,
                     None,
@@ -1933,9 +2020,12 @@ impl Runtime {
                         .view
                         .dismiss_ask_user_question(&call_id);
                     if self.sessions.linkage.deepwork.is_some() {
-                        let batch =
-                            DeepworkQuestionBatch::from_response(request.arguments(), &response);
-                        if let Err(error) = self.sessions.record_deepwork_question_batch(batch) {
+                        let persisted =
+                            DeepworkQuestionBatch::from_response(request.arguments(), &response)
+                                .and_then(|batch| {
+                                    self.sessions.record_deepwork_question_batch(batch)
+                                });
+                        if let Err(error) = persisted {
                             self.sessions.main_mut().view.add_notice(format!(
                                 "The answer was returned, but canonical deepwork state could not be saved: {error:#}"
                             ));

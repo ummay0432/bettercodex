@@ -1,7 +1,10 @@
 /target/
+/.deepwork/
+/.tmp/
 
 # Local planning guidance.
 /TODO.md
+/todo.txt
 
 # Local credentials and runtime state must never enter repository history.
 .bcodex/

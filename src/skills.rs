@@ -345,6 +345,18 @@ impl SkillCatalog {
         &self.warnings
     }
 
+    pub(crate) fn unique_enabled_selection(&self, name: &str) -> Option<SkillSelection> {
+        let mut matches = self
+            .skills
+            .iter()
+            .filter(|skill| skill.enabled && skill.name == name);
+        let skill = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(SkillSelection::new(&skill.name, &skill.path))
+    }
+
     pub(crate) fn catalogue_message(&self, context_window: u64) -> Option<Value> {
         let visible = self
             .skills
@@ -437,12 +449,17 @@ impl SkillCatalog {
         }
 
         let mentions = extract_mentions(text);
+        let explicit_command = explicit_command_name(text);
         let linked_paths = mentions
             .paths
             .iter()
             .map(|path| Path::new(path.strip_prefix("skill://").unwrap_or(path)))
             .collect::<HashSet<_>>();
-        for skill in self.skills.iter().filter(|skill| skill.enabled) {
+        for skill in self
+            .skills
+            .iter()
+            .filter(|skill| skill.enabled && skill.allow_implicit_invocation)
+        {
             if linked_paths.iter().any(|path| skill.matches_path(path))
                 && seen_paths.insert(skill.path.clone())
             {
@@ -455,9 +472,14 @@ impl SkillCatalog {
             *counts.entry(skill.name.as_str()).or_default() += 1;
         }
         for skill in self.skills.iter().filter(|skill| skill.enabled) {
+            let selected_by_text = if skill.allow_implicit_invocation {
+                mentions.plain_names.contains(skill.name.as_str())
+            } else {
+                explicit_command == Some(skill.name.as_str())
+            };
             if seen_paths.contains(&skill.path)
                 || blocked_names.contains(skill.name.as_str())
-                || !mentions.plain_names.contains(skill.name.as_str())
+                || !selected_by_text
                 || counts.get(skill.name.as_str()) != Some(&1)
             {
                 continue;
@@ -554,8 +576,7 @@ pub(crate) fn is_mention_name_byte(byte: u8) -> bool {
 }
 
 pub(crate) fn explicitly_invokes_review(text: &str) -> bool {
-    let mentions = extract_mentions(text);
-    mentions.plain_names.contains("review") || mentions.linked_review
+    explicit_command_name(text) == Some("review")
 }
 
 fn discovery_roots_with_home(
@@ -1147,31 +1168,48 @@ fn bounded_warning(warning: String) -> String {
 
 struct Mentions<'a> {
     plain_names: HashSet<&'a str>,
-    linked_review: bool,
     paths: HashSet<&'a str>,
+}
+
+fn explicit_command_name(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix('$') {
+        (b'$', rest)
+    } else if let Some(rest) = trimmed.strip_prefix('/') {
+        (b'/', rest)
+    } else {
+        return None;
+    };
+    let name_end = rest
+        .as_bytes()
+        .iter()
+        .position(|byte| !is_mention_name_byte(*byte))
+        .unwrap_or(rest.len());
+    if name_end == 0
+        || rest
+            .as_bytes()
+            .get(name_end)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let name = &rest[..name_end];
+    if prefix == b'/' && name != "review" {
+        return None;
+    }
+    (!is_common_environment_variable(name)).then_some(name)
 }
 
 fn extract_mentions(text: &str) -> Mentions<'_> {
     let bytes = text.as_bytes();
     let mut plain_names = HashSet::new();
-    let mut linked_review = false;
     let mut paths = HashSet::new();
-    let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("/review")
-        && rest
-            .as_bytes()
-            .first()
-            .is_none_or(|byte| !is_mention_name_byte(*byte))
-    {
-        plain_names.insert("review");
-    }
     let mut index = 0_usize;
     while index < bytes.len() {
         if bytes[index] == b'['
             && let Some((name, path, end)) = parse_linked_mention(text, index)
         {
             if !is_common_environment_variable(name) {
-                linked_review |= name == "review";
                 paths.insert(path);
             }
             index = end;
@@ -1197,11 +1235,7 @@ fn extract_mentions(text: &str) -> Mentions<'_> {
         }
         index = end.max(index + 1);
     }
-    Mentions {
-        plain_names,
-        linked_review,
-        paths,
-    }
+    Mentions { plain_names, paths }
 }
 
 fn parse_linked_mention(text: &str, start: usize) -> Option<(&str, &str, usize)> {
@@ -1256,3 +1290,151 @@ pub(crate) fn is_common_environment_variable(name: &str) -> bool {
         .any(|common| name.eq_ignore_ascii_case(common))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "bettercodex-deepwork-skill-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&root)
+                .unwrap_or_else(|error| panic!("temporary root should be created: {error}"));
+            Self(root)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn deepwork_is_fixed_non_implicit_and_injects_only_when_explicitly_selected() {
+        let root = TestRoot::new();
+        let prompt = root.0.join(SKILL_FILE_NAME);
+        std::fs::write(&prompt, "test deepwork instructions")
+            .unwrap_or_else(|error| panic!("test skill should be written: {error}"));
+        let mut deepwork = Skill {
+            name: DEEPWORK_SYSTEM_SKILL_NAME.to_string(),
+            description: "test deepwork skill".to_string(),
+            short_description: None,
+            display_name: None,
+            path: prompt.clone(),
+            discovery_path: prompt.clone(),
+            scope: SkillScope::System,
+            enabled: false,
+            allow_implicit_invocation: true,
+        };
+        deepwork.enforce_fixed_settings();
+        let catalog = SkillCatalog {
+            skills: vec![deepwork],
+            warnings: Vec::new(),
+        };
+
+        assert!(catalog.skills()[0].is_enabled());
+        assert!(!catalog.skills()[0].allows_implicit_invocation());
+        assert!(catalog.catalogue_message(272_000).is_none());
+        assert!(
+            catalog
+                .explicit_injections("ordinary task", &[])
+                .items
+                .is_empty()
+        );
+
+        assert!(
+            catalog
+                .explicit_injections("run $deepwork", &[])
+                .items
+                .is_empty()
+        );
+        let text = catalog.explicit_injections("$deepwork run the task", &[]);
+        assert_eq!(text.items.len(), 1);
+        assert_eq!(
+            crate::context::injected_skill_name(&text.items[0]),
+            Some(DEEPWORK_SYSTEM_SKILL_NAME)
+        );
+
+        let structured = catalog.explicit_injections(
+            "ordinary task",
+            &[SkillSelection::new(DEEPWORK_SYSTEM_SKILL_NAME, prompt)],
+        );
+        assert_eq!(structured.items.len(), 1);
+        assert_eq!(
+            crate::context::injected_skill_name(&structured.items[0]),
+            Some(DEEPWORK_SYSTEM_SKILL_NAME)
+        );
+    }
+
+    #[test]
+    fn explicit_only_skills_ignore_literal_references_and_implicit_skills_keep_mentions() {
+        let root = TestRoot::new();
+        let deepwork_prompt = root.0.join("deepwork.md");
+        let other_prompt = root.0.join("other.md");
+        let helper_prompt = root.0.join("helper.md");
+        for path in [&deepwork_prompt, &other_prompt, &helper_prompt] {
+            std::fs::write(path, "test instructions")
+                .unwrap_or_else(|error| panic!("test skill should be written: {error}"));
+        }
+        let skill = |name: &str, path: &Path, allow_implicit_invocation: bool| Skill {
+            name: name.to_string(),
+            description: format!("test {name} skill"),
+            short_description: None,
+            display_name: None,
+            path: path.to_path_buf(),
+            discovery_path: path.to_path_buf(),
+            scope: SkillScope::System,
+            enabled: true,
+            allow_implicit_invocation,
+        };
+        let catalog = SkillCatalog {
+            skills: vec![
+                skill(DEEPWORK_SYSTEM_SKILL_NAME, &deepwork_prompt, false),
+                skill("other-explicit", &other_prompt, false),
+                skill("helper", &helper_prompt, true),
+            ],
+            warnings: Vec::new(),
+        };
+
+        for reference in [
+            "run $deepwork",
+            "Discuss $deepwork and $other-explicit without invoking either.",
+            "```text\n$deepwork task\n$other-explicit task\n```",
+            "Use the literal `$deepwork task` in the documentation.",
+            r"\$deepwork task",
+            "> $deepwork task",
+            "\"$deepwork task\" is an example.",
+            "Example:\n$deepwork task",
+            "[$deepwork](skill://deepwork.md)",
+        ] {
+            assert!(
+                catalog.explicit_injections(reference, &[]).items.is_empty(),
+                "literal reference unexpectedly injected a skill: {reference}"
+            );
+        }
+
+        assert_eq!(
+            catalog
+                .explicit_injections("$deepwork execute carefully", &[])
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .explicit_injections("mention $helper in prose", &[])
+                .items
+                .len(),
+            1
+        );
+        assert!(explicitly_invokes_review("$review inspect this"));
+        assert!(explicitly_invokes_review("/review inspect this"));
+        assert!(!explicitly_invokes_review("please discuss $review"));
+        assert!(!explicitly_invokes_review("`$review inspect this`"));
+    }
+}

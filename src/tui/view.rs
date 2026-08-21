@@ -4006,10 +4006,7 @@ fn git_diff_lines(diff: &str, width: u16) -> Vec<Line<'static>> {
 }
 
 fn final_message_separator_lines(elapsed_seconds: Option<u64>, width: u16) -> Vec<Line<'static>> {
-    let Some(elapsed) = elapsed_seconds
-        .filter(|seconds| *seconds > 60)
-        .map(format_elapsed)
-    else {
+    let Some(elapsed) = elapsed_seconds.map(format_elapsed) else {
         return vec![Line::from("─".repeat(usize::from(width))).dim()];
     };
 
@@ -5172,6 +5169,19 @@ mod tests {
             .iter()
             .map(plain_line)
             .collect()
+    }
+
+    #[test]
+    fn final_message_separator_includes_every_measured_duration() {
+        for (seconds, expected) in [(0, "0s"), (12, "12s"), (60, "1m 00s"), (61, "1m 01s")] {
+            let rendered = final_message_separator_lines(Some(seconds), 80);
+
+            assert_eq!(rendered.len(), 1);
+            assert!(
+                plain_line(&rendered[0]).contains(&format!("Worked for {expected}")),
+                "separator omitted duration for {seconds} seconds"
+            );
+        }
     }
 
     #[test]
