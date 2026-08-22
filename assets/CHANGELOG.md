@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.6] - 2026-08-22
+
+- upstream Codex introduced compaction improvements; these have been ported to bcodex
+
 ## [0.2.5] - 2026-08-21
 
 - added $deepwork

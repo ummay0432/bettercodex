@@ -506,12 +506,13 @@ impl SessionGroupStore {
 
 fn legacy_model_selection(role: SpecialistRole) -> ModelSelection {
     match role {
+        SpecialistRole::Acceptance | SpecialistRole::Worker => {
+            ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::XHigh)
+        }
         SpecialistRole::Manifest => {
             ModelSelection::from_identity("gpt-5.6-luna", ReasoningEffort::Max)
         }
-        SpecialistRole::Acceptance | SpecialistRole::Worker | SpecialistRole::Reviewer => {
-            role.model_selection()
-        }
+        SpecialistRole::Reviewer => role.model_selection(),
     }
 }
 
@@ -864,7 +865,7 @@ mod tests {
         malformed_model["active_session_id"] = serde_json::json!(malformed_model_main.to_string());
         malformed_model["children"][1]["model_selection"] = serde_json::json!({
             "model": "gpt-5.6-sol",
-            "reasoning_effort": "max"
+            "reasoning_effort": "high"
         });
         let malformed_model_bytes = serde_json::to_vec_pretty(&malformed_model)
             .unwrap_or_else(|error| panic!("malformed model fixture should serialize: {error}"));

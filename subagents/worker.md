@@ -2,7 +2,7 @@
 name: worker
 description: Implements and verifies the accepted task against its completion contract, constraints, and documentation handoff
 model: gpt-5.6-sol
-effort: xhigh
+effort: max
 ---
 
 # `$worker`

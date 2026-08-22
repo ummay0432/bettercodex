@@ -109,11 +109,9 @@ impl SpecialistRole {
 
     pub(crate) fn model_selection(self) -> ModelSelection {
         match self {
-            Self::Acceptance | Self::Worker => {
-                ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::XHigh)
+            Self::Acceptance | Self::Manifest | Self::Worker | Self::Reviewer => {
+                ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::Max)
             }
-            Self::Manifest => ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::XHigh),
-            Self::Reviewer => ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::Max),
         }
     }
 
@@ -1583,6 +1581,21 @@ mod tests {
                 .collect(),
         );
         (arguments, response)
+    }
+
+    #[test]
+    fn fixed_specialists_use_max_reasoning_effort() {
+        for role in [
+            SpecialistRole::Acceptance,
+            SpecialistRole::Manifest,
+            SpecialistRole::Worker,
+            SpecialistRole::Reviewer,
+        ] {
+            assert_eq!(
+                role.model_selection().reasoning_effort,
+                ReasoningEffort::Max
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,5 @@
 use crate::context::estimated_tokens;
 use crate::context::is_contextual_user_message;
-use crate::context::is_user_shell_command_message;
 use crate::truncation::approx_token_count;
 use crate::truncation::truncate_text;
 use serde_json::Value;
@@ -140,7 +139,8 @@ fn rewrite_output_for_context_window(item: &mut Value) -> Option<u64> {
 fn is_retained_for_remote_compaction_v2(item: &Value) -> bool {
     match item.get("type").and_then(Value::as_str) {
         Some("agent_message") => {
-            !is_agent_completion(item)
+            !is_descendant_agent_progress(item)
+                && !is_agent_completion(item)
                 && estimated_tokens(std::slice::from_ref(item)) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS
         }
         Some("message") => matches!(
@@ -155,11 +155,27 @@ fn should_keep_compacted_history_item(item: &Value) -> bool {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => {
             item.get("role").and_then(Value::as_str) == Some("user")
-                && (!is_contextual_user_message(item) || is_user_shell_command_message(item))
+                && !is_contextual_user_message(item)
         }
         Some("agent_message") => true,
         _ => false,
     }
+}
+
+fn is_descendant_agent_progress(item: &Value) -> bool {
+    let Some(author) = item.get("author").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(recipient) = item.get("recipient").and_then(Value::as_str) else {
+        return false;
+    };
+    author
+        .strip_prefix(recipient)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+        && item
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with("Message Type: MESSAGE\n"))
 }
 
 fn is_agent_completion(item: &Value) -> bool {
@@ -265,5 +281,255 @@ fn content_text_mut(item: &mut Value) -> Option<&mut String> {
     match item.get_mut("text")? {
         Value::String(text) => Some(text),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(role: &str, text: &str) -> Value {
+        json!({
+            "type": "message",
+            "role": role,
+            "content": [{"type": "input_text", "text": text}],
+        })
+    }
+
+    fn agent_message(author: &str, recipient: &str, text: &str) -> Value {
+        json!({
+            "type": "agent_message",
+            "author": author,
+            "recipient": recipient,
+            "content": [{"type": "input_text", "text": text}],
+        })
+    }
+
+    #[test]
+    fn remote_v2_retains_tasks_but_drops_descendant_progress_and_completions() {
+        let user = message("user", "real user request");
+        let parent_task = agent_message(
+            "/root",
+            "/root/worker",
+            "Message Type: TASK\nPayload:\ndelegated task",
+        );
+        let descendant_task = agent_message(
+            "/root/worker",
+            "/root/worker/grandchild",
+            "Message Type: TASK\nPayload:\nfollow-up task",
+        );
+        let peer_progress = agent_message(
+            "/peer",
+            "/root",
+            "Message Type: MESSAGE\nPayload:\npeer update",
+        );
+        let descendant_progress = agent_message(
+            "/root/child",
+            "/root",
+            "Message Type: MESSAGE\nPayload:\nchild progress",
+        );
+        let completion = agent_message(
+            "/root/child",
+            "/root",
+            "Message Type: FINAL_ANSWER\nPayload:\nchild completion",
+        );
+        let history = vec![
+            message("developer", "stale developer context"),
+            message(
+                "user",
+                "<environment_context>\nstale\n</environment_context>",
+            ),
+            user.clone(),
+            parent_task.clone(),
+            descendant_progress,
+            completion,
+            descendant_task.clone(),
+            peer_progress.clone(),
+        ];
+
+        assert_eq!(
+            retained_compacted_history(history),
+            vec![user, parent_task, descendant_task, peer_progress]
+        );
+    }
+
+    #[test]
+    fn remote_v2_drops_oversized_agent_messages() {
+        let oversized = agent_message("/root", "/root/worker", &"x".repeat(50_000));
+        assert!(retained_compacted_history(vec![oversized]).is_empty());
+    }
+
+    #[test]
+    fn remote_v2_drops_generated_user_shell_context() {
+        let shell = message(
+            "user",
+            "<user_shell_command>\n<command>\nprintf huge-output\n</command>\n<result>\nlarge output\n</result>\n</user_shell_command>",
+        );
+        let operator = message("user", "preserve the actual operator request");
+
+        assert_eq!(
+            retained_compacted_history(vec![shell, operator.clone()]),
+            vec![operator]
+        );
+    }
+
+    #[test]
+    fn retained_text_budget_keeps_images_and_newest_text() {
+        let image = json!({
+            "type": "input_image",
+            "image_url": "data:image/png;base64,AAAA",
+            "detail": "low",
+        });
+        let older = message("user", "older message");
+        let newest = json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "newest message"},
+                image,
+            ],
+        });
+
+        let retained = truncate_retained_messages(vec![older, newest], 2);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["content"][1], image);
+        assert!(
+            retained[0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("tokens truncated"))
+        );
+    }
+
+    #[test]
+    fn image_only_messages_cost_one_budget_unit_regardless_of_image_count() {
+        let image = json!({
+            "type": "input_image",
+            "image_url": "data:image/png;base64,AAAA",
+            "detail": "low",
+        });
+        let image_only = json!({
+            "type": "message",
+            "role": "user",
+            "content": [image.clone(), image],
+        });
+        let newest = message("user", "new");
+
+        assert_eq!(
+            truncate_retained_messages(vec![image_only.clone(), newest.clone()], 2),
+            vec![image_only, newest.clone()]
+        );
+        assert_eq!(
+            truncate_retained_messages(
+                vec![
+                    json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,BBBB",
+                            "detail": "low",
+                        }],
+                    }),
+                    newest.clone(),
+                ],
+                1,
+            ),
+            vec![newest]
+        );
+    }
+
+    #[test]
+    fn retained_text_truncation_preserves_metadata_images_and_later_text_shape() {
+        let item = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "user",
+            "phase": "commentary",
+            "internal_chat_message_metadata_passthrough": {"trace": "keep"},
+            "content": [
+                {"type": "input_text", "text": "abcdef"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAAA",
+                    "detail": "low",
+                },
+                {"type": "output_text", "text": "uvwxyz"},
+            ],
+        });
+
+        let retained = truncate_retained_messages(vec![item], 3);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["id"], "msg_1");
+        assert_eq!(retained[0]["phase"], "commentary");
+        assert_eq!(
+            retained[0]["internal_chat_message_metadata_passthrough"]["trace"],
+            "keep"
+        );
+        assert_eq!(retained[0]["content"][0]["text"], "abcdef");
+        assert_eq!(retained[0]["content"][1]["type"], "input_image");
+        assert!(
+            retained[0]["content"][2]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("tokens truncated"))
+        );
+    }
+
+    #[test]
+    fn tool_output_rewrite_preserves_the_call_pair_and_other_fields() {
+        let call = json!({
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "exec",
+            "arguments": "{}",
+        });
+        let mut history = vec![
+            message("user", "keep"),
+            call.clone(),
+            json!({
+                "type": "function_call_output",
+                "id": "fco_1",
+                "call_id": "call_1",
+                "name": "exec",
+                "namespace": "functions",
+                "output": "x".repeat(8_000),
+                "success": false,
+            }),
+        ];
+        let max_tokens = estimated_tokens(&history[..2]);
+
+        assert_eq!(trim_tool_outputs_to_fit(&mut history, max_tokens), 1);
+        assert_eq!(history[1], call);
+        assert_eq!(
+            history[2]["output"],
+            CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
+        );
+        assert_eq!(history[2]["id"], "fco_1");
+        assert_eq!(history[2]["name"], "exec");
+        assert_eq!(history[2]["namespace"], "functions");
+        assert_eq!(history[2]["success"], false);
+    }
+
+    #[test]
+    fn opaque_compaction_validation_preserves_the_exact_server_item() {
+        let compaction = json!({
+            "type": "compaction",
+            "id": "cmp_1",
+            "encrypted_content": "opaque",
+            "internal_chat_message_metadata_passthrough": {"trace": "keep"},
+        });
+        assert_eq!(
+            opaque_compaction_item(vec![compaction.clone()], 1, 3),
+            Ok(compaction)
+        );
+        assert!(opaque_compaction_item(Vec::new(), 0, 2).is_err());
+        assert!(
+            opaque_compaction_item(
+                vec![json!({"type": "compaction", "encrypted_content": ""})],
+                1,
+                1,
+            )
+            .is_err()
+        );
     }
 }

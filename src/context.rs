@@ -6,6 +6,7 @@ use crate::model::ModelSelection;
 use crate::rate_limits::RateLimitSnapshot;
 use crate::rate_limits::fill_missing_rate_limit_fields;
 use crate::repository;
+use crate::rollout::AutoCompactWindow;
 use crate::rollout::HistoryReplacement;
 use crate::rollout::LoadedRollout;
 use crate::rollout::Rollout;
@@ -49,6 +50,7 @@ const MAX_REPOSITORY_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 const MAX_MODEL_VISIBLE_CONTEXT_ITEM_TOKENS: u64 = 10_000;
 const MAX_CONTEXT_NOTICE_TEXT_TOKENS: usize = 9_900;
 const RESIZED_IMAGE_BYTES_ESTIMATE: u64 = 7_373;
+const ORIGINAL_IMAGE_MAX_PATCHES: u64 = 10_000;
 const SYNTHETIC_OUTPUT_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any command or tool that was running may have partially executed. Inspect the workspace before repeating an interrupted action.";
 const CRASH_NOTICE: &str =
@@ -248,12 +250,18 @@ impl ActiveTurnContext {
         }
         let user_indices = real_user_message_indices(history);
         let retained_inputs = user_indices.len().min(self.input_blocks.len());
+        let latest_agent_message = history.iter().rposition(|item| {
+            item.get("type").and_then(Value::as_str) == Some("agent_message")
+                && is_instruction_boundary(item)
+        });
         if retained_inputs > 0 {
-            return Some(user_indices[user_indices.len() - retained_inputs]);
+            let latest_retained_input = user_indices[user_indices.len() - 1];
+            return Some(latest_agent_message.map_or(latest_retained_input, |agent| {
+                latest_retained_input.max(agent)
+            }));
         }
-        history
-            .iter()
-            .rposition(is_initial_context_boundary)
+        latest_agent_message
+            .or_else(|| history.iter().rposition(is_initial_context_boundary))
             .or_else(|| history.iter().rposition(is_compaction_item))
     }
 
@@ -546,6 +554,10 @@ impl Conversation {
         self.rollout.identity()
     }
 
+    pub(crate) fn initial_auto_compact_window(&self) -> AutoCompactWindow {
+        self.rollout.initial_auto_compact_window()
+    }
+
     pub(crate) fn model_selection(&self) -> &ModelSelection {
         &self.model_selection
     }
@@ -710,6 +722,7 @@ impl Conversation {
         active_turn_context: &ActiveTurnContext,
         response_usage: Option<&TokenUsage>,
         rate_limits: &[RateLimitSnapshot],
+        auto_compact_window: AutoCompactWindow,
     ) -> Result<()> {
         let preferred_insertion = match initial_context_injection {
             InitialContextInjection::AfterCompaction => None,
@@ -723,29 +736,13 @@ impl Conversation {
             preferred_insertion,
         );
         active_turn_context.insert_into(&mut history, initial_context_injection);
-        let mut context_metrics = ContextMetrics::from_history(&history, &self.world_state);
-        let mut replacement_tokens = self.estimated_context_tokens(&context_metrics);
-        let compact_at_tokens = self.model_selection.auto_compact_token_limit();
-        // Codex keeps images attached to retained user messages outside its 64k retained-text
-        // budget. Preserve that quality behavior, then shed only the oldest retained images when
-        // their estimated GPT-5.6 token cost would otherwise cause an immediate compaction loop.
-        while replacement_tokens >= compact_at_tokens {
-            let tokens_to_remove = replacement_tokens
-                .saturating_sub(compact_at_tokens)
-                .saturating_add(1);
-            if trim_oldest_input_images(&mut history, tokens_to_remove) == 0 {
-                break;
-            }
-            context_metrics = ContextMetrics::from_history(&history, &self.world_state);
-            replacement_tokens = self.estimated_context_tokens(&context_metrics);
-        }
-        if replacement_tokens >= compact_at_tokens {
-            anyhow::bail!(
-                "remote compaction replacement is estimated at {replacement_tokens} tokens and did not restore headroom below bettercodex's {compact_at_tokens}-token automatic-compaction threshold; the conversation was left unchanged"
-            );
-        }
+        let context_metrics = ContextMetrics::from_history(&history, &self.world_state);
+        // Match Codex's remote-v2 replacement fidelity exactly: retained images stay attached even
+        // when their estimated cost leaves little immediate headroom. The opaque compaction item
+        // already summarizes discarded history; silently removing retained inputs here loses
+        // information that upstream keeps.
         self.rollout
-            .replace_compacted_history(&history, response_usage)?;
+            .replace_compacted_history(&history, response_usage, auto_compact_window)?;
         if let Some(response_usage) = response_usage {
             self.total_usage.add_assign(response_usage);
         }
@@ -990,14 +987,16 @@ impl Conversation {
     }
 
     fn estimated_context_tokens(&self, metrics: &ContextMetrics) -> u64 {
-        let [tools_tokens, system_prompt_tokens] = crate::api::estimated_harness_tokens_for(
+        let [_, system_prompt_tokens] = crate::api::estimated_harness_tokens_for(
             self.harness_profile,
             self.ask_user_question_enabled,
             self.specialist_coordination_enabled,
         );
+        // Match Codex's fallback/recomputed active-context estimate: base instructions plus
+        // history. Tool declarations remain visible in the UI breakdown, but reserving them again
+        // here would trigger compaction earlier than upstream before the next server usage sample.
         metrics
             .estimated_tokens
-            .saturating_add(tools_tokens)
             .saturating_add(system_prompt_tokens)
     }
 
@@ -1290,36 +1289,6 @@ fn real_user_message_indices(history: &[Value]) -> Vec<usize> {
         .collect()
 }
 
-fn trim_oldest_input_images(history: &mut Vec<Value>, minimum_tokens: u64) -> u64 {
-    let mut removed_tokens = 0_u64;
-    for item in history.iter_mut() {
-        if removed_tokens >= minimum_tokens || !is_user_message(item) {
-            continue;
-        }
-        let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        content.retain(|content_item| {
-            let is_image = content_item.get("type").and_then(Value::as_str) == Some("input_image");
-            if removed_tokens < minimum_tokens && is_image {
-                removed_tokens =
-                    removed_tokens.saturating_add(estimate_value_tokens(content_item).max(1));
-                false
-            } else {
-                true
-            }
-        });
-    }
-    history.retain(|item| {
-        !is_user_message(item)
-            || item
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|content| !content.is_empty())
-    });
-    removed_tokens
-}
-
 impl ContextMetrics {
     fn from_history(history: &[Value], world_state: &WorldState) -> Self {
         let mut metrics = Self::default();
@@ -1330,7 +1299,7 @@ impl ContextMetrics {
     fn extend(&mut self, history: &[Value], world_state: &WorldState) -> u64 {
         let mut additional_tokens = 0_u64;
         for item in history {
-            if is_instruction_boundary(item) {
+            if is_reasoning_instruction_boundary(item) {
                 self.encrypted_reasoning_before_last_instruction = self.encrypted_reasoning_tokens;
             }
             let explicit_operator = is_explicit_operator_user_message(item);
@@ -1569,6 +1538,14 @@ fn is_initial_context_boundary(item: &Value) -> bool {
     is_instruction_boundary(item) || is_assistant_commentary_message(item)
 }
 
+fn is_reasoning_instruction_boundary(item: &Value) -> bool {
+    // Match Codex's token-accounting boundary rather than its initial-context placement boundary:
+    // every structured agent message closes a reasoning segment, including FINAL_ANSWER messages
+    // that are intentionally skipped when deciding where fresh world state should be inserted.
+    (is_user_message(item) && !is_contextual_user_message(item))
+        || item.get("type").and_then(Value::as_str) == Some("agent_message")
+}
+
 fn is_instruction_boundary(item: &Value) -> bool {
     (is_user_message(item) && !is_contextual_user_message(item))
         || (item.get("type").and_then(Value::as_str) == Some("agent_message")
@@ -1668,13 +1645,14 @@ fn world_state_refresh_placement(history: &[Value]) -> WorldStateRefreshPlacemen
         user_index
     } else if cursor > 0 && is_compaction_item(&history[cursor - 1]) && !trailing_world_state {
         // Mid-turn compaction keeps its opaque item last. Refresh the active turn's world state
-        // above the last retained real user, or immediately above the compaction item when remote
-        // retention dropped every real user, so a tool-driven AGENTS.md change cannot demote the
-        // opaque continuation token from the model-trained terminal position.
+        // above the latest retained real user or non-final agent message, or immediately above the
+        // compaction item when remote retention dropped every instruction boundary, so a
+        // tool-driven AGENTS.md change cannot demote the opaque continuation token from the
+        // model-trained terminal position.
         let compaction_index = cursor - 1;
-        let Some(user_index) = history[..compaction_index]
+        let Some(input_index) = history[..compaction_index]
             .iter()
-            .rposition(|item| is_user_message(item) && !is_contextual_user_message(item))
+            .rposition(is_instruction_boundary)
         else {
             let mut insertion = compaction_index;
             while insertion > 0
@@ -1685,7 +1663,7 @@ fn world_state_refresh_placement(history: &[Value]) -> WorldStateRefreshPlacemen
             }
             return WorldStateRefreshPlacement::Exact(insertion);
         };
-        user_index
+        input_index
     } else {
         let Some(user_index) = cursor.checked_sub(1) else {
             return WorldStateRefreshPlacement::Append;
@@ -2162,20 +2140,20 @@ fn estimate_value_tokens(value: &Value) -> u64 {
 
 fn estimate_value_model_visible_bytes(value: &Value) -> u64 {
     let item_type = value.get("type").and_then(Value::as_str);
-    let mut serialized_size = SerializedSize::default();
-    let mut bytes =
-        serde_json::to_writer(&mut serialized_size, &ResponseItemForRequest::new(value))
-            .map(|()| serialized_size.bytes)
-            .unwrap_or_default();
     if matches!(
         item_type,
         Some("reasoning" | "compaction" | "compaction_summary" | "context_compaction")
     ) && let Some(encrypted) = value.get("encrypted_content").and_then(Value::as_str)
     {
-        bytes = bytes
-            .saturating_sub(encrypted.len() as u64)
-            .saturating_add(estimate_reasoning_bytes(encrypted.len()));
+        // Codex's history estimator treats opaque reasoning/compaction payloads as a dedicated
+        // server-visible token blob and does not add their JSON wrapper bytes.
+        return estimate_reasoning_bytes(encrypted.len());
     }
+    let mut serialized_size = SerializedSize::default();
+    let mut bytes =
+        serde_json::to_writer(&mut serialized_size, &ResponseItemForRequest::new(value))
+            .map(|()| serialized_size.bytes)
+            .unwrap_or_default();
     visit_model_content(
         value,
         &mut |content| match content.get("type").and_then(Value::as_str) {
@@ -2186,15 +2164,10 @@ fn estimate_value_model_visible_bytes(value: &Value) -> u64 {
                 let Some(payload) = base64_image_data_url_payload(image_url) else {
                     return;
                 };
-                let replacement = if matches!(
+                let replacement = estimated_image_payload_replacement_bytes(
+                    image_url,
                     content.get("detail").and_then(Value::as_str),
-                    None | Some("auto") | Some("original")
-                ) {
-                    estimate_full_resolution_image_bytes(image_url)
-                        .unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE)
-                } else {
-                    RESIZED_IMAGE_BYTES_ESTIMATE
-                };
+                );
                 bytes = bytes
                     .saturating_sub(payload.len() as u64)
                     .saturating_add(replacement);
@@ -2259,6 +2232,14 @@ fn base64_image_data_url_payload(url: &str) -> Option<&str> {
     has_base64_marker.then_some(payload)
 }
 
+fn estimated_image_payload_replacement_bytes(image_url: &str, detail: Option<&str>) -> u64 {
+    if detail == Some("original") {
+        estimate_full_resolution_image_bytes(image_url).unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE)
+    } else {
+        RESIZED_IMAGE_BYTES_ESTIMATE
+    }
+}
+
 fn estimate_full_resolution_image_bytes(image_url: &str) -> Option<u64> {
     let encoded = base64_image_data_url_payload(image_url)?;
     let decoder = base64::read::DecoderReader::new(
@@ -2268,6 +2249,7 @@ fn estimate_full_resolution_image_bytes(image_url: &str) -> Option<u64> {
     read_image_dimensions(decoder).map(|(width, height)| {
         u64::from(width.div_ceil(32))
             .saturating_mul(u64::from(height.div_ceil(32)))
+            .min(ORIGINAL_IMAGE_MAX_PATCHES)
             .saturating_mul(4)
     })
 }
@@ -2760,6 +2742,7 @@ fn synthetic_output_with_body(call: &CallDescriptor, output: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     fn deepwork_skill_context(marked: bool) -> Value {
         let mut item = message(
@@ -2834,5 +2817,261 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn world_state_uses_the_latest_retained_user_or_agent_boundary() {
+        let first_user = message("user", "start this".to_string());
+        let latest_user = message("user", "steer this".to_string());
+        let agent = json!({
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/worker",
+            "content": [{"type": "input_text", "text": "Message Type: TASK\nPayload:\nwork"}],
+        });
+        let summary = json!({
+            "type": "compaction",
+            "encrypted_content": "opaque",
+        });
+        let mut active = ActiveTurnContext::default();
+        active.record_real_user_input(Vec::new());
+        active.record_real_user_input(Vec::new());
+
+        assert_eq!(
+            active.preferred_world_state_insertion(&[
+                first_user.clone(),
+                latest_user.clone(),
+                summary.clone(),
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            active.preferred_world_state_insertion(&[first_user, latest_user, agent, summary]),
+            Some(2)
+        );
+    }
+
+    fn synthetic_png_data_url(width: u32, height: u32) -> String {
+        let mut bytes = vec![0_u8; 24];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!("data:image/png;base64,{encoded}")
+    }
+
+    #[test]
+    fn opaque_reasoning_estimates_exclude_json_wrapper_bytes_like_upstream() {
+        let encrypted = "x".repeat(4_000);
+        let expected_bytes = estimate_reasoning_bytes(encrypted.len());
+        for item_type in [
+            "reasoning",
+            "compaction",
+            "compaction_summary",
+            "context_compaction",
+        ] {
+            let item = json!({
+                "type": item_type,
+                "id": "opaque_1",
+                "encrypted_content": encrypted,
+                "internal_chat_message_metadata_passthrough": {"trace": "ignored"},
+            });
+            assert_eq!(estimate_value_model_visible_bytes(&item), expected_bytes);
+            assert_eq!(estimate_value_tokens(&item), expected_bytes.div_ceil(4));
+        }
+    }
+
+    #[test]
+    fn final_agent_messages_bound_omitted_reasoning_accounting_like_upstream() {
+        let world_state = WorldState {
+            environment: message("developer", "environment".to_string()),
+            repository_context: None,
+            instruction_source_paths: Vec::new(),
+            skills_catalogue: None,
+            skills: SkillCatalog::default(),
+        };
+        let before_boundary = json!({
+            "type": "reasoning",
+            "encrypted_content": "x".repeat(4_000),
+        });
+        let final_agent = json!({
+            "type": "agent_message",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": [{
+                "type": "input_text",
+                "text": "Message Type: FINAL_ANSWER\nPayload:\ndone",
+            }],
+        });
+        let after_boundary = json!({
+            "type": "reasoning",
+            "encrypted_content": "y".repeat(5_000),
+        });
+        let metrics = ContextMetrics::from_history(
+            &[
+                before_boundary.clone(),
+                final_agent.clone(),
+                after_boundary.clone(),
+            ],
+            &world_state,
+        );
+
+        assert!(!is_instruction_boundary(&final_agent));
+        assert!(is_reasoning_instruction_boundary(&final_agent));
+        assert_eq!(
+            metrics.encrypted_reasoning_before_last_instruction,
+            estimate_value_tokens(&before_boundary)
+        );
+        assert_eq!(
+            metrics.encrypted_reasoning_tokens,
+            estimate_value_tokens(&before_boundary)
+                .saturating_add(estimate_value_tokens(&after_boundary))
+        );
+    }
+
+    #[test]
+    fn image_estimates_match_upstream_detail_policy_and_original_patch_cap() {
+        let oversized = synthetic_png_data_url(6_400, 6_400);
+
+        assert_eq!(
+            estimated_image_payload_replacement_bytes(&oversized, None),
+            RESIZED_IMAGE_BYTES_ESTIMATE
+        );
+        assert_eq!(
+            estimated_image_payload_replacement_bytes(&oversized, Some("auto")),
+            RESIZED_IMAGE_BYTES_ESTIMATE
+        );
+        assert_eq!(
+            estimated_image_payload_replacement_bytes(&oversized, Some("high")),
+            RESIZED_IMAGE_BYTES_ESTIMATE
+        );
+        assert_eq!(
+            estimated_image_payload_replacement_bytes(&oversized, Some("original")),
+            ORIGINAL_IMAGE_MAX_PATCHES.saturating_mul(4)
+        );
+        assert_eq!(
+            estimated_image_payload_replacement_bytes(
+                &synthetic_png_data_url(32, 32),
+                Some("original")
+            ),
+            4
+        );
+    }
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn create(name: &str) -> Result<Self> {
+            let directory =
+                std::env::temp_dir().join(format!("bettercodex-{name}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory)?;
+            Ok(Self(directory))
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn post_compaction_world_state_refresh_keeps_a_newer_agent_boundary() {
+        let history = vec![
+            message("user", "delegate this".to_string()),
+            json!({
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [{"type": "input_text", "text": "Message Type: TASK\nPayload:\nwork"}],
+            }),
+            json!({
+                "type": "compaction",
+                "encrypted_content": "opaque",
+            }),
+        ];
+
+        assert!(matches!(
+            world_state_refresh_placement(&history),
+            WorldStateRefreshPlacement::BeforeTrailingInput(1)
+        ));
+    }
+
+    #[test]
+    fn fallback_active_context_estimate_excludes_tool_declarations_like_upstream() -> Result<()> {
+        let root = TemporaryDirectory::create("fallback-context-estimate")?;
+        let cwd = root.0.join("repo");
+        std::fs::create_dir_all(&cwd)?;
+        let selection = ModelSelection::default();
+        let rollout = Rollout::create_in_with_selection(&root.0, &cwd, &selection)?;
+        let world_state = WorldState::load(&cwd)?;
+        let conversation = Conversation::from_world_state(world_state, rollout, selection)?;
+        let [tool_tokens, instruction_tokens] =
+            crate::api::estimated_harness_tokens_for(HarnessProfile::Main, false, false);
+
+        assert!(tool_tokens > 0);
+        assert_eq!(
+            conversation.active_context_tokens(),
+            conversation
+                .context_metrics
+                .estimated_tokens
+                .saturating_add(instruction_tokens)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_install_preserves_every_retained_image() -> Result<()> {
+        let root = TemporaryDirectory::create("compaction-images")?;
+        let cwd = root.0.join("repo");
+        std::fs::create_dir_all(&cwd)?;
+        let selection = ModelSelection::default();
+        let rollout = Rollout::create_in_with_selection(&root.0, &cwd, &selection)?;
+        let auto_compact_window = rollout.initial_auto_compact_window().advance();
+        let world_state = WorldState::load(&cwd)?;
+        let mut conversation = Conversation::from_world_state(world_state, rollout, selection)?;
+        let mut content = vec![json!({
+            "type": "input_text",
+            "text": "inspect every retained image",
+        })];
+        content.extend((0..150).map(|_| {
+            json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AAAA",
+                "detail": "low",
+            })
+        }));
+        let user = json!({
+            "type": "message",
+            "role": "user",
+            "content": content,
+        });
+        let summary = json!({
+            "type": "compaction",
+            "encrypted_content": "opaque",
+        });
+
+        conversation.replace_compacted(
+            vec![user, summary],
+            InitialContextInjection::BeforeLastUserMessage,
+            &ActiveTurnContext::default(),
+            None,
+            &[],
+            auto_compact_window,
+        )?;
+
+        let retained_images = conversation
+            .history
+            .iter()
+            .flat_map(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|content| content.get("type").and_then(Value::as_str) == Some("input_image"))
+            .count();
+        assert_eq!(retained_images, 150);
+        Ok(())
     }
 }

@@ -431,10 +431,11 @@ impl Agent {
         let mut conversation = Conversation::create_with_selection(&cwd, model_selection)?;
         conversation.set_service_tier(service_tier)?;
         let identity = conversation.identity().clone();
+        let auto_compact_window = conversation.initial_auto_compact_window();
         let api = ApiClient::new(
             auth,
             &identity,
-            0,
+            auto_compact_window,
             conversation.model_selection().clone(),
             conversation.service_tier(),
         )?;
@@ -469,10 +470,10 @@ impl Agent {
         let mut rollout =
             Rollout::create_with_selection(&self.cwd, self.conversation.model_selection())?;
         let identity = rollout.identity().clone();
-        let compaction_count = self.api.compaction_count();
+        let auto_compact_window = self.api.auto_compact_window();
         rollout.record_fork(
             self.session_id(),
-            compaction_count,
+            auto_compact_window,
             self.conversation.prior_usage_for_fork(),
         )?;
         let transcript_checkpoint = Some(transcript.len());
@@ -481,7 +482,7 @@ impl Agent {
         let api = ApiClient::new(
             auth,
             &identity,
-            compaction_count,
+            auto_compact_window,
             conversation.model_selection().clone(),
             conversation.service_tier(),
         )?;
@@ -502,7 +503,7 @@ impl Agent {
     fn from_loaded_rollout(mut loaded: LoadedRollout) -> Result<Self> {
         let cwd = canonical_directory(&loaded.metadata.cwd)?;
         let identity = loaded.metadata.identity.clone();
-        let compaction_count = loaded.compaction_count;
+        let auto_compact_window = loaded.auto_compact_window;
         let resumed_transcript = std::mem::take(&mut loaded.transcript);
         let transcript_checkpoint = loaded.transcript_checkpoint;
         let forked_from = loaded.forked_from.clone();
@@ -511,7 +512,7 @@ impl Agent {
         let api = ApiClient::new(
             auth,
             &identity,
-            compaction_count,
+            auto_compact_window,
             conversation.model_selection().clone(),
             conversation.service_tier(),
         )?;
@@ -1320,12 +1321,14 @@ impl Agent {
                 return Err(error.into());
             }
         };
+        let auto_compact_window = self.api.next_auto_compact_window();
         let replacement = self.conversation.replace_compacted(
             items,
             initial_context_injection,
             active_turn_context,
             usage.as_ref(),
             &rate_limits,
+            auto_compact_window,
         );
         if let Err(error) = replacement {
             // The server has completed a response that was not installed. Drop its
@@ -1336,7 +1339,7 @@ impl Agent {
                 .record_uninstalled_response(usage, rate_limits)?;
             return Err(error);
         }
-        self.api.commit_compaction();
+        self.api.commit_compaction(auto_compact_window);
         self.emit_context(events);
         emit(events, AgentEvent::CompactionCompleted);
         Ok(true)

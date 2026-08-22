@@ -62,6 +62,98 @@ pub(crate) struct SessionIdentity {
     pub(crate) thread_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutoCompactWindow {
+    pub(crate) window_number: u64,
+    pub(crate) first_window_id: Uuid,
+    pub(crate) previous_window_id: Option<Uuid>,
+    pub(crate) window_id: Uuid,
+}
+
+impl AutoCompactWindow {
+    pub(crate) fn new_initial() -> Self {
+        Self::from_initial_id(Uuid::now_v7())
+    }
+
+    fn from_initial_id(window_id: Uuid) -> Self {
+        Self {
+            window_number: 0,
+            first_window_id: window_id,
+            previous_window_id: None,
+            window_id,
+        }
+    }
+
+    pub(crate) fn advance(self) -> Self {
+        Self {
+            window_number: self.window_number.saturating_add(1),
+            first_window_id: self.first_window_id,
+            previous_window_id: Some(self.window_id),
+            window_id: Uuid::now_v7(),
+        }
+    }
+
+    fn legacy_at_window_number(self, window_number: u64) -> Self {
+        Self {
+            window_number,
+            ..self
+        }
+    }
+}
+
+fn parse_uuid_v7(value: &str) -> Option<Uuid> {
+    Uuid::parse_str(value)
+        .ok()
+        .filter(|uuid| uuid.get_version_num() == 7)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedAutoCompactWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_id: Option<String>,
+}
+
+impl PersistedAutoCompactWindow {
+    fn from_window(window: AutoCompactWindow) -> Self {
+        Self {
+            window_number: Some(window.window_number),
+            first_window_id: Some(window.first_window_id.to_string()),
+            previous_window_id: window.previous_window_id.map(|id| id.to_string()),
+            window_id: Some(window.window_id.to_string()),
+        }
+    }
+
+    fn into_window(self, fallback: AutoCompactWindow) -> Option<AutoCompactWindow> {
+        let window_number = self.window_number?;
+        let window_id = self
+            .window_id
+            .as_deref()
+            .and_then(parse_uuid_v7)
+            .unwrap_or(fallback.window_id);
+        Some(AutoCompactWindow {
+            window_number,
+            first_window_id: self
+                .first_window_id
+                .as_deref()
+                .and_then(parse_uuid_v7)
+                .unwrap_or(window_id),
+            previous_window_id: self.previous_window_id.as_deref().and_then(parse_uuid_v7),
+            window_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionContextWindow {
+    pub(crate) window_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SessionMetadata {
     pub(crate) version: u32,
@@ -71,6 +163,8 @@ pub(crate) struct SessionMetadata {
     pub(crate) created_at_unix_ms: u64,
     pub(crate) model: String,
     pub(crate) reasoning_effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_window: Option<SessionContextWindow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -487,7 +581,7 @@ pub(crate) struct LoadedRollout {
     pub(crate) usage_history_estimate: Option<u64>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) context_window_full: bool,
-    pub(crate) compaction_count: u64,
+    pub(crate) auto_compact_window: AutoCompactWindow,
     pub(crate) model_selection: ModelSelection,
     pub(crate) service_tier: ServiceTier,
     pub(crate) unfinished_turn: Option<String>,
@@ -561,6 +655,8 @@ enum RolloutRecordData<Items = Vec<Value>> {
         session_id: String,
         compaction_count: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_compact_window: Option<PersistedAutoCompactWindow>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         prior_usage: Option<TokenUsage>,
     },
     TranscriptSnapshot {
@@ -587,6 +683,8 @@ enum RolloutRecordData<Items = Vec<Value>> {
         items: Items,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_usage: Option<TokenUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_compact_window: Option<PersistedAutoCompactWindow>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcomes: Option<Vec<SessionTranscriptToolOutcome>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -968,7 +1066,6 @@ impl ToolLifecycleJournal {
         })
     }
 
-
     pub(crate) async fn record_finished_async(
         &self,
         call_id: &str,
@@ -993,7 +1090,6 @@ impl Rollout {
         Self::create_in_with_selection(&state_root()?, cwd, selection)
     }
 
-
     pub(crate) fn create_in_with_selection(
         root: &Path,
         cwd: &Path,
@@ -1009,6 +1105,7 @@ impl Rollout {
             session_id: uuid::Uuid::new_v4().to_string(),
             thread_id: uuid::Uuid::new_v4().to_string(),
         };
+        let auto_compact_window = AutoCompactWindow::new_initial();
         let metadata = SessionMetadata {
             version: ROLLOUT_VERSION,
             identity,
@@ -1016,6 +1113,9 @@ impl Rollout {
             created_at_unix_ms: unix_timestamp_millis(),
             model: selection.model.clone(),
             reasoning_effort: selection.reasoning_effort.to_string(),
+            context_window: Some(SessionContextWindow {
+                window_id: auto_compact_window.window_id.to_string(),
+            }),
         };
         let path = sessions.join(format!("{}.jsonl", metadata.identity.session_id));
         let file = lock_rollout(open_private_append(&path, true)?, &path)?;
@@ -1077,6 +1177,15 @@ impl Rollout {
         &self.metadata.identity
     }
 
+    pub(crate) fn initial_auto_compact_window(&self) -> AutoCompactWindow {
+        self.metadata
+            .context_window
+            .as_ref()
+            .and_then(|window| parse_uuid_v7(&window.window_id))
+            .map(AutoCompactWindow::from_initial_id)
+            .unwrap_or_else(AutoCompactWindow::new_initial)
+    }
+
     pub(crate) fn append_history(&mut self, items: &[Value]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -1120,16 +1229,16 @@ impl Rollout {
         })
     }
 
-
     pub(crate) fn record_fork(
         &mut self,
         source_session_id: &str,
-        compaction_count: u64,
+        auto_compact_window: AutoCompactWindow,
         prior_usage: Option<TokenUsage>,
     ) -> Result<()> {
         self.write_record(&RolloutRecord::ForkedFrom {
             session_id: source_session_id.to_string(),
-            compaction_count,
+            compaction_count: auto_compact_window.window_number,
+            auto_compact_window: Some(PersistedAutoCompactWindow::from_window(auto_compact_window)),
             prior_usage,
         })
     }
@@ -1182,6 +1291,7 @@ impl Rollout {
             reason,
             items,
             response_usage: None,
+            auto_compact_window: None,
             outcomes: (!outcomes.is_empty()).then_some(outcomes),
             recovery: None,
         };
@@ -1199,6 +1309,7 @@ impl Rollout {
             reason: HistoryReplacement::Normalization,
             items,
             response_usage: None,
+            auto_compact_window: None,
             outcomes: (!outcomes.is_empty()).then_some(outcomes),
             recovery: Some(TurnRecoveryCheckpoint {
                 turn_id: turn_id.to_string(),
@@ -1212,11 +1323,13 @@ impl Rollout {
         &mut self,
         items: &[Value],
         response_usage: Option<&TokenUsage>,
+        auto_compact_window: AutoCompactWindow,
     ) -> Result<()> {
         let record = BorrowedRolloutRecord::HistoryReplace {
             reason: HistoryReplacement::Compaction,
             items,
             response_usage: response_usage.cloned(),
+            auto_compact_window: Some(PersistedAutoCompactWindow::from_window(auto_compact_window)),
             outcomes: None,
             recovery: None,
         };
@@ -1319,9 +1432,8 @@ fn append_rollout_record(
         shared.file.clear_poison();
     }
     let record_start = file.metadata()?.len();
-    let append_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        append(&mut file)
-    }));
+    let append_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| append(&mut file)));
     let append_result = match append_result {
         Ok(result) => result,
         Err(panic) => {
@@ -1382,6 +1494,8 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     let mut server_reasoning_included = false;
     let mut context_window_full = false;
     let mut compaction_count = 0_u64;
+    let mut initial_auto_compact_window = None;
+    let mut persisted_auto_compact_window = None;
     let mut model_selection = None;
     let mut service_tier = ServiceTier::default();
     let mut unfinished_turn = None;
@@ -1456,6 +1570,11 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                         format!("invalid session header at {}:{line_number}", path.display())
                     })?;
                 model_selection = Some(initial_selection);
+                initial_auto_compact_window = session_metadata
+                    .context_window
+                    .as_ref()
+                    .and_then(|window| parse_uuid_v7(&window.window_id))
+                    .map(AutoCompactWindow::from_initial_id);
                 if metadata.replace(session_metadata).is_some() {
                     return Err(anyhow!(
                         "{} contains multiple session headers",
@@ -1466,11 +1585,17 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
             RolloutRecord::ForkedFrom {
                 session_id,
                 compaction_count: source_compaction_count,
+                auto_compact_window,
                 prior_usage,
             } => {
                 forked_session = true;
                 forked_from = Some(session_id);
                 compaction_count = source_compaction_count;
+                if let Some(window) =
+                    auto_compact_window.filter(|window| window.window_number.is_some())
+                {
+                    persisted_auto_compact_window = Some(window);
+                }
                 if let Some(prior_usage) = prior_usage {
                     total_usage.add_assign(&prior_usage);
                 }
@@ -1550,6 +1675,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 reason,
                 items,
                 response_usage,
+                auto_compact_window,
                 outcomes,
                 recovery,
             } => {
@@ -1623,6 +1749,14 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
                 }
                 if reason == HistoryReplacement::Compaction {
                     compaction_count = compaction_count.saturating_add(1);
+                    // Match Codex's reverse reconstruction: the newest compaction carrying an
+                    // explicit generation is authoritative even when individual UUID strings are
+                    // absent or malformed. UUID fields are reconstructed independently below.
+                    if let Some(window) =
+                        auto_compact_window.filter(|window| window.window_number.is_some())
+                    {
+                        persisted_auto_compact_window = Some(window);
+                    }
                 }
                 // Normalization records written before transcript outcomes existed still define
                 // the latest malformed call's presentation. Repair that exact boundary now so a
@@ -1860,6 +1994,18 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
     apply_tool_recoveries(&mut transcript, &tool_recoveries);
     apply_normalized_aborts(&mut transcript, &normalized_aborted_calls);
 
+    let auto_compact_window = persisted_auto_compact_window
+        .and_then(|window| window.into_window(AutoCompactWindow::new_initial()))
+        .unwrap_or_else(|| {
+            if compaction_count == 0 {
+                initial_auto_compact_window.unwrap_or_else(AutoCompactWindow::new_initial)
+            } else {
+                // Match Codex's tolerant legacy reconstruction: once a compaction lacks an
+                // explicit generation, preserve the inferred count but do not pretend the
+                // session's initial ID is still the active compacted window.
+                AutoCompactWindow::new_initial().legacy_at_window_number(compaction_count)
+            }
+        });
     let rollout = Rollout {
         file: Arc::new(SharedRolloutFile {
             file: Mutex::new(file),
@@ -1878,7 +2024,7 @@ fn load_rollout(path: PathBuf) -> Result<LoadedRollout> {
         usage_history_estimate,
         server_reasoning_included,
         context_window_full,
-        compaction_count,
+        auto_compact_window,
         model_selection,
         service_tier,
         unfinished_turn,
@@ -3556,3 +3702,223 @@ fn lock_rollout(file: File, path: &Path) -> Result<LockedRolloutFile> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn create(name: &str) -> Result<Self> {
+            let directory =
+                std::env::temp_dir().join(format!("bettercodex-{name}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory)?;
+            Ok(Self(directory))
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn auto_compact_window_advances_v7_lineage() {
+        let initial = AutoCompactWindow::new_initial();
+        let next = initial.advance();
+
+        assert_eq!(initial.window_number, 0);
+        assert_eq!(initial.first_window_id, initial.window_id);
+        assert_eq!(initial.previous_window_id, None);
+        assert_eq!(initial.window_id.get_version_num(), 7);
+        assert_eq!(next.window_number, 1);
+        assert_eq!(next.first_window_id, initial.window_id);
+        assert_eq!(next.previous_window_id, Some(initial.window_id));
+        assert_eq!(next.window_id.get_version_num(), 7);
+        assert_ne!(next.window_id, initial.window_id);
+    }
+
+    #[test]
+    fn legacy_compaction_records_default_missing_window_identity() -> Result<()> {
+        let record = serde_json::from_value::<RolloutRecord>(json!({
+            "type": "history_replace",
+            "reason": "compaction",
+            "items": [],
+        }))?;
+
+        assert!(matches!(
+            record,
+            RolloutRecord::HistoryReplace {
+                auto_compact_window: None,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_window_ids_are_reconstructed_independently() -> Result<()> {
+        let valid_window_id = Uuid::now_v7();
+        let record = serde_json::from_value::<RolloutRecord>(json!({
+            "type": "history_replace",
+            "reason": "compaction",
+            "items": [],
+            "auto_compact_window": {
+                "window_number": 1,
+                "first_window_id": "not-a-uuid",
+                "previous_window_id": Uuid::new_v4().to_string(),
+                "window_id": valid_window_id.to_string()
+            }
+        }))?;
+
+        let RolloutRecord::HistoryReplace {
+            auto_compact_window: Some(window),
+            ..
+        } = record
+        else {
+            panic!("expected a history replacement with persisted window metadata");
+        };
+        let reconstructed = window
+            .into_window(AutoCompactWindow::new_initial())
+            .unwrap_or_else(|| panic!("an explicit window number should reconstruct"));
+        assert_eq!(reconstructed.window_number, 1);
+        assert_eq!(reconstructed.window_id, valid_window_id);
+        assert_eq!(reconstructed.first_window_id, valid_window_id);
+        assert_eq!(reconstructed.previous_window_id, None);
+
+        let valid_first_window_id = Uuid::now_v7();
+        let valid_previous_window_id = Uuid::now_v7();
+        let fallback = AutoCompactWindow::new_initial();
+        let reconstructed = PersistedAutoCompactWindow {
+            window_number: Some(7),
+            first_window_id: Some(valid_first_window_id.to_string()),
+            previous_window_id: Some(valid_previous_window_id.to_string()),
+            window_id: Some("invalid-current-window".to_string()),
+        }
+        .into_window(fallback)
+        .unwrap_or_else(|| panic!("an explicit window number should reconstruct"));
+        assert_eq!(reconstructed.window_number, 7);
+        assert_eq!(reconstructed.first_window_id, valid_first_window_id);
+        assert_eq!(
+            reconstructed.previous_window_id,
+            Some(valid_previous_window_id)
+        );
+        assert_eq!(reconstructed.window_id, fallback.window_id);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_compaction_keeps_generation_without_reusing_the_initial_window_id() -> Result<()> {
+        let root = TemporaryDirectory::create("legacy-compaction-window")?;
+        let cwd = root.0.join("repo");
+        std::fs::create_dir_all(&cwd)?;
+        let selection = ModelSelection::default();
+        let rollout = Rollout::create_in_with_selection(&root.0, &cwd, &selection)?;
+        let session_id = Uuid::parse_str(&rollout.identity().session_id)?;
+        let initial = rollout.initial_auto_compact_window();
+        rollout.write_record(&RolloutRecord::HistoryReplace {
+            reason: HistoryReplacement::Compaction,
+            items: Vec::new(),
+            response_usage: None,
+            auto_compact_window: None,
+            outcomes: None,
+            recovery: None,
+        })?;
+        drop(rollout);
+
+        let loaded = Rollout::resume_in(&root.0, ResumeSelector::Id(session_id), &cwd)?;
+        assert_eq!(loaded.auto_compact_window.window_number, 1);
+        assert_eq!(
+            loaded.auto_compact_window.first_window_id,
+            loaded.auto_compact_window.window_id
+        );
+        assert_eq!(loaded.auto_compact_window.previous_window_id, None);
+        assert_ne!(loaded.auto_compact_window.window_id, initial.window_id);
+        drop(loaded);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_compaction_generation_is_authoritative_on_resume() -> Result<()> {
+        let root = TemporaryDirectory::create("explicit-compaction-generation")?;
+        let cwd = root.0.join("repo");
+        std::fs::create_dir_all(&cwd)?;
+        let selection = ModelSelection::default();
+        let rollout = Rollout::create_in_with_selection(&root.0, &cwd, &selection)?;
+        let session_id = Uuid::parse_str(&rollout.identity().session_id)?;
+        let explicit = AutoCompactWindow {
+            window_number: 42,
+            first_window_id: Uuid::now_v7(),
+            previous_window_id: Some(Uuid::now_v7()),
+            window_id: Uuid::now_v7(),
+        };
+        rollout.write_record(&RolloutRecord::HistoryReplace {
+            reason: HistoryReplacement::Compaction,
+            items: Vec::new(),
+            response_usage: None,
+            auto_compact_window: Some(PersistedAutoCompactWindow::from_window(explicit)),
+            outcomes: None,
+            recovery: None,
+        })?;
+        drop(rollout);
+
+        let loaded = Rollout::resume_in(&root.0, ResumeSelector::Id(session_id), &cwd)?;
+        assert_eq!(loaded.auto_compact_window, explicit);
+        drop(loaded);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_window_identity_persists_across_resume() -> Result<()> {
+        let root = TemporaryDirectory::create("compaction-window-resume")?;
+        let cwd = root.0.join("repo");
+        std::fs::create_dir_all(&cwd)?;
+        let selection = ModelSelection::default();
+        let mut rollout = Rollout::create_in_with_selection(&root.0, &cwd, &selection)?;
+        let session_id = Uuid::parse_str(&rollout.identity().session_id)?;
+        let initial = rollout.initial_auto_compact_window();
+        let next = initial.advance();
+        rollout.replace_compacted_history(
+            &[json!({
+                "type": "compaction",
+                "encrypted_content": "opaque",
+            })],
+            None,
+            next,
+        )?;
+        drop(rollout);
+
+        let loaded = Rollout::resume_in(&root.0, ResumeSelector::Id(session_id), &cwd)?;
+        assert_eq!(loaded.auto_compact_window.window_number, 1);
+        assert_eq!(loaded.auto_compact_window, next);
+        drop(loaded);
+        Ok(())
+    }
+
+    #[test]
+    fn full_history_root_forks_preserve_explicit_compaction_window_lineage() -> Result<()> {
+        let root = TemporaryDirectory::create("fork-window-lineage")?;
+        let cwd = root.0.join("repo");
+        std::fs::create_dir_all(&cwd)?;
+        let selection = ModelSelection::default();
+        let mut rollout = Rollout::create_in_with_selection(&root.0, &cwd, &selection)?;
+        let session_id = Uuid::parse_str(&rollout.identity().session_id)?;
+        let child_initial = rollout.initial_auto_compact_window();
+        let inherited = AutoCompactWindow {
+            window_number: 7,
+            first_window_id: Uuid::now_v7(),
+            previous_window_id: Some(Uuid::now_v7()),
+            window_id: Uuid::now_v7(),
+        };
+        rollout.record_fork("source-session", inherited, None)?;
+        drop(rollout);
+
+        let loaded = Rollout::resume_in(&root.0, ResumeSelector::Id(session_id), &cwd)?;
+        assert_eq!(loaded.auto_compact_window, inherited);
+        assert_ne!(loaded.auto_compact_window, child_initial);
+        drop(loaded);
+        Ok(())
+    }
+}

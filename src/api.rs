@@ -16,6 +16,7 @@ use crate::http_client::bounded_error_body;
 use crate::model::ModelSelection;
 use crate::model::ReasoningEffort;
 use crate::model::SharedModelSelection;
+use crate::rollout::AutoCompactWindow;
 use crate::rollout::SessionIdentity;
 use crate::service_tier::ServiceTier;
 use crate::time::unix_timestamp_millis;
@@ -305,7 +306,7 @@ pub(crate) struct ApiClient {
     turn_id: String,
     turn_started_at_unix_ms: u64,
     turn_state: Option<String>,
-    window: u64,
+    auto_compact_window: AutoCompactWindow,
     model_selection: SharedModelSelection,
     service_tier: ServiceTier,
     harness_profile: HarnessProfile,
@@ -775,14 +776,14 @@ impl ApiClient {
     pub(crate) fn new(
         auth: Auth,
         identity: &SessionIdentity,
-        compaction_count: u64,
+        auto_compact_window: AutoCompactWindow,
         model_selection: ModelSelection,
         service_tier: ServiceTier,
     ) -> anyhow::Result<Self> {
         Self::new_with_base_url(
             auth,
             identity,
-            compaction_count,
+            auto_compact_window,
             model_selection,
             service_tier,
             BASE_URL.to_string(),
@@ -792,7 +793,7 @@ impl ApiClient {
     pub(crate) fn new_with_base_url(
         auth: Auth,
         identity: &SessionIdentity,
-        compaction_count: u64,
+        auto_compact_window: AutoCompactWindow,
         model_selection: ModelSelection,
         service_tier: ServiceTier,
         base_url: String,
@@ -820,7 +821,7 @@ impl ApiClient {
             turn_id: uuid::Uuid::new_v4().to_string(),
             turn_started_at_unix_ms: unix_timestamp_millis(),
             turn_state: None,
-            window: compaction_count,
+            auto_compact_window,
             model_selection: SharedModelSelection::new(model_selection),
             service_tier,
             harness_profile: HarnessProfile::Main,
@@ -852,7 +853,7 @@ impl ApiClient {
             turn_id: uuid::Uuid::new_v4().to_string(),
             turn_started_at_unix_ms: unix_timestamp_millis(),
             turn_state: None,
-            window: self.window,
+            auto_compact_window: self.auto_compact_window,
             model_selection: self.model_selection.clone(),
             service_tier: self.service_tier,
             harness_profile: self.harness_profile,
@@ -914,8 +915,12 @@ impl ApiClient {
         &self.turn_id
     }
 
-    pub(crate) fn compaction_count(&self) -> u64 {
-        self.window
+    pub(crate) fn auto_compact_window(&self) -> AutoCompactWindow {
+        self.auto_compact_window
+    }
+
+    pub(crate) fn next_auto_compact_window(&self) -> AutoCompactWindow {
+        self.auto_compact_window.advance()
     }
 
     pub(crate) fn set_service_tier(&mut self, service_tier: ServiceTier) {
@@ -977,8 +982,16 @@ impl ApiClient {
         self.abandon_response();
     }
 
-    pub(crate) fn commit_compaction(&mut self) {
-        self.window = self.window.saturating_add(1);
+    pub(crate) fn commit_compaction(&mut self, auto_compact_window: AutoCompactWindow) {
+        debug_assert_eq!(
+            auto_compact_window.window_number,
+            self.auto_compact_window.window_number.saturating_add(1)
+        );
+        debug_assert_eq!(
+            auto_compact_window.previous_window_id,
+            Some(self.auto_compact_window.window_id)
+        );
+        self.auto_compact_window = auto_compact_window;
         // Compaction replaces history instead of appending to it, so no prefix
         // from the compaction request is a valid baseline for the next sample. Keep the socket's
         // last response ID so delayed compaction frames cannot enter that full request's response.
@@ -1699,19 +1712,20 @@ impl ApiClient {
         }
         let trigger = compaction::compaction_trigger();
         let selection = self.model_selection.get();
-        let [tool_tokens, instruction_tokens] = estimated_harness_tokens_for(
+        let [_, instruction_tokens] = estimated_harness_tokens_for(
             self.harness_profile,
             self.ask_user_question_enabled,
             self.specialist_coordination_enabled,
         );
-        let fixed_request_tokens = tool_tokens
-            .saturating_add(instruction_tokens)
-            .saturating_add(estimated_tokens(std::slice::from_ref(&trigger)));
         let mut prompt_history = history.to_vec();
         let effective_context_window = selection.effective_context_window();
+        // Match Codex's current remote-compaction estimator: reserve the base instructions, then
+        // use the remaining effective window for history. Tool declarations and the synthetic
+        // trigger do not reduce this rewrite boundary upstream; counting them here discarded useful
+        // trailing tool output earlier than Codex.
         let rewritten_outputs = compaction::trim_tool_outputs_to_fit(
             &mut prompt_history,
-            effective_context_window.saturating_sub(fixed_request_tokens),
+            effective_context_window.saturating_sub(instruction_tokens),
         );
         if rewritten_outputs > 0 {
             input_identity = RequestInputIdentity::Exact;
@@ -1878,6 +1892,7 @@ impl ApiClient {
             "thread_id": self.thread_id,
             "turn_id": self.turn_id,
             "window_id": self.window_id(),
+            "context_window_id": self.auto_compact_window.window_id.to_string(),
             "request_kind": request_kind.as_str(),
             "sandbox": "danger-full-access",
             "turn_started_at_unix_ms": self.turn_started_at_unix_ms,
@@ -1895,7 +1910,10 @@ impl ApiClient {
     }
 
     fn window_id(&self) -> String {
-        format!("{}:{}", self.thread_id, self.window)
+        format!(
+            "{}:{}",
+            self.thread_id, self.auto_compact_window.window_number
+        )
     }
 
     fn effective_service_tier(&self) -> Option<&'static str> {
@@ -2212,9 +2230,10 @@ pub(crate) fn estimated_harness_tokens_for(
             HarnessProfile::Specialist(crate::deepwork::SpecialistRole::Reviewer),
         ]
         .map(|profile| {
-            estimated_tokens(std::slice::from_ref(&Value::String(
-                harness_instructions_for(profile).to_string(),
-            )))
+            u64::try_from(crate::truncation::approx_token_count(
+                harness_instructions_for(profile),
+            ))
+            .unwrap_or(u64::MAX)
         })
     })[profile_index];
     [tools, instructions]
@@ -3452,5 +3471,77 @@ fn parse_rate_limit_delay(message: &str) -> Option<Duration> {
         Duration::try_from_secs_f64(value).ok()
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compaction::CompactionPhase;
+
+    #[test]
+    fn request_metadata_advances_context_window_only_after_compaction_commit() -> anyhow::Result<()>
+    {
+        let identity = SessionIdentity {
+            installation_id: "installation".to_string(),
+            session_id: "session".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        let initial = AutoCompactWindow::new_initial();
+        let mut client = ApiClient::new_with_base_url(
+            Auth::for_test("access-token", None),
+            &identity,
+            initial,
+            ModelSelection::default(),
+            ServiceTier::default(),
+            "http://127.0.0.1".to_string(),
+        )?;
+
+        let initial_metadata = client.turn_metadata(RequestKind::Turn);
+        let compact_metadata = client.turn_metadata(RequestKind::Compaction(
+            CompactionRequest::Automatic(CompactionPhase::MidTurn),
+        ));
+        assert_eq!(client.window_id(), "thread:0");
+        assert_eq!(
+            initial_metadata["context_window_id"],
+            initial.window_id.to_string()
+        );
+        assert_eq!(
+            compact_metadata["context_window_id"],
+            initial_metadata["context_window_id"]
+        );
+
+        let next = client.next_auto_compact_window();
+        assert_eq!(client.window_id(), "thread:0");
+        assert_eq!(
+            client.turn_metadata(RequestKind::Turn)["context_window_id"],
+            initial_metadata["context_window_id"]
+        );
+        client.commit_compaction(next);
+
+        let next_metadata = client.turn_metadata(RequestKind::Turn);
+        assert_eq!(client.window_id(), "thread:1");
+        assert_eq!(
+            next_metadata["context_window_id"],
+            next.window_id.to_string()
+        );
+        assert_ne!(
+            next_metadata["context_window_id"],
+            initial_metadata["context_window_id"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn harness_instruction_estimate_matches_upstream_raw_text_accounting() {
+        let [_, instruction_tokens] =
+            estimated_harness_tokens_for(HarnessProfile::Main, false, false);
+        assert_eq!(
+            instruction_tokens,
+            u64::try_from(crate::truncation::approx_token_count(
+                harness_instructions_for(HarnessProfile::Main)
+            ))
+            .unwrap_or(u64::MAX)
+        );
     }
 }

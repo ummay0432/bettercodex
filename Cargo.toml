@@ -1,6 +1,6 @@
 [package]
 name = "bettercodex"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 license = "Apache-2.0"
 description = "A deliberately focused OpenAI Codex coding-agent harness"
@@ -60,7 +60,7 @@ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev 
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 url = "2"
-uuid = { version = "1", default-features = false, features = ["std", "v4", "v5"] }
+uuid = { version = "1", default-features = false, features = ["std", "v4", "v5", "v7"] }
 webbrowser = "1.0"
 which = "8"
 zstd = { version = "0.13", default-features = false }

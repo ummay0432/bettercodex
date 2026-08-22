@@ -2,7 +2,7 @@
 name: manifest
 description: Researches the required official documentation and writes the worker's routing manifest
 model: gpt-5.6-sol
-effort: xhigh
+effort: max
 ---
 
 # `$manifest`

@@ -87,6 +87,19 @@ struct RefreshResponse {
 }
 
 impl Auth {
+    #[cfg(test)]
+    pub(crate) fn for_test(access_token: &str, account_id: Option<&str>) -> Self {
+        Self {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+            account_id: account_id.map(str::to_string),
+            account: ChatGptAccount::default(),
+            expires_at: None,
+            last_refresh: None,
+            refresh_url: Cow::Borrowed(REFRESH_URL),
+            storage: None,
+        }
+    }
 
     pub(crate) fn load() -> Result<Self> {
         if let Ok(access_token) = std::env::var(ACCESS_TOKEN_ENV)
@@ -651,4 +664,3 @@ fn write_private_json(path: &Path, document: &Value) -> Result<()> {
     }
     result
 }
-

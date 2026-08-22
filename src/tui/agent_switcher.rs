@@ -533,19 +533,19 @@ mod tests {
             ),
             AgentSwitcherRow::specialist(
                 None,
-                &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::XHigh),
+                &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::Max),
                 "acceptance",
                 AgentSwitcherStatus::Accepted,
             ),
             AgentSwitcherRow::specialist(
                 None,
-                &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::XHigh),
+                &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::Max),
                 "manifest",
                 AgentSwitcherStatus::Skipped,
             ),
             AgentSwitcherRow::specialist(
                 Some(session_id(2)),
-                &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::XHigh),
+                &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::Max),
                 "worker",
                 AgentSwitcherStatus::Working(Duration::from_secs(134)),
             ),
@@ -632,9 +632,9 @@ mod tests {
         let expected = [
             "$deepwork",
             "├── Main        | sol xhigh · Waiting",
-            "├── $acceptance | sol xhigh · Accepted",
-            "├── $manifest   | sol xhigh · Skipped",
-            "├── $worker     | sol xhigh · Working (2m 14s)",
+            "├── $acceptance | sol max   · Accepted",
+            "├── $manifest   | sol max   · Skipped",
+            "├── $worker     | sol max   · Working (2m 14s)",
             "└── $reviewer   | sol max   · Queued",
         ];
         let positions = expected
@@ -812,7 +812,7 @@ mod tests {
     fn rows_use_measured_role_first_columns() {
         let row = AgentSwitcherRow::specialist(
             None,
-            &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::XHigh),
+            &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::Max),
             "acceptance",
             AgentSwitcherStatus::Accepted,
         );
@@ -823,7 +823,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(rendered, "  ├── $acceptance | sol xhigh · Accepted");
+        assert_eq!(rendered, "  ├── $acceptance | sol max   · Accepted");
         assert_eq!(line.spans.len(), 2);
         assert_eq!(line.spans[1].style, bright_gunmetal_style());
     }
@@ -837,7 +837,7 @@ mod tests {
         );
         let cancelling = AgentSwitcherRow::specialist(
             Some(session_id(2)),
-            &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::XHigh),
+            &ModelSelection::from_identity("gpt-5.6-sol", ReasoningEffort::Max),
             "acceptance",
             AgentSwitcherStatus::Cancelling(Duration::from_secs(9)),
         );
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn working_row_uses_one_continuous_display_cell_shimmer() {
-        let text = "├── $manifest | sol xhigh · Working (2m 14s)";
+        let text = "├── $manifest | sol max · Working (2m 14s)";
         let spans = shimmer_spans_at(
             text,
             Duration::from_millis(1_000),

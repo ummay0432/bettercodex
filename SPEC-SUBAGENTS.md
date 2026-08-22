@@ -108,10 +108,10 @@ $deepwork activation
   0. Create or recover .deepwork/<run-index>/
   1. Main performs a request-directed repository preflight
   2. Main runs one guided acceptance-and-manifest interview
-  3. Sol XHigh · $acceptance
-  4. Sol XHigh · $manifest when materially useful; otherwise persist `Skipped`
-  5. Sol XHigh · $worker
-  6. Sol Max   · $reviewer
+  3. Sol Max · $acceptance
+  4. Sol Max · $manifest when materially useful; otherwise persist `Skipped`
+  5. Sol Max · $worker
+  6. Sol Max · $reviewer
 ```
 
 The pipeline is strictly sequential. Main owns the task, decides what each stage needs, reviews each result, and moves work forward.
@@ -122,9 +122,9 @@ Only one stage owns repository mutation at a time. Main does not advance while t
 
 ## Fixed specialist models
 
-- `$acceptance` — `gpt-5.6-sol` at `xhigh`
-- `$manifest` — `gpt-5.6-sol` at `xhigh`
-- `$worker` — `gpt-5.6-sol` at `xhigh`
+- `$acceptance` — `gpt-5.6-sol` at `max`
+- `$manifest` — `gpt-5.6-sol` at `max`
+- `$worker` — `gpt-5.6-sol` at `max`
 - `$reviewer` — `gpt-5.6-sol` at `max`
 
 These model and reasoning-effort choices are fixed by specialist role and do not inherit Main's current `/model` selection.
@@ -492,7 +492,7 @@ When started, `$manifest` writes only its manifest artifact. It must not alter p
 
 `$worker` performs the implementation work against the accepted task, completion contract, constraints, and the documentation handoff when one was produced.
 
-It uses `gpt-5.6-sol` at `xhigh`. Its exact worker prompt remains undecided.
+It uses `gpt-5.6-sol` at `max`. Its exact worker prompt remains undecided.
 
 ## `$reviewer`
 
@@ -622,9 +622,9 @@ Use one compact tree row per agent:
 ```text
   $deepwork
   ├── Main        | sol xhigh · Waiting
-  ├── $acceptance | sol xhigh · Accepted
-  ├── $manifest   | sol xhigh · Skipped
-  ├── $worker     | sol xhigh · Working (2m 14s)
+  ├── $acceptance | sol max   · Accepted
+  ├── $manifest   | sol max   · Skipped
+  ├── $worker     | sol max   · Working (2m 14s)
   └── $reviewer   | sol max   · Queued
 ```
 

@@ -2,7 +2,7 @@
 name: acceptance
 description: Defines the task's evidence-backed completion contract before implementation
 model: gpt-5.6-sol
-effort: xhigh
+effort: max
 ---
 
 # `$acceptance`
